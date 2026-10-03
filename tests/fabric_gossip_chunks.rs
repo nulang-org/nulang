@@ -3,7 +3,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use nulang::runtime::{Actor, DeterministicNetworkTransport, NodeId, Runtime};
+use nulang::runtime::{
+    Actor, DeterministicNetworkTransport, FabricAdvertisement, FabricAdvertisementSnapshot, NodeId,
+    Packet, Runtime,
+};
 use nulang::vm::Value;
 
 fn noop(_actor: &mut Actor, _args: &[Value]) {}
@@ -47,6 +50,18 @@ fn drive_gossip_until(
         sender.process_network();
         receiver.process_network();
     }
+}
+
+fn advertisements(node_id: NodeId, count: usize) -> Vec<FabricAdvertisement> {
+    (0..count)
+        .map(|index| FabricAdvertisement {
+            node_id,
+            pattern: format!("wire.{index}"),
+            actor_id: index as u64 + 1,
+            behavior: "handle".to_string(),
+            group: None,
+        })
+        .collect()
 }
 
 #[test]
@@ -100,7 +115,9 @@ fn automatic_gossip_converges_more_than_legacy_256_subscription_sender_cap() {
 
 #[test]
 fn complete_snapshot_export_still_fails_closed_above_fab0_decoder_bound() {
-    let mut runtime = Runtime::new();
+    let bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addr: SocketAddr = "127.0.0.1:32403".parse().unwrap();
+    let mut runtime = distributed_runtime(addr, bus);
     let target = runtime.spawn_actor(Box::new(Vec::new));
     runtime
         .actors
@@ -118,5 +135,37 @@ fn complete_snapshot_export_still_fails_closed_above_fab0_decoder_bound() {
     // Until FAB1 is wired into Packet::Gossip, the compatibility bridge must
     // never manufacture a partial authoritative FAB0 replacement above the
     // decoder's existing complete-snapshot bound.
-    assert!(runtime.fabric_advertisements(4096).is_err());
+    let error = runtime.fabric_advertisements(4096).unwrap_err();
+    assert!(error.contains("4097 local subscriptions"));
+    assert!(error.contains("exceeding limit 4096"));
+}
+
+#[test]
+fn fab0_wire_boundary_matches_sender_compatibility_window() {
+    let node_id = NodeId(44);
+    let max_snapshot = FabricAdvertisementSnapshot {
+        node_id,
+        generation: 7,
+        subscriptions: advertisements(node_id, 4096),
+    };
+    let max_packet = Packet::Gossip {
+        members: vec![],
+        directory: vec![],
+        fabric: Some(max_snapshot.clone()),
+    };
+    let bytes = max_packet.to_bytes(81);
+    let (sequence, decoded) = Packet::from_bytes(&bytes).expect("4096-entry FAB0 should decode");
+    assert_eq!(sequence, 81);
+    assert_eq!(decoded, max_packet);
+
+    let too_large = Packet::Gossip {
+        members: vec![],
+        directory: vec![],
+        fabric: Some(FabricAdvertisementSnapshot {
+            node_id,
+            generation: 8,
+            subscriptions: advertisements(node_id, 4097),
+        }),
+    };
+    assert!(Packet::from_bytes(&too_large.to_bytes(82)).is_none());
 }
