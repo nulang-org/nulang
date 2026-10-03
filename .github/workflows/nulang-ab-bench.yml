@@ -77,7 +77,7 @@ jobs:
           python3 scripts/nulang_ab_bench.py "${args[@]}"
 
       - name: Upload A/B results
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: nulang-ab-results-${{ github.sha }}
           path: nulang-ab-results.json
