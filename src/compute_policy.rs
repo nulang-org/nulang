@@ -7,7 +7,7 @@
 use std::fmt;
 
 use crate::compute_planner::{PlannedVectorWidth, VectorLoopPlan};
-use crate::compute_tiling::{ComputeTileError, VectorTilePlan};
+use crate::compute_tiling::{plan_vector_tile, ComputeTileError, VectorTilePlan};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VectorizationPolicy {
@@ -88,7 +88,6 @@ pub enum VectorizationDecision {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComputePolicyError {
-    NotImplemented,
     ZeroMinimumVectors,
     ZeroTileBudget,
     ThresholdOverflow {
@@ -101,7 +100,6 @@ pub enum ComputePolicyError {
 impl fmt::Display for ComputePolicyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotImplemented => write!(f, "vector target policy is not implemented"),
             Self::ZeroMinimumVectors => {
                 write!(f, "vector policy requires at least one vector per loop")
             }
@@ -123,11 +121,62 @@ impl From<ComputeTileError> for ComputePolicyError {
     }
 }
 
+/// Apply backend capabilities and caller-supplied profitability thresholds to
+/// a legal vector loop plan.
+///
+/// Capability mismatches and statically unprofitable loops produce an explicit
+/// scalar decision. Configuration/arithmetic failures remain errors so callers
+/// can distinguish bad policy from an intentional scalar fallback.
 pub fn assess_vectorization(
-    _loop_plan: VectorLoopPlan,
-    _policy: VectorizationPolicy,
+    loop_plan: VectorLoopPlan,
+    policy: VectorizationPolicy,
 ) -> Result<VectorizationDecision, ComputePolicyError> {
-    Err(ComputePolicyError::NotImplemented)
+    if loop_plan.width.is_scalable() && !policy.supports_scalable_vectors {
+        return Ok(VectorizationDecision::Scalar(
+            VectorFallbackReason::ScalableVectorsUnsupported,
+        ));
+    }
+
+    if !loop_plan.start_is_vector_aligned && !policy.supports_unaligned_access {
+        return Ok(VectorizationDecision::Scalar(
+            VectorFallbackReason::UnalignedAccessUnsupported,
+        ));
+    }
+
+    if let Some(vector_iterations) = loop_plan.vector_iterations {
+        if vector_iterations < policy.min_vectors_per_loop {
+            return Ok(VectorizationDecision::Scalar(
+                VectorFallbackReason::StaticLoopTooSmall {
+                    vector_iterations,
+                    minimum: policy.min_vectors_per_loop,
+                },
+            ));
+        }
+    }
+
+    let tile = plan_vector_tile(loop_plan, policy.target_tile_bytes)?;
+    let profitability_guard = match loop_plan.width {
+        PlannedVectorWidth::Fixed(lanes) if loop_plan.vector_iterations.is_none() => {
+            let min_elements = policy
+                .min_vectors_per_loop
+                .checked_mul(u64::from(lanes))
+                .ok_or(ComputePolicyError::ThresholdOverflow {
+                    min_vectors: policy.min_vectors_per_loop,
+                    lanes,
+                })?;
+            ProfitabilityGuard::FixedElementsAtLeast(min_elements)
+        }
+        PlannedVectorWidth::Fixed(_) => ProfitabilityGuard::None,
+        PlannedVectorWidth::ScalableMin(_) => {
+            ProfitabilityGuard::TargetVectorIterationsAtLeast(policy.min_vectors_per_loop)
+        }
+    };
+
+    Ok(VectorizationDecision::Vectorize(VectorExecutionPlan {
+        loop_plan,
+        tile,
+        profitability_guard,
+    }))
 }
 
 #[cfg(test)]
