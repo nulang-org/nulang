@@ -12,9 +12,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 #[cfg(not(unix))]
 use std::io::{Read, Seek, SeekFrom};
+use std::ops::Range;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
-use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use super::tablet::{TabletSnapshotRow, VersionedValue};
@@ -293,7 +293,13 @@ pub(crate) fn write_sstable_v2(
     }
 
     let sequence_runs = sequence_runs(rows)?;
-    let footer = encode_footer(tablet_id, ownership_epoch, rows.len(), &blocks, &sequence_runs)?;
+    let footer = encode_footer(
+        tablet_id,
+        ownership_epoch,
+        rows.len(),
+        &blocks,
+        &sequence_runs,
+    )?;
     if footer.len() > MAX_FOOTER_BYTES {
         return Err(SstableV2Error::TooLarge(footer.len()));
     }
@@ -328,7 +334,8 @@ pub(crate) fn write_sstable_v2(
         ownership_epoch,
         min_sequence,
         max_sequence,
-        row_count: u32::try_from(rows.len()).map_err(|_| SstableV2Error::TooManyRows(rows.len()))?,
+        row_count: u32::try_from(rows.len())
+            .map_err(|_| SstableV2Error::TooManyRows(rows.len()))?,
         min_key: rows.first().unwrap().key.clone(),
         max_key: rows.last().unwrap().key.clone(),
         block_count: u32::try_from(blocks.len())
@@ -388,9 +395,7 @@ fn flush_pending_block(
     }
     let payload_len = u32::try_from(pending.payload.len())
         .map_err(|_| SstableV2Error::TooLarge(pending.payload.len()))?;
-    let payload_offset = offset
-        .checked_add(4)
-        .ok_or(SstableV2Error::InvalidLength)?;
+    let payload_offset = offset.checked_add(4).ok_or(SstableV2Error::InvalidLength)?;
     file.write_all(&payload_len.to_le_bytes())?;
     file.write_all(&pending.payload)?;
     let checksum = *blake3::hash(&pending.payload).as_bytes();
