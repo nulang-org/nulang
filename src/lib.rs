@@ -31,7 +31,9 @@ pub mod cir_lower;
 pub mod compat;
 pub mod compiler_identity;
 pub mod compute_ir;
+pub mod compute_planner;
 pub mod compute_schedule;
+pub mod compute_tiling;
 pub mod content_identity;
 pub mod core_vm;
 #[cfg(feature = "native-codegen")]
