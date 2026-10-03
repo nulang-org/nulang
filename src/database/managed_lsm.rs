@@ -135,11 +135,8 @@ impl ManagedLsmStorage {
         let path = table_path(&self.directory, generation);
         table.write_atomic(&path).map_err(ManagedLsmError::from)?;
 
-        let mut generations: Vec<u64> = self
-            .tables
-            .iter()
-            .map(|active| active.generation)
-            .collect();
+        let mut generations: Vec<u64> =
+            self.tables.iter().map(|active| active.generation).collect();
         generations.push(generation);
         Manifest {
             oldest_readable_sequence: self.oldest_readable_sequence,
@@ -260,11 +257,7 @@ impl ManagedLsmStorage {
 
     /// Checked point read that enforces the same retained snapshot window as
     /// `scan_at` and the tablet-level read API.
-    pub fn try_read_at(
-        &self,
-        key: &[u8],
-        snapshot: u64,
-    ) -> Result<Option<&[u8]>, ManagedLsmError> {
+    pub fn try_read_at(&self, key: &[u8], snapshot: u64) -> Result<Option<&[u8]>, ManagedLsmError> {
         self.validate_snapshot(snapshot)?;
         Ok(self.read_unchecked_at(key, snapshot))
     }
