@@ -124,9 +124,27 @@ jobs:
         run: cargo test --locked --no-default-features --features native-codegen --lib jit::tests -- --test-threads=1
 
       - name: Validate default-feature Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
+        id: clippy
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo clippy --locked --all-targets -- -D warnings 2>&1 | tee native-leaf-clippy.log
+
+      - name: Upload Clippy diagnostic
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-leaf-clippy-log
+          path: native-leaf-clippy.log
+          if-no-files-found: error
+
+      - name: Fail on Clippy diagnostic
+        if: steps.clippy.outcome == 'failure'
+        run: exit 1
 
       - name: Commit validated current-main restack
+        if: steps.clippy.outcome == 'success'
         shell: bash
         run: |
           set -euo pipefail
