@@ -54,18 +54,8 @@ impl NativeFunctionPlan {
                 .unwrap_or(NativeValueRepr::Tagged)
         };
 
-        let params = func
-            .params
-            .iter()
-            .copied()
-            .map(repr_for_local)
-            .collect();
-        let captures = func
-            .captures
-            .iter()
-            .copied()
-            .map(repr_for_local)
-            .collect();
+        let params = func.params.iter().copied().map(repr_for_local).collect();
+        let captures = func.captures.iter().copied().map(repr_for_local).collect();
         let ret = func
             .ret
             .as_ref()
@@ -211,6 +201,10 @@ impl NativeFunctionPlan {
     /// Whether today's AOT integer fast path can safely use raw i64 arguments
     /// and results for this function in isolation.
     ///
+    /// The current boxed entry wrapper always tags the raw return as Int, so a
+    /// unit/void function cannot use this path: its native body returns tagged
+    /// nil, which the wrapper would otherwise retag as integer zero.
+    ///
     /// A module-level ABI planner must additionally prove every call edge is
     /// raw-compatible before removing `CrossFunctionCall`; until then direct
     /// inter-function calls stay boxed rather than passing raw integers into a
@@ -219,7 +213,7 @@ impl NativeFunctionPlan {
         self.constraints.is_empty()
             && self.captures.is_empty()
             && self.params.iter().all(|repr| *repr == NativeValueRepr::I64)
-            && matches!(self.ret, None | Some(NativeValueRepr::I64))
+            && self.ret == Some(NativeValueRepr::I64)
     }
 }
 
@@ -240,10 +234,25 @@ mod tests {
         builder.terminate(Terminator::Return(Some(out)));
         let plan = NativeFunctionPlan::for_function(&builder.build());
 
-        assert_eq!(plan.params, vec![NativeValueRepr::I64, NativeValueRepr::I64]);
+        assert_eq!(
+            plan.params,
+            vec![NativeValueRepr::I64, NativeValueRepr::I64]
+        );
         assert_eq!(plan.ret, Some(NativeValueRepr::I64));
         assert!(plan.constraints.is_empty());
         assert!(plan.supports_unboxed_int_path());
+    }
+
+    #[test]
+    fn unit_return_is_not_supported_by_current_int_wrapper() {
+        let mut builder = FunctionBuilder::new("unit", None);
+        builder.add_param("x", Type::int());
+        builder.terminate(Terminator::Return(None));
+        let plan = NativeFunctionPlan::for_function(&builder.build());
+
+        assert_eq!(plan.ret, None);
+        assert!(plan.constraints.is_empty());
+        assert!(!plan.supports_unboxed_int_path());
     }
 
     #[test]
@@ -274,9 +283,9 @@ mod tests {
         builder.terminate(Terminator::Return(Some(out)));
         let plan = NativeFunctionPlan::for_function(&builder.build());
 
-        assert!(plan.constraints.contains(&NativePlanConstraint::RuntimeBoundary(
-            NativeBoundary::Ffi
-        )));
+        assert!(plan
+            .constraints
+            .contains(&NativePlanConstraint::RuntimeBoundary(NativeBoundary::Ffi)));
         assert!(!plan.supports_unboxed_int_path());
     }
 
@@ -316,9 +325,11 @@ mod tests {
         );
         effect.terminate(Terminator::Return(Some(out)));
         let effect_plan = NativeFunctionPlan::for_function(&effect.build());
-        assert!(effect_plan.constraints.contains(&NativePlanConstraint::RuntimeBoundary(
-            NativeBoundary::EffectRuntime
-        )));
+        assert!(effect_plan
+            .constraints
+            .contains(&NativePlanConstraint::RuntimeBoundary(
+                NativeBoundary::EffectRuntime
+            )));
 
         let mut actor = FunctionBuilder::new("actor", Some(Type::int()));
         let actor_ref = actor.add_param("actor", Type::int());
@@ -335,9 +346,11 @@ mod tests {
         );
         actor.terminate(Terminator::Return(Some(out)));
         let actor_plan = NativeFunctionPlan::for_function(&actor.build());
-        assert!(actor_plan.constraints.contains(&NativePlanConstraint::RuntimeBoundary(
-            NativeBoundary::ActorRuntime
-        )));
+        assert!(actor_plan
+            .constraints
+            .contains(&NativePlanConstraint::RuntimeBoundary(
+                NativeBoundary::ActorRuntime
+            )));
     }
 
     #[test]
@@ -391,7 +404,9 @@ mod tests {
         assert!(plan
             .constraints
             .contains(&NativePlanConstraint::CapturedClosure));
-        assert!(plan.constraints.contains(&NativePlanConstraint::DynamicCall));
+        assert!(plan
+            .constraints
+            .contains(&NativePlanConstraint::DynamicCall));
         assert!(!plan.supports_unboxed_int_path());
     }
 
@@ -406,8 +421,10 @@ mod tests {
         builder.terminate(Terminator::Return(None));
         let plan = NativeFunctionPlan::for_function(&builder.build());
 
-        assert!(plan.constraints.contains(&NativePlanConstraint::RuntimeBoundary(
-            NativeBoundary::ActorRuntime
-        )));
+        assert!(plan
+            .constraints
+            .contains(&NativePlanConstraint::RuntimeBoundary(
+                NativeBoundary::ActorRuntime
+            )));
     }
 }
