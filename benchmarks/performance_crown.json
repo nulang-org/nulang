@@ -78,11 +78,11 @@
         },
         {
           "id": "durable.atomic_transition",
-          "status": "planned",
+          "status": "end_to_end",
           "metric": "transitions_per_second",
-          "runner": null,
+          "runner": "benches/persist_bench.rs",
           "baselines": ["temporal", "restatedev"],
-          "measurement_mode": "planned"
+          "measurement_mode": "criterion"
         }
       ]
     },
