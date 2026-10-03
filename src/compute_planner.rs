@@ -9,7 +9,7 @@
 use std::fmt;
 
 use crate::compute_ir::{Layout, ScalarType, VectorType, VectorWidth, VectorWidthKind};
-use crate::compute_schedule::{IterationSpace, LoopExtent};
+use crate::compute_schedule::{ComputeScheduleError, IterationSpace, LoopExtent};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlannedVectorWidth {
@@ -66,6 +66,7 @@ pub enum ComputePlannerError {
         end: u64,
         axis_extent: u64,
     },
+    Schedule(ComputeScheduleError),
 }
 
 impl fmt::Display for ComputePlannerError {
@@ -96,11 +97,18 @@ impl fmt::Display for ComputePlannerError {
                 f,
                 "static vector range {start}..{end} exceeds axis {axis} extent {axis_extent}"
             ),
+            Self::Schedule(error) => write!(f, "{error}"),
         }
     }
 }
 
 impl std::error::Error for ComputePlannerError {}
+
+impl From<ComputeScheduleError> for ComputePlannerError {
+    fn from(error: ComputeScheduleError) -> Self {
+        Self::Schedule(error)
+    }
+}
 
 /// Validate a layout/iteration/vector combination and derive the information a
 /// backend needs to construct its vector loop.
@@ -363,6 +371,28 @@ mod tests {
         assert_eq!(
             plan_vector_loop(&layout, 2, iteration, fixed_f32x4()),
             Err(ComputePlannerError::AxisOutOfBounds { axis: 2, rank: 2 })
+        );
+    }
+
+    #[test]
+    fn rejects_public_iteration_space_that_skips_constructor_validation() {
+        let layout = Layout::row_major(ScalarType::F32, vec![16]).unwrap();
+        let iteration = IterationSpace {
+            start: i64::MAX,
+            extent: LoopExtent::Static(1),
+            step: 1,
+            scope: LocalityScope::Lane,
+        };
+
+        assert_eq!(
+            plan_vector_loop(&layout, 0, iteration, fixed_f32x4()),
+            Err(ComputePlannerError::Schedule(
+                ComputeScheduleError::StaticRangeOverflow {
+                    start: i64::MAX,
+                    count: 1,
+                    step: 1,
+                }
+            ))
         );
     }
 }
