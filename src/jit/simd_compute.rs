@@ -12,7 +12,11 @@ use cranelift_frontend::FunctionBuilderContext;
 use cranelift_jit::JITModule;
 
 use crate::bytecode::Instruction;
-use crate::compute_ir::{LocalityScope, ScalarType, VectorType, VectorWidth};
+use crate::compute_ir::{Layout, LocalityScope, ScalarType, VectorType, VectorWidth};
+use crate::compute_planner::{ComputePlannerError, VectorLoopPlan};
+use crate::compute_policy::{
+    assess_vectorization, ComputePolicyError, VectorizationDecision, VectorizationPolicy,
+};
 use crate::compute_schedule::{
     ComputeScheduleError, DynamicExtentId, IterationSpace, LoopExtent,
 };
@@ -36,6 +40,7 @@ pub(crate) struct SimdComputePlan {
     pub(crate) vector_type: VectorType,
     pub(crate) iteration: Option<IterationSpace>,
     pub(crate) trip_count: SimdTripCountBinding,
+    pub(crate) vector_loop: Option<VectorLoopPlan>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,8 +56,13 @@ pub(crate) enum SimdComputePlanError {
     UnsupportedScalableLowering,
     UnsupportedLoweringWidth(u16),
     StaticTripCountTooLarge(u64),
+    StaticLayoutSizeOverflow {
+        count: u64,
+        element: ScalarType,
+    },
     MissingRuntimeExtentBinding,
     Schedule(ComputeScheduleError),
+    Planner(ComputePlannerError),
 }
 
 impl fmt::Display for SimdComputePlanError {
@@ -78,11 +88,16 @@ impl fmt::Display for SimdComputePlanError {
             Self::StaticTripCountTooLarge(count) => {
                 write!(f, "static SIMD trip count {count} does not fit usize")
             }
+            Self::StaticLayoutSizeOverflow { count, element } => write!(
+                f,
+                "static SIMD layout for {count} {element:?} elements overflows the portable layout domain"
+            ),
             Self::MissingRuntimeExtentBinding => write!(
                 f,
                 "SIMD region marks its trip count as runtime-derived but has no ArrLen register binding"
             ),
             Self::Schedule(error) => write!(f, "{error}"),
+            Self::Planner(error) => write!(f, "{error}"),
         }
     }
 }
@@ -92,6 +107,12 @@ impl std::error::Error for SimdComputePlanError {}
 impl From<ComputeScheduleError> for SimdComputePlanError {
     fn from(error: ComputeScheduleError) -> Self {
         Self::Schedule(error)
+    }
+}
+
+impl From<ComputePlannerError> for SimdComputePlanError {
+    fn from(error: ComputePlannerError) -> Self {
+        Self::Planner(error)
     }
 }
 
@@ -106,9 +127,6 @@ impl SimdComputePlan {
             });
         }
 
-        // Current bytecode SIMD analysis only produces non-zero fixed widths.
-        // Keep the checked compute-IR constructor as the authority so future
-        // scalable/target-selected widths cannot silently bypass validation.
         let width = VectorWidth::fixed(analyzer_lanes)
             .expect("SIMD analyzer only exposes non-zero fixed widths");
         let vector_type = VectorType::new(scalar_type(region.elem_type), width);
@@ -141,11 +159,21 @@ impl SimdComputePlan {
             (None, _) => (None, SimdTripCountBinding::Unavailable),
         };
 
+        let vector_loop = static_vector_loop_plan(vector_type, iteration)?;
+
         Ok(Self {
             vector_type,
             iteration,
             trip_count,
+            vector_loop,
         })
+    }
+
+    pub(crate) fn vectorization_decision(
+        self,
+        _policy: VectorizationPolicy,
+    ) -> Result<Option<VectorizationDecision>, ComputePolicyError> {
+        Ok(None)
     }
 
     /// Materialize the legacy analyzer structure expected by the current
@@ -181,6 +209,13 @@ impl SimdComputePlan {
         lowering.arr_len_reg = arr_len_reg;
         Ok(lowering)
     }
+}
+
+fn static_vector_loop_plan(
+    _vector_type: VectorType,
+    _iteration: Option<IterationSpace>,
+) -> Result<Option<VectorLoopPlan>, SimdComputePlanError> {
+    Ok(None)
 }
 
 const fn scalar_type(elem_type: SimdElemType) -> ScalarType {
@@ -240,6 +275,7 @@ pub(crate) fn compile_simd_region(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compute_policy::{ProfitabilityGuard, VectorFallbackReason};
     use crate::jit::simd_analyzer::{BinopKind, VectorizablePattern};
 
     fn region(elem_type: SimdElemType, width: SimdWidth) -> SimdRegion {
@@ -294,6 +330,31 @@ mod tests {
     }
 
     #[test]
+    fn static_trip_count_produces_layout_aware_vector_partition() {
+        let plan = SimdComputePlan::from_region(&region(SimdElemType::Int64, SimdWidth::Width2))
+            .expect("static trip count should produce a vector loop plan");
+        let vector_loop = plan.vector_loop.expect("static vector loop plan");
+
+        assert_eq!(vector_loop.vector_iterations, Some(8));
+        assert_eq!(vector_loop.scalar_tail, Some(0));
+        assert_eq!(vector_loop.min_vector_bytes, 16);
+        assert!(!vector_loop.requires_runtime_tail);
+        assert!(!vector_loop.requires_runtime_bounds_check);
+    }
+
+    #[test]
+    fn static_partition_preserves_scalar_tail() {
+        let mut input = region(SimdElemType::Int64, SimdWidth::Width2);
+        input.trip_count_hint = Some(17);
+
+        let plan = SimdComputePlan::from_region(&input).unwrap();
+        let vector_loop = plan.vector_loop.expect("static vector loop plan");
+
+        assert_eq!(vector_loop.vector_iterations, Some(8));
+        assert_eq!(vector_loop.scalar_tail, Some(1));
+    }
+
+    #[test]
     fn maps_runtime_arr_len_to_symbolic_dynamic_extent() {
         let mut input = region(SimdElemType::Float64, SimdWidth::Width2);
         input.trip_count_hint = Some(0);
@@ -314,6 +375,41 @@ mod tests {
                 register: 9,
             }
         );
+        assert_eq!(plan.vector_loop, None);
+    }
+
+    #[test]
+    fn static_plan_can_be_assessed_by_backend_policy() {
+        let plan = SimdComputePlan::from_region(&region(SimdElemType::Int64, SimdWidth::Width2))
+            .unwrap();
+        let policy = VectorizationPolicy::new(4, 64, false, true).unwrap();
+        let decision = plan
+            .vectorization_decision(policy)
+            .unwrap()
+            .expect("static plan should have a policy decision");
+        let VectorizationDecision::Vectorize(execution) = decision else {
+            panic!("expected vectorization");
+        };
+
+        assert_eq!(execution.tile.vectors_per_tile, 4);
+        assert_eq!(execution.profitability_guard, ProfitabilityGuard::None);
+    }
+
+    #[test]
+    fn static_plan_can_fall_back_when_policy_threshold_is_not_met() {
+        let plan = SimdComputePlan::from_region(&region(SimdElemType::Int64, SimdWidth::Width2))
+            .unwrap();
+        let policy = VectorizationPolicy::new(9, 64, false, true).unwrap();
+
+        assert_eq!(
+            plan.vectorization_decision(policy).unwrap(),
+            Some(VectorizationDecision::Scalar(
+                VectorFallbackReason::StaticLoopTooSmall {
+                    vector_iterations: 8,
+                    minimum: 9,
+                }
+            ))
+        );
     }
 
     #[test]
@@ -326,6 +422,7 @@ mod tests {
 
         assert_eq!(plan.iteration, None);
         assert_eq!(plan.trip_count, SimdTripCountBinding::Unavailable);
+        assert_eq!(plan.vector_loop, None);
     }
 
     #[test]
@@ -376,6 +473,7 @@ mod tests {
                 extent,
                 register: 11,
             },
+            vector_loop: None,
         };
 
         let lowering = plan
@@ -394,6 +492,7 @@ mod tests {
             vector_type: VectorType::new(ScalarType::I64, VectorWidth::scalable(2).unwrap()),
             iteration: None,
             trip_count: SimdTripCountBinding::Unavailable,
+            vector_loop: None,
         };
 
         assert_eq!(
