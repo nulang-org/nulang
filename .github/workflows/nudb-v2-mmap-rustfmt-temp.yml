@@ -1,0 +1,30 @@
+name: Temporary NuDB v2 mmap rustfmt
+
+on:
+  push:
+    branches:
+      - perf/nudb-sstable-v2-mmap-borrowed
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: perf/nudb-sstable-v2-mmap-borrowed
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Format mmap serving layer
+        run: cargo fmt --all
+      - name: Commit formatting
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/database/sstable_v2.rs src/database/store.rs
+          git diff --cached --quiet && exit 0
+          git commit -m "style(database): format mmap v2 serving"
+          git push origin HEAD:perf/nudb-sstable-v2-mmap-borrowed
