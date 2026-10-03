@@ -6,7 +6,8 @@
 //! bodies, actor state defaults/init expressions, and workflow step/
 //! compensation bodies are all checked.
 
-use crate::ast::Decl;
+use crate::ast::{Decl, WorkflowItem, WorkflowStep};
+use crate::effect_checker::{flatten_decls, CapContext, CapabilityAnalyzer};
 use crate::types::NuResult;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -16,10 +17,68 @@ pub struct CapabilityAnalysisSummary {
 
 /// Analyze every capability-bearing expression body in a declaration tree.
 ///
-/// RED phase: tests below specify the traversal contract before the shared
-/// implementation replaces the duplicated frontend loops.
-pub fn analyze_module_capabilities(_decls: &[Decl]) -> NuResult<CapabilityAnalysisSummary> {
-    Ok(CapabilityAnalysisSummary::default())
+/// This is the canonical module-level traversal for compiler frontends. Keep
+/// capability *inference* in `CapabilityAnalyzer`; this function only owns the
+/// question of which declaration bodies must be visited and which parameter
+/// capabilities seed each body context.
+pub fn analyze_module_capabilities(decls: &[Decl]) -> NuResult<CapabilityAnalysisSummary> {
+    let mut analyzer = CapabilityAnalyzer::new();
+    let base_ctx = CapContext::new();
+    let mut bodies_checked = 0usize;
+
+    let mut analyze_body = |ctx: &CapContext, body: &crate::ast::Expr| -> NuResult<()> {
+        analyzer.infer_cap(ctx, body)?;
+        bodies_checked += 1;
+        Ok(())
+    };
+
+    for decl in flatten_decls(decls) {
+        match decl {
+            Decl::Function { body, params, .. } => {
+                let ctx = base_ctx.with_params(params);
+                analyze_body(&ctx, body)?;
+            }
+            Decl::Actor {
+                behaviors,
+                state_fields,
+                init,
+                ..
+            } => {
+                for behavior in behaviors {
+                    let ctx = base_ctx.with_params(&behavior.params);
+                    analyze_body(&ctx, &behavior.body)?;
+                }
+                for (_, _, _, default) in state_fields {
+                    analyze_body(&base_ctx, default)?;
+                }
+                for (_, expr) in init {
+                    analyze_body(&base_ctx, expr)?;
+                }
+            }
+            Decl::Workflow {
+                items, compensate, ..
+            } => {
+                for item in items {
+                    let steps: &[WorkflowStep] = match item {
+                        WorkflowItem::Step(step) => std::slice::from_ref(step),
+                        WorkflowItem::Parallel(steps) => steps,
+                    };
+                    for step in steps {
+                        analyze_body(&base_ctx, &step.body)?;
+                        if let Some(compensation) = &step.compensate {
+                            analyze_body(&base_ctx, compensation)?;
+                        }
+                    }
+                }
+                if let Some(compensation) = compensate {
+                    analyze_body(&base_ctx, compensation)?;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(CapabilityAnalysisSummary { bodies_checked })
 }
 
 #[cfg(test)]
