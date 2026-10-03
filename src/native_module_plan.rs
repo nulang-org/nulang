@@ -5,7 +5,15 @@
 //! This module proves those edges before a backend may select an unboxed ABI.
 
 use crate::mir;
-use crate::native_plan::NativeFunctionPlan;
+use crate::native_abi::NativeValueRepr;
+use crate::native_plan::{NativeFunctionPlan, NativePlanConstraint};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectCallSite {
+    callee: usize,
+    args: Vec<NativeValueRepr>,
+    result: NativeValueRepr,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeModulePlan {
@@ -14,15 +22,62 @@ pub struct NativeModulePlan {
 }
 
 impl NativeModulePlan {
-    /// RED phase: the real fixed-point ABI analysis follows in the next commit.
+    /// Build a module-wide raw-ABI plan.
+    ///
+    /// A function starts as a candidate only when its own body is compatible
+    /// with the current integer fast path. `CrossFunctionCall` is the sole
+    /// function-local constraint that may be discharged here. We then iterate
+    /// to a fixed point: every direct callee must itself remain raw-compatible,
+    /// and each call site's argument/result representations must exactly match
+    /// the callee ABI. This admits recursive SCCs without allowing raw values
+    /// to leak into the boxed function table.
     pub fn for_module(module: &mir::Module) -> Self {
+        let functions: Vec<NativeFunctionPlan> = module
+            .functions
+            .iter()
+            .map(NativeFunctionPlan::for_function)
+            .collect();
+
+        let call_sites: Vec<Vec<DirectCallSite>> = module
+            .functions
+            .iter()
+            .zip(functions.iter())
+            .map(|(func, plan)| collect_direct_call_sites(func, plan))
+            .collect();
+
+        let mut unboxed_int_functions: Vec<bool> = functions
+            .iter()
+            .map(is_local_raw_int_candidate)
+            .collect();
+
+        loop {
+            let previous = unboxed_int_functions.clone();
+
+            for (caller_idx, sites) in call_sites.iter().enumerate() {
+                if !previous[caller_idx] {
+                    unboxed_int_functions[caller_idx] = false;
+                    continue;
+                }
+
+                unboxed_int_functions[caller_idx] = sites.iter().all(|site| {
+                    let Some(callee_plan) = functions.get(site.callee) else {
+                        return false;
+                    };
+                    previous.get(site.callee).copied().unwrap_or(false)
+                        && site.args == callee_plan.params
+                        && callee_plan.ret == Some(site.result)
+                        && site.result == NativeValueRepr::I64
+                });
+            }
+
+            if unboxed_int_functions == previous {
+                break;
+            }
+        }
+
         Self {
-            functions: module
-                .functions
-                .iter()
-                .map(NativeFunctionPlan::for_function)
-                .collect(),
-            unboxed_int_functions: vec![false; module.functions.len()],
+            functions,
+            unboxed_int_functions,
         }
     }
 
@@ -32,6 +87,84 @@ impl NativeModulePlan {
             .copied()
             .unwrap_or(false)
     }
+}
+
+fn is_local_raw_int_candidate(plan: &NativeFunctionPlan) -> bool {
+    plan.captures.is_empty()
+        && plan
+            .params
+            .iter()
+            .all(|repr| *repr == NativeValueRepr::I64)
+        // The current boxing wrapper always tags the native return as Int.
+        // `ret == None` therefore cannot use it: the native body returns the
+        // tagged nil sentinel, which the wrapper would incorrectly retag as 0.
+        && plan.ret == Some(NativeValueRepr::I64)
+        && plan
+            .constraints
+            .iter()
+            .all(|constraint| *constraint == NativePlanConstraint::CrossFunctionCall)
+}
+
+fn collect_direct_call_sites(
+    func: &mir::Function,
+    plan: &NativeFunctionPlan,
+) -> Vec<DirectCallSite> {
+    let mut closure_targets = std::collections::HashMap::new();
+    for block in &func.blocks {
+        for stmt in &block.stmts {
+            if let mir::Stmt::Assign {
+                dst,
+                op:
+                    mir::RValue::Closure {
+                        func: target,
+                        captures,
+                    },
+            } = stmt
+            {
+                if captures.is_empty() {
+                    closure_targets.insert(*dst, *target);
+                }
+            }
+        }
+    }
+
+    let local_repr = |id: mir::LocalId| {
+        plan.locals
+            .get(id.0 as usize)
+            .copied()
+            .unwrap_or(NativeValueRepr::Tagged)
+    };
+
+    let mut sites = Vec::new();
+    for block in &func.blocks {
+        for stmt in &block.stmts {
+            let mir::Stmt::Assign {
+                dst,
+                op: mir::RValue::Call { func: target, args },
+            } = stmt
+            else {
+                continue;
+            };
+
+            let callee = match target {
+                mir::FuncRef::Index(index) => Some(*index),
+                mir::FuncRef::Local(local) => closure_targets.get(local).copied(),
+            };
+
+            // Unresolved local calls already carry `DynamicCall`, so they are
+            // never local raw candidates. Omitting them here is therefore safe.
+            let Some(callee) = callee else {
+                continue;
+            };
+
+            sites.push(DirectCallSite {
+                callee,
+                args: args.iter().copied().map(local_repr).collect(),
+                result: local_repr(*dst),
+            });
+        }
+    }
+    sites
 }
 
 #[cfg(test)]
