@@ -9,11 +9,12 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::io;
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
 use super::sstable::{
     atomic_write, discover_tables, sync_parent_directory, table_path, visible_version, Sstable,
-    SstableError,
+    SstableError, SstableRow,
 };
 use super::tablet::{MvccStorage, TabletMutation, VersionedValue};
 
@@ -85,8 +86,6 @@ impl ManagedLsmStorage {
             });
         }
 
-        // Generations are never reused, including generations belonging to an
-        // SSTable that was durably written but never published in MANIFEST.
         let max_disk_generation = discovered
             .last()
             .map(|(generation, _)| *generation)
@@ -116,11 +115,6 @@ impl ManagedLsmStorage {
         self.mutable.values().map(Vec::len).sum()
     }
 
-    /// Publish all committed state since the previous flush.
-    ///
-    /// The immutable table is durable before the manifest references it. If the
-    /// manifest update fails, the table is merely an orphan and the mutable
-    /// state remains intact for a retry.
     pub fn flush(&mut self) -> Result<Option<ManagedFlushResult>, ManagedLsmError> {
         if self.current_sequence == self.flushed_sequence {
             return Ok(None);
@@ -168,12 +162,6 @@ impl ManagedLsmStorage {
         }))
     }
 
-    /// Merge every active immutable table and atomically replace the active set.
-    ///
-    /// Compaction is forbidden while committed state remains in the mutable
-    /// memtable. Once the replacement manifest is published, cleanup failures
-    /// are reported in `CompactionResult` rather than returned as an operation
-    /// error, because the new table set is already authoritative at that point.
     pub fn compact_all(&mut self, safe_point: u64) -> Result<CompactionResult, ManagedLsmError> {
         if self.current_sequence != self.flushed_sequence {
             return Err(ManagedLsmError::UnflushedStateForCompaction {
@@ -242,8 +230,6 @@ impl ManagedLsmStorage {
         }
         .write_atomic(&self.directory.join(MANIFEST_FILE))?;
 
-        // Everything below this point is deliberately infallible with respect
-        // to the caller-visible compaction result: the manifest has committed.
         self.tables = vec![replacement];
         self.oldest_readable_sequence = target_safe_point;
         self.next_generation = following_generation;
@@ -272,11 +258,23 @@ impl ManagedLsmStorage {
         })
     }
 
+    /// Checked point read that enforces the same retained snapshot window as
+    /// `scan_at` and the tablet-level read API.
+    pub fn try_read_at(
+        &self,
+        key: &[u8],
+        snapshot: u64,
+    ) -> Result<Option<&[u8]>, ManagedLsmError> {
+        self.validate_snapshot(snapshot)?;
+        Ok(self.read_unchecked_at(key, snapshot))
+    }
+
     /// Read a stable, ordered key range at one retained MVCC snapshot.
     ///
-    /// `start` is inclusive and `end_exclusive` is optional. Immutable tables
-    /// use their sparse block index to enter the range; newer visible versions
-    /// from later tables or the mutable memtable replace older candidates.
+    /// This is a cursor merge rather than a full-range materialization. One
+    /// cursor enters each eligible SSTable at `start`, plus one mutable B-tree
+    /// cursor. The merge resolves a single key across all sources and stops as
+    /// soon as `limit` live rows have been emitted.
     pub fn scan_at(
         &self,
         start: &[u8],
@@ -289,36 +287,74 @@ impl ManagedLsmStorage {
             return Ok(Vec::new());
         }
 
-        let mut merged: BTreeMap<Vec<u8>, (u64, Option<Vec<u8>>)> = BTreeMap::new();
-        for table in &self.tables {
-            if table.min_sequence > snapshot {
+        let mut table_cursors: Vec<(&[SstableRow], usize)> = self
+            .tables
+            .iter()
+            .take_while(|table| table.min_sequence <= snapshot)
+            .map(|table| (table.range_rows(start, end_exclusive), 0))
+            .filter(|(rows, _)| !rows.is_empty())
+            .collect();
+
+        let bounds = (
+            Bound::Included(start.to_vec()),
+            end_exclusive
+                .map(|end| Bound::Excluded(end.to_vec()))
+                .unwrap_or(Bound::Unbounded),
+        );
+        let mut mutable = self.mutable.range(bounds).peekable();
+        let mut output = Vec::with_capacity(limit.min(64));
+
+        while output.len() < limit {
+            let next_key = {
+                let mut minimum = mutable.peek().map(|(key, _)| key.as_slice());
+                for (rows, index) in &table_cursors {
+                    if let Some(row) = rows.get(*index) {
+                        if minimum
+                            .map(|current| row.key.as_slice() < current)
+                            .unwrap_or(true)
+                        {
+                            minimum = Some(row.key.as_slice());
+                        }
+                    }
+                }
+                minimum.map(<[u8]>::to_vec)
+            };
+
+            let Some(key) = next_key else {
                 break;
+            };
+
+            let mut best: Option<&VersionedValue> = None;
+            for (rows, index) in &mut table_cursors {
+                let Some(row) = rows.get(*index) else {
+                    continue;
+                };
+                if row.key != key {
+                    continue;
+                }
+                if let Some(candidate) = visible_version(&row.versions, snapshot) {
+                    choose_newest(&mut best, candidate);
+                }
+                *index += 1;
             }
-            for row in table.range_rows(start, end_exclusive) {
-                if let Some(version) = visible_version(&row.versions, snapshot) {
-                    insert_newest(&mut merged, &row.key, version);
+
+            if mutable
+                .peek()
+                .map(|(candidate, _)| candidate.as_slice() == key.as_slice())
+                .unwrap_or(false)
+            {
+                let (_, versions) = mutable.next().expect("peeked mutable entry");
+                if let Some(candidate) = visible_version(versions, snapshot) {
+                    choose_newest(&mut best, candidate);
                 }
             }
-        }
 
-        for (key, versions) in &self.mutable {
-            if key.as_slice() < start
-                || end_exclusive
-                    .map(|end| key.as_slice() >= end)
-                    .unwrap_or(false)
-            {
-                continue;
-            }
-            if let Some(version) = visible_version(versions, snapshot) {
-                insert_newest(&mut merged, key, version);
+            if let Some(value) = best.and_then(|version| version.value.as_ref()) {
+                output.push((key, value.clone()));
             }
         }
 
-        Ok(merged
-            .into_iter()
-            .filter_map(|(key, (_, value))| value.map(|value| (key, value)))
-            .take(limit)
-            .collect())
+        Ok(output)
     }
 
     fn validate_snapshot(&self, snapshot: u64) -> Result<(), ManagedLsmError> {
@@ -335,6 +371,22 @@ impl ManagedLsmStorage {
             });
         }
         Ok(())
+    }
+
+    fn read_unchecked_at(&self, key: &[u8], snapshot: u64) -> Option<&[u8]> {
+        let mut best = self
+            .mutable
+            .get(key)
+            .and_then(|versions| visible_version(versions, snapshot));
+        for table in &self.tables {
+            if table.min_sequence > snapshot {
+                break;
+            }
+            if let Some(candidate) = table.visible_version(key, snapshot) {
+                choose_newest(&mut best, candidate);
+            }
+        }
+        best.and_then(|version| version.value.as_deref())
     }
 
     fn fresh_generation(&self) -> Result<u64, ManagedLsmError> {
@@ -381,38 +433,16 @@ impl MvccStorage for ManagedLsmStorage {
     }
 
     fn read_at(&self, key: &[u8], snapshot: u64) -> Option<&[u8]> {
-        let mut best = self
-            .mutable
-            .get(key)
-            .and_then(|versions| visible_version(versions, snapshot));
-        for table in &self.tables {
-            if table.min_sequence > snapshot {
-                break;
-            }
-            if let Some(candidate) = table.visible_version(key, snapshot) {
-                if best
-                    .map(|current| candidate.sequence > current.sequence)
-                    .unwrap_or(true)
-                {
-                    best = Some(candidate);
-                }
-            }
-        }
-        best.and_then(|version| version.value.as_deref())
+        self.read_unchecked_at(key, snapshot)
     }
 }
 
-fn insert_newest(
-    merged: &mut BTreeMap<Vec<u8>, (u64, Option<Vec<u8>>)>,
-    key: &[u8],
-    version: &VersionedValue,
-) {
-    let replace = merged
-        .get(key)
-        .map(|(sequence, _)| version.sequence > *sequence)
-        .unwrap_or(true);
-    if replace {
-        merged.insert(key.to_vec(), (version.sequence, version.value.clone()));
+fn choose_newest<'a>(best: &mut Option<&'a VersionedValue>, candidate: &'a VersionedValue) {
+    if best
+        .map(|current| candidate.sequence > current.sequence)
+        .unwrap_or(true)
+    {
+        *best = Some(candidate);
     }
 }
 
@@ -573,7 +603,8 @@ impl Manifest {
             path: path.to_path_buf(),
             reason: "active table count does not fit in memory".to_string(),
         })?;
-        if count > data.len() / 8 {
+        let remaining = data.len().saturating_sub(cursor);
+        if count > remaining / 8 {
             return Err(ManagedLsmError::CorruptManifest {
                 path: path.to_path_buf(),
                 reason: "active table count exceeds manifest payload".to_string(),
