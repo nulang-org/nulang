@@ -73,6 +73,8 @@ pub mod mir_wasm_simd;
 #[cfg(feature = "native-codegen")]
 pub mod native_abi;
 #[cfg(feature = "native-codegen")]
+pub mod native_call_table;
+#[cfg(feature = "native-codegen")]
 pub mod native_module_plan;
 #[cfg(feature = "native-codegen")]
 pub mod native_plan;
