@@ -161,3 +161,32 @@ fn newer_mutable_tombstone_masks_flushed_sstable_value() {
     assert_eq!(tablet.read_latest(b"k").unwrap(), None);
     cleanup(&path);
 }
+
+#[test]
+fn checkpoint_is_self_contained_after_sstable_eviction_and_wal_reclamation() {
+    let path = temp_wal();
+    cleanup(&path);
+    {
+        let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
+        commit_put(&mut tablet, b"a", b"from-sstable");
+        flush_current(&mut tablet);
+        commit_put(&mut tablet, b"b", b"from-memtable");
+
+        tablet.checkpoint().unwrap();
+    }
+
+    fs::remove_file(path.with_extension("manifest")).unwrap();
+    fs::remove_dir_all(path.with_extension("sstables")).unwrap();
+
+    let reopened = WalBackedTablet::open(descriptor(), &path).unwrap();
+    assert_eq!(reopened.current_sequence(), 2);
+    assert_eq!(
+        reopened.read_latest(b"a").unwrap(),
+        Some(&b"from-sstable"[..])
+    );
+    assert_eq!(
+        reopened.read_latest(b"b").unwrap(),
+        Some(&b"from-memtable"[..])
+    );
+    cleanup(&path);
+}
