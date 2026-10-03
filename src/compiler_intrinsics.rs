@@ -69,8 +69,10 @@ impl MirIntrinsic {
     }
 
     /// Fold the intrinsic when every MIR operand is available as an integer
-    /// constant. Non-integer constants deliberately decline folding rather
-    /// than inventing coercion semantics.
+    /// constant. Inputs are canonicalized through Nulang's signed 48-bit Int
+    /// payload first, exactly as the VM observes a loaded `Constant::Int`.
+    /// Non-integer constants deliberately decline folding rather than
+    /// inventing coercion semantics.
     pub fn fold_constants(&self, args: &[Constant]) -> Option<Constant> {
         if args.len() != self.op.arity() {
             return None;
@@ -78,7 +80,9 @@ impl MirIntrinsic {
         let ints = args
             .iter()
             .map(|arg| match arg {
-                Constant::Int(value) => Some(*value),
+                Constant::Int(value) => Some(crate::value_layout::sext48(
+                    (*value as u64) & crate::value_layout::PAYLOAD_MASK,
+                )),
                 _ => None,
             })
             .collect::<Option<Vec<_>>>()?;
