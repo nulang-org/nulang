@@ -187,7 +187,10 @@ fn acknowledged_commit_survives_immediate_process_kill() {
 
     let tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
     assert_eq!(tablet.current_sequence(), 1);
-    assert_eq!(tablet.read_latest(b"k"), Some(&b"value"[..]));
+    assert_eq!(
+        tablet.read_latest(b"k").unwrap().as_deref(),
+        Some(&b"value"[..])
+    );
 
     cleanup(&wal_path);
 }
@@ -202,8 +205,14 @@ fn acknowledged_group_commit_survives_immediate_process_kill() {
 
     let tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
     assert_eq!(tablet.current_sequence(), 2);
-    assert_eq!(tablet.read_latest(b"k1"), Some(&b"value-1"[..]));
-    assert_eq!(tablet.read_latest(b"k2"), Some(&b"value-2"[..]));
+    assert_eq!(
+        tablet.read_latest(b"k1").unwrap().as_deref(),
+        Some(&b"value-1"[..])
+    );
+    assert_eq!(
+        tablet.read_latest(b"k2").unwrap().as_deref(),
+        Some(&b"value-2"[..])
+    );
 
     cleanup(&wal_path);
 }
@@ -224,8 +233,14 @@ fn published_checkpoint_survives_kill_before_reclamation() {
 
     let tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
     assert_eq!(tablet.current_sequence(), 2);
-    assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"v1"[..]));
-    assert_eq!(tablet.read_at(b"k", 2).unwrap(), Some(&b"v2"[..]));
+    assert_eq!(
+        tablet.read_at(b"k", 1).unwrap().as_deref(),
+        Some(&b"v1"[..])
+    );
+    assert_eq!(
+        tablet.read_at(b"k", 2).unwrap().as_deref(),
+        Some(&b"v2"[..])
+    );
 
     cleanup(&wal_path);
 }
@@ -246,7 +261,10 @@ fn reclaimed_wal_survives_immediate_process_kill() {
 
     let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
     assert_eq!(tablet.current_sequence(), 2);
-    assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"v1"[..]));
+    assert_eq!(
+        tablet.read_at(b"k", 1).unwrap().as_deref(),
+        Some(&b"v1"[..])
+    );
 
     commit_put(&mut tablet, b"k", b"v3");
     assert_eq!(tablet.current_sequence(), 3);

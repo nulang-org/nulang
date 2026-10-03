@@ -53,14 +53,26 @@ fn group_commit_publishes_consecutive_writes_after_one_durable_batch() {
             .unwrap();
         assert_eq!(committed, 2);
         assert_eq!(tablet.current_sequence(), 2);
-        assert_eq!(tablet.read_latest(b"a"), Some(&b"one"[..]));
-        assert_eq!(tablet.read_latest(b"b"), Some(&b"two"[..]));
+        assert_eq!(
+            tablet.read_latest(b"a").unwrap().as_deref(),
+            Some(&b"one"[..])
+        );
+        assert_eq!(
+            tablet.read_latest(b"b").unwrap().as_deref(),
+            Some(&b"two"[..])
+        );
     }
 
     let reopened = WalBackedTablet::open(descriptor(), &path).unwrap();
     assert_eq!(reopened.current_sequence(), 2);
-    assert_eq!(reopened.read_at(b"a", 1).unwrap(), Some(&b"one"[..]));
-    assert_eq!(reopened.read_at(b"b", 2).unwrap(), Some(&b"two"[..]));
+    assert_eq!(
+        reopened.read_at(b"a", 1).unwrap().as_deref(),
+        Some(&b"one"[..])
+    );
+    assert_eq!(
+        reopened.read_at(b"b", 2).unwrap().as_deref(),
+        Some(&b"two"[..])
+    );
 
     let wal = FileWal::open(&path).unwrap();
     assert_eq!(wal.records().len(), 2);
@@ -97,7 +109,7 @@ fn group_commit_prevalidates_the_entire_sequence_before_wal_mutation() {
             })
         );
         assert_eq!(tablet.current_sequence(), 0);
-        assert_eq!(tablet.read_latest(b"a"), None);
+        assert_eq!(tablet.read_latest(b"a").unwrap(), None);
     }
 
     let wal = FileWal::open(&path).unwrap();

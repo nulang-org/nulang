@@ -267,7 +267,7 @@ mod tests {
                 "unexpected recovered sequence after {point:?}"
             );
             assert_eq!(
-                reopened.read_latest(b"k"),
+                reopened.read_latest(b"k").unwrap().as_deref(),
                 (expected_sequence == 1).then_some(&b"v1"[..])
             );
 
@@ -307,8 +307,14 @@ mod tests {
 
             let reopened = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
             assert_eq!(reopened.current_sequence(), 2);
-            assert_eq!(reopened.read_at(b"k", 1).unwrap(), Some(&b"v1"[..]));
-            assert_eq!(reopened.read_at(b"k", 2).unwrap(), Some(&b"v2"[..]));
+            assert_eq!(
+                reopened.read_at(b"k", 1).unwrap().as_deref(),
+                Some(&b"v1"[..])
+            );
+            assert_eq!(
+                reopened.read_at(b"k", 2).unwrap().as_deref(),
+                Some(&b"v2"[..])
+            );
             cleanup(&wal_path);
         }
     }
@@ -347,7 +353,10 @@ mod tests {
 
             let reopened = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
             assert_eq!(reopened.current_sequence(), 1);
-            assert_eq!(reopened.read_latest(b"k"), Some(&b"v1"[..]));
+            assert_eq!(
+                reopened.read_latest(b"k").unwrap().as_deref(),
+                Some(&b"v1"[..])
+            );
             cleanup(&wal_path);
         }
     }
@@ -441,8 +450,14 @@ mod tests {
 
             let mut reopened = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
             assert_eq!(reopened.current_sequence(), 2);
-            assert_eq!(reopened.read_at(b"k", 1).unwrap(), Some(&b"v1"[..]));
-            assert_eq!(reopened.read_at(b"k", 2).unwrap(), Some(&b"v2"[..]));
+            assert_eq!(
+                reopened.read_at(b"k", 1).unwrap().as_deref(),
+                Some(&b"v1"[..])
+            );
+            assert_eq!(
+                reopened.read_at(b"k", 2).unwrap().as_deref(),
+                Some(&b"v2"[..])
+            );
 
             commit_put(&mut reopened, b"v3");
             assert_eq!(reopened.current_sequence(), 3);

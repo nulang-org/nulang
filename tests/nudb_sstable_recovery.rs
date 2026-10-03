@@ -69,7 +69,10 @@ fn manifest_sstable_recovers_when_wal_prefix_has_been_reclaimed() {
 
     let reopened = WalBackedTablet::open(descriptor(), &path).unwrap();
     assert_eq!(reopened.current_sequence(), 1);
-    assert_eq!(reopened.read_latest(b"k"), Some(&b"v1"[..]));
+    assert_eq!(
+        reopened.read_latest(b"k").unwrap().as_deref(),
+        Some(&b"v1"[..])
+    );
     cleanup(&path);
 }
 
@@ -85,8 +88,14 @@ fn sstable_baseline_and_newer_wal_records_compose_without_duplicate_history() {
 
     let reopened = WalBackedTablet::open(descriptor(), &path).unwrap();
     assert_eq!(reopened.current_sequence(), 2);
-    assert_eq!(reopened.read_at(b"k", 1).unwrap(), Some(&b"v1"[..]));
-    assert_eq!(reopened.read_at(b"k", 2).unwrap(), Some(&b"v2"[..]));
+    assert_eq!(
+        reopened.read_at(b"k", 1).unwrap().as_deref(),
+        Some(&b"v1"[..])
+    );
+    assert_eq!(
+        reopened.read_at(b"k", 2).unwrap().as_deref(),
+        Some(&b"v2"[..])
+    );
     cleanup(&path);
 }
 
@@ -125,8 +134,14 @@ fn checkpoint_overlap_uses_only_sstable_versions_newer_than_checkpoint() {
 
     let reopened = WalBackedTablet::open(descriptor(), &path).unwrap();
     assert_eq!(reopened.current_sequence(), 2);
-    assert_eq!(reopened.read_at(b"k", 1).unwrap(), Some(&b"v1"[..]));
-    assert_eq!(reopened.read_at(b"k", 2).unwrap(), Some(&b"v2"[..]));
+    assert_eq!(
+        reopened.read_at(b"k", 1).unwrap().as_deref(),
+        Some(&b"v1"[..])
+    );
+    assert_eq!(
+        reopened.read_at(b"k", 2).unwrap().as_deref(),
+        Some(&b"v2"[..])
+    );
     cleanup(&path);
 }
 
