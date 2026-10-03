@@ -45,10 +45,8 @@ impl NativeModulePlan {
             .map(|(func, plan)| collect_direct_call_sites(func, plan))
             .collect();
 
-        let mut unboxed_int_functions: Vec<bool> = functions
-            .iter()
-            .map(is_local_raw_int_candidate)
-            .collect();
+        let mut unboxed_int_functions: Vec<bool> =
+            functions.iter().map(is_local_raw_int_candidate).collect();
 
         loop {
             let previous = unboxed_int_functions.clone();

@@ -187,7 +187,10 @@ mod tests {
 
     #[test]
     fn typed_internal_values_have_explicit_native_representations() {
-        assert_eq!(NativeValueRepr::for_type(&Type::int()), NativeValueRepr::I64);
+        assert_eq!(
+            NativeValueRepr::for_type(&Type::int()),
+            NativeValueRepr::I64
+        );
         assert_eq!(
             NativeValueRepr::for_type(&Type::float()),
             NativeValueRepr::F64
