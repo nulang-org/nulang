@@ -267,7 +267,7 @@ mod tests {
                 "unexpected recovered sequence after {point:?}"
             );
             assert_eq!(
-                reopened.read_latest(b"k"),
+                reopened.read_latest(b"k").unwrap(),
                 (expected_sequence == 1).then_some(&b"v1"[..])
             );
 
@@ -347,7 +347,7 @@ mod tests {
 
             let reopened = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
             assert_eq!(reopened.current_sequence(), 1);
-            assert_eq!(reopened.read_latest(b"k"), Some(&b"v1"[..]));
+            assert_eq!(reopened.read_latest(b"k").unwrap(), Some(&b"v1"[..]));
             cleanup(&wal_path);
         }
     }
