@@ -72,8 +72,17 @@ impl MirIntrinsic {
     /// constant. Non-integer constants deliberately decline folding rather
     /// than inventing coercion semantics.
     pub fn fold_constants(&self, args: &[Constant]) -> Option<Constant> {
-        let _ = args;
-        todo!("RED: fold MirIntrinsic constants")
+        if args.len() != self.op.arity() {
+            return None;
+        }
+        let ints = args
+            .iter()
+            .map(|arg| match arg {
+                Constant::Int(value) => Some(*value),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        self.op.fold_i64(&ints).map(Constant::Int)
     }
 }
 
@@ -140,13 +149,22 @@ impl IntegerIntrinsic {
     }
 }
 
+/// Lower one raw-i64 intrinsic directly to Cranelift IR.
+///
+/// This function deliberately operates on raw i64 values rather than Nulang's
+/// NaN-tagged runtime representation. Native/AOT callers are responsible for
+/// unboxing integer operands before calling and re-boxing the result when the
+/// surrounding function uses the boxed ABI. Keeping representation handling
+/// outside this primitive gives every native caller the same instruction-level
+/// semantics while avoiding hidden allocations or runtime calls here.
 #[cfg(feature = "native-codegen")]
 pub fn lower_cranelift_i64(
     builder: &mut cranelift_frontend::FunctionBuilder<'_>,
     intrinsic: IntegerIntrinsic,
     args: &[cranelift::prelude::Value],
 ) -> Result<cranelift::prelude::Value, IntrinsicError> {
-    let _ = (builder, args);
+    use cranelift::prelude::InstBuilder as _;
+
     if args.len() != intrinsic.arity() {
         return Err(IntrinsicError::WrongArity {
             intrinsic,
@@ -154,7 +172,16 @@ pub fn lower_cranelift_i64(
             actual: args.len(),
         });
     }
-    todo!("RED: lower integer intrinsic to Cranelift")
+
+    let value = args[0];
+    Ok(match intrinsic {
+        IntegerIntrinsic::Popcount => builder.ins().popcnt(value),
+        IntegerIntrinsic::LeadingZeros => builder.ins().clz(value),
+        IntegerIntrinsic::TrailingZeros => builder.ins().ctz(value),
+        IntegerIntrinsic::RotateLeft => builder.ins().rotl(value, args[1]),
+        IntegerIntrinsic::RotateRight => builder.ins().rotr(value, args[1]),
+        IntegerIntrinsic::ByteSwap => builder.ins().bswap(value),
+    })
 }
 
 #[cfg(test)]
