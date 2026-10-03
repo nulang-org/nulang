@@ -1,4 +1,4 @@
-use super::sstable::{SstableError};
+use super::sstable::SstableError;
 use super::sstable_indexed::{IndexedSstable, IndexedVersion};
 use super::store::{WalBackedError, WalBackedTablet};
 
