@@ -15,13 +15,16 @@ use std::path::{Path, PathBuf};
 
 use super::checkpoint::{self, CheckpointError};
 use super::manifest::{Manifest, ManifestEntry, ManifestError};
-use super::sstable::{self, SstableError};
-use super::tablet::{MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletWrite};
+use super::sstable::{self, Sstable, SstableError};
+use super::tablet::{
+    MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletWrite, VersionedValue,
+};
 use super::wal::{FileWal, WalError};
 
 #[derive(Debug)]
 pub struct WalBackedTablet {
     tablet: MemoryTablet,
+    sstables: Vec<Sstable>,
     wal: FileWal,
     checkpoint_path: PathBuf,
     manifest_path: PathBuf,
@@ -29,7 +32,9 @@ pub struct WalBackedTablet {
 }
 
 impl WalBackedTablet {
-    /// Open a tablet and reconstruct its MVCC state from the valid WAL prefix.
+    /// Open a tablet and reconstruct its MVCC state from durable storage.
+    /// Manifest-referenced SSTables remain serving sources instead of being
+    /// copied back into immutable memtables.
     pub fn open(
         descriptor: TabletDescriptor,
         wal_path: impl AsRef<Path>,
@@ -43,6 +48,7 @@ impl WalBackedTablet {
             .unwrap_or_else(|| MemoryTablet::new(descriptor.clone()));
 
         let manifest = Manifest::load_or_empty(&manifest_path, descriptor.id().get())?;
+        let mut sstables = Vec::with_capacity(manifest.entries().len());
         for entry in manifest.entries() {
             let path = sstable_dir.join(&entry.file_name);
             let table = sstable::Sstable::open(&path)?;
@@ -68,16 +74,19 @@ impl WalBackedTablet {
                     entry.file_name.clone(),
                 ));
             }
+
             if metadata.max_sequence > tablet.current_sequence()
-                && !table.has_contiguous_sequence_coverage_after(tablet.current_sequence())
+                && table.has_contiguous_sequence_coverage_after(tablet.current_sequence())
             {
-                continue;
+                advance_recovered_sequence(&mut tablet, metadata.max_sequence)?;
             }
-            tablet.install_recovered_sstable_rows(table.rows(), metadata.max_sequence)?;
+            sstables.push(table);
         }
+
         wal.replay_after_checkpoint(&mut tablet)?;
         Ok(Self {
             tablet,
+            sstables,
             wal,
             checkpoint_path,
             manifest_path,
@@ -98,7 +107,7 @@ impl WalBackedTablet {
         self.tablet.mutable_memtable_bytes()
     }
 
-    /// Number of frozen in-memory generations awaiting a future flush path.
+    /// Number of frozen in-memory generations that remain resident.
     pub fn immutable_memtable_count(&self) -> usize {
         self.tablet.immutable_memtable_count()
     }
@@ -110,13 +119,13 @@ impl WalBackedTablet {
     }
 
     /// Durably flush the oldest frozen memtable to an immutable SSTable and
-    /// publish a manifest entry. The in-memory generation remains resident and
-    /// the WAL remains unreclaimed until SSTable-backed recovery is promoted.
+    /// publish a manifest entry. Once the manifest is durable and the SSTable
+    /// is installed as a serving source, exactly that frozen generation is
+    /// evicted while newer immutable and mutable state stays resident.
     pub fn flush_oldest_immutable_to_sstable(&mut self) -> Result<bool, WalBackedError> {
-        let rows = self
-            .tablet
-            .oldest_immutable_rows()
-            .ok_or(WalBackedError::NoImmutableMemtable)?;
+        let Some(rows) = self.tablet.oldest_immutable_rows() else {
+            return Ok(false);
+        };
         let min_sequence = rows
             .iter()
             .flat_map(|row| row.versions.iter())
@@ -142,14 +151,6 @@ impl WalBackedTablet {
 
         let mut manifest =
             Manifest::load_or_empty(&self.manifest_path, self.tablet.descriptor().id().get())?;
-        if manifest
-            .entries()
-            .iter()
-            .any(|entry| entry.file_name == file_name)
-        {
-            return Ok(false);
-        }
-
         let path = self.sstable_dir.join(&file_name);
         let expected = sstable::expected_metadata(
             file_name.clone(),
@@ -157,35 +158,57 @@ impl WalBackedTablet {
             self.tablet.descriptor().ownership_epoch(),
             &rows,
         )?;
-        let metadata = if path.exists() {
+
+        if path.exists() {
             let existing = sstable::Sstable::open(&path)?;
             if existing.metadata() != &expected {
                 return Err(WalBackedError::Sstable(SstableError::ExistingFileMismatch(
                     file_name.clone(),
                 )));
             }
-            existing.metadata().clone()
         } else {
             sstable::write_sstable(
                 &path,
                 self.tablet.descriptor().id().get(),
                 self.tablet.descriptor().ownership_epoch(),
                 &rows,
-            )?
-        };
+            )?;
+        }
+
+        let table = sstable::Sstable::open(&path)?;
+        if table.metadata() != &expected {
+            return Err(WalBackedError::Sstable(SstableError::ExistingFileMismatch(
+                file_name.clone(),
+            )));
+        }
+        let metadata = table.metadata().clone();
         let entry = ManifestEntry {
-            file_name: metadata.file_name,
+            file_name: metadata.file_name.clone(),
             tablet_id: metadata.tablet_id,
             ownership_epoch: metadata.ownership_epoch,
             min_sequence: metadata.min_sequence,
             max_sequence: metadata.max_sequence,
             row_count: metadata.row_count,
-            min_key: metadata.min_key,
-            max_key: metadata.max_key,
+            min_key: metadata.min_key.clone(),
+            max_key: metadata.max_key.clone(),
             checksum: metadata.checksum,
         };
         let inserted = manifest.register(entry)?;
-        manifest.publish(&self.manifest_path)?;
+        if inserted {
+            manifest.publish(&self.manifest_path)?;
+        }
+
+        if !self
+            .sstables
+            .iter()
+            .any(|existing| existing.metadata().file_name == metadata.file_name)
+        {
+            self.sstables.push(table);
+        }
+
+        let evicted = self.tablet.pop_oldest_immutable_rows();
+        debug_assert_eq!(evicted.as_deref(), Some(rows.as_slice()));
+
         Ok(inserted)
     }
 
@@ -239,11 +262,29 @@ impl WalBackedTablet {
     }
 
     pub fn read_at(&self, key: &[u8], snapshot: u64) -> Result<Option<&[u8]>, TabletError> {
-        self.tablet.read_at(key, snapshot)
+        let resident_version = self.tablet.visible_version_at(key, snapshot)?;
+        let mut best_sequence = resident_version.map_or(0, |version| version.sequence);
+        let mut best_value = resident_version.and_then(|version| version.value.as_deref());
+        let mut found = resident_version.is_some();
+
+        for table in &self.sstables {
+            let Some(candidate) = sstable_version_at(table, key, snapshot) else {
+                continue;
+            };
+            if !found || candidate.sequence > best_sequence {
+                found = true;
+                best_sequence = candidate.sequence;
+                best_value = candidate.value.as_deref();
+            }
+        }
+
+        Ok(if found { best_value } else { None })
     }
 
     pub fn read_latest(&self, key: &[u8]) -> Option<&[u8]> {
-        self.tablet.read_latest(key)
+        self.read_at(key, self.tablet.current_sequence())
+            .ok()
+            .flatten()
     }
 
     /// Atomically publish a checkpoint without reclaiming the WAL.
@@ -264,6 +305,41 @@ impl WalBackedTablet {
         self.wal.reclaim_through(self.tablet.current_sequence())?;
         Ok(())
     }
+}
+
+fn advance_recovered_sequence(tablet: &mut MemoryTablet, sequence: u64) -> Result<(), TabletError> {
+    if sequence <= tablet.current_sequence() {
+        return Ok(());
+    }
+    let descriptor = tablet.descriptor().clone();
+    let mut state = tablet.snapshot_state();
+    state.current_sequence = sequence;
+    *tablet = MemoryTablet::restore_snapshot(descriptor, state)?;
+    Ok(())
+}
+
+fn sstable_version_at<'a>(
+    table: &'a Sstable,
+    key: &[u8],
+    snapshot: u64,
+) -> Option<&'a VersionedValue> {
+    let metadata = table.metadata();
+    if snapshot < metadata.min_sequence
+        || key < metadata.min_key.as_slice()
+        || key > metadata.max_key.as_slice()
+    {
+        return None;
+    }
+
+    let index = table
+        .rows()
+        .binary_search_by(|row| row.key.as_slice().cmp(key))
+        .ok()?;
+    table.rows()[index]
+        .versions
+        .iter()
+        .rev()
+        .find(|version| version.sequence <= snapshot)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
