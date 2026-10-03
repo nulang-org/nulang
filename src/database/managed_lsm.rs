@@ -7,23 +7,20 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
+use super::sstable::{
+    atomic_write, discover_tables, sync_parent_directory, table_path, visible_version, Sstable,
+    SstableError,
+};
 use super::tablet::{MvccStorage, TabletMutation, VersionedValue};
 
-const SST_MAGIC: &[u8; 8] = b"NUDBSST1";
-const SST_VERSION: u16 = 1;
 const MANIFEST_MAGIC: &[u8; 8] = b"NUDBMAN1";
 const MANIFEST_VERSION: u16 = 1;
 const CHECKSUM_BYTES: usize = 32;
-const MAX_TABLE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
-const MAX_KEY_BYTES: usize = 4 * 1024 * 1024;
-const MAX_VALUE_BYTES: usize = 64 * 1024 * 1024;
-const TABLE_PREFIX: &str = "nudb-sst-";
-const TABLE_SUFFIX: &str = ".sst";
 const MANIFEST_FILE: &str = "MANIFEST";
 
 #[derive(Debug)]
@@ -34,7 +31,7 @@ pub struct ManagedLsmStorage {
     oldest_readable_sequence: u64,
     next_generation: u64,
     mutable: BTreeMap<Vec<u8>, Vec<VersionedValue>>,
-    tables: Vec<ImmutableTable>,
+    tables: Vec<Sstable>,
 }
 
 impl ManagedLsmStorage {
@@ -42,11 +39,11 @@ impl ManagedLsmStorage {
         let directory = directory.as_ref().to_path_buf();
         fs::create_dir_all(&directory).map_err(ManagedLsmError::io)?;
         let manifest_path = directory.join(MANIFEST_FILE);
+        let discovered = discover_tables(&directory).map_err(ManagedLsmError::from)?;
 
         let manifest = if manifest_path.exists() {
             Manifest::load(&manifest_path)?
         } else {
-            let discovered = discover_legacy_tables(&directory)?;
             let manifest = Manifest::from_legacy_tables(&discovered)?;
             manifest.write_atomic(&manifest_path)?;
             manifest
@@ -58,7 +55,7 @@ impl ManagedLsmStorage {
 
         for generation in &manifest.active_generations {
             let path = table_path(&directory, *generation);
-            let table = ImmutableTable::load(&path)?;
+            let table = Sstable::load(&path).map_err(ManagedLsmError::from)?;
             if table.generation != *generation {
                 return Err(ManagedLsmError::CorruptTable {
                     path,
@@ -88,11 +85,15 @@ impl ManagedLsmStorage {
             });
         }
 
-        let next_generation = manifest
-            .active_generations
+        // Generations are never reused, including generations belonging to an
+        // SSTable that was durably written but never published in MANIFEST.
+        let max_disk_generation = discovered
             .last()
-            .copied()
-            .unwrap_or(0)
+            .map(|(generation, _)| *generation)
+            .unwrap_or(0);
+        let max_active_generation = manifest.active_generations.last().copied().unwrap_or(0);
+        let next_generation = max_disk_generation
+            .max(max_active_generation)
             .checked_add(1)
             .ok_or(ManagedLsmError::GenerationOverflow)?;
 
@@ -130,23 +131,15 @@ impl ManagedLsmStorage {
             .checked_add(1)
             .ok_or(ManagedLsmError::SequenceOverflow)?;
         let max_sequence = self.current_sequence;
-        let generation = self.next_generation;
+        let generation = self.fresh_generation()?;
         let following_generation = generation
             .checked_add(1)
             .ok_or(ManagedLsmError::GenerationOverflow)?;
-        let table = ImmutableTable::from_rows(
-            generation,
-            min_sequence,
-            max_sequence,
-            &self.mutable,
-        )?;
+        let table = Sstable::from_rows(generation, min_sequence, max_sequence, &self.mutable)
+            .map_err(ManagedLsmError::from)?;
         let version_count = table.version_count;
         let path = table_path(&self.directory, generation);
-
-        if path.exists() {
-            fs::remove_file(&path).map_err(ManagedLsmError::io)?;
-        }
-        table.write_atomic(&path)?;
+        table.write_atomic(&path).map_err(ManagedLsmError::from)?;
 
         let mut generations: Vec<u64> = self
             .tables
@@ -221,27 +214,26 @@ impl ManagedLsmStorage {
             });
         }
 
-        let generation = self.next_generation;
+        let generation = self.fresh_generation()?;
         let following_generation = generation
             .checked_add(1)
             .ok_or(ManagedLsmError::GenerationOverflow)?;
         let mut rows: BTreeMap<Vec<u8>, Vec<VersionedValue>> = BTreeMap::new();
         for table in &self.tables {
-            for (key, versions) in &table.rows {
-                rows.entry(key.clone())
+            for row in table.rows() {
+                rows.entry(row.key.clone())
                     .or_default()
-                    .extend(versions.iter().cloned());
+                    .extend(row.versions.iter().cloned());
             }
         }
 
         let (versions_removed, keys_removed) = collect_rows(&mut rows, target_safe_point);
-        let replacement =
-            ImmutableTable::from_rows(generation, 1, self.current_sequence, &rows)?;
+        let replacement = Sstable::from_rows(generation, 1, self.current_sequence, &rows)
+            .map_err(ManagedLsmError::from)?;
         let replacement_path = table_path(&self.directory, generation);
-        if replacement_path.exists() {
-            fs::remove_file(&replacement_path).map_err(ManagedLsmError::io)?;
-        }
-        replacement.write_atomic(&replacement_path)?;
+        replacement
+            .write_atomic(&replacement_path)
+            .map_err(ManagedLsmError::from)?;
 
         Manifest {
             oldest_readable_sequence: target_safe_point,
@@ -279,6 +271,83 @@ impl ManagedLsmStorage {
             cleanup_sync_failed,
         })
     }
+
+    /// Read a stable, ordered key range at one retained MVCC snapshot.
+    ///
+    /// `start` is inclusive and `end_exclusive` is optional. Immutable tables
+    /// use their sparse block index to enter the range; newer visible versions
+    /// from later tables or the mutable memtable replace older candidates.
+    pub fn scan_at(
+        &self,
+        start: &[u8],
+        end_exclusive: Option<&[u8]>,
+        snapshot: u64,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ManagedLsmError> {
+        self.validate_snapshot(snapshot)?;
+        if limit == 0 || end_exclusive.map(|end| end <= start).unwrap_or(false) {
+            return Ok(Vec::new());
+        }
+
+        let mut merged: BTreeMap<Vec<u8>, (u64, Option<Vec<u8>>)> = BTreeMap::new();
+        for table in &self.tables {
+            if table.min_sequence > snapshot {
+                break;
+            }
+            for row in table.range_rows(start, end_exclusive) {
+                if let Some(version) = visible_version(&row.versions, snapshot) {
+                    insert_newest(&mut merged, &row.key, version);
+                }
+            }
+        }
+
+        for (key, versions) in &self.mutable {
+            if key.as_slice() < start
+                || end_exclusive
+                    .map(|end| key.as_slice() >= end)
+                    .unwrap_or(false)
+            {
+                continue;
+            }
+            if let Some(version) = visible_version(versions, snapshot) {
+                insert_newest(&mut merged, key, version);
+            }
+        }
+
+        Ok(merged
+            .into_iter()
+            .filter_map(|(key, (_, value))| value.map(|value| (key, value)))
+            .take(limit)
+            .collect())
+    }
+
+    fn validate_snapshot(&self, snapshot: u64) -> Result<(), ManagedLsmError> {
+        if snapshot > self.current_sequence {
+            return Err(ManagedLsmError::SnapshotAhead {
+                committed: self.current_sequence,
+                requested: snapshot,
+            });
+        }
+        if snapshot < self.oldest_readable_sequence {
+            return Err(ManagedLsmError::SnapshotCollected {
+                oldest_readable: self.oldest_readable_sequence,
+                requested: snapshot,
+            });
+        }
+        Ok(())
+    }
+
+    fn fresh_generation(&self) -> Result<u64, ManagedLsmError> {
+        let mut generation = self.next_generation;
+        loop {
+            if !table_path(&self.directory, generation).exists() {
+                return Ok(generation);
+            }
+            generation = generation
+                .checked_add(1)
+                .ok_or(ManagedLsmError::GenerationOverflow)?;
+        }
+    }
 }
 
 impl MvccStorage for ManagedLsmStorage {
@@ -312,7 +381,10 @@ impl MvccStorage for ManagedLsmStorage {
     }
 
     fn read_at(&self, key: &[u8], snapshot: u64) -> Option<&[u8]> {
-        let mut best = visible_version(&self.mutable, key, snapshot);
+        let mut best = self
+            .mutable
+            .get(key)
+            .and_then(|versions| visible_version(versions, snapshot));
         for table in &self.tables {
             if table.min_sequence > snapshot {
                 break;
@@ -327,6 +399,20 @@ impl MvccStorage for ManagedLsmStorage {
             }
         }
         best.and_then(|version| version.value.as_deref())
+    }
+}
+
+fn insert_newest(
+    merged: &mut BTreeMap<Vec<u8>, (u64, Option<Vec<u8>>)>,
+    key: &[u8],
+    version: &VersionedValue,
+) {
+    let replace = merged
+        .get(key)
+        .map(|(sequence, _)| version.sequence > *sequence)
+        .unwrap_or(true);
+    if replace {
+        merged.insert(key.to_vec(), (version.sequence, version.value.clone()));
     }
 }
 
@@ -358,9 +444,7 @@ struct Manifest {
 }
 
 impl Manifest {
-    fn from_legacy_tables(
-        discovered: &[(u64, PathBuf)],
-    ) -> Result<Self, ManagedLsmError> {
+    fn from_legacy_tables(discovered: &[(u64, PathBuf)]) -> Result<Self, ManagedLsmError> {
         let mut expected_generation = 1_u64;
         let mut expected_min_sequence = 1_u64;
         let mut flushed_sequence = 0_u64;
@@ -373,7 +457,7 @@ impl Manifest {
                     presented: *generation,
                 });
             }
-            let table = ImmutableTable::load(path)?;
+            let table = Sstable::load(path).map_err(ManagedLsmError::from)?;
             if table.generation != *generation {
                 return Err(ManagedLsmError::CorruptTable {
                     path: path.clone(),
@@ -445,7 +529,7 @@ impl Manifest {
 
     fn write_atomic(&self, path: &Path) -> Result<(), ManagedLsmError> {
         let encoded = self.encode()?;
-        write_atomic(path, &encoded).map_err(ManagedLsmError::io)
+        atomic_write(path, &encoded).map_err(ManagedLsmError::io)
     }
 
     fn load(path: &Path) -> Result<Self, ManagedLsmError> {
@@ -469,8 +553,7 @@ impl Manifest {
         }
 
         let mut cursor = 0_usize;
-        let magic = take_manifest(data, &mut cursor, MANIFEST_MAGIC.len(), path)?;
-        if magic != MANIFEST_MAGIC {
+        if take_manifest(data, &mut cursor, MANIFEST_MAGIC.len(), path)? != MANIFEST_MAGIC {
             return Err(ManagedLsmError::CorruptManifest {
                 path: path.to_path_buf(),
                 reason: "invalid manifest magic".to_string(),
@@ -490,6 +573,12 @@ impl Manifest {
             path: path.to_path_buf(),
             reason: "active table count does not fit in memory".to_string(),
         })?;
+        if count > data.len() / 8 {
+            return Err(ManagedLsmError::CorruptManifest {
+                path: path.to_path_buf(),
+                reason: "active table count exceeds manifest payload".to_string(),
+            });
+        }
 
         let mut active_generations = Vec::with_capacity(count);
         for _ in 0..count {
@@ -534,250 +623,6 @@ impl Manifest {
     }
 }
 
-#[derive(Debug, Clone)]
-struct ImmutableTable {
-    generation: u64,
-    min_sequence: u64,
-    max_sequence: u64,
-    version_count: usize,
-    rows: BTreeMap<Vec<u8>, Vec<VersionedValue>>,
-}
-
-impl ImmutableTable {
-    fn from_rows(
-        generation: u64,
-        min_sequence: u64,
-        max_sequence: u64,
-        rows: &BTreeMap<Vec<u8>, Vec<VersionedValue>>,
-    ) -> Result<Self, ManagedLsmError> {
-        if generation == 0 || min_sequence == 0 || min_sequence > max_sequence {
-            return Err(ManagedLsmError::CorruptState(
-                "immutable table metadata is invalid".to_string(),
-            ));
-        }
-        let mut version_count = 0_usize;
-        for versions in rows.values() {
-            let mut previous = 0_u64;
-            for version in versions {
-                if version.sequence < min_sequence
-                    || version.sequence > max_sequence
-                    || version.sequence <= previous
-                {
-                    return Err(ManagedLsmError::CorruptState(
-                        "table rows contain invalid MVCC sequence history".to_string(),
-                    ));
-                }
-                previous = version.sequence;
-                version_count = version_count
-                    .checked_add(1)
-                    .ok_or(ManagedLsmError::TableTooLarge(usize::MAX))?;
-            }
-        }
-        Ok(Self {
-            generation,
-            min_sequence,
-            max_sequence,
-            version_count,
-            rows: rows.clone(),
-        })
-    }
-
-    fn visible_version(&self, key: &[u8], snapshot: u64) -> Option<&VersionedValue> {
-        visible_version(&self.rows, key, snapshot)
-    }
-
-    fn write_atomic(&self, path: &Path) -> Result<(), ManagedLsmError> {
-        let encoded = self.encode()?;
-        write_atomic(path, &encoded).map_err(ManagedLsmError::io)
-    }
-
-    fn encode(&self) -> Result<Vec<u8>, ManagedLsmError> {
-        let key_count = u64::try_from(self.rows.len())
-            .map_err(|_| ManagedLsmError::TableTooLarge(self.rows.len()))?;
-        let version_count = u64::try_from(self.version_count)
-            .map_err(|_| ManagedLsmError::TableTooLarge(self.version_count))?;
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(SST_MAGIC);
-        bytes.extend_from_slice(&SST_VERSION.to_le_bytes());
-        bytes.extend_from_slice(&self.generation.to_le_bytes());
-        bytes.extend_from_slice(&self.min_sequence.to_le_bytes());
-        bytes.extend_from_slice(&self.max_sequence.to_le_bytes());
-        bytes.extend_from_slice(&key_count.to_le_bytes());
-        bytes.extend_from_slice(&version_count.to_le_bytes());
-
-        for (key, versions) in &self.rows {
-            if key.len() > MAX_KEY_BYTES {
-                return Err(ManagedLsmError::KeyTooLarge(key.len()));
-            }
-            let key_len = u32::try_from(key.len())
-                .map_err(|_| ManagedLsmError::KeyTooLarge(key.len()))?;
-            let versions_len = u32::try_from(versions.len())
-                .map_err(|_| ManagedLsmError::TableTooLarge(versions.len()))?;
-            bytes.extend_from_slice(&key_len.to_le_bytes());
-            bytes.extend_from_slice(key);
-            bytes.extend_from_slice(&versions_len.to_le_bytes());
-            for version in versions {
-                bytes.extend_from_slice(&version.sequence.to_le_bytes());
-                match &version.value {
-                    None => bytes.push(0),
-                    Some(value) => {
-                        if value.len() > MAX_VALUE_BYTES {
-                            return Err(ManagedLsmError::ValueTooLarge(value.len()));
-                        }
-                        let value_len = u32::try_from(value.len())
-                            .map_err(|_| ManagedLsmError::ValueTooLarge(value.len()))?;
-                        bytes.push(1);
-                        bytes.extend_from_slice(&value_len.to_le_bytes());
-                        bytes.extend_from_slice(value);
-                    }
-                }
-            }
-        }
-
-        if bytes.len().saturating_add(CHECKSUM_BYTES) > MAX_TABLE_BYTES {
-            return Err(ManagedLsmError::TableTooLarge(
-                bytes.len() + CHECKSUM_BYTES,
-            ));
-        }
-        let checksum = blake3::hash(&bytes);
-        bytes.extend_from_slice(checksum.as_bytes());
-        Ok(bytes)
-    }
-
-    fn load(path: &Path) -> Result<Self, ManagedLsmError> {
-        let bytes = fs::read(path).map_err(ManagedLsmError::io)?;
-        if bytes.len() > MAX_TABLE_BYTES {
-            return Err(ManagedLsmError::TableTooLarge(bytes.len()));
-        }
-        if bytes.len() < SST_MAGIC.len() + 2 + (5 * 8) + CHECKSUM_BYTES {
-            return Err(ManagedLsmError::CorruptTable {
-                path: path.to_path_buf(),
-                reason: "table is shorter than the fixed header".to_string(),
-            });
-        }
-        let checksum_start = bytes.len() - CHECKSUM_BYTES;
-        let (data, stored_checksum) = bytes.split_at(checksum_start);
-        if stored_checksum != blake3::hash(data).as_bytes() {
-            return Err(ManagedLsmError::ChecksumMismatch {
-                path: path.to_path_buf(),
-            });
-        }
-
-        let mut cursor = 0_usize;
-        if take_table(data, &mut cursor, SST_MAGIC.len(), path)? != SST_MAGIC {
-            return Err(ManagedLsmError::CorruptTable {
-                path: path.to_path_buf(),
-                reason: "invalid immutable-table magic".to_string(),
-            });
-        }
-        let version = read_table_u16(data, &mut cursor, path)?;
-        if version != SST_VERSION {
-            return Err(ManagedLsmError::UnsupportedVersion {
-                path: path.to_path_buf(),
-                version,
-            });
-        }
-        let generation = read_table_u64(data, &mut cursor, path)?;
-        let min_sequence = read_table_u64(data, &mut cursor, path)?;
-        let max_sequence = read_table_u64(data, &mut cursor, path)?;
-        let key_count = read_table_u64(data, &mut cursor, path)?;
-        let declared_version_count = read_table_u64(data, &mut cursor, path)?;
-        if generation == 0 || min_sequence == 0 || min_sequence > max_sequence {
-            return Err(ManagedLsmError::CorruptTable {
-                path: path.to_path_buf(),
-                reason: "invalid immutable-table metadata".to_string(),
-            });
-        }
-
-        let key_count = usize::try_from(key_count).map_err(|_| ManagedLsmError::CorruptTable {
-            path: path.to_path_buf(),
-            reason: "key count does not fit in memory".to_string(),
-        })?;
-        let declared_version_count = usize::try_from(declared_version_count).map_err(|_| {
-            ManagedLsmError::CorruptTable {
-                path: path.to_path_buf(),
-                reason: "version count does not fit in memory".to_string(),
-            }
-        })?;
-        let mut rows = BTreeMap::new();
-        let mut actual_version_count = 0_usize;
-
-        for _ in 0..key_count {
-            let key_len = read_table_u32(data, &mut cursor, path)? as usize;
-            if key_len > MAX_KEY_BYTES {
-                return Err(ManagedLsmError::CorruptTable {
-                    path: path.to_path_buf(),
-                    reason: "key exceeds immutable-table limit".to_string(),
-                });
-            }
-            let key = take_table(data, &mut cursor, key_len, path)?.to_vec();
-            let version_count = read_table_u32(data, &mut cursor, path)? as usize;
-            if version_count == 0 {
-                return Err(ManagedLsmError::CorruptTable {
-                    path: path.to_path_buf(),
-                    reason: "row contains no versions".to_string(),
-                });
-            }
-            let mut versions = Vec::with_capacity(version_count);
-            let mut previous = 0_u64;
-            for _ in 0..version_count {
-                let sequence = read_table_u64(data, &mut cursor, path)?;
-                if sequence < min_sequence || sequence > max_sequence || sequence <= previous {
-                    return Err(ManagedLsmError::CorruptTable {
-                        path: path.to_path_buf(),
-                        reason: "row contains invalid MVCC sequence history".to_string(),
-                    });
-                }
-                previous = sequence;
-                let tag = take_table(data, &mut cursor, 1, path)?[0];
-                let value = match tag {
-                    0 => None,
-                    1 => {
-                        let value_len = read_table_u32(data, &mut cursor, path)? as usize;
-                        if value_len > MAX_VALUE_BYTES {
-                            return Err(ManagedLsmError::CorruptTable {
-                                path: path.to_path_buf(),
-                                reason: "value exceeds immutable-table limit".to_string(),
-                            });
-                        }
-                        Some(take_table(data, &mut cursor, value_len, path)?.to_vec())
-                    }
-                    _ => {
-                        return Err(ManagedLsmError::CorruptTable {
-                            path: path.to_path_buf(),
-                            reason: "invalid value tag".to_string(),
-                        });
-                    }
-                };
-                versions.push(VersionedValue { sequence, value });
-                actual_version_count = actual_version_count
-                    .checked_add(1)
-                    .ok_or(ManagedLsmError::TableTooLarge(usize::MAX))?;
-            }
-            if rows.insert(key, versions).is_some() {
-                return Err(ManagedLsmError::CorruptTable {
-                    path: path.to_path_buf(),
-                    reason: "duplicate key in immutable table".to_string(),
-                });
-            }
-        }
-        if cursor != data.len() || actual_version_count != declared_version_count {
-            return Err(ManagedLsmError::CorruptTable {
-                path: path.to_path_buf(),
-                reason: "immutable-table payload/count mismatch".to_string(),
-            });
-        }
-
-        Ok(Self {
-            generation,
-            min_sequence,
-            max_sequence,
-            version_count: actual_version_count,
-            rows,
-        })
-    }
-}
-
 fn collect_rows(
     rows: &mut BTreeMap<Vec<u8>, Vec<VersionedValue>>,
     safe_point: u64,
@@ -808,38 +653,6 @@ fn collect_rows(
     (versions_removed, keys_removed)
 }
 
-fn visible_version<'a>(
-    rows: &'a BTreeMap<Vec<u8>, Vec<VersionedValue>>,
-    key: &[u8],
-    snapshot: u64,
-) -> Option<&'a VersionedValue> {
-    let versions = rows.get(key)?;
-    let visible = versions.partition_point(|version| version.sequence <= snapshot);
-    visible.checked_sub(1).map(|index| &versions[index])
-}
-
-fn discover_legacy_tables(
-    directory: &Path,
-) -> Result<Vec<(u64, PathBuf)>, ManagedLsmError> {
-    let mut discovered = Vec::new();
-    for entry in fs::read_dir(directory).map_err(ManagedLsmError::io)? {
-        let entry = entry.map_err(ManagedLsmError::io)?;
-        if !entry.file_type().map_err(ManagedLsmError::io)?.is_file() {
-            continue;
-        }
-        let file_name = entry.file_name();
-        let Some(file_name) = file_name.to_str() else {
-            continue;
-        };
-        let Some(generation) = parse_generation(file_name) else {
-            continue;
-        };
-        discovered.push((generation, entry.path()));
-    }
-    discovered.sort_by_key(|(generation, _)| *generation);
-    Ok(discovered)
-}
-
 fn validate_generations(generations: &[u64]) -> Result<(), String> {
     let mut previous = 0_u64;
     for generation in generations {
@@ -853,105 +666,26 @@ fn validate_generations(generations: &[u64]) -> Result<(), String> {
     Ok(())
 }
 
-fn table_path(directory: &Path, generation: u64) -> PathBuf {
-    directory.join(format!("{TABLE_PREFIX}{generation:020}{TABLE_SUFFIX}"))
-}
-
-fn parse_generation(file_name: &str) -> Option<u64> {
-    let generation = file_name
-        .strip_prefix(TABLE_PREFIX)?
-        .strip_suffix(TABLE_SUFFIX)?;
-    if generation.len() != 20 || !generation.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    generation.parse().ok()
-}
-
-fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut temp = path.as_os_str().to_os_string();
-    temp.push(".tmp");
-    let temp = PathBuf::from(temp);
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&temp)?;
-    file.write_all(bytes)?;
-    file.sync_data()?;
-    drop(file);
-    fs::rename(&temp, path)?;
-    sync_parent_directory(path)
-}
-
-fn sync_parent_directory(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        let parent = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        File::open(parent)?.sync_all()?;
-    }
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
-}
-
-fn take_table<'a>(
-    bytes: &'a [u8],
-    cursor: &mut usize,
-    len: usize,
-    path: &Path,
-) -> Result<&'a [u8], ManagedLsmError> {
-    take_checked(bytes, cursor, len).ok_or_else(|| ManagedLsmError::CorruptTable {
-        path: path.to_path_buf(),
-        reason: "immutable table ended unexpectedly".to_string(),
-    })
-}
-
-fn read_table_u16(
-    bytes: &[u8],
-    cursor: &mut usize,
-    path: &Path,
-) -> Result<u16, ManagedLsmError> {
-    let raw: [u8; 2] = take_table(bytes, cursor, 2, path)?
-        .try_into()
-        .expect("fixed width");
-    Ok(u16::from_le_bytes(raw))
-}
-
-fn read_table_u32(
-    bytes: &[u8],
-    cursor: &mut usize,
-    path: &Path,
-) -> Result<u32, ManagedLsmError> {
-    let raw: [u8; 4] = take_table(bytes, cursor, 4, path)?
-        .try_into()
-        .expect("fixed width");
-    Ok(u32::from_le_bytes(raw))
-}
-
-fn read_table_u64(
-    bytes: &[u8],
-    cursor: &mut usize,
-    path: &Path,
-) -> Result<u64, ManagedLsmError> {
-    let raw: [u8; 8] = take_table(bytes, cursor, 8, path)?
-        .try_into()
-        .expect("fixed width");
-    Ok(u64::from_le_bytes(raw))
-}
-
 fn take_manifest<'a>(
     bytes: &'a [u8],
     cursor: &mut usize,
     len: usize,
     path: &Path,
 ) -> Result<&'a [u8], ManagedLsmError> {
-    take_checked(bytes, cursor, len).ok_or_else(|| ManagedLsmError::CorruptManifest {
-        path: path.to_path_buf(),
-        reason: "manifest ended unexpectedly".to_string(),
-    })
+    let end = cursor
+        .checked_add(len)
+        .ok_or_else(|| ManagedLsmError::CorruptManifest {
+            path: path.to_path_buf(),
+            reason: "manifest offset overflow".to_string(),
+        })?;
+    let slice = bytes
+        .get(*cursor..end)
+        .ok_or_else(|| ManagedLsmError::CorruptManifest {
+            path: path.to_path_buf(),
+            reason: "manifest ended unexpectedly".to_string(),
+        })?;
+    *cursor = end;
+    Ok(slice)
 }
 
 fn read_manifest_u16(
@@ -961,7 +695,7 @@ fn read_manifest_u16(
 ) -> Result<u16, ManagedLsmError> {
     let raw: [u8; 2] = take_manifest(bytes, cursor, 2, path)?
         .try_into()
-        .expect("fixed width");
+        .expect("fixed-width read");
     Ok(u16::from_le_bytes(raw))
 }
 
@@ -972,15 +706,8 @@ fn read_manifest_u64(
 ) -> Result<u64, ManagedLsmError> {
     let raw: [u8; 8] = take_manifest(bytes, cursor, 8, path)?
         .try_into()
-        .expect("fixed width");
+        .expect("fixed-width read");
     Ok(u64::from_le_bytes(raw))
-}
-
-fn take_checked<'a>(bytes: &'a [u8], cursor: &mut usize, len: usize) -> Option<&'a [u8]> {
-    let end = cursor.checked_add(len)?;
-    let slice = bytes.get(*cursor..end)?;
-    *cursor = end;
-    Some(slice)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1025,6 +752,14 @@ pub enum ManagedLsmError {
         current_sequence: u64,
         safe_point: u64,
     },
+    SnapshotAhead {
+        committed: u64,
+        requested: u64,
+    },
+    SnapshotCollected {
+        oldest_readable: u64,
+        requested: u64,
+    },
     UnflushedStateForCompaction {
         current_sequence: u64,
         flushed_sequence: u64,
@@ -1041,6 +776,23 @@ impl ManagedLsmError {
         Self::Io {
             kind: error.kind(),
             message: error.to_string(),
+        }
+    }
+}
+
+impl From<SstableError> for ManagedLsmError {
+    fn from(error: SstableError) -> Self {
+        match error {
+            SstableError::Io { kind, message } => Self::Io { kind, message },
+            SstableError::ChecksumMismatch { path } => Self::ChecksumMismatch { path },
+            SstableError::CorruptTable { path, reason } => Self::CorruptTable { path, reason },
+            SstableError::UnsupportedVersion { path, version } => {
+                Self::UnsupportedVersion { path, version }
+            }
+            SstableError::KeyTooLarge(size) => Self::KeyTooLarge(size),
+            SstableError::ValueTooLarge(size) => Self::ValueTooLarge(size),
+            SstableError::TableTooLarge(size) => Self::TableTooLarge(size),
+            SstableError::CorruptState(reason) => Self::CorruptState(reason),
         }
     }
 }
@@ -1093,6 +845,20 @@ impl fmt::Display for ManagedLsmError {
             } => write!(
                 f,
                 "compaction safe point {safe_point} is ahead of committed sequence {current_sequence}"
+            ),
+            Self::SnapshotAhead {
+                committed,
+                requested,
+            } => write!(
+                f,
+                "snapshot {requested} is ahead of committed sequence {committed}"
+            ),
+            Self::SnapshotCollected {
+                oldest_readable,
+                requested,
+            } => write!(
+                f,
+                "snapshot {requested} is older than retained sequence {oldest_readable}"
             ),
             Self::UnflushedStateForCompaction {
                 current_sequence,
