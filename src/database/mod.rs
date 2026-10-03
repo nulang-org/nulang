@@ -17,4 +17,6 @@ pub mod wal_batch;
 #[cfg(test)]
 mod interruption;
 #[cfg(test)]
+mod sstable_indexed_tests;
+#[cfg(test)]
 mod sstable_mmap_tests;
