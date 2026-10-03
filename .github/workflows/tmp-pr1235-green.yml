@@ -1,0 +1,116 @@
+name: Temporary PR1235 GREEN validation
+
+on:
+  push:
+    branches:
+      - tmp/pr1235-green-20261002
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-commit:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Confirm regressions are RED before the fix
+        shell: bash
+        run: |
+          set +e
+          cargo test --locked --test distributed_runtime_spawn_trait -- --nocapture 2>&1 | tee /tmp/pr1235-red.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "expected the regression suite to fail before the production fix"
+            exit 1
+          fi
+          grep -Fq "the trait must return the id of a real local actor" /tmp/pr1235-red.log
+          grep -Fq "the trait must preserve the supplied initial state" /tmp/pr1235-red.log
+          grep -Fq "the local trait path must install and execute the requested spawnable behavior" /tmp/pr1235-red.log
+
+      - name: Apply exact local-spawn fix
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path("src/runtime/distributed.rs")
+          source = path.read_text()
+          old = '''    fn spawn_on_node(
+              &mut self,
+              _transport: &mut dyn NetworkTransport,
+              node: NodeId,
+              _behavior_name: &str,
+              _initial_state: Vec<(String, Value)>,
+          ) -> ActorAddress {
+              // The trait method doesn't receive cluster/resolver, so we can
+              // only handle local spawns here. For remote spawns, use the
+              // `spawn_on_node` free function which takes all components.
+              if node == NodeId::LOCAL {
+                  // Local spawn would need the behavior_name and initial_state.
+                  // This is a limitation of the trait API — use the free function.
+                  ActorAddress::local(0)
+              } else {
+                  // Cannot determine if node is local without resolver.
+                  // Return a placeholder; callers should use the free function.
+                  ActorAddress::remote(node, 0)
+              }
+          }
+          '''
+          new = '''    fn spawn_on_node(
+              &mut self,
+              _transport: &mut dyn NetworkTransport,
+              node: NodeId,
+              behavior_name: &str,
+              initial_state: Vec<(String, Value)>,
+          ) -> ActorAddress {
+              // This trait method has enough context for a real local spawn. Remote
+              // spawn still requires the free function's cluster/resolver inputs.
+              if node == NodeId::LOCAL {
+                  let handler = self
+                      .runtime
+                      .spawnable_behaviors
+                      .get(behavior_name)
+                      .copied();
+                  let id = self
+                      .runtime
+                      .spawn_actor(Box::new(move || initial_state));
+                  if let Some(handler) = handler {
+                      if let Some(actor) = self.runtime.actors.get_mut(&id) {
+                          actor.register_behavior(behavior_name.to_string(), handler);
+                      }
+                  }
+                  ActorAddress::local(id)
+              } else {
+                  // Remote failure/placeholder semantics are tracked separately in #1238.
+                  ActorAddress::remote(node, 0)
+              }
+          }
+          '''
+          count = source.count(old)
+          if count != 1:
+              raise SystemExit(f"expected exactly one trait spawn_on_node body, found {count}")
+          path.write_text(source.replace(old, new, 1))
+
+      - name: Focused regressions are GREEN
+        run: cargo test --locked --test distributed_runtime_spawn_trait -- --nocapture
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: No-default-features check
+        run: cargo check --locked --no-default-features
+
+      - name: Commit validated production patch and remove validator
+        shell: bash
+        run: |
+          rm .github/workflows/tmp-pr1235-green.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/runtime/distributed.rs .github/workflows/tmp-pr1235-green.yml
+          git diff --cached --check
+          git commit -m "fix(runtime): make local distributed trait spawn real actors"
+          git push origin HEAD:tmp/pr1235-green-20261002
