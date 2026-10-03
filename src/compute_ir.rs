@@ -321,7 +321,7 @@ pub enum ReductionOp {
 }
 
 /// Backend-independent compute and scheduling operations.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComputeOp {
     ParallelFor {
         loop_id: LoopId,
