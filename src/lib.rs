@@ -46,6 +46,12 @@ pub mod durable_effect_persistence;
 pub mod durable_effect_runtime;
 pub mod effect_checker;
 pub mod ffi;
+#[path = "runtime/fabric_metadata.rs"]
+pub(crate) mod fabric_metadata;
+#[path = "runtime/fabric_subscription_metadata.rs"]
+pub(crate) mod fabric_subscription_metadata;
+#[path = "runtime/fabric_subscription_snapshot.rs"]
+pub(crate) mod fabric_subscription_snapshot;
 pub mod fmt;
 pub mod format;
 #[cfg(feature = "native-codegen")]
