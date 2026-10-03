@@ -18,12 +18,16 @@ pub struct CraneliftOptimizationSettings {
 }
 
 impl NativeOptimizationProfile {
-    /// RED phase: tests below specify the profile contract.
     pub const fn cranelift_settings(self) -> CraneliftOptimizationSettings {
-        let _ = self;
-        CraneliftOptimizationSettings {
-            opt_level: "speed",
-            regalloc_algorithm: "backtracking",
+        match self {
+            Self::Fast => CraneliftOptimizationSettings {
+                opt_level: "none",
+                regalloc_algorithm: "single_pass",
+            },
+            Self::Optimized => CraneliftOptimizationSettings {
+                opt_level: "speed",
+                regalloc_algorithm: "backtracking",
+            },
         }
     }
 }
