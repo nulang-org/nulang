@@ -1,0 +1,35 @@
+name: Temporary NuDB manifest-v2 store compatibility fix
+
+on:
+  push:
+    branches:
+      - feat/nudb-manifest-v2-format-contract
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/nudb-manifest-v2-format-contract
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Apply compatibility patch
+        run: python .github/scripts/nudb_manifest_v2_store_fix.py
+      - name: Format
+        run: cargo fmt --all
+      - name: Compile affected gate
+        run: cargo test --locked --no-default-features --test nudb_wal_batch --no-run
+      - name: Commit fix
+        run: |
+          rm .github/scripts/nudb_manifest_v2_store_fix.py
+          rm .github/workflows/nudb-manifest-v2-store-fix-temp.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A src/database/store.rs .github/scripts/nudb_manifest_v2_store_fix.py .github/workflows/nudb-manifest-v2-store-fix-temp.yml
+          git commit -m "fix(database): bridge v1 serving to manifest v2"
+          git push origin HEAD:feat/nudb-manifest-v2-format-contract
