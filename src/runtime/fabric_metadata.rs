@@ -54,7 +54,9 @@ pub enum MetadataAssemblyError {
     ConflictingSnapshot,
     ConflictingChunk,
     TooManyChunks,
+    TooManyInflightSnapshots,
     SnapshotTooLarge,
+    InflightBytesExceeded,
     SnapshotHashMismatch,
 }
 
@@ -117,16 +119,18 @@ struct InflightSnapshot {
     snapshot_hash: [u8; 32],
     chunk_count: u32,
     bytes: usize,
+    last_activity_tick: u64,
     chunks: BTreeMap<u32, Vec<u8>>,
 }
 
 impl InflightSnapshot {
-    fn from_chunk(chunk: &FabricMetadataChunk) -> Self {
+    fn from_chunk(chunk: &FabricMetadataChunk, activity_tick: u64) -> Self {
         Self {
             generation: chunk.generation,
             snapshot_hash: chunk.snapshot_hash,
             chunk_count: chunk.chunk_count,
             bytes: 0,
+            last_activity_tick: activity_tick,
             chunks: BTreeMap::new(),
         }
     }
@@ -137,21 +141,55 @@ impl InflightSnapshot {
 /// At most one incomplete generation is retained for each `(kind, owner)`.
 /// Receiving a newer generation atomically abandons the older incomplete one;
 /// receiving an older/equal completed generation is rejected as stale.
+/// Global count/byte budgets bound abandoned or adversarial incomplete state.
 #[derive(Debug)]
 pub struct FabricMetadataAssembler {
     max_snapshot_bytes: usize,
     max_chunks: u32,
+    max_inflight_snapshots: usize,
+    max_inflight_bytes: usize,
+    inflight_bytes: usize,
     inflight: HashMap<(FabricMetadataKind, u64), InflightSnapshot>,
     latest_generation: HashMap<(FabricMetadataKind, u64), u64>,
 }
 
 impl FabricMetadataAssembler {
+    /// Convenience constructor with conservative process-local aggregate bounds.
+    /// Runtime integration should prefer [`Self::with_limits`] so the limits are
+    /// explicit configuration rather than implicit policy.
     pub fn new(max_snapshot_bytes: usize, max_chunks: u32) -> Self {
-        assert!(max_snapshot_bytes > 0, "Fabric metadata snapshot bound must be non-zero");
-        assert!(max_chunks > 0, "Fabric metadata chunk bound must be non-zero");
+        let max_inflight_bytes = max_snapshot_bytes.saturating_mul(8);
+        Self::with_limits(max_snapshot_bytes, max_chunks, 64, max_inflight_bytes)
+    }
+
+    pub fn with_limits(
+        max_snapshot_bytes: usize,
+        max_chunks: u32,
+        max_inflight_snapshots: usize,
+        max_inflight_bytes: usize,
+    ) -> Self {
+        assert!(
+            max_snapshot_bytes > 0,
+            "Fabric metadata snapshot bound must be non-zero"
+        );
+        assert!(
+            max_chunks > 0,
+            "Fabric metadata chunk bound must be non-zero"
+        );
+        assert!(
+            max_inflight_snapshots > 0,
+            "Fabric metadata in-flight snapshot bound must be non-zero"
+        );
+        assert!(
+            max_inflight_bytes > 0,
+            "Fabric metadata in-flight byte bound must be non-zero"
+        );
         Self {
             max_snapshot_bytes,
             max_chunks,
+            max_inflight_snapshots,
+            max_inflight_bytes,
+            inflight_bytes: 0,
             inflight: HashMap::new(),
             latest_generation: HashMap::new(),
         }
@@ -165,22 +203,68 @@ impl FabricMetadataAssembler {
         self.inflight.len()
     }
 
+    pub fn inflight_bytes(&self) -> usize {
+        self.inflight_bytes
+    }
+
     /// Drop all incomplete and completed-generation tracking for one owner.
     ///
     /// This is intended for the same confirmed-node-removal boundary that
     /// clears Fabric's remote routing generation, allowing a genuine restart
     /// with the same stable node id to begin a fresh generation sequence.
     pub fn discard_owner(&mut self, owner: u64) {
-        self.inflight.retain(|(_, key_owner), _| *key_owner != owner);
+        let keys: Vec<_> = self
+            .inflight
+            .keys()
+            .filter(|(_, key_owner)| *key_owner == owner)
+            .copied()
+            .collect();
+        for key in keys {
+            self.remove_inflight(key);
+        }
         self.latest_generation
             .retain(|(_, key_owner), _| *key_owner != owner);
     }
 
-    /// Add one chunk. Returns a verified snapshot only when the generation is
-    /// complete; partial generations are never surfaced.
+    /// Deterministically drop incomplete snapshots whose last accepted chunk
+    /// activity is older than `cutoff_tick`.
+    ///
+    /// The caller owns the time domain. Runtime integration can pass its
+    /// virtual/logical clock, keeping DST behavior deterministic and avoiding
+    /// wall-clock reads inside this primitive.
+    pub fn prune_inflight_before(&mut self, cutoff_tick: u64) -> usize {
+        let keys: Vec<_> = self
+            .inflight
+            .iter()
+            .filter_map(|(key, state)| {
+                (state.last_activity_tick < cutoff_tick).then_some(*key)
+            })
+            .collect();
+        let removed = keys.len();
+        for key in keys {
+            self.remove_inflight(key);
+        }
+        removed
+    }
+
+    /// Add one chunk without caller-supplied logical time.
+    ///
+    /// This is suitable when expiration is not used. Runtime paths that prune
+    /// abandoned assemblies should call [`Self::push_at`] instead.
     pub fn push(
         &mut self,
         chunk: FabricMetadataChunk,
+    ) -> Result<Option<FabricMetadataSnapshot>, MetadataAssemblyError> {
+        self.push_at(chunk, 0)
+    }
+
+    /// Add one chunk at the caller's deterministic logical time. Returns a
+    /// verified snapshot only when the generation is complete; partial
+    /// generations are never surfaced.
+    pub fn push_at(
+        &mut self,
+        chunk: FabricMetadataChunk,
+        activity_tick: u64,
     ) -> Result<Option<FabricMetadataSnapshot>, MetadataAssemblyError> {
         if chunk.generation == 0
             || chunk.chunk_count == 0
@@ -206,74 +290,117 @@ impl FabricMetadataAssembler {
             return Err(MetadataAssemblyError::StaleGeneration);
         }
 
-        match self.inflight.get(&key) {
-            Some(current) if chunk.generation < current.generation => {
+        if let Some(current) = self.inflight.get(&key) {
+            if chunk.generation < current.generation {
                 return Err(MetadataAssemblyError::StaleGeneration);
             }
-            Some(current) if chunk.generation == current.generation => {
-                if current.snapshot_hash != chunk.snapshot_hash
-                    || current.chunk_count != chunk.chunk_count
-                {
-                    self.inflight.remove(&key);
-                    return Err(MetadataAssemblyError::ConflictingSnapshot);
+            if chunk.generation == current.generation
+                && (current.snapshot_hash != chunk.snapshot_hash
+                    || current.chunk_count != chunk.chunk_count)
+            {
+                self.remove_inflight(key);
+                return Err(MetadataAssemblyError::ConflictingSnapshot);
+            }
+            if chunk.generation > current.generation {
+                self.remove_inflight(key);
+            }
+        }
+
+        if !self.inflight.contains_key(&key) {
+            if self.inflight.len() >= self.max_inflight_snapshots {
+                return Err(MetadataAssemblyError::TooManyInflightSnapshots);
+            }
+            self.inflight
+                .insert(key, InflightSnapshot::from_chunk(&chunk, activity_tick));
+        }
+
+        if let Some(existing) = self
+            .inflight
+            .get(&key)
+            .and_then(|state| state.chunks.get(&chunk.chunk_index))
+        {
+            if existing == &chunk.payload {
+                if let Some(state) = self.inflight.get_mut(&key) {
+                    state.last_activity_tick = activity_tick;
                 }
+                return Ok(None);
             }
-            Some(_) => {
-                // A newer generation supersedes the incomplete old generation.
-                self.inflight.remove(&key);
+            self.remove_inflight(key);
+            return Err(MetadataAssemblyError::ConflictingChunk);
+        }
+
+        let state_bytes = self
+            .inflight
+            .get(&key)
+            .expect("Fabric metadata state must exist before chunk insertion")
+            .bytes;
+        let next_state_bytes = state_bytes
+            .checked_add(chunk.payload.len())
+            .ok_or(MetadataAssemblyError::SnapshotTooLarge)?;
+        if next_state_bytes > self.max_snapshot_bytes {
+            self.remove_inflight(key);
+            return Err(MetadataAssemblyError::SnapshotTooLarge);
+        }
+
+        let next_inflight_bytes = self
+            .inflight_bytes
+            .checked_add(chunk.payload.len())
+            .ok_or(MetadataAssemblyError::InflightBytesExceeded)?;
+        if next_inflight_bytes > self.max_inflight_bytes {
+            // If this generation had no accepted chunks yet, don't retain an
+            // empty shell that would consume the in-flight snapshot budget.
+            if state_bytes == 0 {
+                self.remove_inflight(key);
             }
-            None => {}
+            return Err(MetadataAssemblyError::InflightBytesExceeded);
+        }
+
+        let complete = {
+            let state = self
+                .inflight
+                .get_mut(&key)
+                .expect("Fabric metadata state must exist before chunk insertion");
+            state.bytes = next_state_bytes;
+            state.last_activity_tick = activity_tick;
+            state.chunks.insert(chunk.chunk_index, chunk.payload);
+            state.chunks.len() == state.chunk_count as usize
+        };
+        self.inflight_bytes = next_inflight_bytes;
+
+        if !complete {
+            return Ok(None);
         }
 
         let state = self
             .inflight
-            .entry(key)
-            .or_insert_with(|| InflightSnapshot::from_chunk(&chunk));
-
-        if let Some(existing) = state.chunks.get(&chunk.chunk_index) {
-            if existing == &chunk.payload {
-                return Ok(None);
-            }
-            self.inflight.remove(&key);
-            return Err(MetadataAssemblyError::ConflictingChunk);
-        }
-
-        let next_bytes = state
-            .bytes
-            .checked_add(chunk.payload.len())
-            .ok_or(MetadataAssemblyError::SnapshotTooLarge)?;
-        if next_bytes > self.max_snapshot_bytes {
-            self.inflight.remove(&key);
-            return Err(MetadataAssemblyError::SnapshotTooLarge);
-        }
-        state.bytes = next_bytes;
-        state.chunks.insert(chunk.chunk_index, chunk.payload);
-
-        if state.chunks.len() != state.chunk_count as usize {
-            return Ok(None);
-        }
+            .remove(&key)
+            .expect("complete Fabric metadata state must exist");
+        self.inflight_bytes = self.inflight_bytes.saturating_sub(state.bytes);
 
         let mut payload = Vec::with_capacity(state.bytes);
         for index in 0..state.chunk_count {
             let Some(bytes) = state.chunks.get(&index) else {
-                return Ok(None);
+                return Err(MetadataAssemblyError::InvalidChunk);
             };
             payload.extend_from_slice(bytes);
         }
 
-        let expected_hash = state.snapshot_hash;
-        let generation = state.generation;
-        self.inflight.remove(&key);
-        if blake3::hash(&payload).as_bytes() != &expected_hash {
+        if blake3::hash(&payload).as_bytes() != &state.snapshot_hash {
             return Err(MetadataAssemblyError::SnapshotHashMismatch);
         }
 
-        self.latest_generation.insert(key, generation);
+        self.latest_generation.insert(key, state.generation);
         Ok(Some(FabricMetadataSnapshot {
             owner: chunk.owner,
             kind: chunk.kind,
-            generation,
+            generation: state.generation,
             payload,
         }))
+    }
+
+    fn remove_inflight(&mut self, key: (FabricMetadataKind, u64)) {
+        if let Some(state) = self.inflight.remove(&key) {
+            self.inflight_bytes = self.inflight_bytes.saturating_sub(state.bytes);
+        }
     }
 }
