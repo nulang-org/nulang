@@ -24,6 +24,8 @@ const TABLE_SUFFIX: &str = ".sst";
 const BLOCK_ROWS: usize = 64;
 const BLOOM_BITS_PER_KEY: usize = 10;
 const BLOOM_HASHES: u64 = 7;
+const MIN_VERSION_BYTES: usize = 9;
+const MIN_ROW_BYTES: usize = 4 + 4 + MIN_VERSION_BYTES;
 
 #[derive(Debug, Clone)]
 pub(crate) struct SstableRow {
@@ -96,8 +98,6 @@ fn bloom_hashes(key: &[u8]) -> (u64, u64) {
     let bytes = digest.as_bytes();
     let h1 = u64::from_le_bytes(bytes[0..8].try_into().expect("fixed hash width"));
     let mut h2 = u64::from_le_bytes(bytes[8..16].try_into().expect("fixed hash width"));
-    // A zero second hash would probe the same bit repeatedly. Making it odd also
-    // gives better coverage when the Bloom bit count is a power of two.
     h2 |= 1;
     (h1, h2)
 }
@@ -248,8 +248,7 @@ impl Sstable {
         let position = self
             .blocks
             .partition_point(|block| block.first_key.as_slice() <= key);
-        let index = position.saturating_sub(1);
-        self.blocks.get(index)
+        self.blocks.get(position.saturating_sub(1))
     }
 
     pub(crate) fn write_atomic(&self, path: &Path) -> Result<(), SstableError> {
@@ -348,8 +347,9 @@ impl Sstable {
         let generation = read_u64(data, &mut cursor, path)?;
         let min_sequence = read_u64(data, &mut cursor, path)?;
         let max_sequence = read_u64(data, &mut cursor, path)?;
-        let key_count = read_u64(data, &mut cursor, path)?;
-        let declared_version_count = read_u64(data, &mut cursor, path)?;
+        let key_count = read_count_u64(data, &mut cursor, path, "key count")?;
+        let declared_version_count =
+            read_count_u64(data, &mut cursor, path, "version count")?;
         if generation == 0 || min_sequence == 0 || min_sequence > max_sequence {
             return Err(SstableError::CorruptTable {
                 path: path.to_path_buf(),
@@ -357,29 +357,21 @@ impl Sstable {
             });
         }
 
-        let key_count = usize::try_from(key_count).map_err(|_| SstableError::CorruptTable {
-            path: path.to_path_buf(),
-            reason: "key count does not fit in memory".to_string(),
-        })?;
-        if key_count > data.len() {
+        let remaining = data.len().saturating_sub(cursor);
+        if key_count > remaining / MIN_ROW_BYTES {
             return Err(SstableError::CorruptTable {
                 path: path.to_path_buf(),
-                reason: "key count exceeds payload capacity".to_string(),
+                reason: "key count exceeds minimum payload capacity".to_string(),
             });
         }
-        let declared_version_count =
-            usize::try_from(declared_version_count).map_err(|_| SstableError::CorruptTable {
-                path: path.to_path_buf(),
-                reason: "version count does not fit in memory".to_string(),
-            })?;
-        if declared_version_count > data.len() {
+        if declared_version_count > remaining / MIN_VERSION_BYTES {
             return Err(SstableError::CorruptTable {
                 path: path.to_path_buf(),
-                reason: "version count exceeds payload capacity".to_string(),
+                reason: "version count exceeds minimum payload capacity".to_string(),
             });
         }
 
-        let mut rows = Vec::with_capacity(key_count);
+        let mut rows = Vec::new();
         let mut actual_version_count = 0_usize;
         let mut previous_key: Option<Vec<u8>> = None;
         for _ in 0..key_count {
@@ -404,26 +396,35 @@ impl Sstable {
             previous_key = Some(key.clone());
 
             let version_count = read_u32(data, &mut cursor, path)? as usize;
-            if version_count == 0 || version_count > data.len() {
+            let remaining = data.len().saturating_sub(cursor);
+            if version_count == 0 {
                 return Err(SstableError::CorruptTable {
                     path: path.to_path_buf(),
                     reason: "row contains an invalid version count".to_string(),
                 });
             }
-            let mut versions = Vec::with_capacity(version_count);
-            let mut previous_sequence = 0_u64;
+            if version_count > remaining / MIN_VERSION_BYTES {
+                return Err(SstableError::CorruptTable {
+                    path: path.to_path_buf(),
+                    reason: "row version count exceeds remaining payload capacity".to_string(),
+                });
+            }
+
+            let mut versions = Vec::new();
             for _ in 0..version_count {
                 let sequence = read_u64(data, &mut cursor, path)?;
                 if sequence < min_sequence
                     || sequence > max_sequence
-                    || sequence <= previous_sequence
+                    || versions
+                        .last()
+                        .map(|previous: &VersionedValue| sequence <= previous.sequence)
+                        .unwrap_or(false)
                 {
                     return Err(SstableError::CorruptTable {
                         path: path.to_path_buf(),
                         reason: "row contains invalid MVCC sequence history".to_string(),
                     });
                 }
-                previous_sequence = sequence;
                 let tag = take(data, &mut cursor, 1, path)?[0];
                 let value = match tag {
                     0 => None,
@@ -566,14 +567,18 @@ fn take<'a>(
     len: usize,
     path: &Path,
 ) -> Result<&'a [u8], SstableError> {
-    let end = cursor.checked_add(len).ok_or_else(|| SstableError::CorruptTable {
-        path: path.to_path_buf(),
-        reason: "immutable-table offset overflow".to_string(),
-    })?;
-    let slice = bytes.get(*cursor..end).ok_or_else(|| SstableError::CorruptTable {
-        path: path.to_path_buf(),
-        reason: "immutable table ended unexpectedly".to_string(),
-    })?;
+    let end = cursor
+        .checked_add(len)
+        .ok_or_else(|| SstableError::CorruptTable {
+            path: path.to_path_buf(),
+            reason: "immutable-table offset overflow".to_string(),
+        })?;
+    let slice = bytes
+        .get(*cursor..end)
+        .ok_or_else(|| SstableError::CorruptTable {
+            path: path.to_path_buf(),
+            reason: "immutable table ended unexpectedly".to_string(),
+        })?;
     *cursor = end;
     Ok(slice)
 }
@@ -597,6 +602,19 @@ fn read_u64(bytes: &[u8], cursor: &mut usize, path: &Path) -> Result<u64, Sstabl
         .try_into()
         .expect("fixed-width read");
     Ok(u64::from_le_bytes(raw))
+}
+
+fn read_count_u64(
+    bytes: &[u8],
+    cursor: &mut usize,
+    path: &Path,
+    label: &str,
+) -> Result<usize, SstableError> {
+    let count = read_u64(bytes, cursor, path)?;
+    usize::try_from(count).map_err(|_| SstableError::CorruptTable {
+        path: path.to_path_buf(),
+        reason: format!("{label} does not fit in memory"),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -703,12 +721,7 @@ mod tests {
             .collect();
         assert_eq!(
             keys,
-            vec![
-                &b"k063"[..],
-                &b"k064"[..],
-                &b"k065"[..],
-                &b"k066"[..]
-            ]
+            vec![&b"k063"[..], &b"k064"[..], &b"k065"[..], &b"k066"[..]]
         );
         assert_eq!(
             table.visible_version(b"k064", 1).unwrap().value.as_deref(),
