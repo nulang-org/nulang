@@ -22,7 +22,6 @@ pub struct BufferView {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComputeViewError {
-    NotImplemented,
     RankMismatch {
         shape_rank: usize,
         stride_rank: usize,
@@ -33,7 +32,6 @@ pub enum ComputeViewError {
 impl fmt::Display for ComputeViewError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotImplemented => write!(f, "symbolic buffer views are not implemented"),
             Self::RankMismatch {
                 shape_rank,
                 stride_rank,
@@ -53,16 +51,44 @@ impl std::error::Error for ComputeViewError {}
 
 impl BufferView {
     pub fn from_parts(
-        _element: ScalarType,
-        _shape: impl Into<Vec<ShapeExtent>>,
-        _strides: impl Into<Vec<u64>>,
-        _alignment: u32,
+        element: ScalarType,
+        shape: impl Into<Vec<ShapeExtent>>,
+        strides: impl Into<Vec<u64>>,
+        alignment: u32,
     ) -> Result<Self, ComputeViewError> {
-        Err(ComputeViewError::NotImplemented)
+        let shape = shape.into();
+        let strides = strides.into();
+
+        if shape.len() != strides.len() {
+            return Err(ComputeViewError::RankMismatch {
+                shape_rank: shape.len(),
+                stride_rank: strides.len(),
+            });
+        }
+        if alignment == 0 || !alignment.is_power_of_two() {
+            return Err(ComputeViewError::InvalidAlignment(alignment));
+        }
+
+        Ok(Self {
+            element,
+            shape,
+            strides,
+            alignment,
+        })
     }
 
-    pub fn from_layout(_layout: &Layout) -> Self {
-        panic!("symbolic buffer views are not implemented")
+    pub fn from_layout(layout: &Layout) -> Self {
+        Self {
+            element: layout.element(),
+            shape: layout
+                .shape()
+                .iter()
+                .copied()
+                .map(ShapeExtent::Static)
+                .collect(),
+            strides: layout.strides().to_vec(),
+            alignment: layout.alignment(),
+        }
     }
 
     pub const fn element(&self) -> ScalarType {
