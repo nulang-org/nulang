@@ -26,9 +26,13 @@ fn descriptor() -> TabletDescriptor {
 }
 
 fn cleanup(path: &PathBuf) {
+    let manifest = path.with_extension("manifest");
+    let mut manifest_tmp = manifest.as_os_str().to_os_string();
+    manifest_tmp.push(".tmp");
     let _ = fs::remove_file(path);
     let _ = fs::remove_file(path.with_extension("checkpoint"));
-    let _ = fs::remove_file(path.with_extension("manifest"));
+    let _ = fs::remove_file(&manifest);
+    let _ = fs::remove_file(PathBuf::from(manifest_tmp));
     let _ = fs::remove_dir_all(path.with_extension("sstables"));
 }
 
@@ -42,6 +46,18 @@ fn commit_put(tablet: &mut WalBackedTablet, key: &[u8], value: &[u8]) {
                 key: key.to_vec(),
                 value: value.to_vec(),
             }],
+        )
+        .unwrap();
+    tablet.commit(write).unwrap();
+}
+
+fn commit_delete(tablet: &mut WalBackedTablet, key: &[u8]) {
+    let sequence = tablet.current_sequence();
+    let write = tablet
+        .prepare_write(
+            1,
+            sequence,
+            vec![TabletMutation::Delete { key: key.to_vec() }],
         )
         .unwrap();
     tablet.commit(write).unwrap();
@@ -132,6 +148,36 @@ fn l0_compaction_merges_four_tables_preserves_mvcc_and_retires_sources() {
         );
     }
 
+    cleanup(&path);
+}
+
+#[test]
+fn l0_compaction_preserves_tombstones_and_later_reinsertion() {
+    let path = temp_wal("tombstone");
+    cleanup(&path);
+
+    let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
+    commit_put(&mut tablet, b"k", b"v1");
+    flush_current(&mut tablet);
+    commit_put(&mut tablet, b"k", b"v2");
+    flush_current(&mut tablet);
+    commit_delete(&mut tablet, b"k");
+    flush_current(&mut tablet);
+    commit_put(&mut tablet, b"k", b"v4");
+    flush_current(&mut tablet);
+
+    assert!(tablet.compact_l0_once().unwrap());
+    assert_eq!(tablet.read_at(b"k", 1).unwrap().as_deref(), Some(&b"v1"[..]));
+    assert_eq!(tablet.read_at(b"k", 2).unwrap().as_deref(), Some(&b"v2"[..]));
+    assert_eq!(tablet.read_at(b"k", 3).unwrap(), None);
+    assert_eq!(tablet.read_at(b"k", 4).unwrap().as_deref(), Some(&b"v4"[..]));
+
+    drop(tablet);
+    let reopened = WalBackedTablet::open(descriptor(), &path).unwrap();
+    assert_eq!(reopened.read_at(b"k", 1).unwrap().as_deref(), Some(&b"v1"[..]));
+    assert_eq!(reopened.read_at(b"k", 2).unwrap().as_deref(), Some(&b"v2"[..]));
+    assert_eq!(reopened.read_at(b"k", 3).unwrap(), None);
+    assert_eq!(reopened.read_at(b"k", 4).unwrap().as_deref(), Some(&b"v4"[..]));
     cleanup(&path);
 }
 
