@@ -61,16 +61,21 @@ def command_output(
     child_env = os.environ.copy()
     if env:
         child_env.update(env)
-    proc = subprocess.run(
-        command,
-        cwd=cwd,
-        check=True,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        preexec_fn=preexec_fn,
-        env=child_env,
-    )
+    try:
+        proc = subprocess.run(
+            command,
+            cwd=cwd,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            preexec_fn=preexec_fn,
+            env=child_env,
+        )
+    except subprocess.CalledProcessError as exc:
+        if exc.stdout:
+            print(exc.stdout, file=sys.stderr, end="" if exc.stdout.endswith("\n") else "\n")
+        raise
     return proc.stdout
 
 
@@ -175,16 +180,28 @@ def build_commands(selected: list[str], roundtrips: int, warmup: int) -> dict[st
         ]
 
     if "erlang" in selected:
-        escript = shutil.which("escript")
-        if escript is None:
-            raise RuntimeError("escript is required for the Erlang remote-roundtrip baseline")
+        erlc = shutil.which("erlc")
+        erl = shutil.which("erl")
+        if erlc is None or erl is None:
+            raise RuntimeError("erl and erlc are required for the Erlang remote-roundtrip baseline")
+        command_output(
+            [
+                erlc,
+                "-o",
+                str(BUILD),
+                str(FIXTURES / "remote_roundtrip_baseline.erl"),
+            ]
+        )
         commands["erlang"] = [
-            escript,
-            str(FIXTURES / "erlang_baseline.escript"),
-            "--roundtrips",
-            str(roundtrips),
-            "--warmup",
-            str(warmup),
+            erl,
+            "-noshell",
+            "-pa",
+            str(BUILD),
+            "-eval",
+            f"remote_roundtrip_baseline:run({roundtrips}, {warmup}).",
+            "-s",
+            "init",
+            "stop",
         ]
 
     return commands
@@ -286,7 +303,7 @@ def main() -> int:
         "--cpu-mode",
         choices=("single", "host"),
         default="single",
-        help="single pins every runtime process to one logical CPU; host is diagnostic",
+        help="single pins every measured runtime process to one logical CPU; host is diagnostic",
     )
     parser.add_argument("--output", type=Path, help="write the full JSON report")
     args = parser.parse_args()
