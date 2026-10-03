@@ -54,12 +54,8 @@ fn reopened_sstable_starts_cold_and_cache_stays_within_one_tablet_budget() {
     populate_large_sstable(&path);
 
     let cache_budget = 72 * 1024;
-    let tablet = WalBackedTablet::open_with_sstable_cache_bytes(
-        descriptor(),
-        &path,
-        cache_budget,
-    )
-    .unwrap();
+    let tablet =
+        WalBackedTablet::open_with_sstable_cache_bytes(descriptor(), &path, cache_budget).unwrap();
 
     let initial = tablet.sstable_cache_stats().unwrap();
     assert_eq!(initial.max_bytes, cache_budget);
@@ -130,8 +126,8 @@ fn resident_newer_version_skips_older_sstable_io() {
         tablet.commit(newer).unwrap();
     }
 
-    let tablet = WalBackedTablet::open_with_sstable_cache_bytes(descriptor(), &path, 72 * 1024)
-        .unwrap();
+    let tablet =
+        WalBackedTablet::open_with_sstable_cache_bytes(descriptor(), &path, 72 * 1024).unwrap();
     let before = tablet.sstable_cache_stats().unwrap();
     assert_eq!(before.misses, 0);
     assert_eq!(
@@ -153,12 +149,8 @@ fn checkpoint_scan_does_not_pollute_the_serving_cache() {
     cleanup(&path);
     populate_large_sstable(&path);
 
-    let tablet = WalBackedTablet::open_with_sstable_cache_bytes(
-        descriptor(),
-        &path,
-        72 * 1024,
-    )
-    .unwrap();
+    let tablet =
+        WalBackedTablet::open_with_sstable_cache_bytes(descriptor(), &path, 72 * 1024).unwrap();
     assert_eq!(
         tablet.read_latest(b"k000").unwrap().as_deref(),
         Some(&vec![0_u8; 2048][..])
@@ -178,12 +170,8 @@ fn post_open_sstable_corruption_fails_the_target_block_read_closed() {
     cleanup(&path);
     populate_large_sstable(&path);
 
-    let tablet = WalBackedTablet::open_with_sstable_cache_bytes(
-        descriptor(),
-        &path,
-        72 * 1024,
-    )
-    .unwrap();
+    let tablet =
+        WalBackedTablet::open_with_sstable_cache_bytes(descriptor(), &path, 72 * 1024).unwrap();
 
     let sstable_dir = path.with_extension("sstables");
     let sstable_path = fs::read_dir(&sstable_dir)
