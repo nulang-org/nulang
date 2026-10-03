@@ -243,11 +243,8 @@ mod tests {
 
     #[test]
     fn mir_intrinsic_validates_arity_and_folds_integer_constants() {
-        let call = MirIntrinsic::new(
-            IntegerIntrinsic::RotateLeft,
-            vec![LocalId(0), LocalId(1)],
-        )
-        .unwrap();
+        let call =
+            MirIntrinsic::new(IntegerIntrinsic::RotateLeft, vec![LocalId(0), LocalId(1)]).unwrap();
         assert_eq!(
             call.fold_constants(&[Constant::Int(1), Constant::Int(65)]),
             Some(Constant::Int(2))
@@ -328,8 +325,8 @@ mod native_tests {
         builder.append_block_params_for_function_params(block);
         let args = builder.block_params(block).to_vec();
 
-        let err = lower_cranelift_i64(&mut builder, IntegerIntrinsic::RotateLeft, &args)
-            .unwrap_err();
+        let err =
+            lower_cranelift_i64(&mut builder, IntegerIntrinsic::RotateLeft, &args).unwrap_err();
         assert_eq!(
             err,
             IntrinsicError::WrongArity {
