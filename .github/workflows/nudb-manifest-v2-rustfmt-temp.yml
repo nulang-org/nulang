@@ -1,0 +1,30 @@
+name: Temporary NuDB manifest-v2 rustfmt
+
+on:
+  push:
+    branches:
+      - feat/nudb-manifest-v2-format-contract
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/nudb-manifest-v2-format-contract
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Format manifest v2 files
+        run: cargo fmt --all
+      - name: Commit manifest formatting
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/database/manifest.rs src/database/manifest_v2_tests.rs
+          git diff --cached --quiet && exit 0
+          git commit -m "style(database): format manifest v2 contract"
+          git push origin HEAD:feat/nudb-manifest-v2-format-contract
