@@ -1,0 +1,50 @@
+name: Restack native representation contract
+
+on:
+  push:
+    branches:
+      - refactor/native-representation-current-main-20261003
+    paths:
+      - .github/workflows/tmp-restack-native-representation.yml
+
+permissions:
+  contents: write
+
+jobs:
+  restack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: refactor/native-representation-current-main-20261003
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
+          components: rustfmt,clippy
+      - name: Apply exact reviewed representation delta
+        run: |
+          set -euo pipefail
+          git fetch origin perf/native-representation-contract --no-tags
+          git diff 0ea226ef496ae87594ca35151c5901ae625ab638 75467b102e5f084359ada36446e7e0d3920f6f6c -- src/native_abi.rs > /tmp/native-repr.patch
+          test -s /tmp/native-repr.patch
+          git apply --3way /tmp/native-repr.patch
+          cargo fmt --all
+          git diff --check
+      - name: Validate focused representation contract
+        run: |
+          set -euo pipefail
+          cargo test --locked --no-default-features native_abi::tests -- --test-threads=1
+          cargo check --locked --no-default-features
+          cargo clippy --locked --no-default-features --lib -- -D warnings
+      - name: Commit current-main restack
+        run: |
+          set -euo pipefail
+          rm .github/workflows/tmp-restack-native-representation.yml
+          git config user.name "nulang-maintenance"
+          git config user.email "actions@users.noreply.github.com"
+          git add src/native_abi.rs .github/workflows/tmp-restack-native-representation.yml
+          git diff --cached --check
+          git commit -m "refactor(native): formalize typed representation boundary"
+          git push origin HEAD:refactor/native-representation-current-main-20261003
