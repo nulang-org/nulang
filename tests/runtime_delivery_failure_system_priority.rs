@@ -99,12 +99,7 @@ fn transport_failure_notification_is_system_priority_and_bypasses_full_mailbox()
     let mut cluster = ClusterState::new(local_node, local_addr);
     let mut resolver = AddressResolver::new(local_node);
 
-    process_network_packets(
-        &mut runtime,
-        &mut transport,
-        &mut cluster,
-        &mut resolver,
-    );
+    process_network_packets(&mut runtime, &mut transport, &mut cluster, &mut resolver);
 
     let actor = runtime.actors.get_mut(&sender).expect("sender actor");
     assert_eq!(
