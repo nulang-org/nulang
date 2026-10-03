@@ -45,7 +45,11 @@ fn test_v2_footer_metadata_and_point_reads_match_written_rows() {
         })
     );
     assert_eq!(
-        table.version_at(b"key-1023", 1024).unwrap().unwrap().sequence,
+        table
+            .version_at(b"key-1023", 1024)
+            .unwrap()
+            .unwrap()
+            .sequence,
         1024
     );
 
