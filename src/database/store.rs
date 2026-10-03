@@ -323,6 +323,14 @@ fn sstable_version_at<'a>(
     key: &[u8],
     snapshot: u64,
 ) -> Option<&'a VersionedValue> {
+    let metadata = table.metadata();
+    if snapshot < metadata.min_sequence
+        || key < metadata.min_key.as_slice()
+        || key > metadata.max_key.as_slice()
+    {
+        return None;
+    }
+
     let index = table
         .rows()
         .binary_search_by(|row| row.key.as_slice().cmp(key))
