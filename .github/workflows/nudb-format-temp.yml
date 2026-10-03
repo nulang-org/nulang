@@ -1,0 +1,33 @@
+name: Temporary NuDB rustfmt
+
+on:
+  push:
+    branches:
+      - feat/nudb-l0-compaction-v1
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/nudb-l0-compaction-v1
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Apply rustfmt
+        run: cargo fmt --all
+      - name: Commit formatter output
+        run: |
+          if git diff --quiet; then
+            echo "No formatting changes"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "style(database): apply rustfmt"
+          git push origin HEAD:feat/nudb-l0-compaction-v1
