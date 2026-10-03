@@ -55,6 +55,12 @@ pub fn plan_vector_tile(
     loop_plan: VectorLoopPlan,
     target_tile_bytes: u64,
 ) -> Result<VectorTilePlan, ComputeTileError> {
+    if loop_plan.min_vector_bytes == 0 {
+        return Err(ComputeTileError::ZeroVectorBytes);
+    }
+    if loop_plan.width.min_lanes() == 0 {
+        return Err(ComputeTileError::ZeroVectorLanes);
+    }
     if target_tile_bytes < loop_plan.min_vector_bytes {
         return Err(ComputeTileError::BudgetTooSmall {
             target_bytes: target_tile_bytes,
