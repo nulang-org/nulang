@@ -776,7 +776,7 @@ fn sequence_runs(rows: &[TabletSnapshotRow]) -> Result<Vec<SequenceRun>, Sstable
             sequences.insert(version.sequence);
         }
     }
-    let mut runs = Vec::new();
+    let mut runs: Vec<SequenceRun> = Vec::new();
     for sequence in sequences {
         match runs.last_mut() {
             Some(run) if run.end.checked_add(1) == Some(sequence) => run.end = sequence,
