@@ -1,6 +1,7 @@
 import importlib.util
 import pathlib
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "remote_roundtrip_bench.py"
@@ -50,6 +51,22 @@ class RemoteRoundTripBenchTests(unittest.TestCase):
         summary = self.module.summarize(samples)
         self.assertEqual(200, summary["nulang"]["median_elapsed_ns"])
         self.assertEqual(20.0, summary["nulang"]["median_ns_per_roundtrip"])
+
+    def test_erlang_baseline_uses_compiled_module_launcher(self):
+        def which(name):
+            return f"/usr/bin/{name}" if name in {"erl", "erlc"} else None
+
+        with mock.patch.object(self.module.shutil, "which", side_effect=which), mock.patch.object(
+            self.module, "command_output", return_value=""
+        ) as command_output:
+            commands = self.module.build_commands(["erlang"], 1000, 100)
+
+        compile_command = command_output.call_args_list[0].args[0]
+        self.assertEqual("/usr/bin/erlc", compile_command[0])
+        self.assertIn("remote_roundtrip_baseline.erl", compile_command[-1])
+        self.assertEqual("/usr/bin/erl", commands["erlang"][0])
+        self.assertIn("remote_roundtrip_baseline:run(1000, 100)", commands["erlang"])
+        self.assertNotIn("escript", " ".join(commands["erlang"]))
 
 
 if __name__ == "__main__":
