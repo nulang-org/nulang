@@ -1,5 +1,6 @@
 use nulang::reconcile::{
-    ReconcileController, ReconcileRetryDecision, ReconcileRetryPolicy, ReconcileTimerAdmission,
+    ReconcileController, ReconcilePhase, ReconcileRetryDecision, ReconcileRetryPolicy,
+    ReconcileTimerAdmission,
 };
 use nulang::runtime::{JsonFileStore, Runtime, WorkflowEvent};
 use nulang::vm::Value;
@@ -111,6 +112,33 @@ fn current_retry_timer_starts_a_new_fenced_attempt() {
 
     assert_eq!(next_attempt.generation(), 1);
     assert_eq!(next_attempt.ordinal(), 2);
+}
+
+#[test]
+fn duplicate_retry_timer_delivery_is_consumed_after_first_admission() {
+    let (mut runtime, actor_id) = workflow_runtime();
+    let mut controller = ReconcileController::new("replicas=3".to_string(), retry_policy(3), 18);
+    let first_attempt = controller.begin_attempt().unwrap();
+    let ReconcileRetryDecision::Scheduled(ticket) = controller
+        .schedule_retry(&mut runtime, actor_id, first_attempt)
+        .unwrap()
+    else {
+        panic!("expected scheduled retry");
+    };
+
+    let first = controller.admit_retry_timer(&ticket.timer_name()).unwrap();
+    let ReconcileTimerAdmission::Ready(attempt) = first else {
+        panic!("expected first delivery to start the retry attempt");
+    };
+    assert_eq!(attempt.ordinal(), 2);
+    assert_eq!(controller.state().phase(), ReconcilePhase::Progressing);
+    let after_first = controller.snapshot();
+
+    assert_eq!(
+        controller.admit_retry_timer(&ticket.timer_name()).unwrap(),
+        ReconcileTimerAdmission::Stale(ticket.identity())
+    );
+    assert_eq!(controller.snapshot(), after_first);
 }
 
 #[test]
