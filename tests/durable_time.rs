@@ -1,4 +1,7 @@
-use nulang::durable_time::{ClosedTimestamp, ClosedTimestampError, DurableTransitionTime};
+use nulang::durable_time::{
+    ClosedTimestamp, ClosedTimestampError, DurableTransitionTime, DurableTransitionTimeError,
+    TimedDurableTransition,
+};
 use nulang::hlc::HlcTimestamp;
 use nulang::runtime::{DurableTransition, DURABLE_TRANSITION_VERSION};
 
@@ -45,6 +48,69 @@ fn durable_transition_time_is_stable_across_serde_round_trip() {
 }
 
 #[test]
+fn durable_transition_time_rejects_metadata_for_a_different_transition() {
+    let persisted = DurableTransitionTime::for_transition(
+        &transition(42, 7, 11),
+        HlcTimestamp::new(1_000_000, 3),
+    );
+
+    let error = persisted.validate_for(&transition(42, 8, 11)).unwrap_err();
+
+    assert_eq!(
+        error,
+        DurableTransitionTimeError::ActivationEpochMismatch {
+            expected: 8,
+            actual: 7,
+        }
+    );
+}
+
+#[test]
+fn legacy_timed_transition_preserves_the_existing_digest_byte_for_byte() {
+    let transition = transition(42, 7, 11);
+    let legacy_digest = transition.digest().unwrap();
+
+    let timed = TimedDurableTransition::legacy(transition);
+
+    assert_eq!(timed.timestamp(), None);
+    assert_eq!(timed.digest().unwrap(), legacy_digest);
+}
+
+#[test]
+fn timestamped_transition_digest_is_stable_and_binds_the_supplied_hlc() {
+    let timestamp = HlcTimestamp::new(1_000_000, 3);
+    let same = HlcTimestamp::new(1_000_000, 3);
+    let later = HlcTimestamp::new(1_000_000, 4);
+
+    let first = TimedDurableTransition::with_timestamp(transition(42, 7, 11), timestamp);
+    let retry = TimedDurableTransition::with_timestamp(transition(42, 7, 11), same);
+    let different = TimedDurableTransition::with_timestamp(transition(42, 7, 11), later);
+
+    assert_eq!(first.timestamp(), Some(timestamp));
+    assert_eq!(first.digest().unwrap(), retry.digest().unwrap());
+    assert_ne!(first.digest().unwrap(), different.digest().unwrap());
+}
+
+#[test]
+fn recovered_timed_transition_rejects_mismatched_persisted_identity() {
+    let persisted = DurableTransitionTime::for_transition(
+        &transition(42, 7, 11),
+        HlcTimestamp::new(1_000_000, 3),
+    );
+
+    let error =
+        TimedDurableTransition::from_parts(transition(99, 7, 11), Some(persisted)).unwrap_err();
+
+    assert_eq!(
+        error,
+        DurableTransitionTimeError::ActorIdMismatch {
+            expected: 99,
+            actual: 42,
+        }
+    );
+}
+
+#[test]
 fn unopened_closed_timestamp_does_not_authorize_reads() {
     let closed = ClosedTimestamp::default();
 
@@ -77,7 +143,10 @@ fn closed_timestamp_regression_fails_closed_without_mutating_state() {
 
     let error = closed.advance(attempted).unwrap_err();
 
-    assert_eq!(error, ClosedTimestampError::Regression { current, attempted });
+    assert_eq!(
+        error,
+        ClosedTimestampError::Regression { current, attempted }
+    );
     assert_eq!(closed.get(), Some(current));
 }
 
