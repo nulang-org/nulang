@@ -3,89 +3,18 @@
 //! This module builds on [`crate::authority::AuthorityManifest`] rather than
 //! introducing a second permission model. `AuthorityManifest` remains Nulang's
 //! exact, deny-by-default external-authority vocabulary; this layer adds the
-//! identity and delegation semantics needed for humans, agents, services,
-//! workloads, and devices.
+//! delegation semantics needed for shared security principals.
 //!
-//! The kernel is intentionally pure and deterministic. It does not mint
-//! tokens, perform cryptography, consult storage, or make network calls. Those
-//! protocol and persistence concerns can wrap this layer later (for example an
-//! AuthZEN PDP or a signed delegation envelope).
+//! Identity, explicit Unix-second time, and delegation provenance primitives
+//! live in the dependency-light `nulang-security` crate so agent tooling can
+//! share them without depending on the compiler or VM.
 
 use crate::authority::{AuthorityGrant, AuthorityManifest};
+pub use nulang_security::{
+    DelegationId, DelegationProvenance, Principal, PrincipalKind, RevocationEpoch, UnixSeconds,
+};
 use std::error::Error;
 use std::fmt;
-
-/// Unix time in whole seconds.
-///
-/// A security boundary should never accept an unqualified integer timestamp:
-/// seconds-vs-milliseconds mistakes can accidentally extend or prematurely
-/// expire delegated authority. This newtype makes the unit explicit while
-/// keeping authorization evaluation allocation-free and deterministic.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct UnixSeconds(u64);
-
-impl UnixSeconds {
-    pub const fn from_secs(seconds: u64) -> Self {
-        Self(seconds)
-    }
-
-    pub const fn as_secs(self) -> u64 {
-        self.0
-    }
-}
-
-impl fmt::Display for UnixSeconds {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// Security-principal classes understood by the authorization kernel.
-///
-/// Authorization semantics are uniform across kinds: a human, agent, service,
-/// workload, or device receives only authority delegated to that exact
-/// principal. `Workload` is explicit rather than being folded into `Service`
-/// so hosted runtimes can distinguish deployable execution identities from
-/// long-lived service/application identities without string conventions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum PrincipalKind {
-    Human,
-    Agent,
-    Service,
-    Workload,
-    Device,
-}
-
-/// Stable principal identity within the caller's trust domain.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Principal {
-    kind: PrincipalKind,
-    id: String,
-}
-
-impl Principal {
-    pub fn new(kind: PrincipalKind, id: impl Into<String>) -> Result<Self, DelegationError> {
-        let id = id.into();
-        if id.trim().is_empty() {
-            return Err(DelegationError::InvalidPrincipalId(id));
-        }
-        Ok(Self { kind, id })
-    }
-
-    pub fn kind(&self) -> PrincipalKind {
-        self.kind
-    }
-
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-}
-
-impl fmt::Display for Principal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.id)
-    }
-}
 
 /// Constraints that may narrow a delegation.
 ///
@@ -373,10 +302,9 @@ pub enum DecisionReason {
     MissingGrant(AuthorityGrant),
 }
 
-/// Failure to construct an identity or derive a child delegation safely.
+/// Failure to derive a child delegation safely.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DelegationError {
-    InvalidPrincipalId(String),
     InvalidTimeWindow {
         not_before: UnixSeconds,
         expires_at: UnixSeconds,
@@ -390,7 +318,6 @@ pub enum DelegationError {
 impl fmt::Display for DelegationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidPrincipalId(_) => write!(f, "principal id must not be empty"),
             Self::InvalidTimeWindow {
                 not_before,
                 expires_at,
@@ -426,11 +353,8 @@ mod tests {
     }
 
     #[test]
-    fn whitespace_only_principal_is_rejected() {
-        assert!(matches!(
-            Principal::new(PrincipalKind::Agent, "   "),
-            Err(DelegationError::InvalidPrincipalId(_))
-        ));
+    fn whitespace_only_principal_is_rejected_by_shared_identity_layer() {
+        assert!(Principal::new(PrincipalKind::Agent, "   ").is_err());
     }
 
     #[test]
