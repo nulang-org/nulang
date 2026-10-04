@@ -1,30 +1,58 @@
 //! Principal-aware authorization and constrained authority delegation.
 //!
-//! This module deliberately builds on [`crate::authority::AuthorityManifest`]
-//! instead of introducing a second permission model. `AuthorityManifest`
-//! remains the exact, deny-by-default external-authority vocabulary used by the
-//! compiler and actor runtime; this layer adds the identity and delegation
-//! semantics needed for humans, agents, services, and devices.
+//! This module builds on [`crate::authority::AuthorityManifest`] rather than
+//! introducing a second permission model. `AuthorityManifest` remains Nulang's
+//! exact, deny-by-default external-authority vocabulary; this layer adds the
+//! identity and delegation semantics needed for humans, agents, services,
+//! workloads, and devices.
 //!
-//! The model is intentionally pure and deterministic. It does not mint tokens,
-//! perform cryptography, consult a database, or make network calls. Those are
-//! protocol/storage concerns that can wrap this kernel later (for example an
-//! AuthZEN PDP or signed delegation envelope).
+//! The kernel is intentionally pure and deterministic. It does not mint
+//! tokens, perform cryptography, consult storage, or make network calls. Those
+//! protocol and persistence concerns can wrap this layer later (for example an
+//! AuthZEN PDP or a signed delegation envelope).
 
 use crate::authority::{AuthorityGrant, AuthorityManifest};
 use std::error::Error;
 use std::fmt;
 
-/// The security-principal classes understood by the authorization kernel.
+/// Unix time in whole seconds.
 ///
-/// Authorization semantics are intentionally uniform across kinds: a human,
-/// agent, service, or device is authorized by the authority delegated to that
-/// exact principal, not by special-case ambient privilege.
+/// A security boundary should never accept an unqualified integer timestamp:
+/// seconds-vs-milliseconds mistakes can accidentally extend or prematurely
+/// expire delegated authority. This newtype makes the unit explicit while
+/// keeping authorization evaluation allocation-free and deterministic.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UnixSeconds(u64);
+
+impl UnixSeconds {
+    pub const fn from_secs(seconds: u64) -> Self {
+        Self(seconds)
+    }
+
+    pub const fn as_secs(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for UnixSeconds {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Security-principal classes understood by the authorization kernel.
+///
+/// Authorization semantics are uniform across kinds: a human, agent, service,
+/// workload, or device receives only authority delegated to that exact
+/// principal. `Workload` is explicit rather than being folded into `Service`
+/// so hosted runtimes can distinguish deployable execution identities from
+/// long-lived service/application identities without string conventions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PrincipalKind {
     Human,
     Agent,
     Service,
+    Workload,
     Device,
 }
 
@@ -55,26 +83,26 @@ impl Principal {
 
 impl fmt::Display for Principal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.id)
+        f.write_str(&self.id)
     }
 }
 
 /// Constraints that may narrow a delegation.
 ///
 /// The validity interval is half-open: `not_before <= now < expires_at`.
-/// `can_redelegate` controls whether the subject may create a child delegation
-/// from this authority. Child delegations may only narrow these constraints.
+/// `can_redelegate` controls whether the subject may derive a child
+/// delegation. Child delegations may only narrow these constraints.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DelegationConstraints {
-    not_before: Option<u64>,
-    expires_at: Option<u64>,
+    not_before: Option<UnixSeconds>,
+    expires_at: Option<UnixSeconds>,
     can_redelegate: bool,
 }
 
 impl DelegationConstraints {
     pub fn new(
-        not_before: Option<u64>,
-        expires_at: Option<u64>,
+        not_before: Option<UnixSeconds>,
+        expires_at: Option<UnixSeconds>,
         can_redelegate: bool,
     ) -> Result<Self, DelegationError> {
         if let (Some(not_before), Some(expires_at)) = (not_before, expires_at) {
@@ -92,11 +120,11 @@ impl DelegationConstraints {
         })
     }
 
-    pub fn not_before(&self) -> Option<u64> {
+    pub fn not_before(&self) -> Option<UnixSeconds> {
         self.not_before
     }
 
-    pub fn expires_at(&self) -> Option<u64> {
+    pub fn expires_at(&self) -> Option<UnixSeconds> {
         self.expires_at
     }
 
@@ -104,7 +132,7 @@ impl DelegationConstraints {
         self.can_redelegate
     }
 
-    fn inactive_reason(&self, now: u64) -> Option<DecisionReason> {
+    fn inactive_reason(&self, now: UnixSeconds) -> Option<DecisionReason> {
         if let Some(not_before) = self.not_before {
             if now < not_before {
                 return Some(DecisionReason::NotYetValid { not_before, now });
@@ -154,8 +182,8 @@ pub enum ConstraintField {
 
 /// One explicit authority delegation from an issuer to a subject.
 ///
-/// The issuer is informational/provenance identity. Trust in an initial issuer
-/// is established by the embedding system. Chained delegations are safe by
+/// The issuer is provenance identity. Trust in an initial issuer is established
+/// by the embedding identity system. Chained delegations are safe by
 /// construction because [`AuthorityDelegation::delegate`] makes the current
 /// subject the child issuer and enforces monotonic attenuation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,10 +195,10 @@ pub struct AuthorityDelegation {
 }
 
 impl AuthorityDelegation {
-    /// Establish an authority delegation at a trust boundary.
+    /// Establish an authority delegation at an authenticated trust boundary.
     ///
-    /// This function does not prove that `issuer` is trusted; the embedding
-    /// identity system is responsible for authenticating the root issuer.
+    /// This constructor deliberately does not claim to authenticate `issuer`;
+    /// the embedding system must establish that trust before calling it.
     pub fn issue(
         issuer: Principal,
         subject: Principal,
@@ -204,13 +232,13 @@ impl AuthorityDelegation {
     /// Evaluate one exact authority request for one principal at one instant.
     ///
     /// Decision ordering is deterministic: principal identity, temporal
-    /// validity, then exact authority. This gives audit/explain surfaces one
-    /// stable primary reason instead of depending on hash-map or policy order.
+    /// validity, then exact authority. Audit/explain surfaces therefore receive
+    /// one stable primary reason rather than policy-order-dependent output.
     pub fn authorize(
         &self,
         principal: &Principal,
         grant: &AuthorityGrant,
-        now: u64,
+        now: UnixSeconds,
     ) -> AuthorizationDecision {
         if principal != &self.subject {
             return AuthorizationDecision::deny(
@@ -240,12 +268,12 @@ impl AuthorityDelegation {
 
     /// Create an attenuated child delegation from the current subject.
     ///
-    /// This operation cannot manufacture authority or widen the parent's time
-    /// window. It also refuses to delegate from inactive or explicitly
+    /// This cannot manufacture authority or widen the parent's validity
+    /// interval. It also refuses to delegate from inactive or explicitly
     /// non-redelegable authority.
     pub fn delegate(
         &self,
-        now: u64,
+        now: UnixSeconds,
         subject: Principal,
         requested: AuthorityManifest,
         constraints: DelegationConstraints,
@@ -338,12 +366,12 @@ pub enum DecisionReason {
         actual: Principal,
     },
     NotYetValid {
-        not_before: u64,
-        now: u64,
+        not_before: UnixSeconds,
+        now: UnixSeconds,
     },
     Expired {
-        expires_at: u64,
-        now: u64,
+        expires_at: UnixSeconds,
+        now: UnixSeconds,
     },
     MissingGrant(AuthorityGrant),
 }
@@ -352,7 +380,10 @@ pub enum DecisionReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DelegationError {
     InvalidPrincipalId(String),
-    InvalidTimeWindow { not_before: u64, expires_at: u64 },
+    InvalidTimeWindow {
+        not_before: UnixSeconds,
+        expires_at: UnixSeconds,
+    },
     InactiveParent(DecisionReason),
     RedelegationForbidden,
     AuthorityEscalation(AuthorityGrant),
@@ -393,6 +424,10 @@ impl Error for DelegationError {}
 mod tests {
     use super::*;
 
+    fn t(seconds: u64) -> UnixSeconds {
+        UnixSeconds::from_secs(seconds)
+    }
+
     #[test]
     fn whitespace_only_principal_is_rejected() {
         assert!(matches!(
@@ -409,15 +444,15 @@ mod tests {
             human,
             agent.clone(),
             AuthorityManifest::from_tokens(["Env::Read(API_URL)"]).unwrap(),
-            DelegationConstraints::new(Some(100), Some(200), false).unwrap(),
+            DelegationConstraints::new(Some(t(100)), Some(t(200)), false).unwrap(),
         );
         let grant: AuthorityGrant = "Env::Read(API_URL)".parse().unwrap();
 
         assert_eq!(
-            delegation.authorize(&agent, &grant, 99).reason(),
+            delegation.authorize(&agent, &grant, t(99)).reason(),
             Some(&DecisionReason::NotYetValid {
-                not_before: 100,
-                now: 99,
+                not_before: t(100),
+                now: t(99),
             })
         );
     }
@@ -432,11 +467,11 @@ mod tests {
             human,
             agent,
             authority.clone(),
-            DelegationConstraints::new(None, Some(200), true).unwrap(),
+            DelegationConstraints::new(None, Some(t(200)), true).unwrap(),
         );
 
         assert_eq!(
-            parent.delegate(100, child, authority, DelegationConstraints::default()),
+            parent.delegate(t(100), child, authority, DelegationConstraints::default()),
             Err(DelegationError::ConstraintExpansion(
                 ConstraintField::ExpiresAt
             ))
