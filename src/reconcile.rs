@@ -10,7 +10,9 @@
 //! Nulang without coupling the language surface to Kubernetes or any specific
 //! deployment backend.
 
+mod controller;
 mod durable;
+pub use controller::*;
 pub use durable::*;
 
 /// Lifecycle state for the current desired generation.
