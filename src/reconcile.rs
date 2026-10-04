@@ -10,8 +10,13 @@
 //! Nulang without coupling the language surface to Kubernetes or any specific
 //! deployment backend.
 
+mod durable;
+pub use durable::*;
+
 /// Lifecycle state for the current desired generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+)]
 pub enum ReconcilePhase {
     /// Desired state exists but has not yet been reconciled successfully.
     Pending,
@@ -56,6 +61,8 @@ pub enum ReconcileError {
     GenerationOverflow,
     /// Starting another attempt would wrap the per-generation attempt counter.
     AttemptOverflow,
+    /// Advancing the retry sequence would wrap its counter.
+    RetryOverflow,
     /// A result was produced for a desired generation that has been replaced.
     StaleAttempt {
         attempt_generation: u64,
@@ -82,6 +89,7 @@ pub struct ReconcileState<Spec> {
     observed_generation: u64,
     phase: ReconcilePhase,
     attempt_ordinal: u64,
+    retry_ordinal: u32,
 }
 
 impl<Spec> ReconcileState<Spec> {
@@ -93,6 +101,7 @@ impl<Spec> ReconcileState<Spec> {
             observed_generation: 0,
             phase: ReconcilePhase::Pending,
             attempt_ordinal: 0,
+            retry_ordinal: 0,
         }
     }
 
@@ -115,6 +124,11 @@ impl<Spec> ReconcileState<Spec> {
     /// Current controller phase.
     pub fn phase(&self) -> ReconcilePhase {
         self.phase
+    }
+
+    /// Number of retryable failures scheduled for the current generation.
+    pub fn retry_ordinal(&self) -> u32 {
+        self.retry_ordinal
     }
 
     /// True while the current desired generation still requires reconciliation
@@ -219,6 +233,7 @@ impl<Spec> ReconcileState<Spec> {
             observed_generation: 0,
             phase: ReconcilePhase::Pending,
             attempt_ordinal: 0,
+            retry_ordinal: 0,
         }
     }
 }
@@ -246,6 +261,7 @@ impl<Spec: PartialEq> ReconcileState<Spec> {
         self.generation = generation;
         self.phase = ReconcilePhase::Pending;
         self.attempt_ordinal = 0;
+        self.retry_ordinal = 0;
         Ok(true)
     }
 }
