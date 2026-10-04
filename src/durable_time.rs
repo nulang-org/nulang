@@ -9,7 +9,7 @@
 use crate::hlc::HlcTimestamp;
 use crate::runtime::DurableTransition;
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::{fmt, io};
 
 /// Causal timestamp bound to one already-fenced durable transition identity.
 ///
@@ -49,6 +49,155 @@ impl DurableTransitionTime {
 
     pub const fn timestamp(self) -> HlcTimestamp {
         self.timestamp
+    }
+
+    /// Verify that recovered or received metadata belongs to `transition`.
+    ///
+    /// The sequence/epoch fence remains authoritative. HLC metadata that was
+    /// persisted beside a different transition must fail closed rather than be
+    /// silently attached to the caller's transition.
+    pub fn validate_for(
+        self,
+        transition: &DurableTransition,
+    ) -> Result<(), DurableTransitionTimeError> {
+        if self.actor_id != transition.actor_id {
+            return Err(DurableTransitionTimeError::ActorIdMismatch {
+                expected: transition.actor_id,
+                actual: self.actor_id,
+            });
+        }
+        if self.activation_epoch != transition.activation_epoch {
+            return Err(DurableTransitionTimeError::ActivationEpochMismatch {
+                expected: transition.activation_epoch,
+                actual: self.activation_epoch,
+            });
+        }
+        if self.sequence != transition.sequence {
+            return Err(DurableTransitionTimeError::SequenceMismatch {
+                expected: transition.sequence,
+                actual: self.sequence,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Identity mismatch detected while attaching persisted causal metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DurableTransitionTimeError {
+    ActorIdMismatch { expected: u64, actual: u64 },
+    ActivationEpochMismatch { expected: u64, actual: u64 },
+    SequenceMismatch { expected: u64, actual: u64 },
+}
+
+impl fmt::Display for DurableTransitionTimeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ActorIdMismatch { expected, actual } => write!(
+                f,
+                "durable transition time actor mismatch: expected {expected}, got {actual}"
+            ),
+            Self::ActivationEpochMismatch { expected, actual } => write!(
+                f,
+                "durable transition time activation epoch mismatch: expected {expected}, got {actual}"
+            ),
+            Self::SequenceMismatch { expected, actual } => write!(
+                f,
+                "durable transition time sequence mismatch: expected {expected}, got {actual}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DurableTransitionTimeError {}
+
+/// A durable transition paired with optional caller-supplied causal time.
+///
+/// This envelope establishes the compatibility and retry-identity contract
+/// before storage schemas are migrated. `legacy` preserves the existing
+/// transition digest byte-for-byte. When time is present, the digest is
+/// domain-separated and binds both the legacy transition identity and the
+/// supplied HLC metadata. No wall clock is consulted here.
+#[derive(Clone, Debug)]
+pub struct TimedDurableTransition {
+    transition: DurableTransition,
+    time: Option<DurableTransitionTime>,
+}
+
+impl TimedDurableTransition {
+    /// Wrap an existing transition without causal metadata.
+    pub const fn legacy(transition: DurableTransition) -> Self {
+        Self {
+            transition,
+            time: None,
+        }
+    }
+
+    /// Bind an explicitly supplied HLC timestamp to a transition.
+    pub fn with_timestamp(transition: DurableTransition, timestamp: HlcTimestamp) -> Self {
+        let time = DurableTransitionTime::for_transition(&transition, timestamp);
+        Self {
+            transition,
+            time: Some(time),
+        }
+    }
+
+    /// Reconstruct an envelope from separately persisted pieces.
+    ///
+    /// Recovery validates the duplicated fence before exposing the envelope.
+    pub fn from_parts(
+        transition: DurableTransition,
+        time: Option<DurableTransitionTime>,
+    ) -> Result<Self, DurableTransitionTimeError> {
+        if let Some(time) = time {
+            time.validate_for(&transition)?;
+        }
+        Ok(Self { transition, time })
+    }
+
+    pub const fn transition(&self) -> &DurableTransition {
+        &self.transition
+    }
+
+    pub const fn time(&self) -> Option<DurableTransitionTime> {
+        self.time
+    }
+
+    pub const fn timestamp(&self) -> Option<HlcTimestamp> {
+        match self.time {
+            Some(time) => Some(time.timestamp()),
+            None => None,
+        }
+    }
+
+    pub fn into_parts(self) -> (DurableTransition, Option<DurableTransitionTime>) {
+        (self.transition, self.time)
+    }
+
+    /// Canonical retry identity for a transition plus optional causal time.
+    ///
+    /// A transition without HLC metadata delegates directly to the existing
+    /// digest, preserving all legacy retry identities. Timestamped transitions
+    /// add a versioned domain separator plus fixed-width big-endian metadata so
+    /// distinct HLC values cannot be treated as the same retry.
+    pub fn digest(&self) -> io::Result<[u8; 32]> {
+        let transition_digest = self.transition.digest()?;
+        let Some(time) = self.time else {
+            return Ok(transition_digest);
+        };
+
+        time.validate_for(&self.transition)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"nulang:durable-transition-hlc:v1\0");
+        hasher.update(&transition_digest);
+        hasher.update(&time.actor_id().to_be_bytes());
+        hasher.update(&time.activation_epoch().to_be_bytes());
+        hasher.update(&time.sequence().to_be_bytes());
+        hasher.update(&time.timestamp().physical_micros().to_be_bytes());
+        hasher.update(&time.timestamp().logical().to_be_bytes());
+        Ok(*hasher.finalize().as_bytes())
     }
 }
 
