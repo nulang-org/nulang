@@ -1,0 +1,50 @@
+name: Cold JIT A/B probe
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/cold-jit-probe-pr.yml'
+      - 'scripts/tests/test_cold_jit_ab_probe.py'
+      - 'tests/cold_jit_ab.rs'
+      - 'src/vm.rs'
+      - 'src/jit/**'
+
+concurrency:
+  group: cold-jit-probe-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    name: Counterbalanced cold JIT probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify probe structure
+        run: python3 -m unittest scripts/tests/test_cold_jit_ab_probe.py
+
+      - name: Measure counterbalanced JIT-off/JIT-on probe
+        run: |
+          set -o pipefail
+          cargo test --locked --release --features native-codegen --test cold_jit_ab -- --nocapture --test-threads=1 | tee cold-jit-probe.txt
+
+      - name: Upload probe evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cold-jit-probe-${{ github.sha }}
+          path: cold-jit-probe.txt
+          if-no-files-found: error
+          retention-days: 14
