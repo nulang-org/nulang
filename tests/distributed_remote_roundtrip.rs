@@ -51,9 +51,7 @@ fn make_peer_healthy(runtime: &mut Runtime, peer: NodeId, addr: SocketAddr) {
 }
 
 fn spawn_probe(runtime: &mut Runtime) -> u64 {
-    let actor_id = runtime.spawn_actor(Box::new(|| {
-        vec![("seen".to_string(), Value::int(0))]
-    }));
+    let actor_id = runtime.spawn_actor(Box::new(|| vec![("seen".to_string(), Value::int(0))]));
     runtime
         .actors
         .get_mut(&actor_id)
