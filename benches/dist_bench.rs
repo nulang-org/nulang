@@ -12,13 +12,13 @@ use nulang::runtime::{
 use nulang::vm::Value;
 
 #[cfg(feature = "tcp")]
+use nulang::runtime::{NetworkTransport, TcpTransport, TlsConfig};
+#[cfg(feature = "tcp")]
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[cfg(feature = "tcp")]
 use std::thread;
 #[cfg(feature = "tcp")]
 use std::time::{Duration, Instant};
-#[cfg(feature = "tcp")]
-use nulang::runtime::{NetworkTransport, TcpTransport, TlsConfig};
 
 fn bench_crdt_delta_compute(c: &mut Criterion) {
     c.bench_function("dist/crdt_delta_compute", |b| {
