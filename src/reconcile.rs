@@ -14,9 +14,7 @@ mod durable;
 pub use durable::*;
 
 /// Lifecycle state for the current desired generation.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ReconcilePhase {
     /// Desired state exists but has not yet been reconciled successfully.
     Pending,
