@@ -267,9 +267,11 @@ impl ClosedTimestamp {
     /// Whether a read at `timestamp` is inside the known-closed committed prefix.
     pub const fn permits_read(self, timestamp: HlcTimestamp) -> bool {
         match self.value {
-            Some(closed) => timestamp.physical_micros() < closed.physical_micros()
-                || (timestamp.physical_micros() == closed.physical_micros()
-                    && timestamp.logical() <= closed.logical()),
+            Some(closed) => {
+                timestamp.physical_micros() < closed.physical_micros()
+                    || (timestamp.physical_micros() == closed.physical_micros()
+                        && timestamp.logical() <= closed.logical())
+            }
             None => false,
         }
     }
