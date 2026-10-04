@@ -30,7 +30,10 @@ pub(crate) fn actor_is_workflow(rt: &Runtime, actor_id: u64) -> bool {
         .unwrap_or(false)
 }
 
-fn current_workflow_replay_id(rt: &mut Runtime, actor_id: u64) -> Option<WorkflowReplayEventId> {
+fn current_workflow_replay_id(
+    rt: &mut Runtime,
+    actor_id: u64,
+) -> Option<WorkflowReplayEventId> {
     let actor = rt.actors.get_mut(&actor_id)?;
     let activation = actor.current_workflow_activation?;
 
@@ -45,7 +48,11 @@ fn current_workflow_replay_id(rt: &mut Runtime, actor_id: u64) -> Option<Workflo
     ))
 }
 
-fn advance_workflow_replay_id(rt: &mut Runtime, actor_id: u64, committed: WorkflowReplayEventId) {
+fn advance_workflow_replay_id(
+    rt: &mut Runtime,
+    actor_id: u64,
+    committed: WorkflowReplayEventId,
+) {
     let Some(actor) = rt.actors.get_mut(&actor_id) else {
         return;
     };
@@ -588,7 +595,22 @@ pub(crate) fn append_signal_received(
     let seq = next_sequence(rt, actor_id);
     rt.persistence
         .append_signal_received(actor_id, seq, name.to_string(), payload)?;
-    try_checkpoint_actor(rt, actor_id)?;
+
+    let activation_open = rt.actors.get(&actor_id).is_some_and(|actor| {
+        actor.current_workflow_activation.is_some()
+            || actor
+                .suspended_execution
+                .as_ref()
+                .and_then(|suspended| suspended.activation)
+                .is_some()
+    });
+    if !activation_open {
+        try_checkpoint_actor(rt, actor_id)?;
+    }
+    // During an open activation the SignalReceived record is the replay source
+    // of truth. Keep the last completed snapshot unchanged: it may otherwise
+    // capture state mutated before Signal.wait suspended, causing recovery to
+    // resume from a partially executed step.
     Ok(())
 }
 
@@ -617,7 +639,8 @@ pub(crate) fn signal_workflow(
     payload: Option<String>,
 ) -> std::io::Result<()> {
     // A signal must not become visible in memory or resume execution unless
-    // its durable journal write and checkpoint both succeeded.
+    // its durable journal write succeeded. During an open activation the
+    // completed-state snapshot intentionally remains at the pre-command state.
     append_signal_received(rt, actor_id, name, payload.clone())?;
 
     let should_resume = {
