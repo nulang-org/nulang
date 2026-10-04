@@ -52,7 +52,8 @@ mod benchmarks {
         // Match benches/interp_bench.rs exactly: this loop stays below the
         // current HOT_THRESHOLD, so a JIT-enabled VM should pay only cold
         // candidate/hotness-probe overhead and compile no native region.
-        let source = "var sum = 0; var i = 0; while i < 500 { sum = sum + i * 2 - i / 3; i = i + 1; }; sum";
+        let source =
+            "var sum = 0; var i = 0; while i < 500 { sum = sum + i * 2 - i / 3; i = i + 1; }; sum";
         let module = compile(source);
 
         let mut interp_vms: Vec<VM> = (0..REPEATS)
@@ -65,7 +66,9 @@ mod benchmarks {
         let interp_start = Instant::now();
         let mut interp_result = None;
         for vm in &mut interp_vms {
-            interp_result = Some(black_box(vm.run().expect("bench: cold interpreter run failed")));
+            interp_result = Some(black_box(
+                vm.run().expect("bench: cold interpreter run failed"),
+            ));
         }
         let interp_elapsed = interp_start.elapsed();
         report_ab("interp_cold_jit_off", REPEATS as u64, interp_elapsed);
@@ -80,7 +83,9 @@ mod benchmarks {
         let jit_start = Instant::now();
         let mut jit_result = None;
         for vm in &mut jit_vms {
-            jit_result = Some(black_box(vm.run().expect("bench: cold JIT-enabled run failed")));
+            jit_result = Some(black_box(
+                vm.run().expect("bench: cold JIT-enabled run failed"),
+            ));
         }
         let jit_elapsed = jit_start.elapsed();
 
@@ -90,7 +95,11 @@ mod benchmarks {
             "cold JIT probe must preserve interpreter semantics"
         );
         for vm in &jit_vms {
-            assert_eq!(vm.jit_compiled_count(), 0, "sub-threshold cold probe must not compile a JIT region");
+            assert_eq!(
+                vm.jit_compiled_count(),
+                0,
+                "sub-threshold cold probe must not compile a JIT region"
+            );
         }
         report_ab("interp_cold_jit_on", REPEATS as u64, jit_elapsed);
     }
