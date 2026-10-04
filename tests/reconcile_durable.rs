@@ -180,7 +180,9 @@ fn exhausting_retry_budget_marks_generation_terminally_observed() {
 
     let second = state.begin_attempt().unwrap();
     assert!(matches!(
-        state.mark_retryable_with_policy(second, &policy, 1).unwrap(),
+        state
+            .mark_retryable_with_policy(second, &policy, 1)
+            .unwrap(),
         ReconcileRetryDecision::Scheduled(_)
     ));
 
