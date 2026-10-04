@@ -74,11 +74,8 @@ fn timer_set_replay_consumes_matching_committed_preparation() {
 #[test]
 fn timer_set_replay_rejects_cross_type_identity_collision() {
     let mut rt = Runtime::new();
-    let actor_id = rt.spawn_workflow_actor(
-        "ReplayTimerConflict",
-        Box::new(Vec::new),
-        HashMap::new(),
-    );
+    let actor_id =
+        rt.spawn_workflow_actor("ReplayTimerConflict", Box::new(Vec::new), HashMap::new());
     let activation = WorkflowActivationId::new(actor_id, 91);
 
     {

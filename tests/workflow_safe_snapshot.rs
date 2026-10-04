@@ -6,7 +6,8 @@ use nulang::vm::Value;
 #[test]
 fn replay_identified_custom_event_keeps_last_completed_snapshot_unchanged() {
     let mut rt = Runtime::new();
-    let actor_id = rt.spawn_workflow_actor("ReplaySafeSnapshot", Box::new(Vec::new), HashMap::new());
+    let actor_id =
+        rt.spawn_workflow_actor("ReplaySafeSnapshot", Box::new(Vec::new), HashMap::new());
     assert_ne!(actor_id, 0, "workflow spawn must succeed");
 
     let safe_snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
@@ -40,7 +41,11 @@ fn replay_identified_custom_event_keeps_last_completed_snapshot_unchanged() {
             )
         })
         .collect();
-    assert_eq!(matching.len(), 1, "the intermediate event must still be durable");
+    assert_eq!(
+        matching.len(),
+        1,
+        "the intermediate event must still be durable"
+    );
     assert_eq!(
         rt.actors
             .get(&actor_id)
