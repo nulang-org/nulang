@@ -129,7 +129,9 @@ fn desired_state_change_makes_an_old_retry_timer_stale_without_mutation() {
     let before = controller.snapshot();
 
     let admission = controller.admit_retry_timer(&ticket.timer_name()).unwrap();
-    assert!(matches!(admission, ReconcileTimerAdmission::Stale(identity) if identity == ticket.identity()));
+    assert!(
+        matches!(admission, ReconcileTimerAdmission::Stale(identity) if identity == ticket.identity())
+    );
     assert_eq!(controller.snapshot(), before);
 }
 
@@ -174,19 +176,21 @@ fn retry_budget_exhaustion_never_arms_an_extra_timer() {
 
     let first = controller.begin_attempt().unwrap();
     assert!(matches!(
-        controller.schedule_retry(&mut runtime, actor_id, first).unwrap(),
+        controller
+            .schedule_retry(&mut runtime, actor_id, first)
+            .unwrap(),
         ReconcileRetryDecision::Scheduled(_)
     ));
     assert_eq!(runtime.timer_wheel.len(), 1);
 
-    let current_timer = controller
-        .snapshot()
-        .retry_ordinal;
+    let current_timer = controller.snapshot().retry_ordinal;
     assert_eq!(current_timer, 1);
 
     let second = controller.begin_attempt().unwrap();
     assert_eq!(
-        controller.schedule_retry(&mut runtime, actor_id, second).unwrap(),
+        controller
+            .schedule_retry(&mut runtime, actor_id, second)
+            .unwrap(),
         ReconcileRetryDecision::Exhausted
     );
     assert_eq!(runtime.timer_wheel.len(), 1);
