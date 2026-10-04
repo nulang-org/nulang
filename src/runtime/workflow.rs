@@ -384,7 +384,7 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
         }
         // Persist events for EventSourced fields (non-workflow actors).
         if !is_workflow && !event_sourced_names.is_empty() {
-            let module = actor.bytecode_module.as_ref();
+            let module = actor.bytecode_module.as_deref();
             let persisted_args: Vec<PersistedValue> = args
                 .iter()
                 .map(|v| PersistedValue::from_value_resolved(v, module))
@@ -435,7 +435,7 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
             let module = rt
                 .actors
                 .get(&actor_id)
-                .and_then(|a| a.bytecode_module.as_ref());
+                .and_then(|a| a.bytecode_module.as_deref());
             let payload: Vec<PersistedValue> = args
                 .iter()
                 .map(|v| PersistedValue::from_value_resolved(v, module))
@@ -607,7 +607,7 @@ pub(crate) fn query_workflow(rt: &mut Runtime, actor_id: u64, name: &str) -> Opt
             return None;
         }
         let handler = *actor.query_handlers.get(name)?;
-        (handler, actor.bytecode_module.clone()?)
+        (handler, actor.bytecode_module.as_deref().cloned()?)
     };
 
     let self_ptr: *mut Runtime = rt;
