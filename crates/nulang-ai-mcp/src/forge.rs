@@ -6,6 +6,7 @@
 //! account-wide authority.
 
 use async_trait::async_trait;
+use nulang_security::{Principal, PrincipalKind, UnixSeconds};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fmt;
@@ -86,7 +87,8 @@ fn validate_repository_component(kind: &str, value: &str) -> Result<(), ForgeErr
 pub struct ForgeGrant {
     pub repository: RepositoryRef,
     pub operations: BTreeSet<ForgeOperation>,
-    pub expires_at_unix_secs: Option<u64>,
+    #[serde(rename = "expires_at_unix_secs")]
+    pub expires_at: Option<UnixSeconds>,
 }
 
 impl ForgeGrant {
@@ -97,12 +99,12 @@ impl ForgeGrant {
         Self {
             repository,
             operations: operations.into_iter().collect(),
-            expires_at_unix_secs: None,
+            expires_at: None,
         }
     }
 
-    pub fn with_expiry(mut self, expires_at_unix_secs: u64) -> Self {
-        self.expires_at_unix_secs = Some(expires_at_unix_secs);
+    pub fn with_expiry(mut self, expires_at: UnixSeconds) -> Self {
+        self.expires_at = Some(expires_at);
         self
     }
 
@@ -110,16 +112,13 @@ impl ForgeGrant {
         &self,
         repository: &RepositoryRef,
         operation: ForgeOperation,
-        now_unix_secs: u64,
+        now: UnixSeconds,
     ) -> GrantDecision {
         if &self.repository != repository || !self.operations.contains(&operation) {
             return GrantDecision::NoMatch;
         }
 
-        if self
-            .expires_at_unix_secs
-            .is_some_and(|expires_at| now_unix_secs >= expires_at)
-        {
+        if self.expires_at.is_some_and(|expires_at| now >= expires_at) {
             GrantDecision::Expired
         } else {
             GrantDecision::Allowed
@@ -129,30 +128,35 @@ impl ForgeGrant {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForgeSession {
-    pub subject: String,
+    pub subject: Principal,
     pub grants: Vec<ForgeGrant>,
 }
 
 impl ForgeSession {
-    pub fn new(subject: impl Into<String>, grants: Vec<ForgeGrant>) -> Result<Self, ForgeError> {
-        let subject = subject.into();
-        if subject.trim().is_empty() {
-            return Err(ForgeError::InvalidInput(
-                "forge subject must be non-empty".to_string(),
-            ));
-        }
-        Ok(Self { subject, grants })
+    pub fn new(subject: Principal, grants: Vec<ForgeGrant>) -> Self {
+        Self { subject, grants }
+    }
+
+    /// Compatibility constructor for existing forge-host configuration where
+    /// a subject string unambiguously represents an agent identity.
+    pub fn for_agent(
+        id: impl Into<String>,
+        grants: Vec<ForgeGrant>,
+    ) -> Result<Self, ForgeError> {
+        let subject = Principal::new(PrincipalKind::Agent, id.into())
+            .map_err(|err| ForgeError::InvalidInput(err.to_string()))?;
+        Ok(Self::new(subject, grants))
     }
 
     fn authorize_at(
         &self,
         repository: &RepositoryRef,
         operation: ForgeOperation,
-        now_unix_secs: u64,
+        now: UnixSeconds,
     ) -> Result<(), ForgeError> {
         let mut saw_expired = false;
         for grant in &self.grants {
-            match grant.permits(repository, operation, now_unix_secs) {
+            match grant.permits(repository, operation, now) {
                 GrantDecision::Allowed => return Ok(()),
                 GrantDecision::Expired => saw_expired = true,
                 GrantDecision::NoMatch => {}
@@ -161,13 +165,13 @@ impl ForgeSession {
 
         if saw_expired {
             Err(ForgeError::Expired {
-                subject: self.subject.clone(),
+                subject: self.subject.id().to_string(),
                 repository: repository.full_name(),
                 operation,
             })
         } else {
             Err(ForgeError::Denied {
-                subject: self.subject.clone(),
+                subject: self.subject.id().to_string(),
                 repository: repository.full_name(),
                 operation,
             })
@@ -398,18 +402,18 @@ where
     ) -> Result<ForgeResponse, ForgeError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|_| ForgeError::Backend("system clock is before Unix epoch".to_string()))?
-            .as_secs();
-        self.execute_at(session, command, now).await
+            .map_err(|_| ForgeError::Backend("system clock is before Unix epoch".to_string()))?;
+        self.execute_at(session, command, UnixSeconds::from_secs(now.as_secs()))
+            .await
     }
 
     pub async fn execute_at(
         &self,
         session: &ForgeSession,
         command: ForgeCommand,
-        now_unix_secs: u64,
+        now: UnixSeconds,
     ) -> Result<ForgeResponse, ForgeError> {
-        session.authorize_at(command.repository(), command.operation(), now_unix_secs)?;
+        session.authorize_at(command.repository(), command.operation(), now)?;
         self.backend.execute(command).await
     }
 }
@@ -436,6 +440,10 @@ mod tests {
             Poll::Ready(value) => value,
             Poll::Pending => panic!("test future unexpectedly yielded"),
         }
+    }
+
+    fn t(seconds: u64) -> UnixSeconds {
+        UnixSeconds::from_secs(seconds)
     }
 
     struct RecordingBackend {
@@ -468,14 +476,14 @@ mod tests {
             calls: AtomicUsize::new(0),
         };
         let gateway = ForgeGateway::new(backend);
-        let session = ForgeSession::new(
+        let session = ForgeSession::for_agent(
             "agent-7",
             vec![ForgeGrant::new(repo("nulang"), [ForgeOperation::RepoRead])],
         )
         .unwrap();
 
         let result =
-            block_on_immediate(gateway.execute_at(&session, read_command(repo("nulang")), 100));
+            block_on_immediate(gateway.execute_at(&session, read_command(repo("nulang")), t(100)));
 
         assert!(result.is_ok());
         assert_eq!(gateway.backend().calls.load(Ordering::SeqCst), 1);
@@ -487,14 +495,14 @@ mod tests {
             calls: AtomicUsize::new(0),
         };
         let gateway = ForgeGateway::new(backend);
-        let session = ForgeSession::new(
+        let session = ForgeSession::for_agent(
             "agent-7",
             vec![ForgeGrant::new(repo("other"), [ForgeOperation::RepoRead])],
         )
         .unwrap();
 
         let error =
-            block_on_immediate(gateway.execute_at(&session, read_command(repo("nulang")), 100))
+            block_on_immediate(gateway.execute_at(&session, read_command(repo("nulang")), t(100)))
                 .unwrap_err();
 
         assert!(matches!(error, ForgeError::Denied { .. }));
@@ -507,14 +515,14 @@ mod tests {
             calls: AtomicUsize::new(0),
         };
         let gateway = ForgeGateway::new(backend);
-        let session = ForgeSession::new(
+        let session = ForgeSession::for_agent(
             "agent-7",
-            vec![ForgeGrant::new(repo("nulang"), [ForgeOperation::RepoRead]).with_expiry(100)],
+            vec![ForgeGrant::new(repo("nulang"), [ForgeOperation::RepoRead]).with_expiry(t(100))],
         )
         .unwrap();
 
         let error =
-            block_on_immediate(gateway.execute_at(&session, read_command(repo("nulang")), 100))
+            block_on_immediate(gateway.execute_at(&session, read_command(repo("nulang")), t(100)))
                 .unwrap_err();
 
         assert!(matches!(error, ForgeError::Expired { .. }));
@@ -528,7 +536,7 @@ mod tests {
         };
         let gateway = ForgeGateway::new(backend);
         let repository = repo("nulang");
-        let session = ForgeSession::new(
+        let session = ForgeSession::for_agent(
             "coder-agent",
             vec![ForgeGrant::new(
                 repository.clone(),
@@ -545,7 +553,7 @@ mod tests {
                 method: MergeMethod::Squash,
                 expected_head_sha: None,
             },
-            100,
+            t(100),
         ))
         .unwrap_err();
 
