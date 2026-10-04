@@ -6,6 +6,7 @@
 //! without pulling in the compiler or VM.
 
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::error::Error;
 use std::fmt;
 
@@ -99,7 +100,36 @@ impl fmt::Display for DelegationId {
     }
 }
 
-/// Monotonic hosted-policy revocation generation.
+/// Names the authority that owns a revocation generation sequence.
+///
+/// Epochs are comparable only inside one domain. A tenant policy authority,
+/// workload identity issuer, or another embedding trust boundary should use a
+/// stable domain ID and never compare its epochs with another domain's epochs.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RevocationDomainId(String);
+
+impl RevocationDomainId {
+    pub fn new(id: impl Into<String>) -> Result<Self, SecurityPrimitiveError> {
+        let id = id.into();
+        if id.trim().is_empty() {
+            return Err(SecurityPrimitiveError::EmptyRevocationDomainId);
+        }
+        Ok(Self(id))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for RevocationDomainId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Monotonic hosted-policy revocation generation within one domain.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
@@ -129,13 +159,45 @@ impl fmt::Display for RevocationEpoch {
     }
 }
 
+/// A revocation generation together with the domain that owns it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RevocationVersion {
+    domain: RevocationDomainId,
+    epoch: RevocationEpoch,
+}
+
+impl RevocationVersion {
+    pub fn new(domain: RevocationDomainId, epoch: RevocationEpoch) -> Self {
+        Self { domain, epoch }
+    }
+
+    pub fn domain(&self) -> &RevocationDomainId {
+        &self.domain
+    }
+
+    pub const fn epoch(&self) -> RevocationEpoch {
+        self.epoch
+    }
+
+    /// Compare generations only when both versions belong to the same domain.
+    /// A domain mismatch is intentionally not ordered and must fail closed at
+    /// the policy/authorization layer rather than accidentally comparing the
+    /// raw epoch integers.
+    pub fn compare_epoch(&self, other: &Self) -> Option<Ordering> {
+        if self.domain != other.domain {
+            return None;
+        }
+        Some(self.epoch.cmp(&other.epoch))
+    }
+}
+
 /// Immutable provenance attached to one issued delegation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DelegationProvenance {
     id: DelegationId,
     parent_id: Option<DelegationId>,
     issued_at: UnixSeconds,
-    revocation_epoch: RevocationEpoch,
+    revocation: RevocationVersion,
 }
 
 impl DelegationProvenance {
@@ -143,13 +205,13 @@ impl DelegationProvenance {
         id: DelegationId,
         parent_id: Option<DelegationId>,
         issued_at: UnixSeconds,
-        revocation_epoch: RevocationEpoch,
+        revocation: RevocationVersion,
     ) -> Self {
         Self {
             id,
             parent_id,
             issued_at,
-            revocation_epoch,
+            revocation,
         }
     }
 
@@ -165,8 +227,8 @@ impl DelegationProvenance {
         self.issued_at
     }
 
-    pub const fn revocation_epoch(&self) -> RevocationEpoch {
-        self.revocation_epoch
+    pub fn revocation(&self) -> &RevocationVersion {
+        &self.revocation
     }
 }
 
@@ -174,6 +236,7 @@ impl DelegationProvenance {
 pub enum SecurityPrimitiveError {
     EmptyPrincipalId,
     EmptyDelegationId,
+    EmptyRevocationDomainId,
 }
 
 impl fmt::Display for SecurityPrimitiveError {
@@ -181,6 +244,7 @@ impl fmt::Display for SecurityPrimitiveError {
         match self {
             Self::EmptyPrincipalId => f.write_str("principal id must not be empty"),
             Self::EmptyDelegationId => f.write_str("delegation id must not be empty"),
+            Self::EmptyRevocationDomainId => f.write_str("revocation domain id must not be empty"),
         }
     }
 }
