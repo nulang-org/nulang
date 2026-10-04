@@ -1,7 +1,7 @@
 #[cfg(feature = "native-codegen")]
 mod benchmarks {
     use std::hint::black_box;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use nulang::bytecode::CodeModule;
     use nulang::effect_checker::{CapContext, CapabilityAnalyzer, EffectChecker};
@@ -40,11 +40,17 @@ mod benchmarks {
             .expect("bench: codegen failed")
     }
 
-    fn report_ab(name: &str, operations: u64, elapsed: std::time::Duration) {
+    fn report_ab(name: &str, operations: u64, elapsed: Duration) {
         println!(
             "[ab-bench] benchmark={name} operations={operations} elapsed_ns={}",
             elapsed.as_nanos()
         );
+    }
+
+    fn timed_run(vm: &mut VM, failure: &str) -> (Option<i64>, Duration) {
+        let start = Instant::now();
+        let result = black_box(vm.run().expect(failure)).as_int();
+        (result, start.elapsed())
     }
 
     #[test]
@@ -53,51 +59,45 @@ mod benchmarks {
             "var sum = 0; var i = 0; while i < 500 { sum = sum + i * 2 - i / 3; i = i + 1; }; sum";
         let module = compile(source);
 
-        let mut interp_vms: Vec<VM> = (0..REPEATS)
-            .map(|_| {
-                let mut vm = VM::new_without_jit();
-                vm.load_module(module.clone());
-                vm
-            })
-            .collect();
-        let interp_start = Instant::now();
-        let mut interp_result = None;
-        for vm in &mut interp_vms {
-            interp_result = Some(black_box(
-                vm.run().expect("bench: cold interpreter run failed"),
-            ));
-        }
-        let interp_elapsed = interp_start.elapsed();
-        report_ab("interp_cold_jit_off", REPEATS as u64, interp_elapsed);
+        let mut interp_elapsed = Duration::ZERO;
+        let mut jit_elapsed = Duration::ZERO;
 
-        let mut jit_vms: Vec<VM> = (0..REPEATS)
-            .map(|_| {
-                let mut vm = VM::new();
-                vm.load_module(module.clone());
-                vm
-            })
-            .collect();
-        let jit_start = Instant::now();
-        let mut jit_result = None;
-        for vm in &mut jit_vms {
-            jit_result = Some(black_box(
-                vm.run().expect("bench: cold JIT-enabled run failed"),
-            ));
-        }
-        let jit_elapsed = jit_start.elapsed();
+        for repetition in 0..REPEATS {
+            let mut interp_vm = VM::new_without_jit();
+            interp_vm.load_module(module.clone());
+            let mut jit_vm = VM::new();
+            jit_vm.load_module(module.clone());
 
-        assert_eq!(
-            interp_result.and_then(|value| value.as_int()),
-            jit_result.and_then(|value| value.as_int()),
-            "cold JIT probe must preserve interpreter semantics"
-        );
-        for vm in &jit_vms {
+            let (interp_result, interp_sample);
+            let (jit_result, jit_sample);
+
+            if repetition % 2 == 0 {
+                (interp_result, interp_sample) =
+                    timed_run(&mut interp_vm, "bench: cold interpreter run failed");
+                (jit_result, jit_sample) =
+                    timed_run(&mut jit_vm, "bench: cold JIT-enabled run failed");
+            } else {
+                (jit_result, jit_sample) =
+                    timed_run(&mut jit_vm, "bench: cold JIT-enabled run failed");
+                (interp_result, interp_sample) =
+                    timed_run(&mut interp_vm, "bench: cold interpreter run failed");
+            }
+
+            interp_elapsed += interp_sample;
+            jit_elapsed += jit_sample;
+
             assert_eq!(
-                vm.jit_compiled_count(),
+                interp_result, jit_result,
+                "cold JIT probe must preserve interpreter semantics"
+            );
+            assert_eq!(
+                jit_vm.jit_compiled_count(),
                 0,
                 "sub-threshold cold probe must not compile a JIT region"
             );
         }
+
+        report_ab("interp_cold_jit_off", REPEATS as u64, interp_elapsed);
         report_ab("interp_cold_jit_on", REPEATS as u64, jit_elapsed);
     }
 }
