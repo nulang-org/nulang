@@ -365,7 +365,7 @@ mod tests {
     #[test]
     fn host_registration_exposes_only_command_fields() {
         let registry = ToolRegistry::new();
-        let session = ForgeSession::new(
+        let session = ForgeSession::for_agent(
             "coder",
             vec![ForgeGrant::new(repo(), [ForgeOperation::RepoRead])],
         )
@@ -395,7 +395,7 @@ mod tests {
         let backend = Arc::new(ForgeGateway::new(FakeBackend {
             calls: AtomicUsize::new(0),
         }));
-        let session = ForgeSession::new("reader", vec![]).unwrap();
+        let session = ForgeSession::for_agent("reader", vec![]).unwrap();
         block_on_immediate(register_forge_tools(&registry, backend, session));
         let server = McpServer::new(registry);
 
@@ -428,7 +428,7 @@ mod tests {
         let backend = Arc::new(ForgeGateway::new(FakeBackend {
             calls: AtomicUsize::new(0),
         }));
-        let session = ForgeSession::new(
+        let session = ForgeSession::for_agent(
             "coder",
             vec![ForgeGrant::new(
                 repo(),
@@ -461,7 +461,7 @@ mod tests {
     #[test]
     fn permitted_check_read_reaches_backend() {
         let registry = Arc::new(ToolRegistry::new());
-        let session = ForgeSession::new(
+        let session = ForgeSession::for_agent(
             "reviewer",
             vec![ForgeGrant::new(repo(), [ForgeOperation::CheckRead])],
         )

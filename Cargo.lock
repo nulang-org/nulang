@@ -2451,6 +2451,7 @@ dependencies = [
  "mio",
  "nulang-ai",
  "nulang-ai-local",
+ "nulang-security",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
@@ -2553,6 +2554,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "hmac",
+ "nulang-security",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -2590,6 +2592,14 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "nulang-security"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
