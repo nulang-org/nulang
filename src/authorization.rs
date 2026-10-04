@@ -285,10 +285,7 @@ impl AuthorityDelegation {
             return Err(DelegationError::RedelegationForbidden);
         }
 
-        if let Some(missing) = requested
-            .iter()
-            .find(|grant| !self.authority.allows(grant))
-        {
+        if let Some(missing) = requested.iter().find(|grant| !self.authority.allows(grant)) {
             return Err(DelegationError::AuthorityEscalation(missing.clone()));
         }
 
