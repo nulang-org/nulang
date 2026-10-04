@@ -2,9 +2,9 @@
 //!
 //! The core contract is deliberately infrastructure-agnostic: callers own how
 //! desired and observed state are read or applied, while this module owns the
-//! generation fencing that makes retries, duplicate work, and superseded work
-//! safe. An attempt may mutate controller state only while its generation is
-//! still current.
+//! fencing that makes retries, duplicate work, and superseded work safe. An
+//! attempt may mutate controller state only while both its desired generation
+//! and attempt ordinal are still current.
 //!
 //! This is the runtime foundation for Kubernetes/Borg-style reconciliation in
 //! Nulang without coupling the language surface to Kubernetes or any specific
@@ -26,11 +26,11 @@ pub enum ReconcilePhase {
     TerminalFailure,
 }
 
-/// Opaque generation-fenced token identifying one reconciliation attempt.
+/// Opaque fenced token identifying one reconciliation attempt.
 ///
 /// Controllers should carry this token through asynchronous observe/apply work
-/// and present it when reporting the result. A result from a superseded
-/// generation is rejected without mutating state.
+/// and present it when reporting the result. A result from an older generation
+/// or an older attempt in the same generation is rejected without mutation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ReconcileAttempt {
     generation: u64,
@@ -56,14 +56,20 @@ pub enum ReconcileError {
     GenerationOverflow,
     /// Starting another attempt would wrap the per-generation attempt counter.
     AttemptOverflow,
-    /// A result was produced for a generation that has already been superseded.
+    /// A result was produced for a desired generation that has been replaced.
     StaleAttempt {
         attempt_generation: u64,
         current_generation: u64,
     },
+    /// A newer attempt has already started for the same desired generation.
+    SupersededAttempt {
+        generation: u64,
+        attempt_ordinal: u64,
+        current_ordinal: u64,
+    },
 }
 
-/// Generation-fenced controller state for one logical resource.
+/// Fenced controller state for one logical resource.
 ///
 /// `Spec` is intentionally unconstrained except where an operation needs a
 /// property such as equality. This keeps the primitive usable for deployment
@@ -111,7 +117,8 @@ impl<Spec> ReconcileState<Spec> {
         self.phase
     }
 
-    /// True when the controller should schedule reconciliation work.
+    /// True while the current desired generation still requires reconciliation
+    /// attention.
     ///
     /// Terminal failure deliberately returns false for the current generation:
     /// repeatedly retrying a terminal condition would create an uncontrolled
@@ -132,7 +139,10 @@ impl<Spec> ReconcileState<Spec> {
             && self.observed_generation == self.generation
     }
 
-    /// Start one generation-fenced reconciliation attempt.
+    /// Start one fenced reconciliation attempt.
+    ///
+    /// Starting a newer attempt supersedes every earlier attempt in this same
+    /// generation. Late results from those attempts fail closed.
     pub fn begin_attempt(&mut self) -> Result<ReconcileAttempt, ReconcileError> {
         let ordinal = self
             .attempt_ordinal
@@ -145,8 +155,7 @@ impl<Spec> ReconcileState<Spec> {
         })
     }
 
-    /// Report forward progress for an attempt that still belongs to the current
-    /// desired generation.
+    /// Report forward progress for the current attempt.
     pub fn mark_progressing(
         &mut self,
         attempt: ReconcileAttempt,
@@ -197,6 +206,13 @@ impl<Spec> ReconcileState<Spec> {
             return Err(ReconcileError::StaleAttempt {
                 attempt_generation: attempt.generation,
                 current_generation: self.generation,
+            });
+        }
+        if attempt.ordinal != self.attempt_ordinal {
+            return Err(ReconcileError::SupersededAttempt {
+                generation: self.generation,
+                attempt_ordinal: attempt.ordinal,
+                current_ordinal: self.attempt_ordinal,
             });
         }
         Ok(())
