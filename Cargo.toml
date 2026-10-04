@@ -94,6 +94,9 @@ postgres = ["dep:postgres"]
 difffuzz = ["native-codegen"]
 
 [dependencies]
+# Shared dependency-light security primitives
+nulang-security = { path = "crates/nulang-security", version = "0.1.0" }
+
 # Memory & concurrency
 mimalloc = "0.1"
 crossbeam = "0.8"
