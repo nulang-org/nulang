@@ -107,9 +107,8 @@ fn bench_interp_record_loop(c: &mut Criterion) {
 
 /// A loop below HOT_THRESHOLD (500 < 1000 iterations), so no region ever
 /// tiers up. Comparing JIT-enabled (`VM::new`) vs JIT-disabled
-/// (`new_without_jit`) on identical source quantifies the per-instruction
-/// JIT-probe overhead the default path pays on cold code (two FxHashMap
-/// lookups per step: `is_compiled` + `record_and_check_hot`).
+/// (`new_without_jit`) on identical source quantifies the residual cold-code
+/// cost of candidate classification and hotness probing on JIT-enabled VMs.
 fn bench_interp_cold_jit_probe(c: &mut Criterion) {
     let source =
         "var sum = 0; var i = 0; while i < 500 { sum = sum + i * 2 - i / 3; i = i + 1; }; sum";

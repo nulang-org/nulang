@@ -3558,7 +3558,24 @@ impl VM {
         })
     }
 
-    /// Attempt JIT execution for the current PC.
+    #[cfg(feature = "native-codegen")]
+    #[inline(always)]
+    fn jit_candidate_for_frame(&self, frame_idx: usize) -> bool {
+        let frame = &self.frames[frame_idx];
+        self.jit_candidate_pcs
+            .get(frame.module_idx)
+            .and_then(|row| row.get(frame.pc))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(feature = "native-codegen"))]
+    #[inline(always)]
+    fn jit_candidate_for_frame(&self, _frame_idx: usize) -> bool {
+        false
+    }
+
+    /// Attempt JIT execution for a PC already classified as a JIT candidate.
     ///
     /// Returns `true` if the JIT executed a compiled region and advanced the
     /// PC — the caller should return `Ok(())` immediately.
@@ -3566,18 +3583,6 @@ impl VM {
     fn try_jit_execute(&mut self, frame_idx: usize) -> bool {
         let module_idx = self.frames[frame_idx].module_idx;
         let pc = self.frames[frame_idx].pc;
-
-        // Most PCs can never be profitable JIT region entries. Avoid backend
-        // dispatch and hot-counter mutation entirely for those instructions.
-        if !self
-            .jit_candidate_pcs
-            .get(module_idx)
-            .and_then(|row| row.get(pc))
-            .copied()
-            .unwrap_or(false)
-        {
-            return false;
-        }
 
         // Keep the cold path minimal. Detach the backend only after a compiled
         // region exists or this PC crosses the hot threshold.
@@ -5007,6 +5012,7 @@ impl VM {
         // through the interpreter (and the debug hook below).
         if self.debug_hook.is_none()
             && self.jit_session.is_some()
+            && self.jit_candidate_for_frame(frame_idx)
             && self.try_jit_execute(frame_idx)
         {
             if let Some(msg) = self.jit_pending_error.take() {
