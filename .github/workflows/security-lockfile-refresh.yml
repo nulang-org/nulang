@@ -1,0 +1,27 @@
+name: Security Lockfile Refresh
+
+on:
+  push:
+    branches:
+      - codex/shared-security-primitives
+
+permissions:
+  contents: read
+
+jobs:
+  generate-lockfile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - name: Refresh workspace lock metadata
+        run: cargo metadata --format-version 1 > /dev/null
+      - name: Show lockfile delta
+        run: git diff -- Cargo.lock
+      - uses: actions/upload-artifact@v7
+        with:
+          name: security-cargo-lock
+          path: Cargo.lock
+          if-no-files-found: error
