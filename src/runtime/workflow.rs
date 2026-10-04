@@ -458,7 +458,7 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                         );
                     }
                     CustomEventReplayDisposition::Append => {
-                        should_checkpoint = rt
+                        let appended = rt
                             .persistence
                             .append_workflow_event(
                                 actor_id,
@@ -470,7 +470,12 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                                 },
                             )
                             .is_ok();
-                        if should_checkpoint {
+                        if appended {
+                            // This event belongs to an open activation. Keep the
+                            // last completed snapshot unchanged so recovery can
+                            // re-execute the command and consume this exact
+                            // replay identity instead of treating partial state
+                            // as completed progress.
                             advance_custom_event_replay_id(rt, actor_id, replay_id);
                         }
                     }
