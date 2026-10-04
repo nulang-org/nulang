@@ -77,7 +77,10 @@ fn closed_timestamp_regression_fails_closed_without_mutating_state() {
 
     let error = closed.advance(attempted).unwrap_err();
 
-    assert_eq!(error, ClosedTimestampError::Regression { current, attempted });
+    assert_eq!(
+        error,
+        ClosedTimestampError::Regression { current, attempted }
+    );
     assert_eq!(closed.get(), Some(current));
 }
 
