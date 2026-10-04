@@ -10,6 +10,7 @@ serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["sync"] }
 async-trait = "0.1"
+nulang-security = { path = "../nulang-security", version = "0.1.0" }
 
 hmac = "0.13"
 sha2 = "0.11"
