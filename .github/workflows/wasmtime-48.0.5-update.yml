@@ -39,14 +39,13 @@ jobs:
           from pathlib import Path
           p = Path('Cargo.toml')
           s = p.read_text()
-          old = 'wasmtime = { version = "=48.0.3"'
-          new = 'wasmtime = { version = "=48.0.5"'
+          old = 'wasmtime = { version = "48.0.3"'
+          new = 'wasmtime = { version = "48.0.5"'
           if old not in s:
               raise SystemExit('expected Wasmtime 48.0.3 pin not found')
           p.write_text(s.replace(old, new, 1))
           PY
           cargo update -p wasmtime --precise 48.0.5
-          cargo update -p wasmtime-wasi --precise 48.0.5 || true
 
       - name: Validate locked WASM backend
         run: |
