@@ -60,6 +60,8 @@ class PerformanceCrownTests(unittest.TestCase):
     def test_end_to_end_evidence_requires_runner_but_is_not_claim_ready(self):
         with tempfile.TemporaryDirectory() as td:
             root = pathlib.Path(td)
+            (root / "scripts").mkdir()
+            (root / "scripts" / "runner.py").write_text("# runner\n")
             (root / "benches").mkdir()
             (root / "benches" / "dist_bench.rs").write_text("// benchmark\n")
             manifest = self.make_manifest()
