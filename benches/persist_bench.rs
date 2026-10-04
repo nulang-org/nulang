@@ -19,11 +19,11 @@ use nulang::runtime::{
 };
 
 #[cfg(feature = "sqlite")]
+use nulang::runtime::LibsqlStore;
+#[cfg(feature = "sqlite")]
 use std::path::PathBuf;
 #[cfg(feature = "sqlite")]
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(feature = "sqlite")]
-use nulang::runtime::LibsqlStore;
 
 fn snapshot_with_payload(payload_bytes: usize) -> ActorSnapshot {
     let mut state = HashMap::new();
