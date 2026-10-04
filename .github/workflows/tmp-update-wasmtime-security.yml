@@ -1,0 +1,80 @@
+name: Stage Wasmtime security update
+
+on:
+  push:
+    branches:
+      - fix/audit-gate-current-main-20261003
+    paths:
+      - .github/workflows/tmp-update-wasmtime-security.yml
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/audit-gate-current-main-20261003
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
+
+      - name: Update Wasmtime and lockfile
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          cargo = Path('Cargo.toml')
+          text = cargo.read_text(encoding='utf-8')
+          old = 'wasmtime = { version = "48.0.3", optional = true, default-features = false'
+          new = 'wasmtime = { version = "48.0.5", optional = true, default-features = false'
+          assert text.count(old) == 1, 'unexpected Wasmtime dependency declaration'
+          cargo.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          changelog = Path('CHANGELOG.md')
+          text = changelog.read_text(encoding='utf-8')
+          anchor = '# Nulang Changelog\n'
+          assert text.startswith(anchor)
+          entry = '''### Wasmtime security update — 2026-10-03
+          - **Upgrade Wasmtime from 48.0.3 to 48.0.5 to pick up the 48.0.4 security fixes and the corrected 48.0.5 publication.** This clears the October 2 Wasmtime advisories for component-model tag validation, GC rooting across `try_call`, and async-lifted callback result validation without changing Nulang's enabled Wasmtime feature set.
+
+          '''
+          changelog.write_text(anchor + entry + text[len(anchor):], encoding='utf-8')
+          PY
+          cargo update -p wasmtime@48.0.3 --precise 48.0.5
+          git diff --check
+          grep -n 'wasmtime = { version = "48.0.5"' Cargo.toml
+
+      - name: Validate WASM feature profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --locked --no-default-features --features wasm-backend
+          cargo test --locked --no-default-features --features wasm-backend --lib
+
+      - name: Validate RustSec gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install cargo-audit --locked
+          cargo audit
+
+      - name: Commit validated security update
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/tmp-update-wasmtime-security.yml
+          git config user.name "nulang-maintenance"
+          git config user.email "actions@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock CHANGELOG.md .github/workflows/tmp-update-wasmtime-security.yml
+          git diff --cached --check
+          git commit -m "fix(security): update Wasmtime to 48.0.5"
+          git push origin HEAD:fix/audit-gate-current-main-20261003
