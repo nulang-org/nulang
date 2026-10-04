@@ -307,6 +307,27 @@ mod tests {
     }
 
     #[test]
+    fn older_attempt_in_same_generation_cannot_overwrite_newer_result() {
+        let mut state = ReconcileState::new("replicas=3");
+        let older = state.begin_attempt().unwrap();
+        let newer = state.begin_attempt().unwrap();
+        state.mark_converged(newer).unwrap();
+        let before = state.clone();
+
+        let error = state.mark_retryable_failure(older).unwrap_err();
+
+        assert_eq!(
+            error,
+            ReconcileError::SupersededAttempt {
+                generation: 1,
+                attempt_ordinal: 1,
+                current_ordinal: 2,
+            }
+        );
+        assert_eq!(state, before);
+    }
+
+    #[test]
     fn retryable_failure_keeps_generation_unobserved() {
         let mut state = ReconcileState::new("replicas=3");
         let attempt = state.begin_attempt().unwrap();
