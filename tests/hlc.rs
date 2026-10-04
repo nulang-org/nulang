@@ -30,9 +30,7 @@ fn observing_remote_time_advances_past_remote_timestamp() {
     let mut clock = HybridLogicalClock::new(5_000);
     clock.tick(1_000).unwrap();
 
-    let observed = clock
-        .observe(HlcTimestamp::new(1_500, 7), 1_100)
-        .unwrap();
+    let observed = clock.observe(HlcTimestamp::new(1_500, 7), 1_100).unwrap();
 
     assert_eq!(observed, HlcTimestamp::new(1_500, 8));
 }
@@ -42,9 +40,7 @@ fn observing_equal_physical_time_uses_greatest_logical_counter() {
     let mut clock = HybridLogicalClock::new(5_000);
     clock.observe(HlcTimestamp::new(2_000, 4), 2_000).unwrap();
 
-    let observed = clock
-        .observe(HlcTimestamp::new(2_000, 9), 1_900)
-        .unwrap();
+    let observed = clock.observe(HlcTimestamp::new(2_000, 9), 1_900).unwrap();
 
     assert_eq!(observed, HlcTimestamp::new(2_000, 10));
 }

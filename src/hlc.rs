@@ -13,7 +13,9 @@ use std::fmt;
 /// capture causal ordering when every receive path calls [`HybridLogicalClock::observe`].
 /// They are not globally unique by themselves; protocols that require a total
 /// tie-break across nodes should pair the timestamp with a stable node/actor id.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 pub struct HlcTimestamp {
     physical_micros: u64,
     logical: u32,
@@ -129,9 +131,7 @@ impl HybridLogicalClock {
         remote: HlcTimestamp,
         local_physical_micros: u64,
     ) -> Result<HlcTimestamp, HlcError> {
-        let remote_ahead_by = remote
-            .physical_micros
-            .saturating_sub(local_physical_micros);
+        let remote_ahead_by = remote.physical_micros.saturating_sub(local_physical_micros);
         if remote_ahead_by > self.max_future_drift_micros {
             return Err(HlcError::RemoteClockTooFarAhead {
                 remote_physical_micros: remote.physical_micros,
@@ -150,10 +150,7 @@ impl HybridLogicalClock {
             physical == self.last.physical_micros,
             physical == remote.physical_micros,
         ) {
-            (true, true) => increment_logical(
-                self.last.logical.max(remote.logical),
-                physical,
-            )?,
+            (true, true) => increment_logical(self.last.logical.max(remote.logical), physical)?,
             (true, false) => increment_logical(self.last.logical, physical)?,
             (false, true) => increment_logical(remote.logical, physical)?,
             (false, false) => 0,
