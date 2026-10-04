@@ -6,22 +6,30 @@ on:
       - codex/shared-security-primitives
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   generate-lockfile:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: codex/shared-security-primitives
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
       - name: Refresh workspace lock metadata
         run: cargo metadata --format-version 1 > /dev/null
-      - name: Show lockfile delta
-        run: git diff -- Cargo.lock
-      - uses: actions/upload-artifact@v7
-        with:
-          name: security-cargo-lock
-          path: Cargo.lock
-          if-no-files-found: error
+      - name: Verify lockfile delta is limited to nulang-security wiring
+        run: |
+          git diff -- Cargo.lock
+          test "$(git diff --name-only)" = "Cargo.lock"
+          git diff -- Cargo.lock | grep -q 'nulang-security'
+      - name: Commit lockfile and remove this helper
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          git rm .github/workflows/security-lockfile-refresh.yml
+          git commit -m "chore(security): refresh workspace lockfile"
+          git push origin HEAD:codex/shared-security-primitives
