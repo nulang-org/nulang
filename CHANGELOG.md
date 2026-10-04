@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Wasmtime security update — 2026-10-03
+- **Upgrade Wasmtime from 48.0.3 to 48.0.5 to pick up the 48.0.4 security fixes and the corrected 48.0.5 publication.** This clears the October 2 Wasmtime advisories for component-model tag validation, GC rooting across `try_call`, and async-lifted callback result validation without changing Nulang's enabled Wasmtime feature set.
+
 ### Standalone SQLite feature dependency closure — 2026-10-02
 - **The standalone `sqlite` feature now enables Tokio directly because `LibsqlStore` owns a Tokio runtime.** Minimal `--no-default-features --features sqlite` builds no longer rely on unrelated default-profile features to supply that direct dependency.
 
