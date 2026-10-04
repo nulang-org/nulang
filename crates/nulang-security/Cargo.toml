@@ -1,0 +1,13 @@
+[package]
+name = "nulang-security"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Shared identity and authorization primitives for Nulang runtimes and agent tooling"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[lib]
+name = "nulang_security"
+path = "src/lib.rs"
