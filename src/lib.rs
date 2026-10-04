@@ -18,6 +18,7 @@ pub mod authority_host;
 mod authority_runtime;
 pub use authority_runtime::RuntimeAuthorityError;
 pub mod authorization;
+pub mod authzen;
 pub mod backends;
 pub mod behavior_manifest;
 #[cfg(test)]
