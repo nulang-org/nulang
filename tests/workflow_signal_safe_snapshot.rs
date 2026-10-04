@@ -5,7 +5,8 @@ use nulang::runtime::{Runtime, WorkflowActivationId, WorkflowEvent};
 #[test]
 fn signal_received_during_open_activation_keeps_safe_snapshot() {
     let mut rt = Runtime::new();
-    let actor_id = rt.spawn_workflow_actor("SignalSafeSnapshot", Box::new(Vec::new), HashMap::new());
+    let actor_id =
+        rt.spawn_workflow_actor("SignalSafeSnapshot", Box::new(Vec::new), HashMap::new());
     let safe_snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
     let activation = WorkflowActivationId::new(actor_id, safe_snapshot.sequence + 1);
 
