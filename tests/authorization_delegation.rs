@@ -78,10 +78,7 @@ fn delegation_attenuates_authority_and_sets_the_current_holder_as_issuer() {
     let parent = AuthorityDelegation::issue(
         human,
         parent_agent.clone(),
-        manifest(&[
-            "Net::TcpOut(api.example.com:443)",
-            "Secret::Read(API_KEY)",
-        ]),
+        manifest(&["Net::TcpOut(api.example.com:443)", "Secret::Read(API_KEY)"]),
         DelegationConstraints::new(Some(t(1_000)), Some(t(5_000)), true).unwrap(),
     );
 
