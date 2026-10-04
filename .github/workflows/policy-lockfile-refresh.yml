@@ -1,0 +1,35 @@
+name: Policy Lockfile Refresh
+
+on:
+  push:
+    branches:
+      - codex/application-policy-kernel
+
+permissions:
+  contents: write
+
+jobs:
+  generate-lockfile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: codex/application-policy-kernel
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - name: Refresh workspace lock metadata
+        run: cargo metadata --format-version 1 > /dev/null
+      - name: Verify lockfile delta is limited to the policy workspace package
+        run: |
+          git diff -- Cargo.lock
+          test "$(git diff --name-only)" = "Cargo.lock"
+          git diff -- Cargo.lock | grep -q 'nulang-policy'
+      - name: Commit lockfile and remove this helper
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          git rm .github/workflows/policy-lockfile-refresh.yml
+          git commit -m "chore(policy): refresh workspace lockfile"
+          git push origin HEAD:codex/application-policy-kernel
