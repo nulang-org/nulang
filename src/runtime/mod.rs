@@ -1146,14 +1146,16 @@ impl Runtime {
         workflow::emit_event(self, actor_id, event, args)
     }
 
-    /// Append a `TimerSet` workflow event and checkpoint the actor.
+    /// Append a `TimerSet` workflow event. Outside an open activation this
+    /// also checkpoints the actor; activation-local timer preparation keeps the
+    /// last completed snapshot unchanged for replay.
     pub fn append_timer_set(
         &mut self,
         actor_id: u64,
         name: &str,
         duration_ms: u64,
     ) -> std::io::Result<()> {
-        workflow::append_timer_set(self, actor_id, name, duration_ms)
+        workflow::append_timer_set(self, actor_id, name, duration_ms).map(|_| ())
     }
 
     /// Append a `TimerFired` workflow event and checkpoint the actor.
