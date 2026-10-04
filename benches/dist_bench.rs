@@ -128,8 +128,8 @@ fn bench_actor_message_decode(c: &mut Criterion) {
 const TRANSPORT_ROUNDTRIP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Production TCP/NUL0 only: sender queue/thread -> socket -> reader thread ->
-/// incoming queue. Actor routing, mailbox admission, scheduler dispatch, and
-/// handler execution are deliberately outside this measurement boundary.
+/// incoming queue. Higher-level runtime dispatch is deliberately outside this
+/// measurement boundary.
 #[cfg(feature = "tcp")]
 struct TransportRoundTrip {
     left: TcpTransport,
@@ -227,7 +227,7 @@ impl TransportRoundTrip {
 }
 
 /// Steady-state request+return latency through the real TCP/NUL0 transport,
-/// excluding all actor-runtime work.
+/// excluding all higher-level runtime work.
 #[cfg(feature = "tcp")]
 fn bench_transport_roundtrip(c: &mut Criterion) {
     let mut group = c.benchmark_group("dist/transport_roundtrip");
