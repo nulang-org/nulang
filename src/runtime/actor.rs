@@ -265,7 +265,7 @@ pub struct Actor {
     /// Names of steps already compensated (used during recovery replay).
     pub compensated_steps: Vec<String>,
     /// Bytecode module used by this actor's bytecode behaviors.
-    pub bytecode_module: Option<crate::bytecode::CodeModule>,
+    pub bytecode_module: Option<Box<crate::bytecode::CodeModule>>,
     /// Index of the loaded bytecode module in the runtime VM.
     pub bytecode_module_idx: Option<usize>,
     pub parent: Option<u64>, // Supervisor
@@ -702,11 +702,11 @@ impl Actor {
             });
 
             return resolved.unwrap_or_else(|| {
-                PersistedValue::from_value_resolved(value, self.bytecode_module.as_ref())
+                PersistedValue::from_value_resolved(value, self.bytecode_module.as_deref())
             });
         }
 
-        PersistedValue::from_value_resolved(value, self.bytecode_module.as_ref())
+        PersistedValue::from_value_resolved(value, self.bytecode_module.as_deref())
     }
 
     /// Allocate a null-terminated string on the actor heap and return a pointer
