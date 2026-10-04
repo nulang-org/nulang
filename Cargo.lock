@@ -2595,6 +2595,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nulang-policy"
+version = "0.1.0"
+dependencies = [
+ "nulang-security",
+ "serde",
+]
+
+[[package]]
 name = "nulang-security"
 version = "0.1.0"
 dependencies = [
