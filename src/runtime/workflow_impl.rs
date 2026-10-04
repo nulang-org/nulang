@@ -30,10 +30,7 @@ pub(crate) fn actor_is_workflow(rt: &Runtime, actor_id: u64) -> bool {
         .unwrap_or(false)
 }
 
-fn current_workflow_replay_id(
-    rt: &mut Runtime,
-    actor_id: u64,
-) -> Option<WorkflowReplayEventId> {
+fn current_workflow_replay_id(rt: &mut Runtime, actor_id: u64) -> Option<WorkflowReplayEventId> {
     let actor = rt.actors.get_mut(&actor_id)?;
     let activation = actor.current_workflow_activation?;
 
@@ -48,11 +45,7 @@ fn current_workflow_replay_id(
     ))
 }
 
-fn advance_workflow_replay_id(
-    rt: &mut Runtime,
-    actor_id: u64,
-    committed: WorkflowReplayEventId,
-) {
+fn advance_workflow_replay_id(rt: &mut Runtime, actor_id: u64, committed: WorkflowReplayEventId) {
     let Some(actor) = rt.actors.get_mut(&actor_id) else {
         return;
     };
