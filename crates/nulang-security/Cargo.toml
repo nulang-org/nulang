@@ -8,6 +8,9 @@ description = "Shared identity and authorization primitives for Nulang runtimes 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 
+[dev-dependencies]
+serde_json = "1"
+
 [lib]
 name = "nulang_security"
 path = "src/lib.rs"
