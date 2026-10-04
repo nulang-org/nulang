@@ -54,9 +54,7 @@ fn durable_transition_time_rejects_metadata_for_a_different_transition() {
         HlcTimestamp::new(1_000_000, 3),
     );
 
-    let error = persisted
-        .validate_for(&transition(42, 8, 11))
-        .unwrap_err();
+    let error = persisted.validate_for(&transition(42, 8, 11)).unwrap_err();
 
     assert_eq!(
         error,
@@ -100,8 +98,8 @@ fn recovered_timed_transition_rejects_mismatched_persisted_identity() {
         HlcTimestamp::new(1_000_000, 3),
     );
 
-    let error = TimedDurableTransition::from_parts(transition(99, 7, 11), Some(persisted))
-        .unwrap_err();
+    let error =
+        TimedDurableTransition::from_parts(transition(99, 7, 11), Some(persisted)).unwrap_err();
 
     assert_eq!(
         error,
@@ -145,7 +143,10 @@ fn closed_timestamp_regression_fails_closed_without_mutating_state() {
 
     let error = closed.advance(attempted).unwrap_err();
 
-    assert_eq!(error, ClosedTimestampError::Regression { current, attempted });
+    assert_eq!(
+        error,
+        ClosedTimestampError::Regression { current, attempted }
+    );
     assert_eq!(closed.get(), Some(current));
 }
 
