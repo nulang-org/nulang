@@ -10,7 +10,10 @@ Shared wire-facing primitives use explicit, minimal serde forms:
 
 - principal kinds serialize as stable snake-case values such as `agent` and `workload`;
 - `UnixSeconds` serializes as an integer count of whole Unix seconds;
-- `DelegationId` serializes as its validated string identifier;
-- `RevocationEpoch` serializes as an unsigned integer generation.
+- `DelegationId` and `RevocationDomainId` serialize as validated string identifiers;
+- `RevocationEpoch` serializes as an unsigned integer generation;
+- `RevocationVersion` carries both the revocation domain and its epoch.
 
-The embedding trust domain remains responsible for authenticating principals, assigning delegation IDs, defining the scope of a revocation epoch, and choosing any signed-envelope or token format. Keeping those concerns outside this crate prevents identity metadata from becoming an implicit policy or cryptographic protocol.
+Revocation epochs are intentionally **not globally comparable**. `RevocationVersion::compare_epoch` returns no ordering when the domains differ, so an authorization layer must fail closed instead of comparing unrelated tenant or issuer counters.
+
+The embedding trust domain remains responsible for authenticating principals, assigning delegation IDs, choosing stable revocation-domain IDs, advancing revocation epochs, and choosing any signed-envelope or token format. Keeping those concerns outside this crate prevents identity metadata from becoming an implicit policy or cryptographic protocol.
