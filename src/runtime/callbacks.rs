@@ -2463,7 +2463,7 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
 
                 // Get NBC-encoded bytecode module.
                 let module = match actor.bytecode_module.as_ref() {
-                    Some(m) => m.clone(),
+                    Some(m) => m.as_ref().clone(),
                     None => match rt.recovery_modules.get(&actor_id) {
                         Some((m, _, _)) => m.clone(),
                         None => {
