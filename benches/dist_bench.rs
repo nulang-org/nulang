@@ -11,6 +11,15 @@ use nulang::runtime::{
 };
 use nulang::vm::Value;
 
+#[cfg(feature = "tcp")]
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+#[cfg(feature = "tcp")]
+use std::thread;
+#[cfg(feature = "tcp")]
+use std::time::{Duration, Instant};
+#[cfg(feature = "tcp")]
+use nulang::runtime::{NetworkTransport, TcpTransport, TlsConfig};
+
 fn bench_crdt_delta_compute(c: &mut Criterion) {
     c.bench_function("dist/crdt_delta_compute", |b| {
         b.iter(|| {
@@ -114,10 +123,133 @@ fn bench_actor_message_decode(c: &mut Criterion) {
     group.finish();
 }
 
+// TRANSPORT_STAGE_BENCH_START
+#[cfg(feature = "tcp")]
+const TRANSPORT_ROUNDTRIP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Production TCP/NUL0 only: sender queue/thread -> socket -> reader thread ->
+/// incoming queue. Actor routing, mailbox admission, scheduler dispatch, and
+/// handler execution are deliberately outside this measurement boundary.
+#[cfg(feature = "tcp")]
+struct TransportRoundTrip {
+    left: TcpTransport,
+    right: TcpTransport,
+    left_node: NodeId,
+    right_node: NodeId,
+    left_addr: SocketAddr,
+    right_addr: SocketAddr,
+}
+
+#[cfg(feature = "tcp")]
+impl TransportRoundTrip {
+    fn new() -> Self {
+        let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let mut left = TcpTransport::bind(bind_addr, TlsConfig::PlaintextInsecure)
+            .expect("left benchmark transport should bind");
+        let mut right = TcpTransport::bind(bind_addr, TlsConfig::PlaintextInsecure)
+            .expect("right benchmark transport should bind");
+        let left_node = NetworkTransport::node_id(&left);
+        let right_node = NetworkTransport::node_id(&right);
+        let left_addr = NetworkTransport::listen_addr(&left);
+        let right_addr = NetworkTransport::listen_addr(&right);
+
+        left.connect(right_node, right_addr)
+            .expect("left benchmark transport should connect");
+        right
+            .connect(left_node, left_addr)
+            .expect("right benchmark transport should connect");
+
+        let mut fixture = Self {
+            left,
+            right,
+            left_node,
+            right_node,
+            left_addr,
+            right_addr,
+        };
+        // Exclude connection establishment, NUL0 handshake, and first-use
+        // thread scheduling from the steady-state measurement.
+        fixture.roundtrip(0);
+        fixture
+    }
+
+    fn wait_for_heartbeat(transport: &TcpTransport, from: NodeId, token: u64) {
+        let deadline = Instant::now() + TRANSPORT_ROUNDTRIP_TIMEOUT;
+        loop {
+            for incoming in transport.receive() {
+                if incoming.from_node == from
+                    && matches!(
+                        incoming.packet,
+                        Packet::Heartbeat { node_id, timestamp }
+                            if node_id == from && timestamp == token
+                    )
+                {
+                    return;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "transport benchmark timed out waiting for heartbeat token {token}"
+            );
+            thread::yield_now();
+        }
+    }
+
+    fn roundtrip(&mut self, token: u64) {
+        self.left.send(
+            self.right_node,
+            self.right_addr,
+            Packet::Heartbeat {
+                node_id: self.left_node,
+                timestamp: token,
+            },
+        );
+        Self::wait_for_heartbeat(&self.right, self.left_node, token);
+
+        self.right.send(
+            self.left_node,
+            self.left_addr,
+            Packet::Heartbeat {
+                node_id: self.right_node,
+                timestamp: token,
+            },
+        );
+        Self::wait_for_heartbeat(&self.left, self.right_node, token);
+    }
+
+    fn measure(&mut self, iterations: u64) -> Duration {
+        let started = Instant::now();
+        for token in 1..=iterations {
+            self.roundtrip(token);
+        }
+        started.elapsed()
+    }
+}
+
+/// Steady-state request+return latency through the real TCP/NUL0 transport,
+/// excluding all actor-runtime work.
+#[cfg(feature = "tcp")]
+fn bench_transport_roundtrip(c: &mut Criterion) {
+    let mut group = c.benchmark_group("dist/transport_roundtrip");
+    group.throughput(Throughput::Elements(1));
+    group.sample_size(20);
+    group.measurement_time(Duration::from_secs(3));
+    group.bench_function("tcp_plaintext_heartbeat", |b| {
+        let mut fixture = TransportRoundTrip::new();
+        b.iter_custom(|iterations| fixture.measure(iterations));
+    });
+    group.finish();
+}
+
+#[cfg(not(feature = "tcp"))]
+fn bench_transport_roundtrip(_c: &mut Criterion) {}
+// TRANSPORT_STAGE_BENCH_END
+
 criterion_group!(
     benches,
     bench_crdt_delta_compute,
     bench_gossip_membership_merge,
     bench_actor_message_encode,
-    bench_actor_message_decode
+    bench_actor_message_decode,
+    bench_transport_roundtrip
 );
