@@ -135,8 +135,7 @@ impl<Spec> ReconcileState<Spec> {
 
     /// True only when the current generation is known to match desired state.
     pub fn is_converged(&self) -> bool {
-        self.phase == ReconcilePhase::Converged
-            && self.observed_generation == self.generation
+        self.phase == ReconcilePhase::Converged && self.observed_generation == self.generation
     }
 
     /// Start one fenced reconciliation attempt.
@@ -156,20 +155,14 @@ impl<Spec> ReconcileState<Spec> {
     }
 
     /// Report forward progress for the current attempt.
-    pub fn mark_progressing(
-        &mut self,
-        attempt: ReconcileAttempt,
-    ) -> Result<(), ReconcileError> {
+    pub fn mark_progressing(&mut self, attempt: ReconcileAttempt) -> Result<(), ReconcileError> {
         self.require_current(attempt)?;
         self.phase = ReconcilePhase::Progressing;
         Ok(())
     }
 
     /// Mark the current generation converged.
-    pub fn mark_converged(
-        &mut self,
-        attempt: ReconcileAttempt,
-    ) -> Result<(), ReconcileError> {
+    pub fn mark_converged(&mut self, attempt: ReconcileAttempt) -> Result<(), ReconcileError> {
         self.require_current(attempt)?;
         self.observed_generation = self.generation;
         self.phase = ReconcilePhase::Converged;
