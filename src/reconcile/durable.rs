@@ -3,6 +3,8 @@ use super::{ReconcileAttempt, ReconcileError, ReconcilePhase, ReconcileState};
 /// Current durable wire-format version for reconciliation controller snapshots.
 pub const RECONCILE_SNAPSHOT_VERSION: u16 = 1;
 
+const RECONCILE_RETRY_TIMER_PREFIX: &str = "__reconcile_retry:";
+
 /// Serializable representation of one reconciliation controller state.
 ///
 /// Restoring this value always goes through [`ReconcileState::restore`], which
@@ -138,6 +140,55 @@ impl ReconcileRetryPolicy {
     }
 }
 
+/// Fenced identity encoded in a durable reconciliation retry timer name.
+///
+/// The timer context deliberately carries only identity, not delay: by the time
+/// a timer fires, delay has already served its scheduling purpose. Zero values
+/// are rejected so malformed or unfenced contexts can never alias live work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct ReconcileRetryIdentity {
+    generation: u64,
+    retry_ordinal: u32,
+}
+
+impl ReconcileRetryIdentity {
+    pub fn generation(self) -> u64 {
+        self.generation
+    }
+
+    pub fn retry_ordinal(self) -> u32 {
+        self.retry_ordinal
+    }
+
+    pub fn timer_name(self) -> String {
+        format!(
+            "{RECONCILE_RETRY_TIMER_PREFIX}g{}:r{}",
+            self.generation, self.retry_ordinal
+        )
+    }
+
+    /// Parse a timer context emitted by [`ReconcileRetryTicket::timer_name`].
+    ///
+    /// Parsing is intentionally strict: extra segments, missing numeric
+    /// components, zero generation, and zero retry ordinal are all rejected.
+    pub fn parse_timer_name(name: &str) -> Option<Self> {
+        let rest = name.strip_prefix(RECONCILE_RETRY_TIMER_PREFIX)?;
+        let (generation, retry) = rest.split_once(":r")?;
+        if retry.contains(':') || !generation.starts_with('g') {
+            return None;
+        }
+        let generation = generation.strip_prefix('g')?.parse::<u64>().ok()?;
+        let retry_ordinal = retry.parse::<u32>().ok()?;
+        if generation == 0 || retry_ordinal == 0 {
+            return None;
+        }
+        Some(Self {
+            generation,
+            retry_ordinal,
+        })
+    }
+}
+
 /// One deterministic retry request that can be mapped onto Nulang's existing
 /// durable workflow timer API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -160,12 +211,16 @@ impl ReconcileRetryTicket {
         self.delay_ms
     }
 
+    pub fn identity(self) -> ReconcileRetryIdentity {
+        ReconcileRetryIdentity {
+            generation: self.generation,
+            retry_ordinal: self.retry_ordinal,
+        }
+    }
+
     /// Stable timer name suitable for `Runtime::schedule_workflow_timer`.
     pub fn timer_name(self) -> String {
-        format!(
-            "__reconcile_retry:g{}:r{}",
-            self.generation, self.retry_ordinal
-        )
+        self.identity().timer_name()
     }
 }
 
@@ -281,11 +336,17 @@ impl<Spec> ReconcileState<Spec> {
         }))
     }
 
-    /// Whether a fired durable retry timer still belongs to live desired state.
-    pub fn retry_ticket_is_current(&self, ticket: ReconcileRetryTicket) -> bool {
+    /// Whether a fired durable retry timer identity still belongs to live
+    /// desired state.
+    pub fn retry_identity_is_current(&self, identity: ReconcileRetryIdentity) -> bool {
         self.phase == ReconcilePhase::RetryableFailure
-            && ticket.generation == self.generation
-            && ticket.retry_ordinal == self.retry_ordinal
+            && identity.generation == self.generation
+            && identity.retry_ordinal == self.retry_ordinal
+    }
+
+    /// Whether a retry ticket still belongs to live desired state.
+    pub fn retry_ticket_is_current(&self, ticket: ReconcileRetryTicket) -> bool {
+        self.retry_identity_is_current(ticket.identity())
     }
 }
 
