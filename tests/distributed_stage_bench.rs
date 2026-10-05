@@ -146,6 +146,10 @@ fn bench_ab_distributed_stage_decomposition() {
 
     report_stage("distributed_send_enqueue", ITERATIONS, send_elapsed);
     report_stage("distributed_ingress_mailbox", ITERATIONS, ingress_elapsed);
-    report_stage("distributed_scheduler_handler", ITERATIONS, scheduler_elapsed);
+    report_stage(
+        "distributed_scheduler_handler",
+        ITERATIONS,
+        scheduler_elapsed,
+    );
 }
 // DISTRIBUTED_STAGE_DECOMP_END
