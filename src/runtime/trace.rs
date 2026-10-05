@@ -15,9 +15,9 @@
 //!
 //! The default (non-OTel) build records each handled message as a
 //! `tracing` span carrying `trace_id` / `span_id` / `parent_span_id` as
-//! structured fields. Untraced actor messages do not synthesize a trace
-//! context unless TRACE collection is enabled, so the default hot path avoids
-//! trace-id generation, formatting, parsing, and propagation work entirely.
+//! structured fields. This diagnostic control deliberately preserves the
+//! historical behavior of synthesizing a root trace context for untraced
+//! actor messages even when TRACE collection is disabled.
 //! The optional `otel` feature can bridge those fields into real OTLP spans
 //! via `tracing-opentelemetry`.
 
@@ -91,11 +91,10 @@ impl TraceContext {
     /// Create the context for one actor-message dispatch.
     ///
     /// Existing W3C context always propagates, even when local TRACE spans are
-    /// filtered out. A message with no incoming context only starts a new root
-    /// when this runtime is actually collecting TRACE-level spans. Malformed
-    /// incoming context preserves the historical fail-soft behavior by starting
-    /// a fresh root. This keeps observability semantics intact while making the
-    /// normal untraced actor path allocation/formatting-free.
+    /// filtered out. This diagnostic control deliberately preserves the old
+    /// behavior of creating a root for a message with no incoming context,
+    /// regardless of whether TRACE collection is enabled. Malformed incoming
+    /// context also preserves the historical fail-soft root fallback.
     #[inline]
     pub(crate) fn for_dispatch(traceparent: Option<&str>, create_root: bool) -> Option<Self> {
         match traceparent {
@@ -103,7 +102,7 @@ impl TraceContext {
                 Self::from_traceparent(tp).map_or_else(Self::root, |incoming| incoming.child()),
             ),
             None if create_root => Some(Self::root()),
-            None => None,
+            None => Some(Self::root()),
         }
     }
 
