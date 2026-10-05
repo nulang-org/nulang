@@ -15,9 +15,7 @@
 //!
 //! The default (non-OTel) build records each handled message as a
 //! `tracing` span carrying `trace_id` / `span_id` / `parent_span_id` as
-//! structured fields. Untraced actor messages do not synthesize a trace
-//! context unless TRACE collection is enabled, so the default hot path avoids
-//! trace-id generation, formatting, parsing, and propagation work entirely.
+//! structured fields — zero work when no `tracing` subscriber is attached.
 //! The optional `otel` feature can bridge those fields into real OTLP spans
 //! via `tracing-opentelemetry`.
 
