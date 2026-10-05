@@ -19,4 +19,6 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Focused gossip cadence contract
-        run: cargo test --locked --test cluster_gossip_throttle -- --nocapture
+        run: >-
+          cargo test --locked --no-default-features
+          --test cluster_gossip_throttle -- --nocapture
