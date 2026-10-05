@@ -186,3 +186,30 @@ fn aliasing_empty_array_does_not_regain_polymorphism() {
         "aliases of one mutable array must retain one shared element type"
     );
 }
+
+#[test]
+fn recursive_nominal_arrays_do_not_overflow_value_restriction_walk() {
+    // Mutable arrays may contain recursive nominal values. Generalization must
+    // keep the array's free element variables monomorphic without recursively
+    // expanding the same nominal type forever. This is the minimal shape used
+    // by stdlib::json's JsonValue.
+    let result = typecheck(
+        r#"
+        pub type JsonValue =
+            | JsonNull
+            | JsonArray([JsonValue])
+            | JsonObject([(String, JsonValue)])
+
+        fn main() {
+            let values = [JsonNull]
+            values
+        }
+        "#,
+    );
+
+    assert!(
+        result.is_ok(),
+        "recursive nominal values stored in arrays must typecheck without overflowing: {:?}",
+        result.err()
+    );
+}
