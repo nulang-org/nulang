@@ -111,6 +111,26 @@ class CargoIsolationTests(unittest.TestCase):
         self.assertEqual("present", env["NULANG_AB_SENTINEL"])
 
 
+class CargoCommandPlanTests(unittest.TestCase):
+    def test_measurement_and_build_plans_include_cold_jit_probe(self):
+        extra_args = ["--no-default-features", "--features", "native-codegen"]
+
+        measurement = nulang_ab_bench.cargo_commands(extra_args)
+        builds = nulang_ab_bench.cargo_build_commands(extra_args)
+
+        self.assertTrue(
+            any("benchmarks::bench_" in command for command in measurement),
+            "exact A/B must retain the established runtime benchmark suite",
+        )
+        self.assertTrue(
+            any("--test" in command and "cold_jit_ab" in command for command in measurement),
+            "exact A/B must execute the counterbalanced cold-JIT integration probe",
+        )
+        self.assertTrue(
+            any("--test" in command and "cold_jit_ab" in command for command in builds),
+            "cold-JIT integration probe must be prebuilt before warmup/measurement rounds",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
