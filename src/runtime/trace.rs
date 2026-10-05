@@ -285,8 +285,12 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_without_incoming_trace_is_lazy_when_collection_is_disabled() {
-        assert!(TraceContext::for_dispatch(None, false).is_none());
+    fn dispatch_without_incoming_trace_preserves_old_root_semantics() {
+        let dispatch = TraceContext::for_dispatch(None, false)
+            .expect("control must preserve historical root creation");
+        assert_ne!(dispatch.trace_id(), 0);
+        assert_ne!(dispatch.span_id(), 0);
+        assert_eq!(dispatch.parent_span_id(), 0);
     }
 
     #[test]
