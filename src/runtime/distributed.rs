@@ -774,19 +774,22 @@ impl<'a> DistributedRuntime for DistributedRuntimeImpl<'a> {
         &mut self,
         _transport: &mut dyn NetworkTransport,
         node: NodeId,
-        _behavior_name: &str,
-        _initial_state: Vec<(String, Value)>,
+        behavior_name: &str,
+        initial_state: Vec<(String, Value)>,
     ) -> ActorAddress {
-        // The trait method doesn't receive cluster/resolver, so we can
-        // only handle local spawns here. For remote spawns, use the
-        // `spawn_on_node` free function which takes all components.
+        // This trait method has enough context for a real local spawn. Remote
+        // spawn still requires the free function's cluster/resolver inputs.
         if node == NodeId::LOCAL {
-            // Local spawn would need the behavior_name and initial_state.
-            // This is a limitation of the trait API — use the free function.
-            ActorAddress::local(0)
+            let handler = self.runtime.spawnable_behaviors.get(behavior_name).copied();
+            let id = self.runtime.spawn_actor(Box::new(move || initial_state));
+            if let Some(handler) = handler {
+                if let Some(actor) = self.runtime.actors.get_mut(&id) {
+                    actor.register_behavior(behavior_name.to_string(), handler);
+                }
+            }
+            ActorAddress::local(id)
         } else {
-            // Cannot determine if node is local without resolver.
-            // Return a placeholder; callers should use the free function.
+            // Remote failure/placeholder semantics are tracked separately in #1238.
             ActorAddress::remote(node, 0)
         }
     }
