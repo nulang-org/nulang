@@ -36,9 +36,12 @@ when:
         - ".woodpecker/**"
   - event: manual
 
+# Serialize superseding runs for the same PR without making unrelated PRs wait
+# behind one repository-wide mutex. Push/manual events have no PR number, so
+# they continue to share the fallback `rust-validation-` group.
 concurrency:
   limit: 1
-  group: rust-validation
+  group: rust-validation-${CI_COMMIT_PULL_REQUEST}
 
 steps:
   - name: rust-validation

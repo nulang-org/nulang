@@ -68,6 +68,49 @@ fn advance_custom_event_replay_id(
         .expect("workflow custom-event ordinal exhausted within one activation");
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CustomEventReplayDisposition {
+    Append,
+    Consume,
+    Conflict,
+}
+
+fn custom_event_replay_disposition(
+    rt: &Runtime,
+    actor_id: u64,
+    replay_id: WorkflowReplayEventId,
+    event: &str,
+    payload: &[PersistedValue],
+) -> CustomEventReplayDisposition {
+    let mut committed: Option<(String, Vec<PersistedValue>)> = None;
+
+    for workflow_event in rt.persistence.read_workflow_events(actor_id) {
+        let WorkflowEvent::Custom {
+            replay_id: Some(existing_id),
+            name,
+            args,
+            ..
+        } = workflow_event
+        else {
+            continue;
+        };
+        if existing_id != replay_id {
+            continue;
+        }
+        if committed.is_some() {
+            return CustomEventReplayDisposition::Conflict;
+        }
+        committed = Some((name, args));
+    }
+
+    match committed {
+        None => CustomEventReplayDisposition::Append,
+        Some((name, args)) if name == event && args.as_slice() == payload => {
+            CustomEventReplayDisposition::Consume
+        }
+        Some(_) => CustomEventReplayDisposition::Conflict,
+    }
+}
 // ---------------------------------------------------------------------------
 // Checkpoint
 // ---------------------------------------------------------------------------
@@ -341,7 +384,7 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
         }
         // Persist events for EventSourced fields (non-workflow actors).
         if !is_workflow && !event_sourced_names.is_empty() {
-            let module = actor.bytecode_module.as_ref();
+            let module = actor.bytecode_module.as_deref();
             let persisted_args: Vec<PersistedValue> = args
                 .iter()
                 .map(|v| PersistedValue::from_value_resolved(v, module))
@@ -387,35 +430,74 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                     .unwrap_or(0);
                 actor.set_state_field("parallel_progress", Value::int(current + 1));
             }
+            checkpoint_actor(rt, actor_id);
         } else {
             let module = rt
                 .actors
                 .get(&actor_id)
-                .and_then(|a| a.bytecode_module.as_ref());
+                .and_then(|a| a.bytecode_module.as_deref());
             let payload: Vec<PersistedValue> = args
                 .iter()
                 .map(|v| PersistedValue::from_value_resolved(v, module))
                 .collect();
             let replay_id = current_custom_event_replay_id(rt, actor_id);
-            let appended = rt
-                .persistence
-                .append_workflow_event(
-                    actor_id,
-                    WorkflowEvent::Custom {
-                        sequence: seq,
-                        replay_id,
-                        name: event.to_string(),
-                        args: payload,
-                    },
-                )
-                .is_ok();
-            if appended {
-                if let Some(replay_id) = replay_id {
-                    advance_custom_event_replay_id(rt, actor_id, replay_id);
+            let mut should_checkpoint = false;
+            if let Some(replay_id) = replay_id {
+                match custom_event_replay_disposition(rt, actor_id, replay_id, event, &payload) {
+                    CustomEventReplayDisposition::Consume => {
+                        advance_custom_event_replay_id(rt, actor_id, replay_id);
+                    }
+                    CustomEventReplayDisposition::Conflict => {
+                        tracing::error!(
+                            actor_id,
+                            activation_actor_id = replay_id.activation.actor_id,
+                            activation_command_sequence = replay_id.activation.command_sequence,
+                            ordinal = replay_id.ordinal,
+                            event,
+                            "nulang-workflow: replay identity conflicts with committed custom event; refusing durable mutation"
+                        );
+                    }
+                    CustomEventReplayDisposition::Append => {
+                        let appended = rt
+                            .persistence
+                            .append_workflow_event(
+                                actor_id,
+                                WorkflowEvent::Custom {
+                                    sequence: seq,
+                                    replay_id: Some(replay_id),
+                                    name: event.to_string(),
+                                    args: payload,
+                                },
+                            )
+                            .is_ok();
+                        if appended {
+                            // This event belongs to an open activation. Keep the
+                            // last completed snapshot unchanged so recovery can
+                            // re-execute the command and consume this exact
+                            // replay identity instead of treating partial state
+                            // as completed progress.
+                            advance_custom_event_replay_id(rt, actor_id, replay_id);
+                        }
+                    }
                 }
+            } else {
+                should_checkpoint = rt
+                    .persistence
+                    .append_workflow_event(
+                        actor_id,
+                        WorkflowEvent::Custom {
+                            sequence: seq,
+                            replay_id: None,
+                            name: event.to_string(),
+                            args: payload,
+                        },
+                    )
+                    .is_ok();
+            }
+            if should_checkpoint {
+                checkpoint_actor(rt, actor_id);
             }
         }
-        checkpoint_actor(rt, actor_id);
     }
 }
 
@@ -525,7 +607,7 @@ pub(crate) fn query_workflow(rt: &mut Runtime, actor_id: u64, name: &str) -> Opt
             return None;
         }
         let handler = *actor.query_handlers.get(name)?;
-        (handler, actor.bytecode_module.clone()?)
+        (handler, actor.bytecode_module.as_deref().cloned()?)
     };
 
     let self_ptr: *mut Runtime = rt;

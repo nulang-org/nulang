@@ -2324,7 +2324,7 @@ fn hot_reload_behavior(
     // Rebuild bytecode offsets from the cached module (compressed to the
     // actor's own behaviors for workflow actors — local step ids).
     let offsets = crate::runtime::spawn::bytecode_offsets_for(module, actor.is_workflow);
-    actor.bytecode_module = Some(module.clone());
+    actor.bytecode_module = Some(Box::new(module.clone()));
     actor.bytecode_offsets = offsets;
     warn!(
         "nulang-net: hot-reloaded bytecode module for actor {} ({} behaviors)",
@@ -2561,7 +2561,7 @@ fn ensure_actor_module_idx(runtime: &mut Runtime, actor_id: u64) -> Option<usize
     }
     let vm = runtime.vm.as_mut().expect("VM was just ensured");
     let idx = vm.modules.len();
-    vm.load_module(module.clone());
+    vm.load_module((*module).clone());
     runtime.register_module_grains(&module);
     if let Some(actor) = runtime.actors.get_mut(&actor_id) {
         actor.bytecode_module_idx = Some(idx);
@@ -2675,7 +2675,7 @@ mod tests {
 
         {
             let actor = runtime.actors.get_mut(&actor_id).unwrap();
-            actor.bytecode_module = Some(module_with_hash([0xAA; 32]));
+            actor.bytecode_module = Some(Box::new(module_with_hash([0xAA; 32])));
             actor.bytecode_offsets = vec![0];
         }
 
@@ -3564,7 +3564,7 @@ mod tests {
         let actor_id = rt.spawn_actor(Box::new(|| vec![]));
         {
             let actor = rt.actors.get_mut(&actor_id).unwrap();
-            actor.bytecode_module = Some(module);
+            actor.bytecode_module = Some(Box::new(module));
         }
 
         // First intern: lazy-loads the actor's module and appends the
@@ -3649,7 +3649,7 @@ mod tests {
             runtime_b.spawn_actor(Box::new(|| vec![("received".to_string(), Value::nil())]));
         {
             let actor = runtime_b.actors.get_mut(&actor_b).unwrap();
-            actor.bytecode_module = Some(module_b);
+            actor.bytecode_module = Some(Box::new(module_b));
             actor.register_behavior("store", |actor, args| {
                 let v = args.get(0).copied().unwrap_or(Value::nil());
                 actor.set_state_field("received", v);
