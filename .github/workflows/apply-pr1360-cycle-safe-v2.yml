@@ -1,0 +1,115 @@
+name: Apply PR 1360 cycle-safe repair v2
+
+on:
+  push:
+    branches:
+      - fix/typechecker-array-value-restriction-20261005
+    paths:
+      - .github/workflows/apply-pr1360-cycle-safe-v2.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/typechecker-array-value-restriction-20261005
+          fetch-depth: 0
+      - name: Apply cycle-safe mutable-storage free-variable walk
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/types.rs")
+          text = path.read_text()
+
+          old_reference = "            // The shared cell: every free variable inside must stay monomorphic.\n            Type::Reference { inner, .. } => inner.collect_free_vars(acc),\n"
+          new_reference = "            // Shared mutable storage: every free variable inside must stay monomorphic.\n            Type::Reference { inner, .. } => {\n                let mut nominal_stack = FxHashSet::default();\n                inner.collect_storage_free_vars(acc, &mut nominal_stack);\n            }\n"
+          if text.count(old_reference) != 1:
+              raise SystemExit(f"expected one reference value-restriction anchor, found {text.count(old_reference)}")
+          text = text.replace(old_reference, new_reference, 1)
+
+          old_array = "            Type::Array(t) => t.collect_free_vars(acc),\n            Type::Actor { state, behavior } => {\n                state.collect_ref_free_vars(acc);\n                behavior.collect_ref_free_vars(acc);\n            }\n"
+          new_array = "            Type::Array(t) => {\n                let mut nominal_stack = FxHashSet::default();\n                t.collect_storage_free_vars(acc, &mut nominal_stack);\n            }\n            Type::Actor { state, behavior } => {\n                state.collect_ref_free_vars(acc);\n                behavior.collect_ref_free_vars(acc);\n            }\n"
+          if text.count(old_array) != 1:
+              raise SystemExit(f"expected one array value-restriction context, found {text.count(old_array)}")
+          text = text.replace(old_array, new_array, 1)
+
+          marker = "    fn collect_free_vars(&self, acc: &mut Vec<TypeVar>) {\n"
+          if text.count(marker) != 1:
+              raise SystemExit(f"expected one collect_free_vars marker, found {text.count(marker)}")
+
+          helper = '''    /// Collect free variables beneath mutable storage without infinitely
+    /// expanding a recursive nominal type.
+    fn collect_storage_free_vars(
+        &self,
+        acc: &mut Vec<TypeVar>,
+        nominal_stack: &mut FxHashSet<String>,
+    ) {
+        match self {
+            Type::Var(v) => acc.push(*v),
+            Type::Primitive(_) | Type::Skolem(_) => {}
+            Type::Tuple(ts) => ts
+                .iter()
+                .for_each(|t| t.collect_storage_free_vars(acc, nominal_stack)),
+            Type::Record(fs) => fs
+                .iter()
+                .for_each(|(_, t)| t.collect_storage_free_vars(acc, nominal_stack)),
+            Type::Variant(vs) => vs.iter().for_each(|(_, t)| {
+                if let Some(t) = t {
+                    t.collect_storage_free_vars(acc, nominal_stack)
+                }
+            }),
+            Type::Array(t) => t.collect_storage_free_vars(acc, nominal_stack),
+            Type::Function { param, ret, .. } => {
+                param.collect_storage_free_vars(acc, nominal_stack);
+                ret.collect_storage_free_vars(acc, nominal_stack);
+            }
+            Type::Actor { state, behavior } => {
+                state.collect_storage_free_vars(acc, nominal_stack);
+                behavior.collect_storage_free_vars(acc, nominal_stack);
+            }
+            Type::App { constructor, args } => {
+                constructor.collect_storage_free_vars(acc, nominal_stack);
+                args.iter()
+                    .for_each(|a| a.collect_storage_free_vars(acc, nominal_stack));
+            }
+            Type::Reference { inner, .. } => {
+                inner.collect_storage_free_vars(acc, nominal_stack)
+            }
+            Type::Scheme { vars, body } => {
+                let mut body_vars = Vec::new();
+                body.collect_storage_free_vars(&mut body_vars, nominal_stack);
+                body_vars.retain(|v| !vars.contains(v));
+                acc.extend(body_vars);
+            }
+            Type::Nominal { name, underlying } => {
+                if nominal_stack.insert(name.clone()) {
+                    underlying.collect_storage_free_vars(acc, nominal_stack);
+                    nominal_stack.remove(name);
+                }
+            }
+        }
+    }
+
+'''
+          text = text.replace(marker, helper + marker, 1)
+          path.write_text(text)
+          PY
+      - name: Format
+        run: cargo fmt -- src/types.rs tests/orca_type_invariants.rs
+      - name: Run focused recursive nominal regression
+        run: cargo test --locked --test orca_type_invariants recursive_nominal_arrays_do_not_overflow_value_restriction_walk -- --nocapture
+      - name: Run value-restriction regression suite
+        run: cargo test --locked --test orca_type_invariants -- --nocapture
+      - name: Commit repair
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/types.rs tests/orca_type_invariants.rs
+          git diff --cached --check
+          git commit -m "fix(typechecker): make mutable-storage walk cycle-safe"
+          git push origin HEAD:fix/typechecker-array-value-restriction-20261005
