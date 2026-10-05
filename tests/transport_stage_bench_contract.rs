@@ -22,6 +22,9 @@ fn transport_stage_probe_uses_transport_without_actor_runtime() {
         "dist/transport_roundtrip",
         "TcpTransport",
         "Packet::Heartbeat",
+        "tcp_plaintext_heartbeat",
+        "tcp_plaintext_actor_message_1",
+        "actor_message_packet(1)",
         ".send(",
         ".receive()",
     ] {
