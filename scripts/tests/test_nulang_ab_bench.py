@@ -112,23 +112,23 @@ class CargoIsolationTests(unittest.TestCase):
 
 
 class CargoCommandPlanTests(unittest.TestCase):
-    def test_measurement_and_build_plans_include_cold_jit_probe(self):
+    def test_measurement_filter_includes_integration_benchmark_probes(self):
         extra_args = ["--no-default-features", "--features", "native-codegen"]
 
-        measurement = nulang_ab_bench.cargo_commands(extra_args)
-        builds = nulang_ab_bench.cargo_build_commands(extra_args)
+        measurement = nulang_ab_bench.cargo_command(extra_args)
+        build = nulang_ab_bench.cargo_build_command(extra_args)
 
-        self.assertTrue(
-            any("benchmarks::bench_" in command for command in measurement),
-            "exact A/B must retain the established runtime benchmark suite",
+        self.assertIn("bench_", measurement)
+        self.assertIn("bench_", build)
+        self.assertNotIn(
+            "benchmarks::bench_",
+            measurement,
+            "module-qualified filter excludes tests/cold_jit_ab.rs from exact A/B",
         )
-        self.assertTrue(
-            any("--test" in command and "cold_jit_ab" in command for command in measurement),
-            "exact A/B must execute the counterbalanced cold-JIT integration probe",
-        )
-        self.assertTrue(
-            any("--test" in command and "cold_jit_ab" in command for command in builds),
-            "cold-JIT integration probe must be prebuilt before warmup/measurement rounds",
+        self.assertNotIn(
+            "benchmarks::bench_",
+            build,
+            "prebuild must cover integration benchmark executables too",
         )
 
 
