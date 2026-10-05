@@ -1,16 +1,17 @@
 name: Apply PR 1360 cycle-safe repair
 
 on:
-  pull_request:
-    types: [synchronize, opened, reopened]
-    branches: [main]
+  push:
+    branches:
+      - fix/typechecker-array-value-restriction-20261005
+    paths:
+      - .github/workflows/apply-pr1360-cycle-safe.yml
 
 permissions:
   contents: write
 
 jobs:
   apply:
-    if: github.head_ref == 'fix/typechecker-array-value-restriction-20261005'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -18,14 +19,14 @@ jobs:
           ref: fix/typechecker-array-value-restriction-20261005
           fetch-depth: 0
       - name: Apply cycle-safe mutable-storage free-variable walk
-        shell: python
         run: |
+          python3 - <<'PY'
           from pathlib import Path
 
           path = Path("src/types.rs")
           text = path.read_text()
 
-          old_doc = '''    /// Free type variables that occur underneath a `Reference` constructor.
+          old_doc = """    /// Free type variables that occur underneath a `Reference` constructor.
     ///
     /// Used for the value restriction at generalization: a reference cell is
     /// created once at binding time and shared by every use of the binding, so
@@ -33,8 +34,8 @@ jobs:
     /// incompatible types. Function types are not descended into — a reference
     /// in a function's parameter or return type is created per call, so
     /// quantifying it is sound.
-'''
-          new_doc = '''    /// Free type variables that occur underneath mutable storage constructors.
+"""
+          new_doc = """    /// Free type variables that occur underneath mutable storage constructors.
     ///
     /// Used for the value restriction at generalization: references and arrays
     /// are created once at binding time and shared by every use of the binding,
@@ -42,38 +43,38 @@ jobs:
     /// be used at incompatible types. Function types are not descended into at
     /// the binding boundary because storage produced by a function is allocated
     /// per call and can therefore be instantiated independently.
-'''
+"""
           if old_doc not in text:
               raise SystemExit("value-restriction documentation anchor not found")
           text = text.replace(old_doc, new_doc, 1)
 
-          old_reference = '''            // The shared cell: every free variable inside must stay monomorphic.
+          old_reference = """            // The shared cell: every free variable inside must stay monomorphic.
             Type::Reference { inner, .. } => inner.collect_free_vars(acc),
-'''
-          new_reference = '''            // Shared mutable storage: every free variable inside must stay monomorphic.
+"""
+          new_reference = """            // Shared mutable storage: every free variable inside must stay monomorphic.
             Type::Reference { inner, .. } => {
                 let mut nominal_stack = FxHashSet::default();
                 inner.collect_storage_free_vars(acc, &mut nominal_stack);
             }
-'''
+"""
           if old_reference not in text:
               raise SystemExit("reference value-restriction anchor not found")
           text = text.replace(old_reference, new_reference, 1)
 
-          old_array = '''            Type::Array(t) => t.collect_free_vars(acc),
-'''
-          new_array = '''            Type::Array(t) => {
+          old_array = """            Type::Array(t) => t.collect_free_vars(acc),
+"""
+          new_array = """            Type::Array(t) => {
                 let mut nominal_stack = FxHashSet::default();
                 t.collect_storage_free_vars(acc, &mut nominal_stack);
             }
-'''
+"""
           if text.count(old_array) != 1:
               raise SystemExit(f"expected one array value-restriction anchor, found {text.count(old_array)}")
           text = text.replace(old_array, new_array, 1)
 
-          marker = '''    fn collect_free_vars(&self, acc: &mut Vec<TypeVar>) {
-'''
-          helper = '''    /// Collect every free variable stored beneath a mutable value without
+          marker = """    fn collect_free_vars(&self, acc: &mut Vec<TypeVar>) {
+"""
+          helper = """    /// Collect every free variable stored beneath a mutable value without
     /// recursively expanding the same nominal type forever.
     ///
     /// The nominal-name stack is path-local rather than global: repeated sibling
@@ -133,11 +134,12 @@ jobs:
         }
     }
 
-'''
+"""
           if marker not in text:
               raise SystemExit("collect_free_vars insertion anchor not found")
           text = text.replace(marker, helper + marker, 1)
           path.write_text(text)
+          PY
       - name: Format
         run: cargo fmt -- src/types.rs tests/orca_type_invariants.rs
       - name: Run focused recursive nominal regression
