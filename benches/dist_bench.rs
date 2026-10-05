@@ -169,7 +169,8 @@ impl TransportRoundTrip {
         };
         // Exclude connection establishment, NUL0 handshake, and first-use
         // thread scheduling from the steady-state measurement.
-        fixture.roundtrip(0);
+        fixture.heartbeat_roundtrip(0);
+        fixture.actor_message_roundtrip(0);
         fixture
     }
 
@@ -195,7 +196,43 @@ impl TransportRoundTrip {
         }
     }
 
-    fn roundtrip(&mut self, token: u64) {
+    fn wait_for_actor_message(transport: &TcpTransport, from: NodeId, token: i64) {
+        let deadline = Instant::now() + TRANSPORT_ROUNDTRIP_TIMEOUT;
+        loop {
+            for incoming in transport.receive() {
+                if incoming.from_node != from {
+                    continue;
+                }
+                if let Packet::ActorMessage { payload, .. } = incoming.packet {
+                    if payload.first().and_then(Value::as_int) == Some(token) {
+                        return;
+                    }
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "transport benchmark timed out waiting for actor-message token {token}"
+            );
+            thread::yield_now();
+        }
+    }
+
+    fn actor_packet(sender_node: NodeId, token: i64) -> Packet {
+        let mut packet = actor_message_packet(1);
+        let Packet::ActorMessage {
+            payload,
+            sender_node: packet_sender_node,
+            ..
+        } = &mut packet
+        else {
+            unreachable!("actor_message_packet must construct ActorMessage")
+        };
+        payload[0] = Value::int(token);
+        *packet_sender_node = sender_node;
+        packet
+    }
+
+    fn heartbeat_roundtrip(&mut self, token: u64) {
         self.left.send(
             self.right_node,
             self.right_addr,
@@ -217,27 +254,61 @@ impl TransportRoundTrip {
         Self::wait_for_heartbeat(&self.left, self.right_node, token);
     }
 
-    fn measure(&mut self, iterations: u64) -> Duration {
+    fn actor_message_roundtrip(&mut self, token: i64) {
+        self.left.send(
+            self.right_node,
+            self.right_addr,
+            Self::actor_packet(self.left_node, token),
+        );
+        Self::wait_for_actor_message(&self.right, self.left_node, token);
+
+        self.right.send(
+            self.left_node,
+            self.left_addr,
+            Self::actor_packet(self.right_node, token),
+        );
+        Self::wait_for_actor_message(&self.left, self.right_node, token);
+    }
+
+    fn measure_heartbeat(&mut self, iterations: u64) -> Duration {
         let started = Instant::now();
         for token in 1..=iterations {
-            self.roundtrip(token);
+            self.heartbeat_roundtrip(token);
+        }
+        started.elapsed()
+    }
+
+    fn measure_actor_message(&mut self, iterations: u64) -> Duration {
+        let started = Instant::now();
+        for token in 1..=iterations {
+            self.actor_message_roundtrip(token as i64);
         }
         started.elapsed()
     }
 }
 
 /// Steady-state request+return latency through the real TCP/NUL0 transport,
-/// excluding all higher-level runtime work.
+/// excluding all higher-level runtime work. The heartbeat control isolates the
+/// transport floor; the one-value ActorMessage control adds production message
+/// framing/codec shape without actor routing, ACK generation, mailbox admission,
+/// scheduler dispatch, or handler execution.
 #[cfg(feature = "tcp")]
 fn bench_transport_roundtrip(c: &mut Criterion) {
     let mut group = c.benchmark_group("dist/transport_roundtrip");
     group.throughput(Throughput::Elements(1));
     group.sample_size(20);
     group.measurement_time(Duration::from_secs(3));
+
     group.bench_function("tcp_plaintext_heartbeat", |b| {
         let mut fixture = TransportRoundTrip::new();
-        b.iter_custom(|iterations| fixture.measure(iterations));
+        b.iter_custom(|iterations| fixture.measure_heartbeat(iterations));
     });
+
+    group.bench_function("tcp_plaintext_actor_message_1", |b| {
+        let mut fixture = TransportRoundTrip::new();
+        b.iter_custom(|iterations| fixture.measure_actor_message(iterations));
+    });
+
     group.finish();
 }
 
