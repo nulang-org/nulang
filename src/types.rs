@@ -1058,8 +1058,11 @@ impl Type {
 
     fn collect_ref_free_vars(&self, acc: &mut Vec<TypeVar>) {
         match self {
-            // The shared cell: every free variable inside must stay monomorphic.
-            Type::Reference { inner, .. } => inner.collect_free_vars(acc),
+            // Shared mutable storage: every free variable inside must stay monomorphic.
+            Type::Reference { inner, .. } => {
+                let mut nominal_stack = FxHashSet::default();
+                inner.collect_storage_free_vars(acc, &mut nominal_stack);
+            }
             // Function values are created per call — refs in their types are safe.
             Type::Function { .. } => {}
             Type::Tuple(ts) => ts.iter().for_each(|t| t.collect_ref_free_vars(acc)),
@@ -1069,7 +1072,10 @@ impl Type {
                     t.collect_ref_free_vars(acc)
                 }
             }),
-            Type::Array(t) => t.collect_free_vars(acc),
+            Type::Array(t) => {
+                let mut nominal_stack = FxHashSet::default();
+                t.collect_storage_free_vars(acc, &mut nominal_stack);
+            }
             Type::Actor { state, behavior } => {
                 state.collect_ref_free_vars(acc);
                 behavior.collect_ref_free_vars(acc);
@@ -1081,6 +1087,57 @@ impl Type {
             Type::Scheme { body, .. } => body.collect_ref_free_vars(acc),
             Type::Nominal { underlying, .. } => underlying.collect_ref_free_vars(acc),
             Type::Var(_) | Type::Primitive(_) | Type::Skolem(_) => {}
+        }
+    }
+
+    /// Collect free variables beneath mutable storage without infinitely
+    /// expanding a recursive nominal type.
+    fn collect_storage_free_vars(
+        &self,
+        acc: &mut Vec<TypeVar>,
+        nominal_stack: &mut FxHashSet<String>,
+    ) {
+        match self {
+            Type::Var(v) => acc.push(*v),
+            Type::Primitive(_) | Type::Skolem(_) => {}
+            Type::Tuple(ts) => ts
+                .iter()
+                .for_each(|t| t.collect_storage_free_vars(acc, nominal_stack)),
+            Type::Record(fs) => fs
+                .iter()
+                .for_each(|(_, t)| t.collect_storage_free_vars(acc, nominal_stack)),
+            Type::Variant(vs) => vs.iter().for_each(|(_, t)| {
+                if let Some(t) = t {
+                    t.collect_storage_free_vars(acc, nominal_stack)
+                }
+            }),
+            Type::Array(t) => t.collect_storage_free_vars(acc, nominal_stack),
+            Type::Function { param, ret, .. } => {
+                param.collect_storage_free_vars(acc, nominal_stack);
+                ret.collect_storage_free_vars(acc, nominal_stack);
+            }
+            Type::Actor { state, behavior } => {
+                state.collect_storage_free_vars(acc, nominal_stack);
+                behavior.collect_storage_free_vars(acc, nominal_stack);
+            }
+            Type::App { constructor, args } => {
+                constructor.collect_storage_free_vars(acc, nominal_stack);
+                args.iter()
+                    .for_each(|a| a.collect_storage_free_vars(acc, nominal_stack));
+            }
+            Type::Reference { inner, .. } => inner.collect_storage_free_vars(acc, nominal_stack),
+            Type::Scheme { vars, body } => {
+                let mut body_vars = Vec::new();
+                body.collect_storage_free_vars(&mut body_vars, nominal_stack);
+                body_vars.retain(|v| !vars.contains(v));
+                acc.extend(body_vars);
+            }
+            Type::Nominal { name, underlying } => {
+                if nominal_stack.insert(name.clone()) {
+                    underlying.collect_storage_free_vars(acc, nominal_stack);
+                    nominal_stack.remove(name);
+                }
+            }
         }
     }
 
