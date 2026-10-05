@@ -1,17 +1,16 @@
 name: Apply PR 1360 cycle-safe repair
 
 on:
-  push:
-    branches:
-      - fix/typechecker-array-value-restriction-20261005
-    paths:
-      - .github/workflows/apply-pr1360-cycle-safe.yml
+  pull_request:
+    types: [synchronize, opened, reopened]
+    branches: [main]
 
 permissions:
   contents: write
 
 jobs:
   apply:
+    if: github.head_ref == 'fix/typechecker-array-value-restriction-20261005'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
