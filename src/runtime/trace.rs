@@ -226,6 +226,19 @@ mod tests {
     }
 
     #[test]
+    fn test_fixed_width_traceparent_codec() {
+        let bytes = encode_traceparent_bytes(
+            0x4bf9_2f35_77b3_4da6_a3ce_929d_0e0e_4736,
+            0x00f0_67aa_0ba9_02b7,
+            true,
+        );
+        assert_eq!(
+            std::str::from_utf8(&bytes).unwrap(),
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+        );
+    }
+
+    #[test]
     fn test_child_keeps_trace_links_parent() {
         let root = TraceContext::root();
         let child = root.child();
