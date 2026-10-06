@@ -2359,13 +2359,7 @@ pub fn sync_crdts_delta(runtime: &mut Runtime) {
             cluster
                 .healthy_members()
                 .iter()
-                .map(|member| {
-                    (
-                        member.node_id.0,
-                        NodeId(member.node_id.0),
-                        member.address,
-                    )
-                })
+                .map(|member| (member.node_id.0, NodeId(member.node_id.0), member.address))
                 .collect()
         })
         .unwrap_or_default();
