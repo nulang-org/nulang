@@ -58,7 +58,9 @@ jobs:
           path.write_text(text)
           PY
       - name: Format
-        run: cargo fmt --all -- --check
+        run: cargo fmt --all
+      - name: Check patch whitespace
+        run: git diff --check
       - name: GREEN focused contract
         run: >-
           cargo test --locked --no-default-features
