@@ -1958,7 +1958,19 @@ pub struct OutgoingPacket {
 ///   them to the appropriate TCP stream (connecting first if necessary).
 pub trait NetworkTransport: Send {
     fn connect(&mut self, node_id: NodeId, addr: std::net::SocketAddr) -> std::io::Result<()>;
-    fn send(&mut self, to_node: NodeId, to_addr: std::net::SocketAddr, packet: Packet) -> Option<u64>;
+    fn send(&mut self, to_node: NodeId, to_addr: std::net::SocketAddr, packet: Packet);
+    /// Send a packet and return the exact NUL0 sequence when the transport can
+    /// expose it synchronously. The default preserves compatibility for custom
+    /// transports that only implement fire-and-forget `send`.
+    fn send_tracked(
+        &mut self,
+        to_node: NodeId,
+        to_addr: std::net::SocketAddr,
+        packet: Packet,
+    ) -> Option<u64> {
+        self.send(to_node, to_addr, packet);
+        None
+    }
     fn receive(&self) -> Vec<IncomingPacket>;
     fn node_id(&self) -> NodeId;
     fn listen_addr(&self) -> std::net::SocketAddr;
@@ -1989,13 +2001,16 @@ impl NetworkTransport for Box<dyn NetworkTransport> {
     fn connect(&mut self, node_id: NodeId, addr: std::net::SocketAddr) -> std::io::Result<()> {
         (**self).connect(node_id, addr)
     }
-    fn send(
+    fn send(&mut self, to_node: NodeId, to_addr: std::net::SocketAddr, packet: Packet) {
+        (**self).send(to_node, to_addr, packet)
+    }
+    fn send_tracked(
         &mut self,
         to_node: NodeId,
         to_addr: std::net::SocketAddr,
         packet: Packet,
     ) -> Option<u64> {
-        (**self).send(to_node, to_addr, packet)
+        (**self).send_tracked(to_node, to_addr, packet)
     }
     fn receive(&self) -> Vec<IncomingPacket> {
         (**self).receive()
@@ -2239,7 +2254,13 @@ impl TcpTransport {
     /// backpressure toward the caller (typically the scheduler thread), not
     /// a silent drop. A packet is dropped only if the sender thread has
     /// already shut down (channel disconnected); that case is logged.
-    pub fn send(
+    pub fn send(&mut self, to_node: NodeId, to_addr: SocketAddr, packet: Packet) {
+        let _ = self.send_tracked(to_node, to_addr, packet);
+    }
+
+    /// Send a packet while exposing the exact sequence used by NUL0 so an
+    /// existing transport ACK can be correlated with higher-level state.
+    pub fn send_tracked(
         &mut self,
         to_node: NodeId,
         to_addr: SocketAddr,
@@ -3973,13 +3994,16 @@ impl NetworkTransport for TcpTransport {
     fn connect(&mut self, node_id: NodeId, addr: std::net::SocketAddr) -> std::io::Result<()> {
         self.connect(node_id, addr)
     }
-    fn send(
+    fn send(&mut self, to_node: NodeId, to_addr: std::net::SocketAddr, packet: Packet) {
+        TcpTransport::send(self, to_node, to_addr, packet)
+    }
+    fn send_tracked(
         &mut self,
         to_node: NodeId,
         to_addr: std::net::SocketAddr,
         packet: Packet,
     ) -> Option<u64> {
-        TcpTransport::send(self, to_node, to_addr, packet)
+        TcpTransport::send_tracked(self, to_node, to_addr, packet)
     }
     fn receive(&self) -> Vec<IncomingPacket> {
         self.receive()
@@ -4121,7 +4145,11 @@ impl NetworkTransport for DeterministicNetworkTransport {
         Ok(())
     }
 
-    fn send(
+    fn send(&mut self, to_node: NodeId, to_addr: SocketAddr, packet: Packet) {
+        let _ = self.send_tracked(to_node, to_addr, packet);
+    }
+
+    fn send_tracked(
         &mut self,
         to_node: NodeId,
         _to_addr: SocketAddr,
@@ -4143,16 +4171,35 @@ impl NetworkTransport for DeterministicNetworkTransport {
             };
             if self.reorder {
                 if let Some(previous) = self.held.remove(&to_node) {
-                    let _ = sender.send(incoming);
-                    let _ = sender.send(previous);
+                    let _ = sender.try_send(incoming);
+                    let _ = sender.try_send(previous);
                 } else {
                     self.held.insert(to_node, incoming);
                 }
             } else {
-                let _ = sender.send(incoming);
+                let _ = sender.try_send(incoming);
             }
         }
         Some(seq)
+    }
+
+    fn flush_held(&mut self) {
+        // Drain into an owned Vec first: `held` is a field of `self`, and
+        // `get_incoming_sender` borrows `self` — draining while borrowing
+        // immutably would conflict.
+        let held: Vec<(NodeId, IncomingPacket)> = self.held.drain().collect();
+        for (to, pkt) in held {
+            if let Some(sender) = self.get_incoming_sender(to) {
+                let _ = sender.try_send(pkt);
+            }
+        }
+    }
+
+    fn set_reorder(&mut self, enabled: bool) {
+        self.reorder = enabled;
+        if !enabled {
+            self.held.clear();
+        }
     }
 
     fn receive(&self) -> Vec<IncomingPacket> {

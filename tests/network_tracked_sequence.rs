@@ -32,24 +32,26 @@ fn deterministic_transport_returns_the_wire_sequence_it_delivers() {
     a.register_on_bus();
     b.register_on_bus();
 
-    let first = a.send(
-        node_b,
-        addr_b,
-        Packet::Heartbeat {
-            node_id: a.node_id(),
-            timestamp: 1,
-        },
-    )
-    .expect("wire-safe heartbeat should reserve a sequence");
-    let second = a.send(
-        node_b,
-        addr_b,
-        Packet::Heartbeat {
-            node_id: a.node_id(),
-            timestamp: 2,
-        },
-    )
-    .expect("wire-safe heartbeat should reserve a sequence");
+    let first = a
+        .send_tracked(
+            node_b,
+            addr_b,
+            Packet::Heartbeat {
+                node_id: a.node_id(),
+                timestamp: 1,
+            },
+        )
+        .expect("wire-safe heartbeat should reserve a sequence");
+    let second = a
+        .send_tracked(
+            node_b,
+            addr_b,
+            Packet::Heartbeat {
+                node_id: a.node_id(),
+                timestamp: 2,
+            },
+        )
+        .expect("wire-safe heartbeat should reserve a sequence");
 
     assert_eq!(first, 1);
     assert_eq!(second, 2);
