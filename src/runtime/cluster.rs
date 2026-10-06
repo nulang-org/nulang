@@ -21,8 +21,8 @@
 //!
 //! # Gossip Protocol
 //!
-//! Membership changes propagate via gossip. Each tick, a node selects a random
-//! subset of healthy peers and sends them a compact view of the membership
+//! Membership changes propagate via gossip. At a bounded cadence, a node selects
+//! a random subset of healthy peers and sends them a compact view of the membership
 //! table. When merging incoming gossip, the higher incarnation number wins,
 //! ensuring convergence even under partition.
 
@@ -37,6 +37,11 @@ use tracing::warn;
 
 /// Default interval between heartbeats (500ms).
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Default interval between gossip rounds. This matches the runtime's intended
+/// cluster-maintenance cadence while preventing hot network polls from turning
+/// gossip into an unbounded packet source.
+const DEFAULT_GOSSIP_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Default timeout before marking a node suspicious (2s).
 const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -427,6 +432,10 @@ pub struct ClusterState {
     /// Timestamp of last heartbeat we sent.
     last_heartbeat_sent: Instant,
 
+    /// Timestamp of the last gossip round. `None` permits one immediate
+    /// dissemination after a peer becomes available.
+    last_gossip_sent: Option<Instant>,
+
     /// Optional virtual clock for deterministic testing.
     /// When set, all time queries use this clock instead of wall time.
     clock: Option<super::timer::VirtualClock>,
@@ -517,6 +526,7 @@ impl ClusterState {
             heartbeat_timeout: DEFAULT_HEARTBEAT_TIMEOUT,
             suspicion_duration: DEFAULT_SUSPICION_DURATION,
             last_heartbeat_sent: now,
+            last_gossip_sent: None,
             split_brain: None,
             probe_interval: DEFAULT_PROBE_INTERVAL,
             last_probe_sent: None,
@@ -1003,13 +1013,21 @@ impl ClusterState {
         self.reply_cursor = (self.reply_cursor + 1) % n.max(1);
 
         // ------------------------------------------------------------------
-        // 5. Gossip to a random subset of healthy nodes
+        // 5. Gossip to a random subset of healthy nodes. Unlike callers of
+        //    `tick`, gossip has its own cadence so a hot network poll loop
+        //    cannot flood the bounded transport queues with control traffic.
         // ------------------------------------------------------------------
-        let gossip_targets = self.pick_gossip_targets(GOSSIP_FANOUT);
-        if !gossip_targets.is_empty() {
-            actions.push(ClusterAction::SendGossip {
-                targets: gossip_targets,
-            });
+        let gossip_due = self.last_gossip_sent.map_or(true, |last| {
+            now.duration_since(last) >= DEFAULT_GOSSIP_INTERVAL
+        });
+        if gossip_due {
+            let gossip_targets = self.pick_gossip_targets(GOSSIP_FANOUT);
+            if !gossip_targets.is_empty() {
+                self.last_gossip_sent = Some(now);
+                actions.push(ClusterAction::SendGossip {
+                    targets: gossip_targets,
+                });
+            }
         }
 
         actions
