@@ -15,7 +15,9 @@
 //!
 //! The default (non-OTel) build records each handled message as a
 //! `tracing` span carrying `trace_id` / `span_id` / `parent_span_id` as
-//! structured fields — zero work when no `tracing` subscriber is attached.
+//! structured fields. Untraced actor messages do not synthesize a trace
+//! context unless TRACE collection is enabled, so the default hot path avoids
+//! trace-id generation, formatting, parsing, and propagation work entirely.
 //! The optional `otel` feature can bridge those fields into real OTLP spans
 //! via `tracing-opentelemetry`.
 
@@ -83,6 +85,25 @@ impl TraceContext {
             span_id: nonzero_u64(),
             parent_span_id: 0,
             sampled: true,
+        }
+    }
+
+    /// Create the context for one actor-message dispatch.
+    ///
+    /// Existing W3C context always propagates, even when local TRACE spans are
+    /// filtered out. A message with no incoming context only starts a new root
+    /// when this runtime is actually collecting TRACE-level spans. Malformed
+    /// incoming context preserves the historical fail-soft behavior by starting
+    /// a fresh root. This keeps observability semantics intact while making the
+    /// normal untraced actor path allocation/formatting-free.
+    #[inline]
+    pub(crate) fn for_dispatch(traceparent: Option<&str>, create_root: bool) -> Option<Self> {
+        match traceparent {
+            Some(tp) => Some(
+                Self::from_traceparent(tp).map_or_else(Self::root, |incoming| incoming.child()),
+            ),
+            None if create_root => Some(Self::root()),
+            None => None,
         }
     }
 
@@ -261,5 +282,42 @@ mod tests {
         assert_ne!(a.trace_id(), 0);
         assert_ne!(a.span_id(), 0);
         assert_ne!(a.trace_id(), b.trace_id());
+    }
+
+    #[test]
+    fn dispatch_without_incoming_trace_is_lazy_when_collection_is_disabled() {
+        assert!(TraceContext::for_dispatch(None, false).is_none());
+    }
+
+    #[test]
+    fn dispatch_continues_incoming_trace_even_when_collection_is_disabled() {
+        let incoming = TraceContext::root();
+        let encoded = incoming.to_traceparent();
+        let dispatch = TraceContext::for_dispatch(Some(&encoded), false)
+            .expect("incoming trace must keep propagating");
+
+        assert_eq!(dispatch.trace_id(), incoming.trace_id());
+        assert_eq!(dispatch.parent_span_id(), incoming.span_id());
+        assert_ne!(dispatch.span_id(), incoming.span_id());
+    }
+
+    #[test]
+    fn dispatch_creates_root_when_local_trace_collection_is_enabled() {
+        let dispatch = TraceContext::for_dispatch(None, true)
+            .expect("enabled local collection must start a root trace");
+
+        assert_ne!(dispatch.trace_id(), 0);
+        assert_ne!(dispatch.span_id(), 0);
+        assert_eq!(dispatch.parent_span_id(), 0);
+    }
+
+    #[test]
+    fn dispatch_preserves_malformed_trace_fallback() {
+        let dispatch = TraceContext::for_dispatch(Some("malformed"), false)
+            .expect("malformed incoming context historically starts a fresh trace");
+
+        assert_ne!(dispatch.trace_id(), 0);
+        assert_ne!(dispatch.span_id(), 0);
+        assert_eq!(dispatch.parent_span_id(), 0);
     }
 }
