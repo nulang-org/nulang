@@ -31,6 +31,7 @@ on:
       - 'src/runtime/**'
       - 'src/aot/**'
       - 'src/jit/**'
+      - 'src/vm.rs'
       - 'src/benchmarks.rs'
       - 'benches/actor_bench.rs'
 
