@@ -113,9 +113,7 @@ fn establish_loopback_link(
 }
 
 fn spawn_probe(runtime: &mut Runtime) -> u64 {
-    let actor_id = runtime.spawn_actor(Box::new(|| {
-        vec![("seen".to_string(), Value::int(0))]
-    }));
+    let actor_id = runtime.spawn_actor(Box::new(|| vec![("seen".to_string(), Value::int(0))]));
     runtime
         .actors
         .get_mut(&actor_id)
@@ -136,7 +134,12 @@ fn emit_link_diagnostic(
         .distributed
         .transport
         .as_ref()
-        .map(|transport| (transport.connection_count(), transport.connection_addr(peer_node)))
+        .map(|transport| {
+            (
+                transport.connection_count(),
+                transport.connection_addr(peer_node),
+            )
+        })
         .unwrap_or((0, None));
     let cluster_addr = runtime
         .distributed
@@ -168,7 +171,13 @@ fn drive_until(
         let process_elapsed = process_started.elapsed();
         budget.process_network_ns += process_elapsed.as_nanos();
         if process_elapsed > Duration::from_millis(10) {
-            emit_link_diagnostic(runtime, peer_node, side, sequence, process_elapsed.as_nanos());
+            emit_link_diagnostic(
+                runtime,
+                peer_node,
+                side,
+                sequence,
+                process_elapsed.as_nanos(),
+            );
         }
 
         let scheduler_started = Instant::now();
@@ -230,12 +239,7 @@ impl LoopbackRoundTrip {
         }
     }
 
-    fn send(
-        runtime: &mut Runtime,
-        target_node: NodeId,
-        target_actor: u64,
-        sequence: i64,
-    ) -> u128 {
+    fn send(runtime: &mut Runtime, target_node: NodeId, target_actor: u64, sequence: i64) -> u128 {
         let started = Instant::now();
         runtime.send_distributed(
             ActorAddress::remote(target_node, target_actor),
@@ -248,12 +252,7 @@ impl LoopbackRoundTrip {
     fn roundtrip(&mut self, sequence: i64) -> StageBudget {
         let mut budget = StageBudget::default();
 
-        budget.send_ns += Self::send(
-            &mut self.left,
-            self.right_node,
-            self.right_actor,
-            sequence,
-        );
+        budget.send_ns += Self::send(&mut self.left, self.right_node, self.right_actor, sequence);
         budget.add(drive_until(
             &mut self.right,
             self.left_node,
@@ -262,12 +261,7 @@ impl LoopbackRoundTrip {
             sequence,
         ));
 
-        budget.send_ns += Self::send(
-            &mut self.right,
-            self.left_node,
-            self.left_actor,
-            sequence,
-        );
+        budget.send_ns += Self::send(&mut self.right, self.left_node, self.left_actor, sequence);
         budget.add(drive_until(
             &mut self.left,
             self.right_node,
