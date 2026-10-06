@@ -125,7 +125,13 @@ fn spawn_probe(runtime: &mut Runtime) -> u64 {
     actor_id
 }
 
-fn emit_link_diagnostic(runtime: &Runtime, peer_node: NodeId, side: &str, sequence: i64, elapsed_ns: u128) {
+fn emit_link_diagnostic(
+    runtime: &Runtime,
+    peer_node: NodeId,
+    side: &str,
+    sequence: i64,
+    elapsed_ns: u128,
+) {
     let (connection_count, connection_addr) = runtime
         .distributed
         .transport
