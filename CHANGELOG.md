@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Wasmtime security update — 2026-10-06
+- **`wasmtime` bumped 48.0.3 → 48.0.4** to clear RUSTSEC-2026-0325 / -0326 / -0327 (GC heap corruption on mis-typed tag imports, missing GC rooting across `try_call`, and a **critical** native stack buffer overflow via unvalidated async-lifted callback result counts). The manifest constraint is raised to `48.0.4` so fresh resolutions cannot regress to the vulnerable 48.0.3; the transitive cranelift/`wasmparser`/`wit-*` family moves in lockstep.
+
 ### Standalone SQLite feature dependency closure — 2026-10-02
 - **The standalone `sqlite` feature now enables Tokio directly because `LibsqlStore` owns a Tokio runtime.** Minimal `--no-default-features --features sqlite` builds no longer rely on unrelated default-profile features to supply that direct dependency.
 
