@@ -51,7 +51,7 @@ fn test_actor_module_hash_uses_exact_runtime_schema() {
     let actor_id = rt.spawn_actor(Box::new(Vec::new));
     let actor = rt.actors.get_mut(&actor_id).expect("actor");
     actor.name = "Second".to_string();
-    actor.bytecode_module = Some(module);
+    actor.bytecode_module = Some(Box::new(module));
 
     assert_eq!(
         rt.actor_module_hash(actor_id),
@@ -949,7 +949,7 @@ fn test_restarted_bytecode_child_handles_messages() {
     let child_id = rt.spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
     {
         let actor = rt.actors.get_mut(&child_id).unwrap();
-        actor.bytecode_module = Some(module.clone());
+        actor.bytecode_module = Some(Box::new(module.clone()));
         actor.bytecode_offsets = vec![0];
         actor.compensation_offsets = vec![None];
     }
@@ -1978,7 +1978,7 @@ fn test_persistent_string_state_survives_checkpoint_and_recovery() {
     {
         let actor = rt.actors.get_mut(&actor_id).unwrap();
         actor.set_state_field("greeting", string_val);
-        actor.bytecode_module = Some(module);
+        actor.bytecode_module = Some(Box::new(module));
     }
 
     // Force a checkpoint.
@@ -2038,7 +2038,7 @@ fn test_journal_replay_restores_persisted_string_payload_on_actor_heap() {
 
     {
         let actor = rt.actors.get_mut(&actor_id).unwrap();
-        actor.bytecode_module = Some(module.clone());
+        actor.bytecode_module = Some(Box::new(module.clone()));
         actor.bytecode_offsets = vec![0];
         actor.compensation_offsets = vec![None];
     }
@@ -2141,7 +2141,7 @@ fn test_persistent_native_ask_journal_preserves_module_string_id() {
 
     let mut module = CodeModule::new("journal-string-id");
     let string_idx = module.add_constant(Constant::String("pooled value".to_string()));
-    rt.actors.get_mut(&actor_id).unwrap().bytecode_module = Some(module);
+    rt.actors.get_mut(&actor_id).unwrap().bytecode_module = Some(Box::new(module));
 
     rt.ask_actor_sync(actor_id, 0, &[Value::string(string_idx as u32)])
         .unwrap();
@@ -4842,7 +4842,7 @@ fn test_actor_migration_between_two_nodes() {
             if model == crate::runtime::persistence::StateModel::Durable || model.is_crdt() {
                 let persisted = crate::runtime::persistence::PersistedValue::from_value_resolved(
                     value,
-                    actor.bytecode_module.as_ref(),
+                    actor.bytecode_module.as_deref(),
                 );
                 state.insert(name.clone(), persisted);
             }
@@ -6373,7 +6373,7 @@ fn test_message_retry_after_bytecode_fetch() {
     let actor_id = rt_a.spawn_actor(Box::new(|| vec![("received".to_string(), Value::int(0))]));
     {
         let actor = rt_a.actors.get_mut(&actor_id).unwrap();
-        actor.bytecode_module = Some(module);
+        actor.bytecode_module = Some(Box::new(module));
         actor.bytecode_offsets = vec![0];
         actor.register_behavior("store", |actor, args| {
             let n = args.get(0).and_then(|v| v.as_int()).unwrap_or(-1);
@@ -8533,4 +8533,45 @@ fn workflow_timer_fire_is_not_delivered_when_durable_fire_append_fails() {
     );
 
     let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn workflow_timer_rearm_accepts_valid_behavior_zero() {
+    let mut rt = Runtime::new();
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "timer_zero",
+            Box::new(|| vec![]),
+            std::collections::HashMap::new(),
+        )
+        .unwrap();
+
+    assert_eq!(rt.behavior_id_for(actor_id, "__timer_fired"), Some(0));
+    rt.rearm_timer(actor_id, "wake", 10);
+
+    assert_eq!(
+        rt.timer_wheel.len(),
+        1,
+        "valid __timer_fired behavior id zero must be re-armed",
+    );
+}
+
+#[test]
+fn workflow_timer_rearm_rejects_missing_handler_without_aliasing_behavior_zero() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![]));
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("first", |_actor, _args| {});
+
+    assert_eq!(rt.behavior_id_for(actor_id, "first"), Some(0));
+    assert_eq!(rt.behavior_id_for(actor_id, "__timer_fired"), None);
+
+    rt.rearm_timer(actor_id, "wake", 10);
+
+    assert!(
+        rt.timer_wheel.is_empty(),
+        "missing __timer_fired must not alias behavior zero",
+    );
 }

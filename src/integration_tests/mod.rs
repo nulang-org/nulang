@@ -4546,6 +4546,9 @@ match { a: 2, b: 9 } with {
         let rt = Rc::new(RefCell::new(Runtime::new()));
         rt.borrow_mut().persistence = Box::new(store.clone());
         rt.borrow_mut().install_virtual_clock();
+        // Deliberately let wall time move past the sleep duration. Timer
+        // scheduling must remain relative to the frozen virtual clock.
+        std::thread::sleep(std::time::Duration::from_millis(75));
 
         let value = {
             let mut vm = VM::new();
