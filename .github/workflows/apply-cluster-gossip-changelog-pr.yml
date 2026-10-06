@@ -1,0 +1,47 @@
+name: Apply cluster gossip changelog
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/apply-cluster-gossip-changelog-pr.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+      - name: Prepend changelog entry
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('CHANGELOG.md')
+          text = path.read_text()
+          heading = '# Nulang Changelog\n'
+          if not text.startswith(heading):
+              raise SystemExit('unexpected CHANGELOG.md heading')
+          entry = '''### Poll-rate-independent cluster gossip — 2026-10-06
+- **Cluster gossip now runs on an explicit 100 ms cadence instead of every `Runtime::process_network()` poll.** This prevents hot remote-actor polling loops from amplifying membership traffic into bounded transport queue backpressure while preserving the deterministic cluster-maintenance cadence.
+- **A virtual-clock regression and stacked remote RTT probe pin the boundary.** Immediate repeated ticks suppress gossip, emission resumes at 100 ms, and the Healthy-membership loopback probe completes 2,000 roundtrips without the prior transport stall.
+
+'''
+          if '### Poll-rate-independent cluster gossip — 2026-10-06\n' not in text:
+              path.write_text(heading + entry + text[len(heading):])
+          PY
+      - name: Commit changelog
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git rm .github/workflows/apply-cluster-gossip-changelog-pr.yml
+          git add CHANGELOG.md
+          git diff --cached --check
+          git commit -m 'docs(changelog): note cluster gossip cadence fix'
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
