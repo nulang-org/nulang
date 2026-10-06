@@ -63,6 +63,7 @@ impl PeerCrdtFrontiers {
         Self::with_pending_limit(DEFAULT_MAX_PENDING_BATCHES_PER_PEER)
     }
 
+    /// Create frontiers with an explicit in-flight batch bound per peer.
     pub fn with_pending_limit(max_pending_batches_per_peer: usize) -> Self {
         Self {
             next_batch_id: 1,
@@ -86,7 +87,14 @@ impl PeerCrdtFrontiers {
         let mut ops = Vec::new();
         let mut represented_state = HashMap::new();
 
-        for (id, entry) in &manager.entries {
+        // HashMap iteration order is deliberately not part of the wire
+        // contract. Stable CRDT-id ordering makes repeated generations from
+        // the same state byte-for-byte deterministic once packet framing is
+        // wired to this component.
+        let mut entries: Vec<_> = manager.entries.iter().collect();
+        entries.sort_unstable_by_key(|(id, _)| id.0);
+
+        for (id, entry) in entries {
             match peer.acknowledged.get(id) {
                 None => {
                     ops.push(CrdtDeltaOp {
@@ -209,7 +217,8 @@ mod tests {
         assert!(!frontiers.acknowledge(2, first.batch_id));
         assert!(frontiers.acknowledge(2, second.batch_id));
         assert_eq!(frontiers.acknowledged_entry_count(2), 1);
-        assert!(!frontiers.acknowledge(2, third.batch_id - 2));
+        assert!(frontiers.acknowledge(2, third.batch_id));
+        assert!(!frontiers.acknowledge(2, second.batch_id));
     }
 
     #[test]
@@ -227,5 +236,18 @@ mod tests {
         frontiers.forget_peer(9);
         let rejoin = frontiers.generate(&manager, 9).unwrap();
         assert!(!rejoin.ops[0].is_delta);
+    }
+
+    #[test]
+    fn operation_order_is_stable_by_crdt_id() {
+        let mut manager = CrdtManager::new(1);
+        let first = manager.create_gcounter().0;
+        let second = manager.create_gcounter().0;
+
+        let mut frontiers = PeerCrdtFrontiers::new();
+        let batch = frontiers.generate(&manager, 2).unwrap();
+        let ids: Vec<_> = batch.ops.iter().map(|op| op.op.crdt_id.0).collect();
+
+        assert_eq!(ids, vec![first.0.min(second.0), first.0.max(second.0)]);
     }
 }
