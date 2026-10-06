@@ -1939,6 +1939,8 @@ pub struct IncomingPacket {
 pub struct OutgoingPacket {
     pub to_node: NodeId,
     pub to_addr: SocketAddr,
+    /// Exact sequence number encoded into the NUL0 frame.
+    pub seq: u64,
     pub packet: Packet,
 }
 
@@ -1956,7 +1958,7 @@ pub struct OutgoingPacket {
 ///   them to the appropriate TCP stream (connecting first if necessary).
 pub trait NetworkTransport: Send {
     fn connect(&mut self, node_id: NodeId, addr: std::net::SocketAddr) -> std::io::Result<()>;
-    fn send(&mut self, to_node: NodeId, to_addr: std::net::SocketAddr, packet: Packet);
+    fn send(&mut self, to_node: NodeId, to_addr: std::net::SocketAddr, packet: Packet) -> Option<u64>;
     fn receive(&self) -> Vec<IncomingPacket>;
     fn node_id(&self) -> NodeId;
     fn listen_addr(&self) -> std::net::SocketAddr;
@@ -1987,7 +1989,12 @@ impl NetworkTransport for Box<dyn NetworkTransport> {
     fn connect(&mut self, node_id: NodeId, addr: std::net::SocketAddr) -> std::io::Result<()> {
         (**self).connect(node_id, addr)
     }
-    fn send(&mut self, to_node: NodeId, to_addr: std::net::SocketAddr, packet: Packet) {
+    fn send(
+        &mut self,
+        to_node: NodeId,
+        to_addr: std::net::SocketAddr,
+        packet: Packet,
+    ) -> Option<u64> {
         (**self).send(to_node, to_addr, packet)
     }
     fn receive(&self) -> Vec<IncomingPacket> {
@@ -2034,6 +2041,9 @@ pub struct TcpTransport {
     incoming_tx: mpsc::SyncSender<IncomingPacket>,
     /// Channel endpoint used to enqueue packets for transmission.
     outgoing_tx: mpsc::SyncSender<OutgoingPacket>,
+    /// Next NUL0 sequence reserved synchronously by `send` so callers can
+    /// correlate the existing transport ACK with the logical operation.
+    next_seq: u64,
     /// Background thread handles.
     threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
     /// Flag used to ask background threads to shut down.
@@ -2120,6 +2130,7 @@ impl TcpTransport {
             incoming_rx,
             incoming_tx,
             outgoing_tx,
+            next_seq: 1,
             threads: Arc::new(Mutex::new(handles)),
             shutdown_flag,
             tls_config,
@@ -2228,38 +2239,44 @@ impl TcpTransport {
     /// backpressure toward the caller (typically the scheduler thread), not
     /// a silent drop. A packet is dropped only if the sender thread has
     /// already shut down (channel disconnected); that case is logged.
-    pub fn send(&mut self, to_node: NodeId, to_addr: SocketAddr, packet: Packet) {
-        // Reject payloads that cannot cross the wire losslessly. A heap
-        // pointer is process-local and nil has no exact wire form; a string
-        // id is only meaningful paired with the packet's string table.
-        // Drop the packet loudly instead of silently mangling it.
+    pub fn send(
+        &mut self,
+        to_node: NodeId,
+        to_addr: SocketAddr,
+        packet: Packet,
+    ) -> Option<u64> {
         if !packet_payload_wire_safe(&packet) {
             warn!(
                 "nulang-net: dropping packet to node {:?} (addr {}): payload value cannot cross the wire (heap pointer, nil, or string without content)",
                 to_node, to_addr
             );
-            return;
+            return None;
         }
-        // Simulated partition: silently drop the packet exactly like a
-        // firewall between the two nodes would. The peer sees the link
-        // go quiet and the failure detector handles it from there.
+
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        if self.next_seq == 0 {
+            self.next_seq = 1;
+        }
+
+        // A simulated partition models an in-flight drop: the sequence was
+        // assigned, but the receiver will never acknowledge it.
         if self.partition.contains(&to_node) {
-            return;
+            return Some(seq);
         }
         let outgoing = OutgoingPacket {
             to_node,
             to_addr,
+            seq,
             packet,
         };
-        // Blocks on a full channel (backpressure). An error means the sender
-        // thread has shut down and the packet cannot be delivered — log it
-        // rather than dropping silently.
         if self.outgoing_tx.send(outgoing).is_err() {
             warn!(
                 "nulang-net: dropping packet to node {:?} (addr {}): sender thread shut down",
                 to_node, to_addr
             );
         }
+        Some(seq)
     }
 
     /// Receive incoming packets (non-blocking).
@@ -2573,9 +2590,6 @@ fn sender_thread(
     incoming_tx: mpsc::SyncSender<IncomingPacket>,
     tls_config: TlsConfig,
 ) {
-    // We keep a local sequence counter so we can embed it into the bytes.
-    let mut next_seq: u64 = 1;
-
     loop {
         if shutdown_flag.load(Ordering::Relaxed) && outgoing_rx.try_recv().is_err() {
             break;
@@ -2614,10 +2628,9 @@ fn sender_thread(
             }
         }
 
-        // Send the packet.
-        let seq = next_seq;
-        next_seq = next_seq.wrapping_add(1);
-        let bytes = outgoing.packet.to_bytes(seq);
+        // The caller reserved the sequence synchronously so ACKs can be
+        // correlated with the logical operation that produced this packet.
+        let bytes = outgoing.packet.to_bytes(outgoing.seq);
 
         let result = {
             let mut conns = lock_ignore_poison(&connections);
@@ -3960,8 +3973,13 @@ impl NetworkTransport for TcpTransport {
     fn connect(&mut self, node_id: NodeId, addr: std::net::SocketAddr) -> std::io::Result<()> {
         self.connect(node_id, addr)
     }
-    fn send(&mut self, to_node: NodeId, to_addr: std::net::SocketAddr, packet: Packet) {
-        self.send(to_node, to_addr, packet)
+    fn send(
+        &mut self,
+        to_node: NodeId,
+        to_addr: std::net::SocketAddr,
+        packet: Packet,
+    ) -> Option<u64> {
+        TcpTransport::send(self, to_node, to_addr, packet)
     }
     fn receive(&self) -> Vec<IncomingPacket> {
         self.receive()
@@ -3998,6 +4016,7 @@ pub struct DeterministicNetworkTransport {
     /// Channel for receiving packets.
     incoming_rx: mpsc::Receiver<IncomingPacket>,
     incoming_tx: mpsc::SyncSender<IncomingPacket>,
+    next_seq: Arc<AtomicU64>,
     /// Shared bus for connecting to other nodes: node_id -> (incoming_tx, outgoing_tx)
     shared_bus: Arc<
         parking_lot::Mutex<
@@ -4029,6 +4048,7 @@ impl Clone for DeterministicNetworkTransport {
             listen_addr: self.listen_addr,
             incoming_rx: mpsc::sync_channel(CHANNEL_CAPACITY).1,
             incoming_tx: self.incoming_tx.clone(),
+            next_seq: self.next_seq.clone(),
             shared_bus: self.shared_bus.clone(),
             shutdown_flag: self.shutdown_flag.clone(),
             partition: HashSet::new(),
@@ -4069,6 +4089,7 @@ impl DeterministicNetworkTransport {
             listen_addr: addr,
             incoming_rx,
             incoming_tx,
+            next_seq: Arc::new(AtomicU64::new(1)),
             shared_bus,
             shutdown_flag,
             partition: HashSet::new(),
@@ -4100,53 +4121,38 @@ impl NetworkTransport for DeterministicNetworkTransport {
         Ok(())
     }
 
-    fn send(&mut self, to_node: NodeId, _to_addr: SocketAddr, packet: Packet) {
-        // Simulated partition: silently drop (see set_partition).
+    fn send(
+        &mut self,
+        to_node: NodeId,
+        _to_addr: SocketAddr,
+        packet: Packet,
+    ) -> Option<u64> {
+        let mut seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        if seq == 0 {
+            seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        }
+
         if self.partition.contains(&to_node) {
-            return;
+            return Some(seq);
         }
         if let Some(sender) = self.get_incoming_sender(to_node) {
             let incoming = IncomingPacket {
                 from_node: self.node_id,
-                seq: 0,
+                seq,
                 packet,
             };
             if self.reorder {
-                // Bounded adjacent reorder: hold the first packet of each
-                // pair; when the second arrives, deliver the NEW one first
-                // and then the held one — the receiver sees P2 before P1.
-                // Deterministic (per-pair state, no RNG); nothing is lost
-                // or duplicated, only delayed one slot. `flush_held`
-                // delivers the odd tail at the end of the sender's turn.
-                if let Some(held) = self.held.remove(&to_node) {
-                    let _ = sender.try_send(incoming);
-                    let _ = sender.try_send(held);
+                if let Some(previous) = self.held.remove(&to_node) {
+                    let _ = sender.send(incoming);
+                    let _ = sender.send(previous);
                 } else {
                     self.held.insert(to_node, incoming);
                 }
             } else {
-                let _ = sender.try_send(incoming);
+                let _ = sender.send(incoming);
             }
         }
-    }
-
-    fn flush_held(&mut self) {
-        // Drain into an owned Vec first: `held` is a field of `self`, and
-        // `get_incoming_sender` borrows `self` — draining while borrowing
-        // immutably would conflict.
-        let held: Vec<(NodeId, IncomingPacket)> = self.held.drain().collect();
-        for (to, pkt) in held {
-            if let Some(sender) = self.get_incoming_sender(to) {
-                let _ = sender.try_send(pkt);
-            }
-        }
-    }
-
-    fn set_reorder(&mut self, enabled: bool) {
-        self.reorder = enabled;
-        if !enabled {
-            self.held.clear();
-        }
+        Some(seq)
     }
 
     fn receive(&self) -> Vec<IncomingPacket> {
