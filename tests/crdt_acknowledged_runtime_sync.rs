@@ -2,7 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use nulang::runtime::{DeterministicNetworkTransport, IncomingPacket, NodeId, OutgoingPacket, Runtime};
+use nulang::runtime::{
+    DeterministicNetworkTransport, IncomingPacket, NodeId, OutgoingPacket, Runtime,
+};
 
 fn distributed_runtime(
     addr: SocketAddr,
