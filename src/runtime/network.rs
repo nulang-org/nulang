@@ -1960,15 +1960,15 @@ pub trait NetworkTransport: Send {
     fn connect(&mut self, node_id: NodeId, addr: std::net::SocketAddr) -> std::io::Result<()>;
     fn send(&mut self, to_node: NodeId, to_addr: std::net::SocketAddr, packet: Packet);
     /// Send a packet and return the exact NUL0 sequence when the transport can
-    /// expose it synchronously. The default preserves compatibility for custom
-    /// transports that only implement fire-and-forget `send`.
+    /// expose it synchronously. `None` means no tracked send was performed;
+    /// callers may explicitly fall back to ordinary `send`. This keeps custom
+    /// transports source-compatible without risking an untrackable duplicate.
     fn send_tracked(
         &mut self,
-        to_node: NodeId,
-        to_addr: std::net::SocketAddr,
-        packet: Packet,
+        _to_node: NodeId,
+        _to_addr: std::net::SocketAddr,
+        _packet: Packet,
     ) -> Option<u64> {
-        self.send(to_node, to_addr, packet);
         None
     }
     fn receive(&self) -> Vec<IncomingPacket>;
