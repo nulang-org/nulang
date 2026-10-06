@@ -78,11 +78,7 @@ impl PeerCrdtFrontiers {
     /// Crucially, generating a batch does **not** advance receiver knowledge.
     /// Until [`acknowledge`](Self::acknowledge) succeeds, a subsequent call is
     /// allowed to retransmit equivalent information.
-    pub fn generate(
-        &mut self,
-        manager: &CrdtManager,
-        peer_id: u64,
-    ) -> Option<CrdtPeerSyncBatch> {
+    pub fn generate(&mut self, manager: &CrdtManager, peer_id: u64) -> Option<CrdtPeerSyncBatch> {
         let peer = self.peers.entry(peer_id).or_default();
         let mut ops = Vec::new();
         let mut represented_state = HashMap::new();
