@@ -8,6 +8,7 @@ on:
 permissions:
   contents: write
 
+# Temporary self-removing workflow used only to update the large changelog safely.
 jobs:
   apply:
     if: github.event.pull_request.head.repo.full_name == github.repository
