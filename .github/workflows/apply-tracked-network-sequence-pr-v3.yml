@@ -1,0 +1,93 @@
+name: Apply additive tracked network sequences
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/apply-tracked-network-sequence-pr-v3.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+      - name: Make tracked sends additive and restore deterministic controls
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path('src/runtime/network.rs')
+          text = path.read_text()
+
+          def exact(old, new, expected=1):
+              global text
+              count = text.count(old)
+              if count != expected:
+                  raise SystemExit(f'expected {expected} occurrences, found {count}: {old[:120]!r}')
+              text = text.replace(old, new)
+
+          exact(
+              '''    fn send(&mut self, to_node: NodeId, to_addr: std::net::SocketAddr, packet: Packet) -> Option<u64>;\n    fn receive(&self) -> Vec<IncomingPacket>;''',
+              '''    fn send(&mut self, to_node: NodeId, to_addr: std::net::SocketAddr, packet: Packet);\n    /// Send a packet and return the exact NUL0 sequence when the transport can\n    /// expose it synchronously. The default preserves compatibility for custom\n    /// transports that only implement fire-and-forget `send`.\n    fn send_tracked(\n        &mut self,\n        to_node: NodeId,\n        to_addr: std::net::SocketAddr,\n        packet: Packet,\n    ) -> Option<u64> {\n        self.send(to_node, to_addr, packet);\n        None\n    }\n    fn receive(&self) -> Vec<IncomingPacket>;''',
+          )
+
+          box_pattern = re.compile(
+              r'''    fn send\(\n        &mut self,\n        to_node: NodeId,\n        to_addr: std::net::SocketAddr,\n        packet: Packet,\n    \) -> Option<u64> \{\n        \(\*\*self\)\.send\(to_node, to_addr, packet\)\n    \}\n    fn receive'''
+          )
+          box_replacement = '''    fn send(&mut self, to_node: NodeId, to_addr: std::net::SocketAddr, packet: Packet) {\n        (**self).send(to_node, to_addr, packet)\n    }\n    fn send_tracked(\n        &mut self,\n        to_node: NodeId,\n        to_addr: std::net::SocketAddr,\n        packet: Packet,\n    ) -> Option<u64> {\n        (**self).send_tracked(to_node, to_addr, packet)\n    }\n    fn receive'''
+          text, count = box_pattern.subn(box_replacement, text, count=1)
+          if count != 1:
+              raise SystemExit(f'expected one boxed transport send impl, replaced {count}')
+
+          # Keep the public TcpTransport::send compatibility surface and move\n          # sequence-aware behavior behind an explicit additive method.
+          exact(
+              '''    pub fn send(\n        &mut self,\n        to_node: NodeId,\n        to_addr: SocketAddr,\n        packet: Packet,\n    ) -> Option<u64> {''',
+              '''    pub fn send(&mut self, to_node: NodeId, to_addr: SocketAddr, packet: Packet) {\n        let _ = self.send_tracked(to_node, to_addr, packet);\n    }\n\n    /// Send a packet while exposing the exact sequence used by NUL0 so an\n    /// existing transport ACK can be correlated with higher-level state.\n    pub fn send_tracked(\n        &mut self,\n        to_node: NodeId,\n        to_addr: SocketAddr,\n        packet: Packet,\n    ) -> Option<u64> {''',
+              1,
+          )
+
+          tcp_trait_pattern = re.compile(
+              r'''    fn send\(\n        &mut self,\n        to_node: NodeId,\n        to_addr: std::net::SocketAddr,\n        packet: Packet,\n    \) -> Option<u64> \{\n        TcpTransport::send\(self, to_node, to_addr, packet\)\n    \}\n    fn receive'''
+          )
+          tcp_trait_replacement = '''    fn send(&mut self, to_node: NodeId, to_addr: std::net::SocketAddr, packet: Packet) {\n        TcpTransport::send(self, to_node, to_addr, packet)\n    }\n    fn send_tracked(\n        &mut self,\n        to_node: NodeId,\n        to_addr: std::net::SocketAddr,\n        packet: Packet,\n    ) -> Option<u64> {\n        TcpTransport::send_tracked(self, to_node, to_addr, packet)\n    }\n    fn receive'''
+          text, count = tcp_trait_pattern.subn(tcp_trait_replacement, text, count=1)
+          if count != 1:
+              raise SystemExit(f'expected one TcpTransport trait impl, replaced {count}')
+
+          det_pattern = re.compile(
+              r'''    fn send\(\n        &mut self,\n        to_node: NodeId,\n        _to_addr: SocketAddr,\n        packet: Packet,\n    \) -> Option<u64> \{\n(?P<body>.*?)\n        Some\(seq\)\n    \}\n\n    fn receive''',
+              re.S,
+          )
+          match = det_pattern.search(text)
+          if not match:
+              raise SystemExit('deterministic tracked send body not found')
+          body = match.group('body').replace('sender.send(incoming)', 'sender.try_send(incoming)').replace('sender.send(previous)', 'sender.try_send(previous)')
+          det_replacement = '''    fn send(&mut self, to_node: NodeId, to_addr: SocketAddr, packet: Packet) {\n        let _ = self.send_tracked(to_node, to_addr, packet);\n    }\n\n    fn send_tracked(\n        &mut self,\n        to_node: NodeId,\n        _to_addr: SocketAddr,\n        packet: Packet,\n    ) -> Option<u64> {\n''' + body + '''\n        Some(seq)\n    }\n\n    fn flush_held(&mut self) {\n        // Drain into an owned Vec first: `held` is a field of `self`, and\n        // `get_incoming_sender` borrows `self` — draining while borrowing\n        // immutably would conflict.\n        let held: Vec<(NodeId, IncomingPacket)> = self.held.drain().collect();\n        for (to, pkt) in held {\n            if let Some(sender) = self.get_incoming_sender(to) {\n                let _ = sender.try_send(pkt);\n            }\n        }\n    }\n\n    fn set_reorder(&mut self, enabled: bool) {\n        self.reorder = enabled;\n        if !enabled {\n            self.held.clear();\n        }\n    }\n\n    fn receive'''
+          text = det_pattern.sub(det_replacement, text, count=1)
+
+          path.write_text(text)
+
+          test = Path('tests/network_tracked_sequence.rs')
+          t = test.read_text()
+          t = t.replace('let first = a.send(', 'let first = a.send_tracked(', 1)
+          t = t.replace('let second = a.send(', 'let second = a.send_tracked(', 1)
+          test.write_text(t)
+          PY
+      - name: Format and commit
+        run: |
+          cargo fmt --all
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git rm .github/workflows/apply-tracked-network-sequence-pr-v3.yml
+          git add src/runtime/network.rs tests/network_tracked_sequence.rs
+          git diff --cached --check
+          git commit -m 'refactor(network): keep tracked sequences additive'
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
