@@ -1236,6 +1236,11 @@ pub fn process_network_packets(
             }
             Packet::Ack { packet_seq } => {
                 runtime.acked_packets.insert(packet_seq);
+                if let Some((peer_id, batch_id)) =
+                    runtime.pending_crdt_sync_acks.remove(&packet_seq)
+                {
+                    runtime.crdt_peer_frontiers.acknowledge(peer_id, batch_id);
+                }
             }
             Packet::FetchBehaviorRequest { content_hash } => {
                 let mut nbc_bytes: Option<Vec<u8>> = None;
@@ -2345,20 +2350,79 @@ pub fn sync_crdts_delta(runtime: &mut Runtime) {
     if !runtime.distributed.enabled {
         return;
     }
-    let ops = match &mut runtime.crdt_manager {
-        Some(m) => m.generate_delta_sync_ops(),
-        None => return,
-    };
-    if ops.is_empty() {
+
+    let targets: Vec<(u64, NodeId, std::net::SocketAddr)> = runtime
+        .distributed
+        .cluster
+        .as_ref()
+        .map(|cluster| {
+            cluster
+                .healthy_members()
+                .iter()
+                .map(|member| {
+                    (
+                        member.node_id.0,
+                        NodeId(member.node_id.0),
+                        member.address,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if targets.is_empty() {
         return;
     }
-    let packet = Packet::CrdtDeltaSync { ops: Arc::new(ops) };
-    if let Some(cluster) = &runtime.distributed.cluster {
-        for member in cluster.healthy_members() {
-            if let Some(transport) = &mut runtime.distributed.transport {
-                let net_node_id = NodeId(member.node_id.0);
-                transport.send(net_node_id, member.address, packet.clone());
-            }
+
+    // Generate each receiver's batch from that receiver's last explicitly
+    // acknowledged frontier. Generation itself never advances knowledge, so a
+    // lost packet remains retransmittable on the next ordinary sync round.
+    let batches: Vec<_> = {
+        let Some(manager) = runtime.crdt_manager.as_ref() else {
+            return;
+        };
+        targets
+            .into_iter()
+            .filter_map(|(peer_id, node_id, address)| {
+                runtime
+                    .crdt_peer_frontiers
+                    .generate(manager, peer_id)
+                    .map(|batch| (peer_id, node_id, address, batch))
+            })
+            .collect()
+    };
+
+    for (peer_id, node_id, address, batch) in batches {
+        let packet = Packet::CrdtDeltaSync {
+            ops: Arc::new(batch.ops),
+        };
+
+        let tracked_seq = runtime
+            .distributed
+            .transport
+            .as_mut()
+            .and_then(|transport| transport.send_tracked(node_id, address, packet.clone()));
+
+        if let Some(packet_seq) = tracked_seq {
+            // Retain only the newest tracked attempt for this peer. If an older
+            // packet later succeeds its ACK is conservatively ignored, which
+            // can only cause a retransmission; it cannot advance the frontier
+            // past unproven receiver state.
+            runtime
+                .pending_crdt_sync_acks
+                .retain(|_, (pending_peer, _)| *pending_peer != peer_id);
+            runtime
+                .pending_crdt_sync_acks
+                .insert(packet_seq, (peer_id, batch.batch_id));
+        } else if let Some(transport) = runtime.distributed.transport.as_mut() {
+            // Compatibility path for custom transports that cannot expose a
+            // NUL0 sequence. The default send_tracked implementation performs
+            // no send, so fall back exactly once and retain the historical
+            // optimistic frontier behavior for those transports.
+            transport.send(node_id, address, packet);
+            runtime
+                .crdt_peer_frontiers
+                .acknowledge(peer_id, batch.batch_id);
         }
     }
 }
