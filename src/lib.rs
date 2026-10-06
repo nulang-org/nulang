@@ -32,9 +32,9 @@ pub mod compat;
 pub mod compiler_identity;
 pub mod content_identity;
 pub mod core_vm;
-pub mod crdt_peer_sync;
 #[cfg(feature = "native-codegen")]
 pub mod cranelift_utils;
+pub mod crdt_peer_sync;
 pub mod dap;
 pub mod database;
 pub mod diagnostic;
