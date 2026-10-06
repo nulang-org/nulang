@@ -19,6 +19,8 @@ fn gossip_is_rate_limited_to_cluster_maintenance_cadence() {
     let peer_addr = addr(31_002);
     let local = NodeId::new(&local_addr);
     let peer = NodeId::new(&peer_addr);
+    // Pin the boundary to virtual time so the contract is deterministic and
+    // matches the 100 ms step used by the cluster simulation harness.
     let mut clock = VirtualClock::new();
     let mut cluster = ClusterState::new(local, local_addr);
     cluster.set_clock(clock.clone());
