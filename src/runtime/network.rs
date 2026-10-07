@@ -2801,6 +2801,47 @@ mod tests {
         assert_ne!(id1.0, 0, "NodeId must not be zero");
     }
 
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn test_tcp_connect_failure_is_observable_and_not_retried() {
+        let reservation = TcpListener::bind("127.0.0.1:0").expect("reserve port");
+        let unreachable = reservation.local_addr().expect("reserved address");
+        drop(reservation);
+
+        let mut transport =
+            TcpTransport::bind("127.0.0.1:0".parse().unwrap(), TlsConfig::PlaintextInsecure)
+                .expect("bind transport");
+        let peer = NodeId::new(&unreachable);
+        transport.send(
+            peer,
+            unreachable,
+            Packet::Heartbeat {
+                node_id: transport.node_id(),
+                timestamp: 1,
+            },
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let failure = loop {
+            if let Some(failure) = transport.take_delivery_failures().into_iter().next() {
+                break failure;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "connect failure was not surfaced"
+            );
+            sleep(Duration::from_millis(10));
+        };
+        assert_eq!(failure.kind, DeliveryFailureKind::Connect);
+        assert_eq!(failure.to_node, peer);
+        sleep(Duration::from_millis(100));
+        assert!(
+            transport.take_delivery_failures().is_empty(),
+            "failed send must not be retried"
+        );
+        transport.shutdown();
+    }
+
     // ------------------------------------------------------------------
     // 2. ActorMessage roundtrip
     // ------------------------------------------------------------------
