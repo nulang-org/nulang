@@ -127,6 +127,7 @@ pub use scheduler::*;
 pub use supervisor::*;
 pub use timer::*;
 
+use crate::crdt_peer_sync::PeerCrdtFrontiers;
 use crate::types::{ExitReason, NuError, Span, VmSuspension};
 use crate::vm::Value;
 
@@ -409,6 +410,15 @@ pub struct Runtime {
 
     // CRDT manager (v0.6)
     pub crdt_manager: Option<CrdtManager>,
+    /// Receiver-specific CRDT knowledge. A peer frontier advances only after
+    /// the transport ACK for the packet carrying that logical batch arrives.
+    pub(crate) crdt_peer_frontiers: PeerCrdtFrontiers,
+    /// Tracked NUL0 packet sequence -> (peer id, logical CRDT batch id).
+    ///
+    /// At most the newest tracked batch per peer is retained. Ignoring an
+    /// older late ACK can cause a harmless retransmission; accepting an ACK
+    /// for a packet we no longer track could incorrectly advance knowledge.
+    pub(crate) pending_crdt_sync_acks: HashMap<u64, (u64, u64)>,
 
     // Number of `sync_crdts` calls made; delta-state syncs run on most
     // rounds, with a full-state repair sync every CRDT_FULL_SYNC_INTERVAL.
@@ -660,6 +670,8 @@ impl Runtime {
             // `state crdt` fields register and `Crdt.*` ops work without
             // distribution enabled.
             crdt_manager: Some(CrdtManager::new(0)),
+            crdt_peer_frontiers: PeerCrdtFrontiers::new(),
+            pending_crdt_sync_acks: HashMap::new(),
             virtual_clock: None,
             metrics: None,
             #[cfg(feature = "python")]

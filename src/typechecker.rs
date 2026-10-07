@@ -1265,7 +1265,7 @@ impl TypeChecker {
                             },
                             None => variant_ty.clone(),
                         };
-                        let gen_ty = self.do_generalize(&ctx, &ctor_ty);
+                        let gen_ty = self.do_generalize_constructor(&ctx, &ctor_ty);
                         ctx.bind(ctor_name.clone(), gen_ty, Capability::Ref, false);
                     }
                 }
@@ -4047,6 +4047,24 @@ impl TypeChecker {
     /// same cell be used at incompatible types (e.g.
     /// `let r = &[] in { r = [1]; (*r)[0] == "s" }`).
     fn do_generalize(&self, ctx: &TypeContext, ty: &Type) -> Type {
+        self.do_generalize_impl(ctx, ty, true)
+    }
+
+    /// Variant constructors describe how to build values; binding the
+    /// constructor itself does not allocate the mutable storage mentioned by
+    /// another variant alternative. Applying the mutable-storage restriction
+    /// here would make nullary constructors of recursive ADTs monomorphic
+    /// merely because a sibling constructor carries an array.
+    fn do_generalize_constructor(&self, ctx: &TypeContext, ty: &Type) -> Type {
+        self.do_generalize_impl(ctx, ty, false)
+    }
+
+    fn do_generalize_impl(
+        &self,
+        ctx: &TypeContext,
+        ty: &Type,
+        apply_value_restriction: bool,
+    ) -> Type {
         // Replace any Skolem constants with fresh type variables so they
         // become the function's polymorphic type parameters. Skolems are
         // rigid during body checking; after the body succeeds, they become
@@ -4062,7 +4080,11 @@ impl TypeChecker {
 
         let ty_fv: FxHashSet<TypeVar> = body.free_vars().into_iter().collect();
         let ctx_fv = self.get_ctx_free_vars(ctx);
-        let ref_fv: FxHashSet<TypeVar> = body.ref_free_vars().into_iter().collect();
+        let ref_fv: FxHashSet<TypeVar> = if apply_value_restriction {
+            body.ref_free_vars().into_iter().collect()
+        } else {
+            FxHashSet::default()
+        };
         let mut gen_vars: Vec<TypeVar> = ty_fv
             .difference(&ctx_fv)
             .copied()
