@@ -424,11 +424,11 @@ fn ack_from_wrong_peer_cannot_advance_crdt_frontier() {
 
     // C is not the destination of A's tracked packet. Replaying/guessing the
     // packet sequence from another node must not prove that B received it.
-    c.distributed.transport.as_mut().unwrap().send(
-        node_a,
-        addr_a,
-        Packet::Ack { packet_seq: 1 },
-    );
+    c.distributed
+        .transport
+        .as_mut()
+        .unwrap()
+        .send(node_a, addr_a, Packet::Ack { packet_seq: 1 });
     a.process_network();
 
     // If the forged/wrong-peer ACK advanced B's frontier, the next send would
