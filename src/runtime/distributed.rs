@@ -56,7 +56,9 @@ use super::fabric_stream_epoch::{
     FABRIC_STREAM_EPOCH_REPAIR_BEHAVIOR, FABRIC_STREAM_EPOCH_VOTE_BEHAVIOR,
 };
 use super::mailbox::{Message, MessagePayload, MessagePriority};
-use super::network::{NetworkTransport, Packet, TrackedSendOutcome};
+use super::network::{
+    NetworkTransport, Packet, TrackedSendOutcome, TransportSendFailureReason,
+};
 use super::{ClusterState, NodeId, NodeStatus};
 use crate::runtime::Runtime;
 use crate::types::ExitReason;
@@ -905,6 +907,32 @@ pub fn send_distributed(
     }
 }
 
+/// Notify a sender that an asynchronous transport send failed.
+///
+/// Transport failures keep top-level delivery-failure code 8 and use the
+/// second payload slot for the transport outcome:
+/// 0=connect failed before any write, 1=write failed with delivery unconfirmed,
+/// 2=sender thread was already shut down before enqueue.
+/// This distinction prevents callers from treating an ambiguous write as a
+/// known-safe retry.
+fn notify_transport_send_failed(
+    runtime: &mut Runtime,
+    sender_id: u64,
+    reason: TransportSendFailureReason,
+) {
+    if sender_id == 0 || runtime.actors.get(&sender_id).is_none() {
+        return;
+    }
+
+    let subtype = match reason {
+        TransportSendFailureReason::Connect => 0,
+        TransportSendFailureReason::Write => 1,
+        TransportSendFailureReason::SenderShutdown => 2,
+    };
+    let fail_payload = vec![Value::int(8), Value::int(subtype)];
+    runtime.send_message_by_id(sender_id, 0, &fail_payload);
+}
+
 /// Notify a sender that their message could not be delivered.
 ///
 /// Delivers a system message (behavior 0) to the sender actor with a
@@ -1062,7 +1090,7 @@ pub fn process_network_packets(
             failure.to_node, failure.packet_seq, failure.reason
         );
         if let Some(sender) = failure.sender_actor {
-            notify_delivery_failed(runtime, sender, "transport send failed");
+            notify_transport_send_failed(runtime, sender, failure.reason);
         }
     }
 
