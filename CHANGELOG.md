@@ -1,4 +1,16 @@
 # Nulang Changelog
+### Receiver-acknowledged CRDT delta synchronization — 2026-10-07
+- **Per-peer CRDT frontiers now advance only after a matching NUL0 acknowledgement arrives from the intended receiver.** Dropped or unacknowledged batches remain retransmittable from that peer's last proven frontier instead of disappearing behind sender-side optimistic state.
+- **Peer recovery invalidates stale receiver knowledge.** A `Failed → Healthy` transition through heartbeat or authoritative gossip forgets prior CRDT frontier/correlation state so a restarted process receives fresh state.
+- **Tracked sends distinguish unsupported transports from explicit rejection.** Compatibility transports retain the legacy untracked fallback, while tracked-capable rejection cannot be reinterpreted as success and wrong-peer ACKs cannot advance another peer's frontier.
+
+### Standalone SQLite feature dependency closure — 2026-10-02
+- **The standalone `sqlite` feature now enables Tokio directly because `LibsqlStore` owns a Tokio runtime.** Minimal `--no-default-features --features sqlite` builds no longer rely on unrelated default-profile features to supply that direct dependency.
+
+### Controlled runtime-shard scaling harness on current main — 2026-10-01
+- **A diagnostic runner measures fixed total same-shard message work across 1/2/4/8 runtime shards.** Actor/message setup and worker-thread creation are excluded from the timed region; the harness reports throughput, ns/message, speedup, parallel efficiency, and host parallelism.
+- **This establishes a best-case multicore runtime ceiling, not a cross-shard or distributed benchmark.** Publishable scaling claims still require controlled hardware and recorded CPU topology.
+
 ### Faster tier-2 promotion for native loop regions — 2026-09-30
 - **JIT-compiled regions with an internal back-edge now promote from the low-latency Cranelift tier on their first compiled re-entry.** A single native loop entry can perform arbitrarily many back-edge iterations, so the previous 10,000-entry tier-2 counter could leave genuinely hot loops on first-tier code indefinitely.
 - **Straight-line and already-optimized regions retain the existing tier-2 threshold.** The policy change is limited to first-tier internal loops so cold or call-heavy code does not pay unnecessary optimized-compilation latency.
@@ -186,6 +198,11 @@ version + migration.*
   `GOVERNANCE.md`.
 
 ## Stable tier
+
+### Zero-copy non-reentrant JIT register entry — 2026-09-24
+- **Cranelift regions that cannot re-enter the VM now execute directly against the active frame's 256-register array**, eliminating the previous 2 KiB snapshot before native entry and 2 KiB copy-back afterward. `Value` is explicitly `repr(transparent)` over `u64` so the native register ABI has a documented layout guarantee.
+- **Compiled-region metadata now records whether native execution may grow or replace the VM frame stack.** Regions containing helper-backed direct calls retain the detached register snapshot because re-entrant interpreter calls may reallocate `VM::frames`; typed, SIMD, and scalar non-call regions use the direct-frame path.
+- **The direct-frame path does not install the raw `JIT_VM` pointer.** String-aware helpers receive a separate immutable pointer to the active `CodeModule`, preserving interned-string comparison/concatenation without aliasing the mutably exposed frame registers. Alternate JIT backends default to the conservative re-entry classification, and regression coverage pins both the direct-call fallback and hot string semantics.
 
 ### Backend-neutral JIT region planning — 2026-09-24
 - **Native compilation eligibility is now separated from Cranelift code generation.** `src/jit/region_planner.rs` owns region boundaries, non-suspending direct-call folding, recursion safety, cached per-module analyses, and type metadata production.
@@ -1513,14 +1530,12 @@ in this version; they are recorded here to establish their tier.
   dict-constant calls, field accesses, and method invocations at the
   HIR level, producing correct runtime results. Full end-to-end
   verified with integration tests.
-- **RFC 0003 — Content-addressed functions.** Proposal document
-  (`RFC/0003-content-addressing.md`): defines a deterministic
-  content-hash-based code identity scheme for distributed code
-  deployment, cache invalidation, and reproducible builds across
-  heterogeneous Nulang runtimes. Status: Draft. Content hashing
-  infrastructure (BLAKE3 `source_hash` in `.nbc` artifacts) is
-  available per RFC 0001; full code-identity registry and
-  content-addressed deployment are not yet implemented.
+- **RFC 0003 — Content identity and addressed code (revised).** The original
+  single content-hash proposal is replaced by separate `SourceId`,
+  `SemanticId`, `ArtifactId`, and exact executable `ArtifactDigest` roles,
+  aligned with RFC 0019 semantic closure and RFC 0020 Behavior Manifests.
+  `SourceId`/`SemanticId`/`ArtifactId` and canonical MIR semantic identity are
+  implemented; general addressed-code registry/fetch remains Experimental.
 - **`::` import resolution.** Module imports now support `::`-delimited
   paths: `import stdlib::set`, `import mypkg::utils::math`. The resolver
   (`src/resolver.rs`) maps `stdlib::*` prefixes to the standard library

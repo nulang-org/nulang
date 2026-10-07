@@ -123,6 +123,7 @@ def parse_records(output: str) -> dict[str, dict[str, int]]:
         )
     return rows
 
+
 def measurement_affinity(cpu_mode: str) -> set[int] | None:
     if cpu_mode == "host":
         return None
@@ -142,7 +143,7 @@ def cargo_command(extra_args: list[str]) -> list[str]:
         "test",
         "--release",
         *extra_args,
-        "benchmarks::bench_",
+        "bench_",
         "--",
         "--nocapture",
         "--test-threads=1",
@@ -156,7 +157,7 @@ def cargo_build_command(extra_args: list[str]) -> list[str]:
         "--release",
         "--no-run",
         *extra_args,
-        "benchmarks::bench_",
+        "bench_",
     ]
 
 
@@ -352,6 +353,7 @@ def print_table(
             f"{name:<19}  {base:>11,.0f}  {candidate:>17,.0f}  "
             f"{delta:>+16.2f}%  {speedup:>6.3f}x"
         )
+
 
 def print_candidate_only(
     summary: dict[str, dict[str, dict[str, float | int]]]

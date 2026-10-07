@@ -111,6 +111,26 @@ class CargoIsolationTests(unittest.TestCase):
         self.assertEqual("present", env["NULANG_AB_SENTINEL"])
 
 
+class CargoCommandPlanTests(unittest.TestCase):
+    def test_measurement_filter_includes_integration_benchmark_probes(self):
+        extra_args = ["--no-default-features", "--features", "native-codegen"]
+
+        measurement = nulang_ab_bench.cargo_command(extra_args)
+        build = nulang_ab_bench.cargo_build_command(extra_args)
+
+        self.assertIn("bench_", measurement)
+        self.assertIn("bench_", build)
+        self.assertNotIn(
+            "benchmarks::bench_",
+            measurement,
+            "module-qualified filter excludes tests/cold_jit_ab.rs from exact A/B",
+        )
+        self.assertNotIn(
+            "benchmarks::bench_",
+            build,
+            "prebuild must cover integration benchmark executables too",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

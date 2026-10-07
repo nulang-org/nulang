@@ -419,6 +419,18 @@ pub(crate) fn process_network(rt: &mut Runtime) {
     rt.fabric_stream_tick_retries();
 }
 
+/// Forget receiver-specific CRDT knowledge for a peer whose prior
+/// process state can no longer be trusted.
+///
+/// Packet-to-batch correlations are peer-scoped too: retaining one after the
+/// frontier is reset could let a late ACK from the old process advance the new
+/// receiver's knowledge incorrectly.
+pub(crate) fn forget_crdt_peer_state(rt: &mut Runtime, node: NodeId) {
+    rt.crdt_peer_frontiers.forget_peer(node.0);
+    rt.pending_crdt_sync_acks
+        .retain(|_, (peer_id, _)| *peer_id != node.0);
+}
+
 /// React to a peer node being declared `Failed` by the failure detector:
 ///
 /// 1. Invalidate the `RemoteActorCache` entries for that node so sends to
@@ -474,6 +486,8 @@ fn next_failover_activation_epoch(current: u64) -> Option<u64> {
 /// holds the replica (the deterministic shadow), so exactly one survivor
 /// re-spawns each actor and no two live copies can exist.
 pub(crate) fn handle_node_removed(rt: &mut Runtime, node: NodeId) {
+    forget_crdt_peer_state(rt, node);
+
     // Fabric ownership transitions are deferred until process_network restores
     // runtime-owned cluster/transport state. HashSet semantics deduplicate
     // graceful-goodbye and failure-detector confirmation of the same node.

@@ -856,8 +856,7 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
                 if let Some(callback_name) = callback_name {
                     let rt = self.runtime.borrow_mut();
                     let actor_id = rt.current_actor.unwrap_or(0);
-                    let behavior_id = rt.behavior_id_for(actor_id, &callback_name).unwrap_or(0);
-                    if behavior_id > 0 {
+                    if let Some(behavior_id) = rt.behavior_id_for(actor_id, &callback_name) {
                         rt.timer_wheel.send_after(
                             std::time::Duration::from_millis(ms as u64),
                             actor_id,
@@ -1140,8 +1139,12 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
                     return crate::vm::PerformAsyncResult::Ready(None);
                 }
                 if ms > 0 {
-                    rt.timer_wheel
-                        .timer_sleep_wake(std::time::Duration::from_millis(ms), actor_id);
+                    let now = rt.now();
+                    rt.timer_wheel.timer_sleep_wake_at(
+                        now,
+                        std::time::Duration::from_millis(ms),
+                        actor_id,
+                    );
                 }
                 crate::vm::PerformAsyncResult::Pending
             }
@@ -1730,10 +1733,9 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
                         })
                     });
                     if let Some(callback_name) = callback_name {
-                        let behavior_id = (*self.runtime)
-                            .behavior_id_for(self.actor_id, &callback_name)
-                            .unwrap_or(0);
-                        if behavior_id > 0 {
+                        if let Some(behavior_id) =
+                            (*self.runtime).behavior_id_for(self.actor_id, &callback_name)
+                        {
                             (*self.runtime).timer_wheel.send_after(
                                 std::time::Duration::from_millis(ms as u64),
                                 self.actor_id,
@@ -2104,8 +2106,12 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
                         return PerformAsyncResult::Ready(None);
                     }
                     if ms > 0 {
-                        rt.timer_wheel
-                            .timer_sleep_wake(std::time::Duration::from_millis(ms), self.actor_id);
+                        let now = rt.now();
+                        rt.timer_wheel.timer_sleep_wake_at(
+                            now,
+                            std::time::Duration::from_millis(ms),
+                            self.actor_id,
+                        );
                     }
                 }
                 PerformAsyncResult::Pending
@@ -2457,7 +2463,7 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
 
                 // Get NBC-encoded bytecode module.
                 let module = match actor.bytecode_module.as_ref() {
-                    Some(m) => m.clone(),
+                    Some(m) => m.as_ref().clone(),
                     None => match rt.recovery_modules.get(&actor_id) {
                         Some((m, _, _)) => m.clone(),
                         None => {
