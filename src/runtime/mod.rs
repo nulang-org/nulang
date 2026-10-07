@@ -175,13 +175,12 @@ fn timer_fired_handler(actor: &mut Actor, _args: &[Value]) {
 /// higher indices without colliding.
 fn bytecode_step_placeholder(_actor: &mut Actor, _args: &[Value]) {}
 
-/// Persisted `waiting_signal` marker for a workflow step suspended on a
-/// background LLM call.  A signal wait stores the awaited signal's name so
-/// recovery can re-trigger the in-flight step; an LLM suspend has no
-/// signal, so this reserved marker plays the same role.  The suspended VM
-/// state itself cannot be persisted, so recovery re-runs the step from
-/// its last pre-suspend checkpoint and the re-executed `LLM.ask` starts
-/// a fresh background call.
+/// Legacy persisted `waiting_signal` marker for a workflow step suspended
+/// on a background LLM call. Backends that have not entered RFC 0022 atomic
+/// history use this marker to re-drive the in-flight step from the last safe
+/// checkpoint. Once an atomic tail exists, recovery instead proves unfinished
+/// work from the admitted command and absence of a terminal transition; the
+/// completed-state snapshot is not rewritten merely to encode suspension.
 const LLM_SUSPEND_MARKER: &str = "__llm_ask_pending__";
 
 /// How often (in scheduler ticks) the runtime scans resident grain actors for
