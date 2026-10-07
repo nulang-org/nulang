@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Observable ordinary remote-delivery failures — 2026-10-07
+- **Ordinary remote actor sends remain explicitly best-effort / at-most-once, but local transport failures are no longer silent.** Connect failure, ambiguous write failure, stopped sender, and invalid payload now produce classified delivery-failure outcomes for the originating actor.
+- **Delivery-failure notifications use the real system-priority mailbox lane.** They bypass bounded normal-mailbox capacity and are observed ahead of already-queued normal traffic, preserving failure visibility under overload.
+- **Ambiguous TCP writes are never blindly retried.** Stronger retry semantics still require receiver-side deduplication; the documented delivery contract keeps ordinary actor transport separate from durable workflow/effect guarantees.
+
 ### Receiver-acknowledged CRDT delta synchronization — 2026-10-07
 - **Per-peer CRDT frontiers now advance only after a matching NUL0 acknowledgement arrives from the intended receiver.** Dropped or unacknowledged batches remain retransmittable from that peer's last proven frontier instead of disappearing behind sender-side optimistic state.
 - **Peer recovery invalidates stale receiver knowledge.** A `Failed → Healthy` transition through heartbeat or authoritative gossip forgets prior CRDT frontier/correlation state so a restarted process receives fresh state.
