@@ -911,7 +911,8 @@ pub fn send_distributed(
 /// failure code in the payload: `[failure_code: Int, _reserved: Nil]`.
 /// Codes: 0=unresolvable, 1=node left cluster, 2=string payload unresolvable,
 /// 3=string intern failed on receiver, 4=target actor not found,
-/// 6=object ref unresolvable, 7=object intern failed on receiver, 5=unknown.
+/// 6=object ref unresolvable, 7=object intern failed on receiver,
+/// 8=transport send failed, 5=unknown.
 /// Non-existent senders (id 0) are silently skipped.
 pub(crate) fn notify_delivery_failed(runtime: &mut Runtime, sender_id: u64, reason: &str) {
     if sender_id == 0 {
@@ -935,6 +936,7 @@ fn delivery_failure_code(reason: &str) -> i64 {
         "target actor not found" => 4,
         "object ref unresolvable" => 6,
         "object intern failed on receiver" => 7,
+        "transport send failed" => 8,
         _ => 5,
     }
 }
@@ -1054,6 +1056,16 @@ pub fn process_network_packets(
     cluster: &mut ClusterState,
     resolver: &mut AddressResolver,
 ) {
+    for failure in transport.drain_send_failures() {
+        warn!(
+            "nulang-net: transport send to {:?} failed at sequence {} ({:?})",
+            failure.to_node, failure.packet_seq, failure.reason
+        );
+        if let Some(sender) = failure.sender_actor {
+            notify_delivery_failed(runtime, sender, "transport send failed");
+        }
+    }
+
     let packets = transport.receive();
     for incoming in packets {
         match incoming.packet {
