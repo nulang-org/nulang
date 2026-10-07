@@ -8185,6 +8185,25 @@ match { a: 2, b: 9 } with {
             events.iter().any(|e| matches!(e, WorkflowEvent::StepCompleted { step_name, .. } if step_name == "ask_step")),
             "StepCompleted event should be persisted after the LLM call resumes"
         );
+        let completed_sequence = events
+            .iter()
+            .find_map(|event| match event {
+                WorkflowEvent::StepCompleted {
+                    sequence,
+                    step_name,
+                    ..
+                } if step_name == "ask_step" => Some(*sequence),
+                _ => None,
+            })
+            .unwrap();
+        let tail = store
+            .load_durable_tail_position(actor_id)
+            .unwrap()
+            .expect("LLM resume must remain on the RFC 0022 tail");
+        let snapshot = store.load_snapshot(actor_id).unwrap();
+        assert_eq!(completed_sequence, tail.sequence);
+        assert_eq!(snapshot.sequence, tail.sequence);
+        assert_eq!(store.latest_sequence(actor_id), tail.sequence);
     }
 
     /// Crash-and-recover for a workflow step suspended on `Inference.ask`: the
@@ -8246,15 +8265,23 @@ match { a: 2, b: 9 } with {
             );
             assert!(actor.llm_inflight, "background call should be in flight");
         }
-        // The snapshot must carry the suspension marker so recovery knows
-        // the in-flight step has to be re-driven.
+        // RFC 0022 recovery keeps the completed-state snapshot at the
+        // pre-command boundary. The admitted command + missing terminal event,
+        // not a legacy suspension-marker rewrite, identifies unfinished work.
         let snapshot = store
             .load_snapshot(actor_id)
-            .expect("workflow spawn should have persisted a snapshot");
+            .expect("workflow spawn should have persisted a safe snapshot");
+        let suspended_tail = store
+            .load_durable_tail_position(actor_id)
+            .unwrap()
+            .expect("atomic command admission must establish a durable tail");
+        assert!(
+            snapshot.sequence < suspended_tail.sequence,
+            "suspension must not move the safe snapshot onto partial workflow state"
+        );
         assert_eq!(
-            snapshot.waiting_signal.as_deref(),
-            Some("__llm_ask_pending__"),
-            "snapshot should record the LLM suspension marker"
+            snapshot.waiting_signal, None,
+            "atomic LLM suspension must not mutate the completed-state snapshot marker"
         );
 
         // Simulate a node restart: drop the actor and recover into a fresh
@@ -8301,6 +8328,26 @@ match { a: 2, b: 9 } with {
             "the recovered runtime should issue one fresh LLM call"
         );
         assert_eq!(calls[0].messages[0].content, "hello");
+
+        let completed_sequence = events
+            .iter()
+            .find_map(|event| match event {
+                WorkflowEvent::StepCompleted {
+                    sequence,
+                    step_name,
+                    ..
+                } if step_name == "ask_step" => Some(*sequence),
+                _ => None,
+            })
+            .unwrap();
+        let recovered_tail = store
+            .load_durable_tail_position(actor_id)
+            .unwrap()
+            .expect("recovered LLM completion must close on the atomic tail");
+        let recovered_snapshot = store.load_snapshot(actor_id).unwrap();
+        assert_eq!(completed_sequence, recovered_tail.sequence);
+        assert_eq!(recovered_snapshot.sequence, recovered_tail.sequence);
+        assert_eq!(store.latest_sequence(actor_id), recovered_tail.sequence);
     }
 
     /// A workflow step that waits on a signal AND THEN performs `Inference.ask`
