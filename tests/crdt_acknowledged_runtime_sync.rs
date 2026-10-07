@@ -262,3 +262,112 @@ fn failed_peer_recovery_forgets_stale_crdt_frontier_before_next_sync() {
         2
     );
 }
+
+
+#[test]
+fn failed_peer_recovery_via_gossip_forgets_stale_crdt_frontier_before_next_sync() {
+    let bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addr_a: SocketAddr = "127.0.0.1:34221".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:34222".parse().unwrap();
+    let node_a = NodeId::new(&addr_a);
+    let node_b = NodeId::new(&addr_b);
+
+    let mut a = distributed_runtime(addr_a, bus.clone());
+    let mut b = distributed_runtime(addr_b, bus);
+
+    a.distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_b, addr_b);
+    b.distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_a, addr_a);
+
+    let id = a.crdt_manager.as_mut().unwrap().create_gcounter().0;
+    a.crdt_manager
+        .as_mut()
+        .unwrap()
+        .get_gcounter_mut(id)
+        .unwrap()
+        .increment_by(1);
+
+    nulang::runtime::sync_crdts_delta(&mut a);
+    b.process_network();
+    a.process_network();
+    assert_eq!(
+        b.crdt_manager
+            .as_mut()
+            .unwrap()
+            .get_gcounter_mut(id)
+            .unwrap()
+            .value(),
+        1
+    );
+
+    // Same-NodeId restart: B loses local CRDT state while A still believes
+    // the old process acknowledged value 1.
+    b.crdt_manager = Some(CrdtManager::new(node_b.0));
+    a.distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .merge_membership(vec![NodeGossip {
+            node_id: node_b,
+            address: addr_b,
+            status: NodeStatus::Failed,
+            incarnation: 100,
+        }]);
+
+    // Recovery can arrive as the restarted peer's authoritative self-entry
+    // in gossip before its next heartbeat. That transition must invalidate
+    // receiver-specific CRDT knowledge just like Failed -> Healthy heartbeat
+    // recovery does.
+    b.distributed.transport.as_mut().unwrap().send(
+        node_a,
+        addr_a,
+        Packet::Gossip {
+            members: vec![NodeGossip {
+                node_id: node_b,
+                address: addr_b,
+                status: NodeStatus::Healthy,
+                incarnation: 101,
+            }],
+            directory: Vec::new(),
+            fabric: None,
+        },
+    );
+    a.process_network();
+
+    assert_eq!(
+        a.distributed
+            .cluster
+            .as_ref()
+            .unwrap()
+            .get_node(node_b)
+            .unwrap()
+            .status,
+        NodeStatus::Healthy
+    );
+
+    a.crdt_manager
+        .as_mut()
+        .unwrap()
+        .get_gcounter_mut(id)
+        .unwrap()
+        .increment_by(1);
+    nulang::runtime::sync_crdts_delta(&mut a);
+    b.process_network();
+
+    assert_eq!(
+        b.crdt_manager
+            .as_mut()
+            .unwrap()
+            .get_gcounter_mut(id)
+            .expect("gossip-recovered peer must receive a fresh full-state join")
+            .value(),
+        2
+    );
+}
