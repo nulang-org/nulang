@@ -563,6 +563,9 @@ pub enum FunctionAnnotation {
     Backend { kind: ActorBackendKind },
     /// `@derive(eq, ...)` requests synthesized trait helpers on a record type.
     Derive(Vec<String>),
+    /// Marks a function as the implementation of a web component declared
+    /// with `component Name(...)`.
+    Component,
     /// `@placement(static|server|edge|client|actor|workflow)` marks a web
     /// framework function's compile-time execution target.
     Placement(crate::types::Placement),

@@ -558,6 +558,14 @@ impl StdLib {
                     description: "Construct an HTML element from a tag, attributes, and children.",
                 },
                 BuiltinOp {
+                    name: "Web.fragment",
+                    effect: "Web",
+                    op: "fragment",
+                    signature: "fragment(children: [Html]) -> Html",
+                    implemented_in: ImplSite::RuntimeHost,
+                    description: "Concatenate Html children without adding wrapper markup.",
+                },
+                BuiltinOp {
                     name: "Web.text",
                     effect: "Web",
                     op: "text",

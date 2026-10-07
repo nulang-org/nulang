@@ -212,28 +212,11 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
                 crate::ast::FunctionAnnotation::Placement(p) => Some(*p),
                 _ => None,
             });
-            // Default placement inference from declared effect row (only when the
-            // user explicitly declared effects; inferred rows remain None here).
-            let inferred_placement =
-                explicit_placement.or_else(|| {
-                    let row = effect.as_ref()?;
-                    let effects: Vec<_> = match row {
-                        crate::types::EffectRow::Closed(effs) => effs.clone(),
-                        crate::types::EffectRow::Open(effs, _) => effs.clone(),
-                    };
-                    if effects.iter().any(|e| {
-                        *e == crate::types::Effect::Request || *e == crate::types::Effect::Web
-                    }) {
-                        Some(crate::types::Placement::Server)
-                    } else if effects.iter().all(|e| {
-                        *e == crate::types::Effect::Render || *e == crate::types::Effect::Web
-                    }) && !effects.is_empty()
-                    {
-                        Some(crate::types::Placement::Static)
-                    } else {
-                        None
-                    }
-                });
+            // Default placement inference from the declared effect row. Keep
+            // this routed through the shared compiler rule so HIR metadata and
+            // emitted Web IR cannot disagree about execution placement.
+            let inferred_placement = explicit_placement
+                .or_else(|| effect.as_ref().and_then(crate::types::infer_web_placement));
             hir::Decl::Function(hir::FunctionDef {
                 name: name.clone(),
                 type_params: type_params.clone(),
