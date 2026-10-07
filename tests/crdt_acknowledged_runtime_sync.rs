@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use nulang::runtime::{
-    CrdtManager, DeterministicNetworkTransport, IncomingPacket, NodeGossip, NodeId, NodeStatus,
-    OutgoingPacket, Packet, Runtime,
+    CrdtManager, DeterministicNetworkTransport, IncomingPacket, NetworkTransport, NodeGossip,
+    NodeId, NodeStatus, OutgoingPacket, Packet, Runtime, TrackedSendOutcome,
 };
 
 fn distributed_runtime(
@@ -455,5 +456,169 @@ fn ack_from_wrong_peer_cannot_advance_crdt_frontier() {
             .expect("wrong-peer ACK must not suppress the receiver's full-state join")
             .value(),
         2
+    );
+}
+
+
+#[derive(Clone, Copy)]
+enum TestTrackedMode {
+    Unsupported,
+    Rejected,
+}
+
+struct TestTrackedTransport {
+    node_id: NodeId,
+    listen_addr: SocketAddr,
+    mode: TestTrackedMode,
+    tracked_calls: Arc<AtomicUsize>,
+    fallback_send_calls: Arc<AtomicUsize>,
+}
+
+impl NetworkTransport for TestTrackedTransport {
+    fn connect(&mut self, _node_id: NodeId, _addr: SocketAddr) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn send(&mut self, _to_node: NodeId, _to_addr: SocketAddr, _packet: Packet) {
+        self.fallback_send_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn send_tracked(
+        &mut self,
+        _to_node: NodeId,
+        _to_addr: SocketAddr,
+        _packet: Packet,
+    ) -> TrackedSendOutcome {
+        self.tracked_calls.fetch_add(1, Ordering::Relaxed);
+        match self.mode {
+            TestTrackedMode::Unsupported => TrackedSendOutcome::Unsupported,
+            TestTrackedMode::Rejected => TrackedSendOutcome::Rejected,
+        }
+    }
+
+    fn receive(&self) -> Vec<IncomingPacket> {
+        Vec::new()
+    }
+
+    fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    fn listen_addr(&self) -> SocketAddr {
+        self.listen_addr
+    }
+
+    fn disconnect(&mut self, _node_id: NodeId) {}
+
+    fn shutdown(&mut self) {}
+
+    fn connection_count(&self) -> usize {
+        0
+    }
+
+    fn connection_addr(&self, _node_id: NodeId) -> Option<SocketAddr> {
+        None
+    }
+}
+
+fn runtime_with_test_tracked_transport(
+    addr: SocketAddr,
+    mode: TestTrackedMode,
+) -> (Runtime, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let tracked_calls = Arc::new(AtomicUsize::new(0));
+    let fallback_send_calls = Arc::new(AtomicUsize::new(0));
+    let transport = TestTrackedTransport {
+        node_id: NodeId::new(&addr),
+        listen_addr: addr,
+        mode,
+        tracked_calls: tracked_calls.clone(),
+        fallback_send_calls: fallback_send_calls.clone(),
+    };
+
+    let mut runtime = Runtime::new();
+    runtime
+        .enable_distribution_with_transport(Box::new(transport))
+        .expect("test transport should enable distribution");
+    (runtime, tracked_calls, fallback_send_calls)
+}
+
+#[test]
+fn tracked_rejection_does_not_fall_back_or_advance_peer_frontier() {
+    let addr_a: SocketAddr = "127.0.0.1:34241".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:34242".parse().unwrap();
+    let node_b = NodeId::new(&addr_b);
+
+    let (mut runtime, tracked_calls, fallback_send_calls) =
+        runtime_with_test_tracked_transport(addr_a, TestTrackedMode::Rejected);
+    runtime
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_b, addr_b);
+
+    let id = runtime.crdt_manager.as_mut().unwrap().create_gcounter().0;
+    runtime
+        .crdt_manager
+        .as_mut()
+        .unwrap()
+        .get_gcounter_mut(id)
+        .unwrap()
+        .increment_by(1);
+
+    // A tracked-capable transport rejected the packet before assigning a
+    // sequence. That is not equivalent to an untracked compatibility
+    // transport: there was no send to acknowledge optimistically.
+    nulang::runtime::sync_crdts_delta(&mut runtime);
+    nulang::runtime::sync_crdts_delta(&mut runtime);
+
+    assert_eq!(
+        tracked_calls.load(Ordering::Relaxed),
+        2,
+        "without an ACK or successful compatibility send, the same peer state must remain pending"
+    );
+    assert_eq!(
+        fallback_send_calls.load(Ordering::Relaxed),
+        0,
+        "a tracked-send rejection must not be retried through the untracked fallback"
+    );
+}
+
+#[test]
+fn untracked_transport_keeps_legacy_optimistic_fallback() {
+    let addr_a: SocketAddr = "127.0.0.1:34251".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:34252".parse().unwrap();
+    let node_b = NodeId::new(&addr_b);
+
+    let (mut runtime, tracked_calls, fallback_send_calls) =
+        runtime_with_test_tracked_transport(addr_a, TestTrackedMode::Unsupported);
+    runtime
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_b, addr_b);
+
+    let id = runtime.crdt_manager.as_mut().unwrap().create_gcounter().0;
+    runtime
+        .crdt_manager
+        .as_mut()
+        .unwrap()
+        .get_gcounter_mut(id)
+        .unwrap()
+        .increment_by(1);
+
+    nulang::runtime::sync_crdts_delta(&mut runtime);
+    nulang::runtime::sync_crdts_delta(&mut runtime);
+
+    assert_eq!(
+        tracked_calls.load(Ordering::Relaxed),
+        1,
+        "legacy optimistic acknowledgement should suppress an unchanged second batch"
+    );
+    assert_eq!(
+        fallback_send_calls.load(Ordering::Relaxed),
+        1,
+        "an explicitly unsupported tracked send must fall back exactly once"
     );
 }
