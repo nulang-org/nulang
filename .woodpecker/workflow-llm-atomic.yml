@@ -1,0 +1,34 @@
+# Focused validation for RFC 0022 workflow completion after background LLM resume.
+labels:
+  platform: linux/amd64
+  pool: bootstrap-ci
+
+when:
+  - event: pull_request
+    branch: fix/workflow-suspension-resume-atomic-tail-20261007
+    path:
+      include:
+        - "src/runtime/llm.rs"
+        - "src/runtime/mod.rs"
+        - "src/runtime/workflow_impl.rs"
+        - "src/integration_tests/mod.rs"
+        - "Cargo.toml"
+        - "Cargo.lock"
+        - ".woodpecker/workflow-llm-atomic.yml"
+
+steps:
+  - name: Workflow LLM atomic recovery
+    image: rust:1.95-bookworm
+    environment:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      RUST_BACKTRACE: "1"
+    commands:
+      - set -eux
+      - apt-get update
+      - DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-dev pkg-config
+      - rustup component add rustfmt
+      - cargo fmt --all -- --check
+      - cargo test test_workflow_inference_ask_step_records_completion
+      - cargo test test_workflow_inference_ask_step_redriven_after_restart
+      - git diff --check
