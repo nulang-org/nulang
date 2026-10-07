@@ -2186,15 +2186,7 @@ impl TcpTransport {
             let handle = thread::Builder::new()
                 .name("nulang-net-sender".into())
                 .spawn(move || {
-                    sender_thread(
-                        outgoing_rx,
-                        conns,
-                        flag,
-                        local_id,
-                        in_tx,
-                        failure_tx,
-                        tls,
-                    );
+                    sender_thread(outgoing_rx, conns, flag, local_id, in_tx, failure_tx, tls);
                 })?;
             handles.push(handle);
         }
