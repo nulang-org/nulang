@@ -920,9 +920,20 @@ pub(crate) fn notify_delivery_failed(runtime: &mut Runtime, sender_id: u64, reas
     if !runtime.actors.get(&sender_id).is_some() {
         return;
     }
+
     let code = delivery_failure_code(reason);
-    let fail_payload = vec![Value::int(code), Value::nil()];
-    runtime.send_message_by_id(sender_id, 0, &fail_payload);
+    let failure = Message {
+        behavior_id: 0,
+        payload: MessagePayload::from_slice(&[Value::int(code), Value::nil()]),
+        sender: 0,
+        priority: MessagePriority::System,
+        trace_id: None,
+    };
+
+    if let Some(actor) = runtime.actors.get_mut(&sender_id) {
+        let _ = actor.mailbox.push(failure);
+    }
+    runtime.enqueue_actor(sender_id);
 }
 
 /// Map a delivery-failure reason string to an integer code.
@@ -935,6 +946,10 @@ fn delivery_failure_code(reason: &str) -> i64 {
         "target actor not found" => 4,
         "object ref unresolvable" => 6,
         "object intern failed on receiver" => 7,
+        "transport connect failed" => 8,
+        "transport write failed" => 9,
+        "transport sender stopped" => 10,
+        "transport payload invalid" => 11,
         _ => 5,
     }
 }
@@ -1054,6 +1069,12 @@ pub fn process_network_packets(
     cluster: &mut ClusterState,
     resolver: &mut AddressResolver,
 ) {
+    for failure in transport.take_delivery_failures() {
+        if let Packet::ActorMessage { sender_actor, .. } = &failure.packet {
+            notify_delivery_failed(runtime, *sender_actor, failure.kind.reason());
+        }
+    }
+
     let packets = transport.receive();
     for incoming in packets {
         match incoming.packet {
