@@ -4300,6 +4300,47 @@ fn test_runtime_append_workflow_timer_signal_saga_events() {
     );
 }
 
+
+#[test]
+fn test_legacy_checkpoint_is_rejected_after_atomic_workflow_tail_begins() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor(
+        "RejectLegacyCheckpoint",
+        Box::new(Vec::new),
+        HashMap::new(),
+    );
+    declare_test_behavior(&mut rt, actor_id, "run");
+    let behavior_id = rt.behavior_id_for(actor_id, "run").unwrap();
+    let safe_snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+
+    let activation =
+        workflow::commit_workflow_command(&mut rt, actor_id, behavior_id, Vec::new()).unwrap();
+    let tail = rt
+        .persistence
+        .load_durable_tail_position(actor_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(tail.sequence, activation.command_sequence);
+
+    let error = workflow::try_checkpoint_actor(&mut rt, actor_id)
+        .expect_err("legacy checkpoint must be fenced once RFC 0022 history begins");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(
+        rt.persistence.load_snapshot(actor_id).unwrap().sequence,
+        safe_snapshot.sequence,
+        "rejected legacy checkpoint must leave the last completed-state snapshot unchanged"
+    );
+    assert_eq!(
+        rt.persistence
+            .load_durable_tail_position(actor_id)
+            .unwrap()
+            .unwrap()
+            .sequence,
+        tail.sequence,
+        "rejected legacy checkpoint must not disturb the atomic tail"
+    );
+}
+
 #[test]
 fn test_workflow_recovery_handles_new_event_variants() {
     let mut rt = Runtime::new();
