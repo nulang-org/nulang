@@ -3,8 +3,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use nulang::runtime::{
-    DeterministicNetworkTransport, IncomingPacket, NetworkTransport, NodeId, OutgoingPacket, Packet,
-    TrackedSendOutcome,
+    DeterministicNetworkTransport, IncomingPacket, NetworkTransport, NodeId, OutgoingPacket,
+    Packet, TrackedSendOutcome,
 };
 
 fn bus() -> Arc<
