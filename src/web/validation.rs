@@ -8,6 +8,7 @@
 use crate::web::bindings::compile_route_bindings;
 use crate::web::contracts::ContractCompilation;
 use crate::web::package_contracts::compile_contracts_from_tree;
+use crate::web::response::{response_contract, ResponseBodyKind};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -62,6 +63,17 @@ pub fn validation_diagnostics(compilation: &ContractCompilation) -> Vec<String> 
     let mut diagnostics = compilation.diagnostics.clone();
     for route in &compilation.routes {
         diagnostics.extend(compile_route_bindings(route).diagnostics);
+        if route.placement.as_deref() == Some("static")
+            && matches!(
+                response_contract(route.response_type.as_deref()).map(|contract| contract.kind),
+                Some(ResponseBodyKind::Json)
+            )
+        {
+            diagnostics.push(format!(
+                "{} {}: Json[T] responses cannot use @placement(static); use server/edge placement until static typed-body artifacts are defined",
+                route.method, route.path
+            ));
+        }
     }
 
     let mut seen = HashSet::new();
@@ -108,6 +120,22 @@ mod tests {
         assert!(diagnostics
             .iter()
             .any(|diagnostic| diagnostic.contains("has no same-named parameter")));
+    }
+
+    #[test]
+    fn rejects_static_json_response_placement() {
+        let mut route = contract("/status", Vec::new());
+        route.params.clear();
+        route.response_type = Some("Json[Status]".to_string());
+        route.placement = Some("static".to_string());
+
+        let diagnostics = validation_diagnostics(&ContractCompilation {
+            routes: vec![route],
+            diagnostics: Vec::new(),
+        });
+
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].contains("Json[T] responses cannot use @placement(static)"));
     }
 
     #[test]

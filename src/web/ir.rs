@@ -11,6 +11,7 @@ use crate::web::bindings::{compile_route_bindings, RouteBindingContract};
 use crate::web::contracts::{HandlerParamContract, RouteContract, RouteParamContract};
 use crate::web::modules::ModuleRegistry;
 use crate::web::package_contracts::compile_contracts_from_tree;
+use crate::web::response::{response_contract, ResponseContract};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -39,6 +40,10 @@ pub struct IrRoute {
     pub bindings: Vec<RouteBindingContract>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_type: Option<String>,
+    /// Structured transport semantics derived from the declared response type.
+    /// This remains additive/optional for Deployment IR v1 compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<ResponseContract>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_type: Option<String>,
     /// Declared handler effect row. These are semantic effects, not middleware
@@ -113,9 +118,10 @@ pub fn generate_deployment_ir(
         if let Some(compilation) = &binding_compilation {
             binding_diagnostics.extend(compilation.diagnostics.iter().cloned());
         }
+        let response = contract.and_then(|c| response_contract(c.response_type.as_deref()));
         let placement = contract
             .and_then(|contract| contract.placement.clone())
-            .unwrap_or_else(|| default_route_placement(&method, &route.path));
+            .unwrap_or_else(|| default_route_placement(&method, &route.path, response.as_ref()));
         let artifact = if placement == "static" {
             Some(route_path_to_artifact(&route.path))
         } else {
@@ -136,6 +142,7 @@ pub fn generate_deployment_ir(
                 .map(|compilation| compilation.bindings)
                 .unwrap_or_default(),
             response_type: contract.and_then(|c| c.response_type.clone()),
+            response,
             error_type: contract.and_then(|c| c.error_type.clone()),
             effects: contract.map(|c| c.effects.clone()).unwrap_or_default(),
             reference_capability: contract.and_then(|c| c.reference_capability.clone()),
@@ -186,9 +193,17 @@ pub fn generate_deployment_ir(
     }
 }
 
-fn default_route_placement(method: &str, path: &str) -> String {
+fn default_route_placement(
+    method: &str,
+    path: &str,
+    response: Option<&ResponseContract>,
+) -> String {
     let dynamic_path = path.contains(':') || (path.contains('{') && path.contains('}'));
-    if dynamic_path || !matches!(method, "GET" | "HEAD") {
+    let transport_requires_server = matches!(
+        response.map(|contract| contract.kind),
+        Some(crate::web::response::ResponseBodyKind::Json)
+    );
+    if dynamic_path || transport_requires_server || !matches!(method, "GET" | "HEAD") {
         "server".to_string()
     } else {
         "static".to_string()
@@ -329,14 +344,29 @@ mod tests {
     }
 
     #[test]
-    fn test_default_route_placement_understands_typed_params() {
-        assert_eq!(default_route_placement("GET", "/about"), "static");
-        assert_eq!(default_route_placement("GET", "/users/:id"), "server");
+    fn test_default_route_placement_understands_typed_params_and_response_media() {
+        assert_eq!(default_route_placement("GET", "/about", None), "static");
         assert_eq!(
-            default_route_placement("GET", "/users/{id: UserId}"),
+            default_route_placement("GET", "/users/:id", None),
             "server"
         );
-        assert_eq!(default_route_placement("POST", "/users"), "server");
+        assert_eq!(
+            default_route_placement("GET", "/users/{id: UserId}", None),
+            "server"
+        );
+        assert_eq!(default_route_placement("POST", "/users", None), "server");
+
+        let json = response_contract(Some("Json[User]")).unwrap();
+        assert_eq!(
+            default_route_placement("GET", "/api/status", Some(&json)),
+            "server"
+        );
+
+        let html = response_contract(Some("Html")).unwrap();
+        assert_eq!(
+            default_route_placement("GET", "/about", Some(&html)),
+            "static"
+        );
     }
 
     #[test]
