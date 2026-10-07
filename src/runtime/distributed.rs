@@ -2438,32 +2438,43 @@ pub fn sync_crdts_delta(runtime: &mut Runtime) {
             ops: Arc::new(batch.ops),
         };
 
-        let tracked_seq = runtime
+        let tracked_outcome = runtime
             .distributed
             .transport
             .as_mut()
-            .and_then(|transport| transport.send_tracked(node_id, address, packet.clone()));
+            .map(|transport| transport.send_tracked(node_id, address, packet.clone()));
 
-        if let Some(packet_seq) = tracked_seq {
-            // Retain only the newest tracked attempt for this peer. If an older
-            // packet later succeeds its ACK is conservatively ignored, which
-            // can only cause a retransmission; it cannot advance the frontier
-            // past unproven receiver state.
-            runtime
-                .pending_crdt_sync_acks
-                .retain(|_, (pending_peer, _)| *pending_peer != peer_id);
-            runtime
-                .pending_crdt_sync_acks
-                .insert(packet_seq, (peer_id, batch.batch_id));
-        } else if let Some(transport) = runtime.distributed.transport.as_mut() {
-            // Compatibility path for custom transports that cannot expose a
-            // NUL0 sequence. The default send_tracked implementation performs
-            // no send, so fall back exactly once and retain the historical
-            // optimistic frontier behavior for those transports.
-            transport.send(node_id, address, packet);
-            runtime
-                .crdt_peer_frontiers
-                .acknowledge(peer_id, batch.batch_id);
+        match tracked_outcome {
+            Some(TrackedSendOutcome::Sent(packet_seq)) => {
+                // Retain only the newest tracked attempt for this peer. If an
+                // older packet later succeeds its ACK is conservatively
+                // ignored, which can only cause a retransmission; it cannot
+                // advance the frontier past unproven receiver state.
+                runtime
+                    .pending_crdt_sync_acks
+                    .retain(|_, (pending_peer, _)| *pending_peer != peer_id);
+                runtime
+                    .pending_crdt_sync_acks
+                    .insert(packet_seq, (peer_id, batch.batch_id));
+            }
+            Some(TrackedSendOutcome::Unsupported) => {
+                if let Some(transport) = runtime.distributed.transport.as_mut() {
+                    // Compatibility path for custom transports that cannot
+                    // expose a NUL0 sequence. The default implementation
+                    // performs no send, so fall back exactly once and retain
+                    // the historical optimistic frontier behavior.
+                    transport.send(node_id, address, packet);
+                    runtime
+                        .crdt_peer_frontiers
+                        .acknowledge(peer_id, batch.batch_id);
+                }
+            }
+            Some(TrackedSendOutcome::Rejected) | None => {
+                // A tracked-capable transport explicitly rejected the packet,
+                // or distribution lost its transport between target discovery
+                // and send. In either case no receiver knowledge was proved.
+                // Leave the frontier unchanged so the next sync retries.
+            }
         }
     }
 }
