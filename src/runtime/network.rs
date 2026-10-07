@@ -1985,6 +1985,7 @@ pub struct TransportSendFailure {
     pub reason: TransportSendFailureReason,
 }
 
+#[cfg(feature = "tcp")]
 fn packet_sender_actor(packet: &Packet) -> Option<u64> {
     match packet {
         Packet::ActorMessage { sender_actor, .. } if *sender_actor != 0 => Some(*sender_actor),
