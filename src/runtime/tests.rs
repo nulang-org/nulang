@@ -8575,3 +8575,47 @@ fn workflow_timer_rearm_rejects_missing_handler_without_aliasing_behavior_zero()
         "missing __timer_fired must not alias behavior zero",
     );
 }
+
+#[test]
+fn confirmed_node_removal_forgets_crdt_receiver_knowledge() {
+    let mut rt = Runtime::new();
+    let peer = NodeId(42);
+
+    let mut source = CrdtManager::new(1);
+    let id = source.create_gcounter().0;
+    source.get_gcounter_mut(id).unwrap().increment_by(1);
+
+    let initial = rt
+        .crdt_peer_frontiers
+        .generate(&source, peer.0)
+        .expect("new peer needs initial state");
+    assert!(rt.crdt_peer_frontiers.acknowledge(peer.0, initial.batch_id));
+    assert_eq!(rt.crdt_peer_frontiers.acknowledged_entry_count(peer.0), 1);
+
+    // A transport correlation for the departed peer must not survive either.
+    rt.pending_crdt_sync_acks
+        .insert(99, (peer.0, initial.batch_id));
+
+    super::distribution::handle_node_removed(&mut rt, peer);
+
+    assert_eq!(
+        rt.crdt_peer_frontiers.acknowledged_entry_count(peer.0),
+        0,
+        "confirmed removal must discard stale receiver knowledge"
+    );
+    assert!(
+        rt.pending_crdt_sync_acks
+            .values()
+            .all(|(pending_peer, _)| *pending_peer != peer.0),
+        "confirmed removal must discard stale packet-to-batch correlations"
+    );
+
+    let rejoin = rt
+        .crdt_peer_frontiers
+        .generate(&source, peer.0)
+        .expect("a removed peer must require a fresh join batch");
+    assert!(
+        rejoin.ops.iter().all(|op| !op.is_delta),
+        "a peer that rejoins after confirmed removal must receive full state"
+    );
+}
