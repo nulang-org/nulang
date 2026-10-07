@@ -263,7 +263,6 @@ fn failed_peer_recovery_forgets_stale_crdt_frontier_before_next_sync() {
     );
 }
 
-
 #[test]
 fn failed_peer_recovery_via_gossip_forgets_stale_crdt_frontier_before_next_sync() {
     let bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
