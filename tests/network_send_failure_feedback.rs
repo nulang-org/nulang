@@ -163,8 +163,8 @@ fn actor_packet(sender_node: NodeId, sender_actor: u64, value: i64) -> Packet {
 #[test]
 fn tcp_send_reconnects_after_observed_disconnect_without_application_retry_loop() {
     let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let mut sender = TcpTransport::bind(bind_addr, TlsConfig::PlaintextInsecure)
-        .expect("bind sender transport");
+    let mut sender =
+        TcpTransport::bind(bind_addr, TlsConfig::PlaintextInsecure).expect("bind sender transport");
     let mut receiver = TcpTransport::bind(bind_addr, TlsConfig::PlaintextInsecure)
         .expect("bind receiver transport");
 
