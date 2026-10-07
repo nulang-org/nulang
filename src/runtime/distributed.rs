@@ -56,7 +56,7 @@ use super::fabric_stream_epoch::{
     FABRIC_STREAM_EPOCH_REPAIR_BEHAVIOR, FABRIC_STREAM_EPOCH_VOTE_BEHAVIOR,
 };
 use super::mailbox::{Message, MessagePayload, MessagePriority};
-use super::network::{NetworkTransport, Packet};
+use super::network::{NetworkTransport, Packet, TrackedSendOutcome};
 use super::{ClusterState, NodeId, NodeStatus};
 use crate::runtime::Runtime;
 use crate::types::ExitReason;
