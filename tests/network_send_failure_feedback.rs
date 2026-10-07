@@ -1,11 +1,15 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+#[cfg(feature = "tcp")]
 use std::time::{Duration, Instant};
 
 use nulang::runtime::{
-    process_network_packets, AddressResolver, ClusterState, IncomingPacket, MessagePriority,
-    NetworkTransport, NodeId, Packet, Runtime, TcpTransport, TlsConfig, TrackedSendOutcome,
-    TransportSendFailure, TransportSendFailureReason, Value,
+    process_network_packets, AddressResolver, ClusterState, IncomingPacket, NetworkTransport,
+    NodeId, Packet, Runtime, TransportSendFailure, TransportSendFailureReason,
 };
+#[cfg(feature = "tcp")]
+use nulang::runtime::{MessagePriority, TcpTransport, TlsConfig, TrackedSendOutcome};
+#[cfg(feature = "tcp")]
+use nulang::vm::Value;
 
 struct FailureTransport {
     node_id: NodeId,
@@ -70,12 +74,7 @@ fn runtime_surfaces_transport_connect_failure_to_sender_actor() {
         }],
     };
 
-    process_network_packets(
-        &mut runtime,
-        &mut transport,
-        &mut cluster,
-        &mut resolver,
-    );
+    process_network_packets(&mut runtime, &mut transport, &mut cluster, &mut resolver);
 
     let message = runtime
         .actors
