@@ -83,6 +83,19 @@ fn parse_shards(raw: &str) -> Result<Vec<usize>, String> {
     Ok(out)
 }
 
+fn measurement_order(shard_counts: &[usize], iteration: u32) -> Vec<usize> {
+    debug_assert!(!shard_counts.is_empty());
+    debug_assert!(iteration >= 1);
+
+    let pair = ((iteration - 1) / 2) as usize % shard_counts.len();
+    let mut order = shard_counts.to_vec();
+    if iteration % 2 == 0 {
+        order.reverse();
+    }
+    order.rotate_left(pair);
+    order
+}
+
 fn spawn_counter_for_shard(runtime: &mut Runtime, shard_index: usize, shard_count: usize) -> u64 {
     loop {
         let actor_id = runtime.spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
@@ -324,10 +337,10 @@ fn main() -> ExitCode {
     };
 
     for iteration in 1..=config.repeat {
-        let measurements: Vec<Measurement> = config
-            .shard_counts
-            .iter()
-            .map(|&shards| run_independent(shards, config.messages))
+        let order = measurement_order(&config.shard_counts, iteration);
+        let measurements: Vec<Measurement> = order
+            .into_iter()
+            .map(|shards| run_independent(shards, config.messages))
             .collect();
         let baseline = measurements
             .iter()
@@ -348,6 +361,17 @@ mod tests {
         assert_eq!(super::parse_shards("1,2,4,8").unwrap(), vec![1, 2, 4, 8]);
         assert!(super::parse_shards("1,0,2").is_err());
         assert!(super::parse_shards("1,2,2").is_err());
+    }
+
+    #[test]
+    fn counterbalances_measurement_order_across_forward_reverse_pairs() {
+        let shards = [1, 2, 4, 8];
+        assert_eq!(super::measurement_order(&shards, 1), vec![1, 2, 4, 8]);
+        assert_eq!(super::measurement_order(&shards, 2), vec![8, 4, 2, 1]);
+        assert_eq!(super::measurement_order(&shards, 3), vec![2, 4, 8, 1]);
+        assert_eq!(super::measurement_order(&shards, 4), vec![4, 2, 1, 8]);
+        assert_eq!(super::measurement_order(&shards, 7), vec![8, 1, 2, 4]);
+        assert_eq!(super::measurement_order(&shards, 8), vec![1, 8, 4, 2]);
     }
 
     #[test]

@@ -159,6 +159,19 @@ jobs:
       - name: Test (release)
         run: cargo test --locked --release
 
+      - name: Stage tested release binary
+        run: |
+          mkdir -p ci-artifacts
+          cp /tmp/cargo-target/release/nulang ci-artifacts/nulang
+
+      - name: Upload tested release binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: nulang-release-${{ github.sha }}
+          path: ci-artifacts/nulang
+          if-no-files-found: error
+          retention-days: 1
+
 
   # -----------------------------------------------------------------------
   # Nula package-manager smoke test — scaffold a package and run `nula test`
@@ -168,28 +181,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: release
-    env:
-      # The repo sets `target-dir = "/tmp/cargo-target"` in `.cargo/config.toml`,
-      # but the smoke-test steps below reference `./target/release/nulang`.
-      # Override the target directory locally so the binary lands where the
-      # scripts expect it.
-      CARGO_TARGET_DIR: ./target
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y python3-dev
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Download tested release binary
+        uses: actions/download-artifact@v8
         with:
-          toolchain: '1.95.0'
+          name: nulang-release-${{ github.sha }}
+          path: target/release
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build nulang (release)
-        run: cargo build --locked --release --bin nulang
+      - name: Make release binary executable
+        run: chmod +x ./target/release/nulang
 
       - name: Smoke test (eval)
         run: ./target/release/nulang --eval 'perform IO.print("hello")'
@@ -395,7 +397,6 @@ jobs:
           # Full history lets the regression checker order those samples by
           # Git commit time instead of unreliable filesystem mtimes.
           fetch-depth: 0
-
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y python3-dev
 
@@ -493,10 +494,12 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          # Only the canonical Criterion snapshot belongs in rolling history.
-          # Regression manifests and paired A/B reports are diagnostic artifacts,
-          # not collect_bench_results-compatible history inputs.
-          git add "benchmarks/${{ github.sha }}.json"
+          # Stage every canonical Criterion snapshot restored from history plus
+          # the current result. Diagnostic regression/A/B JSON uses non-SHA
+          # filenames and is intentionally excluded.
+          find benchmarks -maxdepth 1 -type f -regextype posix-extended \
+            -regex 'benchmarks/[0-9a-f]{40}\.json' -print0 | \
+            xargs -0 --no-run-if-empty git add --
           git diff --staged --quiet || git commit -m "bench: record results for ${{ github.sha }} [skip ci]"
           git push --force-with-lease origin "HEAD:refs/heads/${BENCH_HISTORY_BRANCH}"
 
