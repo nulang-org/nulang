@@ -370,3 +370,91 @@ fn failed_peer_recovery_via_gossip_forgets_stale_crdt_frontier_before_next_sync(
         2
     );
 }
+
+
+#[test]
+fn ack_from_wrong_peer_cannot_advance_crdt_frontier() {
+    let bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addr_a: SocketAddr = "127.0.0.1:34231".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:34232".parse().unwrap();
+    let addr_c: SocketAddr = "127.0.0.1:34233".parse().unwrap();
+    let node_a = NodeId::new(&addr_a);
+    let node_b = NodeId::new(&addr_b);
+
+    let mut a = distributed_runtime(addr_a, bus.clone());
+    let mut b = distributed_runtime(addr_b, bus.clone());
+    let mut c = distributed_runtime(addr_c, bus);
+
+    a.distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_b, addr_b);
+    b.distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_a, addr_a);
+
+    let id = a.crdt_manager.as_mut().unwrap().create_gcounter().0;
+    a.crdt_manager
+        .as_mut()
+        .unwrap()
+        .get_gcounter_mut(id)
+        .unwrap()
+        .increment_by(1);
+
+    // Reserve A's first tracked CRDT packet for B, but drop it before B can
+    // observe or acknowledge the state.
+    a.distributed
+        .transport
+        .as_mut()
+        .unwrap()
+        .set_partition(HashSet::from([node_b]));
+    nulang::runtime::sync_crdts_delta(&mut a);
+    b.process_network();
+    assert!(
+        b.crdt_manager
+            .as_mut()
+            .unwrap()
+            .get_gcounter_mut(id)
+            .is_none(),
+        "partitioned receiver must still have no CRDT state"
+    );
+
+    // C is not the destination of A's tracked packet. Replaying/guessing the
+    // packet sequence from another node must not prove that B received it.
+    c.distributed.transport.as_mut().unwrap().send(
+        node_a,
+        addr_a,
+        Packet::Ack { packet_seq: 1 },
+    );
+    a.process_network();
+
+    // If the forged/wrong-peer ACK advanced B's frontier, the next send would
+    // be a delta from value 1 and B could not apply it after missing the base.
+    // Correct correlation keeps B unacknowledged, forcing a fresh full join.
+    a.distributed
+        .transport
+        .as_mut()
+        .unwrap()
+        .set_partition(HashSet::new());
+    a.crdt_manager
+        .as_mut()
+        .unwrap()
+        .get_gcounter_mut(id)
+        .unwrap()
+        .increment_by(1);
+    nulang::runtime::sync_crdts_delta(&mut a);
+    b.process_network();
+
+    assert_eq!(
+        b.crdt_manager
+            .as_mut()
+            .unwrap()
+            .get_gcounter_mut(id)
+            .expect("wrong-peer ACK must not suppress the receiver's full-state join")
+            .value(),
+        2
+    );
+}
