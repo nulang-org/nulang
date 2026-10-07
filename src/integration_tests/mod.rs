@@ -4076,6 +4076,25 @@ match { a: 2, b: 9 } with {
             events.iter().any(|e| matches!(e, WorkflowEvent::StepCompleted { step_name, .. } if step_name == "wait_for_go")),
             "StepCompleted event should be persisted after the signal"
         );
+        let completed_sequence = events
+            .iter()
+            .find_map(|event| match event {
+                WorkflowEvent::StepCompleted {
+                    sequence,
+                    step_name,
+                    ..
+                } if step_name == "wait_for_go" => Some(*sequence),
+                _ => None,
+            })
+            .unwrap();
+        let tail = store
+            .load_durable_tail_position(actor_id)
+            .unwrap()
+            .expect("signal resume must remain on the RFC 0022 tail");
+        let snapshot = store.load_snapshot(actor_id).unwrap();
+        assert_eq!(completed_sequence, tail.sequence);
+        assert_eq!(snapshot.sequence, tail.sequence);
+        assert_eq!(store.latest_sequence(actor_id), tail.sequence);
     }
 
     #[test]
@@ -4597,6 +4616,21 @@ match { a: 2, b: 9 } with {
             Some(1),
             "the workflow must advance past the sleeping step"
         );
+        let completed_sequence = events
+            .iter()
+            .find_map(|event| match event {
+                WorkflowEvent::StepCompleted { sequence, .. } => Some(*sequence),
+                _ => None,
+            })
+            .expect("timer resume must record StepCompleted");
+        let tail = store
+            .load_durable_tail_position(actor_id)
+            .unwrap()
+            .expect("timer resume must remain on the RFC 0022 tail");
+        let snapshot = store.load_snapshot(actor_id).unwrap();
+        assert_eq!(completed_sequence, tail.sequence);
+        assert_eq!(snapshot.sequence, tail.sequence);
+        assert_eq!(store.latest_sequence(actor_id), tail.sequence);
     }
 
     #[test]
