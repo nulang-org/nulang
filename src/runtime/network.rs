@@ -1970,6 +1970,28 @@ pub enum TrackedSendOutcome {
     Rejected,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportSendFailureReason {
+    Connect,
+    Write,
+    SenderShutdown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportSendFailure {
+    pub to_node: NodeId,
+    pub packet_seq: u64,
+    pub sender_actor: Option<u64>,
+    pub reason: TransportSendFailureReason,
+}
+
+fn packet_sender_actor(packet: &Packet) -> Option<u64> {
+    match packet {
+        Packet::ActorMessage { sender_actor, .. } if *sender_actor != 0 => Some(*sender_actor),
+        _ => None,
+    }
+}
+
 pub trait NetworkTransport: Send {
     fn connect(&mut self, node_id: NodeId, addr: std::net::SocketAddr) -> std::io::Result<()>;
     fn send(&mut self, to_node: NodeId, to_addr: std::net::SocketAddr, packet: Packet);
@@ -1987,6 +2009,12 @@ pub trait NetworkTransport: Send {
         TrackedSendOutcome::Unsupported
     }
     fn receive(&self) -> Vec<IncomingPacket>;
+    /// Drain asynchronous transport failures reported after a packet sequence
+    /// was reserved. Transports without asynchronous failure reporting return
+    /// an empty set.
+    fn drain_send_failures(&mut self) -> Vec<TransportSendFailure> {
+        Vec::new()
+    }
     fn node_id(&self) -> NodeId;
     fn listen_addr(&self) -> std::net::SocketAddr;
     fn disconnect(&mut self, node_id: NodeId);
@@ -2030,6 +2058,9 @@ impl NetworkTransport for Box<dyn NetworkTransport> {
     fn receive(&self) -> Vec<IncomingPacket> {
         (**self).receive()
     }
+    fn drain_send_failures(&mut self) -> Vec<TransportSendFailure> {
+        (**self).drain_send_failures()
+    }
     fn node_id(&self) -> NodeId {
         (**self).node_id()
     }
@@ -2071,6 +2102,10 @@ pub struct TcpTransport {
     incoming_tx: mpsc::SyncSender<IncomingPacket>,
     /// Channel endpoint used to enqueue packets for transmission.
     outgoing_tx: mpsc::SyncSender<OutgoingPacket>,
+    /// Transport-local failure queue. The sender thread reports connect/write
+    /// outcomes here so the runtime can surface them to the originating actor.
+    send_failure_tx: mpsc::Sender<TransportSendFailure>,
+    send_failure_rx: mpsc::Receiver<TransportSendFailure>,
     /// Next NUL0 sequence reserved synchronously by `send` so callers can
     /// correlate the existing transport ACK with the logical operation.
     next_seq: u64,
@@ -2113,6 +2148,7 @@ impl TcpTransport {
         // Bounded channels.
         let (incoming_tx, incoming_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let (outgoing_tx, outgoing_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let (send_failure_tx, send_failure_rx) = mpsc::channel();
 
         let connections: Arc<Mutex<HashMap<NodeId, TcpConnection>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -2144,11 +2180,20 @@ impl TcpTransport {
             let conns = Arc::clone(&connections);
             let local_id = node_id;
             let in_tx = incoming_tx.clone();
+            let failure_tx = send_failure_tx.clone();
             let tls = tls_config.clone();
             let handle = thread::Builder::new()
                 .name("nulang-net-sender".into())
                 .spawn(move || {
-                    sender_thread(outgoing_rx, conns, flag, local_id, in_tx, tls);
+                    sender_thread(
+                        outgoing_rx,
+                        conns,
+                        flag,
+                        local_id,
+                        in_tx,
+                        failure_tx,
+                        tls,
+                    );
                 })?;
             handles.push(handle);
         }
@@ -2160,6 +2205,8 @@ impl TcpTransport {
             incoming_rx,
             incoming_tx,
             outgoing_tx,
+            send_failure_tx,
+            send_failure_rx,
             next_seq: 1,
             threads: Arc::new(Mutex::new(handles)),
             shutdown_flag,
@@ -2306,13 +2353,29 @@ impl TcpTransport {
             seq,
             packet,
         };
-        if self.outgoing_tx.send(outgoing).is_err() {
+        if let Err(error) = self.outgoing_tx.send(outgoing) {
+            let outgoing = error.0;
             warn!(
                 "nulang-net: dropping packet to node {:?} (addr {}): sender thread shut down",
                 to_node, to_addr
             );
+            let _ = self.send_failure_tx.send(TransportSendFailure {
+                to_node,
+                packet_seq: seq,
+                sender_actor: packet_sender_actor(&outgoing.packet),
+                reason: TransportSendFailureReason::SenderShutdown,
+            });
         }
         TrackedSendOutcome::Sent(seq)
+    }
+
+    /// Drain asynchronous send failures reported by the background sender.
+    pub fn drain_send_failures(&mut self) -> Vec<TransportSendFailure> {
+        let mut failures = Vec::new();
+        while let Ok(failure) = self.send_failure_rx.try_recv() {
+            failures.push(failure);
+        }
+        failures
     }
 
     /// Receive incoming packets (non-blocking).
@@ -2624,6 +2687,7 @@ fn sender_thread(
     shutdown_flag: Arc<AtomicBool>,
     local_node_id: NodeId,
     incoming_tx: mpsc::SyncSender<IncomingPacket>,
+    send_failure_tx: mpsc::Sender<TransportSendFailure>,
     tls_config: TlsConfig,
 ) {
     loop {
@@ -2661,6 +2725,13 @@ fn sender_thread(
                     "[nulang-net] Failed to connect to {:?} at {}: {}",
                     outgoing.to_node, outgoing.to_addr, e
                 );
+                let _ = send_failure_tx.send(TransportSendFailure {
+                    to_node: outgoing.to_node,
+                    packet_seq: outgoing.seq,
+                    sender_actor: packet_sender_actor(&outgoing.packet),
+                    reason: TransportSendFailureReason::Connect,
+                });
+                continue;
             }
         }
 
@@ -2685,6 +2756,12 @@ fn sender_thread(
                 "[nulang-net] Send to {:?} failed: {}; removing connection",
                 outgoing.to_node, e
             );
+            let _ = send_failure_tx.send(TransportSendFailure {
+                to_node: outgoing.to_node,
+                packet_seq: outgoing.seq,
+                sender_actor: packet_sender_actor(&outgoing.packet),
+                reason: TransportSendFailureReason::Write,
+            });
             let mut conns = lock_ignore_poison(&connections);
             if let Some(conn) = conns.remove(&outgoing.to_node) {
                 let _ = conn.stream.shutdown();
@@ -4022,6 +4099,9 @@ impl NetworkTransport for TcpTransport {
     }
     fn receive(&self) -> Vec<IncomingPacket> {
         self.receive()
+    }
+    fn drain_send_failures(&mut self) -> Vec<TransportSendFailure> {
+        self.drain_send_failures()
     }
     fn node_id(&self) -> NodeId {
         self.node_id()
