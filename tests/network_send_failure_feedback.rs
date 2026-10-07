@@ -86,6 +86,111 @@ fn runtime_surfaces_transport_connect_failure_to_sender_actor() {
 
     assert_eq!(message.behavior_id, 0);
     assert_eq!(message.payload[0].as_int(), Some(8));
+    assert_eq!(
+        message.payload[1].as_int(),
+        Some(0),
+        "connect failure must be distinguishable from an ambiguous write failure"
+    );
+}
+
+#[cfg(feature = "tcp")]
+fn wait_for_transport_state(mut predicate: impl FnMut() -> bool, message: &str) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !predicate() {
+        assert!(Instant::now() < deadline, "{message}");
+        std::thread::yield_now();
+    }
+}
+
+#[cfg(feature = "tcp")]
+fn actor_packet(sender_node: NodeId, sender_actor: u64, value: i64) -> Packet {
+    Packet::ActorMessage {
+        target_actor: 9,
+        behavior_name: "handle".to_string(),
+        content_hash: None,
+        required_protocol_id: None,
+        payload: vec![Value::int(value)],
+        string_table: vec![],
+        object_table: vec![],
+        sender_actor,
+        sender_node,
+        priority: MessagePriority::Normal,
+        trace_id: None,
+    }
+}
+
+#[cfg(feature = "tcp")]
+#[test]
+fn tcp_send_reconnects_after_observed_disconnect_without_application_retry_loop() {
+    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+    let mut sender = TcpTransport::bind(bind_addr, TlsConfig::PlaintextInsecure)
+        .expect("bind sender transport");
+    let mut receiver = TcpTransport::bind(bind_addr, TlsConfig::PlaintextInsecure)
+        .expect("bind receiver transport");
+
+    let receiver_addr = receiver.listen_addr();
+    let receiver_node = receiver.node_id();
+    sender
+        .connect(receiver_node, receiver_addr)
+        .expect("establish initial transport connection");
+    assert_eq!(
+        sender.connection_addr(receiver_node),
+        Some(receiver_addr),
+        "fixture must begin with a registered live connection"
+    );
+
+    receiver.shutdown();
+    wait_for_transport_state(
+        || sender.connection_addr(receiver_node).is_none(),
+        "sender must observe reader EOF and retire the disconnected peer",
+    );
+
+    let mut replacement = TcpTransport::bind(receiver_addr, TlsConfig::PlaintextInsecure)
+        .expect("rebind replacement transport at the same advertised address");
+    assert_eq!(
+        replacement.node_id(),
+        receiver_node,
+        "plaintext node identity must remain stable when the advertised address is reused"
+    );
+
+    let sender_actor = 42;
+    let outcome = sender.send_tracked(
+        receiver_node,
+        receiver_addr,
+        actor_packet(sender.node_id(), sender_actor, 7),
+    );
+    assert!(
+        matches!(outcome, TrackedSendOutcome::Sent(_)),
+        "the first application send after observed disconnect must be admitted for reconnect"
+    );
+
+    let mut delivered = None;
+    wait_for_transport_state(
+        || {
+            delivered = replacement
+                .receive()
+                .into_iter()
+                .find(|packet| matches!(packet.packet, Packet::ActorMessage { .. }));
+            delivered.is_some()
+        },
+        "the first application send after rebind must cross the reconnect boundary",
+    );
+
+    let delivered = delivered.expect("delivery predicate established a packet");
+    assert!(matches!(
+        delivered.packet,
+        Packet::ActorMessage {
+            sender_actor: 42,
+            ..
+        }
+    ));
+    assert!(
+        sender.drain_send_failures().is_empty(),
+        "successful reconnect delivery must not emit a synthetic transport failure"
+    );
+
+    sender.shutdown();
+    replacement.shutdown();
 }
 
 #[cfg(feature = "tcp")]
