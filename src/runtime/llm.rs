@@ -135,7 +135,6 @@ use super::{
     BytecodeRuntimeCallbacks, Runtime,
 };
 use crate::primitives::ActorRole;
-use crate::runtime::persistence::WorkflowEvent;
 use crate::vm::Value;
 
 /// Drain completed background LLM calls and resume any actors waiting for
@@ -473,16 +472,18 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
                             actor.set_state_field("step_index", Value::int(n + 1));
                         }
                     }
-                    let seq = (*self_ptr).next_sequence(actor_id);
-                    let _ = (*self_ptr).persistence.append_workflow_event(
+                    if let Err(error) = super::workflow::persist_step_completed(
+                        &mut *self_ptr,
                         actor_id,
-                        WorkflowEvent::StepCompleted {
-                            sequence: seq,
-                            activation: suspended.activation,
-                            step_name: suspended.step_name,
-                        },
-                    );
-                    (*self_ptr).checkpoint_actor(actor_id);
+                        suspended.activation,
+                        suspended.step_name,
+                    ) {
+                        tracing::error!(
+                            actor_id,
+                            %error,
+                            "nulang-workflow: LLM-resume terminal commit failed"
+                        );
+                    }
                 }
             }
             Err(crate::types::NuError::Suspended(_)) => {
