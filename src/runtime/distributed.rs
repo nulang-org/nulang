@@ -1273,10 +1273,20 @@ pub fn process_network_packets(
             }
             Packet::Ack { packet_seq } => {
                 runtime.acked_packets.insert(packet_seq);
-                if let Some((peer_id, batch_id)) =
-                    runtime.pending_crdt_sync_acks.remove(&packet_seq)
+                if let Some((peer_id, batch_id)) = runtime
+                    .pending_crdt_sync_acks
+                    .get(&packet_seq)
+                    .copied()
                 {
-                    runtime.crdt_peer_frontiers.acknowledge(peer_id, batch_id);
+                    // A transport sequence proves receiver knowledge only
+                    // when the ACK came from the peer that was sent the
+                    // corresponding CRDT batch. A matching sequence from any
+                    // other node is unrelated and must leave the correlation
+                    // pending.
+                    if peer_id == incoming.from_node.0 {
+                        runtime.pending_crdt_sync_acks.remove(&packet_seq);
+                        runtime.crdt_peer_frontiers.acknowledge(peer_id, batch_id);
+                    }
                 }
             }
             Packet::FetchBehaviorRequest { content_hash } => {
