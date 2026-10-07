@@ -1273,10 +1273,8 @@ pub fn process_network_packets(
             }
             Packet::Ack { packet_seq } => {
                 runtime.acked_packets.insert(packet_seq);
-                if let Some((peer_id, batch_id)) = runtime
-                    .pending_crdt_sync_acks
-                    .get(&packet_seq)
-                    .copied()
+                if let Some((peer_id, batch_id)) =
+                    runtime.pending_crdt_sync_acks.get(&packet_seq).copied()
                 {
                     // A transport sequence proves receiver knowledge only
                     // when the ACK came from the peer that was sent the
