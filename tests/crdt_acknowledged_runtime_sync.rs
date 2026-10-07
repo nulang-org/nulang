@@ -459,7 +459,6 @@ fn ack_from_wrong_peer_cannot_advance_crdt_frontier() {
     );
 }
 
-
 #[derive(Clone, Copy)]
 enum TestTrackedMode {
     Unsupported,
