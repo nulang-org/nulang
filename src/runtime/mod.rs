@@ -5549,14 +5549,13 @@ impl Runtime {
                         return None;
                     }
 
-                    let unsafe_post_tail_workflow_history =
-                        workflow_events.iter().any(|event| {
-                            event.sequence() > tail.sequence
-                                && !matches!(
-                                    event.replay_id(),
-                                    Some(replay_id) if replay_id.activation == activation
-                                )
-                        });
+                    let unsafe_post_tail_workflow_history = workflow_events.iter().any(|event| {
+                        event.sequence() > tail.sequence
+                            && !matches!(
+                                event.replay_id(),
+                                Some(replay_id) if replay_id.activation == activation
+                            )
+                    });
                     if unsafe_post_tail_workflow_history {
                         warn!(
                             "nulang-recover: refusing workflow actor {}: unproven workflow history extends beyond atomic tail {}",
