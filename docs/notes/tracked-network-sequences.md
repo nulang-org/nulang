@@ -11,3 +11,4 @@ The default custom-transport implementation returns `Unsupported` **without send
 The built-in TCP and deterministic transports reserve sequence numbers before delivery. A simulated in-flight drop therefore returns `Sent(sequence)` without a later ACK; higher-level receiver-knowledge state must stay at the last acknowledged frontier and retry from there. Wire-unsafe TCP payload rejection returns `Rejected`, which leaves the receiver frontier unchanged.
 
 This does not change the NUL0 frame format or ACK packet. It only makes the transport outcome unambiguous so higher-level protocols can distinguish unsupported tracking from an actual tracked-send rejection.
+- A CRDT frontier ACK is receiver-specific: the packet sequence is accepted only when the ACK's `from_node` matches the peer associated with that tracked batch.
