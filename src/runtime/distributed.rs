@@ -1092,7 +1092,31 @@ pub fn process_network_packets(
                 directory,
                 fabric,
             } => {
+                // A recovered peer may advertise Healthy through its
+                // authoritative gossip self-entry before its next heartbeat.
+                // If our previous view was Failed, the peer may be a fresh
+                // process with no CRDT state, so old receiver knowledge must
+                // not survive the transition.
+                let recovering_failed_nodes: Vec<NodeId> = members
+                    .iter()
+                    .filter_map(|member| {
+                        cluster
+                            .get_node(member.node_id)
+                            .is_some_and(|info| info.status == NodeStatus::Failed)
+                            .then_some(member.node_id)
+                    })
+                    .collect();
+
                 cluster.merge_membership_from_sender(members, incoming.from_node);
+
+                for node in recovering_failed_nodes {
+                    if cluster
+                        .get_node(node)
+                        .is_some_and(|info| info.status == NodeStatus::Healthy)
+                    {
+                        super::distribution::forget_crdt_peer_state(runtime, node);
+                    }
+                }
                 if !directory.is_empty() {
                     cluster.merge_directory(directory);
                     // A re-joined node may have been replaced while away:
