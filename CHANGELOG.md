@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Receiver-acknowledged CRDT delta synchronization — 2026-10-07
+- **Per-peer CRDT frontiers now advance only after a matching NUL0 acknowledgement arrives from the intended receiver.** Dropped or unacknowledged batches remain retransmittable from that peer's last proven frontier instead of disappearing behind sender-side optimistic state.
+- **Peer recovery invalidates stale receiver knowledge.** A `Failed → Healthy` transition through heartbeat or authoritative gossip forgets prior CRDT frontier/correlation state so a restarted process receives fresh state.
+- **Tracked sends distinguish unsupported transports from explicit rejection.** Compatibility transports retain the legacy untracked fallback, while tracked-capable rejection cannot be reinterpreted as success and wrong-peer ACKs cannot advance another peer's frontier.
+
 ### Standalone SQLite feature dependency closure — 2026-10-02
 - **The standalone `sqlite` feature now enables Tokio directly because `LibsqlStore` owns a Tokio runtime.** Minimal `--no-default-features --features sqlite` builds no longer rely on unrelated default-profile features to supply that direct dependency.
 

@@ -1956,20 +1956,35 @@ pub struct OutgoingPacket {
 ///   spawns a per-connection reader thread;
 /// * a **sender** thread that dequeues [`OutgoingPacket`]s and writes
 ///   them to the appropriate TCP stream (connecting first if necessary).
+/// Outcome of a tracked transport send.
+///
+/// `Unsupported` is reserved for transports that cannot expose NUL0 sequence
+/// identity and permits an explicit compatibility fallback to `send`.
+/// `Rejected` means the transport understood tracked sending but refused the
+/// packet before assigning a sequence; callers must not reinterpret rejection
+/// as an untracked successful send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackedSendOutcome {
+    Sent(u64),
+    Unsupported,
+    Rejected,
+}
+
 pub trait NetworkTransport: Send {
     fn connect(&mut self, node_id: NodeId, addr: std::net::SocketAddr) -> std::io::Result<()>;
     fn send(&mut self, to_node: NodeId, to_addr: std::net::SocketAddr, packet: Packet);
-    /// Send a packet and return the exact NUL0 sequence when the transport can
-    /// expose it synchronously. `None` means no tracked send was performed;
-    /// callers may explicitly fall back to ordinary `send`. This keeps custom
-    /// transports source-compatible without risking an untrackable duplicate.
+    /// Send a packet while exposing the exact NUL0 sequence when supported.
+    ///
+    /// Custom transports remain source-compatible through the default
+    /// `Unsupported` result. A transport that rejects a packet before assigning
+    /// a sequence must return `Rejected`, not `Unsupported`.
     fn send_tracked(
         &mut self,
         _to_node: NodeId,
         _to_addr: std::net::SocketAddr,
         _packet: Packet,
-    ) -> Option<u64> {
-        None
+    ) -> TrackedSendOutcome {
+        TrackedSendOutcome::Unsupported
     }
     fn receive(&self) -> Vec<IncomingPacket>;
     fn node_id(&self) -> NodeId;
@@ -2009,7 +2024,7 @@ impl NetworkTransport for Box<dyn NetworkTransport> {
         to_node: NodeId,
         to_addr: std::net::SocketAddr,
         packet: Packet,
-    ) -> Option<u64> {
+    ) -> TrackedSendOutcome {
         (**self).send_tracked(to_node, to_addr, packet)
     }
     fn receive(&self) -> Vec<IncomingPacket> {
@@ -2265,13 +2280,13 @@ impl TcpTransport {
         to_node: NodeId,
         to_addr: SocketAddr,
         packet: Packet,
-    ) -> Option<u64> {
+    ) -> TrackedSendOutcome {
         if !packet_payload_wire_safe(&packet) {
             warn!(
                 "nulang-net: dropping packet to node {:?} (addr {}): payload value cannot cross the wire (heap pointer, nil, or string without content)",
                 to_node, to_addr
             );
-            return None;
+            return TrackedSendOutcome::Rejected;
         }
 
         let seq = self.next_seq;
@@ -2283,7 +2298,7 @@ impl TcpTransport {
         // A simulated partition models an in-flight drop: the sequence was
         // assigned, but the receiver will never acknowledge it.
         if self.partition.contains(&to_node) {
-            return Some(seq);
+            return TrackedSendOutcome::Sent(seq);
         }
         let outgoing = OutgoingPacket {
             to_node,
@@ -2297,7 +2312,7 @@ impl TcpTransport {
                 to_node, to_addr
             );
         }
-        Some(seq)
+        TrackedSendOutcome::Sent(seq)
     }
 
     /// Receive incoming packets (non-blocking).
@@ -4002,7 +4017,7 @@ impl NetworkTransport for TcpTransport {
         to_node: NodeId,
         to_addr: std::net::SocketAddr,
         packet: Packet,
-    ) -> Option<u64> {
+    ) -> TrackedSendOutcome {
         TcpTransport::send_tracked(self, to_node, to_addr, packet)
     }
     fn receive(&self) -> Vec<IncomingPacket> {
@@ -4154,14 +4169,14 @@ impl NetworkTransport for DeterministicNetworkTransport {
         to_node: NodeId,
         _to_addr: SocketAddr,
         packet: Packet,
-    ) -> Option<u64> {
+    ) -> TrackedSendOutcome {
         let mut seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         if seq == 0 {
             seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         }
 
         if self.partition.contains(&to_node) {
-            return Some(seq);
+            return TrackedSendOutcome::Sent(seq);
         }
         if let Some(sender) = self.get_incoming_sender(to_node) {
             let incoming = IncomingPacket {
@@ -4180,7 +4195,7 @@ impl NetworkTransport for DeterministicNetworkTransport {
                 let _ = sender.try_send(incoming);
             }
         }
-        Some(seq)
+        TrackedSendOutcome::Sent(seq)
     }
 
     fn flush_held(&mut self) {

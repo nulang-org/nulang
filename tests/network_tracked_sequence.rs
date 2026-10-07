@@ -3,7 +3,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use nulang::runtime::{
-    DeterministicNetworkTransport, IncomingPacket, NetworkTransport, NodeId, OutgoingPacket, Packet,
+    DeterministicNetworkTransport, IncomingPacket, NetworkTransport, NodeId, OutgoingPacket,
+    Packet, TrackedSendOutcome,
 };
 
 fn bus() -> Arc<
@@ -32,26 +33,28 @@ fn deterministic_transport_returns_the_wire_sequence_it_delivers() {
     a.register_on_bus();
     b.register_on_bus();
 
-    let first = a
-        .send_tracked(
-            node_b,
-            addr_b,
-            Packet::Heartbeat {
-                node_id: a.node_id(),
-                timestamp: 1,
-            },
-        )
-        .expect("wire-safe heartbeat should reserve a sequence");
-    let second = a
-        .send_tracked(
-            node_b,
-            addr_b,
-            Packet::Heartbeat {
-                node_id: a.node_id(),
-                timestamp: 2,
-            },
-        )
-        .expect("wire-safe heartbeat should reserve a sequence");
+    let first = match a.send_tracked(
+        node_b,
+        addr_b,
+        Packet::Heartbeat {
+            node_id: a.node_id(),
+            timestamp: 1,
+        },
+    ) {
+        TrackedSendOutcome::Sent(seq) => seq,
+        other => panic!("wire-safe heartbeat should reserve a sequence: {other:?}"),
+    };
+    let second = match a.send_tracked(
+        node_b,
+        addr_b,
+        Packet::Heartbeat {
+            node_id: a.node_id(),
+            timestamp: 2,
+        },
+    ) {
+        TrackedSendOutcome::Sent(seq) => seq,
+        other => panic!("wire-safe heartbeat should reserve a sequence: {other:?}"),
+    };
 
     assert_eq!(first, 1);
     assert_eq!(second, 2);

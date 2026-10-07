@@ -56,7 +56,7 @@ use super::fabric_stream_epoch::{
     FABRIC_STREAM_EPOCH_REPAIR_BEHAVIOR, FABRIC_STREAM_EPOCH_VOTE_BEHAVIOR,
 };
 use super::mailbox::{Message, MessagePayload, MessagePriority};
-use super::network::{NetworkTransport, Packet};
+use super::network::{NetworkTransport, Packet, TrackedSendOutcome};
 use super::{ClusterState, NodeId, NodeStatus};
 use crate::runtime::Runtime;
 use crate::types::ExitReason;
@@ -1059,6 +1059,12 @@ pub fn process_network_packets(
         match incoming.packet {
             Packet::Heartbeat { node_id, .. } => {
                 let cluster_node_id = NodeId(node_id.0);
+                // A Failed -> Healthy transition may be the same NodeId coming
+                // back as a fresh process. Receiver-specific CRDT knowledge
+                // from the old process is therefore no longer trustworthy.
+                let was_failed = cluster
+                    .get_node(cluster_node_id)
+                    .is_some_and(|info| info.status == NodeStatus::Failed);
                 // The IncomingPacket doesn't carry the sender's address
                 // directly, so prefer the address already recorded in the
                 // membership table. For a previously-unknown node (e.g. a
@@ -1071,6 +1077,13 @@ pub fn process_network_packets(
                     .or_else(|| transport.connection_addr(cluster_node_id));
                 if let Some(addr) = known_addr {
                     cluster.handle_heartbeat(cluster_node_id, addr);
+                    if was_failed
+                        && cluster
+                            .get_node(cluster_node_id)
+                            .is_some_and(|info| info.status == NodeStatus::Healthy)
+                    {
+                        super::distribution::forget_crdt_peer_state(runtime, cluster_node_id);
+                    }
                 }
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
@@ -1079,7 +1092,31 @@ pub fn process_network_packets(
                 directory,
                 fabric,
             } => {
+                // A recovered peer may advertise Healthy through its
+                // authoritative gossip self-entry before its next heartbeat.
+                // If our previous view was Failed, the peer may be a fresh
+                // process with no CRDT state, so old receiver knowledge must
+                // not survive the transition.
+                let recovering_failed_nodes: Vec<NodeId> = members
+                    .iter()
+                    .filter_map(|member| {
+                        cluster
+                            .get_node(member.node_id)
+                            .is_some_and(|info| info.status == NodeStatus::Failed)
+                            .then_some(member.node_id)
+                    })
+                    .collect();
+
                 cluster.merge_membership_from_sender(members, incoming.from_node);
+
+                for node in recovering_failed_nodes {
+                    if cluster
+                        .get_node(node)
+                        .is_some_and(|info| info.status == NodeStatus::Healthy)
+                    {
+                        super::distribution::forget_crdt_peer_state(runtime, node);
+                    }
+                }
                 if !directory.is_empty() {
                     cluster.merge_directory(directory);
                     // A re-joined node may have been replaced while away:
@@ -1236,6 +1273,19 @@ pub fn process_network_packets(
             }
             Packet::Ack { packet_seq } => {
                 runtime.acked_packets.insert(packet_seq);
+                if let Some((peer_id, batch_id)) =
+                    runtime.pending_crdt_sync_acks.get(&packet_seq).copied()
+                {
+                    // A transport sequence proves receiver knowledge only
+                    // when the ACK came from the peer that was sent the
+                    // corresponding CRDT batch. A matching sequence from any
+                    // other node is unrelated and must leave the correlation
+                    // pending.
+                    if peer_id == incoming.from_node.0 {
+                        runtime.pending_crdt_sync_acks.remove(&packet_seq);
+                        runtime.crdt_peer_frontiers.acknowledge(peer_id, batch_id);
+                    }
+                }
             }
             Packet::FetchBehaviorRequest { content_hash } => {
                 let mut nbc_bytes: Option<Vec<u8>> = None;
@@ -2345,19 +2395,83 @@ pub fn sync_crdts_delta(runtime: &mut Runtime) {
     if !runtime.distributed.enabled {
         return;
     }
-    let ops = match &mut runtime.crdt_manager {
-        Some(m) => m.generate_delta_sync_ops(),
-        None => return,
-    };
-    if ops.is_empty() {
+
+    let targets: Vec<(u64, NodeId, std::net::SocketAddr)> = runtime
+        .distributed
+        .cluster
+        .as_ref()
+        .map(|cluster| {
+            cluster
+                .healthy_members()
+                .iter()
+                .map(|member| (member.node_id.0, NodeId(member.node_id.0), member.address))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if targets.is_empty() {
         return;
     }
-    let packet = Packet::CrdtDeltaSync { ops: Arc::new(ops) };
-    if let Some(cluster) = &runtime.distributed.cluster {
-        for member in cluster.healthy_members() {
-            if let Some(transport) = &mut runtime.distributed.transport {
-                let net_node_id = NodeId(member.node_id.0);
-                transport.send(net_node_id, member.address, packet.clone());
+
+    // Generate each receiver's batch from that receiver's last explicitly
+    // acknowledged frontier. Generation itself never advances knowledge, so a
+    // lost packet remains retransmittable on the next ordinary sync round.
+    let batches: Vec<_> = {
+        let Some(manager) = runtime.crdt_manager.as_ref() else {
+            return;
+        };
+        targets
+            .into_iter()
+            .filter_map(|(peer_id, node_id, address)| {
+                runtime
+                    .crdt_peer_frontiers
+                    .generate(manager, peer_id)
+                    .map(|batch| (peer_id, node_id, address, batch))
+            })
+            .collect()
+    };
+
+    for (peer_id, node_id, address, batch) in batches {
+        let packet = Packet::CrdtDeltaSync {
+            ops: Arc::new(batch.ops),
+        };
+
+        let tracked_outcome = runtime
+            .distributed
+            .transport
+            .as_mut()
+            .map(|transport| transport.send_tracked(node_id, address, packet.clone()));
+
+        match tracked_outcome {
+            Some(TrackedSendOutcome::Sent(packet_seq)) => {
+                // Retain only the newest tracked attempt for this peer. If an
+                // older packet later succeeds its ACK is conservatively
+                // ignored, which can only cause a retransmission; it cannot
+                // advance the frontier past unproven receiver state.
+                runtime
+                    .pending_crdt_sync_acks
+                    .retain(|_, (pending_peer, _)| *pending_peer != peer_id);
+                runtime
+                    .pending_crdt_sync_acks
+                    .insert(packet_seq, (peer_id, batch.batch_id));
+            }
+            Some(TrackedSendOutcome::Unsupported) => {
+                if let Some(transport) = runtime.distributed.transport.as_mut() {
+                    // Compatibility path for custom transports that cannot
+                    // expose a NUL0 sequence. The default implementation
+                    // performs no send, so fall back exactly once and retain
+                    // the historical optimistic frontier behavior.
+                    transport.send(node_id, address, packet);
+                    runtime
+                        .crdt_peer_frontiers
+                        .acknowledge(peer_id, batch.batch_id);
+                }
+            }
+            Some(TrackedSendOutcome::Rejected) | None => {
+                // A tracked-capable transport explicitly rejected the packet,
+                // or distribution lost its transport between target discovery
+                // and send. In either case no receiver knowledge was proved.
+                // Leave the frontier unchanged so the next sync retries.
             }
         }
     }
