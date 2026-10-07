@@ -93,6 +93,46 @@ fn runtime_surfaces_transport_connect_failure_to_sender_actor() {
     );
 }
 
+#[test]
+fn runtime_marks_transport_write_failure_as_ambiguous() {
+    let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 41_002);
+    let local_node = NodeId::new(&local_addr);
+    let remote_node = NodeId(0xCAFE);
+
+    let mut runtime = Runtime::new();
+    let sender = runtime.spawn_actor(Box::new(Vec::new));
+    let mut cluster = ClusterState::new(local_node, local_addr);
+    let mut resolver = AddressResolver::new(local_node);
+    let mut transport = FailureTransport {
+        node_id: local_node,
+        addr: local_addr,
+        failures: vec![TransportSendFailure {
+            to_node: remote_node,
+            packet_seq: 23,
+            sender_actor: Some(sender),
+            reason: TransportSendFailureReason::Write,
+        }],
+    };
+
+    process_network_packets(&mut runtime, &mut transport, &mut cluster, &mut resolver);
+
+    let message = runtime
+        .actors
+        .get_mut(&sender)
+        .expect("sender actor must remain live")
+        .mailbox
+        .pop()
+        .expect("transport failure must become a sender-visible system message");
+
+    assert_eq!(message.behavior_id, 0);
+    assert_eq!(message.payload[0].as_int(), Some(8));
+    assert_eq!(
+        message.payload[1].as_int(),
+        Some(1),
+        "write failure must remain distinguishable as an ambiguous delivery outcome"
+    );
+}
+
 #[cfg(feature = "tcp")]
 fn wait_for_transport_state(mut predicate: impl FnMut() -> bool, message: &str) {
     let deadline = Instant::now() + Duration::from_secs(3);
