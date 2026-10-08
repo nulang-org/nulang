@@ -24,10 +24,7 @@ mod tests {
     /// Thread-safe, shareable in-memory persistence store for tests that need
     /// to simulate a runtime restart while keeping the same underlying storage.
     #[derive(Debug, Clone)]
-    struct SharedMemoryStore(
-        Arc<Mutex<MemoryStore>>,
-        Arc<std::sync::atomic::AtomicBool>,
-    );
+    struct SharedMemoryStore(Arc<Mutex<MemoryStore>>, Arc<std::sync::atomic::AtomicBool>);
 
     impl SharedMemoryStore {
         fn new() -> Self {
@@ -40,8 +37,7 @@ mod tests {
         /// Inject a single failed terminal transition while allowing command
         /// admission, signal receipt, and history reads to remain functional.
         fn fail_next_terminal_transition(&self) {
-            self.1
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.1.store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -72,8 +68,13 @@ mod tests {
             &self,
             actor_id: u64,
             effect_id: crate::durable_effect::DurableEffectId,
-        ) -> std::io::Result<Option<crate::durable_effect_persistence::DurableEffectPersistenceRecord>> {
-            self.0.lock().unwrap().load_durable_effect(actor_id, effect_id)
+        ) -> std::io::Result<
+            Option<crate::durable_effect_persistence::DurableEffectPersistenceRecord>,
+        > {
+            self.0
+                .lock()
+                .unwrap()
+                .load_durable_effect(actor_id, effect_id)
         }
         fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> std::io::Result<()> {
             self.0.lock().unwrap().save_snapshot(snapshot)
@@ -151,17 +152,23 @@ mod tests {
         // SignalReceived must persist; only the resumed StepCompleted commit
         // fails. The actor may not expose speculative post-resume state.
         store.fail_next_terminal_transition();
-        rt.borrow_mut().signal_workflow(actor_id, "go", None).unwrap();
+        rt.borrow_mut()
+            .signal_workflow(actor_id, "go", None)
+            .unwrap();
 
         assert!(
-            !store.read_workflow_events(actor_id).iter().any(|event| {
-                matches!(event, WorkflowEvent::StepCompleted { .. })
-            }),
+            !store
+                .read_workflow_events(actor_id)
+                .iter()
+                .any(|event| { matches!(event, WorkflowEvent::StepCompleted { .. }) }),
             "failed atomic StepCompleted must not become durable"
         );
         let snapshot = store.load_snapshot(actor_id).unwrap();
         assert_eq!(snapshot.sequence, safe_snapshot.sequence);
-        assert_eq!(snapshot.state.get("step_index"), safe_snapshot.state.get("step_index"));
+        assert_eq!(
+            snapshot.state.get("step_index"),
+            safe_snapshot.state.get("step_index")
+        );
         assert_eq!(
             rt.borrow()
                 .actors
@@ -4832,7 +4839,9 @@ match { a: 2, b: 9 } with {
             .get(&actor_id)
             .expect("failed terminal commit must recover the actor");
         assert_eq!(
-            actor.get_state_field("step_index").and_then(|value| value.as_int()),
+            actor
+                .get_state_field("step_index")
+                .and_then(|value| value.as_int()),
             Some(0),
             "speculative timer-resumed state must not be visible after failed commit"
         );
@@ -4841,14 +4850,19 @@ match { a: 2, b: 9 } with {
             safe_snapshot.sequence
         );
         assert_eq!(
-            store.load_durable_tail_position(actor_id).unwrap().unwrap().sequence,
+            store
+                .load_durable_tail_position(actor_id)
+                .unwrap()
+                .unwrap()
+                .sequence,
             admitted_tail.sequence,
             "failed terminal must not advance the RFC 0022 tail"
         );
         assert!(
-            !store.read_workflow_events(actor_id).iter().any(|event| {
-                matches!(event, WorkflowEvent::StepCompleted { .. })
-            }),
+            !store
+                .read_workflow_events(actor_id)
+                .iter()
+                .any(|event| { matches!(event, WorkflowEvent::StepCompleted { .. }) }),
             "failed terminal commit must not claim successful workflow completion"
         );
     }
