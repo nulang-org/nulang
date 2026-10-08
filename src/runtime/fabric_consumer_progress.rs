@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::runtime::{MessagePriority, NodeId, NodeStatus, Packet, Runtime};
+use crate::runtime::{ClusterState, MessagePriority, NodeId, NodeStatus, Packet, Runtime};
 
 pub(crate) const FABRIC_CONSUMER_PROGRESS_PREPARE_BEHAVIOR: &str =
     "__nulang_fabric_consumer_progress_prepare_v1";
@@ -968,6 +968,16 @@ impl Runtime {
         &mut self,
         stream: &str,
     ) -> io::Result<FabricConsumerProgressPolicy> {
+        self.consumer_progress_validate_leader_with_cluster(stream, None)
+    }
+
+    /// Packet processing temporarily owns ClusterState outside Runtime.
+    /// Validate against the live cluster instead of bypassing health checks.
+    fn consumer_progress_validate_leader_with_cluster(
+        &mut self,
+        stream: &str,
+        active_cluster: Option<&ClusterState>,
+    ) -> io::Result<FabricConsumerProgressPolicy> {
         let policy = self.consumer_progress_installed_policy(stream)?;
         let local = self.distributed.node_id.ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotConnected, "consumer-progress leader requires distribution")
@@ -978,7 +988,7 @@ impl Runtime {
                 "consumer-progress prepare requires installed stream leader",
             ));
         }
-        let healthy = self.distributed.cluster.as_ref()
+        let healthy = active_cluster.or(self.distributed.cluster.as_ref())
             .and_then(|cluster| cluster.get_node(local))
             .map(|member| matches!(member.status, NodeStatus::Healthy | NodeStatus::Joining))
             .unwrap_or(false);
@@ -1139,7 +1149,19 @@ impl Runtime {
         receipt: &FabricConsumerProgressAckWire,
         from: NodeId,
     ) -> io::Result<()> {
-        let policy = self.consumer_progress_validate_leader(&receipt.stream)?;
+        self.fabric_consumer_progress_record_replica_receipt_with_cluster(receipt, from, None)
+    }
+
+    /// Use packet processing's live cluster when the runtime field is absent.
+    pub(crate) fn fabric_consumer_progress_record_replica_receipt_with_cluster(
+        &mut self,
+        receipt: &FabricConsumerProgressAckWire,
+        from: NodeId,
+        active_cluster: Option<&ClusterState>,
+    ) -> io::Result<()> {
+        let policy = self.consumer_progress_validate_leader_with_cluster(
+            &receipt.stream, active_cluster,
+        )?;
         let local = NodeId(policy.leader);
         if receipt.replica != from.0
             || from == local
@@ -1329,8 +1351,20 @@ impl Runtime {
         receipt: &FabricConsumerProgressCommitAckWire,
         from: NodeId,
     ) -> io::Result<()> {
+        self.fabric_consumer_progress_record_commit_receipt_with_cluster(receipt, from, None)
+    }
+
+    /// Apply the same health and membership gate to post-Commit receipts.
+    pub(crate) fn fabric_consumer_progress_record_commit_receipt_with_cluster(
+        &mut self,
+        receipt: &FabricConsumerProgressCommitAckWire,
+        from: NodeId,
+        active_cluster: Option<&ClusterState>,
+    ) -> io::Result<()> {
         receipt.validate_shape()?;
-        let policy = self.consumer_progress_validate_leader(&receipt.stream)?;
+        let policy = self.consumer_progress_validate_leader_with_cluster(
+            &receipt.stream, active_cluster,
+        )?;
         if receipt.leader != policy.leader
             || receipt.epoch != policy.epoch
             || receipt.replica != from.0
