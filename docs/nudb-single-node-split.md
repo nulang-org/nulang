@@ -1,0 +1,81 @@
+# NuDB: Single-node durable tablet split cutover
+
+Status: experimental, **single-owner** prototype. This is a storage correctness
+milestone, not a distributed database protocol.
+
+## Contract
+
+A tablet initially owns the half-open interval `[start, end)` with one
+per-tablet WAL and a checksummed routing manifest. Under the coordinator's
+exclusive ownership of the directory, the split operation:
+
+1. Materializes both child MVCC histories from a stable committed source
+   sequence `S`. Both children begin with sequence `S` and a strictly newer
+   ownership epoch.
+2. Publishes/fsyncs a child checkpoint for each exact key range.
+3. Creates/fsyncs a **new** child WAL (never overwrites another WAL) with a
+   checksummed header recording the child ID, epoch, and `base_sequence = S`.
+4. Reopens both children, proving that checkpoint and WAL agree.
+5. Marks the live coordinator **poisoned**, then writes/fsyncs a temporary
+   routing manifest and renames it over the old manifest. On Unix, syncs its
+   parent directory to complete durable publication.
+6. Only after confirmed publication does the coordinator begin dispatching
+   writes by the child range boundary.
+
+The routing manifest is the sole authoritative cutover decision:
+
+| Manifest state | Recovery behavior |
+| --- | --- |
+| Parent | Open parent; ignore any staged child artifacts |
+| Split | Require and open **both** children; never fall back to parent |
+| Corrupt/missing with tablet files | Fail closed |
+| Publication result ambiguous | Poison live coordinator; reopen from disk |
+
+Before the manifest rename, staged child bytes are **not live state**. A retry
+under exclusive directory ownership discards abandoned staging and derives
+fresh children from the current committed parent.
+
+After publication, separate child WAL sequences can advance independently.
+The inherited sequence is not a global distributed transaction timestamp.
+Cross-tablet snapshot or atomic transaction semantics are **not provided**.
+
+## Crash simulation coverage
+
+- After left child checkpoint/WAL staging: parent remains authoritative
+- After right child staging: parent remains authoritative
+- After temporary routing manifest fsync, before rename: parent remains authoritative
+- After routing manifest rename: in-process handle refuses stale reads/writes;
+  reopen chooses the published children
+- Corrupt manifest: fail closed
+- Missing child checkpoint or WAL: fail closed, even at source sequence zero
+- Truncated parent or child WAL: fail closed before WAL auto-initialization
+- Child writes after promotion/restart preserve their independent sequence tails
+
+These tests simulate interrupted processes at defined boundaries. They do not
+simulate sudden power loss, filesystem reorderings, or storage hardware faults.
+
+## Explicit exclusions and next gates
+
+- **No multi-process coordination:** A second process can currently open raw
+  tablet WALs. Add process-level ownership enforcement before permitting
+  multiple independent writers or long-running daemons sharing one directory.
+- **No distributed fencing:** Add lease/consensus-backed ownership and durable
+  tablet placement metadata before node migration or shared-storage failover.
+- **No global SQL transaction ordering:** Cross-tablet snapshots, two-phase
+  transactions, and distributed atomic writes require a separate protocol.
+- **No physical crash validation:** Run fail-stop/power-loss tests using a
+  controlled filesystem harness and record fsync semantics across platforms.
+- **No retained WAL cleanup for the parent:** GC should only reclaim retired
+  tablet bytes after verified publication, pins, and backup retention checks.
+- **No Arrow scan path yet:** Integrate the existing snapshot-consistent row
+  iterator with Arrow batches only after storage cutover is validated.
+
+## Validation
+
+```sh
+cargo fmt --all -- --check
+cargo test --no-default-features --test nudb_split_cutover
+cargo test --no-default-features --test nudb_snapshot_scan_split
+cargo test --no-default-features --lib database::split
+cargo test --no-default-features --test wal_backed_tablet --test checkpoint_reclamation --test tablet_wal
+```
