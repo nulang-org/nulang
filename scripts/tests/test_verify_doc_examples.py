@@ -31,9 +31,9 @@ class VerifyDocExamplesTests(unittest.TestCase):
             (root / "src").mkdir()
             if source_doc_comment is not None:
                 (root / "src" / "sample.nula").write_text(
-                    "/// ```nulang\\n"
-                    + "".join(f"/// {line}\\n" for line in source_doc_comment.splitlines())
-                    + "/// ```\\n",
+                    "/// ```nulang\n"
+                    + "".join(f"/// {line}\n" for line in source_doc_comment.splitlines())
+                    + "/// ```\n",
                     encoding="utf-8",
                 )
             for ext in extensions:
