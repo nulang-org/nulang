@@ -5,7 +5,9 @@
 //! accordingly so their timings are not misread as message throughput.
 
 use criterion::{black_box, criterion_group, BatchSize, BenchmarkId, Criterion, Throughput};
-use nulang::runtime::{Actor, Mailbox, Message, MessagePayload, MessagePriority, Runtime, TraceContext};
+use nulang::runtime::{
+    Actor, Mailbox, Message, MessagePayload, MessagePriority, Runtime, TraceContext,
+};
 use nulang::vm::Value;
 
 const MESSAGE_BATCH: usize = 100;
