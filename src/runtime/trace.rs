@@ -262,4 +262,45 @@ mod tests {
         assert_ne!(a.span_id(), 0);
         assert_ne!(a.trace_id(), b.trace_id());
     }
+
+    #[test]
+    fn test_root_ids_are_unique_across_processes() {
+        // A fixed global seed can produce distinct IDs within one process while
+        // returning identical initial root IDs in every independently started VM.
+        const PROBE_ENV: &str = "NULANG_TRACE_ROOT_ID_PROBE";
+        if std::env::var_os(PROBE_ENV).is_some() {
+            println!("NULANG_TRACE_ROOT_ID={:032x}", TraceContext::root().trace_id());
+            return;
+        }
+
+        let executable = std::env::current_exe().expect("current test executable");
+        let run_probe = || {
+            let output = std::process::Command::new(&executable)
+                .arg("test_root_ids_are_unique_across_processes")
+                .arg("--nocapture")
+                .env(PROBE_ENV, "1")
+                .output()
+                .expect("start independent test process");
+            assert!(
+                output.status.success(),
+                "trace probe failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            let stdout = String::from_utf8(output.stdout).expect("UTF-8 probe output");
+            let hex = stdout
+                .split("NULANG_TRACE_ROOT_ID=")
+                .nth(1)
+                .and_then(|value| value.get(..32))
+                .expect("probe produced a 128-bit root trace ID");
+            u128::from_str_radix(hex, 16).expect("valid root trace ID")
+        };
+
+        assert_ne!(
+            run_probe(),
+            run_probe(),
+            "independent processes must not reuse the same root trace ID"
+        );
+    }
+
 }
