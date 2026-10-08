@@ -675,6 +675,84 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// This fixture must run in a separate process: it exits without
+    /// dropping the store or its OS owner lock at one bootstrapping boundary.
+    #[test]
+    #[ignore]
+    fn abrupt_exit_during_parent_bootstrap_fixture() {
+        let root = std::env::var_os("NUDB_BOOTSTRAP_FAILSTOP_ROOT").unwrap();
+        let parent = TabletDescriptor::new(
+            TabletId::new(901).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            7,
+        )
+        .unwrap();
+        let _store = SingleNodeSplitStore::open(root, parent).unwrap();
+        panic!("bootstrap fixture returned instead of terminating at the fail-stop");
+    }
+
+    #[test]
+    fn real_process_exit_recovers_parent_at_each_initial_publication_boundary() {
+        use std::process::Command;
+
+        for stage in ["preparing", "wal_header", "published"] {
+            let root = std::env::temp_dir().join(format!(
+                "nudb_bootstrap_failstop_{}_{}_{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed),
+                stage,
+            ));
+            let child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "database::split::tests::abrupt_exit_during_parent_bootstrap_fixture",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("NUDB_BOOTSTRAP_FAILSTOP_ROOT", &root)
+                .env("NUDB_BOOTSTRAP_FAILSTOP_STAGE", stage)
+                .output()
+                .unwrap();
+            assert_eq!(
+                child.status.code(),
+                Some(74),
+                "fail-stop must exit at stage {stage}: stdout={} stderr={}",
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr)
+            );
+
+            let parent = TabletDescriptor::new(
+                TabletId::new(901).unwrap(),
+                KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+                7,
+            )
+            .unwrap();
+            // Even without destructors running in the child, the owner lock
+            // is released by the OS and the authoritative routing state wins.
+            {
+                let mut recovered = SingleNodeSplitStore::open(&root, parent.clone()).unwrap();
+                assert!(!recovered.is_split(), "stage={stage}");
+                assert_eq!(recovered.read_latest(b"b").unwrap(), None);
+                assert_eq!(
+                    recovered
+                        .commit(TabletMutation::Put {
+                            key: b"b".to_vec(),
+                            value: stage.as_bytes().to_vec(),
+                        })
+                        .unwrap(),
+                    1
+                );
+            }
+            let reopened = SingleNodeSplitStore::open(&root, parent).unwrap();
+            assert_eq!(
+                reopened.read_latest(b"b").unwrap(),
+                Some(stage.as_bytes().to_vec())
+            );
+            drop(reopened);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     #[test]
     fn preparing_manifest_recovers_from_interrupted_parent_wal_creation() {
         let root = std::env::temp_dir().join(format!(
