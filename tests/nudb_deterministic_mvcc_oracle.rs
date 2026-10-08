@@ -10,11 +10,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use nulang::database::store::WalBackedTablet;
+use nulang::database::store::{WalBackedError, WalBackedTablet};
 use nulang::database::tablet::{
     KeyRange, MemoryTablet, TabletDescriptor, TabletError, TabletId, TabletMutation, TabletScanRow,
 };
-use nulang::database::store::WalBackedError;
 
 static NEXT_TEST: AtomicU64 = AtomicU64::new(1);
 
