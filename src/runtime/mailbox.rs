@@ -984,6 +984,48 @@ mod transactional_receive_tests {
     }
 
     #[test]
+    fn tail_commit_preserves_index_for_deep_unmatched_lane() {
+        let mut mb = Mailbox::new(0);
+        for sender in 0..4096u64 {
+            mb.push_local(msg(1, sender, MessagePriority::Normal))
+                .unwrap();
+        }
+
+        for sender in 4096..4128u64 {
+            mb.push_local(msg(9, sender, MessagePriority::Normal))
+                .unwrap();
+            let (_, candidate) = mb.receive_match(&[9]).expect("tail match");
+            assert_eq!(candidate[0].as_int(), Some(sender as i64));
+            assert_eq!(mb.commit_receive_match().unwrap()[0].as_int(), Some(sender as i64));
+
+            let index = &mb.receive_indexes.as_ref().unwrap().local;
+            assert!(index.valid, "tail consumption must keep positional index valid");
+            assert_eq!(index.positions.get(&1).unwrap().len(), 4096);
+            assert!(!index.positions.contains_key(&9));
+            assert_eq!(mb.len(), 4096);
+        }
+
+        assert!(mb.receive_match(&[9]).is_none());
+        assert_eq!(mb.receive_match(&[1]).unwrap().1[0].as_int(), Some(0));
+    }
+
+    #[test]
+    fn middle_commit_invalidates_index_and_retains_fifo() {
+        let mut mb = Mailbox::new(8);
+        for (behavior, sender) in [(1, 1), (9, 2), (1, 3)] {
+            mb.push_local(msg(behavior, sender, MessagePriority::Normal)).unwrap();
+        }
+
+        assert_eq!(mb.receive_match(&[9]).unwrap().1[0].as_int(), Some(2));
+        mb.commit_receive_match().expect("middle commit");
+        assert!(!mb.receive_indexes.as_ref().unwrap().local.valid);
+        assert_eq!(mb.receive_match(&[1]).unwrap().1[0].as_int(), Some(1));
+        mb.commit_receive_match().expect("head commit");
+        assert_eq!(mb.pop().unwrap().sender, 3);
+        assert!(mb.is_empty());
+    }
+
+    #[test]
     fn ordinary_pop_after_rejected_candidate_reindexes_remaining_messages() {
         let mut mb = Mailbox::new(4);
         mb.push_local(msg(7, 11, MessagePriority::Normal)).unwrap();
