@@ -286,7 +286,7 @@ fn three_replica_stream_commits_on_majority() {
         1
     );
     nodes[leader_index]
-        .fabric_stream_commit_cursor("majority", "analytics", 1)
+        .fabric_stream_commit_cursor_fenced("majority", "analytics", 1, 1)
         .unwrap();
 
     for root in roots {
@@ -2030,10 +2030,11 @@ fn replicated_consumers_do_not_read_or_ack_uncommitted_records() {
             .len(),
         1
     );
+    // A storage-only runtime without the installed leader identity cannot
+    // run replicated application consumers, even when the raw tail exists.
     assert!(reopened
         .fabric_stream_read_consumer("consumer-visibility", "effect-worker", 10)
-        .unwrap()
-        .is_empty());
+        .is_err());
     assert!(reopened
         .fabric_stream_commit_cursor("consumer-visibility", "effect-worker", 1)
         .is_err());
@@ -2051,7 +2052,7 @@ fn replicated_consumers_do_not_read_or_ack_uncommitted_records() {
     assert_eq!(available.len(), 1);
     assert_eq!(available[0].payload, b"pending-effect");
     leader
-        .fabric_stream_commit_cursor("consumer-visibility", "effect-worker", 1)
+        .fabric_stream_commit_cursor_fenced("consumer-visibility", "effect-worker", 1, 1)
         .unwrap();
     assert!(leader
         .fabric_stream_read_consumer("consumer-visibility", "effect-worker", 10)

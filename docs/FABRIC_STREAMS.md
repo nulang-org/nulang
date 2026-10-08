@@ -92,9 +92,18 @@ when leadership moves to a different node.
 
 Use idempotency keys for side effects and expect duplicate delivery across
 failover. Do not treat these APIs as JetStream-equivalent, exactly-once, or
-distributed-fenced durable consumer state. ACKs identify a record sequence,
-not a particular delivery attempt or leader epoch. A stale worker can ACK a
-record after its lease expires and it is delivered to another worker.
+distributed-fenced durable consumer state. The Runtime API now verifies the
+locally installed stream leader and requires an explicit `leader_epoch`
+from the delivery receipt for replicated ACK/NACK and cursor mutation.
+Legacy sequence-only mutations are valid only for standalone streams.
+Low-level `FileFabricStreamStore` APIs do not perform runtime ownership checks.
+
+This is a **local epoch fence**, not a live quorum check. An isolated former
+leader that has not learned of its removal may still believe its old epoch is
+current, so quorum-replicated ACK progress and a leader lease/consensus fence
+are still required for failover safety. The token also does not identify a
+particular delivery attempt: a worker can ACK after its lease expires and
+the same epoch redelivers the record to another worker.
 
 A three-replica deterministic test demonstrates confirmed old-leader removal,
 successor epoch promotion, committed-record continuity, and replay of an
@@ -124,11 +133,15 @@ let deliveries = runtime.fabric_stream_deliver_consumer(
     std::time::Duration::from_secs(30),
 )?;
 if let Some(delivery) = deliveries.first() {
-    runtime.fabric_stream_ack_consumer(
-        "orders",
-        "billing-v2",
-        delivery.record.sequence,
-    )?;
+    if let Some(epoch) = delivery.leader_epoch {
+        runtime.fabric_stream_ack_consumer_fenced(
+            "orders", "billing-v2", delivery.record.sequence, epoch,
+        )?;
+    } else {
+        runtime.fabric_stream_ack_consumer(
+            "orders", "billing-v2", delivery.record.sequence,
+        )?;
+    }
 }
 ```
 
@@ -140,9 +153,12 @@ Available APIs:
 - `fabric_stream_read`
 - `fabric_stream_read_consumer`
 - `fabric_stream_deliver_consumer`
-- `fabric_stream_ack_consumer`
-- `fabric_stream_nack_consumer`
-- `fabric_stream_commit_cursor`
+- `fabric_stream_ack_consumer` (standalone streams only)
+- `fabric_stream_ack_consumer_fenced` (replicated streams)
+- `fabric_stream_nack_consumer` (standalone streams only)
+- `fabric_stream_nack_consumer_fenced` (replicated streams)
+- `fabric_stream_commit_cursor` (standalone streams only)
+- `fabric_stream_commit_cursor_fenced` (replicated streams)
 - `fabric_stream_cursor`
 - `fabric_stream_info`
 

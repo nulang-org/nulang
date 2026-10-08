@@ -124,8 +124,14 @@ fn promoted_replica_replays_acknowledged_record_without_consumer_state_replicati
         )
         .unwrap();
     assert_eq!(original_delivery.len(), 1);
+    assert_eq!(original_delivery[0].leader_epoch, Some(1));
     nodes[old_leader]
-        .fabric_stream_ack_consumer("consumer-failover", "billing", 1)
+        .fabric_stream_ack_consumer_fenced(
+            "consumer-failover",
+            "billing",
+            1,
+            original_delivery[0].leader_epoch.unwrap(),
+        )
         .unwrap();
     assert_eq!(
         nodes[old_leader]
@@ -226,8 +232,19 @@ fn promoted_replica_replays_acknowledged_record_without_consumer_state_replicati
     assert_eq!(replay[0].record.payload, b"charge-once");
     assert_eq!(replay[0].attempt, 1);
 
+    assert_eq!(replay[0].leader_epoch, Some(2));
+    // ACKs from an earlier leader's delivery epoch cannot advance progress
+    // on the promoted successor.
+    assert!(nodes[candidate]
+        .fabric_stream_ack_consumer_fenced("consumer-failover", "billing", 1, 1)
+        .is_err());
     nodes[candidate]
-        .fabric_stream_ack_consumer("consumer-failover", "billing", 1)
+        .fabric_stream_ack_consumer_fenced(
+            "consumer-failover",
+            "billing",
+            1,
+            replay[0].leader_epoch.unwrap(),
+        )
         .unwrap();
     assert_eq!(
         nodes[candidate]
