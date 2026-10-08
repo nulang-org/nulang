@@ -34,7 +34,9 @@ class JitBuildContract(unittest.TestCase):
         self.assertIn("jit", binaries["nulang-jit"])
         self.assertIn("aot", binaries["nulang-aot"])
         self.assertIn("bytecode", binaries["nulang"])
-        assert len([cmd for cmd in commands if cmd[:2] == ["cargo", "build"]]) >= 2
+        self.assertEqual(
+            len([cmd for cmd in commands if cmd[:2] == ["cargo", "build"]]), 3
+        )
 
     def test_jit_label_is_not_accepted_as_bytecode_or_aot(self):
         records = "\n".join(
@@ -58,6 +60,24 @@ class JitExecutionContract(unittest.TestCase):
         self.assertIn("nulang-jit", source)
         for workload in ("counting", "ping_pong", "thread_ring", "fork_join"):
             self.assertIn(f'benchmark: "{workload}"', source)
+
+    def test_jit_warmup_precedes_timed_region_in_each_fixture(self):
+        source = (ROOT / "src/bin/nulang_savina.rs").read_text()
+        fixtures = ("counting", "ping_pong", "thread_ring", "fork_join")
+        for index, workload in enumerate(fixtures):
+            start = source.index(f"fn bench_{workload}(")
+            stop = (
+                source.index(f"fn bench_{fixtures[index + 1]}(", start)
+                if index + 1 < len(fixtures)
+                else source.index("fn bench_skynet(", start)
+            )
+            body = source[start:stop]
+            self.assertIn("if backend == Backend::Jit", body)
+            self.assertLess(
+                body.index('warm_and_verify_jit(&rt, "'),
+                body.index("let start = Instant::now();"),
+                f"{workload}: native warmup must stay outside the measured interval",
+            )
 
     def test_warmed_jit_workflow_is_explicit(self):
         workflow = (ROOT / ".github/workflows/cross-runtime-bench.yml").read_text()
