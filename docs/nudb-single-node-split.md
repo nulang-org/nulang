@@ -56,8 +56,13 @@ Cross-tablet snapshot or atomic transaction semantics are **not provided**.
 - The stable lock inode persists after the owner drops so later processes
   cannot accidentally acquire distinct locks on different inodes
 
-These tests simulate interrupted processes at defined boundaries. They do not
-simulate sudden power loss, filesystem reorderings, or storage hardware faults.
+The suite includes both injected in-process interruptions and a subprocess
+that terminates via `std::process::exit(72)` at each publication boundary,
+without running destructors. The parent process reopens the directory and
+verifies the authoritative manifest, values, and released advisory lock.
+
+These tests cover real process termination but **not sudden power loss**,
+filesystem reorderings, or storage hardware faults.
 
 ## Explicit exclusions and next gates
 
