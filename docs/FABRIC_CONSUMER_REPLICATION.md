@@ -22,7 +22,7 @@ updates, bounded and sorted ACK gaps, unique policy members, and majority
 certificate cardinality. It explicitly rejects policy/epoch transitions
 until a proper old-quorum recovery protocol exists. Unit tests cover RF=2/3
 majorities, restart recovery, pending-versus-committed visibility, corruption,
-epoch/policy rejection, and ACK-gap preservation.
+epoch/policy rejection, partition-scoped journal isolation, and ACK-gap preservation.
 
 **This is not an authenticated quorum certificate or distributed durable
 consumer protocol.** Replica IDs and their fsync claims are supplied by
