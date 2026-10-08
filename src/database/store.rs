@@ -14,6 +14,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use super::checkpoint::{self, CheckpointError};
+use super::split::OwnedDirectory;
 use super::tablet::{
     MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletScanRow, TabletSplitPlan,
     TabletWrite,
@@ -34,8 +35,27 @@ impl WalBackedTablet {
         wal_path: impl AsRef<Path>,
     ) -> Result<Self, WalBackedError> {
         let wal_path = wal_path.as_ref();
-        let checkpoint_path = checkpoint::checkpoint_path_for_wal(wal_path);
         let wal = FileWal::open(wal_path)?;
+        Self::recover(descriptor, wal_path, wal)
+    }
+
+    /// Managed files are reachable only through a live coordinator's OS lock.
+    pub(crate) fn open_managed(
+        descriptor: TabletDescriptor,
+        wal_path: impl AsRef<Path>,
+        owner: &OwnedDirectory,
+    ) -> Result<Self, WalBackedError> {
+        let wal_path = wal_path.as_ref();
+        let wal = FileWal::open_managed(wal_path, owner)?;
+        Self::recover(descriptor, wal_path, wal)
+    }
+
+    fn recover(
+        descriptor: TabletDescriptor,
+        wal_path: &Path,
+        wal: FileWal,
+    ) -> Result<Self, WalBackedError> {
+        let checkpoint_path = checkpoint::checkpoint_path_for_wal(wal_path);
         let mut tablet = match checkpoint::load_checkpoint(&checkpoint_path, descriptor.clone())? {
             Some(tablet) => tablet,
             None => wal.recover_memory_tablet(descriptor)?,
