@@ -73,6 +73,8 @@ pub mod mir_inline;
 pub mod mir_lower;
 #[path = "../../../src/mir_codegen.rs"]
 pub mod mir_codegen;
+#[path = "../../../src/noalloc.rs"]
+pub mod noalloc;
 #[path = "../../../src/value_layout.rs"]
 pub mod value_layout;
 #[path = "../../../src/core_vm/mod.rs"]
