@@ -211,9 +211,11 @@ semantics that later cluster and stream layers can reuse.
 - [x] Durable per-replica progress for application ACKs.
 - [x] Bounded lagging committed-replica catch-up.
 - [x] Committed-index propagation to followers.
-- [x] Durable monotonic consumer cursors.
-- [x] Consumer ACK/NACK and timed redelivery.
+- [x] Node-local durable monotonic consumer cursors.
+- [x] Node-local consumer ACK/NACK and timed redelivery.
 - [x] Replay by sequence and committed consumer cursor.
+- [ ] Replicated/fenced consumer cursors, ACK gaps, and leases across leader failover.
+- [ ] Leader-epoch/delivery-attempt fencing for old worker ACKs.
 - [ ] Seek by time.
 - [ ] Retention policies.
 - [ ] Dead-letter streams.
