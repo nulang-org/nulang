@@ -126,6 +126,11 @@ enum FabricConsumerProgressEvent {
         policy: FabricConsumerProgressPolicy,
         stream_committed_through: u64,
     },
+    Receipt {
+        metadata_sequence: u64,
+        replica: u64,
+        digest: String,
+    },
     Commit {
         metadata_sequence: u64,
         acknowledgers: Vec<u64>,
@@ -180,6 +185,15 @@ struct PendingConsumerProgress {
     stream_committed_through: u64,
 }
 
+#[derive(Debug, Clone)]
+struct LastConsumerProgressCommit {
+    change: FabricConsumerProgressChange,
+    policy: FabricConsumerProgressPolicy,
+    stream_committed_through: u64,
+    digest: String,
+    acknowledgers: Vec<u64>,
+}
+
 /// Local append-only journal, ready for later authenticated replica transport.
 ///
 /// Only committed frames affect observable state. A pending prepare survives
@@ -193,6 +207,8 @@ pub(crate) struct FileFabricConsumerProgressJournal {
     poisoned: bool,
     scope: Option<(String, u16)>,
     pending: Option<PendingConsumerProgress>,
+    verified_voters: BTreeSet<u64>,
+    last_commit: Option<LastConsumerProgressCommit>,
     committed: BTreeMap<(String, u16, String), FabricConsumerProgressChange>,
     committed_policy: Option<FabricConsumerProgressPolicy>,
 }
@@ -208,6 +224,8 @@ impl FileFabricConsumerProgressJournal {
             poisoned: false,
             scope: None,
             pending: None,
+            verified_voters: BTreeSet::new(),
+            last_commit: None,
             committed: BTreeMap::new(),
             committed_policy: None,
         };
@@ -246,6 +264,14 @@ impl FileFabricConsumerProgressJournal {
 
     pub(crate) fn last_committed_metadata_sequence(&self) -> u64 {
         self.latest_sequence
+    }
+
+    pub(crate) fn verified_voters(&self) -> Vec<u64> {
+        self.verified_voters.iter().copied().collect()
+    }
+
+    fn last_commit(&self) -> Option<&LastConsumerProgressCommit> {
+        self.last_commit.as_ref()
     }
 
     /// Recover the exact pending proposal for idempotent network retry.
@@ -339,6 +365,31 @@ impl FileFabricConsumerProgressJournal {
                     policy: policy.clone(),
                     stream_committed_through: *stream_committed_through,
                 });
+                self.verified_voters.clear();
+                self.verified_voters.insert(policy.leader);
+            }
+            FabricConsumerProgressEvent::Receipt {
+                metadata_sequence,
+                replica,
+                digest,
+            } => {
+                let pending = self.pending.as_ref().ok_or_else(|| {
+                    invalid("consumer-progress receipt has no pending prepare")
+                })?;
+                if *metadata_sequence != pending.change.metadata_sequence
+                    || *replica == pending.policy.leader
+                    || !pending.policy.replicas.contains(replica)
+                {
+                    return Err(invalid("invalid consumer-progress receipt origin or sequence"));
+                }
+                let exact = FabricConsumerProgressPrepareWire::new(
+                    pending.change.clone(),
+                    pending.policy.clone(),
+                    pending.stream_committed_through,
+                )?;
+                if *digest != exact.digest || !self.verified_voters.insert(*replica) {
+                    return Err(invalid("invalid or duplicate durable consumer-progress receipt"));
+                }
             }
             FabricConsumerProgressEvent::Commit {
                 metadata_sequence,
@@ -351,10 +402,23 @@ impl FileFabricConsumerProgressJournal {
                     return Err(invalid("consumer-progress commit index mismatch"));
                 }
                 pending.policy.validate_quorum(acknowledgers)?;
+                let exact = FabricConsumerProgressPrepareWire::new(
+                    pending.change.clone(),
+                    pending.policy.clone(),
+                    pending.stream_committed_through,
+                )?;
                 let pending = self.pending.take().expect("validated pending metadata");
                 self.latest_sequence = *metadata_sequence;
+                self.last_commit = Some(LastConsumerProgressCommit {
+                    change: pending.change.clone(),
+                    policy: pending.policy.clone(),
+                    stream_committed_through: pending.stream_committed_through,
+                    digest: exact.digest,
+                    acknowledgers: acknowledgers.clone(),
+                });
                 self.committed_policy = Some(pending.policy);
                 self.committed.insert(pending.change.key(), pending.change);
+                self.verified_voters.clear();
             }
         }
         Ok(())
@@ -449,6 +513,52 @@ impl FileFabricConsumerProgressJournal {
             metadata_sequence,
             acknowledgers: acknowledgers.to_vec(),
         })
+    }
+
+    /// Call only *after* the transport layer validated a replica's identity
+    /// and its exact fsynced prepare receipt. The journal persists the
+    /// observation before allowing it to count toward a later quorum.
+    pub(crate) fn record_verified_receipt(
+        &mut self,
+        replica: u64,
+        digest: &str,
+    ) -> io::Result<()> {
+        self.ensure_writable()?;
+        let pending = self.pending.as_ref().ok_or_else(|| {
+            invalid("durable receipt has no pending consumer metadata")
+        })?;
+        let exact = FabricConsumerProgressPrepareWire::new(
+            pending.change.clone(),
+            pending.policy.clone(),
+            pending.stream_committed_through,
+        )?;
+        if replica == pending.policy.leader
+            || !pending.policy.replicas.contains(&replica)
+            || digest != exact.digest
+        {
+            return Err(invalid("untrusted consumer-progress receipt or proposal digest"));
+        }
+        if self.verified_voters.contains(&replica) {
+            return Ok(());
+        }
+        self.append_event(FabricConsumerProgressEvent::Receipt {
+            metadata_sequence: pending.change.metadata_sequence,
+            replica,
+            digest: digest.to_string(),
+        })
+    }
+
+    /// Commit only after *persisted* receipt observations prove a majority.
+    /// This is a leader-local metadata commit; it does not guarantee that a
+    /// successor can recover the decision or return a cluster-durable ACK.
+    pub(crate) fn commit_observed_quorum(&mut self, metadata_sequence: u64) -> io::Result<()> {
+        self.ensure_writable()?;
+        let pending = self.pending.as_ref().ok_or_else(|| {
+            invalid("consumer-progress commit requires an unresolved prepare")
+        })?;
+        let voters = self.verified_voters();
+        pending.policy.validate_quorum(&voters)?;
+        self.commit_with_acknowledgers(metadata_sequence, &voters)
     }
 }
 
