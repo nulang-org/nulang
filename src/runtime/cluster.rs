@@ -2789,4 +2789,57 @@ mod tests {
                 .collect::<Vec<_>>()
         );
     }
+
+    #[test]
+    fn test_seeded_gossip_payload_order_and_limit_are_stable() {
+        fn seeded_cluster() -> ClusterState {
+            let local = addr(9650);
+            let mut cluster = ClusterState::new(NodeId::new(&local), local);
+            cluster.set_rng(Box::new(crate::dst::DeterministicRng::new(44)));
+            for port in 9651..=9674 {
+                let peer = addr(port);
+                cluster.handle_heartbeat(NodeId::new(&peer), peer);
+            }
+            cluster
+        }
+
+        let first = seeded_cluster();
+        let second = seeded_cluster();
+        assert_eq!(
+            first.gossip_payload(12),
+            second.gossip_payload(12),
+            "seeded gossip membership subsets must not vary with HashMap hash seeds"
+        );
+    }
+
+    #[test]
+    fn test_seeded_heartbeat_action_order_is_stable() {
+        fn seeded_cluster() -> ClusterState {
+            let local = addr(9680);
+            let mut cluster = ClusterState::new(NodeId::new(&local), local);
+            cluster.set_rng(Box::new(crate::dst::DeterministicRng::new(45)));
+            for port in 9681..=9692 {
+                cluster.join_cluster(addr(port));
+            }
+            cluster.last_heartbeat_sent = cluster.now() - Duration::from_secs(1);
+            cluster
+        }
+
+        let mut first = seeded_cluster();
+        let mut second = seeded_cluster();
+        let heartbeat_nodes = |actions: Vec<ClusterAction>| {
+            actions
+                .into_iter()
+                .filter_map(|action| match action {
+                    ClusterAction::SendHeartbeat { to, .. } => Some(to),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            heartbeat_nodes(first.tick()),
+            heartbeat_nodes(second.tick()),
+            "seeded simulations must deliver heartbeat actions in a stable order"
+        );
+    }
 }
