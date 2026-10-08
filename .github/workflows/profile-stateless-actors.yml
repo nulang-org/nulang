@@ -27,6 +27,38 @@ jobs:
         run: |
           cargo test --locked --no-default-features --features savina-bench \
             --bin nulang-savina persistent_ping_pong_processes_every_round -- --nocapture
+      - name: Measure admission versus scheduler phases
+        run: |
+          mkdir -p phase-results
+          for workload in counting fork_join; do
+            cargo run --locked --profile savina --no-default-features \
+              --features savina-bench --bin nulang-savina -- \
+              --benchmark "$workload" --repeat 3 --phase-profile --format jsonl \
+              > "phase-results/$workload.jsonl"
+          done
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          from scripts.profile_stateless_actors import validate_phase_samples
+
+          expected = {"counting": 200000, "fork_join": 100000}
+          summary = {}
+          for workload, messages in expected.items():
+              raw = Path(f"phase-results/{workload}.jsonl").read_text()
+              summary[workload] = validate_phase_samples(raw, workload, 3, messages)
+          Path("phase-results/summary.json").write_text(
+              json.dumps(summary, indent=2, sort_keys=True) + "\\n"
+          )
+          for workload, result in summary.items():
+              print(workload, result)
+          PY
+      - name: Retain phase timings
+        uses: actions/upload-artifact@v7
+        with:
+          name: nulang-savina-phase-timings-${{ github.sha }}
+          path: phase-results/
+          if-no-files-found: error
+
       - name: Verify profiler CLI accepts persistent rounds
         run: |
           cargo run --locked --profile savina --no-default-features \
