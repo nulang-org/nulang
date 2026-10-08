@@ -69,30 +69,10 @@ jobs:
 
       - name: Smoke-test Ractor actor density
         run: |
-          cargo run --release \
+          cargo run --locked --release \
             --manifest-path benchmarks/cross_runtime/ractor_baseline/Cargo.toml \
             --bin density -- idle 1000 > ractor-density-smoke.txt
-          grep -q '^actor_count=1000        env:
-          RUNS: "${{ inputs.runs || '3' }}"
-          WARMUP: "${{ inputs.warmup || '1' }}"
-          CPU_MODE: "${{ inputs.cpu_mode || 'single' }}"
-        run: |
-          python3 scripts/cross_runtime_bench.py \
-            --runs "$RUNS" \
-            --warmup "$WARMUP" \
-            --cpu-mode "$CPU_MODE" \
-            --output cross-runtime-results.json
-
-      - name: Upload results
-        uses: actions/upload-artifact@v7
-        with:
-          name: cross-runtime-results-${{ github.sha }}
-          path: |
-            cross-runtime-results.json
-            ractor-density-smoke.txt
-            benchmarks/cross_runtime/ractor_baseline/Cargo.lock
-          if-no-files-found: error
- ractor-density-smoke.txt
+          grep -q '^actor_count=1000$' ractor-density-smoke.txt
           grep -q '^rss_after_settle_bytes=' ractor-density-smoke.txt
 
       - name: Run cross-runtime baselines
@@ -113,5 +93,6 @@ jobs:
           name: cross-runtime-results-${{ github.sha }}
           path: |
             cross-runtime-results.json
+            ractor-density-smoke.txt
             benchmarks/cross_runtime/ractor_baseline/Cargo.lock
           if-no-files-found: error
