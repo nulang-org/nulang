@@ -1236,6 +1236,19 @@ fn nulang_exe_output(args: &[&str]) -> NuResult<std::process::Output> {
     })
 }
 
+/// Build manifest-capability-aware compiler arguments for both package WASM paths.
+fn wasm_aot_args(wasm_path: &str, entry: &str) -> Vec<String> {
+    let mut args = vec![
+        "--backend".to_owned(),
+        "wasm-aot".to_owned(),
+        "--out".to_owned(),
+        wasm_path.to_owned(),
+        entry.to_owned(),
+    ];
+    args.extend(capability_args());
+    args
+}
+
 /// `nula build-wasm`: compile package to .wasm + AOT .cwasm.
 /// `nula build-wasm`: compile package to .wasm + AOT .cwasm in .nula/dist/.
 fn cmd_build_wasm() -> NuResult<()> {
@@ -1261,7 +1274,9 @@ fn cmd_build_wasm() -> NuResult<()> {
 
     eprintln!("Building {} (WASM AOT)...", name);
     eprintln!("  Compiling {} to WASM...", entry.display());
-    nulang_exe(&["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str])?;
+    let args = wasm_aot_args(&wasm_path_str, &entry_str);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    nulang_exe(&arg_refs)?;
     println!("WASM AOT build succeeded.");
     Ok(())
 }
@@ -2280,7 +2295,9 @@ fn cmd_deploy(
         let wasm_path = nula_dist.join(format!("{}.wasm", name));
         let wasm_path_str = wasm_path.to_string_lossy().into_owned();
         eprintln!("Compiling {} to .wasm + .cwasm...", name);
-        nulang_exe(&["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str])?;
+        let args = wasm_aot_args(&wasm_path_str, &entry_str);
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        nulang_exe(&arg_refs)?;
     }
 
     // Bundle into .tar.gz: .nula/dist/ contents + dist/** + Nulang.toml + Nulang.lock.
