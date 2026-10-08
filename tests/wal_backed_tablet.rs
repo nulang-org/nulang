@@ -139,3 +139,79 @@ fn stale_prepared_write_does_not_advance_the_wal_tail() {
 
     let _ = fs::remove_file(path);
 }
+
+#[test]
+fn second_writable_handle_is_rejected_without_changing_the_wal() {
+    let path = temp_wal("exclusive_writer");
+    let _ = fs::remove_file(&path);
+
+    let mut writer = WalBackedTablet::open(descriptor(), &path).unwrap();
+    let initial_size = fs::metadata(&path).unwrap().len();
+
+    assert!(
+        WalBackedTablet::open(descriptor(), &path).is_err(),
+        "a second live writer must not be admitted with the same sequence"
+    );
+    assert_eq!(fs::metadata(&path).unwrap().len(), initial_size);
+
+    let write = writer
+        .prepare_write(
+            1,
+            0,
+            vec![TabletMutation::Put {
+                key: b"k".to_vec(),
+                value: b"acknowledged".to_vec(),
+            }],
+        )
+        .unwrap();
+    assert_eq!(writer.commit(write).unwrap(), 1);
+    assert!(
+        WalBackedTablet::open(descriptor(), &path).is_err(),
+        "a writer must remain exclusive after committing"
+    );
+
+    drop(writer);
+    let reopened = WalBackedTablet::open(descriptor(), &path).unwrap();
+    assert_eq!(reopened.current_sequence(), 1);
+    assert_eq!(reopened.read_latest(b"k"), Some(&b"acknowledged"[..]));
+    drop(reopened);
+
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn writer_ownership_survives_wal_reclamation_and_relative_path_aliases() {
+    let path = temp_wal("exclusive_reclaim");
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(path.with_extension("checkpoint"));
+
+    let mut writer = WalBackedTablet::open(descriptor(), &path).unwrap();
+    let write = writer
+        .prepare_write(
+            1,
+            0,
+            vec![TabletMutation::Put {
+                key: b"k".to_vec(),
+                value: b"value".to_vec(),
+            }],
+        )
+        .unwrap();
+    writer.commit(write).unwrap();
+    writer.checkpoint().unwrap();
+
+    // Two lexical paths to the same physical WAL must share one writer lock.
+    let alias = path.parent().unwrap().join(".").join(path.file_name().unwrap());
+    assert!(
+        WalBackedTablet::open(descriptor(), &alias).is_err(),
+        "checkpoint rename and parent aliases must not bypass the writer lock"
+    );
+    assert_eq!(writer.current_sequence(), 1);
+
+    drop(writer);
+    let reopened = WalBackedTablet::open(descriptor(), &alias).unwrap();
+    assert_eq!(reopened.read_latest(b"k"), Some(&b"value"[..]));
+    drop(reopened);
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(path.with_extension("checkpoint"));
+}
