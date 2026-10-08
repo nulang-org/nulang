@@ -1302,6 +1302,71 @@ mod tests {
     }
 
     #[test]
+    fn journal_first_writes_recover_successful_mutations_and_preserve_counter_ttl() {
+        let wal_path = test_path("writes-recovery-wal");
+        let snapshot_path = test_path("writes-recovery-snapshot");
+        let wal = CacheWal::create_after(&wal_path, 0).unwrap();
+        let mut durable = DurableCacheStore::with_wal(
+            CacheStore::new(),
+            wal,
+            CacheDurabilityMode::SyncedJournal,
+        )
+        .unwrap();
+
+        durable.set_bytes(b"counter", b"4", Some(5_000), 0, 1_000).unwrap();
+        assert_eq!(durable.increment(b"counter", 3, 0, 1_000).unwrap(), 7);
+        durable
+            .set_many_bytes(
+                &[(b"a".as_slice(), b"one".as_slice()),
+                  (b"b".as_slice(), b"two".as_slice())],
+                0,
+                1_000,
+            )
+            .unwrap();
+        assert_eq!(durable.durability_status().wal_last_sequence, Some(3));
+        assert_eq!(durable.ttl(b"counter", 0), CacheTtl::RemainingMs(5_000));
+        drop(durable);
+
+        let (mut recovered, report) = recover_cache(
+            &snapshot_path,
+            &wal_path,
+            CacheConfig::default(),
+            CacheEvictionPolicy::S3Fifo,
+            100,
+            2_000,
+        )
+        .unwrap();
+        assert_eq!(report.replayed_records, 3);
+        assert_eq!(recovered.get(b"counter", 100), Some(CacheValueView::Integer(7)));
+        assert_eq!(recovered.ttl(b"counter", 100), CacheTtl::RemainingMs(4_000));
+        assert_eq!(recovered.get(b"a", 100), Some(CacheValueView::Bytes(b"one")));
+        assert_eq!(recovered.get(b"b", 100), Some(CacheValueView::Bytes(b"two")));
+
+        let _ = fs::remove_file(wal_path);
+    }
+
+    #[test]
+    fn rejected_journaled_increment_does_not_advance_wal() {
+        let wal_path = test_path("invalid-increment-wal");
+        let wal = CacheWal::create_after(&wal_path, 0).unwrap();
+        let mut store = CacheStore::new();
+        store.set_bytes(b"counter", b"not-an-integer", None, 0);
+        let mut durable = DurableCacheStore::with_wal(
+            store,
+            wal,
+            CacheDurabilityMode::SyncedJournal,
+        )
+        .unwrap();
+        assert!(matches!(
+            durable.increment(b"counter", 1, 0, 0),
+            Err(CacheDurabilityError::Increment(CacheIncrementError::NotInteger))
+        ));
+        assert_eq!(durable.durability_status().wal_last_sequence, Some(0));
+        assert!(!durable.is_poisoned());
+        let _ = fs::remove_file(wal_path);
+    }
+
+    #[test]
     fn failed_set_journal_retains_preexisting_value() {
         let wal_path = test_path("set-before-wal");
         let wal = CacheWal::create_after(&wal_path, 0).unwrap();
