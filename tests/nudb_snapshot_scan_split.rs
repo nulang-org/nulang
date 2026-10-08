@@ -206,3 +206,48 @@ fn wal_recovery_and_checkpoint_keep_historical_scans_stable() {
     let _ = fs::remove_file(&wal_path);
     let _ = fs::remove_file(&checkpoint);
 }
+
+#[test]
+fn repeated_mutations_to_one_key_restore_as_one_committed_mvcc_version() {
+    let wal_path = std::env::temp_dir().join(format!(
+        "nulang_nudb_duplicate_keys_{}_{}.wal",
+        std::process::id(),
+        NEXT_TEST.fetch_add(1, Ordering::Relaxed)
+    ));
+    let checkpoint = wal_path.with_extension("checkpoint");
+    let _ = fs::remove_file(&wal_path);
+    let _ = fs::remove_file(&checkpoint);
+
+    {
+        let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
+        let initial = tablet.prepare_write(4, 0, vec![put(b"b", b"first")]).unwrap();
+        tablet.commit(initial).unwrap();
+        let repeated = tablet
+            .prepare_write(
+                4,
+                1,
+                vec![
+                    put(b"b", b"temporary"),
+                    TabletMutation::Delete { key: b"b".to_vec() },
+                    put(b"b", b"final"),
+                ],
+            )
+            .unwrap();
+        tablet.commit(repeated).unwrap();
+        assert_eq!(tablet.read_at(b"b", 2).unwrap(), Some(&b"final"[..]));
+        tablet.checkpoint().unwrap();
+    }
+
+    // A checkpoint must not contain duplicate versions at the same commit
+    // sequence: they make restore_snapshot reject the complete history.
+    let reopened = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
+    assert_eq!(reopened.read_at(b"b", 1).unwrap(), Some(&b"first"[..]));
+    assert_eq!(reopened.read_at(b"b", 2).unwrap(), Some(&b"final"[..]));
+    assert_eq!(
+        reopened.scan_at(b"a", Some(b"z"), 2, 10).unwrap(),
+        vec![row(b"b", b"final")]
+    );
+
+    let _ = fs::remove_file(&wal_path);
+    let _ = fs::remove_file(&checkpoint);
+}
