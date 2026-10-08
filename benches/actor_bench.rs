@@ -5,7 +5,7 @@
 //! accordingly so their timings are not misread as message throughput.
 
 use criterion::{black_box, criterion_group, BatchSize, BenchmarkId, Criterion, Throughput};
-use nulang::runtime::{Mailbox, Message, MessagePayload, MessagePriority, Runtime};
+use nulang::runtime::{Actor, Mailbox, Message, MessagePayload, MessagePriority, Runtime, TraceContext};
 use nulang::vm::Value;
 
 const MESSAGE_BATCH: usize = 100;
@@ -261,11 +261,68 @@ fn bench_selective_receive(c: &mut Criterion) {
     group.finish();
 }
 
+/// The live path has a single tried message in a deep staged mailbox.
+fn bench_selective_receive_reset(c: &mut Criterion) {
+    const HIT: u16 = 60_000;
+    let mut group = c.benchmark_group("actor/selective_receive_sparse_reset");
+    for depth in [64usize, 1024, 16_384] {
+        group.bench_with_input(BenchmarkId::from_parameter(depth), &depth, |b, &depth| {
+            b.iter_batched_ref(
+                || {
+                    let mut mailbox = selective_receive_mailbox(depth, HIT);
+                    assert!(mailbox.receive_match(&[HIT]).is_some());
+                    mailbox
+                },
+                |mailbox| {
+                    mailbox.reset_receive_match();
+                    black_box(mailbox.len());
+                },
+                BatchSize::SmallInput,
+            )
+        });
+    }
+    group.finish();
+}
+
+/// Rewrites to an existing actor field are on the hot behavior path.
+fn bench_actor_state_overwrite(c: &mut Criterion) {
+    let mut actor = Actor::new(1, "counter", 0);
+    actor.set_state_field("count", Value::int(0));
+    c.bench_function("actor/state_field_overwrite", |b| {
+        b.iter(|| {
+            actor.set_state_field("count", black_box(Value::int(42)));
+            black_box(actor.get_state_field("count"));
+        })
+    });
+}
+
+/// Compare tracing-disabled dispatch to TRACE-enabled formatting separately.
+/// Do not interpret the latter as normal production message throughput.
+fn bench_trace_dispatch_span(c: &mut Criterion) {
+    let trace = TraceContext::root();
+    c.bench_function("actor/trace_span_disabled", |b| {
+        b.iter(|| black_box(trace.enter_dispatch_span(black_box(1), black_box(0))));
+    });
+
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(std::io::sink)
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        c.bench_function("actor/trace_span_enabled", |b| {
+            b.iter(|| black_box(trace.enter_dispatch_span(black_box(1), black_box(0))));
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_spawn_idle_batch,
     bench_spawn_send_receive,
     bench_message_enqueue,
     bench_message_drain,
-    bench_selective_receive
+    bench_selective_receive,
+    bench_selective_receive_reset,
+    bench_actor_state_overwrite,
+    bench_trace_dispatch_span
 );
