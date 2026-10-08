@@ -5,6 +5,7 @@ on:
     paths:
       - 'scripts/profile_stateless_actors.py'
       - 'tests/test_profile_stateless_actors.py'
+      - 'src/bin/nulang_savina.rs'
       - '.github/workflows/profile-stateless-actors.yml'
   workflow_dispatch:
 
@@ -20,3 +21,24 @@ jobs:
       - uses: actions/checkout@v7
       - name: Validate profiling contract
         run: python3 -m unittest discover -s tests -p test_profile_stateless_actors.py -v
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify persistent-actor correctness
+        run: |
+          cargo test --locked --no-default-features --features savina-bench \
+            --bin nulang-savina persistent_ping_pong_processes_every_round -- --nocapture
+      - name: Verify profiler CLI accepts persistent rounds
+        run: |
+          cargo run --locked --profile savina --no-default-features \
+            --features savina-bench --bin nulang-savina -- \
+            --benchmark ping_pong --repeat 2 --reuse-setup --format jsonl \
+            > persistent-ping-pong.jsonl
+          python3 - <<'PY'
+          import json
+          with open("persistent-ping-pong.jsonl", encoding="utf-8") as source:
+              records = [json.loads(line) for line in source if line.strip()]
+          assert len(records) == 2, len(records)
+          assert [r["iteration"] for r in records] == [1, 2]
+          assert all(r["benchmark"] == "ping_pong" for r in records)
+          assert all(r["messages"] == 40001 and r["elapsed_ns"] > 0 for r in records)
+          PY
