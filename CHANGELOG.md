@@ -1,5 +1,10 @@
 # Nulang Changelog
 
+### Replicated Fabric consumer commit safety — 2026-10-08
+- **Replicated stream consumers now read only the durable quorum-committed prefix.** Locally fsynced but not quorum-committed records remain available to explicit raw-log inspection/replication, not application-facing consumer reads.
+- **Replicated consumer cursors cannot acknowledge uncommitted records.** Reopened streams retain this bound; legacy cursors beyond the committed sequence fail closed. Standalone streams without a replication policy preserve their existing local cursor behavior.
+- **Deterministic two-node regressions** cover pending-quorum invisibility, reopening on-disk uncommitted data, visibility after follower ACK, cursor progression, and standalone compatibility.
+
 ### Seeded cluster simulation peer ordering — 2026-10-07
 - **Cluster simulations with an injected deterministic RNG now canonicalize peer order for gossip targets, bounded gossip payloads, active-view repair, and heartbeat action emission.** This removes four sources of randomized Rust `HashMap` ordering while preserving the existing unseeded production path. Regression tests compare independently constructed cluster states under identical RNG seeds.
 
