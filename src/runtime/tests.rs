@@ -4337,7 +4337,6 @@ fn test_legacy_checkpoint_is_rejected_after_atomic_workflow_tail_begins() {
     );
 }
 
-
 #[test]
 fn test_failed_resumed_workflow_terminal_rolls_back_uncommitted_state() {
     let mut rt = Runtime::new();
@@ -4364,7 +4363,9 @@ fn test_failed_resumed_workflow_terminal_rolls_back_uncommitted_state() {
 
     let actor = rt.actors.get(&actor_id).expect("actor must recover");
     assert_eq!(
-        actor.get_state_field("step_index").and_then(|value| value.as_int()),
+        actor
+            .get_state_field("step_index")
+            .and_then(|value| value.as_int()),
         Some(0),
         "an uncommitted resumed step must not remain visible in memory"
     );
@@ -4379,9 +4380,10 @@ fn test_failed_resumed_workflow_terminal_rolls_back_uncommitted_state() {
         "recovery must preserve the admitted command for deterministic replay"
     );
     assert!(
-        !rt.persistence.read_workflow_events(actor_id).iter().any(|event| {
-            matches!(event, WorkflowEvent::StepCompleted { .. })
-        }),
+        !rt.persistence
+            .read_workflow_events(actor_id)
+            .iter()
+            .any(|event| { matches!(event, WorkflowEvent::StepCompleted { .. }) }),
         "failed terminal commit must not fabricate successful completion"
     );
 }
