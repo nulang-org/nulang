@@ -602,6 +602,18 @@ impl FileWal {
     }
 }
 
+/// Read only enough bytes to identify a *fresh* WAL header or its
+/// interrupted write prefix. A 64-byte WAL is not necessarily empty: after
+/// checkpoint reclamation it can encode a nonzero committed base sequence.
+/// Never rewrite an existing WAL merely because its length is header-sized.
+pub(crate) fn is_fresh_initial_wal_header_prefix(path: &Path) -> Result<bool, WalError> {
+    let mut file = File::open(path)?;
+    let mut observed = [0_u8; WAL_HEADER_BYTES + 1];
+    let length = read_up_to(&mut file, &mut observed)?;
+    let expected = encode_wal_header(0, None, None);
+    Ok(length <= WAL_HEADER_BYTES && observed[..length] == expected[..length])
+}
+
 fn encode_wal_header(
     base_sequence: u64,
     tablet_id: Option<TabletId>,

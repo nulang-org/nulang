@@ -22,6 +22,9 @@ use super::wal::{FileWal, WalError};
 
 const MANIFEST_MAGIC: &[u8; 8] = b"NUDBRT01";
 const MANIFEST_VERSION: u16 = 1;
+// A preparation record must be rejected by older readers that ignore the
+// unknown serde field, rather than being mistaken for a published route.
+const PREPARING_MANIFEST_VERSION: u16 = 2;
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -62,6 +65,9 @@ struct DiskManifest {
     version: u16,
     parent: DiskDescriptor,
     split: Option<DiskSplit>,
+    // Legacy manifests omit this field and remain published/authoritative.
+    #[serde(default)]
+    preparing: bool,
 }
 
 impl DiskManifest {
@@ -70,6 +76,15 @@ impl DiskManifest {
             version: MANIFEST_VERSION,
             parent: DiskDescriptor::from_tablet(parent),
             split: None,
+            preparing: false,
+        }
+    }
+
+    fn for_preparing_parent(parent: &TabletDescriptor) -> Self {
+        Self {
+            version: PREPARING_MANIFEST_VERSION,
+            preparing: true,
+            ..Self::for_parent(parent)
         }
     }
 
@@ -83,6 +98,7 @@ impl DiskManifest {
                 right: DiskDescriptor::from_tablet(&plan.right),
                 source_sequence,
             }),
+            preparing: false,
         }
     }
 
@@ -90,7 +106,8 @@ impl DiskManifest {
         self,
         requested_parent: &TabletDescriptor,
     ) -> Result<Option<(TabletSplitPlan, u64)>, SplitError> {
-        if self.version != MANIFEST_VERSION
+        if self.preparing
+            || self.version != MANIFEST_VERSION
             || self.parent != DiskDescriptor::from_tablet(requested_parent)
         {
             return Err(SplitError::InvalidManifest(
@@ -165,32 +182,79 @@ impl SingleNodeSplitStore {
         let parent_wal = root.join("parent.wal");
         let active = if manifest_path.exists() {
             let manifest = read_manifest(&manifest_path)?;
-            match manifest.validate(&parent)? {
-                None => {
-                    verify_published_wal(&parent_wal)?;
-                    Active::Parent(WalBackedTablet::open(parent.clone(), &parent_wal)?)
+            if manifest.preparing {
+                // A preparing record is durable before WAL initialization
+                // and cannot have acknowledged writes. Only an empty/torn
+                // WAL header may be discarded; any WAL records, checkpoint,
+                // or child artifacts mean recovery is ambiguous and must
+                // fail closed instead of silently losing committed data.
+                if manifest.version != PREPARING_MANIFEST_VERSION
+                    || manifest.parent != DiskDescriptor::from_tablet(&parent)
+                    || manifest.split.is_some()
+                {
+                    return Err(SplitError::InvalidManifest(
+                        "invalid preparing parent manifest".into(),
+                    ));
                 }
-                Some((plan, sequence)) => {
-                    // Never silently fall back to the parent after promotion.
-                    for child in ["left", "right"] {
-                        verify_published_wal(&root.join(format!("{child}.wal")))?;
-                        if !root.join(format!("{child}.checkpoint")).exists() {
+                if [
+                    "parent.checkpoint",
+                    "left.wal",
+                    "right.wal",
+                    "left.checkpoint",
+                    "right.checkpoint",
+                ]
+                .iter()
+                .any(|file| root.join(file).exists())
+                {
+                    return Err(SplitError::InvalidManifest(
+                        "unexpected durable artifacts during parent initialization".into(),
+                    ));
+                }
+                match fs::metadata(&parent_wal) {
+                    Ok(_) => {
+                        if !super::wal::is_fresh_initial_wal_header_prefix(&parent_wal)? {
                             return Err(SplitError::InvalidManifest(
-                                "published child checkpoint is missing".into(),
+                                "preparing parent WAL is not a fresh, uncommitted header".into(),
                             ));
                         }
+                        fs::remove_file(&parent_wal)?;
+                        sync_directory(&root)?;
                     }
-                    let left = WalBackedTablet::open(plan.left, root.join("left.wal"))?;
-                    let right = WalBackedTablet::open(plan.right, root.join("right.wal"))?;
-                    if left.current_sequence() < sequence || right.current_sequence() < sequence {
-                        return Err(SplitError::InvalidManifest(
-                            "child state regressed behind split source sequence".into(),
-                        ));
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+                    Err(error) => return Err(error.into()),
+                }
+                let parent_tablet = WalBackedTablet::open(parent.clone(), &parent_wal)?;
+                write_manifest(&manifest_path, &DiskManifest::for_parent(&parent), None)?;
+                Active::Parent(parent_tablet)
+            } else {
+                match manifest.validate(&parent)? {
+                    None => {
+                        verify_published_wal(&parent_wal)?;
+                        Active::Parent(WalBackedTablet::open(parent.clone(), &parent_wal)?)
                     }
-                    Active::Children {
-                        split_key: plan.split_key,
-                        left,
-                        right,
+                    Some((plan, sequence)) => {
+                        // Never silently fall back to the parent after promotion.
+                        for child in ["left", "right"] {
+                            verify_published_wal(&root.join(format!("{child}.wal")))?;
+                            if !root.join(format!("{child}.checkpoint")).exists() {
+                                return Err(SplitError::InvalidManifest(
+                                    "published child checkpoint is missing".into(),
+                                ));
+                            }
+                        }
+                        let left = WalBackedTablet::open(plan.left, root.join("left.wal"))?;
+                        let right = WalBackedTablet::open(plan.right, root.join("right.wal"))?;
+                        if left.current_sequence() < sequence || right.current_sequence() < sequence
+                        {
+                            return Err(SplitError::InvalidManifest(
+                                "child state regressed behind split source sequence".into(),
+                            ));
+                        }
+                        Active::Children {
+                            split_key: plan.split_key,
+                            left,
+                            right,
+                        }
                     }
                 }
             }
@@ -198,6 +262,7 @@ impl SingleNodeSplitStore {
             // A missing manifest is not proof of a fresh store. In particular,
             // a lost manifest after promotion cannot resurrect an old parent.
             if parent_wal.exists()
+                || root.join("parent.checkpoint").exists()
                 || [
                     "left.wal",
                     "right.wal",
@@ -211,8 +276,23 @@ impl SingleNodeSplitStore {
                     "tablet files exist without routing manifest".into(),
                 ));
             }
+            // Persist an explicit, recoverable preparing state *before*
+            // creating the WAL, then publish the ready state only after
+            // the WAL header is durable. This closes the WAL-before-manifest
+            // crash window on a previously empty directory.
+            write_manifest(
+                &manifest_path,
+                &DiskManifest::for_preparing_parent(&parent),
+                None,
+            )?;
+            #[cfg(test)]
+            abort_bootstrap_at("preparing");
             let parent_tablet = WalBackedTablet::open(parent.clone(), &parent_wal)?;
+            #[cfg(test)]
+            abort_bootstrap_at("wal_header");
             write_manifest(&manifest_path, &DiskManifest::for_parent(&parent), None)?;
+            #[cfg(test)]
+            abort_bootstrap_at("published");
             Active::Parent(parent_tablet)
         };
         Ok(Self {
@@ -375,6 +455,19 @@ enum SplitStop {
     AfterRight,
     AfterManifestTempSync,
     AfterManifestRename,
+}
+
+// Exercise actual process termination at every durable bootstrap boundary.
+// The helper is deliberately absent from release builds.
+#[cfg(test)]
+fn abort_bootstrap_at(stage: &str) {
+    if std::env::var("NUDB_BOOTSTRAP_FAILSTOP_STAGE")
+        .ok()
+        .as_deref()
+        == Some(stage)
+    {
+        std::process::exit(74);
+    }
 }
 
 fn write_manifest(
@@ -600,6 +693,353 @@ mod tests {
             assert!(recovered.is_split());
         }
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// This fixture must run in a separate process: it exits without
+    /// dropping the store or its OS owner lock at one bootstrapping boundary.
+    #[test]
+    #[ignore]
+    fn abrupt_exit_during_parent_bootstrap_fixture() {
+        let root = std::env::var_os("NUDB_BOOTSTRAP_FAILSTOP_ROOT").unwrap();
+        let parent = TabletDescriptor::new(
+            TabletId::new(901).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            7,
+        )
+        .unwrap();
+        let _store = SingleNodeSplitStore::open(root, parent).unwrap();
+        panic!("bootstrap fixture returned instead of terminating at the fail-stop");
+    }
+
+    #[test]
+    fn real_process_exit_recovers_parent_at_each_initial_publication_boundary() {
+        use std::process::Command;
+
+        for stage in ["preparing", "wal_header", "published"] {
+            let root = std::env::temp_dir().join(format!(
+                "nudb_bootstrap_failstop_{}_{}_{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed),
+                stage,
+            ));
+            let child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "database::split::tests::abrupt_exit_during_parent_bootstrap_fixture",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("NUDB_BOOTSTRAP_FAILSTOP_ROOT", &root)
+                .env("NUDB_BOOTSTRAP_FAILSTOP_STAGE", stage)
+                .output()
+                .unwrap();
+            assert_eq!(
+                child.status.code(),
+                Some(74),
+                "fail-stop must exit at stage {stage}: stdout={} stderr={}",
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr)
+            );
+
+            let parent = TabletDescriptor::new(
+                TabletId::new(901).unwrap(),
+                KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+                7,
+            )
+            .unwrap();
+            // Even without destructors running in the child, the owner lock
+            // is released by the OS and the authoritative routing state wins.
+            {
+                let mut recovered = SingleNodeSplitStore::open(&root, parent.clone()).unwrap();
+                assert!(!recovered.is_split(), "stage={stage}");
+                assert_eq!(recovered.read_latest(b"b").unwrap(), None);
+                assert_eq!(
+                    recovered
+                        .commit(TabletMutation::Put {
+                            key: b"b".to_vec(),
+                            value: stage.as_bytes().to_vec(),
+                        })
+                        .unwrap(),
+                    1
+                );
+            }
+            let reopened = SingleNodeSplitStore::open(&root, parent).unwrap();
+            assert_eq!(
+                reopened.read_latest(b"b").unwrap(),
+                Some(stage.as_bytes().to_vec())
+            );
+            drop(reopened);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn preparing_manifest_recovers_from_interrupted_parent_wal_creation() {
+        let root = std::env::temp_dir().join(format!(
+            "nudb_bootstrap_recovery_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let parent = TabletDescriptor::new(
+            TabletId::new(901).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            7,
+        )
+        .unwrap();
+        fs::create_dir_all(&root).unwrap();
+        write_manifest(
+            &root.join("route.manifest"),
+            &DiskManifest::for_preparing_parent(&parent),
+            None,
+        )
+        .unwrap();
+        // Simulate a crash during the real initial WAL-header write:
+        // truncate an actual checksummed fresh header, not arbitrary bytes.
+        // No store was published, so no writes could have been acknowledged.
+        let wal_path = root.join("parent.wal");
+        drop(FileWal::open(&wal_path).unwrap());
+        let file = OpenOptions::new().write(true).open(&wal_path).unwrap();
+        file.set_len(20).unwrap();
+        file.sync_data().unwrap();
+        drop(file);
+
+        let mut reopened = SingleNodeSplitStore::open(&root, parent.clone()).unwrap();
+        assert!(!reopened.is_split());
+        assert_eq!(reopened.read_latest(b"b").unwrap(), None);
+        assert_eq!(
+            reopened
+                .commit(TabletMutation::Put {
+                    key: b"b".to_vec(),
+                    value: b"committed-after-recovery".to_vec(),
+                })
+                .unwrap(),
+            1
+        );
+        drop(reopened);
+
+        let replayed = SingleNodeSplitStore::open(&root, parent).unwrap();
+        assert_eq!(
+            replayed.read_latest(b"b").unwrap(),
+            Some(b"committed-after-recovery".to_vec())
+        );
+        drop(replayed);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preparing_manifest_rejects_reclaimed_wal_header_with_committed_history() {
+        let root = std::env::temp_dir().join(format!(
+            "nudb_reclaimed_bootstrap_header_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let parent = TabletDescriptor::new(
+            TabletId::new(901).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            7,
+        )
+        .unwrap();
+        fs::create_dir_all(&root).unwrap();
+        write_manifest(
+            &root.join("route.manifest"),
+            &DiskManifest::for_preparing_parent(&parent),
+            None,
+        )
+        .unwrap();
+        let wal_path = root.join("parent.wal");
+        {
+            let mut tablet = WalBackedTablet::open(parent.clone(), &wal_path).unwrap();
+            let write = tablet
+                .prepare_write(
+                    7,
+                    0,
+                    vec![TabletMutation::Put {
+                        key: b"b".to_vec(),
+                        value: b"previously-committed".to_vec(),
+                    }],
+                )
+                .unwrap();
+            tablet.commit(write).unwrap();
+            tablet.checkpoint().unwrap();
+        }
+        // A reclaimed WAL with a nonzero base sequence is only a header,
+        // but it still proves prior committed state once existed.
+        fs::remove_file(root.join("parent.checkpoint")).unwrap();
+        let before = fs::read(&wal_path).unwrap();
+        assert_eq!(before.len(), 64);
+        assert!(matches!(
+            SingleNodeSplitStore::open(&root, parent),
+            Err(SplitError::InvalidManifest(_))
+        ));
+        assert_eq!(fs::read(&wal_path).unwrap(), before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preparing_manifest_rejects_corrupt_full_size_wal_header() {
+        let root = std::env::temp_dir().join(format!(
+            "nudb_invalid_bootstrap_header_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let parent = TabletDescriptor::new(
+            TabletId::new(901).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            7,
+        )
+        .unwrap();
+        fs::create_dir_all(&root).unwrap();
+        write_manifest(
+            &root.join("route.manifest"),
+            &DiskManifest::for_preparing_parent(&parent),
+            None,
+        )
+        .unwrap();
+        let wal_path = root.join("parent.wal");
+        let bad_header = [0_u8; 64];
+        fs::write(&wal_path, bad_header).unwrap();
+        assert!(matches!(
+            SingleNodeSplitStore::open(&root, parent),
+            Err(SplitError::InvalidManifest(_))
+        ));
+        assert_eq!(fs::read(&wal_path).unwrap(), bad_header);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preparing_manifest_never_discards_possible_committed_wal_records() {
+        let root = std::env::temp_dir().join(format!(
+            "nudb_preparing_wal_records_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let parent = TabletDescriptor::new(
+            TabletId::new(901).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            7,
+        )
+        .unwrap();
+        fs::create_dir_all(&root).unwrap();
+        write_manifest(
+            &root.join("route.manifest"),
+            &DiskManifest::for_preparing_parent(&parent),
+            None,
+        )
+        .unwrap();
+        {
+            let mut wal = WalBackedTablet::open(parent.clone(), root.join("parent.wal")).unwrap();
+            let write = wal
+                .prepare_write(
+                    7,
+                    0,
+                    vec![TabletMutation::Put {
+                        key: b"b".to_vec(),
+                        value: b"must-not-discard".to_vec(),
+                    }],
+                )
+                .unwrap();
+            wal.commit(write).unwrap();
+        }
+        let recorded = fs::read(root.join("parent.wal")).unwrap();
+        assert!(recorded.len() > 64);
+        assert!(matches!(
+            SingleNodeSplitStore::open(&root, parent),
+            Err(SplitError::InvalidManifest(_))
+        ));
+        assert_eq!(fs::read(root.join("parent.wal")).unwrap(), recorded);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_manifest_with_lone_checkpoint_still_fails_closed() {
+        let root = std::env::temp_dir().join(format!(
+            "nudb_orphan_parent_checkpoint_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let checkpoint = root.join("parent.checkpoint");
+        fs::write(&checkpoint, b"unexpected-parent-checkpoint").unwrap();
+        let parent = TabletDescriptor::new(
+            TabletId::new(901).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            7,
+        )
+        .unwrap();
+        assert!(matches!(
+            SingleNodeSplitStore::open(&root, parent),
+            Err(SplitError::InvalidManifest(_))
+        ));
+        assert_eq!(
+            fs::read(&checkpoint).unwrap(),
+            b"unexpected-parent-checkpoint"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn older_readers_reject_the_preparing_manifest_format() {
+        let parent = TabletDescriptor::new(
+            TabletId::new(901).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            7,
+        )
+        .unwrap();
+        let mut preparing = DiskManifest::for_preparing_parent(&parent);
+        assert_eq!(preparing.version, PREPARING_MANIFEST_VERSION);
+
+        // An older reader ignores unknown serde fields, including
+        // `preparing`. The separate format version must still reject it.
+        preparing.preparing = false;
+        assert!(matches!(
+            preparing.validate(&parent),
+            Err(SplitError::InvalidManifest(_))
+        ));
+    }
+
+    #[test]
+    fn legacy_manifest_without_preparing_flag_is_published() {
+        let parent = TabletDescriptor::new(
+            TabletId::new(901).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            7,
+        )
+        .unwrap();
+        let mut json = serde_json::to_value(DiskManifest::for_parent(&parent)).unwrap();
+        json.as_object_mut().unwrap().remove("preparing");
+        let legacy: DiskManifest = serde_json::from_value(json).unwrap();
+        assert!(!legacy.preparing);
+        assert!(legacy.validate(&parent).unwrap().is_none());
+    }
+
+    #[test]
+    fn missing_published_manifest_must_not_reset_committed_parent() {
+        let root = std::env::temp_dir().join(format!(
+            "nudb_missing_published_manifest_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let parent = TabletDescriptor::new(
+            TabletId::new(901).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            7,
+        )
+        .unwrap();
+        {
+            let mut first = SingleNodeSplitStore::open(&root, parent.clone()).unwrap();
+            first
+                .commit(TabletMutation::Put {
+                    key: b"b".to_vec(),
+                    value: b"already-acknowledged".to_vec(),
+                })
+                .unwrap();
+        }
+        fs::remove_file(root.join("route.manifest")).unwrap();
+        assert!(matches!(
+            SingleNodeSplitStore::open(&root, parent),
+            Err(SplitError::InvalidManifest(_))
+        ));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
