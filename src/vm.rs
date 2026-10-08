@@ -2549,6 +2549,13 @@ pub struct VM {
     /// not add hotness probes.
     #[cfg(feature = "native-codegen")]
     jit_candidate_pcs: Vec<Vec<bool>>,
+    /// Per-module bitmap of allocation sites proven activation-local by the
+    /// iso-arena escape analysis. Indexed by bytecode PC.
+    iso_arena_sites: Vec<Vec<bool>>,
+    /// Whether qualifying composite allocations should use the actor's
+    /// activation-local bump arena. Off by default unless NULANG_ISO_ARENA
+    /// is set; embedders/tests can override it with set_iso_arena_enabled.
+    iso_arena_enabled: bool,
     /// Runtime error raised by a re-entrant JIT direct call (taken from the
     /// JIT pending-error thread-local in `try_jit_execute`; consumed by
     /// `step` so the error surfaces as a VM error). None when the last JIT
@@ -2747,6 +2754,10 @@ impl VM {
             jit_constants: Vec::new(),
             #[cfg(feature = "native-codegen")]
             jit_candidate_pcs: Vec::new(),
+            iso_arena_sites: Vec::new(),
+            iso_arena_enabled: std::env::var("NULANG_ISO_ARENA")
+                .map(|value| Self::iso_arena_env_opt_in(&value))
+                .unwrap_or(false),
             jit_pending_error: None,
             node_id: 0,
             pending_migrations: Vec::new(),
@@ -3041,10 +3052,66 @@ impl VM {
         let bits = constants_to_jit_bits(&module.constants);
         #[cfg(feature = "native-codegen")]
         let jit_candidates = compute_jit_candidate_pcs(&module);
+        let iso_arena_sites = self.iso_arena_bitmap(&module);
         self.modules.push(module);
         self.jit_constants.push(bits);
+        self.iso_arena_sites.push(iso_arena_sites);
         #[cfg(feature = "native-codegen")]
         self.jit_candidate_pcs.push(jit_candidates);
+    }
+
+    /// Opt-in must never turn on merely because a false-like env value was set.
+    /// Keep parsing allocation-free during VM initialization.
+    fn iso_arena_env_opt_in(value: &str) -> bool {
+        let value = value.trim();
+        value == "1"
+            || value.eq_ignore_ascii_case("true")
+            || value.eq_ignore_ascii_case("yes")
+            || value.eq_ignore_ascii_case("on")
+    }
+
+    /// Enable or disable activation-local arena allocation.
+    ///
+    /// Recomputes the per-module site bitmaps so changing the setting after
+    /// modules are loaded is safe and deterministic.
+    pub fn set_iso_arena_enabled(&mut self, enabled: bool) {
+        self.iso_arena_enabled = enabled;
+        self.iso_arena_sites = self
+            .modules
+            .iter()
+            .map(|module| self.iso_arena_bitmap(module))
+            .collect();
+    }
+
+    fn iso_arena_bitmap(&self, module: &CodeModule) -> Vec<bool> {
+        if !self.iso_arena_enabled {
+            // An empty bitmap is equivalent to all-false at every lookup.
+            // Avoid an O(bytecode length) allocation when the opt-in is off.
+            return Vec::new();
+        }
+        let qualifying = crate::iso_arena::qualifying_alloc_sites(module);
+        (0..module.instructions.len())
+            .map(|pc| qualifying.contains(&pc))
+            .collect()
+    }
+
+    #[inline(always)]
+    fn iso_arena_site(&self, module_idx: usize, pc: usize) -> bool {
+        self.iso_arena_enabled
+            && self
+                .iso_arena_sites
+                .get(module_idx)
+                .and_then(|sites| sites.get(pc))
+                .copied()
+                .unwrap_or(false)
+    }
+
+    #[inline]
+    fn finish_activation(&mut self, value: Value) -> NuResult<Value> {
+        if self.iso_arena_enabled {
+            self.actor_callbacks.reset_arena();
+        }
+        Ok(value)
     }
 
     /// Number of hot regions compiled through the type-directed JIT path
@@ -3331,11 +3398,12 @@ impl VM {
                 if let Some(module) = self.modules.get(module_idx) {
                     if pc >= module.instructions.len() {
                         // PC past end — program complete
-                        return Ok(self
-                            .frames
-                            .get(idx)
-                            .map(|f| f.regs[0])
-                            .unwrap_or(Value::unit()));
+                        return self.finish_activation(
+                            self.frames
+                                .get(idx)
+                                .map(|f| f.regs[0])
+                                .unwrap_or(Value::unit()),
+                        );
                     }
                     // Check if next instruction is Halt
                     if module
@@ -3345,27 +3413,29 @@ impl VM {
                         .unwrap_or(false)
                     {
                         self.frames[idx].pc += 1;
-                        return Ok(self
-                            .frames
-                            .get(idx)
-                            .map(|f| f.regs[0])
-                            .unwrap_or(Value::unit()));
+                        return self.finish_activation(
+                            self.frames
+                                .get(idx)
+                                .map(|f| f.regs[0])
+                                .unwrap_or(Value::unit()),
+                        );
                     }
                 } else {
-                    return Ok(Value::unit());
+                    return self.finish_activation(Value::unit());
                 }
             } else {
-                return Ok(Value::unit());
+                return self.finish_activation(Value::unit());
             }
 
             match self.step() {
                 Ok(()) => {}
                 Err(NuError::VMError { msg, span: _ }) if msg == "Halt" => {
-                    return Ok(self
-                        .current_frame_idx
-                        .and_then(|i| self.frames.get(i))
-                        .map(|f| f.regs[0])
-                        .unwrap_or(Value::unit()));
+                    return self.finish_activation(
+                        self.current_frame_idx
+                            .and_then(|i| self.frames.get(i))
+                            .map(|f| f.regs[0])
+                            .unwrap_or(Value::unit()),
+                    );
                 }
                 Err(NuError::VMError { msg, span }) => {
                     return Err(NuError::VMError {
@@ -3407,7 +3477,7 @@ impl VM {
                             .and_then(|i| self.frames.get(i))
                             .map(|f| f.regs[0])
                             .unwrap_or(Value::unit());
-                        return Ok(v);
+                        return self.finish_activation(v);
                     }
                     if module
                         .instructions
@@ -3421,13 +3491,13 @@ impl VM {
                             .and_then(|i| self.frames.get(i))
                             .map(|f| f.regs[0])
                             .unwrap_or(Value::unit());
-                        return Ok(v);
+                        return self.finish_activation(v);
                     }
                 } else {
-                    return Ok(Value::unit());
+                    return self.finish_activation(Value::unit());
                 }
             } else {
-                return Ok(Value::unit());
+                return self.finish_activation(Value::unit());
             }
 
             match self.step() {
@@ -3437,11 +3507,12 @@ impl VM {
                     }
                 }
                 Err(NuError::VMError { msg, span: _ }) if msg == "Halt" => {
-                    return Ok(self
-                        .current_frame_idx
-                        .and_then(|i| self.frames.get(i))
-                        .map(|f| f.regs[0])
-                        .unwrap_or(Value::unit()));
+                    return self.finish_activation(
+                        self.current_frame_idx
+                            .and_then(|i| self.frames.get(i))
+                            .map(|f| f.regs[0])
+                            .unwrap_or(Value::unit()),
+                    );
                 }
                 Err(NuError::VMError { msg, span }) => {
                     return Err(NuError::VMError {
@@ -3495,11 +3566,12 @@ impl VM {
                 let pc = self.frames[idx].pc;
                 if let Some(module) = self.modules.get(m_idx) {
                     if pc >= module.instructions.len() {
-                        return Ok(self
-                            .current_frame_idx
-                            .and_then(|i| self.frames.get(i))
-                            .map(|f| f.regs[0])
-                            .unwrap_or(Value::unit()));
+                        return self.finish_activation(
+                            self.current_frame_idx
+                                .and_then(|i| self.frames.get(i))
+                                .map(|f| f.regs[0])
+                                .unwrap_or(Value::unit()),
+                        );
                     }
                     if module
                         .instructions
@@ -3508,17 +3580,18 @@ impl VM {
                         .unwrap_or(false)
                     {
                         self.frames[idx].pc += 1;
-                        return Ok(self
-                            .current_frame_idx
-                            .and_then(|i| self.frames.get(i))
-                            .map(|f| f.regs[0])
-                            .unwrap_or(Value::unit()));
+                        return self.finish_activation(
+                            self.current_frame_idx
+                                .and_then(|i| self.frames.get(i))
+                                .map(|f| f.regs[0])
+                                .unwrap_or(Value::unit()),
+                        );
                     }
                 } else {
-                    return Ok(Value::unit());
+                    return self.finish_activation(Value::unit());
                 }
             } else {
-                return Ok(Value::unit());
+                return self.finish_activation(Value::unit());
             }
 
             match self.step() {
@@ -3528,11 +3601,12 @@ impl VM {
                     }
                 }
                 Err(NuError::VMError { msg, span: _ }) if msg == "Halt" => {
-                    return Ok(self
-                        .current_frame_idx
-                        .and_then(|i| self.frames.get(i))
-                        .map(|f| f.regs[0])
-                        .unwrap_or(Value::unit()));
+                    return self.finish_activation(
+                        self.current_frame_idx
+                            .and_then(|i| self.frames.get(i))
+                            .map(|f| f.regs[0])
+                            .unwrap_or(Value::unit()),
+                    );
                 }
                 Err(NuError::VMError { msg, span }) => {
                     return Err(NuError::VMError {
@@ -5032,6 +5106,7 @@ impl VM {
                 msg: format!("PC {} out of bounds in module {}", pc, module_idx),
                 span: Span::default(),
             })?;
+        let iso_arena_site = self.iso_arena_site(module_idx, pc);
 
         // Debugger checkpoint: invoked before the instruction executes, so a
         // pause leaves `pc` pointing at the current instruction (resume
@@ -5594,9 +5669,15 @@ impl VM {
             OpCode::ArrAlloc => {
                 let len = frame.regs[instr.op1 as usize].as_int().unwrap_or(0) as usize;
                 let size = len.checked_mul(std::mem::size_of::<Value>()).unwrap_or(0);
-                frame.regs[instr.op2 as usize] = if let Some(ptr) =
+                let allocation = if iso_arena_site {
+                    match self.actor_callbacks.alloc_arena(size, HeapTypeTag::Array) {
+                        some @ Some(_) => some,
+                        None => self.actor_callbacks.alloc(size, HeapTypeTag::Array),
+                    }
+                } else {
                     self.actor_callbacks.alloc(size, HeapTypeTag::Array)
-                {
+                };
+                frame.regs[instr.op2 as usize] = if let Some(ptr) = allocation {
                     unsafe {
                         let slots = std::slice::from_raw_parts_mut(ptr as *mut Value, len);
                         for slot in slots.iter_mut() {
@@ -5635,9 +5716,15 @@ impl VM {
                 let size = slot_count
                     .checked_mul(std::mem::size_of::<Value>())
                     .unwrap_or(0);
-                frame.regs[instr.op2 as usize] = if let Some(ptr) =
+                let allocation = if iso_arena_site {
+                    match self.actor_callbacks.alloc_arena(size, HeapTypeTag::Record) {
+                        some @ Some(_) => some,
+                        None => self.actor_callbacks.alloc(size, HeapTypeTag::Record),
+                    }
+                } else {
                     self.actor_callbacks.alloc(size, HeapTypeTag::Record)
-                {
+                };
+                frame.regs[instr.op2 as usize] = if let Some(ptr) = allocation {
                     unsafe {
                         let slots = std::slice::from_raw_parts_mut(ptr as *mut Value, slot_count);
                         for slot in slots.iter_mut() {
@@ -5666,9 +5753,15 @@ impl VM {
             OpCode::TupleMk => {
                 let count = instr.op1 as usize;
                 let size = count.checked_mul(std::mem::size_of::<Value>()).unwrap_or(0);
-                frame.regs[instr.op2 as usize] = if let Some(ptr) =
+                let allocation = if iso_arena_site {
+                    match self.actor_callbacks.alloc_arena(size, HeapTypeTag::Tuple) {
+                        some @ Some(_) => some,
+                        None => self.actor_callbacks.alloc(size, HeapTypeTag::Tuple),
+                    }
+                } else {
                     self.actor_callbacks.alloc(size, HeapTypeTag::Tuple)
-                {
+                };
+                frame.regs[instr.op2 as usize] = if let Some(ptr) = allocation {
                     unsafe {
                         let slots = std::slice::from_raw_parts_mut(ptr as *mut Value, count);
                         for slot in slots.iter_mut() {
@@ -6283,6 +6376,35 @@ fn module_with_handler_table(bindings: Vec<crate::bytecode::HandlerBinding>) -> 
 mod vm_tests {
     use super::*;
     use crate::bytecode::{BehaviorTableEntry, HandlerBinding, HandlerTable, Instruction};
+
+    #[test]
+    fn iso_arena_env_opt_in_rejects_explicit_false_and_unknown_values() {
+        for disabled in ["", "0", "false", "FALSE", "off", "no", "unknown"] {
+            assert!(
+                !VM::iso_arena_env_opt_in(disabled),
+                "{disabled} must remain disabled"
+            );
+        }
+        for enabled in ["1", "true", "TRUE", "on", "yes"] {
+            assert!(
+                VM::iso_arena_env_opt_in(enabled),
+                "{enabled} must enable arena"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_iso_arena_does_not_allocate_per_instruction_site_bitmaps() {
+        let mut vm = VM::new_without_jit();
+        vm.set_iso_arena_enabled(false);
+        let mut module = CodeModule::new("default-arena-bitmap");
+        module.emit(Instruction::new0(OpCode::Nop));
+        module.emit(Instruction::new0(OpCode::Halt));
+
+        assert!(vm.iso_arena_bitmap(&module).is_empty());
+        vm.load_module(module);
+        assert!(vm.iso_arena_sites[0].is_empty());
+    }
 
     #[derive(Debug)]
     struct ReadyValueCallbacks {
