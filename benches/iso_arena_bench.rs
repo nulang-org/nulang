@@ -126,13 +126,17 @@ fn bench_iso_arena(c: &mut Criterion) {
     let mut group = c.benchmark_group("vm/iso_arena");
     group.throughput(Throughput::Elements(ALLOCATIONS as u64));
     for (name, enabled) in [("off_orca_heap", false), ("on_iso_arena", true)] {
-        group.bench_with_input(BenchmarkId::new("transient_arrays_256", name), &enabled, |b, &on| {
-            b.iter_batched_ref(
-                || fresh_vm(&module, on),
-                |vm| black_box(vm.run().expect("identical VM workload must complete")),
-                BatchSize::SmallInput,
-            )
-        });
+        group.bench_with_input(
+            BenchmarkId::new("transient_arrays_256", name),
+            &enabled,
+            |b, &on| {
+                b.iter_batched_ref(
+                    || fresh_vm(&module, on),
+                    |vm| black_box(vm.run().expect("identical VM workload must complete")),
+                    BatchSize::SmallInput,
+                )
+            },
+        );
     }
     group.finish();
 }
