@@ -7,7 +7,8 @@
 use crate::web::request_bindings::{
     parse_cookie_header, parse_urlencoded, split_request_target, RequestBindingValues,
 };
-use nulang_ui_protocol::{decode_host_message, ActionPlacement, HostToRuntimeMessage};
+use nulang_ui_protocol::{decode_host_message, ActionPlacement, HostToRuntimeMessage, WireValue};
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 /// Why a renderer-neutral action envelope was rejected at the HTTP boundary.
@@ -15,6 +16,7 @@ use std::collections::HashMap;
 pub enum UiActionEnvelopeError {
     Malformed,
     ClientPlacement,
+    PayloadMismatch,
     LegacyActionMismatch {
         envelope_action: String,
         legacy_action: String,
@@ -27,6 +29,9 @@ impl std::fmt::Display for UiActionEnvelopeError {
             Self::Malformed => f.write_str("malformed or unsupported UI action envelope"),
             Self::ClientPlacement => {
                 f.write_str("client-placement UI action cannot be invoked over server transport")
+            }
+            Self::PayloadMismatch => {
+                f.write_str("UI action payload does not match submitted form values")
             }
             Self::LegacyActionMismatch {
                 envelope_action,
@@ -137,6 +142,25 @@ fn capture_ui_action_message(
                 }),
             );
         }
+    }
+
+    // The envelope and the form are both untrusted. Requiring consistency
+    // prevents ambiguous interpretations of one submission by different
+    // framework layers; it does not authenticate or authorize the action.
+    let submitted: BTreeMap<String, WireValue> = form
+        .iter()
+        .filter(|(key, _)| {
+            key.as_str() != "__nulang_action" && key.as_str() != "__nulang_ui_message"
+        })
+        .map(|(key, value)| (key.clone(), WireValue::from(value.clone())))
+        .collect();
+    let matches_payload = match &request.payload {
+        WireValue::Null => submitted.is_empty(),
+        WireValue::Object(fields) => *fields == submitted,
+        _ => false,
+    };
+    if !matches_payload {
+        return (None, Some(UiActionEnvelopeError::PayloadMismatch));
     }
 
     (Some(message), None)
