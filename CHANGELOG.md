@@ -1,5 +1,8 @@
 # Nulang Changelog
 
+### Optimized release CI semantic smoke — 2026-10-08
+- **Release Build keeps the optimized binary build and representative release-mode regressions without recompiling the entire test corpus a second time.** The default Build & Test job remains the authoritative full-suite gate. Release mode checks raw-value provenance, nominal actor protocols, and durable actor-turn semantic closure before staging the tested binary.
+
 ### Seeded cluster simulation peer ordering — 2026-10-07
 - **Cluster simulations with an injected deterministic RNG now canonicalize peer order for gossip targets, bounded gossip payloads, active-view repair, and heartbeat action emission.** This removes four sources of randomized Rust `HashMap` ordering while preserving the existing unseeded production path. Regression tests compare independently constructed cluster states under identical RNG seeds.
 

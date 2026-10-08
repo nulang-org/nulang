@@ -156,8 +156,16 @@ jobs:
       - name: Build (release)
         run: cargo build --locked --release
 
-      - name: Test (release)
-        run: cargo test --locked --release
+      - name: Optimized semantic smoke
+        # The default Build & Test lane runs the complete nextest suite.
+        # Compile representative tests with release optimizations without
+        # redundantly building every integration and lib-test executable.
+        # Include provenance, actor protocol, and durable-turn invariants.
+        run: |
+          cargo test --locked --release \
+            --test raw_value_provenance \
+            --test actor_protocol_nominal \
+            --test semantic_closure_actor_turns
 
       - name: Stage tested release binary
         run: |
