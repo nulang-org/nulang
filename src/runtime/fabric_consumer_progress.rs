@@ -1834,17 +1834,46 @@ mod tests {
         assert!(follower.fabric_consumer_progress_apply_commit_from_peer(
             &exact_commit, follower_id,
         ).is_err());
+        let forged = FabricConsumerProgressCommitAckWire {
+            version: JOURNAL_FORMAT_VERSION,
+            stream: "orders".into(),
+            partition: 0,
+            epoch: 1,
+            leader: placement.leader.0,
+            metadata_sequence: 1,
+            digest: "e".repeat(64),
+            replica: follower_id.0,
+        };
+        assert!(leader.fabric_consumer_progress_record_commit_receipt(
+            &forged, follower_id,
+        ).is_err());
+        assert!(leader.fabric_consumer_progress_record_commit_receipt(
+            &forged, placement.leader,
+        ).is_err());
+
+        // Drop only the follower -> leader COMMIT-fsync receipt.
+        // The follower has persisted the decision, but the leader cannot
+        // advertise even its private confirmed frontier without the receipt.
+        follower.distributed.transport.as_mut().unwrap()
+            .set_partition(HashSet::from([placement.leader]));
         assert_eq!(
             leader.fabric_consumer_progress_redrive_last_commit("orders").unwrap(),
             1
         );
         follower.process_network();
-        // The separate follower commit fsync receipt must be processed before
-        // the leader can claim even the private confirmed frontier.
+        leader.process_network();
         assert_eq!(
             leader.fabric_consumer_progress_confirmed_commit("orders").unwrap(),
             0
         );
+        // Exact duplicate COMMIT is idempotent and retries its fsync receipt.
+        follower.distributed.transport.as_mut().unwrap()
+            .set_partition(HashSet::new());
+        assert_eq!(
+            leader.fabric_consumer_progress_redrive_last_commit("orders").unwrap(),
+            1
+        );
+        follower.process_network();
         leader.process_network();
         assert_eq!(
             leader.fabric_consumer_progress_confirmed_commit("orders").unwrap(),
