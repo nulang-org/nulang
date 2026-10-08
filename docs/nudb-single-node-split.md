@@ -78,11 +78,13 @@ filesystem reorderings, or storage hardware faults.
 - **Cooperative handoff serialization:** Public `FileWal::open` holds the
   write-gate while it creates, validates and repairs the WAL. Public handles
   also hold the same gate through append/fsync, checkpoint publication, and
-  WAL reclamation/reopen. Owner acquisition must take this gate first, so
-  a mutation that acquired the gate before ownership change finishes before
-  ownership is granted; a competing public mutation waits for the gate,
-  then fails with `ManagedDirectory` after publication. Managed coordinator
-  WALs operate under the coordinator's lifetime gate.
+  WAL reclamation/reopen. The higher-level `WalBackedTablet::commit`
+  additionally retains the gate from validation through WAL fsync, MVCC
+  publication and successful acknowledgement. Owner acquisition must take
+  this gate first, so an operation that acquired the gate before ownership
+  change finishes before ownership is granted; a competing public mutation
+  waits for the gate, then fails with `ManagedDirectory` after publication.
+  Managed coordinator WALs operate under the coordinator's lifetime gate.
 - **Cooperative public WAL API fence:** `FileWal::open` and
   `WalBackedTablet::open` fail closed when a persistent
   `.nudb-owner.lock` or `route.manifest` is present, including when a
