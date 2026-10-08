@@ -12,8 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use nulang::database::store::WalBackedTablet;
 use nulang::database::tablet::{
-    KeyRange, MemoryTablet, TabletDescriptor, TabletId, TabletMutation, TabletScanRow,
+    KeyRange, MemoryTablet, TabletDescriptor, TabletError, TabletId, TabletMutation, TabletScanRow,
 };
+use nulang::database::store::WalBackedError;
 
 static NEXT_TEST: AtomicU64 = AtomicU64::new(1);
 
@@ -102,6 +103,26 @@ fn deterministic_mvcc_reference_model_survives_checkpoint_recovery_and_split() {
                 }
             }
 
+            // Prepare a write that is valid at this point, but must be
+            // rejected after the next commit advances the predecessor.
+            // Rejection must happen before the WAL is appended.
+            let stale_candidate = if sequence % 8 == 0 {
+                Some(
+                    durable
+                        .prepare_write(
+                            5,
+                            sequence - 1,
+                            vec![TabletMutation::Put {
+                                key: b"g".to_vec(),
+                                value: b"stale-write-must-not-commit".to_vec(),
+                            }],
+                        )
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+
             let memory_write = memory
                 .prepare_write(5, sequence - 1, mutations.clone())
                 .unwrap();
@@ -111,6 +132,24 @@ fn deterministic_mvcc_reference_model_survives_checkpoint_recovery_and_split() {
             assert_eq!(memory.commit(memory_write).unwrap(), sequence);
             assert_eq!(durable.commit(durable_write).unwrap(), sequence);
             snapshots.push(reference.clone());
+
+            if let Some(stale) = stale_candidate {
+                let wal_before = fs::read(&path).unwrap();
+                assert_eq!(
+                    durable.commit(stale).unwrap_err(),
+                    WalBackedError::Tablet(TabletError::SequenceMismatch {
+                        committed: sequence,
+                        expected_previous: sequence - 1,
+                    }),
+                    "stale prepared write accepted: seed={initial_seed} sequence={sequence}"
+                );
+                assert_eq!(
+                    fs::read(&path).unwrap(),
+                    wal_before,
+                    "stale write changed WAL: seed={initial_seed} sequence={sequence}"
+                );
+                assert_eq!(durable.current_sequence(), sequence);
+            }
 
             // Checkpoints reclaim the WAL; recovery must still support the
             // entire historical range retained by this prototype.
