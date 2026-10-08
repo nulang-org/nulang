@@ -143,3 +143,11 @@ These are **non-durable actor workloads**, not mathematically stateless actors:
 ping-pong, counting, and fork-join workers mutate private local counters,
 but do not use Nulang's durable workflow/journal subsystem. Keep statefulness
 and persistence separate when interpreting results.
+
+### Runtime execution order
+
+Each measurement round runs every selected runtime. The runner rotates their
+sequence every round, so over one complete cycle each runtime occupies each
+execution position once. This reduces systematic first-run cache/thermal bias,
+but **does not remove cross-run host drift**; record hardware load and compare
+paired Nulang revisions on controlled hardware before making performance claims.
