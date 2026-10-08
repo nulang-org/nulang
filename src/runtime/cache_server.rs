@@ -68,6 +68,7 @@ pub enum CacheServerError {
     Io(io::Error),
     DispatchConfig(CacheDispatchConfigError),
     RedirectModeRequired,
+    DurabilityPoisoned,
     InvalidConfig(&'static str),
 }
 
@@ -527,6 +528,7 @@ impl CacheShardServer {
     /// Drive one reactor iteration. A caller-supplied timeout is capped by the
     /// next expiration sweep deadline so TTL reclamation progresses while idle.
     pub fn poll_once(&mut self, timeout: Option<Duration>) -> Result<(), CacheServerError> {
+        self.ensure_durability_healthy()?;
         let timeout = self.poll_timeout(timeout);
         self.poll.poll(&mut self.events, timeout)?;
 
@@ -549,10 +551,21 @@ impl CacheShardServer {
                 WAKE_TOKEN => self.handle_wake()?,
                 token => self.connection_ready(token, event)?,
             }
+            // Never serve another ready connection after one mutation poisons
+            // the journal. The current connection has already been closed.
+            self.ensure_durability_healthy()?;
         }
 
         self.sweep_expired_if_due();
         Ok(())
+    }
+
+    fn ensure_durability_healthy(&self) -> Result<(), CacheServerError> {
+        if self.store.durability_status().poisoned {
+            Err(CacheServerError::DurabilityPoisoned)
+        } else {
+            Ok(())
+        }
     }
 
     fn poll_timeout(&self, requested: Option<Duration>) -> Option<Duration> {
@@ -734,6 +747,13 @@ impl CacheShardServer {
                 connection.compact_input();
                 return Ok(());
             };
+
+            // A failed WAL append may occur after the volatile mutation.
+            // Stop processing this RESP pipeline *before* the next GET/EXISTS
+            // can observe the unacknowledged value.
+            if self.store.durability_status().poisoned {
+                return Err(CachePipelineError::DurabilityPoisoned);
+            }
 
             match submit.asking_update {
                 CacheAskingUpdate::Unchanged => {}
