@@ -231,14 +231,16 @@ fn competing_process_cannot_write_until_checkpoint_owner_exits() {
     cleanup(&wal_path);
 
     let (mut child, ack) = spawn_until_ack(&wal_path, "hold-lock");
-    assert_eq!(ack.trim(), "ACK WRITER_LOCK 1");
-    assert!(
-        WalBackedTablet::open(descriptor(), &wal_path).is_err(),
-        "a child retaining its writer lock must exclude this process"
-    );
+    let lock_denied = WalBackedTablet::open(descriptor(), &wal_path).is_err();
 
+    // Reap the parked child even if the assertion fails (RED test safety).
     child.kill().unwrap();
     assert!(!child.wait().unwrap().success());
+    assert_eq!(ack.trim(), "ACK WRITER_LOCK 1");
+    assert!(
+        lock_denied,
+        "a child retaining its writer lock must exclude this process"
+    );
 
     let writer = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
     assert_eq!(writer.current_sequence(), 1);
