@@ -1997,6 +1997,30 @@ fn replicated_consumers_do_not_read_or_ack_uncommitted_records() {
         0
     );
 
+    // Reopening the leader's durable files before quorum must not change the
+    // consumer-visible boundary; the raw record still exists on disk.
+    let leader_root = if placement.leader == node_a {
+        &root_a
+    } else {
+        &root_b
+    };
+    let mut reopened = Runtime::new();
+    reopened.fabric_stream_open(leader_root).unwrap();
+    assert_eq!(
+        reopened
+            .fabric_stream_read("consumer-visibility", 1, 10)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(reopened
+        .fabric_stream_read_consumer("consumer-visibility", "effect-worker", 10)
+        .unwrap()
+        .is_empty());
+    assert!(reopened
+        .fabric_stream_commit_cursor("consumer-visibility", "effect-worker", 1)
+        .is_err());
+
     follower.process_network();
     leader.process_network();
 
