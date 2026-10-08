@@ -1706,9 +1706,10 @@ pub fn process_network_packets(
                     match object_table.as_slice() {
                         [(0, bytes)] => FabricConsumerProgressAckWire::from_wire_bytes(bytes)
                             .and_then(|receipt| {
-                                runtime.fabric_consumer_progress_record_replica_receipt(
+                                runtime.fabric_consumer_progress_record_replica_receipt_from_cluster(
                                     &receipt,
                                     incoming.from_node,
+                                    cluster,
                                 )
                             }),
                         _ => Err(std::io::Error::new(
@@ -1809,9 +1810,10 @@ pub fn process_network_packets(
                     match object_table.as_slice() {
                         [(0, bytes)] => FabricConsumerProgressCommitAckWire::from_wire_bytes(bytes)
                             .and_then(|receipt| {
-                                runtime.fabric_consumer_progress_record_commit_receipt(
+                                runtime.fabric_consumer_progress_record_commit_receipt_from_cluster(
                                     &receipt,
                                     incoming.from_node,
+                                    cluster,
                                 )
                             }),
                         _ => Err(std::io::Error::new(
