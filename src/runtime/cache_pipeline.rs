@@ -19,6 +19,7 @@ pub enum CachePipelineError {
     Dispatch(CacheDispatchError),
     Reply(CacheReplyError),
     PipelineFull,
+    DurabilityPoisoned,
     UnknownRemoteRequest(u64),
 }
 
