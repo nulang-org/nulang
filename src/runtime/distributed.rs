@@ -44,8 +44,10 @@ use std::time::{Duration, Instant};
 // ---------------------------------------------------------------------------
 
 use super::fabric_consumer_progress::{
-    FabricConsumerProgressAckWire, FabricConsumerProgressCommitWire,
-    FabricConsumerProgressPrepareWire, FABRIC_CONSUMER_PROGRESS_ACK_BEHAVIOR,
+    FabricConsumerProgressAckWire, FabricConsumerProgressCommitAckWire,
+    FabricConsumerProgressCommitWire, FabricConsumerProgressPrepareWire,
+    FABRIC_CONSUMER_PROGRESS_ACK_BEHAVIOR,
+    FABRIC_CONSUMER_PROGRESS_COMMIT_ACK_BEHAVIOR,
     FABRIC_CONSUMER_PROGRESS_COMMIT_BEHAVIOR,
     FABRIC_CONSUMER_PROGRESS_PREPARE_BEHAVIOR,
 };
@@ -1758,14 +1760,75 @@ pub fn process_network_packets(
                         )),
                     }
                 };
+                match result {
+                    Ok(receipt) => {
+                        // This response follows follower COMMIT frame fsync.
+                        // Never count the transport receipt as a commit vote.
+                        if let Ok(bytes) = receipt.to_wire_bytes() {
+                            let target = incoming.from_node;
+                            let address = cluster.get_node(target)
+                                .map(|node| node.address)
+                                .or_else(|| transport.connection_addr(target));
+                            if let (Some(address), Some(local)) =
+                                (address, runtime.distributed.node_id)
+                            {
+                                transport.send(target, address, Packet::ActorMessage {
+                                    target_actor: 0,
+                                    behavior_name:
+                                        FABRIC_CONSUMER_PROGRESS_COMMIT_ACK_BEHAVIOR.to_string(),
+                                    content_hash: None,
+                                    required_protocol_id: None,
+                                    payload: Vec::new(),
+                                    string_table: Vec::new(),
+                                    object_table: vec![(0, bytes)],
+                                    sender_actor: 0,
+                                    sender_node: local,
+                                    priority: MessagePriority::System,
+                                    trace_id: None,
+                                });
+                            }
+                        }
+                    }
+                    Err(error) => warn!(
+                        "nulang-fabric-consumer: rejected metadata commit from {:?}: {}",
+                        incoming.from_node, error
+                    ),
+                }
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+            }
+            Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name,
+                object_table,
+                sender_node,
+                ..
+            } if behavior_name == FABRIC_CONSUMER_PROGRESS_COMMIT_ACK_BEHAVIOR => {
+                let result = if sender_node != incoming.from_node {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Fabric consumer-progress COMMIT ACK sender differs from transport peer",
+                    ))
+                } else {
+                    match object_table.as_slice() {
+                        [(0, bytes)] =>
+                            FabricConsumerProgressCommitAckWire::from_wire_bytes(bytes)
+                                .and_then(|receipt| {
+                                    runtime.fabric_consumer_progress_record_commit_receipt(
+                                        &receipt, incoming.from_node
+                                    )
+                                }),
+                        _ => Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Fabric consumer-progress COMMIT ACK requires one object with id 0",
+                        )),
+                    }
+                };
                 if let Err(error) = result {
                     warn!(
-                        "nulang-fabric-consumer: rejected metadata commit from {:?}: {}",
+                        "nulang-fabric-consumer: rejected COMMIT fsync ACK from {:?}: {}",
                         incoming.from_node, error
                     );
                 }
-                // This transport receipt is NOT an application metadata
-                // commit acknowledgement, nor a cluster durable-client ACK.
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
             Packet::ActorMessage {
