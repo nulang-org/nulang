@@ -1,7 +1,7 @@
 # Nulang Changelog
 
 ### Seeded cluster simulation peer ordering — 2026-10-07
-- **Cluster simulations with an injected deterministic RNG now normalize peer candidates before gossip selection and active-view repair.** This removes Rust `HashMap` randomized iteration from those seeded choices while retaining the existing unseeded production fast path. Regression tests compare independently constructed cluster states under identical RNG seeds.
+- **Cluster simulations with an injected deterministic RNG now canonicalize peer order for gossip targets, bounded gossip payloads, active-view repair, and heartbeat action emission.** This removes four sources of randomized Rust `HashMap` ordering while preserving the existing unseeded production path. Regression tests compare independently constructed cluster states under identical RNG seeds.
 
 ### Receiver-acknowledged CRDT delta synchronization — 2026-10-07
 - **Per-peer CRDT frontiers now advance only after a matching NUL0 acknowledgement arrives from the intended receiver.** Dropped or unacknowledged batches remain retransmittable from that peer's last proven frontier instead of disappearing behind sender-side optimistic state.
