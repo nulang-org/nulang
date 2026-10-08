@@ -97,6 +97,10 @@ perform IO.print("double(21) = " + perform Int.to_string(answer))`;
 			<span class="output-label">output</span>
 			<pre class="hero-output" aria-live="polite">Compiler loads on first run.</pre>
 		</div>
+		<p class="hero-native-note">
+			The browser runs Core language examples. Actors, supervision, and persistence require the
+			<a href="/getting-started/installation/">native runtime</a>.
+		</p>
 	</div>
 
 	<div class="hero-runtime-flow" aria-label="Nulang resilience model">
@@ -317,7 +321,7 @@ perform IO.print("double(21) = " + perform Int.to_string(answer))`;
 		.hero-proof-grid span {
 			color: var(--nu-text-tertiary);
 			font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-			font-size: 0.62rem;
+			font-size: 0.75rem;
 			font-weight: 700;
 			letter-spacing: 0.07em;
 			text-transform: uppercase;
@@ -492,14 +496,14 @@ perform IO.print("double(21) = " + perform Int.to_string(answer))`;
 		display: inline-flex;
 		align-items: center;
 		gap: 0.5rem;
-		min-height: 2.25rem;
+		min-height: 2.75rem;
 		padding: 0.42rem 0.75rem;
 		border: 1px solid #2563eb;
 		border-radius: 0.48rem;
 		background: #2563eb;
 		color: #fff;
 		font: inherit;
-		font-size: 0.72rem;
+		font-size: 0.875rem;
 		font-weight: 750;
 		cursor: pointer;
 		box-shadow: 0 4px 16px rgba(37, 99, 235, 0.2);
@@ -510,6 +514,13 @@ perform IO.print("double(21) = " + perform Int.to_string(answer))`;
 		border-color: #1d4ed8;
 	}
 
+	.hero-run:focus-visible,
+	.workbench-open:focus-visible,
+	.hero-native-note a:focus-visible {
+		outline: 2px solid #93c5fd;
+		outline-offset: 3px;
+	}
+
 	.hero-run:disabled {
 		opacity: 0.55;
 		cursor: default;
@@ -518,7 +529,7 @@ perform IO.print("double(21) = " + perform Int.to_string(answer))`;
 	.hero-runtime-note {
 		color: #64748b;
 		font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-		font-size: 0.61rem;
+		font-size: 0.75rem;
 	}
 
 	.output-shell {
@@ -531,9 +542,9 @@ perform IO.print("double(21) = " + perform Int.to_string(answer))`;
 		top: 0.55rem;
 		right: 0.8rem;
 		z-index: 1;
-		color: #475569;
+		color: #b6c2d1;
 		font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-		font-size: 0.56rem;
+		font-size: 0.75rem;
 		font-weight: 750;
 		letter-spacing: 0.08em;
 		text-transform: uppercase;
@@ -594,7 +605,7 @@ perform IO.print("double(21) = " + perform Int.to_string(answer))`;
 	.flow-stage span {
 		color: var(--nu-text-tertiary);
 		font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-		font-size: 0.58rem;
+		font-size: 0.75rem;
 		font-weight: 750;
 		letter-spacing: 0.065em;
 		text-transform: uppercase;
@@ -676,5 +687,19 @@ perform IO.print("double(21) = " + perform Int.to_string(answer))`;
 		.hero-source {
 			min-height: 12rem;
 		}
+	}
+
+	.hero-native-note {
+		margin: 0;
+		padding: 0.8rem 1rem 1rem;
+		font-size: 0.85rem;
+		line-height: 1.55;
+		color: #b6c2d1;
+		background: #090d14;
+	}
+
+	.hero-native-note a {
+		color: #93c5fd;
+		text-underline-offset: 0.2rem;
 	}
 </style>

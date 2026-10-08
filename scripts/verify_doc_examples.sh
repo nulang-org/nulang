@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Verify all ```nulang code blocks in documentation.
-# Runs each block through --check (parse + type + effect checking) or
-# a full run when the block is a standalone program.
+# Only performs --check (parse, type, and effect checking).
+# Executable runtime behavior belongs in conformance/tests, not docs CI.
 #
 # Sources scanned:
 #   1. Markdown fences in the Astro docs site
@@ -9,7 +9,7 @@
 #      (SPEC2.md, README.md, docs/GETTING_STARTED.md, docs/TUTORIAL.md).
 #   2. `///` doc comments in .nula source files (PLAN Phase 1 bullet 6).
 #
-# Blocks that are intentionally NOT standalone programs are skipped via
+# Blocks that are intentionally NOT self-contained are skipped via
 # explicit markers, never silently:
 #   - a `// fragment` comment line (illustrative snippet that references
 #     surrounding prose — SPEC2 narrative examples),
@@ -33,15 +33,6 @@ trap cleanup EXIT
 
 # Check if a block looks like a REPL session (starts with nulang>)
 is_repl() { echo "$1" | head -1 | grep -q '^nulang>'; }
-
-# Check if block looks runnable (not a declaration fragment)
-is_runnable() {
-    local first
-    first=$(echo "$1" | head -1)
-    # Declaration keywords → fragment, not standalone
-    echo "$first" | grep -qE '^(actor |behavior |fn |effect |type |workflow|agent |state |import |use |receive )' && return 1
-    return 0
-}
 
 echo "=== Verifying documentation code examples ==="
 echo ""
@@ -106,29 +97,14 @@ verify_file() {
                 continue
             fi
 
-            if is_runnable "$block"; then
-                echo "$block" > "$TMPDIR/test.nula"
-                if $NULANG "$TMPDIR/test.nula" >/dev/null 2>&1; then
-                    PASS=$((PASS + 1))
-                    echo "  PASS  $label (run)"
-                elif $NULANG --check "$TMPDIR/test.nula" >/dev/null 2>&1; then
-                    PASS=$((PASS + 1))
-                    echo "  PASS  $label (check only)"
-                else
-                    FAIL=$((FAIL + 1))
-                    echo "  FAIL  $label"
-                    $NULANG --check "$TMPDIR/test.nula" 2>&1 | head -3 | sed 's/^/        /'
-                fi
+            echo "$block" > "$TMPDIR/test.nula"
+            if $NULANG --check "$TMPDIR/test.nula" > "$TMPDIR/check.log" 2>&1; then
+                PASS=$((PASS + 1))
+                echo "  PASS  $label (check)"
             else
-                echo "$block" > "$TMPDIR/test.nula"
-                if $NULANG --check "$TMPDIR/test.nula" >/dev/null 2>&1; then
-                    PASS=$((PASS + 1))
-                    echo "  OK    $label (check)"
-                else
-                    FAIL=$((FAIL + 1))
-                    echo "  FAIL  $label"
-                    $NULANG --check "$TMPDIR/test.nula" 2>&1 | head -3 | sed 's/^/        /'
-                fi
+                FAIL=$((FAIL + 1))
+                echo "  FAIL  $label"
+                head -3 "$TMPDIR/check.log" | sed 's/^/        /'
             fi
             continue
         fi
@@ -141,7 +117,7 @@ verify_file() {
 # Verify ```nulang blocks inside `///` doc comments of one .nula source
 # file. Consecutive `///` lines form the doc comment; fences inside it
 # are extracted and verified with the same machinery as markdown blocks
-# (run first, fall back to --check; declaration-first blocks check only).
+# (compiler --check only, never executing documentation content).
 # `////` lines are regular comments, not doc comments (matches docgen).
 verify_nula_source() {
     local file="$1" rel="$2"
@@ -178,29 +154,14 @@ verify_nula_source() {
                 continue
             fi
 
-            if is_runnable "$block"; then
-                echo "$block" > "$TMPDIR/test.nula"
-                if $NULANG "$TMPDIR/test.nula" >/dev/null 2>&1; then
-                    PASS=$((PASS + 1))
-                    echo "  PASS  $label (run)"
-                elif $NULANG --check "$TMPDIR/test.nula" >/dev/null 2>&1; then
-                    PASS=$((PASS + 1))
-                    echo "  PASS  $label (check only)"
-                else
-                    FAIL=$((FAIL + 1))
-                    echo "  FAIL  $label"
-                    $NULANG --check "$TMPDIR/test.nula" 2>&1 | head -3 | sed 's/^/        /'
-                fi
+            echo "$block" > "$TMPDIR/test.nula"
+            if $NULANG --check "$TMPDIR/test.nula" > "$TMPDIR/check.log" 2>&1; then
+                PASS=$((PASS + 1))
+                echo "  PASS  $label (check)"
             else
-                echo "$block" > "$TMPDIR/test.nula"
-                if $NULANG --check "$TMPDIR/test.nula" >/dev/null 2>&1; then
-                    PASS=$((PASS + 1))
-                    echo "  OK    $label (check)"
-                else
-                    FAIL=$((FAIL + 1))
-                    echo "  FAIL  $label"
-                    $NULANG --check "$TMPDIR/test.nula" 2>&1 | head -3 | sed 's/^/        /'
-                fi
+                FAIL=$((FAIL + 1))
+                echo "  FAIL  $label"
+                head -3 "$TMPDIR/check.log" | sed 's/^/        /'
             fi
             continue
         fi
@@ -212,7 +173,7 @@ verify_nula_source() {
 
 while IFS= read -r -d '' file; do
     verify_file "$file" "${file#$DOCS_DIR/}"
-done < <(find "$DOCS_DIR" -name '*.md' -o -name '*.mdx' -print0)
+done < <(find "$DOCS_DIR" -type f \( -name '*.md' -o -name '*.mdx' \) -print0)
 
 for file in "${ROOT_DOCS[@]}"; do
     [[ -f "$file" ]] || continue
@@ -220,7 +181,7 @@ for file in "${ROOT_DOCS[@]}"; do
 done
 
 # .nula sources: every ```nulang block inside a /// doc comment must
-# compile+run (PLAN Phase 1 bullet 6). Repo-controlled content, always on.
+# compile-check (PLAN Phase 1 bullet 6). Repo-controlled content, always on.
 while IFS= read -r -d '' file; do
     verify_nula_source "$file" "$file"
 done < <(find src -name '*.nula' -print0)

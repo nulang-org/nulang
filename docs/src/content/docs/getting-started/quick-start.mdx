@@ -1,6 +1,6 @@
 ---
 title: Quick Start
-description: Write and run your first Nulang programs — from Hello World to distributed actors.
+description: Write and run your first Nulang programs — from Hello World to local actors and algebraic effects.
 ---
 import CopyMarkdown from '../../../components/CopyMarkdown.astro';
 
@@ -15,10 +15,12 @@ Actors, networking, FFI, and JIT execution still require the native runtime.
 :::
 
 
+After [building from source](/getting-started/installation/), run these commands from the `nulang` repository root using the release configuration:
+
 Run a one-liner:
 
 ```bash
-cargo run -- --eval 'perform IO.print("Hello, Nulang!")'
+cargo run --release -- --eval 'perform IO.print("Hello, Nulang!")'
 ```
 
 ```
@@ -28,7 +30,7 @@ Hello, Nulang!
 Or start the REPL for an interactive session:
 
 ```bash
-cargo run -- --repl
+cargo run --release -- --repl
 ```
 
 ## Variables and Functions
@@ -106,4 +108,5 @@ handle greet_with_log("World") {
 - Dive into [Syntax Basics](/language/syntax/)
 - Explore the [Type System](/language/types/)
 - Learn about [Algebraic Effects](/language/effects/)
+- Run [Native Actors & Recovery](/getting-started/native-actors/) to try supervision and the durability test gate
 - Build [Distributed Actors](/actors/overview/)

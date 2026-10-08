@@ -1,0 +1,86 @@
+---
+title: Native Actors & Recovery
+description: Run real Nulang actors, inspect supervision and failure signals, and test durable recovery contracts using the native runtime.
+---
+
+The [browser playground](/playground/) is for Core language examples. **Actors, supervisors, persistent state, native networking, and the JIT require a native build.** This guide uses examples already maintained in the Nulang repository instead of introducing unverified snippets.
+
+:::caution[Alpha runtime]
+Nulang's stable *language surface* does not imply production-grade uptime. Multi-node distribution and failover are experimental. Keep these exercises on test data and validate failure semantics before deploying consequential workloads.
+:::
+
+## 1. Build and check the native runtime
+
+Install the [documented prerequisites](/getting-started/installation/) and run these commands from the repository root:
+
+```bash
+git clone https://github.com/nulang-org/nulang.git
+cd nulang
+cargo build --release
+cargo run --release -- --version
+```
+
+Nulang configures Cargo's output directory in `.cargo/config.toml`. Using `cargo run --release --` avoids assuming the executable lives under `./target/release`.
+
+## 2. Run an actor example
+
+Start with a local counter and then a worker pool:
+
+```bash
+cargo run --release -- examples/counter_actor.nula
+cargo run --release -- examples/supervisor_tree.nula
+```
+
+[Read the counter](https://github.com/nulang-org/nulang/blob/main/examples/counter_actor.nula) to see a stateful actor declaration and spawn. [Read the supervisor-tree example](https://github.com/nulang-org/nulang/blob/main/examples/supervisor_tree.nula) to see `Otp.create_supervisor`, a `simple_one_for_one` worker template, `Otp.start_child`, explicit child termination, and a child-count query.
+
+**What this proves:** native actor and supervisor APIs can be exercised. **What it does not prove:** that an actor will automatically recover every lost message or that state survives a process crash. The sample terminates a worker explicitly; it is not an end-to-end crash/restart test.
+
+## 3. Explore fault signals and monitoring
+
+Run the link/monitor example:
+
+```bash
+cargo run --release -- examples/link_monitor.nula
+```
+
+[Inspect its source](https://github.com/nulang-org/nulang/blob/main/examples/link_monitor.nula) for these operations:
+
+- `Actor.link`: relate actor lifecycles, including abnormal-exit propagation.
+- `Actor.monitor`: arrange a DOWN notification when a watched actor exits.
+- `Actor.trap_exit`: convert linked-exit signals into messages that an actor can process.
+- `Actor.exit(1)`: trigger an abnormal exit in the example victim.
+
+This example mainly demonstrates behavior via its source and runtime state; do not expect a printed DOWN notification for every signal. For the detailed rules and restart policies, use the [Actor Model](/actors/overview/) and [Supervision Trees](/actors/supervision/) references.
+
+## 4. Understand persistence separately
+
+An ordinary actor is **in-memory**. Persistent actors opt into durable or event-sourced state and store-backed recovery; a supervisor restart is not the same thing as durable state restoration. The selected store and the sequence of journal/checkpoint commits matter.
+
+For durable **external effects**, read the [failure and delivery contract](https://github.com/nulang-org/nulang/blob/main/docs/DURABILITY_GUARANTEES.md), then run its deterministic correctness gate:
+
+```bash
+bash scripts/test-durability-guarantees.sh
+```
+
+That gate tests defined crash windows, effect operation identity, and persistence contracts. It **does not** prove that every HTTP client, LLM provider, actor turn, or distributed transport already satisfies those semantics.
+
+To evaluate your own persistent workload, explicitly test restarting the process from an existing store, rehydrating expected actor state, and rejecting duplicate external work where a backend offers idempotency. Do not claim exactly-once external side effects without verifying provider-side deduplication.
+
+## 5. Verify docs and run runtime tests
+
+```bash
+# Compile/check fenced Nulang snippets in both .md and .mdx docs.
+NULANG_BIN=/tmp/cargo-target/release/nulang bash scripts/verify_doc_examples.sh
+
+# Exercise the repository's Python checks (including docs-verifier regression tests).
+python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+```
+
+The first command uses the repository's **configured** Cargo target directory. If you've overridden `CARGO_TARGET_DIR`, set `NULANG_BIN` to the location of your own release executable.
+
+## Where to go next
+
+- [Supervision Trees](/actors/supervision/) — learn restart strategies and child policies.
+- [Running a Cluster](/actors/cluster-ops/) — understand the experimental multi-node model and its documented limitations.
+- [Durable Workflows](/workflows/overview/) — inspect optional state and workflow semantics.
+- [Source and issues](https://github.com/nulang-org/nulang) — compare examples with current implementation and report reproducible failures.

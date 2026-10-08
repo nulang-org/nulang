@@ -1,112 +1,67 @@
 ---
 title: Why Nulang?
-description: The benefits of Nulang compared to other languages and the goal behind the project.
+description: Where Nulang's typed actor model helps, how it differs from Erlang, Rust, Go, and TypeScript, and when to choose another language.
 ---
 
-## The Goal: A Language for Software That Survives
+Nulang explores a particular design: **typed effects + isolated actors + supervision + opt-in durability** in one language and runtime. The objective is to make failure handling visible in application code rather than spreading it across unrelated libraries.
 
-Nulang is a **durable computation language**. Its core purpose is to let you describe software that keeps running across crashes, restarts, node migrations, and decades of change. The unit of thought is an **entity**: a named identity that carries state, responds to messages, evolves over time, and persists by default.
+**Current status: alpha.** Some language and actor surfaces are designated stable under the project's change-control policy. That is **not** a promise of production readiness, performance leadership, compatibility with existing ecosystems, or proven distributed failover. Multi-node distribution, AI integrations, and alternate compilation backends remain experimental.
 
-The goal is not to compete with every programming language. It's to fill a gap: there is no language today that gives you actors, algebraic effects, static types, and durable state in one coherent system.
+## What makes the design interesting?
 
----
+- **Types and effects.** Hindley-Milner inference, row-polymorphic records and effects, and reference capabilities express more constraints before execution.
+- **Actors and supervision.** Addressable actors isolate mutable state, exchange messages, and can be linked, monitored, and restarted through supervisors.
+- **Explicit durability.** Ordinary actors are in-memory. Persistent actors opt into snapshots, journals, and restart hydration using configured storage. Durability still requires failure-injection testing and an appropriate store for the intended guarantees.
+- **One compiler pipeline.** The project has a bytecode virtual machine with optional Cranelift JIT tiering, plus experimental WASM and native/AOT routes.
 
-## Nulang vs Erlang/Elixir
+These are architectural properties, not comparative throughput or reliability results. Evaluate both correctness and performance on **your actual workload**.
 
-Both languages share the actor model, supervision trees, and "let it crash" philosophy. The differences:
+## Nulang versus established alternatives
 
-| | Nulang | Erlang/Elixir |
-|---|---|---|
-| **Type system** | Static, HM-inferred, row-polymorphic | Dynamic (Erlang) / Gradual (Elixir) |
-| **Effects** | Algebraic effects, compile-time checked | No effect tracking |
-| **Execution** | Semantic-reference bytecode + tiered Cranelift JIT; experimental WASM and secondary native AOT | BEAM VM + JIT, garbage-collected |
-| **Memory model** | Per-actor heaps, ORCA GC | Shared heap, per-process GC |
-| **AI library** | Optional nulang-ai library with memory | Library-level (Nx, Bumblebee) |
+| If you need... | Consider first | What Nulang changes | Important trade-off |
+| --- | --- | --- | --- |
+| Proven fault-tolerant messaging and supervision | **Erlang / Elixir** | Adds inferred static types, capability analysis, and algebraic effects to an actor-oriented language | BEAM has much more deployment experience, libraries, and operational tooling |
+| Predictable native systems performance and low-level memory control | **Rust** | Makes supervised actors and optional persistent state first-class programming concepts | Rust has a mature ecosystem and stronger evidence for production low-level workloads |
+| Simple services with fast onboarding | **Go** | Provides algebraic effects, actor identities, and supervision rather than assembling conventions with libraries | Go offers a much more mature toolchain and ecosystem; it also has generics |
+| Web applications and established AI integrations | **TypeScript / Python** | Experiments with language-level effects and optional AI-runtime patterns | TypeScript and Python have far broader web, data, model, and SDK support |
 
-**Takeaway**: If you want Erlang's fault tolerance with static types that catch bugs at compile time and native performance, Nulang is designed for you.
+### Erlang / Elixir
 
----
+The strongest reason to prefer Nulang is an interest in **static, inferred type-and-effect checking alongside actor primitives**. Erlang/OTP remains the more defensible choice for production supervision, distribution, observability, and decades of operational precedent. Nulang is not a drop-in BEAM replacement.
 
-## Nulang vs Rust
+### Rust
 
-Rust and Nulang share a focus on safety and performance, but their domains differ:
+Choose Rust when native performance, memory layout, platform integration, or mature libraries are the primary requirement. Nulang experiments with higher-level actor and recovery semantics that would otherwise be built from Rust crates or services. No general-purpose performance advantage is established by the language design alone.
 
-| | Nulang | Rust |
-|---|---|---|
-| **Concurrency model** | Actors + messages | async/await, channels, Arc&lt;Mutex&lt;T&gt;&gt; |
-| **Distribution** | Built-in clustering, CRDTs | Manual (gRPC, custom protocols) |
-| **Fault tolerance** | Supervision trees, cascading restart | Manual error handling, panic=abort |
-| **Workflows** | Built-in durable workflows | Temporal/Sidekiq libraries |
-| **Type safety** | HM inference + capabilities | Ownership + borrows + lifetimes |
+### Go
 
-**Takeaway**: Rust gives you fine-grained memory control. Nulang gives you fault-tolerant distribution out of the box. Use Rust for systems programming; use Nulang for distributed applications.
+Go already supports generics, concurrency primitives, and a substantial production ecosystem. Nulang is worth exploring when typed effects, actor isolation, or supervisor-managed state matter more than Go's simplicity and deployment maturity.
 
----
+### TypeScript / Python
 
-## Nulang vs Go
+Stay with TypeScript for mainstream browser apps and with Python or TypeScript when you depend on broad AI frameworks and SDKs. Nulang's AI providers, pipelines, memory, and multi-agent primitives are **experimental and optional**. They do not eliminate the need for model evaluation, credentials management, observability, and durable infrastructure.
 
-Go's strength is simplicity. Nulang's strength is correctness under failure:
+## When to experiment with Nulang
 
-| | Nulang | Go |
-|---|---|---|
-| **Concurrency** | Actors with supervision | Goroutines + channels |
-| **Error handling** | Pattern matching, supervision | `if err != nil` |
-| **Type system** | HM inference, row polymorphism, ADTs | Structural types, no generics (pre-1.18) |
-| **Effects** | Compile-time effect tracking | No effect system |
-| **Distribution** | Built into the language | Library-level |
+- You are researching type-and-effect systems or runtime architecture.
+- You want to prototype supervised actor workloads and compare semantics against OTP or a Rust/Go service.
+- You can test persistence, recovery, and operational behavior without placing critical production data at risk.
+- You are comfortable with an evolving language, limited packages, and building from source.
 
-**Takeaway**: Go is great for simple networked services. When those services become distributed systems with complex failure modes, Nulang's supervision, effects, and durable state reduce the operational burden.
+## When to choose something else
 
----
+- **Revenue-critical production service:** use a proven runtime unless you have explicitly validated the failure, security, deployment, and recovery behavior you need.
+- **Hard multi-node availability guarantees:** prefer a mature distributed platform; Nulang's clustering and transport are still experimental.
+- **Conventional website or SPA:** TypeScript and established web frameworks are substantially more practical.
+- **Quick scripting or broad third-party API access:** Python, Go, or TypeScript usually reduce delivery time.
+- **Lowest possible latency:** benchmark a representative workload before considering a migration.
 
-## Nulang vs Python/TypeScript (for AI)
+## A low-risk way to evaluate it
 
-The AI ecosystem has converged on Python and TypeScript, but both languages were designed before LLMs existed:
+1. [Try the browser playground](/playground/) for pure Core functions and effects. It does **not** run native actors, networking, JIT, or FFI.
+2. [Build the native release binary](/getting-started/installation/) and run the [guided tutorial](/tutorial/).
+3. [Exercise actor supervision](/actors/supervision/) and [distribution](/actors/distribution/) separately; do not infer network guarantees from local tests.
+4. Read the [durability contract](https://github.com/nulang-org/nulang/blob/main/docs/DURABILITY_GUARANTEES.md) and write crash/restart tests against your selected store.
+5. Inspect the [conformance cases](https://github.com/nulang-org/nulang/tree/main/conformance) and [benchmark sources](https://github.com/nulang-org/nulang/tree/main/benchmarks) rather than relying on performance claims.
 
-| | Nulang | Python/TypeScript |
-|---|---|---|
-| **Agent declaration** | Declarative `agent` keyword | Library objects (LangChain, etc.) |
-| **Memory** | 3 built-in subsystems | Manual vector DB integration |
-| **Multi-agent** | Pipelines, debates, supervisors | Custom orchestration code |
-| **Determinism** | Type-checked effect isolation | No effect guarantees |
-| **Persistence** | Built-in checkpointing, event sourcing | External databases |
-
-**Takeaway**: Python and TypeScript have vast AI library ecosystems. Nulang gives you declarative primitives that eliminate boilerplate for the common patterns: define an agent, give it memory, compose agents into teams. No LangChain required.
-
----
-
-## The Bet: Primitives Over Frameworks
-
-Every decade brings new AI models, new cloud providers, and new orchestration frameworks. The Nulang bet is that a small set of primitives — actors, effects, capabilities, state, identity, messages — will outlast all of them.
-
-- **Actors** were meaningful in 1973 (Hewitt et al.) and will be meaningful in 2073.
-- **Algebraic effects** generalize exceptions, async/await, generators, and state — all in one mechanism.
-- **Reference capabilities** prevent data races without a GC or borrow checker.
-- **Durable state** means your program's execution survives the machine it runs on.
-
-Nulang freezes these primitives in a [Frozen Core](https://github.com/nulang-org/nulang/blob/main/GOVERNANCE.md) and builds everything else — AI, cloud services, billing, multi-tenancy — as evolvable layers.
-
----
-
-## When to Use Nulang
-
-- You're building a system that **must not lose state** across restarts.
-- You need **fault tolerance** but don't want to learn OTP from scratch.
-- You want **static types** that catch bugs before they reach production.
-- You're building **AI agents** that need memory, tool use, and multi-agent coordination.
-- You want to **start local** and deploy to the cloud without rewriting.
-
-## When Not to Use Nulang
-
-- You need a mature ecosystem with thousands of libraries. (Nulang is alpha.)
-- You're building a CLI tool or a simple script. (Use Rust, Go, or Python.)
-- You need Web/React/SPA frontend support. (Use TypeScript.)
-- You're under a tight deadline with no tolerance for alpha software.
-
----
-
-## Getting Started
-
-[Install Nulang](/getting-started/installation/) and follow the [Quick Start](/getting-started/quick-start/) guide to write your first actor.
-
-The [source code is on GitHub](https://github.com/nulang-org/nulang) under the Apache 2.0 license.
+Nulang is [open source under Apache 2.0](https://github.com/nulang-org/nulang/blob/main/LICENSE). Feedback, reproducible cases, and narrow benchmark comparisons are especially useful at this stage.

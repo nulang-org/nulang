@@ -4,7 +4,7 @@ const steps = [
 		step: '01',
 		title: 'Clone',
 		description: 'Get the compiler and runtime source.',
-		command: 'git clone https://github.com/nulang-org/nulang',
+		command: 'git clone https://github.com/nulang-org/nulang && cd nulang',
 	},
 	{
 		step: '02',
@@ -15,13 +15,13 @@ const steps = [
 	{
 		step: '03',
 		title: 'Run',
-		description: 'Start the REPL or execute a .nula file.',
-		command: 'cargo run -- --repl',
+		description: 'Use the binary you just compiled to start the REPL.',
+		command: 'cargo run --release -- --repl',
 	},
 ];
 ---
 
-<div class="steps-flow" aria-label="Install Nulang in three steps">
+<div class="steps-flow" aria-label="Build and run Nulang from source in three steps">
 	{steps.map((step) => (
 		<div class="step">
 			<div class="step-index">{step.step}</div>

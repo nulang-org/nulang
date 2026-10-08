@@ -92,7 +92,7 @@ let counter = spawn Counter {}
 send counter tick()
 ```
 
-Messages are always delivered and never dropped. The sender does not block.
+Local sends enqueue messages asynchronously, but delivery is not an unconditional guarantee. Configured bounded mailboxes can apply backpressure, and remote transport or actor failures require explicit error handling. Do not assume exactly-once delivery across nodes.
 
 ## Receiving Messages
 
