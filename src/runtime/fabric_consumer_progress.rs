@@ -635,6 +635,28 @@ mod tests {
     }
 
     #[test]
+    fn journal_rejects_cross_stream_or_partition_history() {
+        let root = temp_root("scope");
+        let group = policy(vec![10, 11]);
+        let mut journal = FileFabricConsumerProgressJournal::open(&root).unwrap();
+        journal.prepare(change(1, 0, 1), group.clone(), 1).unwrap();
+        journal.commit_with_acknowledgers(1, &[10, 11]).unwrap();
+
+        let mut different_stream = change(2, 1, 2);
+        different_stream.stream = "payments".to_string();
+        assert!(journal.prepare(different_stream, group.clone(), 2).is_err());
+
+        let mut different_partition = change(2, 1, 2);
+        different_partition.partition = 1;
+        assert!(journal.prepare(different_partition, group.clone(), 2).is_err());
+
+        let mut same_partition_other_consumer = change(2, 1, 1);
+        same_partition_other_consumer.consumer = "analytics".to_string();
+        journal.prepare(same_partition_other_consumer, group, 2).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn two_replica_metadata_requires_both_durable_votes() {
         let root = temp_root("rf2");
         let mut journal = FileFabricConsumerProgressJournal::open(&root).unwrap();
