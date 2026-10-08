@@ -156,8 +156,7 @@ fn invalid_typed_query_is_problem_json_over_real_http() {
 fn duplicate_canonical_action_form_fields_fail_over_real_http() {
     let mut route = legacy_route();
     route.method = HttpMethod::Post;
-    let server = WebDevServer::bind(0, None, None, vec![route])
-        .expect("bind WebDevServer");
+    let server = WebDevServer::bind(0, None, None, vec![route]).expect("bind WebDevServer");
 
     let form = "title=admin&title=user&__nulang_ui_message=invalid";
     let request = format!(
