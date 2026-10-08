@@ -616,12 +616,21 @@ impl FileWal {
     /// have been written and `sync_data` succeeds. If an I/O failure leaves a
     /// partial physical append, reopening the WAL truncates that crash tail.
     pub fn append_write(&mut self, write: &TabletWrite) -> Result<(), WalError> {
+        // Old public handles may predate coordinator ownership. Hold this
+        // guard through the entire durable append, never just its preflight.
+        let _gate = self.acquire_public_io_gate()?;
+        self.append_write_under_held_gate(write)
+    }
+
+    /// Only call when the public I/O gate is held, or from a managed WAL whose
+    /// coordinator holds the gate for its entire lifetime.
+    pub(crate) fn append_write_under_held_gate(
+        &mut self,
+        write: &TabletWrite,
+    ) -> Result<(), WalError> {
         if self.poisoned {
             return Err(WalError::Poisoned);
         }
-        // Also check old public handles: they may have opened their WAL
-        // before a directory was adopted by the single-node coordinator.
-        let _gate = self.acquire_public_io_gate()?;
 
         let record = WalRecord::from_write(write);
         let last_sequence = self.last_sequence();
