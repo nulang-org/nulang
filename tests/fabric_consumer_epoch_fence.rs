@@ -282,24 +282,22 @@ fn abrupt_leader_termination_fences_old_ack_epoch_after_manual_removal() {
         1
     );
 
-    // The new leader replays an ACKed record because the old cursor is local,
-    // but it cannot accept the previous leader epoch as an ACK token.
-    let replay = nodes[candidate]
+    // The new leader has no quorum-proven cursor or lease recovery.
+    // Even its correct epoch token must not authorize consumer side effects.
+    assert!(nodes[candidate]
         .fabric_stream_deliver_consumer(
             "crash-fence",
             "worker",
             1,
             Duration::from_secs(30),
         )
-        .unwrap();
-    assert_eq!(replay.len(), 1);
-    assert_eq!(replay[0].leader_epoch, Some(2));
+        .is_err());
     assert!(nodes[candidate]
         .fabric_stream_ack_consumer_fenced("crash-fence", "worker", 1, 1)
         .is_err());
-    nodes[candidate]
+    assert!(nodes[candidate]
         .fabric_stream_ack_consumer_fenced("crash-fence", "worker", 1, 2)
-        .unwrap();
+        .is_err());
 
     for root in roots {
         let _ = std::fs::remove_dir_all(root);
