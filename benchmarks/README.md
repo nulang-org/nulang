@@ -63,14 +63,16 @@ Performance PRs should use the same-runner Nulang A/B workflow below as the
 primary before/after evidence; a fixed self-hosted runner is preferred when
 longitudinal absolute numbers matter.
 
-## Cross-runtime Savina baselines
+## Cross-runtime stateless actor baselines
 
 `benchmarks/cross_runtime/` contains an opt-in comparison harness for the
 same counting, ping-pong, thread-ring, and fork-join workloads in Nulang,
-Rust standard-library channels, Go channels/goroutines, and Erlang processes.
-Use `scripts/cross_runtime_bench.py` to run every available runtime on the
-same machine and emit one JSON report with exact toolchain metadata and median
-timings.
+Rust standard-library channels, Go channels/goroutines, Erlang processes,
+and Ractor's native Rust actors. The runner reports actor-language runtimes,
+a third-party actor framework, and native concurrency primitives as distinct
+comparator categories. Use `scripts/cross_runtime_bench.py` to execute
+the fixtures on one host and emit JSON with toolchain/topology metadata and
+median timings.
 
 Comparative runs default to `--cpu-mode single`: every measured runtime
 process is pinned to the same one logical CPU, matching the current
@@ -79,6 +81,11 @@ diagnostic only until a separate sharded Nulang fixture exists; in particular,
 host-mode fork-join results must not be presented as a fair multicore
 comparison. These are language/runtime baselines, not a universal framework
 ranking; see the cross-runtime README for the full interpretation constraints.
+
+For separate idle-actor spawn and Linux RSS diagnostics against Ractor,
+run `python3 scripts/actor_density_cross_runtime.py --actors 1000,10000`.
+This reuses the existing Nulang density probe rather than duplicating it.
+See `benchmarks/cross_runtime/README.md` for startup and allocation caveats.
 
 ## Nulang shard scaling
 
