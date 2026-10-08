@@ -7,6 +7,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+
 use nulang::database::split::{SingleNodeSplitStore, SplitError};
 use nulang::database::tablet::{KeyRange, TabletDescriptor, TabletId, TabletMutation};
 
@@ -126,12 +129,23 @@ fn lock_file_inode_is_retained_after_owner_releases_it() {
     let owner = SingleNodeSplitStore::open(&dir, parent()).unwrap();
     let lock_file = dir.join(".nudb-owner.lock");
     assert!(lock_file.exists());
+    // Existence alone cannot detect lock-file unlink/recreate races.
+    #[cfg(unix)]
+    let original_identity = {
+        let meta = fs::metadata(&lock_file).unwrap();
+        (meta.dev(), meta.ino())
+    };
     drop(owner);
 
     // Deleting/recreating an advisory lock file permits concurrent locks on
     // different inodes. The coordinator must never unlink it on drop.
     assert!(lock_file.exists());
     let recovered = SingleNodeSplitStore::open(&dir, parent()).unwrap();
+    #[cfg(unix)]
+    {
+        let meta = fs::metadata(&lock_file).unwrap();
+        assert_eq!((meta.dev(), meta.ino()), original_identity);
+    }
     drop(recovered);
     let _ = fs::remove_dir_all(dir);
 }
