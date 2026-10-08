@@ -133,6 +133,43 @@ fn published_manifest_fails_closed_when_child_wal_is_missing_at_sequence_zero() 
 }
 
 #[test]
+fn published_manifest_fails_closed_when_child_wal_is_truncated() {
+    let root = temp_root("truncated_child");
+    {
+        let mut store = SingleNodeSplitStore::open(&root, parent()).unwrap();
+        store
+            .split(
+                &parent()
+                    .plan_split(b"m", TabletId::new(402).unwrap(), TabletId::new(403).unwrap(), 8)
+                    .unwrap(),
+            )
+            .unwrap();
+    }
+    // A fresh-child sequence of zero must not excuse a truncated WAL.
+    fs::write(root.join("right.wal"), []).unwrap();
+    assert!(matches!(
+        SingleNodeSplitStore::open(&root, parent()),
+        Err(SplitError::InvalidManifest(_))
+    ));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn published_manifest_fails_closed_when_parent_wal_is_truncated() {
+    let root = temp_root("truncated_parent");
+    {
+        let mut store = SingleNodeSplitStore::open(&root, parent()).unwrap();
+        store.commit(put(b"b", b"persist")).unwrap();
+    }
+    fs::write(root.join("parent.wal"), []).unwrap();
+    assert!(matches!(
+        SingleNodeSplitStore::open(&root, parent()),
+        Err(SplitError::InvalidManifest(_))
+    ));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn corrupted_manifest_fails_closed_instead_of_reopening_parent() {
     let root = temp_root("corrupt_catalog");
     {
