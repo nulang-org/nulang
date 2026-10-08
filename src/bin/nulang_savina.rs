@@ -38,6 +38,7 @@ struct Config {
     benchmark: Option<String>,
     repeat: u32,
     reuse_setup: bool,
+    phase_profile: bool,
 }
 
 #[derive(Debug)]
@@ -45,6 +46,7 @@ struct Measurement {
     benchmark: &'static str,
     messages: u64,
     elapsed: Duration,
+    phases: Option<(Duration, Duration)>,
 }
 
 impl Measurement {
@@ -68,6 +70,13 @@ fn main() -> ExitCode {
         }
     };
 
+    if config.phase_profile
+        && !matches!(config.benchmark.as_deref(), Some("counting" | "fork_join"))
+    {
+        eprintln!("--phase-profile requires --benchmark counting or fork_join");
+        return ExitCode::from(2);
+    }
+
     if let Some(name) = config.benchmark.as_deref() {
         if !BENCHMARKS.contains(&name) {
             eprintln!("unknown benchmark: {name}");
@@ -87,7 +96,7 @@ fn main() -> ExitCode {
         let (runtime, pinger, ponger) = ping_pong_fixture();
         for iteration in 1..=config.repeat {
             let measurement = run_ping_pong(&runtime, pinger, ponger, iteration);
-            emit(&measurement, iteration, config.format);
+            emit(&measurement, iteration, config.format, config.phase_profile);
         }
         return ExitCode::SUCCESS;
     }
@@ -110,7 +119,7 @@ fn main() -> ExitCode {
                 "skynet" => bench_skynet(),
                 _ => unreachable!("benchmark list and dispatcher must stay in sync"),
             };
-            emit(&measurement, iteration, config.format);
+            emit(&measurement, iteration, config.format, config.phase_profile);
         }
     }
 
@@ -122,6 +131,7 @@ fn parse_args() -> Result<Option<Config>, String> {
     let mut benchmark = None;
     let mut repeat = 1u32;
     let mut reuse_setup = false;
+    let mut phase_profile = false;
     let mut args = env::args().skip(1);
 
     while let Some(arg) = args.next() {
@@ -156,6 +166,9 @@ fn parse_args() -> Result<Option<Config>, String> {
             "--reuse-setup" => {
                 reuse_setup = true;
             }
+            "--phase-profile" => {
+                phase_profile = true;
+            }
             "--list" => {
                 for name in BENCHMARKS {
                     println!("{name}");
@@ -175,16 +188,17 @@ fn parse_args() -> Result<Option<Config>, String> {
         benchmark,
         repeat,
         reuse_setup,
+        phase_profile,
     }))
 }
 
 fn print_usage() {
     eprintln!(
-        "Usage: nulang-savina [--format human|jsonl] [--benchmark NAME] [--repeat N] [--reuse-setup] [--list]"
+        "Usage: nulang-savina [--format human|jsonl] [--benchmark NAME] [--repeat N] [--reuse-setup] [--phase-profile] [--list]"
     );
 }
 
-fn emit(measurement: &Measurement, iteration: u32, format: OutputFormat) {
+fn emit(measurement: &Measurement, iteration: u32, format: OutputFormat, phase_profile: bool) {
     match format {
         OutputFormat::Human => {
             println!(
@@ -205,20 +219,25 @@ fn emit(measurement: &Measurement, iteration: u32, format: OutputFormat) {
         OutputFormat::Jsonl => {
             let elapsed_ns = u64::try_from(measurement.elapsed.as_nanos())
                 .expect("benchmark duration must fit in u64 nanoseconds");
-            println!(
-                "{}",
-                json!({
-                    "schema": 1,
-                    "runtime": "nulang",
-                    "suite": "savina-style",
-                    "benchmark": measurement.benchmark,
-                    "iteration": iteration,
-                    "messages": measurement.messages,
-                    "elapsed_ns": elapsed_ns,
-                    "messages_per_second": measurement.messages_per_second(),
-                    "ns_per_message": measurement.ns_per_message(),
-                })
-            );
+            let mut record = json!({
+                "schema": 1,
+                "runtime": "nulang",
+                "suite": "savina-style",
+                "benchmark": measurement.benchmark,
+                "iteration": iteration,
+                "messages": measurement.messages,
+                "elapsed_ns": elapsed_ns,
+                "messages_per_second": measurement.messages_per_second(),
+                "ns_per_message": measurement.ns_per_message(),
+            });
+            if phase_profile {
+                let (admission, scheduler) = measurement
+                    .phases
+                    .expect("phase profiling must use a supported workload");
+                record["phase_admission_ns"] = json!(admission.as_nanos());
+                record["phase_scheduler_ns"] = json!(scheduler.as_nanos());
+            }
+            println!("{record}");
         }
     }
 }
@@ -260,8 +279,10 @@ fn bench_counting() -> Measurement {
     for _ in 0..N {
         rt.borrow_mut().send_message(actor_id, "inc", &[]);
     }
+    let admission = start.elapsed();
     rt.borrow_mut().run_scheduler();
     let elapsed = start.elapsed();
+    let scheduler = elapsed.saturating_sub(admission);
 
     let count = rt
         .borrow()
@@ -275,6 +296,7 @@ fn bench_counting() -> Measurement {
         benchmark: "counting",
         messages: N as u64,
         elapsed,
+        phases: Some((admission, scheduler)),
     }
 }
 
@@ -363,6 +385,7 @@ fn run_ping_pong(
         benchmark: "ping_pong",
         messages: 2 * N as u64 + 1,
         elapsed,
+        phases: None,
     }
 }
 
@@ -433,6 +456,7 @@ let s = spawn Sink {} in
         benchmark: "thread_ring",
         messages: HOPS as u64,
         elapsed,
+        phases: None,
     }
 }
 
@@ -487,8 +511,10 @@ let s = spawn Sink {} in
         rt.borrow_mut()
             .send_message(worker, "task", &[Value::int(i)]);
     }
+    let admission = start.elapsed();
     rt.borrow_mut().run_scheduler();
     let elapsed = start.elapsed();
+    let scheduler = elapsed.saturating_sub(admission);
 
     let count = rt
         .borrow()
@@ -502,6 +528,7 @@ let s = spawn Sink {} in
         benchmark: "fork_join",
         messages: 2 * TASKS as u64,
         elapsed,
+        phases: Some((admission, scheduler)),
     }
 }
 
@@ -565,6 +592,7 @@ spawn Skynet {}
         benchmark: "skynet",
         messages: EXPECTED as u64 - 1,
         elapsed,
+        phases: None,
     }
 }
 
