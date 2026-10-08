@@ -234,14 +234,10 @@ fn emit(measurement: &Measurement, iteration: u32, format: OutputFormat, phase_p
                 let (admission, scheduler) = measurement
                     .phases
                     .expect("phase profiling must use a supported workload");
-                record["phase_admission_ns"] = json!(
-                    u64::try_from(admission.as_nanos())
-                        .expect("admission phase duration must fit u64 nanoseconds")
-                );
-                record["phase_scheduler_ns"] = json!(
-                    u64::try_from(scheduler.as_nanos())
-                        .expect("scheduler phase duration must fit u64 nanoseconds")
-                );
+                record["phase_admission_ns"] = json!(u64::try_from(admission.as_nanos())
+                    .expect("admission phase duration must fit u64 nanoseconds"));
+                record["phase_scheduler_ns"] = json!(u64::try_from(scheduler.as_nanos())
+                    .expect("scheduler phase duration must fit u64 nanoseconds"));
             }
             println!("{record}");
         }
