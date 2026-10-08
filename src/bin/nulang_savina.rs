@@ -52,6 +52,7 @@ struct Config {
     backend: Backend,
     format: OutputFormat,
     benchmark: Option<String>,
+    cross_runtime_only: bool,
     repeat: u32,
 }
 
@@ -100,6 +101,9 @@ fn main() -> ExitCode {
             {
                 continue;
             }
+            if config.cross_runtime_only && name == "skynet" {
+                continue;
+            }
 
             let measurement = match name {
                 "counting" => bench_counting(config.backend),
@@ -120,11 +124,13 @@ fn parse_args() -> Result<Option<Config>, String> {
     let mut format = OutputFormat::Human;
     let mut backend = Backend::Bytecode;
     let mut benchmark = None;
+    let mut cross_runtime_only = false;
     let mut repeat = 1u32;
     let mut args = env::args().skip(1);
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--cross-runtime-only" => cross_runtime_only = true,
             "--backend" => {
                 backend = match args.next().as_deref() {
                     Some("bytecode") => Backend::Bytecode,
@@ -181,13 +187,14 @@ fn parse_args() -> Result<Option<Config>, String> {
         backend,
         format,
         benchmark,
+        cross_runtime_only,
         repeat,
     }))
 }
 
 fn print_usage() {
     eprintln!(
-        "Usage: nulang-savina [--backend bytecode|aot] [--format human|jsonl] [--benchmark NAME] [--repeat N] [--list]"
+        "Usage: nulang-savina [--backend bytecode|aot] [--format human|jsonl] [--benchmark NAME] [--cross-runtime-only] [--repeat N] [--list]"
     );
 }
 
