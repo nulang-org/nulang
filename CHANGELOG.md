@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Opt-in activation-local VM arena routing — 2026-10-08
+- **Conservatively proven activation-local arrays, records, and tuples route to the actor iso arena in the bytecode interpreter** when `NULANG_ISO_ARENA` is enabled; escaping allocations and embedders without arena support retain the normal actor-heap path.
+- **Arena reset happens only on successful activation completion**, not on a yield or suspension. Per-module bytecode site classification is recomputed when the opt-in setting changes after loading.
+- **Regression coverage** includes each supported composite type, escaping allocation, explicitly disabled mode, post-load enabling, and completion reclamation. This is a fresh-main port of #1121; no speedup claim is made before controlled measurements.
+
 ### Receiver-acknowledged CRDT delta synchronization — 2026-10-07
 - **Per-peer CRDT frontiers now advance only after a matching NUL0 acknowledgement arrives from the intended receiver.** Dropped or unacknowledged batches remain retransmittable from that peer's last proven frontier instead of disappearing behind sender-side optimistic state.
 - **Peer recovery invalidates stale receiver knowledge.** A `Failed → Healthy` transition through heartbeat or authoritative gossip forgets prior CRDT frontier/correlation state so a restarted process receives fresh state.
