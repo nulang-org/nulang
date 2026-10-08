@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Run matched Savina-style messaging baselines on one host.
+"""Run matched stateless actor / message-passing baselines on one host.
 
-The script intentionally compares standard runtime primitives, not third-party
-actor frameworks. See benchmarks/cross_runtime/README.md before interpreting
-or publishing results.
+Includes native runtime primitives and a separately labeled actor-framework
+fixture. See benchmarks/cross_runtime/README.md for semantic limitations.
 """
 
 from __future__ import annotations
@@ -23,7 +22,21 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "benchmarks" / "cross_runtime"
 BUILD = ROOT / "target" / "cross-runtime"
-BENCHMARKS = ("counting", "ping_pong", "thread_ring", "fork_join")
+EXPECTED_MESSAGES = {
+    "counting": 200_000,
+    "ping_pong": 40_001,
+    "thread_ring": 20_000,
+    "fork_join": 100_000,
+}
+BENCHMARKS = tuple(EXPECTED_MESSAGES)
+RUNTIMES = ("nulang", "rust", "go", "erlang", "ractor")
+RUNTIME_KINDS = {
+    "nulang": "language-actor-runtime",
+    "rust": "native-threads-and-channels",
+    "go": "goroutines-and-channels",
+    "erlang": "language-actor-runtime",
+    "ractor": "third-party-actor-framework",
+}
 RECORD_RE = re.compile(
     r"\[cross-bench\]\s+runtime=(?P<runtime>[a-z0-9_-]+)\s+"
     r"benchmark=(?P<benchmark>[a-z0-9_-]+)\s+"
@@ -80,18 +93,36 @@ def parse_records(output: str, expected_runtime: str) -> dict[str, dict[str, int
         name = match.group("benchmark")
         if name not in BENCHMARKS:
             continue
-        records[name] = {
-            "messages": int(match.group("messages")),
-            "elapsed_ns": int(match.group("elapsed_ns")),
-        }
+        if name in records:
+            raise RuntimeError(f"{expected_runtime}/{name}: duplicate benchmark record")
+        messages = int(match.group("messages"))
+        elapsed_ns = int(match.group("elapsed_ns"))
+        if messages != EXPECTED_MESSAGES[name]:
+            raise RuntimeError(
+                f"{expected_runtime}/{name}: message count {messages} != "
+                f"{EXPECTED_MESSAGES[name]}"
+            )
+        if elapsed_ns <= 0:
+            raise RuntimeError(f"{expected_runtime}/{name}: elapsed time must be positive")
+        records[name] = {"messages": messages, "elapsed_ns": elapsed_ns}
 
     missing = [name for name in BENCHMARKS if name not in records]
     if missing:
         print(output, file=sys.stderr)
         raise RuntimeError(
-            f"{expected_runtime} did not emit records for: {', '.join(missing)}"
+            f"{expected_runtime}: missing benchmark records for: {', '.join(missing)}"
         )
     return records
+
+
+def validate_runtimes(selected: list[str]) -> None:
+    unknown = sorted(set(selected) - set(RUNTIMES))
+    if unknown:
+        raise ValueError(f"unknown runtimes: {', '.join(unknown)}")
+    if len(set(selected)) != len(selected):
+        raise ValueError("duplicate runtime selection")
+    if not selected:
+        raise ValueError("at least one runtime is required")
 
 
 def build_commands(selected: list[str]) -> dict[str, list[str]]:
@@ -158,6 +189,25 @@ def build_commands(selected: list[str]) -> dict[str, list[str]]:
             ]
         )
         commands["go"] = [str(binary)]
+
+    if "ractor" in selected:
+        cargo = shutil.which("cargo")
+        if cargo is None:
+            raise RuntimeError("cargo is required for the Ractor framework fixture")
+        manifest = FIXTURES / "ractor_baseline" / "Cargo.toml"
+        # Isolated Cargo workspace: do not add Ractor to Nulang's dependencies.
+        command_output(
+            [cargo, "build", "--release", "--manifest-path", str(manifest)]
+        )
+        metadata = json.loads(
+            command_output(
+                [cargo, "metadata", "--format-version", "1", "--no-deps",
+                 "--manifest-path", str(manifest)]
+            )
+        )
+        executable = "nulang-ractor-baseline.exe" if os.name == "nt" else "nulang-ractor-baseline"
+        binary = Path(metadata["target_directory"]) / "release" / executable
+        commands["ractor"] = [str(binary)]
 
     if "erlang" in selected:
         erlc = shutil.which("erlc")
@@ -252,6 +302,7 @@ def environment_metadata(
         "cargo": maybe_version(["cargo", "--version"]) if shutil.which("cargo") else None,
         "go": maybe_version(["go", "version"]) if shutil.which("go") else None,
         "erlang_otp": otp,
+        "ractor": "0.16.5 (exact direct dependency)" if shutil.which("cargo") else None,
     }
 
 
@@ -262,7 +313,11 @@ def summarize(
     for runtime, workloads in samples.items():
         summary[runtime] = {}
         for name, rows in workloads.items():
+            if not rows:
+                raise RuntimeError(f"{runtime}/{name}: no samples")
             elapsed = [row["elapsed_ns"] for row in rows]
+            if any(value <= 0 for value in elapsed):
+                raise RuntimeError(f"{runtime}/{name}: elapsed time must be positive")
             message_counts = {row["messages"] for row in rows}
             if len(message_counts) != 1:
                 raise RuntimeError(f"{runtime}/{name}: message count changed across samples")
@@ -300,8 +355,8 @@ def main() -> int:
     parser.add_argument("--warmup", type=int, default=1, help="discarded warm-up runs")
     parser.add_argument(
         "--runtimes",
-        default="nulang,rust,go,erlang",
-        help="comma-separated subset of nulang,rust,go,erlang",
+        default="nulang,rust,go,erlang,ractor",
+        help="comma-separated subset of nulang,rust,go,erlang,ractor",
     )
     parser.add_argument(
         "--cpu-mode",
@@ -320,9 +375,10 @@ def main() -> int:
         parser.error("--runs must be >= 1 and --warmup must be >= 0")
 
     selected = [item.strip() for item in args.runtimes.split(",") if item.strip()]
-    unknown = sorted(set(selected) - {"nulang", "rust", "go", "erlang"})
-    if unknown:
-        parser.error(f"unknown runtimes: {', '.join(unknown)}")
+    try:
+        validate_runtimes(selected)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     cpu_affinity = measurement_affinity(args.cpu_mode)
     if cpu_affinity is not None:
@@ -365,8 +421,10 @@ def main() -> int:
     print_table(summary)
 
     report = {
-        "schema": 2,
-        "methodology": "standard-runtime Savina-style messaging baselines",
+        "schema": 3,
+        "methodology": "Savina-style runtime-primitives and actor-framework baselines",
+        "runtime_kinds": {runtime: RUNTIME_KINDS[runtime] for runtime in selected},
+        "workload_expected_messages": EXPECTED_MESSAGES,
         "warmup_runs": args.warmup,
         "measured_runs": args.runs,
         "environment": environment_metadata(args.cpu_mode, cpu_affinity),
