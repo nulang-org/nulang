@@ -158,3 +158,94 @@ fn checkpoint_ahead_of_wal_tail_fails_closed() {
     let _ = fs::remove_file(&wal_path);
     let _ = fs::remove_file(&checkpoint);
 }
+
+#[test]
+fn duplicate_key_mutations_recover_as_one_mvcc_version_per_commit() {
+    let wal_path = temp_wal("duplicate_key_batch");
+    let checkpoint = checkpoint_path(&wal_path);
+    let _ = fs::remove_file(&wal_path);
+    let _ = fs::remove_file(&checkpoint);
+
+    {
+        let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
+        let first = tablet
+            .prepare_write(
+                3,
+                0,
+                vec![
+                    TabletMutation::Put {
+                        key: b"k".to_vec(),
+                        value: b"first".to_vec(),
+                    },
+                    TabletMutation::Delete { key: b"k".to_vec() },
+                    TabletMutation::Put {
+                        key: b"other".to_vec(),
+                        value: b"independent".to_vec(),
+                    },
+                    TabletMutation::Put {
+                        key: b"k".to_vec(),
+                        value: b"last".to_vec(),
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(tablet.commit(first).unwrap(), 1);
+        assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"last"[..]));
+
+        let second = tablet
+            .prepare_write(
+                3,
+                1,
+                vec![
+                    TabletMutation::Put {
+                        key: b"k".to_vec(),
+                        value: b"intermediate".to_vec(),
+                    },
+                    TabletMutation::Delete { key: b"k".to_vec() },
+                ],
+            )
+            .unwrap();
+        assert_eq!(tablet.commit(second).unwrap(), 2);
+        assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"last"[..]));
+        assert_eq!(tablet.read_at(b"k", 2).unwrap(), None);
+
+        tablet.checkpoint().unwrap();
+    }
+
+    {
+        let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
+        assert_eq!(tablet.current_sequence(), 2);
+        assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"last"[..]));
+        assert_eq!(tablet.read_at(b"k", 2).unwrap(), None);
+        assert_eq!(tablet.read_latest(b"other"), Some(&b"independent"[..]));
+
+        let third = tablet
+            .prepare_write(
+                3,
+                2,
+                vec![
+                    TabletMutation::Put {
+                        key: b"k".to_vec(),
+                        value: b"before".to_vec(),
+                    },
+                    TabletMutation::Put {
+                        key: b"k".to_vec(),
+                        value: b"after".to_vec(),
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(tablet.commit(third).unwrap(), 3);
+        tablet.publish_checkpoint().unwrap();
+    }
+
+    let tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
+    assert_eq!(tablet.current_sequence(), 3);
+    assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"last"[..]));
+    assert_eq!(tablet.read_at(b"k", 2).unwrap(), None);
+    assert_eq!(tablet.read_at(b"k", 3).unwrap(), Some(&b"after"[..]));
+    assert_eq!(tablet.read_latest(b"other"), Some(&b"independent"[..]));
+
+    let _ = fs::remove_file(&wal_path);
+    let _ = fs::remove_file(&checkpoint);
+}
