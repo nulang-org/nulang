@@ -273,10 +273,7 @@ impl FileWal {
         descriptor: &TabletDescriptor,
         base_sequence: u64,
     ) -> Result<(), WalError> {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(path)?;
+        let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
         let header = encode_wal_header(
             base_sequence,
             Some(descriptor.id()),
