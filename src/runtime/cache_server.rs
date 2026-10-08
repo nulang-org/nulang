@@ -65,6 +65,7 @@ pub enum CacheServerError {
     Io(io::Error),
     DispatchConfig(CacheDispatchConfigError),
     RedirectModeRequired,
+    DurabilityPoisoned,
     InvalidConfig(&'static str),
 }
 
@@ -524,6 +525,7 @@ impl CacheShardServer {
     /// Drive one reactor iteration. A caller-supplied timeout is capped by the
     /// next expiration sweep deadline so TTL reclamation progresses while idle.
     pub fn poll_once(&mut self, timeout: Option<Duration>) -> Result<(), CacheServerError> {
+        self.ensure_durability_healthy()?;
         let timeout = self.poll_timeout(timeout);
         self.poll.poll(&mut self.events, timeout)?;
 
@@ -546,10 +548,21 @@ impl CacheShardServer {
                 WAKE_TOKEN => self.handle_wake()?,
                 token => self.connection_ready(token, event)?,
             }
+            // Never serve another ready connection after one mutation poisons
+            // the journal. The current connection has already been closed.
+            self.ensure_durability_healthy()?;
         }
 
         self.sweep_expired_if_due();
         Ok(())
+    }
+
+    fn ensure_durability_healthy(&self) -> Result<(), CacheServerError> {
+        if self.store.durability_status().poisoned {
+            Err(CacheServerError::DurabilityPoisoned)
+        } else {
+            Ok(())
+        }
     }
 
     fn poll_timeout(&self, requested: Option<Duration>) -> Option<Duration> {
@@ -731,6 +744,13 @@ impl CacheShardServer {
                 connection.compact_input();
                 return Ok(());
             };
+
+            // A failed WAL append may occur after the volatile mutation.
+            // Stop processing this RESP pipeline *before* the next GET/EXISTS
+            // can observe the unacknowledged value.
+            if self.store.durability_status().poisoned {
+                return Err(CachePipelineError::DurabilityPoisoned);
+            }
 
             match submit.asking_update {
                 CacheAskingUpdate::Unchanged => {}
@@ -1038,6 +1058,72 @@ mod tests {
             Some(CacheValueView::Bytes(b"value"))
         );
 
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    #[test]
+    fn poisoned_journal_halts_reactor_before_following_pipelined_get() {
+        let wal_path = test_path("failed-journal-wal");
+        let placement = CacheSlotMap::new_local(1, 1).unwrap();
+        let owner = placement.owner_for_slot(0).unwrap();
+        let (channels, mut inboxes) = CacheDispatchChannels::new(1, 32).unwrap();
+        let mut endpoints = CacheEndpointMap::new();
+        endpoints.insert(owner, CacheAdvertisedEndpoint::new("127.0.0.1", 7000));
+        let dispatcher = CacheDispatcher::new(1, 0, placement, channels)
+            .unwrap()
+            .with_cluster_redirects(endpoints);
+
+        let wal = CacheWal::create_after(&wal_path, 0).unwrap();
+        let durable =
+            DurableCacheStore::with_wal(CacheStore::new(), wal, CacheDurabilityMode::SyncedJournal)
+                .unwrap();
+        let mut server = CacheShardServer::bind_durable(
+            "127.0.0.1:0".parse().unwrap(),
+            dispatcher,
+            inboxes.remove(0),
+            durable,
+            CacheServerConfig::default(),
+            CacheServerClock::new(),
+        )
+        .unwrap();
+
+        // Replace the WAL writer with a read-only descriptor after startup.
+        // The SET mutates volatile state, but its journal append must fail.
+        if let CacheServerStore::Durable(ref mut durable) = server.store {
+            durable.make_wal_readonly_for_test(&wal_path).unwrap();
+        } else {
+            panic!("expected journal-backed cache server");
+        }
+
+        let mut client = StdTcpStream::connect(server.local_addr().unwrap()).unwrap();
+        client.set_nodelay(true).unwrap();
+        client
+            .write_all(
+                b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n",
+            )
+            .unwrap();
+
+        let mut halted = false;
+        for _ in 0..16 {
+            match server.poll_once(Some(Duration::from_millis(10))) {
+                Err(CacheServerError::DurabilityPoisoned) => {
+                    halted = true;
+                    break;
+                }
+                Ok(()) => {}
+                Err(other) => panic!("unexpected server error: {other:?}"),
+            }
+        }
+        assert!(halted, "reactor must halt after a WAL append failure");
+        assert!(server.durability_status().poisoned);
+        assert_eq!(server.store().len(), 1, "SET already mutated volatile state");
+        assert!(matches!(
+            server.poll_once(Some(Duration::from_millis(0))),
+            Err(CacheServerError::DurabilityPoisoned)
+        ));
+
+        drop(client);
+        drop(server);
         let _ = std::fs::remove_file(wal_path);
     }
 

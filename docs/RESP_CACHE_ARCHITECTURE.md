@@ -197,11 +197,15 @@ The local acknowledgement model is now explicit through
   operation succeeds, without forcing a data sync;
 - `SyncedJournal`: append and `sync_data` before the operation succeeds.
 
-Multi-key mutations are encoded as one WAL batch record. If journaling fails
-after the in-memory mutation, the durability wrapper poisons itself and refuses
-all subsequent mutations. Because a shard executes one command at a time, this
-provides fail-stop behavior before a response or later command can observe a
-state transition that was not journaled.
+Multi-key mutations are encoded as one WAL batch record. If journaling
+fails after an in-memory mutation, the durability wrapper poisons itself.
+The RESP reactor now closes the affected pipeline immediately and exits with
+`DurabilityPoisoned` before serving another connection; it also rejects any
+subsequent `poll_once` calls against the poisoned store. This avoids returning
+an unacknowledged volatile value to a later RESP GET, but does not make
+mutate-before-append atomic. Embedders using `DurableCacheStore` directly must
+enforce their own fail-stop policy. WAL-before-visibility remains a follow-up
+requirement for fully transactional acknowledgement semantics.
 
 `snapshot_and_rotate` publishes a durable snapshot at the current WAL
 sequence and then atomically installs a new WAL whose base sequence equals that
