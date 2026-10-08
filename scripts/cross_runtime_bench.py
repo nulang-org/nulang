@@ -107,13 +107,17 @@ def build_commands(selected: list[str]) -> dict[str, list[str]]:
     BUILD.mkdir(parents=True, exist_ok=True)
     commands: dict[str, list[str]] = {}
 
-    for runtime in ("nulang", "nulang-aot"):
+    for runtime in ("nulang", "nulang-jit", "nulang-aot"):
         if runtime not in selected:
             continue
         if shutil.which("cargo") is None:
             raise RuntimeError("cargo is required for the Nulang benchmark")
-        backend = "aot" if runtime == "nulang-aot" else "bytecode"
-        features = "savina-bench,native-codegen" if backend == "aot" else "savina-bench"
+        backend = runtime.removeprefix("nulang-") if runtime != "nulang" else "bytecode"
+        features = (
+            "savina-bench,native-codegen"
+            if backend in {"jit", "aot"}
+            else "savina-bench"
+        )
         # Build each distinct Cargo feature set outside measured rounds.
         # Copy immediately so a subsequent cargo build with different features
         # cannot overwrite a command's executable or silently relabel data.
@@ -319,7 +323,7 @@ def main() -> int:
     parser.add_argument(
         "--runtimes",
         default="nulang,rust,go,erlang",
-        help="comma-separated subset of nulang,nulang-aot,rust,go,erlang",
+        help="comma-separated subset of nulang,nulang-jit,nulang-aot,rust,go,erlang",
     )
     parser.add_argument(
         "--cpu-mode",
@@ -338,7 +342,7 @@ def main() -> int:
         parser.error("--runs must be >= 1 and --warmup must be >= 0")
 
     selected = [item.strip() for item in args.runtimes.split(",") if item.strip()]
-    unknown = sorted(set(selected) - {"nulang", "nulang-aot", "rust", "go", "erlang"})
+    unknown = sorted(set(selected) - {"nulang", "nulang-jit", "nulang-aot", "rust", "go", "erlang"})
     if unknown:
         parser.error(f"unknown runtimes: {', '.join(unknown)}")
 
