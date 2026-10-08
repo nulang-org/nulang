@@ -1054,7 +1054,7 @@ fn view() -> Html {
                 < rendered.find("/app.client.js").unwrap()
         );
         assert!(rendered.contains("session-1"));
-        assert!(rendered.contains("\\"9\\""));
+        assert!(rendered.contains(r#""9""#));
     }
 
     #[test]
