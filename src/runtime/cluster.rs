@@ -844,7 +844,7 @@ impl ClusterState {
         // active, probationary, or passive. Anything else (a Joining
         // seed awaiting its first heartbeat, a demoted probationary)
         // goes to the passive pool so the repair path can find it.
-        let homeless: Vec<NodeId> = self
+        let mut homeless: Vec<NodeId> = self
             .members
             .values()
             .filter(|info| {
@@ -856,6 +856,12 @@ impl ClusterState {
             })
             .map(|info| info.node_id)
             .collect();
+        // The simulator installs a seeded RNG, but HashMap has an
+        // independent random iteration order. Canonicalize the input to
+        // seeded repair choices without adding sort cost in production.
+        if self.rng.is_some() {
+            homeless.sort_unstable();
+        }
         for node_id in homeless {
             if self.passive_view.len() < self.passive_view_size {
                 self.passive_view.push(node_id);
@@ -961,6 +967,7 @@ impl ClusterState {
         // ------------------------------------------------------------------
         if now.duration_since(self.last_heartbeat_sent) >= self.heartbeat_interval {
             self.last_heartbeat_sent = now;
+            let heartbeat_start = actions.len();
 
             for info in self.members.values() {
                 if info.node_id == self.local_node {
@@ -980,6 +987,14 @@ impl ClusterState {
                         addr: info.address,
                     });
                 }
+            }
+            // Only seeded simulations pay to canonicalize emission order;
+            // the unseeded transport path remains unchanged.
+            if self.rng.is_some() {
+                actions[heartbeat_start..].sort_unstable_by_key(|action| match action {
+                    ClusterAction::SendHeartbeat { to, .. } => *to,
+                    _ => unreachable!("heartbeat slice only contains SendHeartbeat actions"),
+                });
             }
         }
 
@@ -1269,19 +1284,34 @@ impl ClusterState {
     /// Returns up to `max_entries` entries from the membership table.
     /// If the table is smaller than `max_entries`, all entries are returned.
     pub fn gossip_payload(&self, max_entries: usize) -> Vec<NodeGossip> {
+        let to_gossip = |info: &NodeInfo| NodeGossip {
+            node_id: info.node_id,
+            address: info.address,
+            status: info.status,
+            incarnation: info
+                .metadata
+                .get("_incarnation")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1),
+        };
+
+        if self.rng.is_some() {
+            // The seeded simulator must serialize the same membership
+            // subset in the same order across independently randomized maps.
+            let mut members: Vec<&NodeInfo> = self.members.values().collect();
+            members.sort_unstable_by_key(|info| info.node_id);
+            return members
+                .into_iter()
+                .take(max_entries)
+                .map(to_gossip)
+                .collect();
+        }
+
+        // Preserve the allocation-free production iteration path.
         self.members
             .values()
             .take(max_entries)
-            .map(|info| NodeGossip {
-                node_id: info.node_id,
-                address: info.address,
-                status: info.status,
-                incarnation: info
-                    .metadata
-                    .get("_incarnation")
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(1),
-            })
+            .map(to_gossip)
             .collect()
     }
 
@@ -1454,6 +1484,11 @@ impl ClusterState {
             .collect();
         if healthy.is_empty() {
             return Vec::new();
+        }
+        // Seeded simulations must select from a stable candidate order.
+        // Unseeded production keeps the existing O(N) collection path.
+        if self.rng.is_some() {
+            healthy.sort_unstable_by_key(|(node_id, _)| *node_id);
         }
 
         // Partial Fisher-Yates: swap a random remaining element into
@@ -2717,5 +2752,118 @@ mod tests {
             .iter()
             .any(|a| matches!(a, ClusterAction::NodeRemoved { .. })));
         assert!(!cs.is_removed(b));
+    }
+
+    #[test]
+    fn test_seeded_gossip_peer_order_independent_of_hash_map_seed() {
+        fn seeded_cluster() -> ClusterState {
+            let local = addr(9600);
+            let mut cluster = ClusterState::new(NodeId::new(&local), local);
+            cluster.set_rng(Box::new(crate::dst::DeterministicRng::new(42)));
+            for port in 9601..=9624 {
+                let peer = addr(port);
+                cluster.handle_heartbeat(NodeId::new(&peer), peer);
+            }
+            cluster
+        }
+
+        // Two independently allocated HashMaps use different random hash
+        // seeds, but an explicitly seeded simulation must draw identical
+        // peers from an identical logical membership set.
+        let mut first = seeded_cluster();
+        let mut second = seeded_cluster();
+        assert_eq!(
+            first.pick_gossip_targets(24),
+            second.pick_gossip_targets(24),
+            "seeded gossip order must not depend on HashMap iteration"
+        );
+    }
+
+    #[test]
+    fn test_seeded_repair_peer_order_independent_of_hash_map_seed() {
+        fn seeded_cluster() -> ClusterState {
+            let local = addr(9630);
+            let mut cluster = ClusterState::new(NodeId::new(&local), local);
+            cluster.set_rng(Box::new(crate::dst::DeterministicRng::new(43)));
+            for port in 9631..=9642 {
+                cluster.join_cluster(addr(port));
+            }
+            cluster
+        }
+
+        let mut first = seeded_cluster();
+        let mut second = seeded_cluster();
+        first.tick();
+        second.tick();
+        assert_eq!(
+            first.passive_view(),
+            second.passive_view(),
+            "seeded repair must not inherit HashMap iteration order"
+        );
+        assert_eq!(
+            first
+                .probationary()
+                .iter()
+                .map(|(node, _)| *node)
+                .collect::<Vec<_>>(),
+            second
+                .probationary()
+                .iter()
+                .map(|(node, _)| *node)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_seeded_gossip_payload_order_and_limit_are_stable() {
+        fn seeded_cluster() -> ClusterState {
+            let local = addr(9650);
+            let mut cluster = ClusterState::new(NodeId::new(&local), local);
+            cluster.set_rng(Box::new(crate::dst::DeterministicRng::new(44)));
+            for port in 9651..=9674 {
+                let peer = addr(port);
+                cluster.handle_heartbeat(NodeId::new(&peer), peer);
+            }
+            cluster
+        }
+
+        let first = seeded_cluster();
+        let second = seeded_cluster();
+        assert_eq!(
+            first.gossip_payload(12),
+            second.gossip_payload(12),
+            "seeded gossip membership subsets must not vary with HashMap hash seeds"
+        );
+    }
+
+    #[test]
+    fn test_seeded_heartbeat_action_order_is_stable() {
+        fn seeded_cluster() -> ClusterState {
+            let local = addr(9680);
+            let mut cluster = ClusterState::new(NodeId::new(&local), local);
+            cluster.set_rng(Box::new(crate::dst::DeterministicRng::new(45)));
+            for port in 9681..=9692 {
+                cluster.join_cluster(addr(port));
+            }
+            cluster.last_heartbeat_sent = cluster.now() - Duration::from_secs(1);
+            cluster
+        }
+
+        let mut first = seeded_cluster();
+        let mut second = seeded_cluster();
+        let heartbeat_nodes = |actions: Vec<ClusterAction>| {
+            actions
+                .into_iter()
+                .filter_map(|action| match action {
+                    ClusterAction::SendHeartbeat { to, .. } => Some(to),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            heartbeat_nodes(first.tick()),
+            heartbeat_nodes(second.tick()),
+            "seeded simulations must deliver heartbeat actions in a stable order"
+        );
     }
 }
