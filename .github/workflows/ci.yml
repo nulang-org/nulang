@@ -30,6 +30,9 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Test Web UI runtime protocol
+        run: node --test tests/web_ui_runtime.test.cjs
+
       - name: Enable corepack
         run: corepack enable
 
