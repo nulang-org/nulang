@@ -4,6 +4,10 @@
 - **The cross-runtime runner fails closed on missing, duplicate, zero-duration, or incorrect-message-count measurements.** JSON schema 3 records comparator families, and focused Python ingestion tests precede benchmark execution in CI.
 - **The comparator is single-worker only, matching the current one-shard Nulang harness.** No multicore actor scaling or performance ranking is claimed without matched sharded workloads and repeated measurements on controlled hardware.
 
+### Ractor actor-density diagnostic — 2026-10-08
+- **Nulang's existing actor-density probe can now be run against a Ractor `spawn_instant` companion on the same host.** Fresh-process measurements report actor publication cost and Linux RSS after startup settlement; results retain explicit lifecycle comparability caveats.
+- **The new Python density runner validates actor counts, elapsed time, and RSS availability before collecting medians.** A 1,000-actor Ractor smoke test and parser unit tests run in the cross-runtime workflow; external framework dependencies are locked in their isolated Cargo workspace.
+
 ### Receiver-acknowledged CRDT delta synchronization — 2026-10-07
 - **Per-peer CRDT frontiers now advance only after a matching NUL0 acknowledgement arrives from the intended receiver.** Dropped or unacknowledged batches remain retransmittable from that peer's last proven frontier instead of disappearing behind sender-side optimistic state.
 - **Peer recovery invalidates stale receiver knowledge.** A `Failed → Healthy` transition through heartbeat or authoritative gossip forgets prior CRDT frontier/correlation state so a restarted process receives fresh state.
