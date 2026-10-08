@@ -679,4 +679,106 @@ mod tests {
         assert_eq!(journal.committed_cursor("orders", 0, "billing"), 1);
         let _ = fs::remove_dir_all(root);
     }
+    #[test]
+    fn follower_prepare_fsync_ack_is_observed_but_not_committed() {
+        use std::collections::HashMap;
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use crate::runtime::{
+            DeterministicNetworkTransport, FabricStreamConfig, IncomingPacket, NodeId,
+            OutgoingPacket, Runtime,
+        };
+
+        type Bus = Arc<parking_lot::Mutex<HashMap<
+            NodeId,
+            (
+                std::sync::mpsc::SyncSender<IncomingPacket>,
+                std::sync::mpsc::SyncSender<OutgoingPacket>,
+            ),
+        >>>;
+        fn node(addr: SocketAddr, bus: Bus) -> Runtime {
+            let mut runtime = Runtime::new();
+            runtime.install_virtual_clock();
+            let transport = DeterministicNetworkTransport::bind_with_bus(addr, bus).unwrap();
+            transport.register_on_bus();
+            runtime.enable_distribution_with_transport(Box::new(transport)).unwrap();
+            runtime
+        }
+        let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let a_addr: SocketAddr = "127.0.0.1:39211".parse().unwrap();
+        let b_addr: SocketAddr = "127.0.0.1:39212".parse().unwrap();
+        let a_id = NodeId::new(&a_addr);
+        let b_id = NodeId::new(&b_addr);
+        let mut a = node(a_addr, bus.clone());
+        let mut b = node(b_addr, bus);
+        a.distributed.cluster.as_mut().unwrap().handle_heartbeat(b_id, b_addr);
+        b.distributed.cluster.as_mut().unwrap().handle_heartbeat(a_id, a_addr);
+        let placement = a.fabric_stream_placement("orders", 0, 2).unwrap();
+        let a_root = temp_root("network-a");
+        let b_root = temp_root("network-b");
+        a.fabric_stream_open(&a_root).unwrap();
+        b.fabric_stream_open(&b_root).unwrap();
+        let (leader, follower, leader_root, follower_root) = if placement.leader == a_id {
+            (&mut a, &mut b, &a_root, &b_root)
+        } else {
+            (&mut b, &mut a, &b_root, &a_root)
+        };
+
+        leader.fabric_stream_create("orders", FabricStreamConfig::default()).unwrap();
+        leader.fabric_stream_replicated_append("orders", 0, 2, b"event").unwrap();
+        follower.process_network();
+        leader.process_network();
+        follower.process_network();
+        assert_eq!(leader.fabric_stream_committed_sequence("orders").unwrap(), 1);
+        assert_eq!(follower.fabric_stream_committed_sequence("orders").unwrap(), 1);
+
+        let change = FabricConsumerProgressChange {
+            stream: "orders".into(),
+            partition: 0,
+            consumer: "billing".into(),
+            epoch: 1,
+            generation: 1,
+            metadata_sequence: 1,
+            previous_metadata_sequence: 0,
+            committed_cursor: 1,
+            acked_gaps: vec![],
+        };
+        leader.fabric_consumer_progress_stage(change).unwrap();
+        assert_eq!(
+            leader.fabric_consumer_progress_observed_votes("orders", 0, 1).unwrap().len(), 1
+        );
+        assert_eq!(leader.fabric_consumer_progress_dispatch_prepare("orders", 0, 1).unwrap(), 1);
+        follower.process_network();
+        leader.process_network();
+        let observed = leader.fabric_consumer_progress_observed_votes("orders", 0, 1).unwrap();
+        assert_eq!(observed.len(), 2);
+        assert!(observed.contains(&placement.leader));
+        assert!(observed.contains(&if placement.leader == a_id { b_id } else { a_id }));
+
+        let local = FileFabricConsumerProgressJournal::open(
+            leader_root.join("orders").join("consumer_progress")
+        ).unwrap();
+        let remote = FileFabricConsumerProgressJournal::open(
+            follower_root.join("orders").join("consumer_progress")
+        ).unwrap();
+        assert_eq!(local.pending_sequence(), Some(1));
+        assert_eq!(remote.pending_sequence(), Some(1));
+        assert_eq!(local.committed_cursor("orders", 0, "billing"), 0);
+        assert_eq!(remote.committed_cursor("orders", 0, "billing"), 0);
+        let _ = fs::remove_dir_all(a_root);
+        let _ = fs::remove_dir_all(b_root);
+    }
+
+    #[test]
+    fn prepare_wire_rejects_tampering_and_unmatched_sender() {
+        let change = change(1, 0, 1);
+        let policy = policy(vec![10, 11]);
+        let mut wire = FabricConsumerProgressPrepareWire::new(
+            change, policy, 1
+        ).unwrap();
+        assert_eq!(wire.from_wire_bytes(&wire.to_wire_bytes().unwrap()).is_ok(), true);
+        wire.change.committed_cursor = 2;
+        assert!(wire.verify().is_err());
+    }
+
 }
