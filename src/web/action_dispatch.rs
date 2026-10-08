@@ -7,11 +7,16 @@
 
 use crate::bytecode::CodeModule;
 use crate::vm::{Value, VM};
-use nulang_ui_protocol::{ActionPlacement, HostToRuntimeMessage};
+use nulang_ui_protocol::{ActionPlacement, HostToRuntimeMessage, Revision, UiDocument, WireValue};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiActionDispatchError {
     InvalidEnvelope(String),
+    InvalidDocument(String),
+    DocumentMismatch,
+    RevisionMismatch { expected: Revision, found: Revision },
+    UnregisteredAction(String),
+    UnexpectedPayload,
     ClientPlacement,
     UnknownAction(String),
     RequiresBindingPlan {
@@ -25,6 +30,20 @@ impl std::fmt::Display for UiActionDispatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidEnvelope(message) => write!(f, "invalid UI action envelope: {message}"),
+            Self::InvalidDocument(message) => write!(f, "invalid authoritative UI document: {message}"),
+            Self::DocumentMismatch => f.write_str("UI action targets another document"),
+            Self::RevisionMismatch { expected, found } => write!(
+                f,
+                "UI action revision mismatch: expected {}, found {}",
+                expected.0, found.0
+            ),
+            Self::UnregisteredAction(action) => write!(
+                f,
+                "UI action '{action}' is not registered as a server action on this document"
+            ),
+            Self::UnexpectedPayload => f.write_str(
+                "zero-argument UI action received data without a compiler-owned binding plan"
+            ),
             Self::ClientPlacement => {
                 f.write_str("client-placement action cannot be executed by the server runtime")
             }
@@ -97,6 +116,75 @@ pub fn invoke_zero_arg_action(
     message: &HostToRuntimeMessage,
 ) -> Result<Value, UiActionDispatchError> {
     let resolved = resolve_zero_arg_action(module, message)?;
+    let mut vm = VM::new();
+    vm.load_module(module.clone());
+    vm.call_function(0, resolved.code_offset, &[])
+        .map_err(|error| UiActionDispatchError::Execution(error.to_string()))
+}
+
+/// Resolve a zero-argument server action against a *trusted, server-owned* UI
+/// document. A client-supplied document must never be used as the authority.
+/// This is a dispatch building block; it does not provide authentication,
+/// authorization or idempotent execution on its own.
+pub fn resolve_document_zero_arg_action(
+    module: &CodeModule,
+    document: &UiDocument,
+    message: &HostToRuntimeMessage,
+) -> Result<ResolvedUiAction, UiActionDispatchError> {
+    document
+        .validate()
+        .map_err(|error| UiActionDispatchError::InvalidDocument(error.to_string()))?;
+    message
+        .validate()
+        .map_err(|error| UiActionDispatchError::InvalidEnvelope(error.to_string()))?;
+
+    let HostToRuntimeMessage::InvokeAction { request, .. } = message;
+    if request.document_id != document.document_id {
+        return Err(UiActionDispatchError::DocumentMismatch);
+    }
+    if request.revision != document.revision {
+        return Err(UiActionDispatchError::RevisionMismatch {
+            expected: document.revision,
+            found: request.revision,
+        });
+    }
+    if request.placement != ActionPlacement::Server {
+        return Err(UiActionDispatchError::ClientPlacement);
+    }
+    let registered = document.nodes.iter().any(|node| {
+        node.actions.iter().any(|binding| {
+            binding.action_id == request.action_id
+                && binding.placement == ActionPlacement::Server
+        })
+    });
+    if !registered {
+        return Err(UiActionDispatchError::UnregisteredAction(
+            request.action_id.as_str().to_owned(),
+        ));
+    }
+
+    // A zero-argument action has no defined payload decoder. Do not silently
+    // discard client-supplied fields, or reinterpret them as VM registers.
+    let payload_empty = match &request.payload {
+        WireValue::Null => true,
+        WireValue::Object(fields) => fields.is_empty(),
+        _ => false,
+    };
+    if !payload_empty {
+        return Err(UiActionDispatchError::UnexpectedPayload);
+    }
+    resolve_zero_arg_action(module, message)
+}
+
+/// Execute only after binding the action to the current, authoritative UI
+/// document. The host must authenticate the caller and deduplicate action
+/// idempotency keys before invoking effects with external side effects.
+pub fn invoke_document_zero_arg_action(
+    module: &CodeModule,
+    document: &UiDocument,
+    message: &HostToRuntimeMessage,
+) -> Result<Value, UiActionDispatchError> {
+    let resolved = resolve_document_zero_arg_action(module, document, message)?;
     let mut vm = VM::new();
     vm.load_module(module.clone());
     vm.call_function(0, resolved.code_offset, &[])
