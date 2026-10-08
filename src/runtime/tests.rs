@@ -4338,6 +4338,70 @@ fn test_legacy_checkpoint_is_rejected_after_atomic_workflow_tail_begins() {
 }
 
 #[test]
+fn test_open_activation_intermediate_events_extend_atomic_tail() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor(
+        "AtomicIntermediateEvents",
+        Box::new(Vec::new),
+        HashMap::new(),
+    );
+    declare_test_behavior(&mut rt, actor_id, "run");
+    let behavior_id = rt.behavior_id_for(actor_id, "run").unwrap();
+    let activation =
+        workflow::commit_workflow_command(&mut rt, actor_id, behavior_id, Vec::new()).unwrap();
+
+    let command_tail = rt
+        .persistence
+        .load_durable_tail_position(actor_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(command_tail.sequence, activation.command_sequence);
+
+    rt.emit_event(actor_id, "Custom", &[Value::int(1)]);
+    let custom_tail = rt
+        .persistence
+        .load_durable_tail_position(actor_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(custom_tail.sequence, command_tail.sequence + 1);
+    assert_eq!(
+        rt.persistence.latest_sequence(actor_id),
+        custom_tail.sequence
+    );
+
+    rt.append_timer_set(actor_id, "wake", 250).unwrap();
+    let timer_tail = rt
+        .persistence
+        .load_durable_tail_position(actor_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(timer_tail.sequence, custom_tail.sequence + 1);
+    assert_eq!(
+        rt.persistence.latest_sequence(actor_id),
+        timer_tail.sequence
+    );
+
+    rt.append_signal_received(actor_id, "go", Some("payload".to_string()))
+        .unwrap();
+    let signal_tail = rt
+        .persistence
+        .load_durable_tail_position(actor_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(signal_tail.sequence, timer_tail.sequence + 1);
+    assert_eq!(
+        rt.persistence.latest_sequence(actor_id),
+        signal_tail.sequence
+    );
+
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert!(
+        snapshot.sequence < activation.command_sequence,
+        "intermediate activation events must keep the last completed-state snapshot at the pre-command boundary"
+    );
+}
+
+#[test]
 fn test_workflow_recovery_handles_new_event_variants() {
     let mut rt = Runtime::new();
     let mut models = HashMap::new();
