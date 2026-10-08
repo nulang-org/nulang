@@ -1070,6 +1070,16 @@ pub fn is_all_int(func: &mir::Function) -> bool {
             return false;
         }
     }
+    // A declared Int type is insufficient when directly constructed MIR
+    // contains a Return(None): the emitted tagged nil must not be passed
+    // through the raw integer boxing wrapper.
+    if func
+        .blocks
+        .iter()
+        .any(|block| matches!(&block.terminator, mir::Terminator::Return(None)))
+    {
+        return false;
+    }
     // The current boxing wrapper always tags an unboxed raw return as Int.
     // A unit/void function instead returns tagged nil, so compiling it
     // unboxed would silently turn nil into integer zero at the entry point.
