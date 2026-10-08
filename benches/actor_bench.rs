@@ -297,7 +297,14 @@ fn bench_selective_receive_tail_commit(c: &mut Criterion) {
     for depth in [64usize, 1024, 16_384] {
         group.bench_with_input(BenchmarkId::from_parameter(depth), &depth, |b, &depth| {
             b.iter_batched_ref(
-                || selective_receive_mailbox(depth, HIT),
+                || {
+                    let mut mailbox = selective_receive_mailbox(depth, HIT);
+                    // Build the receive index outside the timed section; the
+                    // measured loop isolates repeated terminal commits.
+                    assert!(mailbox.receive_match(&[HIT]).is_some());
+                    mailbox.reset_receive_match();
+                    mailbox
+                },
                 |mailbox| {
                     for _ in 0..ROUNDS {
                         black_box(mailbox.receive_match(black_box(&[HIT])));
