@@ -116,12 +116,7 @@ fn promoted_replica_replays_acknowledged_record_without_consumer_state_replicati
 
     // Successful ACK is durable *on the old leader*, not on its followers.
     let original_delivery = nodes[old_leader]
-        .fabric_stream_deliver_consumer(
-            "consumer-failover",
-            "billing",
-            10,
-            Duration::from_secs(30),
-        )
+        .fabric_stream_deliver_consumer("consumer-failover", "billing", 10, Duration::from_secs(30))
         .unwrap();
     assert_eq!(original_delivery.len(), 1);
     assert_eq!(original_delivery[0].leader_epoch, Some(1));
@@ -224,14 +219,16 @@ fn promoted_replica_replays_acknowledged_record_without_consumer_state_replicati
     assert!(nodes[candidate]
         .fabric_stream_read_consumer("consumer-failover", "billing", 10)
         .is_err());
-    assert!(nodes[candidate]
-        .fabric_stream_deliver_consumer(
-            "consumer-failover",
-            "billing",
-            10,
-            Duration::from_secs(30),
-        )
-        .is_err());
+    assert!(
+        nodes[candidate]
+            .fabric_stream_deliver_consumer(
+                "consumer-failover",
+                "billing",
+                10,
+                Duration::from_secs(30),
+            )
+            .is_err()
+    );
     assert!(nodes[candidate]
         .fabric_stream_ack_consumer_fenced("consumer-failover", "billing", 1, 1)
         .is_err());
