@@ -44,8 +44,11 @@ fn is_managed_directory(path: &Path) -> Result<bool, WalError> {
     // Neither a symlink to the tablet directory nor a symlink to an
     // individual WAL may redirect public access into a managed root.
     match fs::canonicalize(parent) {
-        Ok(real_parent) if has_marker(&real_parent)? => return Ok(true),
-        Ok(_) => {}
+        Ok(real_parent) => {
+            if has_marker(&real_parent)? {
+                return Ok(true);
+            }
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
