@@ -295,7 +295,10 @@ impl DurableCacheStore {
         self.record(CacheWalMutation::Batch { mutations })?;
         for key in &live {
             let removed = self.store.delete_at(key, store_now_ms);
-            debug_assert!(removed, "preflighted live key disappeared during batch delete");
+            debug_assert!(
+                removed,
+                "preflighted live key disappeared during batch delete"
+            );
         }
         Ok(live.len())
     }
@@ -1271,10 +1274,9 @@ mod tests {
             DurableCacheStore::with_wal(store, wal, CacheDurabilityMode::SyncedJournal).unwrap();
 
         assert_eq!(
-            durable.delete_many_at(
-                &[b"a".as_slice(), b"b".as_slice(), b"a".as_slice()],
-                0,
-            ).unwrap(),
+            durable
+                .delete_many_at(&[b"a".as_slice(), b"b".as_slice(), b"a".as_slice()], 0)
+                .unwrap(),
             2,
         );
         assert_eq!(durable.durability_status().wal_last_sequence, Some(1));
@@ -1301,7 +1303,10 @@ mod tests {
             durable.expire_ms(b"session", 500, 0, 1_000),
             Err(CacheDurabilityError::Persistence(_))
         ));
-        assert_eq!(durable.store().snapshot_entries(0)[0].remaining_ttl_ms, None);
+        assert_eq!(
+            durable.store().snapshot_entries(0)[0].remaining_ttl_ms,
+            None
+        );
         assert!(durable.is_poisoned());
         let _ = fs::remove_file(wal_path);
     }
