@@ -11,7 +11,7 @@ function boot({ withAction = false, fetchResponse, bootstrapSnapshot } = {}) {
   const action = {
     dataset: { action: 'save', actionPlacement: 'server' },
     tagName: 'FORM',
-    closest: () => null,
+    closest(selector) { return selector === 'form' ? this : null; },
     addEventListener(name, fn) { listeners.set(name, fn); }
   };
   const document = {
