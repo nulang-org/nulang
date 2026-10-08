@@ -19,7 +19,8 @@ class DispatchStageProfileContracts(unittest.TestCase):
         self.assertIn("benchmark_jit_compiled_count()", source)
         self.assertIn("pub(crate) fn benchmark_jit_compiled_count(&self)", runtime)
         self.assertIn("jit_compiled_regions", source)
-        self.assertIn("jit_execution_verified", source)
+        self.assertIn("jit_compilation_verified", source)
+        self.assertNotIn("jit_execution_verified", source)
         self.assertNotIn("warmed bytecode/JIT actor must process every message", source)
 
     def test_ci_executes_stage_profile_contracts(self):
