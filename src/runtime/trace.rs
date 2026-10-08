@@ -225,8 +225,14 @@ mod tests {
 
     #[test]
     fn formatted_trace_ids_keep_w3c_width_without_heap_strings() {
-        assert_eq!(format!("{}", TraceHexId(0xabu128)), format!("{:032x}", 0xabu128));
-        assert_eq!(format!("{}", SpanHexId(0xabu64)), format!("{:016x}", 0xabu64));
+        assert_eq!(
+            format!("{}", TraceHexId(0xabu128)),
+            format!("{:032x}", 0xabu128)
+        );
+        assert_eq!(
+            format!("{}", SpanHexId(0xabu64)),
+            format!("{:016x}", 0xabu64)
+        );
         assert_eq!(format!("{}", SpanHexId(0)), "0000000000000000");
     }
 
