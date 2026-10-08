@@ -212,7 +212,7 @@ verify_nula_source() {
 
 while IFS= read -r -d '' file; do
     verify_file "$file" "${file#$DOCS_DIR/}"
-done < <(find "$DOCS_DIR" -name '*.md' -o -name '*.mdx' -print0)
+done < <(find "$DOCS_DIR" -type f \( -name '*.md' -o -name '*.mdx' \) -print0)
 
 for file in "${ROOT_DOCS[@]}"; do
     [[ -f "$file" ]] || continue
