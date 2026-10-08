@@ -46,10 +46,8 @@ use std::time::{Duration, Instant};
 use super::fabric_consumer_progress::{
     FabricConsumerProgressAckWire, FabricConsumerProgressCommitAckWire,
     FabricConsumerProgressCommitWire, FabricConsumerProgressPrepareWire,
-    FABRIC_CONSUMER_PROGRESS_ACK_BEHAVIOR,
-    FABRIC_CONSUMER_PROGRESS_COMMIT_ACK_BEHAVIOR,
-    FABRIC_CONSUMER_PROGRESS_COMMIT_BEHAVIOR,
-    FABRIC_CONSUMER_PROGRESS_PREPARE_BEHAVIOR,
+    FABRIC_CONSUMER_PROGRESS_ACK_BEHAVIOR, FABRIC_CONSUMER_PROGRESS_COMMIT_ACK_BEHAVIOR,
+    FABRIC_CONSUMER_PROGRESS_COMMIT_BEHAVIOR, FABRIC_CONSUMER_PROGRESS_PREPARE_BEHAVIOR,
 };
 use super::fabric_stream_cluster::{
     FabricStreamCommitUpdate, FabricStreamReplicaAck, FabricStreamReplicaAppend,
@@ -1636,15 +1634,13 @@ pub fn process_network_packets(
                     ))
                 } else {
                     match object_table.as_slice() {
-                        [(0, bytes)] => {
-                            FabricConsumerProgressPrepareWire::from_wire_bytes(bytes)
-                                .and_then(|prepare| {
-                                    runtime.fabric_consumer_progress_apply_prepare_from_peer(
-                                        &prepare,
-                                        incoming.from_node,
-                                    )
-                                })
-                        }
+                        [(0, bytes)] => FabricConsumerProgressPrepareWire::from_wire_bytes(bytes)
+                            .and_then(|prepare| {
+                                runtime.fabric_consumer_progress_apply_prepare_from_peer(
+                                    &prepare,
+                                    incoming.from_node,
+                                )
+                            }),
                         _ => Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             "Fabric consumer-progress prepare requires one object with id 0",
@@ -1669,8 +1665,8 @@ pub fn process_network_packets(
                                         address,
                                         Packet::ActorMessage {
                                             target_actor: 0,
-                                            behavior_name:
-                                                FABRIC_CONSUMER_PROGRESS_ACK_BEHAVIOR.to_string(),
+                                            behavior_name: FABRIC_CONSUMER_PROGRESS_ACK_BEHAVIOR
+                                                .to_string(),
                                             content_hash: None,
                                             required_protocol_id: None,
                                             payload: Vec::new(),
@@ -1708,15 +1704,13 @@ pub fn process_network_packets(
                     ))
                 } else {
                     match object_table.as_slice() {
-                        [(0, bytes)] => {
-                            FabricConsumerProgressAckWire::from_wire_bytes(bytes)
-                                .and_then(|receipt| {
-                                    runtime.fabric_consumer_progress_record_replica_receipt(
-                                        &receipt,
-                                        incoming.from_node,
-                                    )
-                                })
-                        }
+                        [(0, bytes)] => FabricConsumerProgressAckWire::from_wire_bytes(bytes)
+                            .and_then(|receipt| {
+                                runtime.fabric_consumer_progress_record_replica_receipt(
+                                    &receipt,
+                                    incoming.from_node,
+                                )
+                            }),
                         _ => Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             "Fabric consumer-progress receipt requires one object with id 0",
@@ -1745,15 +1739,13 @@ pub fn process_network_packets(
                     ))
                 } else {
                     match object_table.as_slice() {
-                        [(0, bytes)] => {
-                            FabricConsumerProgressCommitWire::from_wire_bytes(bytes)
-                                .and_then(|update| {
-                                    runtime.fabric_consumer_progress_apply_commit_from_peer(
-                                        &update,
-                                        incoming.from_node,
-                                    )
-                                })
-                        }
+                        [(0, bytes)] => FabricConsumerProgressCommitWire::from_wire_bytes(bytes)
+                            .and_then(|update| {
+                                runtime.fabric_consumer_progress_apply_commit_from_peer(
+                                    &update,
+                                    incoming.from_node,
+                                )
+                            }),
                         _ => Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             "Fabric consumer-progress commit requires one object with id 0",
@@ -1766,26 +1758,31 @@ pub fn process_network_packets(
                         // Never count the transport receipt as a commit vote.
                         if let Ok(bytes) = receipt.to_wire_bytes() {
                             let target = incoming.from_node;
-                            let address = cluster.get_node(target)
+                            let address = cluster
+                                .get_node(target)
                                 .map(|node| node.address)
                                 .or_else(|| transport.connection_addr(target));
                             if let (Some(address), Some(local)) =
                                 (address, runtime.distributed.node_id)
                             {
-                                transport.send(target, address, Packet::ActorMessage {
-                                    target_actor: 0,
-                                    behavior_name:
-                                        FABRIC_CONSUMER_PROGRESS_COMMIT_ACK_BEHAVIOR.to_string(),
-                                    content_hash: None,
-                                    required_protocol_id: None,
-                                    payload: Vec::new(),
-                                    string_table: Vec::new(),
-                                    object_table: vec![(0, bytes)],
-                                    sender_actor: 0,
-                                    sender_node: local,
-                                    priority: MessagePriority::System,
-                                    trace_id: None,
-                                });
+                                transport.send(
+                                    target,
+                                    address,
+                                    Packet::ActorMessage {
+                                        target_actor: 0,
+                                        behavior_name: FABRIC_CONSUMER_PROGRESS_COMMIT_ACK_BEHAVIOR
+                                            .to_string(),
+                                        content_hash: None,
+                                        required_protocol_id: None,
+                                        payload: Vec::new(),
+                                        string_table: Vec::new(),
+                                        object_table: vec![(0, bytes)],
+                                        sender_actor: 0,
+                                        sender_node: local,
+                                        priority: MessagePriority::System,
+                                        trace_id: None,
+                                    },
+                                );
                             }
                         }
                     }
@@ -1810,13 +1807,13 @@ pub fn process_network_packets(
                     ))
                 } else {
                     match object_table.as_slice() {
-                        [(0, bytes)] =>
-                            FabricConsumerProgressCommitAckWire::from_wire_bytes(bytes)
-                                .and_then(|receipt| {
-                                    runtime.fabric_consumer_progress_record_commit_receipt(
-                                        &receipt, incoming.from_node
-                                    )
-                                }),
+                        [(0, bytes)] => FabricConsumerProgressCommitAckWire::from_wire_bytes(bytes)
+                            .and_then(|receipt| {
+                                runtime.fabric_consumer_progress_record_commit_receipt(
+                                    &receipt,
+                                    incoming.from_node,
+                                )
+                            }),
                         _ => Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             "Fabric consumer-progress COMMIT ACK requires one object with id 0",
