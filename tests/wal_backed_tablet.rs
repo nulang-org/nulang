@@ -6,7 +6,7 @@ use nulang::database::store::{WalBackedError, WalBackedTablet};
 use nulang::database::tablet::{
     KeyRange, TabletDescriptor, TabletError, TabletId, TabletMutation, TabletWrite,
 };
-use nulang::database::wal::FileWal;
+use nulang::database::wal::{FileWal, WalError};
 
 static NEXT_STORE: AtomicU64 = AtomicU64::new(1);
 
@@ -214,4 +214,37 @@ fn writer_ownership_survives_wal_reclamation_and_relative_path_aliases() {
 
     let _ = fs::remove_file(&path);
     let _ = fs::remove_file(path.with_extension("checkpoint"));
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_and_hardlink_wal_aliases_fail_closed() {
+    use std::os::unix::fs::symlink;
+
+    let path = temp_wal("aliased_wal");
+    let symlink_path = path.with_extension("symlink");
+    let hardlink_path = path.with_extension("hardlink");
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(&symlink_path);
+    let _ = fs::remove_file(&hardlink_path);
+
+    let writer = WalBackedTablet::open(descriptor(), &path).unwrap();
+    symlink(&path, &symlink_path).unwrap();
+    fs::hard_link(&path, &hardlink_path).unwrap();
+
+    assert_eq!(
+        WalBackedTablet::open(descriptor(), &symlink_path).unwrap_err(),
+        WalBackedError::Wal(WalError::AliasedWalPath)
+    );
+    assert_eq!(
+        WalBackedTablet::open(descriptor(), &hardlink_path).unwrap_err(),
+        WalBackedError::Wal(WalError::AliasedWalPath)
+    );
+
+    drop(writer);
+    fs::remove_file(&symlink_path).unwrap();
+    fs::remove_file(&hardlink_path).unwrap();
+    let reopened = WalBackedTablet::open(descriptor(), &path).unwrap();
+    drop(reopened);
+    let _ = fs::remove_file(&path);
 }
