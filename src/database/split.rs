@@ -62,6 +62,9 @@ struct DiskManifest {
     version: u16,
     parent: DiskDescriptor,
     split: Option<DiskSplit>,
+    // Legacy manifests omit this field and remain published/authoritative.
+    #[serde(default)]
+    preparing: bool,
 }
 
 impl DiskManifest {
@@ -70,6 +73,14 @@ impl DiskManifest {
             version: MANIFEST_VERSION,
             parent: DiskDescriptor::from_tablet(parent),
             split: None,
+            preparing: false,
+        }
+    }
+
+    fn for_preparing_parent(parent: &TabletDescriptor) -> Self {
+        Self {
+            preparing: true,
+            ..Self::for_parent(parent)
         }
     }
 
@@ -83,6 +94,7 @@ impl DiskManifest {
                 right: DiskDescriptor::from_tablet(&plan.right),
                 source_sequence,
             }),
+            preparing: false,
         }
     }
 
@@ -90,7 +102,8 @@ impl DiskManifest {
         self,
         requested_parent: &TabletDescriptor,
     ) -> Result<Option<(TabletSplitPlan, u64)>, SplitError> {
-        if self.version != MANIFEST_VERSION
+        if self.preparing
+            || self.version != MANIFEST_VERSION
             || self.parent != DiskDescriptor::from_tablet(requested_parent)
         {
             return Err(SplitError::InvalidManifest(
@@ -167,12 +180,57 @@ impl SingleNodeSplitStore {
         let parent_wal = root.join("parent.wal");
         let active = if manifest_path.exists() {
             let manifest = read_manifest(&manifest_path)?;
-            match manifest.validate(&parent)? {
-                None => {
-                    verify_published_wal(&parent_wal)?;
-                    Active::Parent(WalBackedTablet::open(parent.clone(), &parent_wal)?)
+            if manifest.preparing {
+                // A preparing record is durable before WAL initialization
+                // and cannot have acknowledged writes. Only an empty/torn
+                // WAL header may be discarded; any WAL records, checkpoint,
+                // or child artifacts mean recovery is ambiguous and must
+                // fail closed instead of silently losing committed data.
+                if manifest.version != MANIFEST_VERSION
+                    || manifest.parent != DiskDescriptor::from_tablet(&parent)
+                    || manifest.split.is_some()
+                {
+                    return Err(SplitError::InvalidManifest(
+                        "invalid preparing parent manifest".into(),
+                    ));
                 }
-                Some((plan, sequence)) => {
+                if [
+                    "parent.checkpoint",
+                    "left.wal",
+                    "right.wal",
+                    "left.checkpoint",
+                    "right.checkpoint",
+                ]
+                .iter()
+                .any(|file| root.join(file).exists())
+                {
+                    return Err(SplitError::InvalidManifest(
+                        "unexpected durable artifacts during parent initialization".into(),
+                    ));
+                }
+                match fs::metadata(&parent_wal) {
+                    Ok(metadata) if metadata.len() > 64 => {
+                        return Err(SplitError::InvalidManifest(
+                            "preparing parent WAL contains possible committed records".into(),
+                        ));
+                    }
+                    Ok(_) => {
+                        fs::remove_file(&parent_wal)?;
+                        sync_directory(&root)?;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+                    Err(error) => return Err(error.into()),
+                }
+                let parent_tablet = WalBackedTablet::open(parent.clone(), &parent_wal)?;
+                write_manifest(&manifest_path, &DiskManifest::for_parent(&parent), None)?;
+                Active::Parent(parent_tablet)
+            } else {
+                match manifest.validate(&parent)? {
+                    None => {
+                        verify_published_wal(&parent_wal)?;
+                        Active::Parent(WalBackedTablet::open(parent.clone(), &parent_wal)?)
+                    }
+                    Some((plan, sequence)) => {
                     // Never silently fall back to the parent after promotion.
                     for child in ["left", "right"] {
                         verify_published_wal(&root.join(format!("{child}.wal")))?;
@@ -194,6 +252,7 @@ impl SingleNodeSplitStore {
                         left,
                         right,
                     }
+                    }
                 }
             }
         } else {
@@ -213,6 +272,15 @@ impl SingleNodeSplitStore {
                     "tablet files exist without routing manifest".into(),
                 ));
             }
+            // Persist an explicit, recoverable preparing state *before*
+            // creating the WAL, then publish the ready state only after
+            // the WAL header is durable. This closes the WAL-before-manifest
+            // crash window on a previously empty directory.
+            write_manifest(
+                &manifest_path,
+                &DiskManifest::for_preparing_parent(&parent),
+                None,
+            )?;
             let parent_tablet = WalBackedTablet::open(parent.clone(), &parent_wal)?;
             write_manifest(&manifest_path, &DiskManifest::for_parent(&parent), None)?;
             Active::Parent(parent_tablet)
