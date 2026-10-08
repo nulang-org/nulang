@@ -6365,6 +6365,19 @@ mod vm_tests {
     use super::*;
     use crate::bytecode::{BehaviorTableEntry, HandlerBinding, HandlerTable, Instruction};
 
+    #[test]
+    fn disabled_iso_arena_does_not_allocate_per_instruction_site_bitmaps() {
+        let mut vm = VM::new_without_jit();
+        vm.set_iso_arena_enabled(false);
+        let mut module = CodeModule::new("default-arena-bitmap");
+        module.emit(Instruction::new0(OpCode::Nop));
+        module.emit(Instruction::new0(OpCode::Halt));
+
+        assert!(vm.iso_arena_bitmap(&module).is_empty());
+        vm.load_module(module);
+        assert!(vm.iso_arena_sites[0].is_empty());
+    }
+
     #[derive(Debug)]
     struct ReadyValueCallbacks {
         heap: ActorHeap,
