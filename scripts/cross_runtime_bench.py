@@ -100,12 +100,16 @@ def build_commands(selected: list[str]) -> dict[str, list[str]]:
     BUILD.mkdir(parents=True, exist_ok=True)
     commands: dict[str, list[str]] = {}
 
-    if "nulang" in selected:
+    for runtime in ("nulang", "nulang-aot"):
+        if runtime not in selected:
+            continue
         if shutil.which("cargo") is None:
             raise RuntimeError("cargo is required for the Nulang benchmark")
-        # Build the standalone minimal runner outside the affinity-constrained
-        # measured rounds. This avoids compiling unrelated default features or
-        # the full release-test matrix before each cross-runtime comparison.
+        backend = "aot" if runtime == "nulang-aot" else "bytecode"
+        features = "savina-bench,native-codegen" if backend == "aot" else "savina-bench"
+        # Build each distinct Cargo feature set outside measured rounds.
+        # Copy immediately so a subsequent cargo build with different features
+        # cannot overwrite a command's executable or silently relabel data.
         command_output(
             [
                 "cargo",
@@ -115,7 +119,7 @@ def build_commands(selected: list[str]) -> dict[str, list[str]]:
                 "savina",
                 "--no-default-features",
                 "--features",
-                "savina-bench",
+                features,
                 "--bin",
                 "nulang-savina",
             ]
@@ -123,9 +127,13 @@ def build_commands(selected: list[str]) -> dict[str, list[str]]:
         metadata = json.loads(
             command_output(["cargo", "metadata", "--format-version", "1", "--no-deps"])
         )
-        executable = "nulang-savina.exe" if os.name == "nt" else "nulang-savina"
-        binary = Path(metadata["target_directory"]) / "savina" / executable
-        commands["nulang"] = [str(binary), "--format", "human"]
+        suffix = ".exe" if os.name == "nt" else ""
+        binary = Path(metadata["target_directory"]) / "savina" / ("nulang-savina" + suffix)
+        isolated_binary = BUILD / (runtime + suffix)
+        shutil.copy2(binary, isolated_binary)
+        commands[runtime] = [
+            str(isolated_binary), "--backend", backend, "--format", "human"
+        ]
 
     if "rust" in selected:
         rustc = shutil.which("rustc")
@@ -284,13 +292,13 @@ def summarize(
 
 def print_table(summary: dict[str, dict[str, dict[str, float | int]]]) -> None:
     print()
-    print("runtime   benchmark      median msg/s   median ns/msg")
-    print("--------  -------------  -------------  -------------")
+    print("runtime     benchmark      median msg/s   median ns/msg")
+    print("----------  -------------  -------------  -------------")
     for runtime in sorted(summary):
         for name in BENCHMARKS:
             row = summary[runtime][name]
             print(
-                f"{runtime:<8}  {name:<13}  "
+                f"{runtime:<10}  {name:<13}  "
                 f"{row['median_messages_per_second']:>13,.0f}  "
                 f"{row['median_ns_per_message']:>13,.1f}"
             )
@@ -303,7 +311,7 @@ def main() -> int:
     parser.add_argument(
         "--runtimes",
         default="nulang,rust,go,erlang",
-        help="comma-separated subset of nulang,rust,go,erlang",
+        help="comma-separated subset of nulang,nulang-aot,rust,go,erlang",
     )
     parser.add_argument(
         "--cpu-mode",
@@ -322,7 +330,7 @@ def main() -> int:
         parser.error("--runs must be >= 1 and --warmup must be >= 0")
 
     selected = [item.strip() for item in args.runtimes.split(",") if item.strip()]
-    unknown = sorted(set(selected) - {"nulang", "rust", "go", "erlang"})
+    unknown = sorted(set(selected) - {"nulang", "nulang-aot", "rust", "go", "erlang"})
     if unknown:
         parser.error(f"unknown runtimes: {', '.join(unknown)}")
 
