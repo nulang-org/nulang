@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Stateless actor framework comparator — 2026-10-08
+- **A standalone Ractor 0.16.5 fixture now implements the same counting, ping-pong, ring, and fork-join message workloads used by the Nulang Savina harness.** The external Rust actor framework is built separately and classified distinctly from the Go/Rust primitive baselines.
+- **The cross-runtime runner fails closed on missing, duplicate, zero-duration, or incorrect-message-count measurements.** JSON schema 3 records comparator families, and focused Python ingestion tests precede benchmark execution in CI.
+- **The comparator is single-worker only, matching the current one-shard Nulang harness.** No multicore actor scaling or performance ranking is claimed without matched sharded workloads and repeated measurements on controlled hardware.
+
 ### Receiver-acknowledged CRDT delta synchronization — 2026-10-07
 - **Per-peer CRDT frontiers now advance only after a matching NUL0 acknowledgement arrives from the intended receiver.** Dropped or unacknowledged batches remain retransmittable from that peer's last proven frontier instead of disappearing behind sender-side optimistic state.
 - **Peer recovery invalidates stale receiver knowledge.** A `Failed → Healthy` transition through heartbeat or authoritative gossip forgets prior CRDT frontier/correlation state so a restarted process receives fresh state.
