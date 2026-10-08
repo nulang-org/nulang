@@ -64,6 +64,47 @@ fn is_managed_directory(path: &Path) -> Result<bool, WalError> {
     }
 }
 
+/// A persistent OS lock serializes every public WAL mutation and mutable
+/// recovery open with coordinator ownership acquisition. Markers are checked
+/// before and again *under* the gate. Lock files must never be unlinked:
+/// otherwise an old handle could lock a different inode than its successor.
+fn lock_public_io_gate(path: &Path) -> Result<File, WalError> {
+    if is_managed_directory(path)? {
+        return Err(WalError::ManagedDirectory);
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+
+    // Resolve an existing file as well as its parent. An unmanaged symlink
+    // alias to a WAL must contend on its *target* directory's gate.
+    let canonical_dir = match fs::canonicalize(path) {
+        Ok(real_file) => real_file
+            .parent()
+            .ok_or(WalError::InvalidHeader)?
+            .to_path_buf(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => fs::canonicalize(parent)?,
+        Err(error) => return Err(error.into()),
+    };
+    let gate = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(canonical_dir.join(".nudb-write-gate.lock"))?;
+    // Standalone WALs in the same directory can operate concurrently; wait
+    // for the current short mutation instead of spuriously failing tests or
+    // caller writes. Coordinator acquisition remains nonblocking.
+    gate.lock()?;
+    // This second check is essential: publication could occur between
+    // the fast preflight and our acquisition of the stable gate inode.
+    if is_managed_directory(path)? {
+        return Err(WalError::ManagedDirectory);
+    }
+    Ok(gate)
+}
+
 const WAL_MAGIC: &[u8; 8] = b"NUDBWAL3";
 const WAL_HEADER_PREFIX_BYTES: usize = 8 + 8 + 8 + 8;
 const WAL_HEADER_BYTES: usize = WAL_HEADER_PREFIX_BYTES + 32;
@@ -198,7 +239,7 @@ impl FileWal {
     /// Public WAL open is for standalone storage, never coordinator-owned
     /// directories. Managed tablet files must be accessed via `open_managed`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, WalError> {
-        Self::open_internal(path.as_ref(), false)
+        Self::open_internal(path.as_ref(), false, false)
     }
 
     /// Crate-internal managed WAL open. Only the single-node split coordinator
@@ -211,14 +252,31 @@ impl FileWal {
         if !owner.authorizes(path) {
             return Err(WalError::ManagedDirectory);
         }
-        Self::open_internal(path, true)
+        Self::open_internal(path, true, false)
     }
 
-    fn open_internal(path: &Path, managed: bool) -> Result<Self, WalError> {
+    fn open_internal(
+        path: &Path,
+        managed: bool,
+        public_gate_already_held: bool,
+    ) -> Result<Self, WalError> {
+        let _gate = if managed || public_gate_already_held {
+            None
+        } else {
+            Some(lock_public_io_gate(path)?)
+        };
         if !managed && is_managed_directory(path)? {
             return Err(WalError::ManagedDirectory);
         }
-        let path = path.to_path_buf();
+        // Reclaim replaces the WAL by rename. For a symlink alias, retain
+        // the real target path rather than replacing the alias itself with
+        // a new file (which would strand the original committed WAL).
+        let path = match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(path)?,
+            Ok(_) => path.to_path_buf(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => path.to_path_buf(),
+            Err(error) => return Err(error.into()),
+        };
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -357,11 +415,14 @@ impl FileWal {
         Ok(())
     }
 
-    pub(crate) fn check_public_write_authority(&self) -> Result<(), WalError> {
-        if !self.managed && is_managed_directory(&self.path)? {
-            return Err(WalError::ManagedDirectory);
+    /// Hold this guard through the entire public checkpoint, WAL append or
+    /// reclaim operation, not merely while checking the routing marker.
+    pub(crate) fn acquire_public_io_gate(&self) -> Result<Option<File>, WalError> {
+        if self.managed {
+            Ok(None)
+        } else {
+            Ok(Some(lock_public_io_gate(&self.path)?))
         }
-        Ok(())
     }
 
     pub fn path(&self) -> &Path {
@@ -496,7 +557,7 @@ impl FileWal {
         if self.poisoned {
             return Err(WalError::Poisoned);
         }
-        self.check_public_write_authority()?;
+        let _gate = self.acquire_public_io_gate()?;
         let current = self.last_sequence();
         if base_sequence != current {
             return Err(WalError::InvalidReclaimSequence {
@@ -544,7 +605,8 @@ impl FileWal {
             super::interruption::StorageInterruptionPoint::WalReclaimAfterDirectorySync,
         )?;
 
-        *self = Self::open_internal(&self.path, self.managed)?;
+        // Reopen under the *same* public gate: reacquiring would self-contend.
+        *self = Self::open_internal(&self.path, self.managed, true)?;
         Ok(())
     }
 
@@ -554,12 +616,21 @@ impl FileWal {
     /// have been written and `sync_data` succeeds. If an I/O failure leaves a
     /// partial physical append, reopening the WAL truncates that crash tail.
     pub fn append_write(&mut self, write: &TabletWrite) -> Result<(), WalError> {
+        // Old public handles may predate coordinator ownership. Hold this
+        // guard through the entire durable append, never just its preflight.
+        let _gate = self.acquire_public_io_gate()?;
+        self.append_write_under_held_gate(write)
+    }
+
+    /// Only call when the public I/O gate is held, or from a managed WAL whose
+    /// coordinator holds the gate for its entire lifetime.
+    pub(crate) fn append_write_under_held_gate(
+        &mut self,
+        write: &TabletWrite,
+    ) -> Result<(), WalError> {
         if self.poisoned {
             return Err(WalError::Poisoned);
         }
-        // Also check old public handles: they may have opened their WAL
-        // before a directory was adopted by the single-node coordinator.
-        self.check_public_write_authority()?;
 
         let record = WalRecord::from_write(write);
         let last_sequence = self.last_sequence();

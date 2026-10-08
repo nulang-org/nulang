@@ -88,8 +88,21 @@ impl WalBackedTablet {
 
     /// Durably commit one write before making it visible to readers.
     pub fn commit(&mut self, write: TabletWrite) -> Result<u64, WalBackedError> {
+        self.commit_inner(write, || {})
+    }
+
+    fn commit_inner(
+        &mut self,
+        write: TabletWrite,
+        after_wal: impl FnOnce(),
+    ) -> Result<u64, WalBackedError> {
+        // WAL durability, in-memory publication and acknowledgement form one
+        // fenced operation. Releasing the gate immediately after WAL fsync
+        // would allow a coordinator to assume ownership before commit returns.
+        let _gate = self.wal.acquire_public_io_gate()?;
         self.tablet.validate_write(&write)?;
-        self.wal.append_write(&write)?;
+        self.wal.append_write_under_held_gate(&write)?;
+        after_wal();
         Ok(self.tablet.publish_validated(write))
     }
 
@@ -130,7 +143,9 @@ impl WalBackedTablet {
     /// This is a valid crash state and is intentionally public so operators can
     /// separate checkpoint publication from later space reclamation.
     pub fn publish_checkpoint(&self) -> Result<(), WalBackedError> {
-        self.wal.check_public_write_authority()?;
+        // Prevent owner takeover between the marker check and the durable
+        // checkpoint rename/fsync. The guard lives until publication ends.
+        let _gate = self.wal.acquire_public_io_gate()?;
         checkpoint::write_checkpoint(&self.checkpoint_path, &self.tablet)?;
         Ok(())
     }
@@ -182,3 +197,58 @@ impl fmt::Display for WalBackedError {
 }
 
 impl std::error::Error for WalBackedError {}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::super::tablet::{KeyRange, TabletId};
+    use super::*;
+    use std::fs::{self, OpenOptions};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn public_commit_retains_gate_after_wal_fsync_until_mvcc_publish() {
+        let root = std::env::temp_dir().join(format!(
+            "nudb_store_ack_gate_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let descriptor = TabletDescriptor::new(
+            TabletId::new(941).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            3,
+        )
+        .unwrap();
+        let mut tablet = WalBackedTablet::open(descriptor, root.join("ordinary.wal")).unwrap();
+        let write = tablet
+            .prepare_write(
+                3,
+                0,
+                vec![TabletMutation::Put {
+                    key: b"b".to_vec(),
+                    value: b"ack".to_vec(),
+                }],
+            )
+            .unwrap();
+
+        tablet
+            .commit_inner(write, || {
+                // This callback executes after the durable WAL sync and
+                // before the in-memory MVCC publication and acknowledgement.
+                let contender = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(root.join(".nudb-write-gate.lock"))
+                    .unwrap();
+                assert!(matches!(
+                    contender.try_lock(),
+                    Err(std::fs::TryLockError::WouldBlock)
+                ));
+            })
+            .unwrap();
+        assert_eq!(tablet.read_latest(b"b"), Some(&b"ack"[..]));
+        drop(tablet);
+        let _ = fs::remove_dir_all(root);
+    }
+}
