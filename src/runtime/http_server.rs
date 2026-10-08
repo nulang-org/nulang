@@ -21,6 +21,7 @@ use crate::web::dispatch::{render_direct_request, DirectRequestRenderError};
 use crate::web::http_problem::request_decode_problem_response;
 use crate::web::http_request::HttpRequestBindingInputs;
 use crate::web::reactivity::inject_client_runtime_script;
+use crate::web::request_bindings::percent_decode_form;
 use crate::web::runtime_bindings::RuntimeWebRoute;
 
 /// HTTP method — must match the Nulang-level variant type.
@@ -503,42 +504,11 @@ pub fn parse_form_urlencoded(body: &[u8]) -> Vec<(String, String)> {
             continue;
         }
         let mut kv = part.splitn(2, '=');
-        let key = kv.next().unwrap_or("").to_string();
-        let value = kv.next().unwrap_or("").to_string();
-        pairs.push((percent_decode(&key), percent_decode(&value)));
+        let key = kv.next().unwrap_or("");
+        let value = kv.next().unwrap_or("");
+        pairs.push((percent_decode_form(key), percent_decode_form(value)));
     }
     pairs
-}
-
-fn percent_decode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h1), Some(h2)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
-                out.push(((h1 << 4) | h2) as char);
-                i += 3;
-                continue;
-            }
-        }
-        if bytes[i] == b'+' {
-            out.push(' ');
-        } else {
-            out.push(bytes[i] as char);
-        }
-        i += 1;
-    }
-    out
-}
-
-fn hex_value(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -739,6 +709,17 @@ pub fn render_route_handler(
     }
 }
 
+fn invalid_ui_action_response(captured: &HttpRequestBindingInputs) -> Option<HttpResponse> {
+    captured
+        .ui_message_error
+        .as_ref()
+        .map(|error| HttpResponse {
+            status: 400,
+            headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
+            body: format!("Invalid UI action envelope: {error}").into_bytes(),
+        })
+}
+
 /// Dev server that dispatches registered `Web.route` handlers and falls back
 /// to static files for unmatched paths.
 #[derive(Debug)]
@@ -929,53 +910,60 @@ impl WebDevServer {
                                     &request.headers,
                                     &request.body,
                                 );
-                                let values = captured.values(&params, &request.headers);
-                                let ctx = RequestContext {
-                                    request: request.clone(),
-                                    params: params.clone(),
-                                };
-                                let rendered = with_request_context(ctx, || {
-                                    match render_direct_request(route, &values) {
-                                        Ok(Some(rendered)) => Ok(Some(rendered)),
-                                        Ok(None) => Ok(render_route_handler(
-                                            &route.route.handler_module,
-                                            route.route.handler_func_idx,
-                                            None,
-                                        )),
-                                        Err(error) => Err(error),
-                                    }
-                                });
-                                match rendered {
-                                    Ok(Some(html)) => HttpResponse {
-                                        status: 200,
-                                        headers: vec![(
-                                            "Content-Type".into(),
-                                            "text/html; charset=utf-8".into(),
-                                        )],
-                                        body: inject_client_runtime_script(&html).into_bytes(),
-                                    },
-                                    Ok(None) => HttpResponse {
-                                        status: 500,
-                                        headers: vec![("Content-Type".into(), "text/plain".into())],
-                                        body: b"Internal server error".to_vec(),
-                                    },
-                                    Err(DirectRequestRenderError::Decode(error)) => {
-                                        let problem = request_decode_problem_response(&error);
-                                        HttpResponse {
-                                            status: problem.status,
-                                            headers: problem.headers,
-                                            body: problem.body,
+                                if let Some(response) = invalid_ui_action_response(&captured) {
+                                    response
+                                } else {
+                                    let values = captured.values(&params, &request.headers);
+                                    let ctx = RequestContext {
+                                        request: request.clone(),
+                                        params: params.clone(),
+                                    };
+                                    let rendered = with_request_context(ctx, || {
+                                        match render_direct_request(route, &values) {
+                                            Ok(Some(rendered)) => Ok(Some(rendered)),
+                                            Ok(None) => Ok(render_route_handler(
+                                                &route.route.handler_module,
+                                                route.route.handler_func_idx,
+                                                None,
+                                            )),
+                                            Err(error) => Err(error),
                                         }
-                                    }
-                                    Err(DirectRequestRenderError::Execution(error)) => {
-                                        eprintln!("typed route dispatch error: {error}");
-                                        HttpResponse {
+                                    });
+                                    match rendered {
+                                        Ok(Some(html)) => HttpResponse {
+                                            status: 200,
+                                            headers: vec![(
+                                                "Content-Type".into(),
+                                                "text/html; charset=utf-8".into(),
+                                            )],
+                                            body: inject_client_runtime_script(&html).into_bytes(),
+                                        },
+                                        Ok(None) => HttpResponse {
                                             status: 500,
                                             headers: vec![(
                                                 "Content-Type".into(),
                                                 "text/plain".into(),
                                             )],
                                             body: b"Internal server error".to_vec(),
+                                        },
+                                        Err(DirectRequestRenderError::Decode(error)) => {
+                                            let problem = request_decode_problem_response(&error);
+                                            HttpResponse {
+                                                status: problem.status,
+                                                headers: problem.headers,
+                                                body: problem.body,
+                                            }
+                                        }
+                                        Err(DirectRequestRenderError::Execution(error)) => {
+                                            eprintln!("typed route dispatch error: {error}");
+                                            HttpResponse {
+                                                status: 500,
+                                                headers: vec![(
+                                                    "Content-Type".into(),
+                                                    "text/plain".into(),
+                                                )],
+                                                body: b"Internal server error".to_vec(),
+                                            }
                                         }
                                     }
                                 }
@@ -1142,11 +1130,12 @@ mod tests {
 
     #[test]
     fn test_parse_form_urlencoded() {
-        let pairs = parse_form_urlencoded(b"title=Buy+milk&id=1&foo=%26%3D");
-        assert_eq!(pairs.len(), 3);
+        let pairs = parse_form_urlencoded(b"title=Buy+milk&id=1&foo=%26%3D&name=%C3%A9");
+        assert_eq!(pairs.len(), 4);
         assert!(pairs.contains(&("title".to_string(), "Buy milk".to_string())));
         assert!(pairs.contains(&("id".to_string(), "1".to_string())));
         assert!(pairs.contains(&("foo".to_string(), "&=".to_string())));
+        assert!(pairs.contains(&("name".to_string(), "é".to_string())));
     }
 
     #[test]
@@ -1175,6 +1164,26 @@ mod tests {
                 assert_eq!(form_value("missing"), None);
             },
         );
+    }
+
+    #[test]
+    fn invalid_ui_action_envelope_is_rejected_before_route_dispatch() {
+        let headers = vec![(
+            "Content-Type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        )];
+        let captured = HttpRequestBindingInputs::capture(
+            "/",
+            &headers,
+            b"__nulang_ui_message=%7B%22type%22%3A%22invoke_action%22%7D",
+        );
+
+        let response = invalid_ui_action_response(&captured)
+            .expect("malformed envelope must fail closed before route dispatch");
+        assert_eq!(response.status, 400);
+        assert!(String::from_utf8(response.body)
+            .unwrap()
+            .contains("Invalid UI action envelope"));
     }
 
     #[test]
