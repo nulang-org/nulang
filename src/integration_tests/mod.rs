@@ -4853,6 +4853,94 @@ match { a: 2, b: 9 } with {
         );
     }
 
+    /// #1389: receive-after timeout goes through the receive-wait VM resume
+    /// path, not Timer.sleep. A failed atomic terminal write must roll back
+    /// the resulting speculative workflow state without fabricating success.
+    #[test]
+    fn test_workflow_receive_wait_terminal_commit_failure_recovers_safe_state() {
+        let source = r#"
+            workflow ReceiveWaitCommitFailure {
+                step wait {
+                    self.outcome = receive {
+                        | wait() => 2
+                    } after 50 => 1
+                }
+            }
+            spawn ReceiveWaitCommitFailure {}
+        "#;
+        let store = SharedMemoryStore::new();
+        let (module, _ty) = compile_source(source).unwrap();
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        rt.borrow_mut().persistence = Box::new(store.clone());
+        rt.borrow_mut().install_virtual_clock();
+
+        let actor_id = {
+            let mut vm = VM::new();
+            vm.load_module(module);
+            vm.set_actor_callbacks(Box::new(RuntimeVmCallbacks::new(rt.clone())));
+            vm.run()
+                .unwrap()
+                .as_actor_id()
+                .expect("workflow actor reference")
+        };
+
+        rt.borrow_mut().send_message_by_id(actor_id, 0, &[]);
+        rt.borrow_mut().step_actor(actor_id);
+        {
+            let runtime = rt.borrow();
+            let actor = runtime.actors.get(&actor_id).unwrap();
+            assert!(
+                actor.suspended_execution.is_some(),
+                "receive-after must suspend the workflow before the deadline"
+            );
+            assert!(actor.receive_wait.is_some(), "receive-after must arm a timeout");
+        }
+
+        let safe_snapshot = store.load_snapshot(actor_id).unwrap();
+        let admitted_tail = store
+            .load_durable_tail_position(actor_id)
+            .unwrap()
+            .expect("workflow command must be admitted atomically");
+        assert!(safe_snapshot.sequence < admitted_tail.sequence);
+
+        // Fire the receive-wait timeout; VM execution completes but the
+        // StepCompleted atomic transition is rejected exactly once.
+        store.fail_next_terminal_transition();
+        rt.borrow_mut()
+            .advance_time(std::time::Duration::from_millis(100));
+        rt.borrow_mut().tick_timers();
+
+        let runtime = rt.borrow();
+        let actor = runtime
+            .actors
+            .get(&actor_id)
+            .expect("failed terminal commit must restore a safe actor");
+        assert_eq!(
+            actor.get_state_field("step_index").and_then(|value| value.as_int()),
+            Some(0),
+            "uncommitted receive-resume step index must be rolled back"
+        );
+        assert!(
+            actor.get_state_field("outcome").is_none(),
+            "receive-after body must not leak uncommitted state"
+        );
+        assert_eq!(
+            store.load_snapshot(actor_id).unwrap().sequence,
+            safe_snapshot.sequence
+        );
+        assert_eq!(
+            store.load_durable_tail_position(actor_id).unwrap().unwrap().sequence,
+            admitted_tail.sequence,
+            "failed terminal must not advance the RFC 0022 tail"
+        );
+        assert!(
+            !store.read_workflow_events(actor_id).iter().any(|event| {
+                matches!(event, WorkflowEvent::StepCompleted { .. })
+            }),
+            "rejected terminal must not claim workflow completion"
+        );
+    }
+
     #[test]
     fn test_workflow_parallel_branches_normal() {
         // A simple parallel block with no suspension: both branches run in one
