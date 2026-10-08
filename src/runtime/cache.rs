@@ -551,9 +551,9 @@ impl S3Fifo {
 
 #[derive(Debug, Clone, Copy)]
 struct ExpirationLocation {
-    level: usize,
-    bucket: usize,
-    index: usize,
+    index: u32,
+    level: u8,
+    bucket: u16,
 }
 
 #[derive(Debug)]
@@ -596,9 +596,9 @@ impl ExpirationWheel {
             return;
         };
 
-        let bucket = &mut self.levels[location.level][location.bucket];
-        bucket.swap_remove(location.index);
-        if let Some(moved) = bucket.get(location.index) {
+        let bucket = &mut self.levels[location.level as usize][location.bucket as usize];
+        bucket.swap_remove(location.index as usize);
+        if let Some(moved) = bucket.get(location.index as usize) {
             self.locations[moved.slot as usize]
                 .as_mut()
                 .expect("moved expiration must have a location")
@@ -634,9 +634,9 @@ impl ExpirationWheel {
             self.locations.resize(slot_index + 1, None);
         }
         self.locations[slot_index] = Some(ExpirationLocation {
-            level,
-            bucket,
-            index,
+            index: u32::try_from(index).expect("expiration bucket index exceeds u32"),
+            level: u8::try_from(level).expect("expiration wheel level exceeds u8"),
+            bucket: u16::try_from(bucket).expect("expiration wheel bucket exceeds u16"),
         });
     }
 
@@ -721,34 +721,36 @@ impl ExpirationWheel {
     }
 
     fn reserved_bytes(&self) -> usize {
-        self.locations
+        let handles_bytes = self
+            .locations
             .capacity()
-            .saturating_mul(std::mem::size_of::<Option<ExpirationLocation>>())
-            .saturating_add(
-                self.levels
+            .saturating_mul(std::mem::size_of::<Option<ExpirationLocation>>());
+        let levels_bytes = self
+            .levels
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Vec<Vec<ExpirationRef>>>());
+        let buckets_bytes = self
+            .levels
+            .iter()
+            .map(|level| {
+                level
                     .capacity()
-            .saturating_mul(std::mem::size_of::<Vec<Vec<ExpirationRef>>>())
-            .saturating_add(
-                self.levels
-                    .iter()
-                    .map(|level| {
+                    .saturating_mul(std::mem::size_of::<Vec<ExpirationRef>>())
+                    .saturating_add(
                         level
-                            .capacity()
-                            .saturating_mul(std::mem::size_of::<Vec<ExpirationRef>>())
-                            .saturating_add(
-                                level
-                                    .iter()
-                                    .map(|bucket| {
-                                        bucket
-                                            .capacity()
-                                            .saturating_mul(std::mem::size_of::<ExpirationRef>())
-                                    })
-                                    .sum::<usize>(),
-                            )
-                    })
-                    .sum::<usize>(),
-            ),
-            )
+                            .iter()
+                            .map(|bucket| {
+                                bucket
+                                    .capacity()
+                                    .saturating_mul(std::mem::size_of::<ExpirationRef>())
+                            })
+                            .sum::<usize>(),
+                    )
+            })
+            .sum::<usize>();
+        handles_bytes
+            .saturating_add(levels_bytes)
+            .saturating_add(buckets_bytes)
     }
 }
 
