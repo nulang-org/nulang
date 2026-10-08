@@ -26,6 +26,25 @@ use crate::mir;
 use crate::runtime::heap::TypeTag as HeapTypeTag;
 use crate::types::{NuResult, Span};
 
+/// The current unboxed function table substitutes only the running
+/// function's own unboxed entry. Every other function remains a *boxed*
+/// entry point, and all local/closure calls use tagged-value dispatch.
+///
+/// Until module-wide raw ABI call tables are wired into codegen, an unboxed
+/// caller may therefore call itself directly but must not call another
+/// function (or a closure), even when that callee happens to return Int.
+fn raw_int_call_edges_are_safe(func: &mir::Function, caller_index: usize) -> bool {
+    func.blocks.iter().all(|block| {
+        block.stmts.iter().all(|stmt| match stmt {
+            mir::Stmt::Assign {
+                op: mir::RValue::Call { func: target, .. },
+                ..
+            } => matches!(target, mir::FuncRef::Index(index) if *index == caller_index),
+            _ => true,
+        })
+    })
+}
+
 /// Compiled AOT module ready for execution.
 pub struct AotModule {
     /// The Cranelift JIT module that owns compiled code memory.
@@ -142,8 +161,10 @@ impl AotModule {
                     span: Span::default(),
                 })?;
             func_ids.push(fid);
-            // If the function is all-Int, also declare an unboxed variant.
-            if codegen::is_all_int(func) {
+            // The current unboxed call table only proves self-recursion.
+            // Cross-function calls still enter a boxed callee; keep the
+            // caller boxed rather than forwarding raw arguments to it.
+            if codegen::is_all_int(func) && raw_int_call_edges_are_safe(func, idx) {
                 let ub_name = format!("nulang_fn_{}_unboxed", idx);
                 let mut ub_sig = jit_module.make_signature();
                 for _ in &func.params {
