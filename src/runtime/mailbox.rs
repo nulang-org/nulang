@@ -161,8 +161,8 @@ enum MatchLane {
 /// Lazy positional index for one staged selective-receive lane.
 ///
 /// Positions remain stable while a receive transaction only appends arrivals
-/// and rejects guards. A successful commit or ordinary pop shifts VecDeque
-/// positions and invalidates the index, which is rebuilt lazily.
+/// and rejects guards. A tail commit also preserves positions. Middle removals
+/// and ordinary pops invalidate the index, which is rebuilt lazily.
 #[derive(Debug)]
 struct ReceiveLaneIndex {
     positions: FxHashMap<u16, Vec<usize>>,
@@ -197,6 +197,28 @@ impl ReceiveLaneIndex {
         self.positions.clear();
         self.cursors.clear();
         self.valid = false;
+    }
+
+    /// Removing the final staged element never shifts positions of preceding
+    /// messages. Prune only its index entry rather than rebuilding the whole
+    /// lane at the next receive. All attempted flags/cursors must be reset
+    /// before this is called.
+    fn remove_tail(&mut self, behavior_id: u16, position: usize) {
+        if !self.valid {
+            return;
+        }
+        debug_assert!(self.tried_positions.is_empty());
+        let Some(positions) = self.positions.get_mut(&behavior_id) else {
+            self.invalidate();
+            return;
+        };
+        if positions.pop() != Some(position) {
+            self.invalidate();
+            return;
+        }
+        if positions.is_empty() {
+            self.positions.remove(&behavior_id);
+        }
     }
 
     fn reset_attempts(&mut self, buffer: &mut VecDeque<(Message, bool)>) {
@@ -581,13 +603,33 @@ impl Mailbox {
         // Reset only attempted candidates while their positional indexes
         // still refer to the pre-commit buffers.
         self.clear_tried_flags();
-        let _removed = match lane {
+        let is_tail = match lane {
+            MatchLane::System => idx + 1 == self.system_skip_buffer.len(),
+            MatchLane::Local => idx + 1 == self.local_skip_buffer.len(),
+            MatchLane::Normal => idx + 1 == self.skip_buffer.len(),
+        };
+        let (removed, _) = match lane {
+            MatchLane::System if is_tail => self.system_skip_buffer.pop_back(),
+            MatchLane::Local if is_tail => self.local_skip_buffer.pop_back(),
+            MatchLane::Normal if is_tail => self.skip_buffer.pop_back(),
             MatchLane::System => self.system_skip_buffer.remove(idx),
             MatchLane::Local => self.local_skip_buffer.remove(idx),
             MatchLane::Normal => self.skip_buffer.remove(idx),
         }?;
         self.release_slot();
-        self.invalidate_receive_indexes();
+        if is_tail {
+            if let Some(indexes) = self.receive_indexes.as_mut() {
+                let index = match lane {
+                    MatchLane::System => &mut indexes.system,
+                    MatchLane::Local => &mut indexes.local,
+                    MatchLane::Normal => &mut indexes.normal,
+                };
+                index.remove_tail(removed.behavior_id, idx);
+            }
+        } else {
+            // A middle/head removal shifts the following VecDeque positions.
+            self.invalidate_receive_indexes();
+        }
         Some(payload)
     }
 
