@@ -32,6 +32,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_shared_memory_store_can_opt_in_to_atomic_tail_reads() {
+        let legacy = SharedMemoryStore::new();
+        let atomic = SharedMemoryStore::new_atomic();
+        assert_eq!(
+            legacy.load_durable_tail_position(42).unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported,
+        );
+        assert_eq!(atomic.load_durable_tail_position(42).unwrap(), None);
+    }
+
     impl PersistenceStore for SharedMemoryStore {
         fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> std::io::Result<()> {
             self.0.lock().unwrap().save_snapshot(snapshot)
@@ -4560,7 +4571,7 @@ match { a: 2, b: 9 } with {
             spawn TimerWorkflow {}
         "#;
 
-        let store = SharedMemoryStore::new();
+        let store = SharedMemoryStore::new_atomic();
         let (module, _ty) = compile_source(source).unwrap();
         let rt = Rc::new(RefCell::new(Runtime::new()));
         rt.borrow_mut().persistence = Box::new(store.clone());
@@ -8144,7 +8155,7 @@ match { a: 2, b: 9 } with {
             let w = spawn LlmFlow {} in { w }
         "#;
 
-        let store = SharedMemoryStore::new();
+        let store = SharedMemoryStore::new_atomic();
         let (module, _ty) = compile_source(source).unwrap();
 
         let rt = Rc::new(RefCell::new(Runtime::new()));
@@ -8222,7 +8233,7 @@ match { a: 2, b: 9 } with {
             let w = spawn LlmFlowRecover {} in { w }
         "#;
 
-        let store = SharedMemoryStore::new();
+        let store = SharedMemoryStore::new_atomic();
         let (module, _ty) = compile_source(source).unwrap();
         let meta = module.actor_metadata.first().unwrap();
         let mut offsets = vec![0; module.behaviors.len()];
