@@ -89,8 +89,14 @@ fn replicated_consumer_requires_leader_and_matching_delivery_epoch() {
     follower.process_network();
     leader.process_network();
     follower.process_network();
-    assert_eq!(leader.fabric_stream_committed_sequence("fenced").unwrap(), 1);
-    assert_eq!(follower.fabric_stream_committed_sequence("fenced").unwrap(), 1);
+    assert_eq!(
+        leader.fabric_stream_committed_sequence("fenced").unwrap(),
+        1
+    );
+    assert_eq!(
+        follower.fabric_stream_committed_sequence("fenced").unwrap(),
+        1
+    );
 
     // Isolate the committed follower from the leader. A replica with a valid
     // durable log must not start serving application consumer side effects.
@@ -105,8 +111,12 @@ fn replicated_consumer_requires_leader_and_matching_delivery_epoch() {
     assert!(follower
         .fabric_stream_deliver_consumer("fenced", "worker", 10, Duration::from_secs(30))
         .is_err());
-    assert!(follower.fabric_stream_read_consumer("fenced", "worker", 10).is_err());
-    assert!(follower.fabric_stream_commit_cursor("fenced", "worker", 1).is_err());
+    assert!(follower
+        .fabric_stream_read_consumer("fenced", "worker", 10)
+        .is_err());
+    assert!(follower
+        .fabric_stream_commit_cursor("fenced", "worker", 1)
+        .is_err());
     assert!(follower
         .fabric_stream_ack_consumer_fenced("fenced", "worker", 1, 1)
         .is_err());
@@ -119,9 +129,15 @@ fn replicated_consumer_requires_leader_and_matching_delivery_epoch() {
     assert_eq!(delivery[0].record.sequence, 1);
 
     // Old APIs cannot bypass the epoch token on a replicated stream.
-    assert!(leader.fabric_stream_ack_consumer("fenced", "worker", 1).is_err());
-    assert!(leader.fabric_stream_nack_consumer("fenced", "worker", 1).is_err());
-    assert!(leader.fabric_stream_commit_cursor("fenced", "worker", 1).is_err());
+    assert!(leader
+        .fabric_stream_ack_consumer("fenced", "worker", 1)
+        .is_err());
+    assert!(leader
+        .fabric_stream_nack_consumer("fenced", "worker", 1)
+        .is_err());
+    assert!(leader
+        .fabric_stream_commit_cursor("fenced", "worker", 1)
+        .is_err());
     assert_eq!(leader.fabric_stream_cursor("fenced", "worker").unwrap(), 0);
 
     assert!(leader
@@ -157,13 +173,17 @@ fn unreplicated_runtime_consumer_preserves_unfenced_ack() {
     runtime
         .fabric_stream_create("local", FabricStreamConfig::default())
         .unwrap();
-    runtime.fabric_stream_append("local", b"standalone").unwrap();
+    runtime
+        .fabric_stream_append("local", b"standalone")
+        .unwrap();
     let delivery = runtime
         .fabric_stream_deliver_consumer("local", "worker", 10, Duration::from_secs(30))
         .unwrap();
     assert_eq!(delivery.len(), 1);
     assert_eq!(delivery[0].leader_epoch, None);
-    runtime.fabric_stream_ack_consumer("local", "worker", 1).unwrap();
+    runtime
+        .fabric_stream_ack_consumer("local", "worker", 1)
+        .unwrap();
     assert_eq!(runtime.fabric_stream_cursor("local", "worker").unwrap(), 1);
     let _ = std::fs::remove_dir_all(root);
 }
@@ -194,12 +214,12 @@ fn abrupt_leader_termination_fences_old_ack_epoch_after_manual_removal() {
         }
     }
 
-    let initial = nodes[0].fabric_stream_placement("crash-fence", 0, 3).unwrap();
+    let initial = nodes[0]
+        .fabric_stream_placement("crash-fence", 0, 3)
+        .unwrap();
     let old_leader = ids.iter().position(|id| *id == initial.leader).unwrap();
     let survivors: Vec<usize> = (0..3).filter(|i| *i != old_leader).collect();
-    let roots: Vec<PathBuf> = (0..3)
-        .map(|i| temp_dir(&format!("crash-{i}")))
-        .collect();
+    let roots: Vec<PathBuf> = (0..3).map(|i| temp_dir(&format!("crash-{i}"))).collect();
     for (runtime, root) in nodes.iter_mut().zip(&roots) {
         runtime.fabric_stream_open(root).unwrap();
     }
@@ -225,12 +245,7 @@ fn abrupt_leader_termination_fences_old_ack_epoch_after_manual_removal() {
         );
     }
     let first = nodes[old_leader]
-        .fabric_stream_deliver_consumer(
-            "crash-fence",
-            "worker",
-            1,
-            Duration::from_secs(30),
-        )
+        .fabric_stream_deliver_consumer("crash-fence", "worker", 1, Duration::from_secs(30))
         .unwrap();
     assert_eq!(first.len(), 1);
     assert_eq!(first[0].leader_epoch, Some(1));
@@ -260,11 +275,7 @@ fn abrupt_leader_termination_fences_old_ack_epoch_after_manual_removal() {
         .copied()
         .find(|i| ids[*i] == new_placement.leader)
         .unwrap();
-    let voter = survivors
-        .iter()
-        .copied()
-        .find(|i| *i != candidate)
-        .unwrap();
+    let voter = survivors.iter().copied().find(|i| *i != candidate).unwrap();
 
     let starting = nodes[candidate]
         .fabric_stream_begin_epoch_transition("crash-fence", 0, 2)
@@ -274,7 +285,10 @@ fn abrupt_leader_termination_fences_old_ack_epoch_after_manual_removal() {
     nodes[candidate].process_network();
     nodes[voter].process_network();
 
-    assert_eq!(nodes[candidate].fabric_stream_epoch("crash-fence").unwrap(), Some(2));
+    assert_eq!(
+        nodes[candidate].fabric_stream_epoch("crash-fence").unwrap(),
+        Some(2)
+    );
     assert_eq!(
         nodes[candidate]
             .fabric_stream_committed_sequence("crash-fence")
@@ -285,12 +299,7 @@ fn abrupt_leader_termination_fences_old_ack_epoch_after_manual_removal() {
     // The new leader has no quorum-proven cursor or lease recovery.
     // Even its correct epoch token must not authorize consumer side effects.
     assert!(nodes[candidate]
-        .fabric_stream_deliver_consumer(
-            "crash-fence",
-            "worker",
-            1,
-            Duration::from_secs(30),
-        )
+        .fabric_stream_deliver_consumer("crash-fence", "worker", 1, Duration::from_secs(30),)
         .is_err());
     assert!(nodes[candidate]
         .fabric_stream_ack_consumer_fenced("crash-fence", "worker", 1, 1)
