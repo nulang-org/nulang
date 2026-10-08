@@ -41,7 +41,12 @@ fn raw_parent_wal_writer_can_bypass_owner_after_published_split() {
     // Capturing it before split models an uncooperative stale parent handle.
     let mut stale_parent = WalBackedTablet::open(parent(), dir.join("parent.wal")).unwrap();
     let plan = parent()
-        .plan_split(b"m", TabletId::new(992).unwrap(), TabletId::new(993).unwrap(), 8)
+        .plan_split(
+            b"m",
+            TabletId::new(992).unwrap(),
+            TabletId::new(993).unwrap(),
+            8,
+        )
         .unwrap();
     owner.split(&plan).unwrap();
 
