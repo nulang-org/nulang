@@ -463,7 +463,6 @@ impl FabricConsumerProgressPrepareWire {
             self.version,
             &self.change,
             &self.policy,
-            self.stream_committed_through,
         )).map_err(|error| invalid(error.to_string()))?;
         Ok(blake3::hash(&bytes).to_hex().to_string())
     }
@@ -554,13 +553,12 @@ impl FabricConsumerProgressAckWire {
 
 impl Runtime {
     fn consumer_progress_directory(&mut self, stream: &str) -> io::Result<PathBuf> {
-        let storage = self.distributed.fabric_streams.as_ref().ok_or_else(|| {
+        let root = self.distributed.fabric_streams.as_ref().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotConnected, "Fabric stream storage not open")
-        })?;
-        // Ensure the stream exists and the canonical stream name has passed
-        // storage-layer validation before joining an on-disk path.
+        })?.root().to_path_buf();
+        // Validate and recover the stream before joining its filesystem path.
         self.fabric_stream_info(stream)?;
-        Ok(storage.root().join(stream).join("consumer_progress"))
+        Ok(root.join(stream).join("consumer_progress"))
     }
 
     fn consumer_progress_installed_policy(
@@ -1164,7 +1162,9 @@ mod tests {
         let mut wire = FabricConsumerProgressPrepareWire::new(
             change, policy, 1
         ).unwrap();
-        assert_eq!(wire.from_wire_bytes(&wire.to_wire_bytes().unwrap()).is_ok(), true);
+        assert!(FabricConsumerProgressPrepareWire::from_wire_bytes(
+            &wire.to_wire_bytes().unwrap()
+        ).is_ok());
         wire.change.committed_cursor = 2;
         assert!(wire.verify().is_err());
     }
