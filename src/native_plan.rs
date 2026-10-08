@@ -22,6 +22,59 @@ pub enum NativePlanConstraint {
     NullableArithmetic,
 }
 
+/// A closure-valued local is a proven direct target only if its sole
+/// definition is a capture-free closure and that definition precedes the call
+/// in the same basic block. Cross-block use needs dominance analysis.
+pub(crate) fn stable_direct_closure_targets(
+    func: &mir::Function,
+) -> std::collections::HashMap<mir::LocalId, (usize, usize, usize)> {
+    use std::collections::{HashMap, HashSet};
+
+    let mut seen: HashSet<mir::LocalId> = func
+        .params
+        .iter()
+        .chain(func.captures.iter())
+        .copied()
+        .collect();
+    let mut targets = HashMap::new();
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        for (stmt_idx, stmt) in block.stmts.iter().enumerate() {
+            let mir::Stmt::Assign { dst, op } = stmt else {
+                continue;
+            };
+            if !seen.insert(*dst) {
+                // A reassignment, including to an argument, invalidates the
+                // proof even when both writes happen to name the same target.
+                targets.remove(dst);
+                continue;
+            }
+            if let mir::RValue::Closure {
+                func: target,
+                captures,
+            } = op
+            {
+                if captures.is_empty() {
+                    targets.insert(*dst, (block_idx, stmt_idx, *target));
+                }
+            }
+        }
+    }
+    targets
+}
+
+/// Resolve a call only when a single capture-free closure definition
+/// dominates it trivially (earlier in the same basic block).
+pub(crate) fn stable_direct_closure_call(
+    targets: &std::collections::HashMap<mir::LocalId, (usize, usize, usize)>,
+    local: mir::LocalId,
+    block_idx: usize,
+    stmt_idx: usize,
+) -> Option<usize> {
+    targets.get(&local).and_then(|&(defined_block, defined_stmt, target)| {
+        (defined_block == block_idx && defined_stmt < stmt_idx).then_some(target)
+    })
+}
+
 /// Compiler-owned representation plan for one MIR function.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeFunctionPlan {
@@ -72,29 +125,12 @@ impl NativeFunctionPlan {
             push_constraint(NativePlanConstraint::CapturedClosure);
         }
 
-        // Calls through locals created by an uncaptured closure are statically
-        // targetable, but still cross a function ABI. The module-level planner
-        // must prove the callee uses the same raw ABI before that call can be
-        // admitted to an unboxed caller.
-        let mut direct_closure_locals = std::collections::HashSet::new();
-        for block in &func.blocks {
-            for stmt in &block.stmts {
-                if let mir::Stmt::Assign {
-                    dst,
-                    op: mir::RValue::Closure { captures, .. },
-                } = stmt
-                {
-                    if captures.is_empty() {
-                        direct_closure_locals.insert(*dst);
-                    } else {
-                        push_constraint(NativePlanConstraint::CapturedClosure);
-                    }
-                }
-            }
-        }
+        // Analyze single-assignment closure locals once. A local whose
+        // definition may not dominate its call must remain dynamically boxed.
+        let direct_closure_targets = stable_direct_closure_targets(func);
 
-        for block in &func.blocks {
-            for stmt in &block.stmts {
+        for (block_idx, block) in func.blocks.iter().enumerate() {
+            for (stmt_idx, stmt) in block.stmts.iter().enumerate() {
                 match stmt {
                     mir::Stmt::Assign { op, .. } => match op {
                         mir::RValue::Binary(BinOp::Div | BinOp::Mod | BinOp::Pow, ..) => {
@@ -153,7 +189,14 @@ impl NativeFunctionPlan {
                         mir::RValue::Call { func: target, .. } => {
                             push_constraint(NativePlanConstraint::CrossFunctionCall);
                             if let mir::FuncRef::Local(local) = target {
-                                if !direct_closure_locals.contains(local) {
+                                if stable_direct_closure_call(
+                                    &direct_closure_targets,
+                                    *local,
+                                    block_idx,
+                                    stmt_idx,
+                                )
+                                .is_none()
+                                {
                                     push_constraint(NativePlanConstraint::DynamicCall);
                                 }
                             }
