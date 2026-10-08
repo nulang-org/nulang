@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Linux stateless actor hot-path profiler — 2026-10-08
+- **The existing Savina actor runner can now be sampled through a reproducible opt-in Linux `perf` workflow.** It builds a symbolized, frame-pointer-enabled bytecode actor binary and retains raw perf data, textual hot-symbol reports, environment metadata, and workload-completion JSONL.
+- **Fail-closed sample parsing and independent CI contract tests verify benchmark identity, repeat count, nonzero work, and contiguous iterations.** Profiler timing is explicitly diagnostic, not an optimized-build regression comparison; exact-parent Nulang A/B remains the performance confirmation path.
+
 ### Receiver-acknowledged CRDT delta synchronization — 2026-10-07
 - **Per-peer CRDT frontiers now advance only after a matching NUL0 acknowledgement arrives from the intended receiver.** Dropped or unacknowledged batches remain retransmittable from that peer's last proven frontier instead of disappearing behind sender-side optimistic state.
 - **Peer recovery invalidates stale receiver knowledge.** A `Failed → Healthy` transition through heartbeat or authoritative gossip forgets prior CRDT frontier/correlation state so a restarted process receives fresh state.
