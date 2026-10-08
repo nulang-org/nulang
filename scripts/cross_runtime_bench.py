@@ -20,6 +20,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from cross_runtime_order import counterbalanced_runtime_order
+
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "benchmarks" / "cross_runtime"
 BUILD = ROOT / "target" / "cross-runtime"
@@ -346,11 +348,19 @@ def main() -> int:
     # Cycle across runtimes per sample rather than exhausting one runtime at a
     # time. This reduces simple thermal/load drift bias within a host run.
     total_rounds = args.warmup + args.runs
+    measured_execution_orders: list[list[str]] = []
     for round_idx in range(total_rounds):
         measured = round_idx >= args.warmup
         phase = "sample" if measured else "warmup"
         index = round_idx - args.warmup + 1 if measured else round_idx + 1
-        for runtime in selected:
+        # Counterbalance the measured rounds independently of warm-up count.
+        # Across 2*N rounds, each runtime occupies every position twice.
+        runtime_order = counterbalanced_runtime_order(
+            selected, round_idx - args.warmup if measured else round_idx
+        )
+        if measured:
+            measured_execution_orders.append(runtime_order)
+        for runtime in runtime_order:
             print(f"[{phase} {index}] {runtime}", flush=True)
             output = command_output(
                 commands[runtime],
@@ -369,6 +379,7 @@ def main() -> int:
         "methodology": "standard-runtime Savina-style messaging baselines",
         "warmup_runs": args.warmup,
         "measured_runs": args.runs,
+        "measured_execution_orders": measured_execution_orders,
         "environment": environment_metadata(args.cpu_mode, cpu_affinity),
         "samples": samples,
         "summary": summary,
