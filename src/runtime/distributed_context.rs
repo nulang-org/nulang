@@ -512,10 +512,6 @@ pub struct DistributedContext {
     /// Leader-local pending quorum tickets for durable Fabric stream appends.
     /// The durable committed boundary itself lives in the stream store.
     pub(crate) fabric_stream_replication: FabricStreamReplicationState,
-    /// Volatile, peer-identified application fsync receipts for pending
-    /// consumer metadata prepares. Not a durable quorum decision/certificate.
-    pub(crate) fabric_consumer_progress_receipts:
-        HashMap<(String, u16, u64, String), HashSet<NodeId>>,
     /// Confirmed removed nodes awaiting Fabric stream ownership orchestration.
     /// Processing is deferred until Runtime owns cluster/transport state again.
     pub(crate) fabric_stream_removed_nodes_pending: HashSet<NodeId>,
