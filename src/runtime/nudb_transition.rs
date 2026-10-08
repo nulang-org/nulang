@@ -158,7 +158,11 @@ impl NuDbTransitionJournal {
         }))
     }
 
-    pub fn load_transition(&self, actor_id: u64, sequence: u64) -> io::Result<Option<DurableTransition>> {
+    pub fn load_transition(
+        &self,
+        actor_id: u64,
+        sequence: u64,
+    ) -> io::Result<Option<DurableTransition>> {
         self.tablet
             .read_latest(&transition_key(actor_id, sequence))
             .map(|bytes| {
