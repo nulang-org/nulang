@@ -989,6 +989,48 @@ fn view() -> Html {
     }
 
     #[test]
+    fn test_escapes_server_owned_snapshot_before_client_runtime() {
+        let mut root = nulang_ui_protocol::UiNode::new("root", "interaction_root");
+        root.properties.insert(
+            "danger".to_owned(),
+            nulang_ui_protocol::WireValue::from("</script><svg/onload=alert(1)>"),
+        );
+        let document = nulang_ui_protocol::UiDocument::new(
+            "session-1",
+            nulang_ui_protocol::Revision(9),
+            "root",
+            vec![root],
+        );
+        let html = "<html><body><button data-action=\"save\">Save</button></body></html>";
+        let rendered = inject_client_runtime_script_with_document(html, &document)
+            .expect("valid authoritative snapshot");
+        assert!(rendered.contains("nulang-ui-bootstrap"));
+        assert!(rendered.contains(r"\u003c/script\u003e"));
+        assert!(!rendered.contains("</script><svg"));
+        assert!(
+            rendered.find("nulang-ui-bootstrap").unwrap()
+                < rendered.find("/app.client.js").unwrap()
+        );
+        assert!(rendered.contains("session-1"));
+        assert!(rendered.contains("\\"9\\""));
+    }
+
+    #[test]
+    fn test_rejects_invalid_server_bootstrap_document() {
+        let document = nulang_ui_protocol::UiDocument::new(
+            "session-1",
+            nulang_ui_protocol::Revision(0),
+            "nonexistent",
+            vec![],
+        );
+        let result = inject_client_runtime_script_with_document(
+            "<html><body><span data-signal=\"count\">0</span></body></html>",
+            &document,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_static_html_does_not_inject_client_script() {
         let html = "<html><body><h1>Hi</h1></body></html>";
         assert_eq!(inject_client_runtime_script(html), html);
