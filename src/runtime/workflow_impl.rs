@@ -237,12 +237,14 @@ fn commit_workflow_event_transition(
         )
     })?;
     let snapshot = if snapshot_state {
-        Some(build_actor_snapshot_at_sequence(rt, actor_id, sequence)?.ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "workflow transition requires a live persistent actor",
-            )
-        })?)
+        Some(
+            build_actor_snapshot_at_sequence(rt, actor_id, sequence)?.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "workflow transition requires a live persistent actor",
+                )
+            })?,
+        )
     } else {
         None
     };
@@ -403,13 +405,11 @@ pub(crate) fn commit_step_failed(
     step_name: String,
     error: String,
 ) -> std::io::Result<()> {
-    commit_workflow_event_transition(rt, actor_id, true, |sequence| {
-        WorkflowEvent::StepFailed {
-            sequence,
-            activation,
-            step_name,
-            error,
-        }
+    commit_workflow_event_transition(rt, actor_id, true, |sequence| WorkflowEvent::StepFailed {
+        sequence,
+        activation,
+        step_name,
+        error,
     })
 }
 
@@ -625,17 +625,16 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                         );
                     }
                     ReplayDisposition::Append => {
-                        let appended = commit_intermediate_workflow_event(
-                            rt,
-                            actor_id,
-                            |sequence| WorkflowEvent::Custom {
-                                sequence,
-                                replay_id: Some(replay_id),
-                                name: event.to_string(),
-                                args: payload,
-                            },
-                        )
-                        .is_ok();
+                        let appended =
+                            commit_intermediate_workflow_event(rt, actor_id, |sequence| {
+                                WorkflowEvent::Custom {
+                                    sequence,
+                                    replay_id: Some(replay_id),
+                                    name: event.to_string(),
+                                    args: payload,
+                                }
+                            })
+                            .is_ok();
                         if appended {
                             // This event belongs to an open activation. Keep the
                             // last completed snapshot unchanged so recovery can
@@ -658,16 +657,14 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                         return;
                     }
                 };
-                should_checkpoint = commit_intermediate_workflow_event(
-                    rt,
-                    actor_id,
-                    |sequence| WorkflowEvent::Custom {
+                should_checkpoint = commit_intermediate_workflow_event(rt, actor_id, |sequence| {
+                    WorkflowEvent::Custom {
                         sequence,
                         replay_id: None,
                         name: event.to_string(),
                         args: payload,
-                    },
-                )
+                    }
+                })
                 .is_ok()
                     && !atomic_tail;
             }
