@@ -56,7 +56,7 @@ use super::fabric_stream_epoch::{
     FABRIC_STREAM_EPOCH_REPAIR_BEHAVIOR, FABRIC_STREAM_EPOCH_VOTE_BEHAVIOR,
 };
 use super::mailbox::{Message, MessagePayload, MessagePriority};
-use super::network::{NetworkTransport, Packet, TrackedSendOutcome};
+use super::network::{NetworkTransport, Packet, TrackedSendOutcome, TransportSendFailureReason};
 use super::{ClusterState, NodeId, NodeStatus};
 use crate::runtime::Runtime;
 use crate::types::ExitReason;
@@ -905,13 +905,40 @@ pub fn send_distributed(
     }
 }
 
+/// Notify a sender that an asynchronous transport send failed.
+///
+/// Transport failures keep top-level delivery-failure code 8 and use the
+/// second payload slot for the transport outcome:
+/// 0=connect failed before any write, 1=write failed with delivery unconfirmed,
+/// 2=sender thread was already shut down before enqueue.
+/// This distinction prevents callers from treating an ambiguous write as a
+/// known-safe retry.
+fn notify_transport_send_failed(
+    runtime: &mut Runtime,
+    sender_id: u64,
+    reason: TransportSendFailureReason,
+) {
+    if sender_id == 0 || runtime.actors.get(&sender_id).is_none() {
+        return;
+    }
+
+    let subtype = match reason {
+        TransportSendFailureReason::Connect => 0,
+        TransportSendFailureReason::Write => 1,
+        TransportSendFailureReason::SenderShutdown => 2,
+    };
+    let fail_payload = vec![Value::int(8), Value::int(subtype)];
+    runtime.send_message_by_id(sender_id, 0, &fail_payload);
+}
+
 /// Notify a sender that their message could not be delivered.
 ///
 /// Delivers a system message (behavior 0) to the sender actor with a
 /// failure code in the payload: `[failure_code: Int, _reserved: Nil]`.
 /// Codes: 0=unresolvable, 1=node left cluster, 2=string payload unresolvable,
 /// 3=string intern failed on receiver, 4=target actor not found,
-/// 6=object ref unresolvable, 7=object intern failed on receiver, 5=unknown.
+/// 6=object ref unresolvable, 7=object intern failed on receiver,
+/// 8=transport send failed, 5=unknown.
 /// Non-existent senders (id 0) are silently skipped.
 pub(crate) fn notify_delivery_failed(runtime: &mut Runtime, sender_id: u64, reason: &str) {
     if sender_id == 0 {
@@ -935,6 +962,7 @@ fn delivery_failure_code(reason: &str) -> i64 {
         "target actor not found" => 4,
         "object ref unresolvable" => 6,
         "object intern failed on receiver" => 7,
+        "transport send failed" => 8,
         _ => 5,
     }
 }
@@ -1054,6 +1082,16 @@ pub fn process_network_packets(
     cluster: &mut ClusterState,
     resolver: &mut AddressResolver,
 ) {
+    for failure in transport.drain_send_failures() {
+        warn!(
+            "nulang-net: transport send to {:?} failed at sequence {} ({:?})",
+            failure.to_node, failure.packet_seq, failure.reason
+        );
+        if let Some(sender) = failure.sender_actor {
+            notify_transport_send_failed(runtime, sender, failure.reason);
+        }
+    }
+
     let packets = transport.receive();
     for incoming in packets {
         match incoming.packet {

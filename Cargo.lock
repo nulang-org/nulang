@@ -2451,6 +2451,7 @@ dependencies = [
  "mio",
  "nulang-ai",
  "nulang-ai-local",
+ "nulang-ui-protocol",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
