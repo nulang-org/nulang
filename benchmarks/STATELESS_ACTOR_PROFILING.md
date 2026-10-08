@@ -5,6 +5,38 @@ difference, but the runtime responsible for the overhead is not yet known.
 It deliberately uses the existing Nulang Savina runner, not a new actor
 implementation.
 
+## Unprivileged phase attribution in CI
+
+The profiler workflow also runs **real optimized Nulang workloads** with
+`--phase-profile` (counting and fork-join). It records three complete
+rounds per workload in `nulang-savina-phase-timings-<commit>` as JSONL
+and a median summary. Each JSONL row checks the same completed logical
+message count as the ordinary suite and partitions wall-clock time into:
+
+- `phase_admission_ns`: application-to-runtime enqueue before scheduler start
+- `phase_scheduler_ns`: `Runtime::run_scheduler()` through completed delivery
+
+The two phase durations must add up exactly to `elapsed_ns`. Source
+compilation, actor creation, and initial wire-up are **excluded from the
+timed sections**, although the benchmark process still performs them.
+
+This is a wall-clock **coarse component breakdown**, not CPU sampling and
+not an instruction-level flame graph. It cannot attribute time *within*
+`run_scheduler` to VM, timers, GC, scheduler selection, etc. The CLI
+option is opt-in; the ordinary cross-runtime output retains its existing
+record schema and benchmark semantics.
+
+Run manually with:
+
+```bash
+cargo run --locked --profile savina --no-default-features \
+  --features savina-bench --bin nulang-savina -- \
+  --benchmark counting --repeat 5 --phase-profile --format jsonl
+cargo run --locked --profile savina --no-default-features \
+  --features savina-bench --bin nulang-savina -- \
+  --benchmark fork_join --repeat 5 --phase-profile --format jsonl
+```
+
 ## Prerequisites
 
 Linux on an otherwise idle host, `perf`, Rust/Cargo, and permission to use
