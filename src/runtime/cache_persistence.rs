@@ -743,6 +743,7 @@ fn load_cache_snapshot(
     decode_cache_snapshot(&bytes, wall_now_ms)
 }
 
+#[derive(Debug)]
 struct WalScan {
     base_sequence: u64,
     last_sequence: u64,
