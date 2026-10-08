@@ -87,7 +87,9 @@ fn full_transition_round_trips_after_checkpoint_and_restart() {
             DeliverySemantics::AtLeastOnce,
         );
         record.durable_effects.push(
-            DurableEffectPersistenceRecord::from_effect(DurableEffectRecord::prepare(spec, b"prompt")),
+            DurableEffectPersistenceRecord::from_effect(DurableEffectRecord::prepare(
+                spec, b"prompt",
+            )),
         );
         record
     };
