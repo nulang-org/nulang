@@ -1,7 +1,9 @@
-# Cross-runtime Savina baselines
+# Cross-runtime stateless actor baselines
 
 This directory provides matched message-passing baselines for four workloads
-already implemented by Nulang's `src/benchmarks.rs` harness:
+already implemented by Nulang's `src/benchmarks.rs` harness. It now reports
+**two distinct comparator classes**: native runtime primitives and a full actor
+framework. They must not be blended into a generic language leaderboard.
 
 | Workload | Parameters | Reported logical messages |
 |---|---:|---:|
@@ -17,6 +19,13 @@ primitive:
 - **Rust** — `std::sync::mpsc` channels + native threads
 - **Go** — channels + goroutines
 - **Erlang/BEAM** — native processes + mailboxes
+- **Ractor 0.16.5** — native Rust actor framework (Tokio single-thread executor)
+
+Ractor is built from an isolated Cargo workspace under `ractor_baseline/`:
+its dependencies do not change Nulang's main `Cargo.toml` or lockfile.
+The exact direct dependency is pinned; the fixture's generated `Cargo.lock`
+captures the resolved transitive dependencies. Save that file alongside every
+result if the fixture lockfile has not yet been committed.
 
 Run all installed runtimes on the same host:
 
@@ -26,10 +35,22 @@ python3 scripts/cross_runtime_bench.py --runs 5 --warmup 1 \
   --output /tmp/nulang-cross-runtime.json
 ```
 
-The runner compiles each external fixture once, performs warm-up runs, then
-records exact nanosecond timings from each runtime and reports the median for
+The runner builds each external fixture once, performs warm-up runs, then
+records elapsed nanoseconds from each runtime and reports the median for
 every workload. The JSON also records OS/CPU counts, git SHA, toolchain
-versions, and the CPU topology used for measurement.
+versions, the CPU topology, comparator category, and the expected
+logical-message counts. It rejects missing, duplicated, zero-duration, or
+incorrect-message-count records instead of silently reporting them.
+
+Run the independent ingestion tests with:
+
+```bash
+python3 -m unittest discover -s tests -p test_cross_runtime_bench.py -v
+```
+
+Run the baseline runtimes without Ractor by passing
+`--runtimes nulang,rust,go,erlang`, or the actor-framework pair with
+`--runtimes nulang,ractor`. The default runs all five runtimes.
 
 ## CPU-topology rule
 
@@ -37,7 +58,8 @@ versions, and the CPU topology used for measurement.
 comparison. On Linux it constrains every measured runtime process, including
 all of its child threads/schedulers, to the same one logical CPU chosen from
 the benchmark process's allowed CPU set. Nulang's current Savina harness uses
-one runtime shard, so this prevents `fork_join` from silently comparing
+one runtime shard, and the Ractor comparator explicitly uses a single
+Tokio execution thread, so this prevents `fork_join` from silently comparing
 single-shard Nulang with multi-core Rust, Go, or BEAM execution.
 
 `--cpu-mode host` leaves CPU affinity unconstrained. It is useful for
@@ -53,8 +75,9 @@ another environment where the selected affinity is recorded and enforced.
 ## Interpretation constraints
 
 These numbers are **baselines, not a universal language or framework
-ranking**. The implementations intentionally use standard runtime primitives,
-not third-party actor frameworks, and their schedulers differ materially.
+ranking**. Rust/Go use standard concurrency primitives; Ractor uses a
+third-party actor framework; Erlang/Nulang use actor-language runtimes.
+Even within the actor category, message semantics and scheduling differ.
 
 In particular:
 
@@ -63,9 +86,15 @@ In particular:
 - Nulang's existing benchmark sends the counting/fork-join input burst and
   then drains the runtime scheduler; Rust/Go/Erlang actors may consume while
   the producer is still sending.
-- Rust's baseline uses native threads, Go uses goroutines, and Erlang uses
-  BEAM processes. CPU affinity makes the available compute budget comparable;
-  it does not make their scheduling semantics identical.
+- Rust's baseline uses native threads, Go uses goroutines, Erlang uses
+  BEAM processes, and Ractor uses Tokio actor tasks. CPU affinity makes the
+  available compute budget comparable; it does not make their semantics
+  identical.
+- Ractor's current-thread Tokio executor processes queued work after the
+  synchronous producer loop yields; this resembles Nulang's burst-then-drain
+  counting/fork-join path more closely than Go/Erlang, but is not identical.
+- Both Ractor and Nulang are measured on a single execution worker; host mode
+  is diagnostic, not a multicore actor-scaling comparison.
 - `thread_ring` reports the same logical hop count as Nulang's existing
   harness rather than attempting to count setup/completion control messages.
 - Compilation, process startup, actor wiring, and fixture construction are
@@ -74,6 +103,7 @@ In particular:
   and repeat important results on controlled hardware before publishing them.
 - Do not turn one workload into a blanket "X is faster than Y" claim.
 
-For actor-framework comparisons (for example Pony, Ractor/Actix/Kameo,
-Proto.Actor, or Pekko/Akka), add separate pinned fixtures instead of silently
-changing these standard-runtime baselines.
+For other actor-framework comparisons (for example Actix, Kameo,
+Proto.Actor, or Pekko/Akka), add separate pinned fixtures rather than
+silently changing standard-runtime baselines. Do not introduce a
+cross-language performance gate on shared CI runners.
