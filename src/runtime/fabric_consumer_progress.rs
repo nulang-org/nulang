@@ -323,6 +323,32 @@ impl FileFabricConsumerProgressJournal {
             .collect())
     }
 
+    /// Read-only recovery evidence from one node's *locally verified* log.
+    /// The caller must authenticate which physical node produced this data.
+    pub(crate) fn recovery_witness(
+        &self,
+        replica: u64,
+        old_policy: &FabricConsumerProgressPolicy,
+    ) -> io::Result<FabricConsumerRecoveryWitness> {
+        old_policy.validate()?;
+        if !old_policy.replicas.contains(&replica)
+            || self.committed_policy.as_ref() != Some(old_policy)
+        {
+            return Err(invalid("recovery witness is not in the old installed policy"));
+        }
+        let history: Vec<(u64, String)> = self.committed_history.iter()
+            .map(|(sequence, record)| (*sequence, record.digest.clone()))
+            .collect();
+        Ok(FabricConsumerRecoveryWitness {
+            replica,
+            policy: old_policy.clone(),
+            committed_sequence: self.latest_sequence,
+            history,
+            cursors: self.committed.clone(),
+            pending_sequence: self.pending_sequence(),
+        })
+    }
+
     /// Recover the exact pending proposal for idempotent network retry.
     pub(crate) fn pending_change(
         &self,
@@ -1423,6 +1449,89 @@ impl Runtime {
         }
         Ok(updates.len())
     }
+}
+
+
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FabricConsumerRecoveryWitness {
+    pub replica: u64,
+    pub policy: FabricConsumerProgressPolicy,
+    pub committed_sequence: u64,
+    pub history: Vec<(u64, String)>,
+    pub cursors: BTreeMap<(String, u16, String), FabricConsumerProgressChange>,
+    pub pending_sequence: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FabricConsumerRecoveredSnapshot {
+    pub committed_sequence: u64,
+    pub history: Vec<(u64, String)>,
+    pub cursors: BTreeMap<(String, u16, String), FabricConsumerProgressChange>,
+}
+
+impl FabricConsumerRecoveredSnapshot {
+    pub(crate) fn committed_cursor(
+        &self, stream: &str, partition: u16, consumer: &str,
+    ) -> u64 {
+        self.cursors.get(&(stream.to_string(), partition, consumer.to_string()))
+            .map(|entry| entry.committed_cursor).unwrap_or(0)
+    }
+}
+
+/// A deliberately conservative *local proof-evaluation primitive*.
+///
+/// Requiring ALL old-policy members avoids silently treating a reachable
+/// majority's lower metadata frontier as complete while an unavailable
+/// old leader may hold a newer fsynced COMMIT. The manifest is not signed:
+/// it must be delivered by a separately authenticated transport and bound
+/// to a fenced old policy before this can be used for real admission.
+///
+/// The current runtime intentionally does NOT use this to unblock
+/// post-failover consumer delivery: remote witness exchange, epoch grant,
+/// catch-up and replay of ACK gaps/leases remain unimplemented.
+pub(crate) fn validate_complete_old_policy_recovery(
+    old_policy: &FabricConsumerProgressPolicy,
+    witnesses: &[FabricConsumerRecoveryWitness],
+) -> io::Result<FabricConsumerRecoveredSnapshot> {
+    old_policy.validate()?;
+    if witnesses.len() != old_policy.replicas.len() {
+        return Err(invalid("every old-policy replica must submit recovery evidence"));
+    }
+    let mut seen = BTreeSet::new();
+    let mut common: Option<FabricConsumerRecoveredSnapshot> = None;
+    for witness in witnesses {
+        if witness.policy != *old_policy
+            || !old_policy.replicas.contains(&witness.replica)
+            || !seen.insert(witness.replica)
+            || witness.pending_sequence.is_some()
+        {
+            return Err(invalid("missing, duplicate, foreign, or unresolved recovery witness"));
+        }
+        if witness.history.len() as u64 != witness.committed_sequence
+            || witness.history.iter().enumerate().any(|(index, (sequence, digest))| {
+                *sequence != (index as u64 + 1) || digest.len() != 64
+            })
+        {
+            return Err(invalid("recovery witness has a missing or invalid metadata predecessor"));
+        }
+        let candidate = FabricConsumerRecoveredSnapshot {
+            committed_sequence: witness.committed_sequence,
+            history: witness.history.clone(),
+            cursors: witness.cursors.clone(),
+        };
+        if let Some(previous) = &common {
+            if previous != &candidate {
+                return Err(invalid("old-policy replicas disagree on committed consumer metadata"));
+            }
+        } else {
+            common = Some(candidate);
+        }
+    }
+    if seen.len() != old_policy.replicas.len() {
+        return Err(invalid("old-policy witness set is incomplete"));
+    }
+    common.ok_or_else(|| invalid("no old-policy consumer metadata recovery evidence"))
 }
 
 
