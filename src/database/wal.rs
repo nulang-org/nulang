@@ -20,7 +20,21 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use super::split::OwnedDirectory;
 use super::tablet::{MemoryTablet, TabletDescriptor, TabletId, TabletMutation, TabletWrite};
+
+/// A coordinator's persistent owner marker prevents new unguarded WAL access.
+/// Checking both markers fails closed even if a directory has a manifest but
+/// its lock file was accidentally lost. The marker is never intentionally
+/// removed, including on owner shutdown.
+fn is_managed_directory(path: &Path) -> Result<bool, WalError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    Ok(parent.join(".nudb-owner.lock").try_exists()?
+        || parent.join("route.manifest").try_exists()?)
+}
 
 const WAL_MAGIC: &[u8; 8] = b"NUDBWAL3";
 const WAL_HEADER_PREFIX_BYTES: usize = 8 + 8 + 8 + 8;
@@ -146,13 +160,37 @@ pub struct FileWal {
     tablet_id: Option<TabletId>,
     latest_ownership_epoch: Option<u64>,
     poisoned: bool,
+    /// True only for WALs opened through a live coordinator's private path.
+    managed: bool,
     #[cfg(test)]
     append_failpoint: Option<AppendFailPoint>,
 }
 
 impl FileWal {
+    /// Public WAL open is for standalone storage, never coordinator-owned
+    /// directories. Managed tablet files must be accessed via `open_managed`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, WalError> {
-        let path = path.as_ref().to_path_buf();
+        Self::open_internal(path.as_ref(), false)
+    }
+
+    /// Crate-internal managed WAL open. Only the single-node split coordinator
+    /// can construct and retain the authority from the OS directory lock.
+    pub(crate) fn open_managed(
+        path: impl AsRef<Path>,
+        owner: &OwnedDirectory,
+    ) -> Result<Self, WalError> {
+        let path = path.as_ref();
+        if !owner.authorizes(path) {
+            return Err(WalError::ManagedDirectory);
+        }
+        Self::open_internal(path, true)
+    }
+
+    fn open_internal(path: &Path, managed: bool) -> Result<Self, WalError> {
+        if !managed && is_managed_directory(path)? {
+            return Err(WalError::ManagedDirectory);
+        }
+        let path = path.to_path_buf();
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -256,6 +294,7 @@ impl FileWal {
             tablet_id,
             latest_ownership_epoch,
             poisoned: false,
+            managed,
             #[cfg(test)]
             append_failpoint: None,
         })
@@ -272,7 +311,11 @@ impl FileWal {
         path: &Path,
         descriptor: &TabletDescriptor,
         base_sequence: u64,
+        owner: &OwnedDirectory,
     ) -> Result<(), WalError> {
+        if !owner.authorizes(path) {
+            return Err(WalError::ManagedDirectory);
+        }
         let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
         let header = encode_wal_header(
             base_sequence,
@@ -283,6 +326,13 @@ impl FileWal {
         file.sync_data()?;
         drop(file);
         sync_parent_directory(path)?;
+        Ok(())
+    }
+
+    fn check_public_write_authority(&self) -> Result<(), WalError> {
+        if !self.managed && is_managed_directory(&self.path)? {
+            return Err(WalError::ManagedDirectory);
+        }
         Ok(())
     }
 
@@ -418,6 +468,7 @@ impl FileWal {
         if self.poisoned {
             return Err(WalError::Poisoned);
         }
+        self.check_public_write_authority()?;
         let current = self.last_sequence();
         if base_sequence != current {
             return Err(WalError::InvalidReclaimSequence {
@@ -465,7 +516,7 @@ impl FileWal {
             super::interruption::StorageInterruptionPoint::WalReclaimAfterDirectorySync,
         )?;
 
-        *self = Self::open(&self.path)?;
+        *self = Self::open_internal(&self.path, self.managed)?;
         Ok(())
     }
 
@@ -478,6 +529,9 @@ impl FileWal {
         if self.poisoned {
             return Err(WalError::Poisoned);
         }
+        // Also check old public handles: they may have opened their WAL
+        // before a directory was adopted by the single-node coordinator.
+        self.check_public_write_authority()?;
 
         let record = WalRecord::from_write(write);
         let last_sequence = self.last_sequence();
@@ -847,6 +901,8 @@ pub enum WalError {
     Serialization {
         message: String,
     },
+    /// An unmanaged public WAL handle attempted I/O inside a coordinator root.
+    ManagedDirectory,
     Poisoned,
 }
 
@@ -944,6 +1000,9 @@ impl fmt::Display for WalError {
             Self::Serialization { message } => {
                 write!(f, "WAL serialization error: {message}")
             }
+            Self::ManagedDirectory => f.write_str(
+                "NuDB WAL belongs to a managed tablet directory; use the owning coordinator",
+            ),
             Self::Poisoned => f.write_str(
                 "NuDB WAL handle is poisoned after an ambiguous storage mutation; reopen before retrying",
             ),
