@@ -202,6 +202,11 @@ def run_profile(args: argparse.Namespace) -> int:
             "RUSTFLAGS": build_env["RUSTFLAGS"],
         },
         "workload": args.workload,
+        "fixture_mode": (
+            "persistent-ping-pong-after-one-compilation"
+            if args.workload == "ping_pong"
+            else "fresh-actor-and-compiler-setup-per-iteration"
+        ),
         "samples": samples,
     }
     (output / "manifest.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
