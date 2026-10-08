@@ -80,6 +80,15 @@ class VerifyDocExamplesTests(unittest.TestCase):
         self.assertEqual(len(calls), 1, calls)
         self.assertTrue(calls[0].startswith("--check "), calls)
 
+    def test_interactive_input_is_checked_without_running(self):
+        result, calls = self.run_verifier(
+            ("md",),
+            source='let input = perform IO.read()',
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(calls), 1, calls)
+        self.assertTrue(calls[0].startswith("--check "), calls)
+
 
 if __name__ == "__main__":
     unittest.main()
