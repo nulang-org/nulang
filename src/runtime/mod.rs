@@ -1532,21 +1532,18 @@ impl Runtime {
     /// Drain all pending cross-shard messages into local mailboxes. Called
     /// at the top of every scheduler-loop iteration before dequeuing work.
     fn drain_cross_shard_messages(&mut self) {
-        let mut pending: Vec<CrossShardMsg> = Vec::new();
-        {
-            let rx = match self.cross_shard_rx.as_ref() {
-                Some(rx) => rx,
+        // Take one message at a time so delivery does not allocate a
+        // temporary Vec proportional to the cross-shard backlog. Keep the
+        // receiver borrow scoped to the receive operation: delivery needs
+        // mutable access to the runtime and may enqueue further work.
+        loop {
+            let msg = match self.cross_shard_rx.as_ref() {
+                Some(rx) => match rx.try_recv() {
+                    Ok(msg) => msg,
+                    Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
+                },
                 None => return,
             };
-            loop {
-                match rx.try_recv() {
-                    Ok(msg) => pending.push(msg),
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => break,
-                }
-            }
-        }
-        for msg in pending {
             match msg {
                 CrossShardMsg::DeliverMessage {
                     target_id,
