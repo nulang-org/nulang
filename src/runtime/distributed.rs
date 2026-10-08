@@ -44,8 +44,10 @@ use std::time::{Duration, Instant};
 // ---------------------------------------------------------------------------
 
 use super::fabric_consumer_progress::{
-    FabricConsumerProgressAckWire, FabricConsumerProgressPrepareWire,
-    FABRIC_CONSUMER_PROGRESS_ACK_BEHAVIOR, FABRIC_CONSUMER_PROGRESS_PREPARE_BEHAVIOR,
+    FabricConsumerProgressAckWire, FabricConsumerProgressCommitWire,
+    FabricConsumerProgressPrepareWire, FABRIC_CONSUMER_PROGRESS_ACK_BEHAVIOR,
+    FABRIC_CONSUMER_PROGRESS_COMMIT_BEHAVIOR,
+    FABRIC_CONSUMER_PROGRESS_PREPARE_BEHAVIOR,
 };
 use super::fabric_stream_cluster::{
     FabricStreamCommitUpdate, FabricStreamReplicaAck, FabricStreamReplicaAppend,
@@ -1725,6 +1727,45 @@ pub fn process_network_packets(
                         incoming.from_node, error
                     );
                 }
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+            }
+            Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name,
+                object_table,
+                sender_node,
+                ..
+            } if behavior_name == FABRIC_CONSUMER_PROGRESS_COMMIT_BEHAVIOR => {
+                let result = if sender_node != incoming.from_node {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Fabric consumer-progress commit sender differs from transport peer",
+                    ))
+                } else {
+                    match object_table.as_slice() {
+                        [(0, bytes)] => {
+                            FabricConsumerProgressCommitWire::from_wire_bytes(bytes)
+                                .and_then(|update| {
+                                    runtime.fabric_consumer_progress_apply_commit_from_peer(
+                                        &update,
+                                        incoming.from_node,
+                                    )
+                                })
+                        }
+                        _ => Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Fabric consumer-progress commit requires one object with id 0",
+                        )),
+                    }
+                };
+                if let Err(error) = result {
+                    warn!(
+                        "nulang-fabric-consumer: rejected metadata commit from {:?}: {}",
+                        incoming.from_node, error
+                    );
+                }
+                // This transport receipt is NOT an application metadata
+                // commit acknowledgement, nor a cluster durable-client ACK.
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
             Packet::ActorMessage {
