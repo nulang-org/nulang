@@ -28,12 +28,37 @@ use super::tablet::{MemoryTablet, TabletDescriptor, TabletId, TabletMutation, Ta
 /// its lock file was accidentally lost. The marker is never intentionally
 /// removed, including on owner shutdown.
 fn is_managed_directory(path: &Path) -> Result<bool, WalError> {
+    fn has_marker(parent: &Path) -> io::Result<bool> {
+        Ok(parent.join(".nudb-owner.lock").try_exists()?
+            || parent.join("route.manifest").try_exists()?)
+    }
+
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    Ok(parent.join(".nudb-owner.lock").try_exists()?
-        || parent.join("route.manifest").try_exists()?)
+    if has_marker(parent)? {
+        return Ok(true);
+    }
+
+    // Neither a symlink to the tablet directory nor a symlink to an
+    // individual WAL may redirect public access into a managed root.
+    match fs::canonicalize(parent) {
+        Ok(real_parent) if has_marker(&real_parent)? => return Ok(true),
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    match fs::canonicalize(path) {
+        Ok(real_file) => {
+            if let Some(real_parent) = real_file.parent() {
+                return Ok(has_marker(real_parent)?);
+            }
+            Ok(false)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 const WAL_MAGIC: &[u8; 8] = b"NUDBWAL3";
