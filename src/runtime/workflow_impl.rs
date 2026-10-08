@@ -30,6 +30,20 @@ pub(crate) fn actor_is_workflow(rt: &Runtime, actor_id: u64) -> bool {
         .unwrap_or(false)
 }
 
+/// Return whether this actor has already entered RFC 0022 atomic history.
+///
+/// Unsupported backends are intentionally treated as legacy-only. Any other
+/// storage error is propagated so callers do not silently cross persistence
+/// modes after an atomic tail has begun.
+pub(crate) fn workflow_has_atomic_tail(rt: &Runtime, actor_id: u64) -> std::io::Result<bool> {
+    match rt.persistence.load_durable_tail_position(actor_id) {
+        Ok(Some(_)) => Ok(true),
+        Ok(None) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 fn current_workflow_replay_id(rt: &mut Runtime, actor_id: u64) -> Option<WorkflowReplayEventId> {
     let actor = rt.actors.get_mut(&actor_id)?;
     let activation = actor.current_workflow_activation?;
@@ -211,6 +225,13 @@ fn build_actor_snapshot_at_sequence(
 /// commits, signals, compensation) must use this path so storage failure cannot
 /// be mistaken for a committed transition.
 pub(crate) fn try_checkpoint_actor(rt: &mut Runtime, actor_id: u64) -> std::io::Result<()> {
+    if actor_is_workflow(rt, actor_id) && workflow_has_atomic_tail(rt, actor_id)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "legacy workflow checkpoint is forbidden after the RFC 0022 atomic tail begins",
+        ));
+    }
+
     let sequence = next_sequence(rt, actor_id);
     let Some(snapshot) = build_actor_snapshot_at_sequence(rt, actor_id, sequence)? else {
         return Ok(());
