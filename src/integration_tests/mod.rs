@@ -72,6 +72,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_shared_memory_store_supports_atomic_tail_contract() {
+        let mut store = SharedMemoryStore::new();
+        let actor_id = 991_001;
+        store
+            .save_snapshot(ActorSnapshot {
+                actor_id,
+                sequence: 1,
+                ..ActorSnapshot::default()
+            })
+            .unwrap();
+
+        store
+            .commit_transition(crate::runtime::DurableTransition {
+                version: crate::runtime::DURABLE_TRANSITION_VERSION,
+                actor_id,
+                activation_epoch: 1,
+                sequence: 2,
+                expected_previous_sequence: 1,
+                command: None,
+                snapshot: None,
+                workflow_events: vec![WorkflowEvent::StepCompleted {
+                    sequence: 2,
+                    activation: None,
+                    step_name: "done".to_string(),
+                }],
+                domain_events: vec![],
+                durable_effects: vec![],
+                outbox: vec![],
+            })
+            .expect("test store must forward RFC 0022 atomic commits");
+        assert_eq!(
+            store
+                .load_durable_tail_position(actor_id)
+                .unwrap()
+                .unwrap()
+                .sequence,
+            2
+        );
+        assert_eq!(store.latest_sequence(actor_id), 2);
+    }
+
     // -----------------------------------------------------------------------
     // Test helpers
     // -----------------------------------------------------------------------
