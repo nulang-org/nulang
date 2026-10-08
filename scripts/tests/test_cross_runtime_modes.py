@@ -71,6 +71,8 @@ class NativeBackendSourceContractTests(unittest.TestCase):
         self.assertIn("AotModule::compile(&mir)", source)
         self.assertIn("register_aot_module(aot)", source)
         self.assertIn("aot_targets", source)
+        self.assertIn("meta.behavior_indices.len()", source)
+        self.assertNotIn("aot_targets.len() == actor.bytecode_offsets.len()", source)
         self.assertIn("native-codegen", source)
         self.assertIn('"nulang-aot"', source)
 
