@@ -22,12 +22,20 @@ class VerifyDocExamplesTests(unittest.TestCase):
         binary_exit_code: int = 0,
         source: str = HELLO_EXAMPLE,
         reject_execution: bool = False,
+        source_doc_comment: str | None = None,
     ):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             docs = root / "docs" / "src" / "content" / "docs" / "actors"
             docs.mkdir(parents=True)
             (root / "src").mkdir()
+            if source_doc_comment is not None:
+                (root / "src" / "sample.nula").write_text(
+                    "/// ```nulang\\n"
+                    + "".join(f"/// {line}\\n" for line in source_doc_comment.splitlines())
+                    + "/// ```\\n",
+                    encoding="utf-8",
+                )
             for ext in extensions:
                 (docs / f"sample.{ext}").write_text(
                     f"# Example\n\n```nulang\n{source}\n```\n",
@@ -77,10 +85,22 @@ class VerifyDocExamplesTests(unittest.TestCase):
         self.assertTrue(calls[0].startswith("--check "), calls)
 
     def test_markdown_compilation_failure_fails_verification(self):
-        result, _ = self.run_verifier(("md",), binary_exit_code=1)
+        result, calls = self.run_verifier(("md",), binary_exit_code=1)
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("FAIL  actors/sample.md#1", result.stdout)
         self.assertIn("0 passed, 1 failed", result.stdout)
+        self.assertEqual(len(calls), 1, calls)
+
+    def test_source_doc_comments_are_compiler_checked(self):
+        result, calls = self.run_verifier(
+            (),
+            source_doc_comment='perform IO.print("from source")',
+            reject_execution=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("src/sample.nula#1 (check)", result.stdout)
+        self.assertEqual(len(calls), 1, calls)
+        self.assertTrue(calls[0].startswith("--check "), calls)
 
     def test_tool_declarations_are_checked_without_running(self):
         result, calls = self.run_verifier(
