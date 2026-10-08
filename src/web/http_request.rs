@@ -5,11 +5,11 @@
 //! coupling the decoder to the runtime server implementation.
 
 use crate::web::request_bindings::{
-    parse_cookie_header, parse_urlencoded, split_request_target, RequestBindingValues,
+    parse_cookie_header, parse_urlencoded, percent_decode_form, split_request_target,
+    RequestBindingValues,
 };
 use nulang_ui_protocol::{decode_host_message, ActionPlacement, HostToRuntimeMessage, WireValue};
-use std::collections::BTreeMap;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Why a renderer-neutral action envelope was rejected at the HTTP boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +17,7 @@ pub enum UiActionEnvelopeError {
     Malformed,
     ClientPlacement,
     PayloadMismatch,
+    DuplicateFormField { name: String },
     LegacyActionMismatch {
         envelope_action: String,
         legacy_action: String,
@@ -32,6 +33,9 @@ impl std::fmt::Display for UiActionEnvelopeError {
             }
             Self::PayloadMismatch => {
                 f.write_str("UI action payload does not match submitted form values")
+            }
+            Self::DuplicateFormField { name } => {
+                write!(f, "duplicate field '{name}' in canonical UI action form")
             }
             Self::LegacyActionMismatch {
                 envelope_action,
@@ -83,7 +87,20 @@ impl HttpRequestBindingInputs {
         } else {
             HashMap::new()
         };
-        let (ui_message, ui_message_error) = capture_ui_action_message(&form);
+        // A canonical action must have a single unambiguous interpretation.
+        // The legacy form path remains unchanged until its own contract migrates.
+        let (ui_message, ui_message_error) =
+            if form.contains_key("__nulang_ui_message") {
+                match find_duplicate_form_field(body) {
+                    Some(name) => (
+                        None,
+                        Some(UiActionEnvelopeError::DuplicateFormField { name }),
+                    ),
+                    None => capture_ui_action_message(&form),
+                }
+            } else {
+                (None, None)
+            };
 
         Self {
             query,
@@ -111,6 +128,20 @@ impl HttpRequestBindingInputs {
             form: &self.form,
         }
     }
+}
+
+/// Decode field names with the same rules as the existing form parser, but
+/// preserve multiplicity long enough to reject ambiguity before map collapse.
+fn find_duplicate_form_field(body: &[u8]) -> Option<String> {
+    let mut seen = HashSet::new();
+    for pair in String::from_utf8_lossy(body).split('&').filter(|pair| !pair.is_empty()) {
+        let key = pair.split_once('=').map_or(pair, |(key, _)| key);
+        let name = percent_decode_form(key);
+        if !seen.insert(name.clone()) {
+            return Some(name);
+        }
+    }
+    None
 }
 
 fn capture_ui_action_message(
