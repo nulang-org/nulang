@@ -1133,13 +1133,41 @@ mod tests {
         assert_eq!(
             leader.fabric_consumer_progress_observed_votes("orders", 0, 1).unwrap().len(), 1
         );
+        let installed = leader.consumer_progress_installed_policy("orders").unwrap();
+        let wire = FabricConsumerProgressPrepareWire::new(
+            leader
+                .fabric_consumer_progress_pending_change("orders")
+                .unwrap(),
+            installed,
+            1,
+        ).unwrap();
+        let follower_id = if placement.leader == a_id { b_id } else { a_id };
+        assert!(follower.fabric_consumer_progress_apply_prepare_from_peer(
+            &wire, follower_id,
+        ).is_err());
+        assert!(follower.fabric_consumer_progress_apply_prepare_from_peer(
+            &wire, NodeId(999_999),
+        ).is_err());
+
         assert_eq!(leader.fabric_consumer_progress_dispatch_prepare("orders", 0, 1).unwrap(), 1);
         follower.process_network();
         leader.process_network();
         let observed = leader.fabric_consumer_progress_observed_votes("orders", 0, 1).unwrap();
         assert_eq!(observed.len(), 2);
         assert!(observed.contains(&placement.leader));
-        assert!(observed.contains(&if placement.leader == a_id { b_id } else { a_id }));
+        assert!(observed.contains(&follower_id));
+        let bogus = FabricConsumerProgressAckWire {
+            version: JOURNAL_FORMAT_VERSION,
+            stream: "orders".to_string(),
+            partition: 0,
+            epoch: 1,
+            metadata_sequence: 1,
+            digest: "f".repeat(64),
+            replica: follower_id.0,
+        };
+        assert!(leader
+            .fabric_consumer_progress_record_replica_receipt(&bogus, follower_id)
+            .is_err());
 
         let local = FileFabricConsumerProgressJournal::open(
             leader_root.join("orders").join("consumer_progress")
