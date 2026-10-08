@@ -8,9 +8,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use nulang::database::split::{SingleNodeSplitStore, SplitError};
-use nulang::database::tablet::{
-    KeyRange, TabletDescriptor, TabletId, TabletMutation,
-};
+use nulang::database::tablet::{KeyRange, TabletDescriptor, TabletId, TabletMutation};
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
@@ -32,7 +30,10 @@ fn parent() -> TabletDescriptor {
 }
 
 fn put(key: &[u8], value: &[u8]) -> TabletMutation {
-    TabletMutation::Put { key: key.to_vec(), value: value.to_vec() }
+    TabletMutation::Put {
+        key: key.to_vec(),
+        value: value.to_vec(),
+    }
 }
 
 #[test]
@@ -59,7 +60,12 @@ fn cannot_open_same_directory_twice_until_first_store_is_dropped() {
 fn exclusive_ownership_survives_split_publication() {
     let dir = root("split");
     let plan = parent()
-        .plan_split(b"m", TabletId::new(892).unwrap(), TabletId::new(893).unwrap(), 8)
+        .plan_split(
+            b"m",
+            TabletId::new(892).unwrap(),
+            TabletId::new(893).unwrap(),
+            8,
+        )
         .unwrap();
     {
         let mut primary = SingleNodeSplitStore::open(&dir, parent()).unwrap();
