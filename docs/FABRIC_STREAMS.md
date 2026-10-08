@@ -79,8 +79,30 @@ so ACKing sequence 5 cannot skip an unprocessed sequence 4. A lease created
 before installing a replication policy cannot be ACKed until its sequence is
 quorum-committed. Delivery state survives restart through `deliveries.json`.
 
-This safety requirement is shared with the standalone committed-consumer
-correction in PR #1421 and must be preserved when the branches are integrated.
+### Durability scope across leader changes
+
+**Consumer cursors, ACK gaps, and in-flight leases are durable only on the
+node that writes them.** `cursors.json` and `deliveries.json` are not part of
+the replicated stream log or replicated epoch-transition state. A promoted
+replica can have the same quorum-committed records while its consumer cursor
+is still zero. It will then deliver previously ACKed records again, and the
+delivery attempt counter can restart from one. A restarted *same node* can
+recover its local consumer progress; that does **not** establish continuity
+when leadership moves to a different node.
+
+Use idempotency keys for side effects and expect duplicate delivery across
+failover. Do not treat these APIs as JetStream-equivalent, exactly-once, or
+distributed-fenced durable consumer state. ACKs identify a record sequence,
+not a particular delivery attempt or leader epoch. A stale worker can ACK a
+record after its lease expires and it is delivered to another worker.
+
+A three-replica deterministic test demonstrates confirmed old-leader removal,
+successor epoch promotion, committed-record continuity, and replay of an
+ACKed record whose consumer state was not replicated. Abrupt crash and
+stale-leader/partition scenarios still need dedicated coverage. Before
+advertising durable consumer failover, replicate or quorum-checkpoint consumer
+progress and lease ownership, fence old epochs/attempts, and test a stopped
+leader plus restart and network partitions.
 
 ## Runtime APIs
 
