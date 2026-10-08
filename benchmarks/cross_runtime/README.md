@@ -14,6 +14,7 @@ The companion implementations use only each platform's standard message
 primitive:
 
 - **Nulang bytecode** (`nulang`) — real `Runtime` + bytecode actors, compiled without native-codegen
+- **Nulang warmed JIT** (`nulang-jit`) — bytecode actors with native JIT enabled, each workload warmed outside the timed region and required to have compiled at least one actor-VM native region before measurement
 - **Nulang AOT** (`nulang-aot`) — the same Nulang source and MIR, Cranelift ahead-of-time native actor behaviors registered before VM actor spawning; the harness rejects missing native dispatch targets rather than silently reporting bytecode execution as AOT
 - **Rust** — `std::sync::mpsc` channels + native threads
 - **Go** — channels + goroutines
@@ -22,8 +23,8 @@ primitive:
 Run all installed runtimes on the same host:
 
 ```bash
-python3 scripts/cross_runtime_bench.py --runs 10 --warmup 1 \
-  --runtimes nulang,nulang-aot,rust,go,erlang \
+python3 scripts/cross_runtime_bench.py --runs 12 --warmup 1 \
+  --runtimes nulang,nulang-jit,nulang-aot,rust,go,erlang \
   --cpu-mode single \
   --output /tmp/nulang-cross-runtime.json
 ```
@@ -32,15 +33,18 @@ The runner compiles each external fixture once, performs warm-up runs, then
 records exact nanosecond timings from each runtime and reports the median for
 every workload. Measured rounds counterbalance runtime order by rotating each
 pair and reversing its second round. Over **2 × the number of selected runtimes**
-measured rounds (ten for these five runtimes), every runtime occupies each
+measured rounds (twelve for these six runtimes), every runtime occupies each
 execution position twice. Smaller run counts are only partially balanced.
-Warm-ups do not shift the measured-round schedule. Both Nulang binaries are
+Warm-ups do not shift the measured-round schedule. All Nulang binaries are
 built outside timing and copied to distinct paths, so changing Cargo feature
 sets cannot overwrite or silently relabel a measured executable. Backend
 compilation time is excluded from the per-message throughput values.
-**This comparison does not yet include a distinct, verified warmed-JIT mode.**
-Enabling native-codegen is not itself proof that any particular actor behavior
-was JIT-executed. The JSON records
+The warmed-JIT mode requires nonzero actor-VM compiled-region telemetry after
+untimed workload-specific message warmup; enabling `native-codegen` alone is
+insufficient. That proof establishes that the JIT tier engaged somewhere in
+the actor VM, **not** that every actor behavior was compiled or that all timed
+instructions ran as native code. Successful CI execution and equivalent final
+actor state are still required before presenting comparative data. The JSON records
 `measured_execution_orders` so comparisons can audit actual execution order.
 The JSON also records OS/CPU counts, git SHA, toolchain versions, and the CPU
 topology used for measurement.
