@@ -46,7 +46,7 @@ fn bench_point_reads(c: &mut Criterion) {
             ("before_first", 0),
         ] {
             group.bench_with_input(
-                BenchmarkId::new(versions, position),
+                BenchmarkId::new(versions.to_string(), position),
                 &snapshot,
                 |b, &snapshot| {
                     b.iter(|| {
@@ -93,7 +93,7 @@ fn bench_tombstone_reads(c: &mut Criterion) {
             ("previous_present", (versions - 1) as u64),
         ] {
             group.bench_with_input(
-                BenchmarkId::new(versions, position),
+                BenchmarkId::new(versions.to_string(), position),
                 &snapshot,
                 |b, &snapshot| {
                     b.iter(|| {
