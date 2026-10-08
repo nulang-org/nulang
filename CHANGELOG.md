@@ -52,6 +52,7 @@ version + migration.*
 ## Stable tier
 
 ### RESP cache memory/TTL hardening and Valkey differential gate — 2026-09-24
+- **Journaled SET, MSET and INCR now validate without mutating, append/sync the WAL, and only then publish the cache write**; invalid counters or oversized values fail before WAL append. Journaled admission fails closed rather than evicting unjournaled keys; Memory mode retains eviction behavior.
 - **Durable DEL, multi-key DEL, and EXPIRE now journal before mutating live cache state**, preserving preexisting values and TTLs if a WAL append fails; multi-key DEL also deduplicates keys. SET/MSET/INCR still need write-ahead admission and publication changes.
 - **The experimental RESP cache now uses keyed hashing, bounded admission, S3-FIFO eviction, segmented size-class slabs, and pressure-triggered empty-slab reclamation** instead of relying on one relocatable arena backing buffer.
 - **Expiration now uses a five-level hierarchical timing wheel**, preventing long-lived TTLs from being reconsidered on each base-wheel rotation while preserving lazy expiry and generation fencing.

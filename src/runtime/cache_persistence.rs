@@ -204,14 +204,27 @@ impl DurableCacheStore {
         wall_now_ms: u64,
     ) -> Result<(), CacheDurabilityError> {
         self.ensure_healthy()?;
+        if self.mode == CacheDurabilityMode::Memory {
+            return self
+                .store
+                .try_set_bytes(key, value, ttl_ms, store_now_ms)
+                .map_err(CacheDurabilityError::Store);
+        }
+        // A journaled write may not evict other entries ahead of the WAL.
+        // Reject admission that would require unjournaled evictions.
         self.store
-            .try_set_bytes(key, value, ttl_ms, store_now_ms)
+            .validate_bytes_write(key, value)
             .map_err(CacheDurabilityError::Store)?;
         self.record(CacheWalMutation::SetBytes {
             key: key.to_vec(),
             value: value.to_vec(),
             expires_unix_ms: ttl_ms.map(|ttl| wall_now_ms.saturating_add(ttl)),
-        })
+        })?;
+        let result = self.store.try_set_bytes(key, value, ttl_ms, store_now_ms);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result.map_err(CacheDurabilityError::Store)
     }
 
     pub fn set_integer(
@@ -223,25 +236,42 @@ impl DurableCacheStore {
         wall_now_ms: u64,
     ) -> Result<(), CacheDurabilityError> {
         self.ensure_healthy()?;
+        if self.mode == CacheDurabilityMode::Memory {
+            return self
+                .store
+                .try_set_integer(key, value, ttl_ms, store_now_ms)
+                .map_err(CacheDurabilityError::Store);
+        }
         self.store
-            .try_set_integer(key, value, ttl_ms, store_now_ms)
+            .validate_integer_write(key)
             .map_err(CacheDurabilityError::Store)?;
         self.record(CacheWalMutation::SetInteger {
             key: key.to_vec(),
             value,
             expires_unix_ms: ttl_ms.map(|ttl| wall_now_ms.saturating_add(ttl)),
-        })
+        })?;
+        let result = self.store.try_set_integer(key, value, ttl_ms, store_now_ms);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result.map_err(CacheDurabilityError::Store)
     }
 
     pub fn set_many_bytes(
         &mut self,
         pairs: &[(&[u8], &[u8])],
         store_now_ms: u64,
-        wall_now_ms: u64,
+        _wall_now_ms: u64,
     ) -> Result<(), CacheDurabilityError> {
         self.ensure_healthy()?;
+        if self.mode == CacheDurabilityMode::Memory {
+            return self
+                .store
+                .try_set_many_bytes(pairs, None, store_now_ms)
+                .map_err(CacheDurabilityError::Store);
+        }
         self.store
-            .try_set_many_bytes(pairs, None, store_now_ms)
+            .validate_bytes_batch(pairs)
             .map_err(CacheDurabilityError::Store)?;
         let mutations = pairs
             .iter()
@@ -251,8 +281,12 @@ impl DurableCacheStore {
                 expires_unix_ms: None,
             })
             .collect();
-        let _ = wall_now_ms;
-        self.record(CacheWalMutation::Batch { mutations })
+        self.record(CacheWalMutation::Batch { mutations })?;
+        let result = self.store.try_set_many_bytes(pairs, None, store_now_ms);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result.map_err(CacheDurabilityError::Store)
     }
 
     pub fn delete_at(
@@ -334,25 +368,32 @@ impl DurableCacheStore {
         wall_now_ms: u64,
     ) -> Result<i64, CacheDurabilityError> {
         self.ensure_healthy()?;
-        let value = self
+        if self.mode == CacheDurabilityMode::Memory {
+            return self
+                .store
+                .increment(key, delta, store_now_ms)
+                .map_err(CacheDurabilityError::Increment);
+        }
+        let (next, remaining_ttl_ms) = self
             .store
-            .increment(key, delta, store_now_ms)
+            .preview_increment(key, delta, store_now_ms)
             .map_err(CacheDurabilityError::Increment)?;
-        let expires_unix_ms = match self.store.ttl(key, store_now_ms) {
-            CacheTtl::Persistent => None,
-            CacheTtl::RemainingMs(remaining) => Some(wall_now_ms.saturating_add(remaining)),
-            CacheTtl::Missing => {
-                return Err(CacheDurabilityError::InvalidMode(
-                    "increment succeeded but cache entry disappeared before journaling",
-                ));
-            }
-        };
         self.record(CacheWalMutation::SetInteger {
             key: key.to_vec(),
-            value,
-            expires_unix_ms,
+            value: next,
+            expires_unix_ms: remaining_ttl_ms
+                .map(|remaining| wall_now_ms.saturating_add(remaining)),
         })?;
-        Ok(value)
+        // The same shard owns the entire preflight -> record -> apply
+        // sequence, so successful preflight guarantees the value and admission
+        // stay unchanged. Unexpected apply failures still poison the shard.
+        let result = self.store.increment(key, delta, store_now_ms);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        let applied = result.map_err(CacheDurabilityError::Increment)?;
+        debug_assert_eq!(applied, next);
+        Ok(applied)
     }
 
     pub fn snapshot_and_rotate(
@@ -1260,6 +1301,192 @@ mod tests {
         ));
         assert_eq!(durable.store().snapshot_entries(0).len(), 2);
         assert!(durable.is_poisoned());
+        let _ = fs::remove_file(wal_path);
+    }
+
+    #[test]
+    fn journal_first_writes_recover_successful_mutations_and_preserve_counter_ttl() {
+        let wal_path = test_path("writes-recovery-wal");
+        let snapshot_path = test_path("writes-recovery-snapshot");
+        let wal = CacheWal::create_after(&wal_path, 0).unwrap();
+        let mut durable = DurableCacheStore::with_wal(
+            CacheStore::new(),
+            wal,
+            CacheDurabilityMode::SyncedJournal,
+        )
+        .unwrap();
+
+        durable.set_bytes(b"counter", b"4", Some(5_000), 0, 1_000).unwrap();
+        assert_eq!(durable.increment(b"counter", 3, 0, 1_000).unwrap(), 7);
+        durable
+            .set_many_bytes(
+                &[(b"a".as_slice(), b"one".as_slice()),
+                  (b"b".as_slice(), b"two".as_slice())],
+                0,
+                1_000,
+            )
+            .unwrap();
+        assert_eq!(durable.durability_status().wal_last_sequence, Some(3));
+        assert_eq!(durable.ttl(b"counter", 0), CacheTtl::RemainingMs(5_000));
+        drop(durable);
+
+        let (mut recovered, report) = recover_cache(
+            &snapshot_path,
+            &wal_path,
+            CacheConfig::default(),
+            CacheEvictionPolicy::S3Fifo,
+            100,
+            2_000,
+        )
+        .unwrap();
+        assert_eq!(report.replayed_records, 3);
+        assert_eq!(recovered.get(b"counter", 100), Some(CacheValueView::Integer(7)));
+        assert_eq!(recovered.ttl(b"counter", 100), CacheTtl::RemainingMs(4_000));
+        assert_eq!(recovered.get(b"a", 100), Some(CacheValueView::Bytes(b"one")));
+        assert_eq!(recovered.get(b"b", 100), Some(CacheValueView::Bytes(b"two")));
+
+        let _ = fs::remove_file(wal_path);
+    }
+
+    #[test]
+    fn rejected_journaled_increment_does_not_advance_wal() {
+        let wal_path = test_path("invalid-increment-wal");
+        let wal = CacheWal::create_after(&wal_path, 0).unwrap();
+        let mut store = CacheStore::new();
+        store.set_bytes(b"counter", b"not-an-integer", None, 0);
+        let mut durable = DurableCacheStore::with_wal(
+            store,
+            wal,
+            CacheDurabilityMode::SyncedJournal,
+        )
+        .unwrap();
+        assert!(matches!(
+            durable.increment(b"counter", 1, 0, 0),
+            Err(CacheDurabilityError::Increment(CacheIncrementError::NotInteger))
+        ));
+        assert_eq!(durable.durability_status().wal_last_sequence, Some(0));
+        assert!(!durable.is_poisoned());
+        let _ = fs::remove_file(wal_path);
+    }
+
+    #[test]
+    fn durable_capacity_pressure_does_not_evict_unjournaled_live_key() {
+        let wal_path = test_path("write-capacity");
+        let wal = CacheWal::create_after(&wal_path, 0).unwrap();
+        let mut store = CacheStore::with_config_and_eviction(
+            CacheConfig {
+                max_key_bytes: 32,
+                max_value_bytes: 32,
+                max_entries: 1,
+                max_arena_bytes: 1024,
+            },
+            CacheEvictionPolicy::S3Fifo,
+        );
+        store.set_bytes(b"existing", b"original", None, 0);
+        let mut durable = DurableCacheStore::with_wal(
+            store,
+            wal,
+            CacheDurabilityMode::SyncedJournal,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            durable.set_bytes(b"new", b"replacement", None, 0, 0),
+            Err(CacheDurabilityError::Store(CacheWriteError::EntryLimitReached))
+        ));
+        assert_eq!(durable.durability_status().wal_last_sequence, Some(0));
+        assert!(!durable.is_poisoned());
+        assert_eq!(
+            durable.store().snapshot_entries(0)[0].value,
+            CacheSnapshotValue::Bytes(b"original".to_vec())
+        );
+        let _ = fs::remove_file(wal_path);
+    }
+
+    #[test]
+    fn failed_set_journal_retains_preexisting_value() {
+        let wal_path = test_path("set-before-wal");
+        let wal = CacheWal::create_after(&wal_path, 0).unwrap();
+        let mut store = CacheStore::new();
+        store.set_bytes(b"k", b"before", None, 0);
+        let mut durable =
+            DurableCacheStore::with_wal(store, wal, CacheDurabilityMode::SyncedJournal).unwrap();
+        let readonly = OpenOptions::new().read(true).open(&wal_path).unwrap();
+        durable.wal.as_mut().unwrap().file = readonly;
+        assert!(matches!(
+            durable.set_bytes(b"k", b"after", None, 0, 0),
+            Err(CacheDurabilityError::Persistence(_))
+        ));
+        assert_eq!(
+            durable.store().snapshot_entries(0)[0].value,
+            CacheSnapshotValue::Bytes(b"before".to_vec())
+        );
+        assert!(durable.is_poisoned());
+        let _ = fs::remove_file(wal_path);
+    }
+
+    #[test]
+    fn failed_mset_journal_keeps_all_prior_keys_and_values() {
+        let wal_path = test_path("mset-before-wal");
+        let wal = CacheWal::create_after(&wal_path, 0).unwrap();
+        let mut store = CacheStore::new();
+        store.set_bytes(b"a", b"one", None, 0);
+        let mut durable =
+            DurableCacheStore::with_wal(store, wal, CacheDurabilityMode::SyncedJournal).unwrap();
+        let readonly = OpenOptions::new().read(true).open(&wal_path).unwrap();
+        durable.wal.as_mut().unwrap().file = readonly;
+        let pairs = [
+            (b"a".as_slice(), b"two".as_slice()),
+            (b"b".as_slice(), b"three".as_slice()),
+        ];
+        assert!(matches!(
+            durable.set_many_bytes(&pairs, 0, 0),
+            Err(CacheDurabilityError::Persistence(_))
+        ));
+        let state = durable.store().snapshot_entries(0);
+        assert_eq!(state.len(), 1);
+        assert_eq!(state[0].value, CacheSnapshotValue::Bytes(b"one".to_vec()));
+        let _ = fs::remove_file(wal_path);
+    }
+
+    #[test]
+    fn failed_increment_journal_keeps_integer_and_ttl() {
+        let wal_path = test_path("increment-before-wal");
+        let wal = CacheWal::create_after(&wal_path, 0).unwrap();
+        let mut store = CacheStore::new();
+        store.set_integer(b"counter", 4, Some(5_000), 0);
+        let mut durable =
+            DurableCacheStore::with_wal(store, wal, CacheDurabilityMode::SyncedJournal).unwrap();
+        let readonly = OpenOptions::new().read(true).open(&wal_path).unwrap();
+        durable.wal.as_mut().unwrap().file = readonly;
+        assert!(matches!(
+            durable.increment(b"counter", 1, 0, 0),
+            Err(CacheDurabilityError::Persistence(_))
+        ));
+        let state = durable.store().snapshot_entries(0);
+        assert_eq!(state[0].value, CacheSnapshotValue::Integer(4));
+        assert_eq!(state[0].remaining_ttl_ms, Some(5_000));
+        let _ = fs::remove_file(wal_path);
+    }
+
+    #[test]
+    fn journaled_set_preflight_rejects_before_appending() {
+        let wal_path = test_path("write-preflight");
+        let wal = CacheWal::create_after(&wal_path, 0).unwrap();
+        let store = CacheStore::with_config(CacheConfig {
+            max_key_bytes: 2,
+            max_value_bytes: 2,
+            max_entries: 1,
+            max_arena_bytes: 1024,
+        });
+        let mut durable =
+            DurableCacheStore::with_wal(store, wal, CacheDurabilityMode::SyncedJournal).unwrap();
+        assert!(matches!(
+            durable.set_bytes(b"excess", b"x", None, 0, 0),
+            Err(CacheDurabilityError::Store(CacheWriteError::KeyTooLarge))
+        ));
+        assert_eq!(durable.durability_status().wal_last_sequence, Some(0));
+        assert!(!durable.is_poisoned());
         let _ = fs::remove_file(wal_path);
     }
 

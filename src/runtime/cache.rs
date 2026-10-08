@@ -810,7 +810,7 @@ impl CacheStore {
         hasher.finish()
     }
 
-    fn validate_bytes_write(&self, key: &[u8], value: &[u8]) -> Result<(), CacheWriteError> {
+    pub(crate) fn validate_bytes_write(&self, key: &[u8], value: &[u8]) -> Result<(), CacheWriteError> {
         if key.len() > self.config.max_key_bytes {
             return Err(CacheWriteError::KeyTooLarge);
         }
@@ -836,7 +836,7 @@ impl CacheStore {
         Ok(())
     }
 
-    fn validate_bytes_batch(&self, pairs: &[(&[u8], &[u8])]) -> Result<(), CacheWriteError> {
+    pub(crate) fn validate_bytes_batch(&self, pairs: &[(&[u8], &[u8])]) -> Result<(), CacheWriteError> {
         let mut new_entries = 0usize;
         let mut arena_lengths = Vec::with_capacity(pairs.len().saturating_mul(2));
 
@@ -911,7 +911,7 @@ impl CacheStore {
         }
     }
 
-    fn validate_integer_write(&self, key: &[u8]) -> Result<(), CacheWriteError> {
+    pub(crate) fn validate_integer_write(&self, key: &[u8]) -> Result<(), CacheWriteError> {
         if key.len() > self.config.max_key_bytes {
             return Err(CacheWriteError::KeyTooLarge);
         }
@@ -1472,6 +1472,42 @@ impl CacheStore {
             Some(deadline) => CacheTtl::RemainingMs(deadline.saturating_sub(now_ms)),
             None => CacheTtl::Persistent,
         }
+    }
+
+    /// Validate and compute the next counter value without changing a live
+    /// value. This is the journal-before-apply preflight for durable INCR.
+    /// Absent keys use non-evicting admission so no live entry can be removed
+    /// before a successful WAL append.
+    pub(crate) fn preview_increment(
+        &mut self,
+        key: &[u8],
+        delta: i64,
+        now_ms: u64,
+    ) -> Result<(i64, Option<u64>), CacheIncrementError> {
+        let Some(slot_id) = self.live_slot_id(key, now_ms) else {
+            self.validate_integer_write(key)
+                .map_err(CacheIncrementError::WriteRejected)?;
+            return Ok((delta, None));
+        };
+        let entry = self.slots[slot_id as usize]
+            .entry
+            .as_ref()
+            .expect("live slot vanished");
+        let base = match entry.value {
+            CacheValue::Integer(value) => value,
+            CacheValue::Bytes(bytes) => {
+                let raw = bytes.as_slice(&self.arena);
+                let text = std::str::from_utf8(raw)
+                    .map_err(|_| CacheIncrementError::NotInteger)?;
+                text.parse::<i64>()
+                    .map_err(|_| CacheIncrementError::NotInteger)?
+            }
+        };
+        let next = base.checked_add(delta).ok_or(CacheIncrementError::Overflow)?;
+        let remaining_ttl = entry
+            .expires_at_ms
+            .map(|deadline| deadline.saturating_sub(now_ms));
+        Ok((next, remaining_ttl))
     }
 
     pub fn increment(

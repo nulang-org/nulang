@@ -200,8 +200,17 @@ The local acknowledgement model is now explicit through
 Journaled deletes (single or multi-key) and expiry changes now persist
 their mutations before changing live cache state. A WAL error therefore does
 not remove an existing value or alter its TTL, and poisons the wrapper.
-SET, MSET and INCR still mutate before journaling and require a separate
-admission/commit redesign before full write-ahead visibility is guaranteed.
+SET, MSET and INCR now also perform non-mutating admission/value
+preflight before appending, then publish the write only after the selected WAL
+acknowledgement boundary. Counter preflight computes the exact next value and
+preserves the key's existing TTL, rejecting integer parsing and overflow before
+journal append. Journaled writes fail capacity admission rather than evicting
+live keys whose removal is not represented in the WAL; Memory mode retains
+its existing eviction behavior. If an unexpected in-memory apply error occurs
+after WAL success, the durable wrapper poisons itself instead of continuing
+to serve a state diverged from the WAL. The write-ahead guarantees apply to
+single-shard commands only; replication acknowledgements and durability
+across leader failover remain separate concerns.
 
 Multi-key mutations are encoded as one WAL batch record. If journaling fails
 after the in-memory mutation, the durability wrapper poisons itself and refuses
