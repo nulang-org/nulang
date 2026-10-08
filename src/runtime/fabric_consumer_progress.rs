@@ -1067,7 +1067,7 @@ mod tests {
     }
     #[test]
     fn follower_prepare_fsync_ack_is_observed_but_not_committed() {
-        use std::collections::HashMap;
+        use std::collections::{HashMap, HashSet};
         use std::net::SocketAddr;
         use std::sync::Arc;
         use crate::runtime::{
@@ -1149,7 +1149,26 @@ mod tests {
             &wire, NodeId(999_999),
         ).is_err());
 
-        assert_eq!(leader.fabric_consumer_progress_dispatch_prepare("orders", 0, 1).unwrap(), 1);
+        // A transport partition can still enqueue a send, but it must not
+        // create an application fsync receipt or committed consumer cursor.
+        leader.distributed.transport.as_mut().unwrap()
+            .set_partition(HashSet::from([follower_id]));
+        assert_eq!(
+            leader.fabric_consumer_progress_dispatch_prepare("orders", 0, 1).unwrap(),
+            1
+        );
+        follower.process_network();
+        leader.process_network();
+        assert_eq!(
+            leader.fabric_consumer_progress_observed_votes("orders", 0, 1).unwrap().len(),
+            1
+        );
+        leader.distributed.transport.as_mut().unwrap()
+            .set_partition(HashSet::new());
+        assert_eq!(
+            leader.fabric_consumer_progress_dispatch_prepare("orders", 0, 1).unwrap(),
+            1
+        );
         follower.process_network();
         leader.process_network();
         let observed = leader.fabric_consumer_progress_observed_votes("orders", 0, 1).unwrap();
