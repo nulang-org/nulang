@@ -268,7 +268,7 @@ fn compile_run_with_runtime(
         nulang::mir_codegen::compile_mir(&mut mir, "savina").expect("bench: codegen failed");
     let mut vm = VM::new();
     vm.load_module(module);
-    vm.set_actor_callbacks(Box::new(RuntimeVmCallbacks::new(runtime)));
+    vm.set_actor_callbacks(Box::new(RuntimeVmCallbacks::new(Rc::clone(&runtime))));
     let value = vm.run().expect("bench: VM run failed");
     #[cfg(feature = "native-codegen")]
     if backend == Backend::Aot {
