@@ -2016,6 +2016,50 @@ fn collect_rvalue_field_and_consts(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn raw_integer_call_table_preserves_self_recursion_but_rejects_other_callees() {
+        use crate::mir::{FuncRef, FunctionBuilder, RValue, Terminator};
+        use crate::types::Type;
+
+        let build = |callee| {
+            let mut builder = FunctionBuilder::new("caller", Some(Type::int()));
+            let x = builder.add_param("x", Type::int());
+            let output = builder.add_temp(Type::int());
+            builder.assign(
+                output,
+                RValue::Call {
+                    func: FuncRef::Index(callee),
+                    args: vec![x],
+                },
+            );
+            builder.terminate(Terminator::Return(Some(output)));
+            builder.build()
+        };
+
+        assert!(super::raw_int_call_edges_are_safe(&build(0), 0));
+        assert!(!super::raw_int_call_edges_are_safe(&build(1), 0));
+    }
+
+    #[test]
+    fn raw_integer_call_table_rejects_local_closure_dispatch() {
+        use crate::mir::{FuncRef, FunctionBuilder, RValue, Terminator};
+        use crate::types::Type;
+
+        let mut builder = FunctionBuilder::new("caller", Some(Type::int()));
+        let closure = builder.add_param("callback", Type::unit());
+        let x = builder.add_param("x", Type::int());
+        let output = builder.add_temp(Type::int());
+        builder.assign(
+            output,
+            RValue::Call {
+                func: FuncRef::Local(closure),
+                args: vec![x],
+            },
+        );
+        builder.terminate(Terminator::Return(Some(output)));
+        assert!(!super::raw_int_call_edges_are_safe(&builder.build(), 0));
+    }
+
     /// End-to-end: `"hello" + 2 + 3` must concatenate with coercion ("hello23"),
     /// not fall through to integer arithmetic on the string's tag bits. Replicates
     /// `AotModule::run`'s heap + constants setup but keeps the heap alive so the
