@@ -14,7 +14,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use super::checkpoint::{self, CheckpointError};
-use super::tablet::{MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletWrite};
+use super::tablet::{MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletScanRow, TabletWrite};
 use super::wal::{FileWal, WalError};
 
 #[derive(Debug)]
@@ -76,6 +76,18 @@ impl WalBackedTablet {
 
     pub fn read_latest(&self, key: &[u8]) -> Option<&[u8]> {
         self.tablet.read_latest(key)
+    }
+
+    /// Return owned rows from one committed snapshot, suitable for a future
+    /// Arrow/columnar batch adapter. This does not expose mutable tablet state.
+    pub fn scan_at(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        snapshot: u64,
+        limit: usize,
+    ) -> Result<Vec<TabletScanRow>, TabletError> {
+        self.tablet.scan_at(start, end, snapshot, limit)
     }
 
     /// Atomically publish a checkpoint without reclaiming the WAL.
