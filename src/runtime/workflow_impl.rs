@@ -381,55 +381,84 @@ pub(crate) fn commit_workflow_command(
 
 /// Atomically commit the durable state produced by one successful workflow
 /// step together with its terminal StepCompleted event.
-///
-/// The command has already been atomically admitted by
-/// `commit_workflow_command`; this transition closes the same activation with
-/// one sequence shared by the resulting snapshot and terminal event.
 pub(crate) fn commit_step_completed(
     rt: &mut Runtime,
     actor_id: u64,
     activation: Option<WorkflowActivationId>,
     step_name: String,
 ) -> std::io::Result<()> {
-    let expected_previous_sequence = rt.persistence.latest_sequence(actor_id);
-    let sequence = expected_previous_sequence.checked_add(1).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "workflow terminal transition sequence overflow",
-        )
-    })?;
-    let snapshot = build_actor_snapshot_at_sequence(rt, actor_id, sequence)?.ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "workflow terminal transition requires a live persistent actor",
-        )
-    })?;
-    let activation_epoch = snapshot.activation_epoch;
-
-    rt.persistence.commit_transition(DurableTransition {
-        version: DURABLE_TRANSITION_VERSION,
-        actor_id,
-        activation_epoch,
-        sequence,
-        expected_previous_sequence,
-        command: None,
-        snapshot: Some(snapshot.clone()),
-        workflow_events: vec![WorkflowEvent::StepCompleted {
+    commit_workflow_event_transition(rt, actor_id, true, |sequence| {
+        WorkflowEvent::StepCompleted {
             sequence,
             activation,
             step_name,
-        }],
-        domain_events: vec![],
-        durable_effects: vec![],
-        outbox: vec![],
-    })?;
+        }
+    })
+}
 
-    rt.maybe_shadow_replicate(actor_id, &snapshot);
-    if let Some(actor) = rt.actors.get_mut(&actor_id) {
-        actor.sequence = sequence;
-        actor.dirty_fields.clear();
+/// Atomically close a failed workflow activation together with the durable
+/// state visible at the failure boundary.
+pub(crate) fn commit_step_failed(
+    rt: &mut Runtime,
+    actor_id: u64,
+    activation: Option<WorkflowActivationId>,
+    step_name: String,
+    error: String,
+) -> std::io::Result<()> {
+    commit_workflow_event_transition(rt, actor_id, true, |sequence| WorkflowEvent::StepFailed {
+        sequence,
+        activation,
+        step_name,
+        error,
+    })
+}
+
+/// Persist successful workflow completion without crossing persistence modes.
+pub(crate) fn persist_step_completed(
+    rt: &mut Runtime,
+    actor_id: u64,
+    activation: Option<WorkflowActivationId>,
+    step_name: String,
+) -> std::io::Result<()> {
+    if workflow_has_atomic_tail(rt, actor_id)? {
+        return commit_step_completed(rt, actor_id, activation, step_name);
     }
-    Ok(())
+
+    let sequence = next_sequence(rt, actor_id);
+    rt.persistence.append_workflow_event(
+        actor_id,
+        WorkflowEvent::StepCompleted {
+            sequence,
+            activation,
+            step_name,
+        },
+    )?;
+    try_checkpoint_actor(rt, actor_id)
+}
+
+/// Persist failed workflow completion without crossing persistence modes.
+pub(crate) fn persist_step_failed(
+    rt: &mut Runtime,
+    actor_id: u64,
+    activation: Option<WorkflowActivationId>,
+    step_name: String,
+    error: String,
+) -> std::io::Result<()> {
+    if workflow_has_atomic_tail(rt, actor_id)? {
+        return commit_step_failed(rt, actor_id, activation, step_name, error);
+    }
+
+    let sequence = next_sequence(rt, actor_id);
+    rt.persistence.append_workflow_event(
+        actor_id,
+        WorkflowEvent::StepFailed {
+            sequence,
+            activation,
+            step_name,
+            error,
+        },
+    )?;
+    try_checkpoint_actor(rt, actor_id)
 }
 
 /// Commit a nonterminal workflow event without moving the completed-state

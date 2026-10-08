@@ -4338,6 +4338,112 @@ fn test_legacy_checkpoint_is_rejected_after_atomic_workflow_tail_begins() {
 }
 
 #[test]
+fn test_compiled_workflow_turn_closes_on_atomic_tail() {
+    use crate::bytecode::{Instruction, OpCode};
+
+    let mut rt = Runtime::new();
+    let actor_id =
+        rt.spawn_workflow_actor("CompiledAtomicTail", Box::new(Vec::new), HashMap::new());
+
+    let mut module = CodeModule::new("compiled-atomic-tail");
+    module.emit(Instruction::new0(OpCode::Ret));
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.bytecode_module = Some(Box::new(module.clone()));
+        actor.bytecode_offsets = vec![0];
+        actor.compensation_offsets = vec![None];
+    }
+    rt.layout_workflow_behavior_table(actor_id);
+    rt.register_recovery_module(actor_id, module, vec![0], vec![None]);
+
+    rt.send_message_by_id(actor_id, 0, &[]);
+    run_ready_actor_turn(&mut rt, actor_id);
+
+    let tail = rt
+        .persistence
+        .load_durable_tail_position(actor_id)
+        .unwrap()
+        .expect("compiled workflow command and completion must use RFC 0022 transitions");
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    let journal = rt.persistence.read_journal(actor_id);
+    let completed = rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .into_iter()
+        .find_map(|event| match event {
+            WorkflowEvent::StepCompleted {
+                sequence,
+                activation,
+                ..
+            } => Some((sequence, activation)),
+            _ => None,
+        })
+        .expect("compiled workflow turn must record StepCompleted");
+
+    assert_eq!(journal.len(), 1);
+    let activation = WorkflowActivationId::new(actor_id, journal[0].sequence);
+    assert_eq!(completed.1, Some(activation));
+    assert_eq!(completed.0, tail.sequence);
+    assert_eq!(snapshot.sequence, tail.sequence);
+    assert_eq!(
+        rt.persistence.latest_sequence(actor_id),
+        tail.sequence,
+        "compiled workflow completion must not leave any legacy-only sequence beyond the atomic tail"
+    );
+}
+
+#[test]
+fn test_compiled_workflow_keeps_legacy_path_on_store_without_atomic_transitions() {
+    use crate::bytecode::{Instruction, OpCode};
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "nulang-compiled-workflow-legacy-{}-{nonce}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&path);
+
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(JsonFileStore::new(&path).unwrap());
+    let actor_id =
+        rt.spawn_workflow_actor("CompiledLegacyFallback", Box::new(Vec::new), HashMap::new());
+
+    let mut module = CodeModule::new("compiled-legacy-fallback");
+    module.emit(Instruction::new0(OpCode::Ret));
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.bytecode_module = Some(Box::new(module.clone()));
+        actor.bytecode_offsets = vec![0];
+        actor.compensation_offsets = vec![None];
+    }
+    rt.layout_workflow_behavior_table(actor_id);
+    rt.register_recovery_module(actor_id, module, vec![0], vec![None]);
+
+    rt.send_message_by_id(actor_id, 0, &[]);
+    run_ready_actor_turn(&mut rt, actor_id);
+
+    assert!(
+        rt.persistence
+            .load_durable_tail_position(actor_id)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::Unsupported),
+        "JSON persistence must remain explicitly legacy-only"
+    );
+    assert_eq!(rt.persistence.read_journal(actor_id).len(), 1);
+    assert!(
+        rt.persistence
+            .read_workflow_events(actor_id)
+            .iter()
+            .any(|event| matches!(event, WorkflowEvent::StepCompleted { .. })),
+        "compiled workflow must still complete through the pre-atomic compatibility path"
+    );
+
+    let _ = std::fs::remove_dir_all(path);
+}
+
+#[test]
 fn test_open_activation_intermediate_events_extend_atomic_tail() {
     let mut rt = Runtime::new();
     let actor_id = rt.spawn_workflow_actor(
