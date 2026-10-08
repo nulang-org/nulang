@@ -143,3 +143,31 @@ These are **non-durable actor workloads**, not mathematically stateless actors:
 ping-pong, counting, and fork-join workers mutate private local counters,
 but do not use Nulang's durable workflow/journal subsystem. Keep statefulness
 and persistence separate when interpreting results.
+
+## Contended admission (not an actor-speed leaderboard)
+
+Use the separate many-to-one queue benchmark for 1/2/4/8 concurrent producers:
+
+```bash
+python3 -m unittest discover -s tests -p test_mailbox_contention_cross_runtime.py -v
+python3 scripts/mailbox_contention_cross_runtime.py \
+  --producers 1,2,4,8 --messages-per-producer 10000 \
+  --runs 5 --warmup 1 --cpu-mode host \
+  --output /tmp/nulang-ractor-contention.json
+```
+
+The Nulang fixture measures **`Mailbox::push` only** with a lock-free
+concurrent queue. It excludes actor-reference routing, scheduler activation,
+runtime wakeups, message execution, and distributed delivery. The Ractor fixture
+measures **`ActorRef::cast`**, a higher-level actor-mailbox admission path.
+These are deliberately separately classified lower-bound diagnostics, not fair
+end-to-end actor-vs-actor performance comparisons. Do **not** use their raw
+throughput ratio as evidence of a language-speed advantage.
+
+Both implementations construct producer threads outside timing, release them
+through a barrier, send immutable one-integer messages, and require that the
+exact expected count be received after the timed enqueue phase. Barrier wakeup
+and producer joins remain inside timing. Neither fixture processes its actor
+mailbox during the enqueue measurement. `--cpu-mode host` is preferred for
+actual multicore contention. Record the host CPU topology and repeat on
+controlled hardware before interpreting differences.
