@@ -588,11 +588,7 @@ impl ExpirationWheel {
     }
 
     fn cancel(&mut self, slot: u32) {
-        let Some(location) = self
-            .locations
-            .get_mut(slot as usize)
-            .and_then(Option::take)
-        else {
+        let Some(location) = self.locations.get_mut(slot as usize).and_then(Option::take) else {
             return;
         };
 
@@ -2335,7 +2331,10 @@ mod tests {
             .flat_map(|level| level.iter())
             .map(Vec::len)
             .sum();
-        assert_eq!(queued, 1, "each overwrite must unlink the previous TTL record");
+        assert_eq!(
+            queued, 1,
+            "each overwrite must unlink the previous TTL record"
+        );
         assert_eq!(
             store.get(b"session", 1_000),
             Some(CacheValueView::Integer(999))
@@ -2426,7 +2425,11 @@ mod tests {
         );
 
         wheel.drain_candidates(3_000, &mut ready);
-        assert_eq!(ready.len(), 1, "requeue must replace, not duplicate, the handle");
+        assert_eq!(
+            ready.len(),
+            1,
+            "requeue must replace, not duplicate, the handle"
+        );
         assert_eq!(ready[0].expires_at_ms, 3_000);
         assert!(wheel.locations[7].is_none());
     }
