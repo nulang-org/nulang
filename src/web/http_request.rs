@@ -319,6 +319,72 @@ mod tests {
     }
 
     #[test]
+    fn rejects_duplicate_form_field_in_canonical_action_before_dispatch() {
+        let headers = vec![(
+            "Content-Type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        )];
+        let captured = HttpRequestBindingInputs::capture(
+            "/",
+            &headers,
+            b"role=admin&role=user&__nulang_ui_message=invalid",
+        );
+        assert!(captured.ui_message.is_none());
+        assert_eq!(
+            captured.ui_message_error,
+            Some(UiActionEnvelopeError::DuplicateFormField {
+                name: "role".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_percent_encoded_and_duplicate_control_fields() {
+        let headers = vec![(
+            "Content-Type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        )];
+        let encoded = HttpRequestBindingInputs::capture(
+            "/",
+            &headers,
+            b"role=admin&ro%6Ce=user&__nulang_ui_message=invalid",
+        );
+        assert_eq!(
+            encoded.ui_message_error,
+            Some(UiActionEnvelopeError::DuplicateFormField {
+                name: "role".to_string(),
+            })
+        );
+
+        let controls = HttpRequestBindingInputs::capture(
+            "/",
+            &headers,
+            b"__nulang_ui_message=invalid&__nulang_ui_message=another",
+        );
+        assert_eq!(
+            controls.ui_message_error,
+            Some(UiActionEnvelopeError::DuplicateFormField {
+                name: "__nulang_ui_message".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn keeps_legacy_form_compatibility_for_duplicate_fields() {
+        let headers = vec![(
+            "Content-Type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        )];
+        let legacy = HttpRequestBindingInputs::capture(
+            "/",
+            &headers,
+            b"role=admin&role=user",
+        );
+        assert!(legacy.ui_message.is_none());
+        assert_eq!(legacy.ui_message_error, None);
+    }
+
+    #[test]
     fn rejects_action_payload_disagreeing_with_posted_form() {
         let message = nulang_ui_protocol::HostToRuntimeMessage::invoke_action(
             nulang_ui_protocol::ActionRequest {
