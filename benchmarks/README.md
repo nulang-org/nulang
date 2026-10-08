@@ -119,12 +119,12 @@ with deliberately **different boundaries**. Do not add their rates directly:
 | `aot_actor_drain` | drain the identical state-updating actor through Cranelift AOT | matched AOT comparison |
 
 The AOT comparison now emits `[backend-provenance]` with
-`jit_compiled_regions` and `jit_execution_verified` for its bytecode
-counterpart. `jit_execution_verified=false` means the short warmed actor
+`jit_compiled_regions` and `jit_compilation_verified` for its bytecode
+counterpart. `jit_compilation_verified=false` means the short warmed actor
 behavior **did not cause native JIT compilation**. The previous wording
-`bytecode/JIT` was too strong. A nonzero region count would show that the
-actor VM compiled at least one region; it does not prove that all behavior
-instructions or all measured messages executed in native code.
+`bytecode/JIT` was too strong. A nonzero region count shows only that the actor VM compiled at least one
+region; it does **not** prove native execution even occurred, much less that
+all timed messages executed in native code.
 
 Never interpret the native noop drain as an isolated arithmetic decomposition
 of the state-updating actor workload; it does less application work. The
