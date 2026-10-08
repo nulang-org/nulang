@@ -70,9 +70,11 @@ pub(crate) fn stable_direct_closure_call(
     block_idx: usize,
     stmt_idx: usize,
 ) -> Option<usize> {
-    targets.get(&local).and_then(|&(defined_block, defined_stmt, target)| {
-        (defined_block == block_idx && defined_stmt < stmt_idx).then_some(target)
-    })
+    targets
+        .get(&local)
+        .and_then(|&(defined_block, defined_stmt, target)| {
+            (defined_block == block_idx && defined_stmt < stmt_idx).then_some(target)
+        })
 }
 
 /// Compiler-owned representation plan for one MIR function.
