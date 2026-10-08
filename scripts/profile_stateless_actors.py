@@ -90,6 +90,44 @@ def parse_samples(output: str, workload: str, repeat: int) -> list[dict[str, obj
     return results
 
 
+def validate_phase_samples(
+    output: str, workload: str, repeat: int, expected_messages: int
+) -> dict[str, float | int]:
+    """Check admission + scheduler timing has no missing or unaccounted work."""
+    if workload not in ("counting", "fork_join"):
+        raise ValueError("phase profiling currently supports counting and fork_join")
+    rows = parse_samples(output, workload, repeat)
+    if expected_messages <= 0:
+        raise ValueError("expected_messages must be positive")
+    admissions: list[int] = []
+    schedulers: list[int] = []
+    for row in rows:
+        if row["messages"] != expected_messages:
+            raise RuntimeError("phase profiling changed logical message count")
+        elapsed = row["elapsed_ns"]
+        admission = row.get("phase_admission_ns")
+        scheduler = row.get("phase_scheduler_ns")
+        if (type(admission) is not int or type(scheduler) is not int
+                or admission < 0 or scheduler < 0):
+            raise RuntimeError("missing or negative phase timings")
+        if admission + scheduler != elapsed:
+            raise RuntimeError("phase timings do not account for total elapsed time")
+        admissions.append(admission)
+        schedulers.append(scheduler)
+    import statistics
+
+    median_admission = statistics.median(admissions)
+    median_scheduler = statistics.median(schedulers)
+    total = median_admission + median_scheduler
+    return {
+        "samples": repeat,
+        "messages_per_sample": expected_messages,
+        "median_admission_ns": median_admission,
+        "median_scheduler_ns": median_scheduler,
+        "scheduler_fraction": median_scheduler / total if total else 0,
+    }
+
+
 def version(command: list[str]) -> str | None:
     try:
         result = subprocess.run(
