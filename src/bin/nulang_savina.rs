@@ -30,6 +30,7 @@ const BENCHMARKS: &[&str] = &[
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Backend {
     Bytecode,
+    Jit,
     Aot,
 }
 
@@ -37,6 +38,7 @@ impl Backend {
     fn label(self) -> &'static str {
         match self {
             Self::Bytecode => "nulang",
+            Self::Jit => "nulang-jit",
             Self::Aot => "nulang-aot",
         }
     }
@@ -104,6 +106,13 @@ fn main() -> ExitCode {
             if config.cross_runtime_only && name == "skynet" {
                 continue;
             }
+            if config.backend == Backend::Jit && name == "skynet" {
+                if config.benchmark.as_deref() == Some("skynet") {
+                    eprintln!("warmed JIT mode has no Skynet fixture");
+                    return ExitCode::from(2);
+                }
+                continue;
+            }
 
             let measurement = match name {
                 "counting" => bench_counting(config.backend),
@@ -134,8 +143,9 @@ fn parse_args() -> Result<Option<Config>, String> {
             "--backend" => {
                 backend = match args.next().as_deref() {
                     Some("bytecode") => Backend::Bytecode,
+                    Some("jit") => Backend::Jit,
                     Some("aot") => Backend::Aot,
-                    _ => return Err("--backend requires bytecode or aot".to_string()),
+                    _ => return Err("--backend requires bytecode, jit or aot".to_string()),
                 };
             }
             "--format" => {
@@ -179,8 +189,8 @@ fn parse_args() -> Result<Option<Config>, String> {
         }
     }
 
-    if backend == Backend::Aot && !cfg!(feature = "native-codegen") {
-        return Err("AOT backend requires --features native-codegen".to_string());
+    if backend != Backend::Bytecode && !cfg!(feature = "native-codegen") {
+        return Err("JIT and AOT backends require --features native-codegen".to_string());
     }
 
     Ok(Some(Config {
@@ -194,7 +204,7 @@ fn parse_args() -> Result<Option<Config>, String> {
 
 fn print_usage() {
     eprintln!(
-        "Usage: nulang-savina [--backend bytecode|aot] [--format human|jsonl] [--benchmark NAME] [--cross-runtime-only] [--repeat N] [--list]"
+        "Usage: nulang-savina [--backend bytecode|jit|aot] [--format human|jsonl] [--benchmark NAME] [--cross-runtime-only] [--repeat N] [--list]"
     );
 }
 
@@ -262,7 +272,7 @@ fn compile_run_with_runtime(
         runtime.borrow_mut().register_aot_module(aot);
     }
     #[cfg(not(feature = "native-codegen"))]
-    assert_eq!(backend, Backend::Bytecode, "AOT requires native-codegen");
+    assert_eq!(backend, Backend::Bytecode, "JIT/AOT require native-codegen");
 
     let module =
         nulang::mir_codegen::compile_mir(&mut mir, "savina").expect("bench: codegen failed");
@@ -303,6 +313,26 @@ fn compile_run_with_runtime(
     value
 }
 
+/// A warmed-JIT measurement is valid only after the actor runtime's own VM
+/// has compiled at least one native region, rather than just enabling the
+/// native-codegen Cargo feature. This check is deliberately outside timing.
+fn warm_and_verify_jit(runtime: &Rc<RefCell<Runtime>>, workload: &str) {
+    #[cfg(feature = "native-codegen")]
+    {
+        let compiled = runtime.borrow().benchmark_jit_compiled_count();
+        assert!(
+            compiled > 0,
+            "bench: warmed JIT did not compile an actor-VM region for {workload}"
+        );
+        eprintln!("[jit-warm] workload={workload} actor_vm_compiled_regions={compiled}");
+    }
+    #[cfg(not(feature = "native-codegen"))]
+    {
+        let _ = runtime;
+        panic!("bench: warmed JIT requires native-codegen for {workload}");
+    }
+}
+
 fn bench_counting(backend: Backend) -> Measurement {
     const N: i64 = 200_000;
     let source = r#"
@@ -316,6 +346,19 @@ fn bench_counting(backend: Backend) -> Measurement {
     let actor_id = compile_run_with_runtime(source, rt.clone(), backend)
         .as_actor_id()
         .expect("spawn returns an actor ref");
+
+    if backend == Backend::Jit {
+        for _ in 0..20_000 {
+            rt.borrow_mut().send_message(actor_id, "inc", &[]);
+        }
+        rt.borrow_mut().run_scheduler();
+        warm_and_verify_jit(&rt, "counting");
+        rt.borrow_mut()
+            .actors
+            .get_mut(&actor_id)
+            .expect("warmed counter still exists")
+            .set_state_field("count", Value::int(0));
+    }
 
     let start = Instant::now();
     for _ in 0..N {
@@ -386,6 +429,18 @@ fn bench_ping_pong(backend: Backend) -> Measurement {
 
     rt.borrow_mut().run_scheduler();
 
+    if backend == Backend::Jit {
+        rt.borrow_mut()
+            .send_message(pinger, "kick", &[Value::int(20_000)]);
+        rt.borrow_mut().run_scheduler();
+        warm_and_verify_jit(&rt, "ping_pong");
+        rt.borrow_mut()
+            .actors
+            .get_mut(&ponger)
+            .expect("warmed pong actor still exists")
+            .set_state_field("count", Value::int(0));
+    }
+
     let start = Instant::now();
     rt.borrow_mut()
         .send_message(pinger, "kick", &[Value::int(N)]);
@@ -450,6 +505,18 @@ let s = spawn Sink {} in
     };
 
     rt.borrow_mut().run_scheduler();
+
+    if backend == Backend::Jit {
+        rt.borrow_mut()
+            .send_message(r0, "token", &[Value::int(20_000), Value::int(0)]);
+        rt.borrow_mut().run_scheduler();
+        warm_and_verify_jit(&rt, "thread_ring");
+        rt.borrow_mut()
+            .actors
+            .get_mut(&sink)
+            .expect("warmed ring sink exists")
+            .set_state_field("total", Value::int(-1));
+    }
 
     let start = Instant::now();
     rt.borrow_mut()
@@ -516,6 +583,24 @@ let s = spawn Sink {} in
     assert_eq!(worker_ids.len(), WORKERS, "exactly W workers spawned");
 
     rt.borrow_mut().run_scheduler();
+
+    if backend == Backend::Jit {
+        for i in 0..TASKS {
+            let worker = worker_ids[(i as usize) % WORKERS];
+            rt.borrow_mut()
+                .send_message(worker, "task", &[Value::int(i)]);
+        }
+        rt.borrow_mut().run_scheduler();
+        warm_and_verify_jit(&rt, "fork_join");
+        let mut runtime = rt.borrow_mut();
+        for id in worker_ids.iter().copied().chain(std::iter::once(sink)) {
+            runtime
+                .actors
+                .get_mut(&id)
+                .expect("warmed worker or sink exists")
+                .set_state_field("count", Value::int(0));
+        }
+    }
 
     let start = Instant::now();
     for i in 0..TASKS {
