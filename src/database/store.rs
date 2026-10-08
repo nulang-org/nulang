@@ -184,3 +184,59 @@ impl fmt::Display for WalBackedError {
 }
 
 impl std::error::Error for WalBackedError {}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    use super::super::tablet::{KeyRange, TabletId};
+    use std::fs::{self, OpenOptions};
+    use std::io;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn public_commit_retains_gate_after_wal_fsync_until_mvcc_publish() {
+        let root = std::env::temp_dir().join(format!(
+            "nudb_store_ack_gate_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let descriptor = TabletDescriptor::new(
+            TabletId::new(941).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            3,
+        )
+        .unwrap();
+        let mut tablet = WalBackedTablet::open(descriptor, root.join("ordinary.wal")).unwrap();
+        let write = tablet
+            .prepare_write(
+                3,
+                0,
+                vec![TabletMutation::Put {
+                    key: b"b".to_vec(),
+                    value: b"ack".to_vec(),
+                }],
+            )
+            .unwrap();
+
+        tablet
+            .commit_inner(write, || {
+                // This callback executes after the durable WAL sync and
+                // before the in-memory MVCC publication and acknowledgement.
+                let contender = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(root.join(".nudb-write-gate.lock"))
+                    .unwrap();
+                assert_eq!(
+                    contender.try_lock().unwrap_err().kind(),
+                    io::ErrorKind::WouldBlock
+                );
+            })
+            .unwrap();
+        assert_eq!(tablet.read_latest(b"b"), Some(&b"ack"[..]));
+        drop(tablet);
+        let _ = fs::remove_dir_all(root);
+    }
+}
