@@ -967,6 +967,7 @@ impl ClusterState {
         // ------------------------------------------------------------------
         if now.duration_since(self.last_heartbeat_sent) >= self.heartbeat_interval {
             self.last_heartbeat_sent = now;
+            let heartbeat_start = actions.len();
 
             for info in self.members.values() {
                 if info.node_id == self.local_node {
@@ -986,6 +987,14 @@ impl ClusterState {
                         addr: info.address,
                     });
                 }
+            }
+            // Only seeded simulations pay to canonicalize emission order;
+            // the unseeded transport path remains unchanged.
+            if self.rng.is_some() {
+                actions[heartbeat_start..].sort_unstable_by_key(|action| match action {
+                    ClusterAction::SendHeartbeat { to, .. } => *to,
+                    _ => unreachable!("heartbeat slice only contains SendHeartbeat actions"),
+                });
             }
         }
 
@@ -1275,19 +1284,34 @@ impl ClusterState {
     /// Returns up to `max_entries` entries from the membership table.
     /// If the table is smaller than `max_entries`, all entries are returned.
     pub fn gossip_payload(&self, max_entries: usize) -> Vec<NodeGossip> {
+        let to_gossip = |info: &NodeInfo| NodeGossip {
+            node_id: info.node_id,
+            address: info.address,
+            status: info.status,
+            incarnation: info
+                .metadata
+                .get("_incarnation")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1),
+        };
+
+        if self.rng.is_some() {
+            // The seeded simulator must serialize the same membership
+            // subset in the same order across independently randomized maps.
+            let mut members: Vec<&NodeInfo> = self.members.values().collect();
+            members.sort_unstable_by_key(|info| info.node_id);
+            return members
+                .into_iter()
+                .take(max_entries)
+                .map(to_gossip)
+                .collect();
+        }
+
+        // Preserve the allocation-free production iteration path.
         self.members
             .values()
             .take(max_entries)
-            .map(|info| NodeGossip {
-                node_id: info.node_id,
-                address: info.address,
-                status: info.status,
-                incarnation: info
-                    .metadata
-                    .get("_incarnation")
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(1),
-            })
+            .map(to_gossip)
             .collect()
     }
 
