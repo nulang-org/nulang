@@ -31,7 +31,7 @@ class ProfileContractTests(unittest.TestCase):
             },
         ]
         summary = profile.validate_phase_samples(
-            "\\n".join(json.dumps(row) for row in records),
+            "\n".join(json.dumps(row) for row in records),
             "counting", 2, 200000,
         )
         self.assertEqual(summary["samples"], 2)
