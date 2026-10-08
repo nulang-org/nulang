@@ -1370,6 +1370,40 @@ mod tests {
     }
 
     #[test]
+    fn durable_capacity_pressure_does_not_evict_unjournaled_live_key() {
+        let wal_path = test_path("write-capacity");
+        let wal = CacheWal::create_after(&wal_path, 0).unwrap();
+        let mut store = CacheStore::with_config_and_eviction(
+            CacheConfig {
+                max_key_bytes: 32,
+                max_value_bytes: 32,
+                max_entries: 1,
+                max_arena_bytes: 1024,
+            },
+            CacheEvictionPolicy::S3Fifo,
+        );
+        store.set_bytes(b"existing", b"original", None, 0);
+        let mut durable = DurableCacheStore::with_wal(
+            store,
+            wal,
+            CacheDurabilityMode::SyncedJournal,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            durable.set_bytes(b"new", b"replacement", None, 0, 0),
+            Err(CacheDurabilityError::Store(CacheWriteError::EntryLimitReached))
+        ));
+        assert_eq!(durable.durability_status().wal_last_sequence, Some(0));
+        assert!(!durable.is_poisoned());
+        assert_eq!(
+            durable.store().snapshot_entries(0)[0].value,
+            CacheSnapshotValue::Bytes(b"original".to_vec())
+        );
+        let _ = fs::remove_file(wal_path);
+    }
+
+    #[test]
     fn failed_set_journal_retains_preexisting_value() {
         let wal_path = test_path("set-before-wal");
         let wal = CacheWal::create_after(&wal_path, 0).unwrap();
