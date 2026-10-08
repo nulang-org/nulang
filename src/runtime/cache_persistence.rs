@@ -1297,6 +1297,92 @@ mod tests {
     }
 
     #[test]
+    fn wal_scanner_replays_incrementally_and_stops_at_first_callback_failure() {
+        let wal_path = test_path("stream-stop");
+        let mut wal = CacheWal::create_after(&wal_path, 0).unwrap();
+        for number in 1..=3 {
+            wal.append(
+                &CacheWalMutation::SetInteger {
+                    key: format!("record-{number}").into_bytes(),
+                    value: number,
+                    expires_unix_ms: None,
+                },
+                CacheWalSync::Buffered,
+            )
+            .unwrap();
+        }
+        drop(wal);
+
+        let mut reader = File::open(&wal_path).unwrap();
+        let mut called = 0;
+        let failure = scan_wal_stream(&mut reader, |record| {
+            called += 1;
+            assert_eq!(record.sequence, 1);
+            Err(io::Error::other("stop after first record"))
+        })
+        .unwrap_err();
+
+        assert_eq!(failure.to_string(), "stop after first record");
+        assert_eq!(called, 1);
+        assert!(reader.stream_position().unwrap() < fs::metadata(&wal_path).unwrap().len());
+        let _ = fs::remove_file(wal_path);
+    }
+
+    #[test]
+    fn streaming_recovery_replays_large_journal_and_trims_partial_tail() {
+        let wal_path = test_path("stream-batch");
+        let snapshot_path = test_path("stream-snapshot");
+        let mut wal = CacheWal::create_after(&wal_path, 0).unwrap();
+        for number in 0..512 {
+            wal.append(
+                &CacheWalMutation::SetInteger {
+                    key: format!("item:{number}").into_bytes(),
+                    value: number,
+                    expires_unix_ms: None,
+                },
+                CacheWalSync::Buffered,
+            )
+            .unwrap();
+        }
+        drop(wal);
+        let complete_len = fs::metadata(&wal_path).unwrap().len();
+        let mut file = OpenOptions::new().append(true).open(&wal_path).unwrap();
+        file.write_all(&[0x11, 0x00, 0x00]).unwrap();
+        drop(file);
+
+        let (mut store, report) = recover_cache(
+            &snapshot_path, &wal_path,
+            CacheConfig::default(), CacheEvictionPolicy::None, 0, 0,
+        ).unwrap();
+        assert_eq!(report.replayed_records, 512);
+        assert_eq!(report.wal_last_sequence, 512);
+        assert_eq!(store.get(b"item:511", 0), Some(super::super::cache::CacheValueView::Integer(511)));
+
+        let reopened = CacheWal::open(&wal_path).unwrap();
+        assert_eq!(reopened.last_sequence(), 512);
+        assert_eq!(fs::metadata(&wal_path).unwrap().len(), complete_len);
+        drop(reopened);
+        let _ = fs::remove_file(wal_path);
+    }
+
+    #[test]
+    fn streaming_scan_rejects_oversized_record_header_before_loading_payload() {
+        let wal_path = test_path("stream-oversized");
+        let mut wal = CacheWal::create_after(&wal_path, 0).unwrap();
+        drop(wal);
+        let declared = u32::try_from(MAX_WAL_RECORD_BYTES + 1).unwrap();
+        let mut file = OpenOptions::new().append(true).open(&wal_path).unwrap();
+        file.write_all(&declared.to_le_bytes()).unwrap();
+        file.write_all(&(declared ^ u32::MAX).to_le_bytes()).unwrap();
+        drop(file);
+
+        let mut reader = File::open(&wal_path).unwrap();
+        let error = scan_wal_stream(&mut reader, |_| Ok(())).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let _ = fs::remove_file(wal_path);
+    }
+
+    #[test]
     fn wal_open_truncates_torn_tail_without_losing_complete_record() {
         let wal_path = test_path("torn");
         let mut wal = CacheWal::create_after(&wal_path, 0).unwrap();
