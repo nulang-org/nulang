@@ -1181,8 +1181,12 @@ impl FileFabricStreamStore {
             .entry(consumer.to_string())
             .or_default();
 
+        let acked_before = state.acked.len();
+        let inflight_before = state.inflight.len();
         state.acked.retain(|sequence| *sequence > cursor);
         state.inflight.retain(|sequence, _| *sequence > cursor);
+        let mut changed =
+            state.acked.len() != acked_before || state.inflight.len() != inflight_before;
 
         let mut delivered = Vec::with_capacity(limit.min(256));
         let mut start = cursor.saturating_add(1);
@@ -1215,6 +1219,7 @@ impl FileFabricStreamStore {
                     Some(lease) => {
                         lease.attempt = lease.attempt.saturating_add(1);
                         lease.deadline_unix_ms = deadline_ms;
+                        changed = true;
                         delivered.push(FabricConsumerDelivery {
                             record,
                             attempt: lease.attempt,
@@ -1230,6 +1235,7 @@ impl FileFabricStreamStore {
                                 attempt: 1,
                             },
                         );
+                        changed = true;
                         delivered.push(FabricConsumerDelivery {
                             record,
                             attempt: 1,
@@ -1246,8 +1252,12 @@ impl FileFabricStreamStore {
             start = last_sequence + 1;
         }
 
-        write_json_atomic(&path, &delivery_file)?;
-        sync_dir(&self.stream_dir(name))?;
+        // Do not rewrite and fsync consumer state for an empty/no-change poll.
+        // Active leases are still durable, and stale state is persisted if pruned.
+        if changed {
+            write_json_atomic(&path, &delivery_file)?;
+            sync_dir(&self.stream_dir(name))?;
+        }
         Ok(delivered)
     }
 
