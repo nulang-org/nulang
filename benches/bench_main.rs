@@ -10,6 +10,7 @@ mod cache_bench;
 mod dist_bench;
 mod gc_bench;
 mod interp_bench;
+mod iso_arena_bench;
 #[cfg(feature = "native-codegen")]
 mod jit_bench;
 mod persist_bench;
@@ -22,6 +23,7 @@ use criterion::criterion_main;
 criterion_main!(
     vm_bench::benches,
     interp_bench::benches,
+    iso_arena_bench::benches,
     actor_bench::benches,
     cache_bench::benches,
     aot_bench::benches,
@@ -36,6 +38,7 @@ criterion_main!(
 criterion_main!(
     vm_bench::benches,
     interp_bench::benches,
+    iso_arena_bench::benches,
     actor_bench::benches,
     cache_bench::benches,
     gc_bench::benches,
