@@ -999,5 +999,4 @@ mod transactional_receive_tests {
         assert_eq!(mb.pop().unwrap().sender, 33);
         assert!(mb.is_empty());
     }
-
 }
