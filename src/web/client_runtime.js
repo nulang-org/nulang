@@ -4,6 +4,7 @@
   const signalBindings = Object.create(null);
   let documentId = 'app';
   let revision = '0';
+  let hasAuthoritativeDocument = false;
 
   function refreshSignal(name) {
     const bindings = signalBindings[name];
@@ -27,10 +28,56 @@
     return undefined;
   }
 
+  // Keep the DOM adapter's snapshot checks aligned with UiDocument::validate:
+  // unique nonempty node IDs, reachable root, valid child links, no duplicate
+  // children, multiple parents or cycles. Unknown valid node kinds are allowed.
+  function validUiDocument(doc) {
+    const validId = (value) => typeof value === 'string' && value.trim().length > 0;
+    if (!doc || doc.protocol !== 'nulang-ui/1' ||
+        !validId(doc.document_id) || !validId(doc.root) ||
+        !validRevision(doc.revision) || !Array.isArray(doc.nodes)) return false;
+    const nodes = new Map();
+    for (const node of doc.nodes) {
+      if (!node || !validId(node.id) || !validId(node.kind) || nodes.has(node.id) ||
+          (node.children !== undefined && !Array.isArray(node.children)) ||
+          (node.actions !== undefined && !Array.isArray(node.actions)) ||
+          (node.properties !== undefined && (!node.properties || typeof node.properties !== 'object' ||
+            Array.isArray(node.properties)))) return false;
+      for (const action of node.actions || []) {
+        if (!action || !validId(action.event) || !validId(action.action_id) ||
+            (action.placement !== 'client' && action.placement !== 'server')) return false;
+      }
+      nodes.set(node.id, node);
+    }
+    if (!nodes.has(doc.root)) return false;
+    const parents = new Set();
+    for (const node of nodes.values()) {
+      const local = new Set();
+      for (const child of node.children || []) {
+        if (!validId(child) || !nodes.has(child) || local.has(child) || parents.has(child))
+          return false;
+        local.add(child);
+        parents.add(child);
+      }
+    }
+    const visited = new Set();
+    const stack = [doc.root];
+    while (stack.length) {
+      const id = stack.pop();
+      if (visited.has(id)) return false;
+      visited.add(id);
+      for (const child of nodes.get(id).children || []) stack.push(child);
+    }
+    return visited.size === nodes.size;
+  }
+
+
+
   // Accept only the protocol operations that this DOM micro-runtime can apply.
   // Validate the entire patch before touching DOM state (all-or-nothing).
   function applyPatch(patch) {
-    if (!patch || patch.protocol !== 'nulang-ui/1' || patch.document_id !== documentId ||
+    if (!hasAuthoritativeDocument || !patch || patch.protocol !== 'nulang-ui/1' ||
+        patch.document_id !== documentId ||
         !validRevision(patch.base_revision) || !validRevision(patch.revision) ||
         patch.base_revision !== revision || BigInt(patch.revision) <= BigInt(revision) ||
         !Array.isArray(patch.operations)) return false;
@@ -54,23 +101,28 @@
   }
 
   function applySnapshot(snapshot) {
-    if (!snapshot || snapshot.protocol !== 'nulang-ui/1' ||
-        snapshot.document_id !== documentId || !validRevision(snapshot.revision) ||
-        !Array.isArray(snapshot.nodes)) return false;
+    if (!validUiDocument(snapshot) ||
+        (hasAuthoritativeDocument && (snapshot.document_id !== documentId ||
+          BigInt(snapshot.revision) < BigInt(revision)))) return false;
+
+    // Validate every recognized signal before mutating the DOM or revision.
     const changes = new Map();
     for (const node of snapshot.nodes) {
-      if (!node || node.kind !== 'signal') continue;
+      if (node.kind !== 'signal') continue;
       const named = node.properties && node.properties.name;
       if (!named || named.type !== 'string' ||
           !Object.prototype.hasOwnProperty.call(signalBindings, named.value)) continue;
       const value = wireText(node.properties.value);
-      if (value !== undefined && node.properties.value.type !== 'null') changes.set(named.value, value);
+      if (value === undefined) return false;
+      changes.set(named.value, value);
     }
     changes.forEach(function (value, name) {
       signals[name] = value;
       refreshSignal(name);
     });
+    documentId = snapshot.document_id;
     revision = snapshot.revision;
+    hasAuthoritativeDocument = true;
     return true;
   }
 
@@ -154,6 +206,21 @@
       if (!signalBindings[name]) signalBindings[name] = [];
       signalBindings[name].push(el);
     });
+
+    // A page may include a validated, server-produced initial UiDocument as a
+    // JSON snapshot. Without that handshake, reject canonical patches rather
+    // than silently assuming the authoritative revision is zero.
+    const bootstrap = document.getElementById &&
+      document.getElementById('nulang-ui-bootstrap');
+    if (bootstrap) {
+      try {
+        if (!receiveUiMessage(JSON.parse(bootstrap.textContent))) {
+          console.warn('nulang: rejected UI bootstrap snapshot');
+        }
+      } catch (_) {
+        console.warn('nulang: malformed UI bootstrap snapshot');
+      }
+    }
 
     document.querySelectorAll('[data-action]').forEach(function (el) {
       const handler = el.dataset.action;
