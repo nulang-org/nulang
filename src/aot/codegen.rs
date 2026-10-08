@@ -901,8 +901,11 @@ pub enum CompileMode {
     Unboxed,
 }
 
-/// Check whether a function is eligible for unboxed compilation:
-/// all params are `KnownType::Int` and the return type is Int or void.
+/// Check whether a function's body is eligible for unboxed compilation:
+/// all params are `KnownType::Int` and the return type is exactly Int.
+///
+/// Module-level direct-call ABI compatibility is checked separately by the
+/// AOT orchestrator; this local predicate is not sufficient by itself.
 pub fn is_all_int(func: &mir::Function) -> bool {
     // Functions with handled effects (resuming or abortive) must stay boxed.
     // The perform-result and handler-param locals carry Unknown type metadata,
@@ -1067,14 +1070,25 @@ pub fn is_all_int(func: &mir::Function) -> bool {
             return false;
         }
     }
-    // Return type: None (unit) is fine, Some(Int) is fine, anything else disqualifies.
-    if let Some(ref ret_ty) = func.ret {
-        match ret_ty {
-            crate::types::Type::Primitive(crate::types::PrimitiveType::Int) => {}
-            _ => return false,
-        }
+    // A declared Int type is insufficient when directly constructed MIR
+    // contains a Return(None): the emitted tagged nil must not be passed
+    // through the raw integer boxing wrapper.
+    if func
+        .blocks
+        .iter()
+        .any(|block| matches!(&block.terminator, mir::Terminator::Return(None)))
+    {
+        return false;
     }
-    true
+    // The current boxing wrapper always tags an unboxed raw return as Int.
+    // A unit/void function instead returns tagged nil, so compiling it
+    // unboxed would silently turn nil into integer zero at the entry point.
+    matches!(
+        func.ret.as_ref(),
+        Some(crate::types::Type::Primitive(
+            crate::types::PrimitiveType::Int
+        ))
+    )
 }
 
 /// Compile the body of a MIR function that was already declared.

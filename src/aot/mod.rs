@@ -26,6 +26,25 @@ use crate::mir;
 use crate::runtime::heap::TypeTag as HeapTypeTag;
 use crate::types::{NuResult, Span};
 
+/// The current unboxed function table substitutes only the running
+/// function's own unboxed entry. Every other function remains a *boxed*
+/// entry point, and all local/closure calls use tagged-value dispatch.
+///
+/// Until module-wide raw ABI call tables are wired into codegen, an unboxed
+/// caller may therefore call itself directly but must not call another
+/// function (or a closure), even when that callee happens to return Int.
+fn raw_int_call_edges_are_safe(func: &mir::Function, caller_index: usize) -> bool {
+    func.blocks.iter().all(|block| {
+        block.stmts.iter().all(|stmt| match stmt {
+            mir::Stmt::Assign {
+                op: mir::RValue::Call { func: target, .. },
+                ..
+            } => matches!(target, mir::FuncRef::Index(index) if *index == caller_index),
+            _ => true,
+        })
+    })
+}
+
 /// Compiled AOT module ready for execution.
 pub struct AotModule {
     /// The Cranelift JIT module that owns compiled code memory.
@@ -142,8 +161,10 @@ impl AotModule {
                     span: Span::default(),
                 })?;
             func_ids.push(fid);
-            // If the function is all-Int, also declare an unboxed variant.
-            if codegen::is_all_int(func) {
+            // The current unboxed call table only proves self-recursion.
+            // Cross-function calls still enter a boxed callee; keep the
+            // caller boxed rather than forwarding raw arguments to it.
+            if codegen::is_all_int(func) && raw_int_call_edges_are_safe(func, idx) {
                 let ub_name = format!("nulang_fn_{}_unboxed", idx);
                 let mut ub_sig = jit_module.make_signature();
                 for _ in &func.params {
@@ -1995,6 +2016,50 @@ fn collect_rvalue_field_and_consts(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn raw_integer_call_table_preserves_self_recursion_but_rejects_other_callees() {
+        use crate::mir::{FuncRef, FunctionBuilder, RValue, Terminator};
+        use crate::types::Type;
+
+        let build = |callee| {
+            let mut builder = FunctionBuilder::new("caller", Some(Type::int()));
+            let x = builder.add_param("x", Type::int());
+            let output = builder.add_temp(Type::int());
+            builder.assign(
+                output,
+                RValue::Call {
+                    func: FuncRef::Index(callee),
+                    args: vec![x],
+                },
+            );
+            builder.terminate(Terminator::Return(Some(output)));
+            builder.build()
+        };
+
+        assert!(super::raw_int_call_edges_are_safe(&build(0), 0));
+        assert!(!super::raw_int_call_edges_are_safe(&build(1), 0));
+    }
+
+    #[test]
+    fn raw_integer_call_table_rejects_local_closure_dispatch() {
+        use crate::mir::{FuncRef, FunctionBuilder, RValue, Terminator};
+        use crate::types::Type;
+
+        let mut builder = FunctionBuilder::new("caller", Some(Type::int()));
+        let closure = builder.add_param("callback", Type::unit());
+        let x = builder.add_param("x", Type::int());
+        let output = builder.add_temp(Type::int());
+        builder.assign(
+            output,
+            RValue::Call {
+                func: FuncRef::Local(closure),
+                args: vec![x],
+            },
+        );
+        builder.terminate(Terminator::Return(Some(output)));
+        assert!(!super::raw_int_call_edges_are_safe(&builder.build(), 0));
+    }
+
     /// End-to-end: `"hello" + 2 + 3` must concatenate with coercion ("hello23"),
     /// not fall through to integer arithmetic on the string's tag bits. Replicates
     /// `AotModule::run`'s heap + constants setup but keeps the heap alive so the
