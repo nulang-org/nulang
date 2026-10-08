@@ -57,4 +57,11 @@ echo "NuDB MVCC: reverse=$baseline_sha binary=$candidate_sha"
   cargo +1.95.0 bench --locked --no-default-features --bench bench_main \
     -- nudb/mvcc --baseline nudb_reverse
 )
-echo "Review the Criterion per-case differences before promotion."
+# Retain machine-readable Criterion samples; the worktrees themselves are disposable.
+results_dir="$repo/benchmarks/nudb-mvcc-comparison"
+case_dir="$results_dir/$(printf '%s' "$baseline_sha" | cut -c1-12)-$(printf '%s' "$candidate_sha" | cut -c1-12)"
+mkdir -p "$case_dir"
+cp -a "$work/target/criterion/." "$case_dir/"
+printf 'baseline=%s\ncandidate=%s\nrust=1.95.0\n' "$baseline_sha" "$candidate_sha" > "$case_dir/refs.txt"
+echo "Saved Criterion results to $case_dir"
+echo "Review the per-case latency and noise before promotion."
