@@ -5,6 +5,7 @@ on:
     paths:
       - "src/database/**"
       - "tests/nudb_*.rs"
+      - "tests/tablet_owner_admission.rs"
       - "benches/database_bench.rs"
       - "benches/bench_main.rs"
       - ".github/workflows/nudb-storage.yml"
@@ -13,6 +14,7 @@ on:
     paths:
       - "src/database/**"
       - "tests/nudb_*.rs"
+      - "tests/tablet_owner_admission.rs"
       - "benches/database_bench.rs"
       - "benches/bench_main.rs"
       - ".github/workflows/nudb-storage.yml"
@@ -32,6 +34,10 @@ jobs:
           cargo test --locked --no-default-features --test nudb_wal_batch_decoder_hardening
       - name: Group commit contract
         run: cargo test --locked --no-default-features --test nudb_group_commit
+      - name: Tablet owner admission and coalescing
+        run: |
+          cargo test --locked --no-default-features --lib database::owner::tests
+          cargo test --locked --no-default-features --test tablet_owner_admission
       - name: Storage interruption matrix
         run: cargo test --locked --no-default-features --lib database::interruption::tests
       - name: Existing NulangDB storage contracts
