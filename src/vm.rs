@@ -6380,10 +6380,16 @@ mod vm_tests {
     #[test]
     fn iso_arena_env_opt_in_rejects_explicit_false_and_unknown_values() {
         for disabled in ["", "0", "false", "FALSE", "off", "no", "unknown"] {
-            assert!(!VM::iso_arena_env_opt_in(disabled), "{disabled} must remain disabled");
+            assert!(
+                !VM::iso_arena_env_opt_in(disabled),
+                "{disabled} must remain disabled"
+            );
         }
         for enabled in ["1", "true", "TRUE", "on", "yes"] {
-            assert!(VM::iso_arena_env_opt_in(enabled), "{enabled} must enable arena");
+            assert!(
+                VM::iso_arena_env_opt_in(enabled),
+                "{enabled} must enable arena"
+            );
         }
     }
 
