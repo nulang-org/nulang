@@ -115,7 +115,7 @@ fn leased_delivery_and_ack_remain_blocked_until_application_quorum() {
     );
     assert!(reopened
         .fabric_stream_deliver_consumer("leases", "worker", 10, Duration::from_secs(30))
-        .unwrap().is_empty());
+        .is_err());
     assert!(reopened.fabric_stream_ack_consumer("leases", "worker", 1).is_err());
 
     follower.process_network();
@@ -128,7 +128,14 @@ fn leased_delivery_and_ack_remain_blocked_until_application_quorum() {
     assert_eq!(delivery.len(), 1);
     assert_eq!(delivery[0].record.sequence, 1);
     assert_eq!(delivery[0].record.payload, b"do-not-run");
-    leader.fabric_stream_ack_consumer("leases", "worker", 1).unwrap();
+    leader
+        .fabric_stream_ack_consumer_fenced(
+            "leases",
+            "worker",
+            1,
+            delivery[0].leader_epoch.unwrap(),
+        )
+        .unwrap();
     assert_eq!(leader.fabric_stream_cursor("leases", "worker").unwrap(), 1);
     assert!(leader
         .fabric_stream_deliver_consumer("leases", "worker", 10, Duration::from_secs(30))
