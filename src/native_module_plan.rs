@@ -136,24 +136,7 @@ fn collect_direct_call_sites(
     func: &mir::Function,
     plan: &NativeFunctionPlan,
 ) -> Vec<DirectCallSite> {
-    let mut closure_targets = std::collections::HashMap::new();
-    for block in &func.blocks {
-        for stmt in &block.stmts {
-            if let mir::Stmt::Assign {
-                dst,
-                op:
-                    mir::RValue::Closure {
-                        func: target,
-                        captures,
-                    },
-            } = stmt
-            {
-                if captures.is_empty() {
-                    closure_targets.insert(*dst, *target);
-                }
-            }
-        }
-    }
+    let closure_targets = crate::native_plan::stable_direct_closure_targets(func);
 
     let local_repr = |id: mir::LocalId| {
         plan.locals
@@ -163,8 +146,8 @@ fn collect_direct_call_sites(
     };
 
     let mut sites = Vec::new();
-    for block in &func.blocks {
-        for stmt in &block.stmts {
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        for (stmt_idx, stmt) in block.stmts.iter().enumerate() {
             let mir::Stmt::Assign {
                 dst,
                 op: mir::RValue::Call { func: target, args },
@@ -175,7 +158,12 @@ fn collect_direct_call_sites(
 
             let callee = match target {
                 mir::FuncRef::Index(index) => Some(*index),
-                mir::FuncRef::Local(local) => closure_targets.get(local).copied(),
+                mir::FuncRef::Local(local) => crate::native_plan::stable_direct_closure_call(
+                    &closure_targets,
+                    *local,
+                    block_idx,
+                    stmt_idx,
+                ),
             };
 
             // Unresolved local calls already carry `DynamicCall`, so they are
