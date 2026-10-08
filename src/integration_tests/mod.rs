@@ -5,11 +5,14 @@
 #[cfg(test)]
 mod tests {
     use crate::bytecode::OpCode;
+    use crate::durable_effect::DurableEffectId;
+    use crate::durable_effect_persistence::DurableEffectPersistenceRecord;
     use crate::lexer::Lexer;
     use crate::parser::Parser;
     use crate::runtime::{
-        grain_actor_id, ActorSnapshot, DehydratePolicy, EventEntry, GrainId, JournalEntry,
-        MemoryStore, PersistenceStore, Runtime, RuntimeVmCallbacks, WorkflowEvent,
+        grain_actor_id, ActorSnapshot, DehydratePolicy, DurableCommit, DurableTailPosition,
+        DurableTransition, EventEntry, GrainId, JournalEntry, MemoryStore, PersistenceStore,
+        Runtime, RuntimeVmCallbacks, WorkflowEvent,
     };
     use crate::typechecker::TypeChecker;
     use crate::types::NuError;
@@ -19,20 +22,59 @@ mod tests {
     use std::collections::HashSet;
     use std::path::Path;
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     /// Thread-safe, shareable in-memory persistence store for tests that need
     /// to simulate a runtime restart while keeping the same underlying storage.
     #[derive(Debug, Clone)]
-    struct SharedMemoryStore(Arc<Mutex<MemoryStore>>);
+    struct SharedMemoryStore(Arc<Mutex<MemoryStore>>, Arc<AtomicBool>);
 
     impl SharedMemoryStore {
         fn new() -> Self {
-            Self(Arc::new(Mutex::new(MemoryStore::new())))
+            Self(
+                Arc::new(Mutex::new(MemoryStore::new())),
+                Arc::new(AtomicBool::new(false)),
+            )
+        }
+
+        /// Inject a single failed terminal transition while allowing command
+        /// admission, signal receipt, and history reads to remain functional.
+        fn fail_next_terminal_transition(&self) {
+            self.1.store(true, Ordering::SeqCst);
         }
     }
 
     impl PersistenceStore for SharedMemoryStore {
+        fn commit_transition(
+            &mut self,
+            transition: DurableTransition,
+        ) -> std::io::Result<DurableCommit> {
+            if transition
+                .workflow_events
+                .iter()
+                .any(|event| matches!(event, WorkflowEvent::StepCompleted { .. }))
+                && self.1.swap(false, Ordering::SeqCst)
+            {
+                return Err(std::io::Error::other(
+                    "injected atomic StepCompleted write failure",
+                ));
+            }
+            self.0.lock().unwrap().commit_transition(transition)
+        }
+        fn load_durable_tail_position(
+            &self,
+            actor_id: u64,
+        ) -> std::io::Result<Option<DurableTailPosition>> {
+            self.0.lock().unwrap().load_durable_tail_position(actor_id)
+        }
+        fn load_durable_effect(
+            &self,
+            actor_id: u64,
+            effect_id: DurableEffectId,
+        ) -> std::io::Result<Option<DurableEffectPersistenceRecord>> {
+            self.0.lock().unwrap().load_durable_effect(actor_id, effect_id)
+        }
         fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> std::io::Result<()> {
             self.0.lock().unwrap().save_snapshot(snapshot)
         }
@@ -70,6 +112,189 @@ mod tests {
         fn read_events(&self, actor_id: u64) -> Vec<EventEntry> {
             self.0.lock().unwrap().read_events(actor_id)
         }
+    }
+
+    #[test]
+    fn test_signal_resume_terminal_commit_failure_recovers_safe_snapshot() {
+        let source = r#"
+            workflow SignalTerminalFailure {
+                step wait_for_go { perform Signal.wait("go") }
+            }
+            let w = spawn SignalTerminalFailure {} in { w }
+        "#;
+        let store = SharedMemoryStore::new();
+        let (module, _) = compile_source(source).unwrap();
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        rt.borrow_mut().persistence = Box::new(store.clone());
+
+        let value = {
+            let mut vm = VM::new();
+            vm.load_module(module);
+            vm.set_actor_callbacks(Box::new(RuntimeVmCallbacks::new(rt.clone())));
+            vm.run().unwrap()
+        };
+        let actor_id = value.as_actor_id().expect("spawn should return actor ref");
+        rt.borrow_mut().send_message_by_id(actor_id, 0, &[]);
+        rt.borrow_mut().run_scheduler();
+        assert!(
+            rt.borrow().actors[&actor_id].suspended_execution.is_some(),
+            "workflow must be suspended before injecting terminal failure"
+        );
+
+        let safe_snapshot = store.load_snapshot(actor_id).unwrap();
+        let admitted_tail = store
+            .load_durable_tail_position(actor_id)
+            .unwrap()
+            .expect("command admission should establish atomic tail");
+        assert!(safe_snapshot.sequence < admitted_tail.sequence);
+
+        // SignalReceived must persist; only the resumed StepCompleted commit
+        // fails. The actor may not expose speculative post-resume state.
+        store.fail_next_terminal_transition();
+        rt.borrow_mut().signal_workflow(actor_id, "go", None).unwrap();
+        assert!(
+            !store.1.load(Ordering::SeqCst),
+            "signal resume must actually reach the injected terminal failure"
+        );
+
+        assert!(
+            !store.read_workflow_events(actor_id).iter().any(|event| {
+                matches!(event, WorkflowEvent::StepCompleted { .. })
+            }),
+            "failed atomic StepCompleted must not become durable"
+        );
+        let snapshot = store.load_snapshot(actor_id).unwrap();
+        assert_eq!(snapshot.sequence, safe_snapshot.sequence);
+        assert_eq!(
+            snapshot.state.get("step_index"),
+            safe_snapshot.state.get("step_index")
+        );
+        assert_eq!(
+            rt.borrow()
+                .actors
+                .get(&actor_id)
+                .expect("actor must recover after terminal storage error")
+                .get_state_field("step_index")
+                .and_then(|value| value.as_int()),
+            Some(0),
+            "resumed in-memory step must roll back to the safe boundary"
+        );
+    }
+
+    #[test]
+    fn test_timer_resume_terminal_commit_failure_recovers_safe_snapshot() {
+        let source = r#"
+            workflow TimerTerminalFailure {
+                step wait { perform Timer.sleep(50) }
+            }
+            let w = spawn TimerTerminalFailure {} in { w }
+        "#;
+        let store = SharedMemoryStore::new();
+        let (module, _) = compile_source(source).unwrap();
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        rt.borrow_mut().persistence = Box::new(store.clone());
+        rt.borrow_mut().install_virtual_clock();
+
+        let value = {
+            let mut vm = VM::new();
+            vm.load_module(module);
+            vm.set_actor_callbacks(Box::new(RuntimeVmCallbacks::new(rt.clone())));
+            vm.run().unwrap()
+        };
+        let actor_id = value.as_actor_id().expect("spawn should return actor ref");
+
+        rt.borrow_mut().send_message_by_id(actor_id, 0, &[]);
+        rt.borrow_mut().step_actor(actor_id);
+        assert!(
+            rt.borrow().actors[&actor_id].suspended_execution.is_some(),
+            "Timer.sleep must suspend before injecting terminal failure"
+        );
+        let safe_snapshot = store.load_snapshot(actor_id).unwrap();
+        let admitted_tail = store
+            .load_durable_tail_position(actor_id)
+            .unwrap()
+            .expect("command admission should establish atomic tail");
+        assert!(safe_snapshot.sequence < admitted_tail.sequence);
+
+        store.fail_next_terminal_transition();
+        rt.borrow_mut()
+            .advance_time(std::time::Duration::from_millis(100));
+        rt.borrow_mut().tick_timers();
+        assert!(
+            !store.1.load(Ordering::SeqCst),
+            "timer resume must actually reach the injected terminal failure"
+        );
+
+        assert!(
+            !store
+                .read_workflow_events(actor_id)
+                .iter()
+                .any(|event| { matches!(event, WorkflowEvent::StepCompleted { .. }) }),
+            "a failed timer-resume commit must not record StepCompleted"
+        );
+        let snapshot = store.load_snapshot(actor_id).unwrap();
+        assert_eq!(snapshot.sequence, safe_snapshot.sequence);
+        assert_eq!(
+            store
+                .load_durable_tail_position(actor_id)
+                .unwrap()
+                .expect("admitted atomic tail remains readable")
+                .sequence,
+            admitted_tail.sequence,
+            "a rejected StepCompleted must not advance the atomic tail"
+        );
+        assert_eq!(
+            rt.borrow()
+                .actors
+                .get(&actor_id)
+                .expect("actor must recover after timer terminal write failure")
+                .get_state_field("step_index")
+                .and_then(|value| value.as_int()),
+            Some(0),
+            "timer resume must not expose an uncommitted step_index"
+        );
+    }
+
+    #[test]
+    fn test_shared_memory_store_supports_atomic_tail_contract() {
+        let mut store = SharedMemoryStore::new();
+        let actor_id = 991_001;
+        store
+            .save_snapshot(ActorSnapshot {
+                actor_id,
+                sequence: 1,
+                ..ActorSnapshot::default()
+            })
+            .unwrap();
+
+        store
+            .commit_transition(crate::runtime::DurableTransition {
+                version: crate::runtime::DURABLE_TRANSITION_VERSION,
+                actor_id,
+                activation_epoch: 1,
+                sequence: 2,
+                expected_previous_sequence: 1,
+                command: None,
+                snapshot: None,
+                workflow_events: vec![WorkflowEvent::StepCompleted {
+                    sequence: 2,
+                    activation: None,
+                    step_name: "done".to_string(),
+                }],
+                domain_events: vec![],
+                durable_effects: vec![],
+                outbox: vec![],
+            })
+            .expect("test store must forward RFC 0022 atomic commits");
+        assert_eq!(
+            store
+                .load_durable_tail_position(actor_id)
+                .unwrap()
+                .unwrap()
+                .sequence,
+            2
+        );
+        assert_eq!(store.latest_sequence(actor_id), 2);
     }
 
     // -----------------------------------------------------------------------
@@ -8185,6 +8410,104 @@ match { a: 2, b: 9 } with {
             events.iter().any(|e| matches!(e, WorkflowEvent::StepCompleted { step_name, .. } if step_name == "ask_step")),
             "StepCompleted event should be persisted after the LLM call resumes"
         );
+        let completed_sequence = events
+            .iter()
+            .find_map(|event| match event {
+                WorkflowEvent::StepCompleted {
+                    sequence,
+                    step_name,
+                    ..
+                } if step_name == "ask_step" => Some(*sequence),
+                _ => None,
+            })
+            .unwrap();
+        let tail = store
+            .load_durable_tail_position(actor_id)
+            .unwrap()
+            .expect("LLM resume must remain on the RFC 0022 tail");
+        let snapshot = store.load_snapshot(actor_id).unwrap();
+        assert_eq!(completed_sequence, tail.sequence);
+        assert_eq!(snapshot.sequence, tail.sequence);
+        assert_eq!(store.latest_sequence(actor_id), tail.sequence);
+    }
+
+    /// Failed LLM-resume StepCompleted persistence must recover from the last
+    /// safe snapshot and re-drive the admitted activation. The retry may call
+    /// the external provider again, but it must persist only one completion.
+    #[cfg(feature = "ai-runtime")]
+    #[test]
+    fn test_workflow_inference_ask_failed_terminal_commit_redrives_safely() {
+        let source = r#"
+            workflow LlmTerminalFailure {
+                step ask_step { self.answer = perform Inference.ask("hello") }
+            }
+            let w = spawn LlmTerminalFailure {} in { w }
+        "#;
+        let store = SharedMemoryStore::new();
+        let (module, _) = compile_source(source).unwrap();
+        let llm = nulang_ai::MockLlmClient::text("world");
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        rt.borrow_mut().persistence = Box::new(store.clone());
+        rt.borrow_mut().set_llm_client(Box::new(llm.clone()));
+
+        let actor_id = {
+            let mut vm = VM::new();
+            vm.load_module(module);
+            vm.set_actor_callbacks(Box::new(RuntimeVmCallbacks::new(rt.clone())));
+            vm.run()
+                .unwrap()
+                .as_actor_id()
+                .expect("spawn must return the workflow actor")
+        };
+        let safe_snapshot = store.load_snapshot(actor_id).unwrap();
+        store.fail_next_terminal_transition();
+        rt.borrow_mut().send_message_by_id(actor_id, 0, &[]);
+        rt.borrow_mut().run_scheduler();
+
+        assert!(
+            !store.1.load(Ordering::SeqCst),
+            "the LLM resume must reach the injected terminal write failure"
+        );
+        assert_eq!(
+            llm.recorded_calls().len(),
+            2,
+            "one rejected terminal transition should re-drive one fresh LLM call"
+        );
+
+        let completed: Vec<_> = store
+            .read_workflow_events(actor_id)
+            .into_iter()
+            .filter_map(|event| match event {
+                WorkflowEvent::StepCompleted {
+                    sequence,
+                    step_name,
+                    ..
+                } if step_name == "ask_step" => Some(sequence),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            completed.len(),
+            1,
+            "a failed StepCompleted followed by recovery must persist only one terminal event"
+        );
+        let tail = store
+            .load_durable_tail_position(actor_id)
+            .unwrap()
+            .expect("the recovered command must end on the atomic tail");
+        let snapshot = store.load_snapshot(actor_id).unwrap();
+        assert!(tail.sequence > safe_snapshot.sequence);
+        assert_eq!(completed[0], tail.sequence);
+        assert_eq!(snapshot.sequence, tail.sequence);
+        assert_eq!(store.latest_sequence(actor_id), tail.sequence);
+
+        let live = rt.borrow();
+        let actor = live.actors.get(&actor_id).expect("workflow actor must recover");
+        assert_eq!(
+            actor.get_state_field("step_index").and_then(|v| v.as_int()),
+            Some(1)
+        );
+        assert_eq!(live.actor_state_string(actor_id, "answer").as_deref(), Some("world"));
     }
 
     /// Crash-and-recover for a workflow step suspended on `Inference.ask`: the
@@ -8246,15 +8569,23 @@ match { a: 2, b: 9 } with {
             );
             assert!(actor.llm_inflight, "background call should be in flight");
         }
-        // The snapshot must carry the suspension marker so recovery knows
-        // the in-flight step has to be re-driven.
+        // RFC 0022 recovery keeps the completed-state snapshot at the
+        // pre-command boundary. The admitted command + missing terminal event,
+        // not a legacy suspension-marker rewrite, identifies unfinished work.
         let snapshot = store
             .load_snapshot(actor_id)
-            .expect("workflow spawn should have persisted a snapshot");
+            .expect("workflow spawn should have persisted a safe snapshot");
+        let suspended_tail = store
+            .load_durable_tail_position(actor_id)
+            .unwrap()
+            .expect("atomic command admission must establish a durable tail");
+        assert!(
+            snapshot.sequence < suspended_tail.sequence,
+            "suspension must not move the safe snapshot onto partial workflow state"
+        );
         assert_eq!(
-            snapshot.waiting_signal.as_deref(),
-            Some("__llm_ask_pending__"),
-            "snapshot should record the LLM suspension marker"
+            snapshot.waiting_signal, None,
+            "atomic LLM suspension must not mutate the completed-state snapshot marker"
         );
 
         // Simulate a node restart: drop the actor and recover into a fresh
@@ -8301,6 +8632,26 @@ match { a: 2, b: 9 } with {
             "the recovered runtime should issue one fresh LLM call"
         );
         assert_eq!(calls[0].messages[0].content, "hello");
+
+        let completed_sequence = events
+            .iter()
+            .find_map(|event| match event {
+                WorkflowEvent::StepCompleted {
+                    sequence,
+                    step_name,
+                    ..
+                } if step_name == "ask_step" => Some(*sequence),
+                _ => None,
+            })
+            .unwrap();
+        let recovered_tail = store
+            .load_durable_tail_position(actor_id)
+            .unwrap()
+            .expect("recovered LLM completion must close on the atomic tail");
+        let recovered_snapshot = store.load_snapshot(actor_id).unwrap();
+        assert_eq!(completed_sequence, recovered_tail.sequence);
+        assert_eq!(recovered_snapshot.sequence, recovered_tail.sequence);
+        assert_eq!(store.latest_sequence(actor_id), recovered_tail.sequence);
     }
 
     /// A workflow step that waits on a signal AND THEN performs `Inference.ask`

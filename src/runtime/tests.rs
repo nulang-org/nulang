@@ -4337,6 +4337,56 @@ fn test_legacy_checkpoint_is_rejected_after_atomic_workflow_tail_begins() {
     );
 }
 
+#[test]
+fn test_failed_resumed_workflow_terminal_rolls_back_uncommitted_state() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "RollbackResume",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+    declare_test_behavior(&mut rt, actor_id, "run");
+    let behavior_id = rt.behavior_id_for(actor_id, "run").unwrap();
+    let safe_snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    let activation =
+        workflow::commit_workflow_command(&mut rt, actor_id, behavior_id, Vec::new()).unwrap();
+
+    // Simulate a resumed bytecode step mutating durable state before its
+    // StepCompleted transition fails. The live mutation must not survive.
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .set_state_field("step_index", Value::int(99));
+    rt.recover_workflow_after_failed_terminal(actor_id);
+
+    let actor = rt.actors.get(&actor_id).expect("actor must recover");
+    assert_eq!(
+        actor
+            .get_state_field("step_index")
+            .and_then(|value| value.as_int()),
+        Some(0),
+        "an uncommitted resumed step must not remain visible in memory"
+    );
+    assert_eq!(
+        rt.persistence.load_snapshot(actor_id).unwrap().sequence,
+        safe_snapshot.sequence,
+        "recovery must keep the last successfully committed snapshot"
+    );
+    assert_eq!(
+        rt.persistence.latest_sequence(actor_id),
+        activation.command_sequence,
+        "recovery must preserve the admitted command for deterministic replay"
+    );
+    assert!(
+        !rt.persistence
+            .read_workflow_events(actor_id)
+            .iter()
+            .any(|event| { matches!(event, WorkflowEvent::StepCompleted { .. }) }),
+        "failed terminal commit must not fabricate successful completion"
+    );
+}
 
 #[test]
 fn test_compiled_workflow_turn_closes_on_atomic_tail() {
