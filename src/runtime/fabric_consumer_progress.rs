@@ -20,6 +20,8 @@ pub(crate) const FABRIC_CONSUMER_PROGRESS_PREPARE_BEHAVIOR: &str =
     "__nulang_fabric_consumer_progress_prepare_v1";
 pub(crate) const FABRIC_CONSUMER_PROGRESS_ACK_BEHAVIOR: &str =
     "__nulang_fabric_consumer_progress_ack_v1";
+pub(crate) const FABRIC_CONSUMER_PROGRESS_COMMIT_BEHAVIOR: &str =
+    "__nulang_fabric_consumer_progress_commit_v1";
 
 const JOURNAL_FORMAT_VERSION: u16 = 1;
 const MAX_FRAME_BYTES: usize = 1_048_576;
@@ -1043,6 +1045,122 @@ impl Runtime {
             change.clone(), policy, stage_bound,
         )?;
         Ok(journal.verified_voters().into_iter().map(NodeId).collect())
+    }
+
+    /// Persist locally only after observed follower fsync receipts survived
+    /// a journal replay. Does not apply public consumer ACKs.
+    pub(crate) fn fabric_consumer_progress_commit_observed(
+        &mut self,
+        stream: &str,
+        partition: u16,
+        metadata_sequence: u64,
+    ) -> io::Result<usize> {
+        let policy = self.consumer_progress_validate_leader(stream)?;
+        let path = self.consumer_progress_directory(stream)?;
+        let mut journal = FileFabricConsumerProgressJournal::open(path)?;
+        let (change, installed, _) = journal.pending_change().ok_or_else(|| {
+            invalid("consumer-progress commit requires a pending metadata change")
+        })?;
+        if change.metadata_sequence != metadata_sequence
+            || change.partition != partition
+            || installed != &policy
+        {
+            return Err(invalid("consumer-progress commit differs from installed policy"));
+        }
+        journal.commit_observed_quorum(metadata_sequence)?;
+        let last = journal.last_commit().ok_or_else(|| {
+            invalid("committed consumer-progress record missing after local fsync")
+        })?;
+        let wire = FabricConsumerProgressCommitWire::from_committed(last);
+        self.consumer_progress_dispatch_commit(&wire)
+    }
+
+    /// Redrive an exact committed metadata decision after packet loss or
+    /// restart on the *same* leader. Reconfiguration requires more recovery.
+    pub(crate) fn fabric_consumer_progress_redrive_last_commit(
+        &mut self,
+        stream: &str,
+    ) -> io::Result<usize> {
+        let _policy = self.consumer_progress_validate_leader(stream)?;
+        let path = self.consumer_progress_directory(stream)?;
+        let journal = FileFabricConsumerProgressJournal::open(path)?;
+        let last = journal.last_commit().ok_or_else(|| {
+            invalid("no consumer-progress committed decision to redrive")
+        })?;
+        let wire = FabricConsumerProgressCommitWire::from_committed(last);
+        self.consumer_progress_dispatch_commit(&wire)
+    }
+
+    fn consumer_progress_dispatch_commit(
+        &mut self,
+        wire: &FabricConsumerProgressCommitWire,
+    ) -> io::Result<usize> {
+        let policy = self.consumer_progress_validate_leader(&wire.stream)?;
+        if wire.partition != 0 || wire.leader != policy.leader || wire.epoch != policy.epoch {
+            return Err(invalid("consumer-progress commit epoch or leader changed"));
+        }
+        let bytes = wire.to_wire_bytes()?;
+        let local = NodeId(policy.leader);
+        let cluster = self.distributed.cluster.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "consumer-progress commit requires cluster")
+        })?;
+        let targets: Vec<(NodeId, std::net::SocketAddr)> = policy.replicas.iter()
+            .copied()
+            .map(NodeId)
+            .filter(|replica| *replica != local)
+            .filter_map(|replica| {
+                cluster.get_node(replica)
+                    .filter(|node| matches!(node.status, NodeStatus::Healthy | NodeStatus::Joining))
+                    .map(|node| (replica, node.address))
+            })
+            .collect();
+        let transport = self.distributed.transport.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "consumer-progress commit requires transport")
+        })?;
+        for (target, address) in &targets {
+            transport.send(*target, *address, Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name: FABRIC_CONSUMER_PROGRESS_COMMIT_BEHAVIOR.to_string(),
+                content_hash: None,
+                required_protocol_id: None,
+                payload: Vec::new(),
+                string_table: Vec::new(),
+                object_table: vec![(0, bytes.clone())],
+                sender_actor: 0,
+                sender_node: local,
+                priority: MessagePriority::System,
+                trace_id: None,
+            });
+        }
+        Ok(targets.len())
+    }
+
+    /// Accept exact leader-origin metadata commit after matching local prepare.
+    /// Structural certificate checks are not cryptographic proof of peer fsync.
+    pub(crate) fn fabric_consumer_progress_apply_commit_from_peer(
+        &mut self,
+        wire: &FabricConsumerProgressCommitWire,
+        from: NodeId,
+    ) -> io::Result<()> {
+        wire.validate_shape()?;
+        let policy = self.consumer_progress_installed_policy(&wire.stream)?;
+        let local = self.distributed.node_id.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "consumer-progress follower needs distribution")
+        })?;
+        if from.0 != policy.leader
+            || wire.leader != policy.leader
+            || wire.epoch != policy.epoch
+            || !policy.replicas.contains(&local.0)
+            || local.0 == policy.leader
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "consumer-progress commit rejected: sender/leader/epoch mismatch",
+            ));
+        }
+        let path = self.consumer_progress_directory(&wire.stream)?;
+        let mut journal = FileFabricConsumerProgressJournal::open(path)?;
+        journal.apply_committed_update(wire)
     }
 }
 
