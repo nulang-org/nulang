@@ -149,7 +149,7 @@ fn deterministic_mvcc_reference_model_survives_checkpoint_recovery_and_split() {
                     value,
                     "recovery: seed={initial_seed} snapshot={snapshot} key={key:?}"
                 );
-                let child_value = if key < b"m" {
+                let child_value = if key < &b"m"[..] {
                     left.read_at(key, snapshot).unwrap()
                 } else {
                     right.read_at(key, snapshot).unwrap()
