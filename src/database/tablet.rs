@@ -355,10 +355,7 @@ impl MemoryTablet {
     /// tablets. This is a pure preparation operation, NOT a routing cutover:
     /// durable split publication requires a fenced, atomic catalog transition.
     /// Both children inherit the source sequence as their initial predecessor.
-    pub fn materialize_split(
-        &self,
-        plan: &TabletSplitPlan,
-    ) -> Result<(Self, Self), TabletError> {
+    pub fn materialize_split(&self, plan: &TabletSplitPlan) -> Result<(Self, Self), TabletError> {
         if plan.source != self.descriptor {
             return Err(TabletError::SplitPlanMismatch);
         }
@@ -583,6 +580,9 @@ impl MemoryTablet {
             return Err(TabletError::KeyOutsideTabletRange);
         }
         let upper = end.map(Excluded).unwrap_or(Unbounded);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let mut rows = Vec::new();
         for (key, versions) in self.rows.range::<[u8], _>((Included(start), upper)) {
             if let Some(value) = versions
@@ -676,8 +676,12 @@ impl fmt::Display for TabletError {
                 f,
                 "tablet split epoch {proposed} must be newer than current epoch {current}"
             ),
-            Self::SplitPlanMismatch => f.write_str("tablet split plan does not match the source descriptor"),
-            Self::InvalidScanBounds => f.write_str("tablet scan end must be strictly greater than start"),
+            Self::SplitPlanMismatch => {
+                f.write_str("tablet split plan does not match the source descriptor")
+            }
+            Self::InvalidScanBounds => {
+                f.write_str("tablet scan end must be strictly greater than start")
+            }
             Self::StaleEpoch { current, presented } => write!(
                 f,
                 "stale tablet ownership epoch {presented}; current epoch is {current}"
