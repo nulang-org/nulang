@@ -105,8 +105,8 @@ fn another_process_cannot_take_the_live_directory_lock() {
         .output()
         .unwrap();
     assert!(
-        output.status.success(),
-        "contending process unexpectedly opened tablet: stdout={} stderr={}",
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "contending child test must execute and reject ownership: stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
