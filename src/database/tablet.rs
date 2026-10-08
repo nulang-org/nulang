@@ -629,19 +629,40 @@ mod snapshot_binary_lookup_tests {
     #[test]
     fn sparse_history_finds_last_visible_version_and_respects_tombstones() {
         let versions = vec![
-            VersionedValue { sequence: 2, value: Some(b"first".to_vec()) },
-            VersionedValue { sequence: 9, value: None },
-            VersionedValue { sequence: 25, value: Some(b"restored".to_vec()) },
+            VersionedValue {
+                sequence: 2,
+                value: Some(b"first".to_vec()),
+            },
+            VersionedValue {
+                sequence: 9,
+                value: None,
+            },
+            VersionedValue {
+                sequence: 25,
+                value: Some(b"restored".to_vec()),
+            },
         ];
 
         assert!(visible_version_at(&versions, 0).is_none());
         assert!(visible_version_at(&versions, 1).is_none());
-        assert_eq!(visible_version_at(&versions, 2).unwrap().value.as_deref(), Some(&b"first"[..]));
-        assert_eq!(visible_version_at(&versions, 8).unwrap().value.as_deref(), Some(&b"first"[..]));
+        assert_eq!(
+            visible_version_at(&versions, 2).unwrap().value.as_deref(),
+            Some(&b"first"[..])
+        );
+        assert_eq!(
+            visible_version_at(&versions, 8).unwrap().value.as_deref(),
+            Some(&b"first"[..])
+        );
         assert!(visible_version_at(&versions, 9).unwrap().value.is_none());
         assert!(visible_version_at(&versions, 24).unwrap().value.is_none());
-        assert_eq!(visible_version_at(&versions, 25).unwrap().value.as_deref(), Some(&b"restored"[..]));
-        assert_eq!(visible_version_at(&versions, u64::MAX).unwrap().sequence, 25);
+        assert_eq!(
+            visible_version_at(&versions, 25).unwrap().value.as_deref(),
+            Some(&b"restored"[..])
+        );
+        assert_eq!(
+            visible_version_at(&versions, u64::MAX).unwrap().sequence,
+            25
+        );
         assert!(visible_version_at(&[], 25).is_none());
     }
 
@@ -655,7 +676,10 @@ mod snapshot_binary_lookup_tests {
             .collect();
 
         for sequence in [0, 1, 2, 3, 5, 6, 9, 99, 100, 4096 * 3 - 1, 4096 * 3] {
-            let expected = versions.iter().rev().find(|version| version.sequence <= sequence);
+            let expected = versions
+                .iter()
+                .rev()
+                .find(|version| version.sequence <= sequence);
             let actual = visible_version_at(&versions, sequence);
             assert_eq!(actual, expected, "snapshot {sequence}");
             if let (Some(actual), Some(expected)) = (actual, expected) {
