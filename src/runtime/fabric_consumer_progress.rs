@@ -2093,6 +2093,15 @@ mod tests {
         nonphysical.partition = 1;
         assert!(leader.fabric_consumer_progress_stage(nonphysical).is_err());
         leader.fabric_consumer_progress_stage(change).unwrap();
+        // Packet dispatch temporarily owns the ClusterState outside Runtime.
+        // A verified leader must remain eligible to process fsync receipts
+        // against that held membership without weakening health fencing.
+        let held_cluster = leader.distributed.cluster.take().unwrap();
+        assert!(leader
+            .consumer_progress_validate_leader_from_cluster("orders", &held_cluster)
+            .is_ok());
+        assert!(leader.consumer_progress_validate_leader("orders").is_err());
+        leader.distributed.cluster = Some(held_cluster);
         assert_eq!(
             leader
                 .fabric_consumer_progress_observed_votes("orders", 0, 1)
