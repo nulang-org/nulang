@@ -175,18 +175,21 @@
     };
   }
 
-  function formBody(form) {
+  function formBody(form, submitter) {
     const body = new URLSearchParams();
     if (!form) return body;
-    new FormData(form).forEach(function (value, key) {
+    // HTML successful-control semantics include the clicked submitter.
+    // FormData(form) alone omits the clicked button's name/value.
+    const fields = submitter ? new FormData(form, submitter) : new FormData(form);
+    fields.forEach(function (value, key) {
       if (typeof value === 'string') body.append(key, value);
     });
     return body;
   }
 
-  async function runServerAction(handler, el) {
+  async function runServerAction(handler, el, submitter) {
     const form = el.closest('form');
-    const body = formBody(form);
+    const body = formBody(form, submitter);
     const message = createActionMessage(handler, 'server', body);
     body.append('__nulang_action', handler);
     body.append('__nulang_ui_message', JSON.stringify(message));
@@ -231,7 +234,7 @@
       const listener = function (e) {
         e.preventDefault();
         if (placement === 'server') {
-          runServerAction(handler, el).catch(function (err) {
+          runServerAction(handler, el, e.submitter || (el.tagName === 'BUTTON' ? el : null)).catch(function (err) {
             console.error('nulang: server action failed', err);
           });
         } else {
