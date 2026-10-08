@@ -820,6 +820,86 @@ mod tests {
     }
 
     #[test]
+    fn preparing_manifest_rejects_reclaimed_wal_header_with_committed_history() {
+        let root = std::env::temp_dir().join(format!(
+            "nudb_reclaimed_bootstrap_header_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let parent = TabletDescriptor::new(
+            TabletId::new(901).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            7,
+        )
+        .unwrap();
+        fs::create_dir_all(&root).unwrap();
+        write_manifest(
+            &root.join("route.manifest"),
+            &DiskManifest::for_preparing_parent(&parent),
+            None,
+        )
+        .unwrap();
+        let wal_path = root.join("parent.wal");
+        {
+            let mut tablet = WalBackedTablet::open(parent.clone(), &wal_path).unwrap();
+            let write = tablet
+                .prepare_write(
+                    7,
+                    0,
+                    vec![TabletMutation::Put {
+                        key: b"b".to_vec(),
+                        value: b"previously-committed".to_vec(),
+                    }],
+                )
+                .unwrap();
+            tablet.commit(write).unwrap();
+            tablet.checkpoint().unwrap();
+        }
+        // A reclaimed WAL with a nonzero base sequence is only a header,
+        // but it still proves prior committed state once existed.
+        fs::remove_file(root.join("parent.checkpoint")).unwrap();
+        let before = fs::read(&wal_path).unwrap();
+        assert_eq!(before.len(), 64);
+        assert!(matches!(
+            SingleNodeSplitStore::open(&root, parent),
+            Err(SplitError::InvalidManifest(_))
+        ));
+        assert_eq!(fs::read(&wal_path).unwrap(), before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preparing_manifest_rejects_corrupt_full_size_wal_header() {
+        let root = std::env::temp_dir().join(format!(
+            "nudb_invalid_bootstrap_header_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let parent = TabletDescriptor::new(
+            TabletId::new(901).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            7,
+        )
+        .unwrap();
+        fs::create_dir_all(&root).unwrap();
+        write_manifest(
+            &root.join("route.manifest"),
+            &DiskManifest::for_preparing_parent(&parent),
+            None,
+        )
+        .unwrap();
+        let wal_path = root.join("parent.wal");
+        let bad_header = [0_u8; 64];
+        fs::write(&wal_path, bad_header).unwrap();
+        assert!(matches!(
+            SingleNodeSplitStore::open(&root, parent),
+            Err(SplitError::InvalidManifest(_))
+        ));
+        assert_eq!(fs::read(&wal_path).unwrap(), bad_header);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn preparing_manifest_never_discards_possible_committed_wal_records() {
         let root = std::env::temp_dir().join(format!(
             "nudb_preparing_wal_records_{}_{}",
