@@ -9,17 +9,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nulang::runtime::{
-    ClusterState, DeterministicNetworkTransport, FabricStreamConfig, IncomingPacket, NodeId,
-    OutgoingPacket, Runtime,
+    DeterministicNetworkTransport, FabricStreamConfig, IncomingPacket, NodeId, OutgoingPacket,
+    Runtime,
 };
 
-type Bus = Arc<parking_lot::Mutex<HashMap<
-    NodeId,
-    (
-        std::sync::mpsc::SyncSender<IncomingPacket>,
-        std::sync::mpsc::SyncSender<OutgoingPacket>,
-    ),
->>>;
+type Bus = Arc<
+    parking_lot::Mutex<
+        HashMap<
+            NodeId,
+            (
+                std::sync::mpsc::SyncSender<IncomingPacket>,
+                std::sync::mpsc::SyncSender<OutgoingPacket>,
+            ),
+        >,
+    >,
+>;
 
 fn node(addr: SocketAddr, bus: Bus) -> Runtime {
     let mut runtime = Runtime::new();
@@ -27,7 +31,8 @@ fn node(addr: SocketAddr, bus: Bus) -> Runtime {
     let transport = DeterministicNetworkTransport::bind_with_bus(addr, bus)
         .expect("deterministic transport must bind");
     transport.register_on_bus();
-    runtime.enable_distribution_with_transport(Box::new(transport))
+    runtime
+        .enable_distribution_with_transport(Box::new(transport))
         .expect("distribution must enable");
     runtime
 }
@@ -51,8 +56,16 @@ fn leased_delivery_and_ack_remain_blocked_until_application_quorum() {
 
     let mut a = node(addr_a, bus.clone());
     let mut b = node(addr_b, bus);
-    a.distributed.cluster.as_mut().unwrap().handle_heartbeat(id_b, addr_b);
-    b.distributed.cluster.as_mut().unwrap().handle_heartbeat(id_a, addr_a);
+    a.distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(id_b, addr_b);
+    b.distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(id_a, addr_a);
 
     let placement = a.fabric_stream_placement("leases", 0, 2).unwrap();
     let root_a = temp_dir("a");
@@ -64,18 +77,28 @@ fn leased_delivery_and_ack_remain_blocked_until_application_quorum() {
     } else {
         (&mut b, &mut a, &root_b)
     };
-    leader.fabric_stream_create("leases", FabricStreamConfig::default())
+    leader
+        .fabric_stream_create("leases", FabricStreamConfig::default())
         .unwrap();
 
     let append = leader
         .fabric_stream_replicated_append("leases", 0, 2, b"do-not-run")
         .unwrap();
     assert!(!append.status.committed);
-    assert_eq!(leader.fabric_stream_read("leases", 1, 10).unwrap().len(), 1);
-    assert!(leader.fabric_stream_read_committed("leases", 1, 10).unwrap().is_empty());
+    assert_eq!(
+        leader.fabric_stream_read("leases", 1, 10).unwrap().len(),
+        1
+    );
+    assert!(leader
+        .fabric_stream_read_committed("leases", 1, 10)
+        .unwrap()
+        .is_empty());
 
     // Neither legacy nor leased consumers may observe/ACK a local-only record.
-    assert!(leader.fabric_stream_read_consumer("leases", "worker", 10).unwrap().is_empty());
+    assert!(leader
+        .fabric_stream_read_consumer("leases", "worker", 10)
+        .unwrap()
+        .is_empty());
     assert!(leader
         .fabric_stream_deliver_consumer("leases", "worker", 10, Duration::from_secs(30))
         .unwrap().is_empty());
@@ -86,7 +109,10 @@ fn leased_delivery_and_ack_remain_blocked_until_application_quorum() {
     // Persisted raw tail exists on reopen, but quorum is still absent.
     let mut reopened = Runtime::new();
     reopened.fabric_stream_open(leader_dir).unwrap();
-    assert_eq!(reopened.fabric_stream_read("leases", 1, 10).unwrap().len(), 1);
+    assert_eq!(
+        reopened.fabric_stream_read("leases", 1, 10).unwrap().len(),
+        1
+    );
     assert!(reopened
         .fabric_stream_deliver_consumer("leases", "worker", 10, Duration::from_secs(30))
         .unwrap().is_empty());
