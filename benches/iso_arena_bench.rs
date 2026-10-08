@@ -3,12 +3,14 @@
 //!
 //! Run: cargo bench --bench bench_main -- vm/iso_arena
 //! All VM construction, bytecode loading, and static escape classification
-//! happen outside the timed region. Only VM execution is measured.
+//! happen outside the timed region. Only VM execution is measured, including
+//! normal ORCA local-release bookkeeping on the heap-backed path.
 
 use criterion::{black_box, criterion_group, BatchSize, BenchmarkId, Criterion, Throughput};
 use nulang::bytecode::{CodeModule, Constant, Instruction, OpCode};
 use nulang::iso_arena::IsoArena;
 use nulang::runtime::heap::{ActorHeap, TypeTag};
+use nulang::runtime::OrcaGc;
 use nulang::vm::{ActorVmCallbacks, Value, VM};
 
 const ALLOCATIONS: usize = 256;
@@ -17,13 +19,17 @@ const ARRAY_ELEMENTS: usize = 8;
 struct BenchCallbacks {
     heap: ActorHeap,
     arena: IsoArena,
+    gc: OrcaGc,
 }
 
 impl BenchCallbacks {
     fn new() -> Self {
+        let mut heap = ActorHeap::new(64 * 1024);
+        heap.set_actor_id(0);
         Self {
-            heap: ActorHeap::new(64 * 1024),
+            heap,
             arena: IsoArena::new(),
+            gc: OrcaGc::new(0),
         }
     }
 }
@@ -45,9 +51,18 @@ impl ActorVmCallbacks for BenchCallbacks {
         self.arena.contains(ptr)
     }
 
-    fn drop_ref(&mut self, _ptr: *mut u8) {}
+    fn drop_ref(&mut self, ptr: *mut u8) {
+        if !self.arena.contains(ptr) {
+            // Mirror the actor runtime's ORCA release path for heap-backed values.
+            unsafe { self.gc.drop_local_ref(&mut self.heap, ptr) };
+        }
+    }
 
-    fn retain_ref(&mut self, _ptr: *mut u8) {}
+    fn retain_ref(&mut self, ptr: *mut u8) {
+        if !self.arena.contains(ptr) {
+            unsafe { self.gc.local_ref(&self.heap, ptr) };
+        }
+    }
 
     fn array_len(&self, ptr: *mut u8) -> Option<usize> {
         if ptr.is_null() {
