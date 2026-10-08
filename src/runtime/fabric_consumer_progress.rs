@@ -1578,6 +1578,17 @@ mod tests {
             1
         );
         follower.process_network();
+        // The separate follower commit fsync receipt must be processed before
+        // the leader can claim even the private confirmed frontier.
+        assert_eq!(
+            leader.fabric_consumer_progress_confirmed_commit("orders").unwrap(),
+            0
+        );
+        leader.process_network();
+        assert_eq!(
+            leader.fabric_consumer_progress_confirmed_commit("orders").unwrap(),
+            1
+        );
         assert!(follower.fabric_consumer_progress_apply_commit_from_peer(
             &exact_commit, placement.leader,
         ).is_ok());
@@ -1733,6 +1744,73 @@ mod tests {
         assert!(journal.record_verified_receipt(11, &other.digest).is_err());
         assert!(journal.commit_observed_quorum(1).is_err());
         assert_eq!(journal.committed_cursor("orders", 0, "billing"), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn commit_receipts_require_matching_digest_and_recover_after_restart() {
+        let root = temp_root("commit-confirmed");
+        let group = policy(vec![10, 11, 12]);
+        let proposal = change(1, 0, 2);
+        let wire = FabricConsumerProgressPrepareWire::new(
+            proposal.clone(), group.clone(), 2,
+        ).unwrap();
+        {
+            let mut journal = FileFabricConsumerProgressJournal::open(&root).unwrap();
+            journal.prepare(proposal, group, 2).unwrap();
+            journal.record_verified_receipt(11, &wire.digest).unwrap();
+            journal.commit_observed_quorum(1).unwrap();
+            assert_eq!(journal.confirmed_commit_sequence(), 0);
+            assert!(journal.record_commit_receipt(1, 99, &wire.digest).is_err());
+            assert!(journal.record_commit_receipt(1, 11, "faked").is_err());
+            assert!(journal.record_commit_receipt(1, 10, &wire.digest).is_err());
+            assert_eq!(journal.confirmed_commit_sequence(), 0);
+        }
+        let mut journal = FileFabricConsumerProgressJournal::open(&root).unwrap();
+        assert_eq!(journal.confirmed_commit_sequence(), 0);
+        journal.record_commit_receipt(1, 11, &wire.digest).unwrap();
+        journal.record_commit_receipt(1, 11, &wire.digest).unwrap();
+        assert_eq!(journal.confirmed_commit_sequence(), 1);
+        let recovered = FileFabricConsumerProgressJournal::open(&root).unwrap();
+        assert_eq!(recovered.confirmed_commit_sequence(), 1);
+        assert_eq!(recovered.committed_cursor("orders", 0, "billing"), 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bounded_commit_history_replay_preserves_contiguous_proven_frontier() {
+        let root = temp_root("commit-history");
+        let group = policy(vec![10, 11, 12]);
+        let mut journal = FileFabricConsumerProgressJournal::open(&root).unwrap();
+        for seq in 1..=3 {
+            let proposal = change(seq, seq - 1, seq);
+            let wire = FabricConsumerProgressPrepareWire::new(
+                proposal.clone(), group.clone(), seq,
+            ).unwrap();
+            journal.prepare(proposal, group.clone(), seq).unwrap();
+            journal.record_verified_receipt(11, &wire.digest).unwrap();
+            journal.commit_observed_quorum(seq).unwrap();
+        }
+        assert_eq!(journal.confirmed_commit_sequence(), 0);
+        let history = journal.committed_updates_from(2, 2).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].metadata_sequence, 2);
+        assert_eq!(history[1].metadata_sequence, 3);
+        assert!(journal.committed_updates_from(1, 0).is_err());
+        assert!(journal.committed_updates_from(1, 257).is_err());
+
+        let one = journal.committed_updates_from(1, 1).unwrap();
+        let two = journal.committed_updates_from(2, 1).unwrap();
+        let three = journal.committed_updates_from(3, 1).unwrap();
+        journal.record_commit_receipt(2, 11, &two[0].digest).unwrap();
+        assert_eq!(journal.confirmed_commit_sequence(), 0);
+        journal.record_commit_receipt(1, 11, &one[0].digest).unwrap();
+        assert_eq!(journal.confirmed_commit_sequence(), 2);
+        journal.record_commit_receipt(3, 12, &three[0].digest).unwrap();
+        assert_eq!(journal.confirmed_commit_sequence(), 3);
+        let reopened = FileFabricConsumerProgressJournal::open(&root).unwrap();
+        assert_eq!(reopened.confirmed_commit_sequence(), 3);
+        assert_eq!(reopened.committed_updates_from(1, 2).unwrap().len(), 2);
         let _ = fs::remove_dir_all(root);
     }
 
