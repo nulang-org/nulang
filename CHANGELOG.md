@@ -1,5 +1,12 @@
 # Nulang Changelog
 
+### Fabric consumer installed-epoch fencing — 2026-10-08
+- **Runtime application-consumer reads and leased deliveries now require the installed stream leader on replicated streams.** A partitioned follower with a committed replica cannot deliver or ACK application work.
+- **Replicated ACK/NACK and explicit cursor commits require an epoch token.** Deliveries carry `leader_epoch`; `fabric_stream_ack_consumer_fenced`, `fabric_stream_nack_consumer_fenced`, and `fabric_stream_commit_cursor_fenced` reject an epoch different from the locally installed stream policy. Unfenced sequence-only mutations remain supported for standalone streams.
+- **Leader succession tests reject an ACK from the previous epoch.** A deterministic partitioned-follower fixture pins leader-only consumer behavior.
+- **This does not replicate consumer progress or prove a live quorum.** An isolated old leader unaware of a higher epoch can still accept local ACKs, and delivery-attempt fencing remains unimplemented. Full durable-consumer failover parity is not claimed.
+
+
 ### Fabric committed consumer delivery and ACK/NACK integration — 2026-10-08
 - **Durable consumer leases and ACK/NACK are available on the current runtime baseline.** Records have persisted delivery attempts, deadlines and redelivery, while ACK gaps advance the consumer cursor only across a contiguous acknowledged prefix.
 - **Replicated consumers cannot receive or ACK an uncommitted tail.** Leased delivery, replay, ACK and cursor commits honor the persisted quorum-committed boundary; explicit raw-log reads remain available to replication, and standalone streams preserve local-tail semantics.
