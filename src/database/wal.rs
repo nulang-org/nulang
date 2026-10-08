@@ -134,6 +134,13 @@ impl WalRecord {
 
 /// File-backed, per-tablet append-only WAL.
 ///
+/// A nonblocking advisory lock on a persistent `.lock` sidecar admits at most
+/// one cooperating writer per canonical local WAL path. The lock is held until
+/// this handle is dropped, including across WAL replacement during checkpoint
+/// reclamation. Never delete the sidecar while a writer may still be alive.
+/// This is not a distributed lease and does not claim correctness on untested
+/// network filesystems or in directories writable by untrusted processes.
+///
 /// A WAL starts at tablet sequence 1 and requires each new record to name the
 /// current tail as its predecessor. Ownership epochs may advance over time,
 /// but all records in one WAL must belong to the same tablet id.
@@ -900,7 +907,9 @@ impl fmt::Display for WalError {
             Self::Io { message, .. } => write!(f, "WAL I/O error: {message}"),
             Self::InvalidHeader => f.write_str("invalid NuDB WAL header"),
             Self::WriterLocked => f.write_str("NuDB WAL already has an exclusive writer"),
-            Self::AliasedWalPath => f.write_str("NuDB WAL or lock path must not be a symlink or hardlink"),
+            Self::AliasedWalPath => {
+                f.write_str("NuDB WAL or lock path must not be a symlink or hardlink")
+            }
             Self::WalHeaderChecksumMismatch => f.write_str("NuDB WAL header checksum mismatch"),
             Self::InvalidFrameHeader { offset, reason } => {
                 write!(
