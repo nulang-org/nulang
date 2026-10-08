@@ -15,11 +15,11 @@ cd nulang
 cargo build --release
 ```
 
-From the cloned repository root, verify the release binary:
+From the cloned repository root, run the version check and release-mode REPL:
 
 ```bash
-./target/release/nulang --version
-./target/release/nulang --repl
+cargo run --release -- --version
+cargo run --release -- --repl
 ```
 
 For detailed platform-specific instructions, see the [Installation](/getting-started/installation/) page.
@@ -37,13 +37,13 @@ perform IO.print("Hello, Nulang!")
 Run it:
 
 ```bash
-./target/release/nulang --eval 'perform IO.print("Hello, Nulang!")'
+cargo run --release -- --eval 'perform IO.print("Hello, Nulang!")'
 ```
 
 Or start the REPL and type interactively:
 
 ```bash
-./target/release/nulang --repl
+cargo run --release -- --repl
 nulang> perform IO.print("Hello, Nulang!")
 ```
 
