@@ -17,7 +17,9 @@ pub enum UiActionEnvelopeError {
     Malformed,
     ClientPlacement,
     PayloadMismatch,
-    DuplicateFormField { name: String },
+    DuplicateFormField {
+        name: String,
+    },
     LegacyActionMismatch {
         envelope_action: String,
         legacy_action: String,
@@ -133,7 +135,10 @@ impl HttpRequestBindingInputs {
 /// preserve multiplicity long enough to reject ambiguity before map collapse.
 fn find_duplicate_form_field(body: &[u8]) -> Option<String> {
     let mut seen = HashSet::new();
-    for pair in String::from_utf8_lossy(body).split('&').filter(|pair| !pair.is_empty()) {
+    for pair in String::from_utf8_lossy(body)
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+    {
         let key = pair.split_once('=').map_or(pair, |(key, _)| key);
         let name = percent_decode_form(key);
         if !seen.insert(name.clone()) {
@@ -405,11 +410,7 @@ mod tests {
             "Content-Type".to_string(),
             "application/x-www-form-urlencoded".to_string(),
         )];
-        let legacy = HttpRequestBindingInputs::capture(
-            "/",
-            &headers,
-            b"role=admin&role=user",
-        );
+        let legacy = HttpRequestBindingInputs::capture("/", &headers, b"role=admin&role=user");
         assert!(legacy.ui_message.is_none());
         assert_eq!(legacy.ui_message_error, None);
     }
@@ -425,9 +426,12 @@ mod tests {
                 correlation_id: "corr-1".into(),
                 idempotency_key: "idem-1".into(),
                 payload: nulang_ui_protocol::WireValue::Object(
-                    [("title".to_string(), nulang_ui_protocol::WireValue::from("forged"))]
-                        .into_iter()
-                        .collect(),
+                    [(
+                        "title".to_string(),
+                        nulang_ui_protocol::WireValue::from("forged"),
+                    )]
+                    .into_iter()
+                    .collect(),
                 ),
             },
         );
@@ -459,9 +463,12 @@ mod tests {
                 correlation_id: "corr-1".into(),
                 idempotency_key: "idem-1".into(),
                 payload: nulang_ui_protocol::WireValue::Object(
-                    [("title".to_string(), nulang_ui_protocol::WireValue::from("actual"))]
-                        .into_iter()
-                        .collect(),
+                    [(
+                        "title".to_string(),
+                        nulang_ui_protocol::WireValue::from("actual"),
+                    )]
+                    .into_iter()
+                    .collect(),
                 ),
             },
         );
