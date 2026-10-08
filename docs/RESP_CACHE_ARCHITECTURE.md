@@ -182,6 +182,10 @@ now provides the first durable substrate:
 - torn-tail detection/truncation without accepting checksum corruption;
 - WAL base sequences for safe post-snapshot rotation;
 - atomic snapshot publication through file sync + rename;
+- bounded streaming WAL scans and replay that validate one record at a time
+  (up to the configured maximum record size), rather than loading the whole
+  journal into memory; torn final records remain recoverable while complete
+  checksum corruption, sequence gaps, and oversize headers fail closed;
 - recovery that loads the snapshot and replays only newer WAL records;
 - wall-clock expiry on disk, translated back to the recovered process's
   monotonic cache clock so restart downtime does not extend TTLs.
