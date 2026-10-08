@@ -1261,6 +1261,32 @@ mod tests {
     }
 
     #[test]
+    fn journal_before_delete_batch_keeps_duplicate_key_semantics() {
+        let wal_path = test_path("delete-dedup");
+        let wal = CacheWal::create_after(&wal_path, 0).unwrap();
+        let mut store = CacheStore::new();
+        store.set_integer(b"a", 1, None, 0);
+        store.set_integer(b"b", 2, None, 0);
+        let mut durable =
+            DurableCacheStore::with_wal(store, wal, CacheDurabilityMode::SyncedJournal).unwrap();
+
+        assert_eq!(
+            durable.delete_many_at(
+                &[b"a".as_slice(), b"b".as_slice(), b"a".as_slice()],
+                0,
+            ).unwrap(),
+            2,
+        );
+        assert_eq!(durable.durability_status().wal_last_sequence, Some(1));
+        assert!(durable.store().is_empty());
+
+        let reopened = CacheWal::open(&wal_path).unwrap();
+        assert_eq!(reopened.last_sequence(), 1);
+        drop(reopened);
+        let _ = fs::remove_file(wal_path);
+    }
+
+    #[test]
     fn failed_expiry_journal_does_not_change_existing_ttl() {
         let wal_path = test_path("expire-before-wal");
         let wal = CacheWal::create_after(&wal_path, 0).unwrap();
