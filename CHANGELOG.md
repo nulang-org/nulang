@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Linux stateless actor hot-path profiler — 2026-10-08
+- **The existing Savina actor runner can now be sampled through a reproducible opt-in Linux `perf` workflow.** It builds a symbolized, frame-pointer-enabled bytecode actor binary and retains raw perf data, textual hot-symbol reports, environment metadata, and workload-completion JSONL.
+- **Fail-closed sample parsing and independent CI contract tests verify benchmark identity, repeat count, nonzero work, and contiguous iterations.** Profiler timing is explicitly diagnostic, not an optimized-build regression comparison; exact-parent Nulang A/B remains the performance confirmation path.
+
 
 ### Seeded cluster simulation peer ordering — 2026-10-07
 - **Cluster simulations with an injected deterministic RNG now canonicalize peer order for gossip targets, bounded gossip payloads, active-view repair, and heartbeat action emission.** This removes four sources of randomized Rust `HashMap` ordering while preserving the existing unseeded production path. Regression tests compare independently constructed cluster states under identical RNG seeds.
