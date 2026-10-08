@@ -278,13 +278,23 @@ fn compile_run_with_runtime(
             "bench: AOT workload spawned no actors"
         );
         for actor in rt.actors.values() {
-            // The AOT backend is allowed no silent fallback in this suite:
-            // every declared behavior of every spawned actor must have a
-            // registered native dispatch target before measurement.
+            // Ordinary bytecode offsets index the *entire* module, whereas
+            // AOT dispatch targets index only this actor type's behaviors.
+            // Match native coverage to the compiler's actor-local metadata.
+            let expected = actor
+                .bytecode_module
+                .as_ref()
+                .and_then(|code| {
+                    code.actor_metadata
+                        .iter()
+                        .find(|meta| meta.name == actor.name)
+                })
+                .map(|meta| meta.behavior_indices.len())
+                .expect("bench: missing actor behavior metadata");
             assert!(
-                !actor.aot_targets.is_empty()
-                    && actor.aot_targets.iter().all(Option::is_some)
-                    && actor.aot_targets.len() == actor.bytecode_offsets.len(),
+                expected > 0
+                    && actor.aot_targets.len() == expected
+                    && actor.aot_targets.iter().all(Option::is_some),
                 "bench: actor {} lacks full AOT behavior coverage",
                 actor.name,
             );
