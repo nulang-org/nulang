@@ -905,6 +905,39 @@ pub fn send_distributed(
     }
 }
 
+/// Publish delivery failures on the system-priority mailbox lane.
+///
+/// Failure feedback must remain observable even when a bounded sender mailbox
+/// is saturated with normal traffic. `send_message_by_id` is intentionally not
+/// used here because it delivers with normal priority and can be backpressured.
+/// The system queue is also consumed before scheduler-local normal messages.
+fn enqueue_delivery_failure_feedback(runtime: &mut Runtime, sender_id: u64, payload: &[Value]) {
+    if sender_id == 0 {
+        return;
+    }
+
+    let Some(actor) = runtime.actors.get_mut(&sender_id) else {
+        return;
+    };
+    let notification = Message {
+        behavior_id: 0,
+        payload: MessagePayload::from_slice(payload),
+        sender: 0,
+        priority: MessagePriority::System,
+        trace_id: None,
+    };
+    if actor.mailbox.push(notification).is_ok() {
+        runtime.enqueue_actor(sender_id);
+    } else {
+        // System admission is currently infallible; surface future contract
+        // regressions instead of silently losing delivery-failure feedback.
+        tracing::error!(
+            sender_id,
+            "nulang-net: system delivery-failure notification rejected"
+        );
+    }
+}
+
 /// Notify a sender that an asynchronous transport send failed.
 ///
 /// Transport failures keep top-level delivery-failure code 8 and use the
@@ -918,38 +951,26 @@ fn notify_transport_send_failed(
     sender_id: u64,
     reason: TransportSendFailureReason,
 ) {
-    if sender_id == 0 || runtime.actors.get(&sender_id).is_none() {
-        return;
-    }
-
     let subtype = match reason {
         TransportSendFailureReason::Connect => 0,
         TransportSendFailureReason::Write => 1,
         TransportSendFailureReason::SenderShutdown => 2,
     };
-    let fail_payload = vec![Value::int(8), Value::int(subtype)];
-    runtime.send_message_by_id(sender_id, 0, &fail_payload);
+    enqueue_delivery_failure_feedback(runtime, sender_id, &[Value::int(8), Value::int(subtype)]);
 }
 
 /// Notify a sender that their message could not be delivered.
 ///
-/// Delivers a system message (behavior 0) to the sender actor with a
-/// failure code in the payload: `[failure_code: Int, _reserved: Nil]`.
+/// Delivers a system-priority message (behavior 0) with a failure code:
+/// `[failure_code: Int, _reserved: Nil]`.
 /// Codes: 0=unresolvable, 1=node left cluster, 2=string payload unresolvable,
 /// 3=string intern failed on receiver, 4=target actor not found,
 /// 6=object ref unresolvable, 7=object intern failed on receiver,
 /// 8=transport send failed, 5=unknown.
-/// Non-existent senders (id 0) are silently skipped.
+/// Non-existent senders (including id 0) are silently skipped.
 pub(crate) fn notify_delivery_failed(runtime: &mut Runtime, sender_id: u64, reason: &str) {
-    if sender_id == 0 {
-        return;
-    }
-    if !runtime.actors.get(&sender_id).is_some() {
-        return;
-    }
     let code = delivery_failure_code(reason);
-    let fail_payload = vec![Value::int(code), Value::nil()];
-    runtime.send_message_by_id(sender_id, 0, &fail_payload);
+    enqueue_delivery_failure_feedback(runtime, sender_id, &[Value::int(code), Value::nil()]);
 }
 
 /// Map a delivery-failure reason string to an integer code.
