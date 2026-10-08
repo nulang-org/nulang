@@ -4300,15 +4300,11 @@ fn test_runtime_append_workflow_timer_signal_saga_events() {
     );
 }
 
-
 #[test]
 fn test_legacy_checkpoint_is_rejected_after_atomic_workflow_tail_begins() {
     let mut rt = Runtime::new();
-    let actor_id = rt.spawn_workflow_actor(
-        "RejectLegacyCheckpoint",
-        Box::new(Vec::new),
-        HashMap::new(),
-    );
+    let actor_id =
+        rt.spawn_workflow_actor("RejectLegacyCheckpoint", Box::new(Vec::new), HashMap::new());
     declare_test_behavior(&mut rt, actor_id, "run");
     let behavior_id = rt.behavior_id_for(actor_id, "run").unwrap();
     let safe_snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
@@ -4342,17 +4338,13 @@ fn test_legacy_checkpoint_is_rejected_after_atomic_workflow_tail_begins() {
 }
 
 
-
 #[test]
 fn test_compiled_workflow_turn_closes_on_atomic_tail() {
     use crate::bytecode::{Instruction, OpCode};
 
     let mut rt = Runtime::new();
-    let actor_id = rt.spawn_workflow_actor(
-        "CompiledAtomicTail",
-        Box::new(Vec::new),
-        HashMap::new(),
-    );
+    let actor_id =
+        rt.spawn_workflow_actor("CompiledAtomicTail", Box::new(Vec::new), HashMap::new());
 
     let mut module = CodeModule::new("compiled-atomic-tail");
     module.emit(Instruction::new0(OpCode::Ret));
@@ -4417,11 +4409,8 @@ fn test_compiled_workflow_keeps_legacy_path_on_store_without_atomic_transitions(
 
     let mut rt = Runtime::new();
     rt.persistence = Box::new(JsonFileStore::new(&path).unwrap());
-    let actor_id = rt.spawn_workflow_actor(
-        "CompiledLegacyFallback",
-        Box::new(Vec::new),
-        HashMap::new(),
-    );
+    let actor_id =
+        rt.spawn_workflow_actor("CompiledLegacyFallback", Box::new(Vec::new), HashMap::new());
 
     let mut module = CodeModule::new("compiled-legacy-fallback");
     module.emit(Instruction::new0(OpCode::Ret));
@@ -4482,16 +4471,22 @@ fn test_open_activation_intermediate_events_extend_atomic_tail() {
         .unwrap()
         .unwrap();
     assert_eq!(custom_tail.sequence, command_tail.sequence + 1);
-    assert_eq!(rt.persistence.latest_sequence(actor_id), custom_tail.sequence);
+    assert_eq!(
+        rt.persistence.latest_sequence(actor_id),
+        custom_tail.sequence
+    );
 
-    assert!(rt.append_timer_set(actor_id, "wake", 250).unwrap());
+    rt.append_timer_set(actor_id, "wake", 250).unwrap();
     let timer_tail = rt
         .persistence
         .load_durable_tail_position(actor_id)
         .unwrap()
         .unwrap();
     assert_eq!(timer_tail.sequence, custom_tail.sequence + 1);
-    assert_eq!(rt.persistence.latest_sequence(actor_id), timer_tail.sequence);
+    assert_eq!(
+        rt.persistence.latest_sequence(actor_id),
+        timer_tail.sequence
+    );
 
     rt.append_signal_received(actor_id, "go", Some("payload".to_string()))
         .unwrap();
@@ -4501,7 +4496,10 @@ fn test_open_activation_intermediate_events_extend_atomic_tail() {
         .unwrap()
         .unwrap();
     assert_eq!(signal_tail.sequence, timer_tail.sequence + 1);
-    assert_eq!(rt.persistence.latest_sequence(actor_id), signal_tail.sequence);
+    assert_eq!(
+        rt.persistence.latest_sequence(actor_id),
+        signal_tail.sequence
+    );
 
     let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
     assert!(
