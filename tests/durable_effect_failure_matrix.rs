@@ -367,3 +367,145 @@ fn backend_defined_semantics_remain_delegated_after_restart() {
     );
     assert_eq!(store.latest_sequence(ACTOR_ID), 1);
 }
+
+#[test]
+fn stale_owner_cannot_redispatch_existing_prepared_intent_after_takeover() {
+    let request = b"charge=order-42";
+    let original = effect_spec(
+        "checkout/order-42",
+        "Payment.charge",
+        EffectBoundary::External,
+        DeliverySemantics::EffectivelyOnceWithDeduplication,
+    );
+    let mut store = MemoryStore::new();
+
+    DurableEffectCoordinator::new(&mut store, ACTOR_ID, 1)
+        .begin(original.clone(), request)
+        .unwrap();
+
+    // A different committed transition installs the successor's fencing epoch.
+    let successor = effect_spec(
+        "checkout/order-43",
+        "Payment.charge",
+        EffectBoundary::External,
+        DeliverySemantics::EffectivelyOnceWithDeduplication,
+    );
+    DurableEffectCoordinator::new(&mut store, ACTOR_ID, 2)
+        .begin(successor, b"charge=order-43")
+        .unwrap();
+
+    // The original intent remains Prepared. Replaying it must not authorize
+    // external dispatch under an owner that has already been fenced out.
+    let error = DurableEffectCoordinator::new(&mut store, ACTOR_ID, 1)
+        .begin(original, request)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        DurableEffectRuntimeError::Storage(ref source)
+            if source.kind() == std::io::ErrorKind::PermissionDenied
+    ));
+    assert_eq!(store.latest_sequence(ACTOR_ID), 2);
+}
+
+#[test]
+fn successor_must_commit_its_activation_epoch_before_redispatching_old_intent() {
+    let request = b"charge=order-42";
+    let original = effect_spec(
+        "checkout/order-42",
+        "Payment.charge",
+        EffectBoundary::External,
+        DeliverySemantics::EffectivelyOnceWithDeduplication,
+    );
+    let original_id = original.id;
+    let mut store = MemoryStore::new();
+    DurableEffectCoordinator::new(&mut store, ACTOR_ID, 1)
+        .begin(original.clone(), request)
+        .unwrap();
+
+    // Merely declaring a higher epoch in process memory is not ownership.
+    let error = DurableEffectCoordinator::new(&mut store, ACTOR_ID, 2)
+        .begin(original.clone(), request)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        DurableEffectRuntimeError::Storage(ref source)
+            if source.kind() == std::io::ErrorKind::PermissionDenied
+    ));
+    assert_eq!(store.latest_sequence(ACTOR_ID), 1);
+
+    // A successful fenced commit installs the new epoch. Existing intent can
+    // then be retried using exactly the same provider idempotency key.
+    let successor = effect_spec(
+        "checkout/order-43",
+        "Payment.charge",
+        EffectBoundary::External,
+        DeliverySemantics::EffectivelyOnceWithDeduplication,
+    );
+    DurableEffectCoordinator::new(&mut store, ACTOR_ID, 2)
+        .begin(successor, b"charge=order-43")
+        .unwrap();
+
+    assert_eq!(
+        DurableEffectCoordinator::new(&mut store, ACTOR_ID, 2)
+            .begin(original, request)
+            .unwrap(),
+        DurableEffectDispatchDecision::DispatchWithDeduplication {
+            operation_id: original_id
+        }
+    );
+    assert_eq!(store.latest_sequence(ACTOR_ID), 2);
+}
+
+#[test]
+fn stale_owner_cannot_replay_completed_receipt_or_accept_duplicate_completion() {
+    let request = b"charge=order-42";
+    let original = effect_spec(
+        "checkout/order-42",
+        "Payment.charge",
+        EffectBoundary::External,
+        DeliverySemantics::EffectivelyOnceWithDeduplication,
+    );
+    let id = original.id;
+    let mut store = MemoryStore::new();
+
+    {
+        let mut owner = DurableEffectCoordinator::new(&mut store, ACTOR_ID, 1);
+        owner.begin(original.clone(), request).unwrap();
+        owner.complete(id, request, b"receipt".to_vec()).unwrap();
+    }
+
+    let successor = effect_spec(
+        "checkout/order-43",
+        "Payment.charge",
+        EffectBoundary::External,
+        DeliverySemantics::EffectivelyOnceWithDeduplication,
+    );
+    DurableEffectCoordinator::new(&mut store, ACTOR_ID, 2)
+        .begin(successor, b"charge=order-43")
+        .unwrap();
+
+    let stale_begin = DurableEffectCoordinator::new(&mut store, ACTOR_ID, 1)
+        .begin(original.clone(), request)
+        .unwrap_err();
+    assert!(matches!(
+        stale_begin,
+        DurableEffectRuntimeError::Storage(ref source)
+            if source.kind() == std::io::ErrorKind::PermissionDenied
+    ));
+    let stale_complete = DurableEffectCoordinator::new(&mut store, ACTOR_ID, 1)
+        .complete(id, request, b"late-response".to_vec())
+        .unwrap_err();
+    assert!(matches!(
+        stale_complete,
+        DurableEffectRuntimeError::Storage(ref source)
+            if source.kind() == std::io::ErrorKind::PermissionDenied
+    ));
+
+    assert_eq!(
+        DurableEffectCoordinator::new(&mut store, ACTOR_ID, 2)
+            .begin(original, request)
+            .unwrap(),
+        DurableEffectDispatchDecision::ReplayRecordedResult(b"receipt".to_vec())
+    );
+    assert_eq!(store.latest_sequence(ACTOR_ID), 3);
+}
