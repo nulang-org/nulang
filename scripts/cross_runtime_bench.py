@@ -125,6 +125,18 @@ def validate_runtimes(selected: list[str]) -> None:
         raise ValueError("at least one runtime is required")
 
 
+def runtime_order(selected: list[str], round_idx: int) -> list[str]:
+    """Rotate measured positions to avoid consistently favoring the first runtime.
+
+    The first len(selected) rounds form a Latin-square rotation, so each runtime
+    occupies each execution position exactly once. Warmups use the same policy.
+    """
+    if not selected or round_idx < 0:
+        raise ValueError("runtime order requires a nonempty set and nonnegative round")
+    offset = round_idx % len(selected)
+    return selected[offset:] + selected[:offset]
+
+
 def build_commands(selected: list[str]) -> dict[str, list[str]]:
     BUILD.mkdir(parents=True, exist_ok=True)
     commands: dict[str, list[str]] = {}
@@ -399,14 +411,15 @@ def main() -> int:
         runtime: {name: [] for name in BENCHMARKS} for runtime in selected
     }
 
-    # Cycle across runtimes per sample rather than exhausting one runtime at a
-    # time. This reduces simple thermal/load drift bias within a host run.
+    # Execute every runtime in each round, rotating the first runtime so each
+    # occupies every sequence position once per full cycle. This reduces
+    # first-position warm-cache and monotonic thermal/load-order bias.
     total_rounds = args.warmup + args.runs
     for round_idx in range(total_rounds):
         measured = round_idx >= args.warmup
         phase = "sample" if measured else "warmup"
         index = round_idx - args.warmup + 1 if measured else round_idx + 1
-        for runtime in selected:
+        for runtime in runtime_order(selected, round_idx):
             print(f"[{phase} {index}] {runtime}", flush=True)
             output = command_output(
                 commands[runtime],
