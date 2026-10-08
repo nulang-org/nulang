@@ -1998,7 +1998,10 @@ fn replicated_consumers_do_not_read_or_ack_uncommitted_records() {
 
     // The replication/log interface may inspect the local uncommitted tail.
     assert_eq!(
-        leader.fabric_stream_read("consumer-visibility", 1, 10).unwrap().len(),
+        leader
+            .fabric_stream_read("consumer-visibility", 1, 10)
+            .unwrap()
+            .len(),
         1
     );
     // But application consumers must never execute or acknowledge pending data.
@@ -2010,7 +2013,9 @@ fn replicated_consumers_do_not_read_or_ack_uncommitted_records() {
         .fabric_stream_commit_cursor("consumer-visibility", "effect-worker", 1)
         .is_err());
     assert_eq!(
-        leader.fabric_stream_cursor("consumer-visibility", "effect-worker").unwrap(),
+        leader
+            .fabric_stream_cursor("consumer-visibility", "effect-worker")
+            .unwrap(),
         0
     );
 
@@ -2043,7 +2048,9 @@ fn replicated_consumers_do_not_read_or_ack_uncommitted_records() {
     leader.process_network();
 
     assert_eq!(
-        leader.fabric_stream_committed_sequence("consumer-visibility").unwrap(),
+        leader
+            .fabric_stream_committed_sequence("consumer-visibility")
+            .unwrap(),
         1
     );
     let available = leader
