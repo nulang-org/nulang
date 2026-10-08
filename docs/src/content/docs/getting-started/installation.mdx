@@ -22,7 +22,7 @@ cd nulang
 cargo build --release
 ```
 
-The release build uses `opt-level=3`, LTO, and single codegen-unit for maximum performance. A debug build (`cargo build`) is faster to compile, but the binary you built above is at `./target/release/nulang`. Running `cargo run` without `--release` builds or executes the debug binary instead.
+The release build uses `opt-level=3`, LTO, and single codegen-unit for maximum performance. A debug build (`cargo build`) is faster to compile, but `cargo run --release -- ...` executes the optimized binary built above. This repository sets Cargo's target directory to `/tmp/cargo-target` in `.cargo/config.toml`, so do not assume the executable is in `./target/release/`.
 
 ### Feature Flags
 
@@ -67,10 +67,10 @@ Run these commands from the cloned `nulang` repository directory:
 cargo test
 
 # Start the REPL
-./target/release/nulang --repl
+cargo run --release -- --repl
 
 # Run a Nulang program
-./target/release/nulang examples/fibonacci.nula
+cargo run --release -- examples/fibonacci.nula
 ```
 
 ## System-Specific Notes
