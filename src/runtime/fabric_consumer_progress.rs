@@ -1683,6 +1683,34 @@ mod tests {
         assert_eq!(recovered.committed_cursor("orders", 0, "billing"), 2);
         let after = FileFabricConsumerProgressJournal::open(&root).unwrap();
         assert_eq!(after.committed_cursor("orders", 0, "billing"), 2);
+        let decision = after.last_commit().unwrap();
+        assert_eq!(decision.digest, wire.digest);
+        assert_eq!(decision.acknowledgers, vec![10, 11]);
+        assert_eq!(decision.change.metadata_sequence, 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tampering_with_persisted_follower_receipt_fails_closed() {
+        let root = temp_root("receipt-tamper");
+        let group = policy(vec![10, 11, 12]);
+        let proposal = change(1, 0, 1);
+        let wire = FabricConsumerProgressPrepareWire::new(
+            proposal.clone(), group.clone(), 1,
+        ).unwrap();
+        let mut journal = FileFabricConsumerProgressJournal::open(&root).unwrap();
+        journal.prepare(proposal, group, 1).unwrap();
+        journal.record_verified_receipt(11, &wire.digest).unwrap();
+        drop(journal);
+
+        let path = root.join("consumer_progress.log");
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("\"replica\":11"));
+        fs::write(
+            &path,
+            contents.replace("\"replica\":11", "\"replica\":99"),
+        ).unwrap();
+        assert!(FileFabricConsumerProgressJournal::open(&root).is_err());
         let _ = fs::remove_dir_all(root);
     }
 
