@@ -464,20 +464,23 @@ impl MemoryTablet {
 
     fn apply_mutations(&mut self, sequence: u64, mutations: Vec<TabletMutation>) {
         for mutation in mutations {
-            match mutation {
-                TabletMutation::Put { key, value } => {
-                    self.rows.entry(key).or_default().push(VersionedValue {
-                        sequence,
-                        value: Some(value),
-                    });
-                }
-                TabletMutation::Delete { key } => {
-                    self.rows.entry(key).or_default().push(VersionedValue {
-                        sequence,
-                        value: None,
-                    });
+            let (key, value) = match mutation {
+                TabletMutation::Put { key, value } => (key, Some(value)),
+                TabletMutation::Delete { key } => (key, None),
+            };
+            let versions = self.rows.entry(key).or_default();
+
+            // A write may update the same key more than once. Its last
+            // mutation wins, but a key must have only one MVCC version per
+            // committed sequence or checkpoint restore will reject the
+            // duplicate sequence numbers as corrupt history.
+            if let Some(last) = versions.last_mut() {
+                if last.sequence == sequence {
+                    last.value = value;
+                    continue;
                 }
             }
+            versions.push(VersionedValue { sequence, value });
         }
         self.current_sequence = sequence;
     }
