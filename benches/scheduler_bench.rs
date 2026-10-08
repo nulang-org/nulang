@@ -122,10 +122,14 @@ fn bench_peer_steal_dispatch(c: &mut Criterion) {
 fn bench_ready_work_probe(c: &mut Criterion) {
     let mut group = c.benchmark_group("scheduler/has_ready_work_empty");
     for workers in [1usize, 4] {
-        group.bench_with_input(BenchmarkId::from_parameter(workers), &workers, |b, &workers| {
-            let scheduler = Scheduler::new(workers);
-            b.iter(|| black_box(scheduler.has_ready_work()));
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(workers),
+            &workers,
+            |b, &workers| {
+                let scheduler = Scheduler::new(workers);
+                b.iter(|| black_box(scheduler.has_ready_work()));
+            },
+        );
     }
     group.finish();
 }
