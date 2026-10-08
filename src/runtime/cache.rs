@@ -2430,4 +2430,45 @@ mod tests {
         assert_eq!(ready[0].expires_at_ms, 3_000);
         assert!(wheel.locations[7].is_none());
     }
+
+    #[test]
+    fn expiry_sweep_limits_candidate_buffer_not_only_deletions() {
+        let mut store = CacheStore::new();
+        for key in 0..512 {
+            store.set_integer(format!("ttl-{key}").as_bytes(), key, Some(100), 0);
+        }
+
+        assert_eq!(store.purge_expired(100, 3), 3);
+        assert!(
+            store.expiry_scratch.capacity() <= 8,
+            "a three-candidate sweep must not materialize the entire due bucket"
+        );
+        assert_eq!(store.len(), 509);
+
+        let mut purged = 3;
+        while purged < 512 {
+            let n = store.purge_expired(100, 3);
+            assert!(n > 0 && n <= 3, "pending expired entries must make progress");
+            purged += n;
+        }
+        assert_eq!(purged, 512);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn expiry_sweep_resumes_coarse_bucket_and_tolerates_cancelled_entries() {
+        let mut store = CacheStore::new();
+        for key in 0..25 {
+            store.set_integer(format!("long-{key}").as_bytes(), key, Some(2_600), 0);
+        }
+
+        assert_eq!(store.purge_expired(2_560, 2), 0);
+        assert!(store.delete_at(b"long-17", 2_560));
+        let mut expired = 0;
+        for _ in 0..25 {
+            expired += store.purge_expired(2_600, 2);
+        }
+        assert_eq!(expired, 24);
+        assert!(store.is_empty());
+    }
 }
