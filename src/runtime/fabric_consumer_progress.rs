@@ -177,6 +177,7 @@ impl FabricConsumerProgressFrame {
 struct PendingConsumerProgress {
     change: FabricConsumerProgressChange,
     policy: FabricConsumerProgressPolicy,
+    stream_committed_through: u64,
 }
 
 /// Local append-only journal, ready for later authenticated replica transport.
@@ -250,10 +251,10 @@ impl FileFabricConsumerProgressJournal {
     /// Recover the exact pending proposal for idempotent network retry.
     pub(crate) fn pending_change(
         &self,
-    ) -> Option<(&FabricConsumerProgressChange, &FabricConsumerProgressPolicy)> {
-        self.pending
-            .as_ref()
-            .map(|pending| (&pending.change, &pending.policy))
+    ) -> Option<(&FabricConsumerProgressChange, &FabricConsumerProgressPolicy, u64)> {
+        self.pending.as_ref().map(|pending| {
+            (&pending.change, &pending.policy, pending.stream_committed_through)
+        })
     }
 
     /// Recover ACK gaps as well as the committed contiguous cursor.
@@ -336,6 +337,7 @@ impl FileFabricConsumerProgressJournal {
                 self.pending = Some(PendingConsumerProgress {
                     change: change.clone(),
                     policy: policy.clone(),
+                    stream_committed_through: *stream_committed_through,
                 });
             }
             FabricConsumerProgressEvent::Commit {
@@ -409,7 +411,10 @@ impl FileFabricConsumerProgressJournal {
         self.ensure_writable()?;
         if let Some(pending) = &self.pending {
             // Same exact prepare is idempotent and must not add another frame.
-            if pending.change == change && pending.policy == policy {
+            if pending.change == change
+                && pending.policy == policy
+                && pending.stream_committed_through == stream_committed_through
+            {
                 return Ok(());
             }
             return Err(invalid("different consumer-progress record already pending"));
@@ -463,6 +468,7 @@ impl FabricConsumerProgressPrepareWire {
             self.version,
             &self.change,
             &self.policy,
+            self.stream_committed_through,
         )).map_err(|error| invalid(error.to_string()))?;
         Ok(blake3::hash(&bytes).to_hex().to_string())
     }
@@ -654,7 +660,7 @@ impl Runtime {
         let policy = self.consumer_progress_validate_leader(stream)?;
         let path = self.consumer_progress_directory(stream)?;
         let journal = FileFabricConsumerProgressJournal::open(path)?;
-        let (change, pending_policy) = journal.pending_change().ok_or_else(|| {
+        let (change, pending_policy, stage_bound) = journal.pending_change().ok_or_else(|| {
             invalid("no pending consumer-progress prepare to dispatch")
         })?;
         if change.partition != partition
@@ -664,7 +670,7 @@ impl Runtime {
             return Err(invalid("consumer-progress prepare does not match installed policy"));
         }
         let wire = FabricConsumerProgressPrepareWire::new(
-            change.clone(), policy.clone(), self.fabric_stream_committed_sequence(stream)?,
+            change.clone(), policy.clone(), stage_bound,
         )?;
         let bytes = wire.to_wire_bytes()?;
         let local = NodeId(policy.leader);
@@ -736,7 +742,7 @@ impl Runtime {
         let path = self.consumer_progress_directory(&wire.change.stream)?;
         let mut journal = FileFabricConsumerProgressJournal::open(path)?;
         journal.prepare(
-            wire.change.clone(), wire.policy.clone(), local_commit,
+            wire.change.clone(), wire.policy.clone(), wire.stream_committed_through,
         )?;
         Ok(FabricConsumerProgressAckWire {
             version: JOURNAL_FORMAT_VERSION,
@@ -769,7 +775,7 @@ impl Runtime {
         }
         let path = self.consumer_progress_directory(&receipt.stream)?;
         let journal = FileFabricConsumerProgressJournal::open(path)?;
-        let (change, pending_policy) = journal.pending_change().ok_or_else(|| {
+        let (change, pending_policy, stage_bound) = journal.pending_change().ok_or_else(|| {
             invalid("consumer-progress replica receipt has no pending leader proposal")
         })?;
         if receipt.metadata_sequence != change.metadata_sequence
@@ -781,7 +787,7 @@ impl Runtime {
         let wire = FabricConsumerProgressPrepareWire::new(
             change.clone(),
             policy,
-            self.fabric_stream_committed_sequence(&receipt.stream)?,
+            stage_bound,
         )?;
         if receipt.digest != wire.digest {
             return Err(invalid("consumer-progress replica receipt digest mismatch"));
@@ -808,14 +814,14 @@ impl Runtime {
         let policy = self.consumer_progress_validate_leader(stream)?;
         let path = self.consumer_progress_directory(stream)?;
         let journal = FileFabricConsumerProgressJournal::open(path)?;
-        let (change, _) = journal.pending_change().ok_or_else(|| {
+        let (change, _, stage_bound) = journal.pending_change().ok_or_else(|| {
             invalid("consumer-progress votes requested without pending prepare")
         })?;
         if change.partition != partition || change.metadata_sequence != metadata_sequence {
             return Err(invalid("consumer-progress vote query mismatched pending proposal"));
         }
         let wire = FabricConsumerProgressPrepareWire::new(
-            change.clone(), policy, self.fabric_stream_committed_sequence(stream)?,
+            change.clone(), policy, stage_bound,
         )?;
         let key = (stream.to_string(), partition, metadata_sequence, wire.digest);
         let mut votes: Vec<NodeId> = self.distributed.fabric_consumer_progress_receipts
