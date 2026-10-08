@@ -214,8 +214,11 @@ semantics that later cluster and stream layers can reuse.
 - [x] Node-local durable monotonic consumer cursors.
 - [x] Node-local consumer ACK/NACK and timed redelivery.
 - [x] Replay by sequence and committed consumer cursor.
-- [ ] Replicated/fenced consumer cursors, ACK gaps, and leases across leader failover.
-- [ ] Leader-epoch/delivery-attempt fencing for old worker ACKs.
+- [x] Runtime consumer ownership checks against the locally installed leader epoch.
+- [x] Explicit epoch-bearing ACK/NACK/cursor APIs for replicated streams.
+- [ ] Quorum-replicated consumer cursors, ACK gaps, and leases across leader failover.
+- [ ] Live quorum/lease fencing of an isolated old leader.
+- [ ] Delivery-attempt fencing for old worker ACKs after lease expiration.
 - [ ] Seek by time.
 - [ ] Retention policies.
 - [ ] Dead-letter streams.
