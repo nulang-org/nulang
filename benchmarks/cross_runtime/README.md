@@ -107,3 +107,39 @@ For other actor-framework comparisons (for example Actix, Kameo,
 Proto.Actor, or Pekko/Akka), add separate pinned fixtures rather than
 silently changing standard-runtime baselines. Do not introduce a
 cross-language performance gate on shared CI runners.
+
+## Actor creation and resident-memory companion
+
+Use the existing Nulang `examples/actor_density.rs` probe and Ractor's
+`ractor_baseline/src/bin/density.rs` for single-host actor-density diagnostics:
+
+```bash
+python3 -m unittest discover -s tests -p test_actor_density_cross_runtime.py -v
+python3 scripts/actor_density_cross_runtime.py \
+  --actors 1000,10000 --runs 5 --warmup 1 --cpu-mode single \
+  --output /tmp/nulang-ractor-density.json
+```
+
+The runner builds both binaries once and executes **each sample in a fresh
+process**. It reports median spawn operations/sec and the difference between
+Linux process RSS before actor creation and after actor startup settles. If RSS
+is unavailable, does not grow, or declines, it reports `null`, not zero.
+
+**Lifecycle caveat:** Nulang's `Runtime::spawn_actor` and Ractor's
+`ActorRuntime::spawn_instant` both return before message handling, but
+Ractor completes asynchronous pre-start work during the separate settle stage.
+They are different APIs. The spawn and memory results are diagnostics,
+not apples-to-apples proof of runtime superiority. Warmups and all three
+RSS measurements are produced by independent processes.
+
+The original `benchmarks/ACTOR_DENSITY.md` still owns Nulang's actor-density
+ladder (10k to 1M), exact-base regressions, and existing BEAM comparator.
+The cross-runtime density companion does not replace those tests. Run the
+new sampler on controlled hardware before treating RSS deltas as representative.
+
+### Vocabulary
+
+These are **non-durable actor workloads**, not mathematically stateless actors:
+ping-pong, counting, and fork-join workers mutate private local counters,
+but do not use Nulang's durable workflow/journal subsystem. Keep statefulness
+and persistence separate when interpreting results.
