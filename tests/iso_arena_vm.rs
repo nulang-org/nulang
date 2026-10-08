@@ -246,3 +246,33 @@ fn yielding_activation_preserves_arena_until_resume_completes() {
     let counts = stats.borrow();
     assert_eq!(counts.arena_resets, 1, "completion reclaims the arena once");
 }
+
+#[test]
+fn disabled_arena_local_drop_releases_through_orca() {
+    let (mut vm, stats) = with_iso_arena_vm();
+    vm.set_iso_arena_enabled(false);
+    vm.set_actor_callbacks(Box::new(TrackingCallbacks::new(stats.clone())));
+    vm.load_module(local_array_module(false));
+
+    vm.run().expect("normal heap-backed run should succeed");
+
+    let stats = stats.borrow();
+    assert_eq!(stats.heap_allocs, 1);
+    assert_eq!(stats.heap_ref_drops, 1);
+    assert_eq!(stats.arena_ref_drops, 0);
+}
+
+#[test]
+fn qualified_arena_drop_never_enters_orca() {
+    let (mut vm, stats) = with_iso_arena_vm();
+    vm.set_actor_callbacks(Box::new(TrackingCallbacks::new(stats.clone())));
+    vm.load_module(local_array_module(false));
+
+    vm.run().expect("arena-backed run should succeed");
+
+    let stats = stats.borrow();
+    assert_eq!(stats.arena_allocs, 1);
+    assert_eq!(stats.arena_ref_drops, 1);
+    assert_eq!(stats.heap_ref_drops, 0);
+    assert_eq!(stats.arena_resets, 1);
+}
