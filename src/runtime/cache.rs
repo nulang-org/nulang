@@ -2398,4 +2398,36 @@ mod tests {
         assert_eq!(store.get(b"additional", 0), None);
         assert_eq!(store.len(), 256);
     }
+
+    #[test]
+    fn expiration_handle_requeues_from_coarse_level_without_duplicate() {
+        let mut wheel = ExpirationWheel::new(DEFAULT_WHEEL_BUCKETS, DEFAULT_WHEEL_TICK_MS);
+        let first = ExpirationRef {
+            slot: 7,
+            generation: 1,
+            expires_at_ms: 2_600,
+        };
+        wheel.schedule(first, 0);
+        let mut ready = Vec::new();
+
+        // A coarse-level bucket can cascade before the entry is actually due.
+        wheel.drain_candidates(2_560, &mut ready);
+        assert_eq!(ready.len(), 1);
+        assert!(wheel.locations[7].is_none());
+        ready.clear();
+
+        wheel.schedule(first, 2_560);
+        wheel.schedule(
+            ExpirationRef {
+                expires_at_ms: 3_000,
+                ..first
+            },
+            2_560,
+        );
+
+        wheel.drain_candidates(3_000, &mut ready);
+        assert_eq!(ready.len(), 1, "requeue must replace, not duplicate, the handle");
+        assert_eq!(ready[0].expires_at_ms, 3_000);
+        assert!(wheel.locations[7].is_none());
+    }
 }
