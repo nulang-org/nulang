@@ -1124,12 +1124,16 @@ impl FileFabricStreamStore {
         Ok(Some(committed))
     }
 
-    /// Deliver records under a durable acknowledgement lease.
+    /// Deliver records under a node-local durable acknowledgement lease.
     ///
     /// A delivery remains in-flight until it is ACKed, NACKed, or its lease
     /// expires. Expired or NACKed records are redelivered with an incremented
     /// attempt count. The durable cursor advances only across a contiguous
     /// prefix of acknowledged records.
+    ///
+    /// Consumer cursors, ACK gaps, and leases are not replicated with stream
+    /// records. A promoted replica may redeliver an event already ACKed on the
+    /// former leader. Callers must make side effects idempotent.
     pub fn deliver_consumer(
         &mut self,
         name: &str,
@@ -1261,11 +1265,12 @@ impl FileFabricStreamStore {
         Ok(delivered)
     }
 
-    /// ACK one previously delivered sequence.
+    /// ACK one previously delivered sequence on this node.
     ///
     /// ACKs may arrive out of order, but the durable cursor only advances when
     /// every sequence from the current cursor through the ACKed sequence has
-    /// been acknowledged.
+    /// been acknowledged. An ACK is not replicated to future leaders and is
+    /// not fenced against an expired worker attempt.
     pub fn ack_consumer(&mut self, name: &str, consumer: &str, sequence: u64) -> io::Result<()> {
         validate_name("consumer", consumer)?;
         self.ensure_state(name)?;
