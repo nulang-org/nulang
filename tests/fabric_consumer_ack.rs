@@ -173,3 +173,27 @@ fn active_leases_do_not_block_delivery_of_newer_records() {
     assert_eq!(second[0].record.sequence, 2);
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn polling_empty_stream_does_not_write_lease_state() {
+    let root = test_dir("empty-poll");
+    let mut store = FileFabricStreamStore::open(&root).unwrap();
+    store
+        .create_stream("events", FabricStreamConfig::default())
+        .unwrap();
+
+    assert!(store
+        .deliver_consumer_at(
+            "events",
+            "worker",
+            10,
+            Duration::from_secs(30),
+            UNIX_EPOCH + Duration::from_secs(100),
+        )
+        .unwrap()
+        .is_empty());
+
+    // A no-op poll should not create/sync a new deliveries.json.
+    assert!(!root.join("events").join("deliveries.json").exists());
+    let _ = fs::remove_dir_all(root);
+}
