@@ -567,3 +567,19 @@ spawn Skynet {}
         elapsed,
     }
 }
+
+#[cfg(test)]
+mod profiling_tests {
+    use super::*;
+
+    #[test]
+    fn persistent_ping_pong_processes_every_round_without_recompilation() {
+        let (runtime, pinger, ponger) = ping_pong_fixture();
+        for iteration in 1..=3 {
+            let measured = run_ping_pong(&runtime, pinger, ponger, iteration);
+            assert_eq!(measured.benchmark, "ping_pong");
+            assert_eq!(measured.messages, 40_001);
+            assert!(measured.elapsed.as_nanos() > 0);
+        }
+    }
+}
