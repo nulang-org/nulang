@@ -76,9 +76,14 @@ on TTL refresh, persistent overwrite, or delete. This keeps queued expiration
 records bounded by the number of live TTL-bearing entries rather than the
 number of TTL updates. The handle index is included in reserved-memory stats.
 
-Expiration sweeps still drain whole eligible buckets before applying the
-configured maximum number of deletions. A true candidate/CPU work budget and
-total-memory admission cap covering all metadata remain release blockers.
+Expiration sweeps now enqueue only eligible wheel buckets and extract at
+most the configured candidate budget per sweep, retaining partially processed
+buckets in a bounded, round-robin pending queue. This bounds inspected
+expiration records and temporary candidate buffering even when thousands of
+keys expire simultaneously. Pending-queue metadata is included in reserved
+memory accounting. This candidate budget is not a wall-clock CPU deadline:
+other reactor work, memory-admission accounting, and full-system RSS caps
+remain separate release blockers.
 
 ## RESP ingress and command execution
 
