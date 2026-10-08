@@ -140,10 +140,7 @@ pub struct SingleNodeSplitStore {
 }
 
 impl SingleNodeSplitStore {
-    pub fn open(
-        root: impl AsRef<Path>,
-        parent: TabletDescriptor,
-    ) -> Result<Self, SplitError> {
+    pub fn open(root: impl AsRef<Path>, parent: TabletDescriptor) -> Result<Self, SplitError> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
         let manifest_path = root.join("route.manifest");
@@ -183,9 +180,14 @@ impl SingleNodeSplitStore {
             // A missing manifest is not proof of a fresh store. In particular,
             // a lost manifest after promotion cannot resurrect an old parent.
             if parent_wal.exists()
-                || ["left.wal", "right.wal", "left.checkpoint", "right.checkpoint"]
-                    .iter()
-                    .any(|file| root.join(file).exists())
+                || [
+                    "left.wal",
+                    "right.wal",
+                    "left.checkpoint",
+                    "right.checkpoint",
+                ]
+                .iter()
+                .any(|file| root.join(file).exists())
             {
                 return Err(SplitError::InvalidManifest(
                     "tablet files exist without routing manifest".into(),
@@ -195,7 +197,11 @@ impl SingleNodeSplitStore {
             write_manifest(&manifest_path, &DiskManifest::for_parent(&parent), None)?;
             Active::Parent(parent_tablet)
         };
-        Ok(Self { root, parent, active })
+        Ok(Self {
+            root,
+            parent,
+            active,
+        })
     }
 
     pub fn is_split(&self) -> bool {
@@ -260,7 +266,10 @@ impl SingleNodeSplitStore {
 
     /// Snapshot numbers are tablet-local, not a cross-tablet transaction ID.
     pub fn read_at(&self, key: &[u8], snapshot: u64) -> Result<Option<Vec<u8>>, SplitError> {
-        Ok(self.select(key)?.read_at(key, snapshot)?.map(ToOwned::to_owned))
+        Ok(self
+            .select(key)?
+            .read_at(key, snapshot)?
+            .map(ToOwned::to_owned))
     }
 
     /// Prepare both durable child checkpoints/WALs, verify their recovery,
@@ -316,11 +325,7 @@ impl SingleNodeSplitStore {
         // ambiguous to this process. Mark it poisoned before attempting it.
         self.active = Active::Poisoned;
         let new_manifest = DiskManifest::for_split(plan, source_sequence);
-        write_manifest(
-            &self.root.join("route.manifest"),
-            &new_manifest,
-            stop,
-        )?;
+        write_manifest(&self.root.join("route.manifest"), &new_manifest, stop)?;
         self.active = Active::Children {
             split_key: plan.split_key.clone(),
             left,
@@ -337,11 +342,7 @@ impl SingleNodeSplitStore {
         let wal_path = self.root.join(format!("{side}.wal"));
         let checkpoint_path = checkpoint::checkpoint_path_for_wal(&wal_path);
         checkpoint::write_checkpoint(&checkpoint_path, tablet)?;
-        FileWal::seed_from_checkpoint(
-            &wal_path,
-            tablet.descriptor(),
-            tablet.current_sequence(),
-        )?;
+        FileWal::seed_from_checkpoint(&wal_path, tablet.descriptor(), tablet.current_sequence())?;
         Ok(WalBackedTablet::open(
             tablet.descriptor().clone(),
             wal_path,
@@ -401,21 +402,26 @@ fn read_manifest(path: &Path) -> Result<DiskManifest, SplitError> {
     file.read_exact(&mut len)?;
     let size = u32::from_le_bytes(len) as usize;
     if size > MAX_MANIFEST_BYTES {
-        return Err(SplitError::InvalidManifest("manifest exceeds size limit".into()));
+        return Err(SplitError::InvalidManifest(
+            "manifest exceeds size limit".into(),
+        ));
     }
     let mut payload = vec![0; size];
     file.read_exact(&mut payload)?;
     let mut checksum = [0; 32];
     file.read_exact(&mut checksum)?;
     if checksum != *blake3::hash(&payload).as_bytes() {
-        return Err(SplitError::InvalidManifest("manifest checksum mismatch".into()));
+        return Err(SplitError::InvalidManifest(
+            "manifest checksum mismatch".into(),
+        ));
     }
     let mut trailer = [0; 1];
     if file.read(&mut trailer)? != 0 {
-        return Err(SplitError::InvalidManifest("manifest has trailing bytes".into()));
+        return Err(SplitError::InvalidManifest(
+            "manifest has trailing bytes".into(),
+        ));
     }
-    serde_json::from_slice(&payload)
-        .map_err(|error| SplitError::InvalidManifest(error.to_string()))
+    serde_json::from_slice(&payload).map_err(|error| SplitError::InvalidManifest(error.to_string()))
 }
 
 /// FileWal::open intentionally creates/reinitializes empty files for fresh
@@ -527,7 +533,12 @@ mod tests {
         )
         .unwrap();
         let plan = parent
-            .plan_split(b"m", TabletId::new(802).unwrap(), TabletId::new(803).unwrap(), 8)
+            .plan_split(
+                b"m",
+                TabletId::new(802).unwrap(),
+                TabletId::new(803).unwrap(),
+                8,
+            )
             .unwrap();
         {
             let mut store = SingleNodeSplitStore::open(&root, parent.clone()).unwrap();
@@ -556,7 +567,10 @@ mod tests {
         let published = stop == SplitStop::AfterManifestRename;
         assert_eq!(recovered.is_split(), published);
         assert_eq!(recovered.read_latest(b"b").unwrap(), Some(b"left".to_vec()));
-        assert_eq!(recovered.read_latest(b"n").unwrap(), Some(b"right".to_vec()));
+        assert_eq!(
+            recovered.read_latest(b"n").unwrap(),
+            Some(b"right".to_vec())
+        );
         if !published {
             // Orphaned staging does not route reads or block a retried split.
             recovered.split(&plan).unwrap();
