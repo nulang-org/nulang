@@ -1,4 +1,4 @@
-use super::mvcc_gc::{retain_versions_for_floor, MvccRetentionError};
+use super::mvcc_gc::{plan_versions_for_floor, retain_versions_for_floor, MvccRetentionError};
 use super::tablet::VersionedValue;
 
 fn put(sequence: u64, value: &[u8]) -> VersionedValue {
@@ -20,6 +20,19 @@ fn visible_value(versions: &[VersionedValue], snapshot: u64) -> Option<&[u8]> {
         .iter()
         .rev()
         .find(|version| version.sequence <= snapshot)
+        .and_then(|version| version.value.as_deref())
+}
+
+fn visible_across_authorities<'a>(
+    retained: &'a [VersionedValue],
+    stale: &'a [VersionedValue],
+    snapshot: u64,
+) -> Option<&'a [u8]> {
+    retained
+        .iter()
+        .chain(stale)
+        .filter(|version| version.sequence <= snapshot)
+        .max_by_key(|version| version.sequence)
         .and_then(|version| version.value.as_deref())
 }
 
@@ -84,6 +97,69 @@ fn retained_history_preserves_reads_for_every_snapshot_at_or_above_floor() {
             );
         }
     }
+}
+
+#[test]
+fn retention_plan_marks_only_versions_older_than_the_retained_barrier_obsolete() {
+    let versions = vec![
+        put(1, b"one"),
+        put(2, b"two"),
+        tombstone(5),
+        put(9, b"nine"),
+    ];
+    let plan = plan_versions_for_floor(&versions, 8).unwrap();
+
+    assert_eq!(plan.barrier_sequence(), 5);
+    assert_eq!(plan.obsolete(), &[put(1, b"one"), put(2, b"two")]);
+    assert_eq!(plan.retained(), &[tombstone(5), put(9, b"nine")]);
+    assert!(plan
+        .obsolete()
+        .iter()
+        .all(|version| version.sequence < plan.barrier_sequence()));
+}
+
+#[test]
+fn retained_barrier_masks_any_subset_of_stale_obsolete_authority() {
+    let versions = vec![
+        put(1, b"one"),
+        tombstone(3),
+        put(4, b"four"),
+        tombstone(7),
+        put(10, b"ten"),
+    ];
+    let floor = 9;
+    let plan = plan_versions_for_floor(&versions, floor).unwrap();
+    let obsolete = plan.obsolete();
+
+    for mask in 0..(1_usize << obsolete.len()) {
+        let stale: Vec<VersionedValue> = obsolete
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| mask & (1_usize << index) != 0)
+            .map(|(_, version)| version.clone())
+            .collect();
+
+        for snapshot in floor..=12 {
+            assert_eq!(
+                visible_across_authorities(plan.retained(), &stale, snapshot),
+                visible_value(&versions, snapshot),
+                "stale authority changed read for mask {mask}, snapshot {snapshot}"
+            );
+        }
+    }
+}
+
+#[test]
+fn tombstone_barrier_prevents_resurrection_from_stale_lower_authority() {
+    let versions = vec![put(1, b"one"), put(2, b"two"), tombstone(6)];
+    let plan = plan_versions_for_floor(&versions, 10).unwrap();
+
+    assert_eq!(plan.retained(), &[tombstone(6)]);
+    assert_eq!(plan.obsolete(), &[put(1, b"one"), put(2, b"two")]);
+    assert_eq!(
+        visible_across_authorities(plan.retained(), plan.obsolete(), 10),
+        None
+    );
 }
 
 #[test]
