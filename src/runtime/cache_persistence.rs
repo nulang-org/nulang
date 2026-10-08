@@ -4,6 +4,7 @@
 //! durable bytes, checksums, wall-clock TTL translation, and crash recovery.
 //! Process-relative CacheStore timestamps are never written to disk.
 
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -260,11 +261,13 @@ impl DurableCacheStore {
         store_now_ms: u64,
     ) -> Result<bool, CacheDurabilityError> {
         self.ensure_healthy()?;
-        let removed = self.store.delete_at(key, store_now_ms);
-        if removed {
-            self.record(CacheWalMutation::Delete { key: key.to_vec() })?;
+        // Lazy expiry during the existence check is a logical no-op.
+        // No live deletion is visible until the WAL acknowledgement succeeds.
+        if !self.store.exists(key, store_now_ms) {
+            return Ok(false);
         }
-        Ok(removed)
+        self.record(CacheWalMutation::Delete { key: key.to_vec() })?;
+        Ok(self.store.delete_at(key, store_now_ms))
     }
 
     pub fn delete_many_at(
@@ -273,17 +276,27 @@ impl DurableCacheStore {
         store_now_ms: u64,
     ) -> Result<usize, CacheDurabilityError> {
         self.ensure_healthy()?;
-        let mut mutations = Vec::new();
-        for key in keys {
-            if self.store.delete_at(key, store_now_ms) {
-                mutations.push(CacheWalMutation::Delete { key: key.to_vec() });
+        // Stage only distinct, live keys, preserving Redis DEL's duplicate-key
+        // semantics. Mutation happens only after the whole WAL batch succeeds.
+        let mut seen = HashSet::with_capacity(keys.len());
+        let mut live = Vec::new();
+        for &key in keys {
+            if seen.insert(key) && self.store.exists(key, store_now_ms) {
+                live.push(key);
             }
         }
-        let deleted = mutations.len();
-        if deleted != 0 {
-            self.record(CacheWalMutation::Batch { mutations })?;
+        if live.is_empty() {
+            return Ok(0);
         }
-        Ok(deleted)
+        let mutations = live
+            .iter()
+            .map(|key| CacheWalMutation::Delete { key: key.to_vec() })
+            .collect();
+        self.record(CacheWalMutation::Batch { mutations })?;
+        for key in &live {
+            debug_assert!(self.store.delete_at(key, store_now_ms));
+        }
+        Ok(live.len())
     }
 
     pub fn expire_ms(
@@ -294,18 +307,19 @@ impl DurableCacheStore {
         wall_now_ms: u64,
     ) -> Result<bool, CacheDurabilityError> {
         self.ensure_healthy()?;
-        let changed = self.store.expire_ms(key, ttl_ms, store_now_ms);
-        if changed {
-            if ttl_ms == 0 {
-                self.record(CacheWalMutation::Delete { key: key.to_vec() })?;
-            } else {
-                self.record(CacheWalMutation::ExpireAt {
-                    key: key.to_vec(),
-                    expires_unix_ms: wall_now_ms.saturating_add(ttl_ms),
-                })?;
-            }
+        if !self.store.exists(key, store_now_ms) {
+            return Ok(false);
         }
-        Ok(changed)
+        let mutation = if ttl_ms == 0 {
+            CacheWalMutation::Delete { key: key.to_vec() }
+        } else {
+            CacheWalMutation::ExpireAt {
+                key: key.to_vec(),
+                expires_unix_ms: wall_now_ms.saturating_add(ttl_ms),
+            }
+        };
+        self.record(mutation)?;
+        Ok(self.store.expire_ms(key, ttl_ms, store_now_ms))
     }
 
     pub fn increment(
