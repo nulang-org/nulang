@@ -47,7 +47,7 @@ jobs:
               raw = Path(f"phase-results/{workload}.jsonl").read_text()
               summary[workload] = validate_phase_samples(raw, workload, 3, messages)
           Path("phase-results/summary.json").write_text(
-              json.dumps(summary, indent=2, sort_keys=True) + "\\n"
+              json.dumps(summary, indent=2, sort_keys=True) + "\n"
           )
           for workload, result in summary.items():
               print(workload, result)
