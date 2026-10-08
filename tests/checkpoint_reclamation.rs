@@ -239,4 +239,3 @@ fn repeated_key_mutations_survive_wal_replay_and_checkpoint_reclamation() {
     let _ = fs::remove_file(&wal_path);
     let _ = fs::remove_file(&checkpoint);
 }
-
