@@ -77,18 +77,22 @@ filesystem reorderings, or storage hardware faults.
   after crash recovery.
 - **Cooperative public WAL API fence:** `FileWal::open` and
   `WalBackedTablet::open` fail closed when a persistent
-  `.nudb-owner.lock` or `route.manifest` is present. Only the crate-private
-  managed-open path, scoped to a held `OwnedDirectory` lock and the matching
-  canonical root, can recover a managed tablet. Previously opened public WAL
-  handles recheck before append/reclamation, and public tablet handles recheck
-  before checkpoint publication.
+  `.nudb-owner.lock` or `route.manifest` is present, including when a
+  caller reaches the WAL through an ordinary file or directory symlink. Only
+  the crate-private managed-open path, scoped to a held `OwnedDirectory`
+  lock and the matching canonical root, can recover a managed tablet.
+  Previously opened public WAL handles recheck before append/reclamation,
+  and public tablet handles recheck before checkpoint publication.
 - **Advisory, not physical fencing:** An uncooperative process can still edit
   underlying files directly; a public handle that passed its admission check
   before a concurrent owner transition has a possible TOCTOU window.
   Do not use this as distributed ownership fencing or a protection against
   malicious filesystem writes. Multi-process migration requires a protocol
   preventing takeover until old owners have stopped, with a durable
-  monotonically increasing fencing token validated at commit time.
+  monotonically increasing fencing token validated at commit time. This
+  path-based check does not prevent hard-link aliases, manual file mutation,
+  or other operations outside the NuDB API, and adds filesystem metadata
+  checks on unowned WAL writes pending a measured lower-overhead protocol.
 - **No distributed fencing:** Add lease/consensus-backed ownership and durable
   tablet placement metadata before node migration or shared-storage failover.
 - **No global SQL transaction ordering:** Cross-tablet snapshots, two-phase
