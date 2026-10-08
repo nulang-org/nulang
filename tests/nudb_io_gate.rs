@@ -159,7 +159,9 @@ fn public_symlink_to_unmanaged_wal_uses_real_directory_gate() {
     let (sender, done) = mpsc::channel();
     let alias_for_thread = alias.clone();
     let reader = std::thread::spawn(move || {
-        sender.send(FileWal::open(&alias_for_thread).is_ok()).unwrap();
+        sender
+            .send(FileWal::open(&alias_for_thread).is_ok())
+            .unwrap();
     });
     // The public open must wait while the real target's lock is held.
     assert!(matches!(
@@ -176,7 +178,10 @@ fn public_symlink_to_unmanaged_wal_uses_real_directory_gate() {
     wal.append_write(&put(0)).unwrap();
     wal.reclaim_through(1).unwrap();
     drop(wal);
-    assert!(fs::symlink_metadata(&alias).unwrap().file_type().is_symlink());
+    assert!(fs::symlink_metadata(&alias)
+        .unwrap()
+        .file_type()
+        .is_symlink());
     assert_eq!(FileWal::open(&real).unwrap().base_sequence(), 1);
     let _ = fs::remove_dir_all(aliases);
     let _ = fs::remove_dir_all(actual_root);
