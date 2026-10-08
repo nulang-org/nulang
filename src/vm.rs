@@ -6368,6 +6368,16 @@ mod vm_tests {
     use crate::bytecode::{BehaviorTableEntry, HandlerBinding, HandlerTable, Instruction};
 
     #[test]
+    fn iso_arena_env_opt_in_rejects_explicit_false_and_unknown_values() {
+        for disabled in ["", "0", "false", "FALSE", "off", "no", "unknown"] {
+            assert!(!VM::iso_arena_env_opt_in(disabled), "{disabled} must remain disabled");
+        }
+        for enabled in ["1", "true", "TRUE", "on", "yes"] {
+            assert!(VM::iso_arena_env_opt_in(enabled), "{enabled} must enable arena");
+        }
+    }
+
+    #[test]
     fn disabled_iso_arena_does_not_allocate_per_instruction_site_bitmaps() {
         let mut vm = VM::new_without_jit();
         vm.set_iso_arena_enabled(false);
