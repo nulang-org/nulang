@@ -42,10 +42,7 @@ pub(crate) struct FabricConsumerProgressPolicy {
 
 impl FabricConsumerProgressPolicy {
     fn validate(&self) -> io::Result<()> {
-        if self.epoch == 0
-            || self.replicas.is_empty()
-            || !self.replicas.contains(&self.leader)
-        {
+        if self.epoch == 0 || self.replicas.is_empty() || !self.replicas.contains(&self.leader) {
             return Err(invalid("invalid consumer-progress replication policy"));
         }
         let members: BTreeSet<u64> = self.replicas.iter().copied().collect();
@@ -101,13 +98,17 @@ impl FabricConsumerProgressChange {
             || self.committed_cursor > stream_committed_through
             || self.acked_gaps.len() > MAX_ACK_GAPS
         {
-            return Err(invalid("invalid consumer-progress metadata or record boundary"));
+            return Err(invalid(
+                "invalid consumer-progress metadata or record boundary",
+            ));
         }
 
         let mut last = self.committed_cursor;
         for gap in &self.acked_gaps {
             if *gap <= last || *gap > stream_committed_through {
-                return Err(invalid("consumer-progress ACK gaps must be ordered and committed"));
+                return Err(invalid(
+                    "consumer-progress ACK gaps must be ordered and committed",
+                ));
             }
             last = *gap;
         }
@@ -178,10 +179,11 @@ impl FabricConsumerProgressFrame {
     fn validate(&self, expected_previous_hash: &str) -> io::Result<()> {
         if self.version != JOURNAL_FORMAT_VERSION
             || self.previous_hash != expected_previous_hash
-            || self.integrity_hash
-                != Self::hash(self.version, &self.previous_hash, &self.event)?
+            || self.integrity_hash != Self::hash(self.version, &self.previous_hash, &self.event)?
         {
-            return Err(invalid("Fabric consumer-progress journal integrity violation"));
+            return Err(invalid(
+                "Fabric consumer-progress journal integrity violation",
+            ));
         }
         Ok(())
     }
@@ -254,15 +256,12 @@ impl FileFabricConsumerProgressJournal {
                 }
                 // A torn tail, empty interior frame, or oversized record
                 // must be repaired from a trusted source, never ignored.
-                if line.len() > MAX_FRAME_BYTES
-                    || line.last() != Some(&b'\n')
-                    || line.len() == 1
-                {
+                if line.len() > MAX_FRAME_BYTES || line.last() != Some(&b'\n') || line.len() == 1 {
                     return Err(invalid("invalid or truncated consumer-progress frame"));
                 }
                 line.pop();
-                let frame: FabricConsumerProgressFrame = serde_json::from_slice(&line)
-                    .map_err(|error| invalid(error.to_string()))?;
+                let frame: FabricConsumerProgressFrame =
+                    serde_json::from_slice(&line).map_err(|error| invalid(error.to_string()))?;
                 frame.validate(&journal.last_hash)?;
                 journal.apply_event(&frame.event)?;
                 journal.last_hash = frame.integrity_hash;
@@ -272,7 +271,9 @@ impl FileFabricConsumerProgressJournal {
     }
 
     pub(crate) fn pending_sequence(&self) -> Option<u64> {
-        self.pending.as_ref().map(|pending| pending.change.metadata_sequence)
+        self.pending
+            .as_ref()
+            .map(|pending| pending.change.metadata_sequence)
     }
 
     pub(crate) fn last_committed_metadata_sequence(&self) -> u64 {
@@ -316,9 +317,14 @@ impl FileFabricConsumerProgressJournal {
         limit: usize,
     ) -> io::Result<Vec<FabricConsumerProgressCommitWire>> {
         if start_sequence == 0 || limit == 0 || limit > 256 {
-            return Err(invalid("invalid bounded consumer-progress commit replay request"));
+            return Err(invalid(
+                "invalid bounded consumer-progress commit replay request",
+            ));
         }
-        Ok(self.committed_history.range(start_sequence..).take(limit)
+        Ok(self
+            .committed_history
+            .range(start_sequence..)
+            .take(limit)
             .map(|(_, committed)| FabricConsumerProgressCommitWire::from_committed(committed))
             .collect())
     }
@@ -334,9 +340,13 @@ impl FileFabricConsumerProgressJournal {
         if !old_policy.replicas.contains(&replica)
             || self.committed_policy.as_ref() != Some(old_policy)
         {
-            return Err(invalid("recovery witness is not in the old installed policy"));
+            return Err(invalid(
+                "recovery witness is not in the old installed policy",
+            ));
         }
-        let history: Vec<(u64, String)> = self.committed_history.iter()
+        let history: Vec<(u64, String)> = self
+            .committed_history
+            .iter()
             .map(|(sequence, record)| (*sequence, record.digest.clone()))
             .collect();
         Ok(FabricConsumerRecoveryWitness {
@@ -352,9 +362,17 @@ impl FileFabricConsumerProgressJournal {
     /// Recover the exact pending proposal for idempotent network retry.
     pub(crate) fn pending_change(
         &self,
-    ) -> Option<(&FabricConsumerProgressChange, &FabricConsumerProgressPolicy, u64)> {
+    ) -> Option<(
+        &FabricConsumerProgressChange,
+        &FabricConsumerProgressPolicy,
+        u64,
+    )> {
         self.pending.as_ref().map(|pending| {
-            (&pending.change, &pending.policy, pending.stream_committed_through)
+            (
+                &pending.change,
+                &pending.policy,
+                pending.stream_committed_through,
+            )
         })
     }
 
@@ -392,17 +410,25 @@ impl FileFabricConsumerProgressJournal {
                 "consumer-progress journal cannot mix streams or partitions",
             ));
         }
-        let next_sequence = self.latest_sequence.checked_add(1)
+        let next_sequence = self
+            .latest_sequence
+            .checked_add(1)
             .ok_or_else(|| invalid("consumer-progress metadata index overflow"))?;
         if change.metadata_sequence != next_sequence
             || change.previous_metadata_sequence != self.latest_sequence
         {
-            return Err(invalid("consumer-progress metadata predecessor does not match"));
+            return Err(invalid(
+                "consumer-progress metadata predecessor does not match",
+            ));
         }
 
         // Epoch changes require a separate old-quorum recovery/transition
         // protocol, which is not implemented in this storage slice.
-        if self.committed_policy.as_ref().is_some_and(|old| old != policy) {
+        if self
+            .committed_policy
+            .as_ref()
+            .is_some_and(|old| old != policy)
+        {
             return Err(invalid(
                 "consumer-progress epoch/policy transition requires quorum recovery",
             ));
@@ -411,11 +437,14 @@ impl FileFabricConsumerProgressJournal {
         if let Some(old) = self.committed.get(&change.key()) {
             if change.generation != old.generation
                 || change.committed_cursor < old.committed_cursor
-                || old.acked_gaps.iter().any(|gap| {
-                    *gap > change.committed_cursor && !change.acked_gaps.contains(gap)
-                })
+                || old
+                    .acked_gaps
+                    .iter()
+                    .any(|gap| *gap > change.committed_cursor && !change.acked_gaps.contains(gap))
             {
-                return Err(invalid("consumer progress would regress or discard ACK gaps"));
+                return Err(invalid(
+                    "consumer progress would regress or discard ACK gaps",
+                ));
             }
         }
         Ok(())
@@ -448,14 +477,17 @@ impl FileFabricConsumerProgressJournal {
                 replica,
                 digest,
             } => {
-                let pending = self.pending.as_ref().ok_or_else(|| {
-                    invalid("consumer-progress receipt has no pending prepare")
-                })?;
+                let pending = self
+                    .pending
+                    .as_ref()
+                    .ok_or_else(|| invalid("consumer-progress receipt has no pending prepare"))?;
                 if *metadata_sequence != pending.change.metadata_sequence
                     || *replica == pending.policy.leader
                     || !pending.policy.replicas.contains(replica)
                 {
-                    return Err(invalid("invalid consumer-progress receipt origin or sequence"));
+                    return Err(invalid(
+                        "invalid consumer-progress receipt origin or sequence",
+                    ));
                 }
                 let exact = FabricConsumerProgressPrepareWire::new(
                     pending.change.clone(),
@@ -463,7 +495,9 @@ impl FileFabricConsumerProgressJournal {
                     pending.stream_committed_through,
                 )?;
                 if *digest != exact.digest || !self.verified_voters.insert(*replica) {
-                    return Err(invalid("invalid or duplicate durable consumer-progress receipt"));
+                    return Err(invalid(
+                        "invalid or duplicate durable consumer-progress receipt",
+                    ));
                 }
             }
             FabricConsumerProgressEvent::Commit {
@@ -493,17 +527,20 @@ impl FileFabricConsumerProgressJournal {
                 };
                 self.last_commit = Some(committed.clone());
                 self.committed_history.insert(*metadata_sequence, committed);
-                self.commit_receipts.insert(
-                    *metadata_sequence, BTreeSet::from([pending.policy.leader]),
-                );
+                self.commit_receipts
+                    .insert(*metadata_sequence, BTreeSet::from([pending.policy.leader]));
                 self.committed_policy = Some(pending.policy);
                 self.committed.insert(pending.change.key(), pending.change);
                 self.verified_voters.clear();
             }
             FabricConsumerProgressEvent::CommitReceipt {
-                metadata_sequence, replica, digest,
+                metadata_sequence,
+                replica,
+                digest,
             } => {
-                let decision = self.committed_history.get(metadata_sequence)
+                let decision = self
+                    .committed_history
+                    .get(metadata_sequence)
                     .ok_or_else(|| invalid("commit receipt has no durable committed decision"))?;
                 if *replica == decision.policy.leader
                     || !decision.policy.replicas.contains(replica)
@@ -511,7 +548,9 @@ impl FileFabricConsumerProgressJournal {
                 {
                     return Err(invalid("commit receipt origin or exact digest mismatch"));
                 }
-                let accepted = self.commit_receipts.get_mut(metadata_sequence)
+                let accepted = self
+                    .commit_receipts
+                    .get_mut(metadata_sequence)
                     .ok_or_else(|| invalid("missing commit receipt ledger"))?
                     .insert(*replica);
                 if !accepted {
@@ -534,8 +573,7 @@ impl FileFabricConsumerProgressJournal {
     fn append_event(&mut self, event: FabricConsumerProgressEvent) -> io::Result<()> {
         self.ensure_writable()?;
         let frame = FabricConsumerProgressFrame::new(self.last_hash.clone(), event)?;
-        let mut bytes = serde_json::to_vec(&frame)
-            .map_err(|error| invalid(error.to_string()))?;
+        let mut bytes = serde_json::to_vec(&frame).map_err(|error| invalid(error.to_string()))?;
         bytes.push(b'\n');
         if bytes.len() > MAX_FRAME_BYTES {
             return Err(invalid("consumer-progress journal frame exceeds limit"));
@@ -579,7 +617,9 @@ impl FileFabricConsumerProgressJournal {
             {
                 return Ok(());
             }
-            return Err(invalid("different consumer-progress record already pending"));
+            return Err(invalid(
+                "different consumer-progress record already pending",
+            ));
         }
         self.check_prepare(&change, &policy, stream_committed_through)?;
         self.append_event(FabricConsumerProgressEvent::Prepare {
@@ -600,9 +640,10 @@ impl FileFabricConsumerProgressJournal {
         acknowledgers: &[u64],
     ) -> io::Result<()> {
         self.ensure_writable()?;
-        let pending = self.pending.as_ref().ok_or_else(|| {
-            invalid("consumer-progress commit has no pending durable record")
-        })?;
+        let pending = self
+            .pending
+            .as_ref()
+            .ok_or_else(|| invalid("consumer-progress commit has no pending durable record"))?;
         if pending.change.metadata_sequence != metadata_sequence {
             return Err(invalid("consumer-progress commit index mismatch"));
         }
@@ -616,15 +657,12 @@ impl FileFabricConsumerProgressJournal {
     /// Call only *after* the transport layer validated a replica's identity
     /// and its exact fsynced prepare receipt. The journal persists the
     /// observation before allowing it to count toward a later quorum.
-    pub(crate) fn record_verified_receipt(
-        &mut self,
-        replica: u64,
-        digest: &str,
-    ) -> io::Result<()> {
+    pub(crate) fn record_verified_receipt(&mut self, replica: u64, digest: &str) -> io::Result<()> {
         self.ensure_writable()?;
-        let pending = self.pending.as_ref().ok_or_else(|| {
-            invalid("durable receipt has no pending consumer metadata")
-        })?;
+        let pending = self
+            .pending
+            .as_ref()
+            .ok_or_else(|| invalid("durable receipt has no pending consumer metadata"))?;
         let exact = FabricConsumerProgressPrepareWire::new(
             pending.change.clone(),
             pending.policy.clone(),
@@ -634,7 +672,9 @@ impl FileFabricConsumerProgressJournal {
             || !pending.policy.replicas.contains(&replica)
             || digest != exact.digest
         {
-            return Err(invalid("untrusted consumer-progress receipt or proposal digest"));
+            return Err(invalid(
+                "untrusted consumer-progress receipt or proposal digest",
+            ));
         }
         if self.verified_voters.contains(&replica) {
             return Ok(());
@@ -651,9 +691,10 @@ impl FileFabricConsumerProgressJournal {
     /// successor can recover the decision or return a cluster-durable ACK.
     pub(crate) fn commit_observed_quorum(&mut self, metadata_sequence: u64) -> io::Result<()> {
         self.ensure_writable()?;
-        let pending = self.pending.as_ref().ok_or_else(|| {
-            invalid("consumer-progress commit requires an unresolved prepare")
-        })?;
+        let pending = self
+            .pending
+            .as_ref()
+            .ok_or_else(|| invalid("consumer-progress commit requires an unresolved prepare"))?;
         let voters = self.verified_voters();
         pending.policy.validate_quorum(&voters)?;
         self.commit_with_acknowledgers(metadata_sequence, &voters)
@@ -668,7 +709,9 @@ impl FileFabricConsumerProgressJournal {
         digest: &str,
     ) -> io::Result<()> {
         self.ensure_writable()?;
-        let committed = self.committed_history.get(&metadata_sequence)
+        let committed = self
+            .committed_history
+            .get(&metadata_sequence)
             .ok_or_else(|| invalid("no durable metadata commit for follower receipt"))?;
         if replica == committed.policy.leader
             || !committed.policy.replicas.contains(&replica)
@@ -676,7 +719,9 @@ impl FileFabricConsumerProgressJournal {
         {
             return Err(invalid("untrusted commit receipt or conflicting digest"));
         }
-        if self.commit_receipts.get(&metadata_sequence)
+        if self
+            .commit_receipts
+            .get(&metadata_sequence)
             .is_some_and(|voters| voters.contains(&replica))
         {
             return Ok(());
@@ -706,7 +751,9 @@ impl FileFabricConsumerProgressJournal {
                 || update.metadata_sequence != pending.change.metadata_sequence
                 || update.digest != exact.digest
             {
-                return Err(invalid("consumer-progress commit does not match prepared record"));
+                return Err(invalid(
+                    "consumer-progress commit does not match prepared record",
+                ));
             }
             return pending.policy.validate_quorum(&update.acknowledgers);
         }
@@ -725,12 +772,15 @@ impl FileFabricConsumerProgressJournal {
                 return Ok(());
             }
         }
-        Err(invalid("consumer-progress commit has no matching pending prepare"))
+        Err(invalid(
+            "consumer-progress commit has no matching pending prepare",
+        ))
     }
 
-    fn apply_committed_update(&mut self, update: &FabricConsumerProgressCommitWire)
-        -> io::Result<()>
-    {
+    fn apply_committed_update(
+        &mut self,
+        update: &FabricConsumerProgressCommitWire,
+    ) -> io::Result<()> {
         self.ensure_writable()?;
         self.verify_commit_update(update)?;
         if self.pending.is_none() {
@@ -739,7 +789,6 @@ impl FileFabricConsumerProgressJournal {
         self.commit_with_acknowledgers(update.metadata_sequence, &update.acknowledgers)
     }
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct FabricConsumerProgressPrepareWire {
@@ -757,7 +806,8 @@ impl FabricConsumerProgressPrepareWire {
             &self.change,
             &self.policy,
             self.stream_committed_through,
-        )).map_err(|error| invalid(error.to_string()))?;
+        ))
+        .map_err(|error| invalid(error.to_string()))?;
         Ok(blake3::hash(&bytes).to_hex().to_string())
     }
 
@@ -773,32 +823,38 @@ impl FabricConsumerProgressPrepareWire {
             stream_committed_through,
             digest: String::new(),
         };
-        wire.change.validate(&wire.policy, stream_committed_through)?;
+        wire.change
+            .validate(&wire.policy, stream_committed_through)?;
         wire.digest = wire.calculate_digest()?;
         Ok(wire)
     }
 
     fn verify(&self) -> io::Result<()> {
-        if self.version != JOURNAL_FORMAT_VERSION
-            || self.digest != self.calculate_digest()?
-        {
-            return Err(invalid("Fabric consumer-progress prepare digest or version mismatch"));
+        if self.version != JOURNAL_FORMAT_VERSION || self.digest != self.calculate_digest()? {
+            return Err(invalid(
+                "Fabric consumer-progress prepare digest or version mismatch",
+            ));
         }
-        self.change.validate(&self.policy, self.stream_committed_through)
+        self.change
+            .validate(&self.policy, self.stream_committed_through)
     }
 
     pub(crate) fn to_wire_bytes(&self) -> io::Result<Vec<u8>> {
         self.verify()?;
         let bytes = serde_json::to_vec(self).map_err(|error| invalid(error.to_string()))?;
         if bytes.len() > MAX_FRAME_BYTES {
-            return Err(invalid("Fabric consumer-progress prepare wire frame too large"));
+            return Err(invalid(
+                "Fabric consumer-progress prepare wire frame too large",
+            ));
         }
         Ok(bytes)
     }
 
     pub(crate) fn from_wire_bytes(bytes: &[u8]) -> io::Result<Self> {
         if bytes.len() > MAX_FRAME_BYTES {
-            return Err(invalid("Fabric consumer-progress prepare wire frame too large"));
+            return Err(invalid(
+                "Fabric consumer-progress prepare wire frame too large",
+            ));
         }
         let wire: Self =
             serde_json::from_slice(bytes).map_err(|error| invalid(error.to_string()))?;
@@ -848,8 +904,8 @@ impl FabricConsumerProgressCommitWire {
         if bytes.len() > MAX_FRAME_BYTES {
             return Err(invalid("consumer-progress commit frame exceeds wire limit"));
         }
-        let wire: Self = serde_json::from_slice(bytes)
-            .map_err(|error| invalid(error.to_string()))?;
+        let wire: Self =
+            serde_json::from_slice(bytes).map_err(|error| invalid(error.to_string()))?;
         wire.validate_shape()?;
         Ok(wire)
     }
@@ -887,20 +943,23 @@ pub(crate) struct FabricConsumerProgressCommitAckWire {
 impl FabricConsumerProgressCommitAckWire {
     pub(crate) fn to_wire_bytes(&self) -> io::Result<Vec<u8>> {
         self.validate_shape()?;
-        let bytes = serde_json::to_vec(self)
-            .map_err(|error| invalid(error.to_string()))?;
+        let bytes = serde_json::to_vec(self).map_err(|error| invalid(error.to_string()))?;
         if bytes.len() > MAX_FRAME_BYTES {
-            return Err(invalid("consumer-progress commit ACK wire frame is oversized"));
+            return Err(invalid(
+                "consumer-progress commit ACK wire frame is oversized",
+            ));
         }
         Ok(bytes)
     }
 
     pub(crate) fn from_wire_bytes(bytes: &[u8]) -> io::Result<Self> {
         if bytes.len() > MAX_FRAME_BYTES {
-            return Err(invalid("consumer-progress commit ACK wire frame is oversized"));
+            return Err(invalid(
+                "consumer-progress commit ACK wire frame is oversized",
+            ));
         }
-        let receipt: Self = serde_json::from_slice(bytes)
-            .map_err(|error| invalid(error.to_string()))?;
+        let receipt: Self =
+            serde_json::from_slice(bytes).map_err(|error| invalid(error.to_string()))?;
         receipt.validate_shape()?;
         Ok(receipt)
     }
@@ -960,9 +1019,18 @@ impl FabricConsumerProgressAckWire {
 
 impl Runtime {
     fn consumer_progress_directory(&mut self, stream: &str) -> io::Result<PathBuf> {
-        let root = self.distributed.fabric_streams.as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "Fabric stream storage not open")
-        })?.root().to_path_buf();
+        let root = self
+            .distributed
+            .fabric_streams
+            .as_ref()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "Fabric stream storage not open",
+                )
+            })?
+            .root()
+            .to_path_buf();
         // Validate and recover the stream before joining its filesystem path.
         self.fabric_stream_info(stream)?;
         Ok(root.join(stream).join("consumer_progress"))
@@ -972,9 +1040,11 @@ impl Runtime {
         &mut self,
         stream: &str,
     ) -> io::Result<FabricConsumerProgressPolicy> {
-        let installed = self.fabric_stream_replication_policy(stream)?.ok_or_else(|| {
-            invalid("consumer-progress metadata requires installed stream replication policy")
-        })?;
+        let installed = self
+            .fabric_stream_replication_policy(stream)?
+            .ok_or_else(|| {
+                invalid("consumer-progress metadata requires installed stream replication policy")
+            })?;
         if let Some(promise) = self.fabric_stream_epoch_promise(stream)? {
             if promise.epoch > installed.epoch {
                 return Err(io::Error::new(
@@ -996,7 +1066,10 @@ impl Runtime {
     ) -> io::Result<FabricConsumerProgressPolicy> {
         let policy = self.consumer_progress_installed_policy(stream)?;
         let local = self.distributed.node_id.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "consumer-progress leader requires distribution")
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "consumer-progress leader requires distribution",
+            )
         })?;
         if local.0 != policy.leader {
             return Err(io::Error::new(
@@ -1004,7 +1077,10 @@ impl Runtime {
                 "consumer-progress prepare requires installed stream leader",
             ));
         }
-        let healthy = self.distributed.cluster.as_ref()
+        let healthy = self
+            .distributed
+            .cluster
+            .as_ref()
             .and_then(|cluster| cluster.get_node(local))
             .map(|member| matches!(member.status, NodeStatus::Healthy | NodeStatus::Joining))
             .unwrap_or(false);
@@ -1031,11 +1107,7 @@ impl Runtime {
         let policy = self.consumer_progress_validate_leader(&change.stream)?;
         let committed_through = self.fabric_stream_committed_sequence(&change.stream)?;
         let path = self.consumer_progress_directory(&change.stream)?;
-        let wire = FabricConsumerProgressPrepareWire::new(
-            change,
-            policy,
-            committed_through,
-        )?;
+        let wire = FabricConsumerProgressPrepareWire::new(change, policy, committed_through)?;
         let mut journal = FileFabricConsumerProgressJournal::open(path)?;
         journal.prepare(
             wire.change.clone(),
@@ -1057,52 +1129,64 @@ impl Runtime {
         let policy = self.consumer_progress_validate_leader(stream)?;
         let path = self.consumer_progress_directory(stream)?;
         let journal = FileFabricConsumerProgressJournal::open(path)?;
-        let (change, pending_policy, stage_bound) = journal.pending_change().ok_or_else(|| {
-            invalid("no pending consumer-progress prepare to dispatch")
-        })?;
+        let (change, pending_policy, stage_bound) = journal
+            .pending_change()
+            .ok_or_else(|| invalid("no pending consumer-progress prepare to dispatch"))?;
         if change.partition != partition
             || change.metadata_sequence != metadata_sequence
             || pending_policy != &policy
         {
-            return Err(invalid("consumer-progress prepare does not match installed policy"));
+            return Err(invalid(
+                "consumer-progress prepare does not match installed policy",
+            ));
         }
-        let wire = FabricConsumerProgressPrepareWire::new(
-            change.clone(), policy.clone(), stage_bound,
-        )?;
+        let wire =
+            FabricConsumerProgressPrepareWire::new(change.clone(), policy.clone(), stage_bound)?;
         let bytes = wire.to_wire_bytes()?;
         let local = NodeId(policy.leader);
         let mut destinations = Vec::new();
         let cluster = self.distributed.cluster.as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "consumer-progress dispatch requires cluster")
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "consumer-progress dispatch requires cluster",
+            )
         })?;
         for replica in &policy.replicas {
             let id = NodeId(*replica);
             if id == local {
                 continue;
             }
-            if let Some(member) = cluster.get_node(id).filter(|member| {
-                matches!(member.status, NodeStatus::Healthy | NodeStatus::Joining)
-            }) {
+            if let Some(member) = cluster
+                .get_node(id)
+                .filter(|member| matches!(member.status, NodeStatus::Healthy | NodeStatus::Joining))
+            {
                 destinations.push((id, member.address));
             }
         }
         let transport = self.distributed.transport.as_mut().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "consumer-progress dispatch requires transport")
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "consumer-progress dispatch requires transport",
+            )
         })?;
         for (target, address) in &destinations {
-            transport.send(*target, *address, Packet::ActorMessage {
-                target_actor: 0,
-                behavior_name: FABRIC_CONSUMER_PROGRESS_PREPARE_BEHAVIOR.to_string(),
-                content_hash: None,
-                required_protocol_id: None,
-                payload: Vec::new(),
-                string_table: Vec::new(),
-                object_table: vec![(0, bytes.clone())],
-                sender_actor: 0,
-                sender_node: local,
-                priority: MessagePriority::System,
-                trace_id: None,
-            });
+            transport.send(
+                *target,
+                *address,
+                Packet::ActorMessage {
+                    target_actor: 0,
+                    behavior_name: FABRIC_CONSUMER_PROGRESS_PREPARE_BEHAVIOR.to_string(),
+                    content_hash: None,
+                    required_protocol_id: None,
+                    payload: Vec::new(),
+                    string_table: Vec::new(),
+                    object_table: vec![(0, bytes.clone())],
+                    sender_actor: 0,
+                    sender_node: local,
+                    priority: MessagePriority::System,
+                    trace_id: None,
+                },
+            );
         }
         Ok(destinations.len())
     }
@@ -1123,7 +1207,10 @@ impl Runtime {
         }
         let installed = self.consumer_progress_installed_policy(&wire.change.stream)?;
         let local = self.distributed.node_id.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "consumer-progress follower requires distribution")
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "consumer-progress follower requires distribution",
+            )
         })?;
         if from.0 != wire.policy.leader
             || wire.policy != installed
@@ -1145,7 +1232,9 @@ impl Runtime {
         let path = self.consumer_progress_directory(&wire.change.stream)?;
         let mut journal = FileFabricConsumerProgressJournal::open(path)?;
         journal.prepare(
-            wire.change.clone(), wire.policy.clone(), wire.stream_committed_through,
+            wire.change.clone(),
+            wire.policy.clone(),
+            wire.stream_committed_through,
         )?;
         Ok(FabricConsumerProgressAckWire {
             version: JOURNAL_FORMAT_VERSION,
@@ -1173,7 +1262,8 @@ impl Runtime {
             || receipt.epoch != policy.epoch
         {
             return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied, "unauthorized consumer-progress replica receipt",
+                io::ErrorKind::PermissionDenied,
+                "unauthorized consumer-progress replica receipt",
             ));
         }
         let path = self.consumer_progress_directory(&receipt.stream)?;
@@ -1185,13 +1275,11 @@ impl Runtime {
             || receipt.partition != change.partition
             || pending_policy != &policy
         {
-            return Err(invalid("consumer-progress replica receipt does not match pending metadata"));
+            return Err(invalid(
+                "consumer-progress replica receipt does not match pending metadata",
+            ));
         }
-        let wire = FabricConsumerProgressPrepareWire::new(
-            change.clone(),
-            policy,
-            stage_bound,
-        )?;
+        let wire = FabricConsumerProgressPrepareWire::new(change.clone(), policy, stage_bound)?;
         if receipt.digest != wire.digest {
             return Err(invalid("consumer-progress replica receipt digest mismatch"));
         }
@@ -1210,15 +1298,15 @@ impl Runtime {
         let policy = self.consumer_progress_validate_leader(stream)?;
         let path = self.consumer_progress_directory(stream)?;
         let journal = FileFabricConsumerProgressJournal::open(path)?;
-        let (change, _, stage_bound) = journal.pending_change().ok_or_else(|| {
-            invalid("consumer-progress votes requested without pending prepare")
-        })?;
+        let (change, _, stage_bound) = journal
+            .pending_change()
+            .ok_or_else(|| invalid("consumer-progress votes requested without pending prepare"))?;
         if change.partition != partition || change.metadata_sequence != metadata_sequence {
-            return Err(invalid("consumer-progress vote query mismatched pending proposal"));
+            return Err(invalid(
+                "consumer-progress vote query mismatched pending proposal",
+            ));
         }
-        let _wire = FabricConsumerProgressPrepareWire::new(
-            change.clone(), policy, stage_bound,
-        )?;
+        let _wire = FabricConsumerProgressPrepareWire::new(change.clone(), policy, stage_bound)?;
         Ok(journal.verified_voters().into_iter().map(NodeId).collect())
     }
 
@@ -1240,7 +1328,9 @@ impl Runtime {
             || change.partition != partition
             || installed != &policy
         {
-            return Err(invalid("consumer-progress commit differs from installed policy"));
+            return Err(invalid(
+                "consumer-progress commit differs from installed policy",
+            ));
         }
         journal.commit_observed_quorum(metadata_sequence)?;
         let last = journal.last_commit().ok_or_else(|| {
@@ -1259,9 +1349,9 @@ impl Runtime {
         let _policy = self.consumer_progress_validate_leader(stream)?;
         let path = self.consumer_progress_directory(stream)?;
         let journal = FileFabricConsumerProgressJournal::open(path)?;
-        let last = journal.last_commit().ok_or_else(|| {
-            invalid("no consumer-progress committed decision to redrive")
-        })?;
+        let last = journal
+            .last_commit()
+            .ok_or_else(|| invalid("no consumer-progress committed decision to redrive"))?;
         let wire = FabricConsumerProgressCommitWire::from_committed(last);
         self.consumer_progress_dispatch_commit(&wire)
     }
@@ -1277,35 +1367,48 @@ impl Runtime {
         let bytes = wire.to_wire_bytes()?;
         let local = NodeId(policy.leader);
         let cluster = self.distributed.cluster.as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "consumer-progress commit requires cluster")
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "consumer-progress commit requires cluster",
+            )
         })?;
-        let targets: Vec<(NodeId, std::net::SocketAddr)> = policy.replicas.iter()
+        let targets: Vec<(NodeId, std::net::SocketAddr)> = policy
+            .replicas
+            .iter()
             .copied()
             .map(NodeId)
             .filter(|replica| *replica != local)
             .filter_map(|replica| {
-                cluster.get_node(replica)
+                cluster
+                    .get_node(replica)
                     .filter(|node| matches!(node.status, NodeStatus::Healthy | NodeStatus::Joining))
                     .map(|node| (replica, node.address))
             })
             .collect();
         let transport = self.distributed.transport.as_mut().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "consumer-progress commit requires transport")
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "consumer-progress commit requires transport",
+            )
         })?;
         for (target, address) in &targets {
-            transport.send(*target, *address, Packet::ActorMessage {
-                target_actor: 0,
-                behavior_name: FABRIC_CONSUMER_PROGRESS_COMMIT_BEHAVIOR.to_string(),
-                content_hash: None,
-                required_protocol_id: None,
-                payload: Vec::new(),
-                string_table: Vec::new(),
-                object_table: vec![(0, bytes.clone())],
-                sender_actor: 0,
-                sender_node: local,
-                priority: MessagePriority::System,
-                trace_id: None,
-            });
+            transport.send(
+                *target,
+                *address,
+                Packet::ActorMessage {
+                    target_actor: 0,
+                    behavior_name: FABRIC_CONSUMER_PROGRESS_COMMIT_BEHAVIOR.to_string(),
+                    content_hash: None,
+                    required_protocol_id: None,
+                    payload: Vec::new(),
+                    string_table: Vec::new(),
+                    object_table: vec![(0, bytes.clone())],
+                    sender_actor: 0,
+                    sender_node: local,
+                    priority: MessagePriority::System,
+                    trace_id: None,
+                },
+            );
         }
         Ok(targets.len())
     }
@@ -1320,7 +1423,10 @@ impl Runtime {
         wire.validate_shape()?;
         let policy = self.consumer_progress_installed_policy(&wire.stream)?;
         let local = self.distributed.node_id.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "consumer-progress follower needs distribution")
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "consumer-progress follower needs distribution",
+            )
         })?;
         if from.0 != policy.leader
             || wire.leader != policy.leader
@@ -1370,7 +1476,9 @@ impl Runtime {
         }
         let path = self.consumer_progress_directory(&receipt.stream)?;
         let mut journal = FileFabricConsumerProgressJournal::open(path)?;
-        let exact = journal.committed_history.get(&receipt.metadata_sequence)
+        let exact = journal
+            .committed_history
+            .get(&receipt.metadata_sequence)
             .ok_or_else(|| invalid("commit-fsync receipt has no local durable commit"))?;
         if exact.change.stream != receipt.stream
             || exact.change.partition != receipt.partition
@@ -1378,11 +1486,11 @@ impl Runtime {
             || exact.policy != policy
             || exact.digest != receipt.digest
         {
-            return Err(invalid("commit-fsync receipt does not match durable decision"));
+            return Err(invalid(
+                "commit-fsync receipt does not match durable decision",
+            ));
         }
-        journal.record_commit_receipt(
-            receipt.metadata_sequence, from.0, &receipt.digest
-        )
+        journal.record_commit_receipt(receipt.metadata_sequence, from.0, &receipt.digest)
     }
 
     /// Local leader's persisted contiguous follower-confirmed frontier.
@@ -1392,9 +1500,8 @@ impl Runtime {
         stream: &str,
     ) -> io::Result<u64> {
         self.consumer_progress_validate_leader(stream)?;
-        let journal = FileFabricConsumerProgressJournal::open(
-            self.consumer_progress_directory(stream)?
-        )?;
+        let journal =
+            FileFabricConsumerProgressJournal::open(self.consumer_progress_directory(stream)?)?;
         Ok(journal.confirmed_commit_sequence())
     }
 
@@ -1415,11 +1522,13 @@ impl Runtime {
                 "invalid consumer-progress metadata catch-up destination",
             ));
         }
-        let journal = FileFabricConsumerProgressJournal::open(
-            self.consumer_progress_directory(stream)?
-        )?;
+        let journal =
+            FileFabricConsumerProgressJournal::open(self.consumer_progress_directory(stream)?)?;
         let updates = journal.committed_updates_from(start_sequence, limit)?;
-        let Some(address) = self.distributed.cluster.as_ref()
+        let Some(address) = self
+            .distributed
+            .cluster
+            .as_ref()
             .and_then(|cluster| cluster.get_node(target))
             .filter(|member| matches!(member.status, NodeStatus::Healthy | NodeStatus::Joining))
             .map(|member| member.address)
@@ -1430,28 +1539,33 @@ impl Runtime {
             ));
         };
         let transport = self.distributed.transport.as_mut().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "metadata catch-up needs transport")
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "metadata catch-up needs transport",
+            )
         })?;
         for update in &updates {
-            transport.send(target, address, Packet::ActorMessage {
-                target_actor: 0,
-                behavior_name: FABRIC_CONSUMER_PROGRESS_COMMIT_BEHAVIOR.to_string(),
-                content_hash: None,
-                required_protocol_id: None,
-                payload: Vec::new(),
-                string_table: Vec::new(),
-                object_table: vec![(0, update.to_wire_bytes()?)],
-                sender_actor: 0,
-                sender_node: NodeId(policy.leader),
-                priority: MessagePriority::System,
-                trace_id: None,
-            });
+            transport.send(
+                target,
+                address,
+                Packet::ActorMessage {
+                    target_actor: 0,
+                    behavior_name: FABRIC_CONSUMER_PROGRESS_COMMIT_BEHAVIOR.to_string(),
+                    content_hash: None,
+                    required_protocol_id: None,
+                    payload: Vec::new(),
+                    string_table: Vec::new(),
+                    object_table: vec![(0, update.to_wire_bytes()?)],
+                    sender_actor: 0,
+                    sender_node: NodeId(policy.leader),
+                    priority: MessagePriority::System,
+                    trace_id: None,
+                },
+            );
         }
         Ok(updates.len())
     }
 }
-
-
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FabricConsumerRecoveryWitness {
@@ -1471,11 +1585,11 @@ pub(crate) struct FabricConsumerRecoveredSnapshot {
 }
 
 impl FabricConsumerRecoveredSnapshot {
-    pub(crate) fn committed_cursor(
-        &self, stream: &str, partition: u16, consumer: &str,
-    ) -> u64 {
-        self.cursors.get(&(stream.to_string(), partition, consumer.to_string()))
-            .map(|entry| entry.committed_cursor).unwrap_or(0)
+    pub(crate) fn committed_cursor(&self, stream: &str, partition: u16, consumer: &str) -> u64 {
+        self.cursors
+            .get(&(stream.to_string(), partition, consumer.to_string()))
+            .map(|entry| entry.committed_cursor)
+            .unwrap_or(0)
     }
 }
 
@@ -1496,7 +1610,9 @@ pub(crate) fn validate_complete_old_policy_recovery(
 ) -> io::Result<FabricConsumerRecoveredSnapshot> {
     old_policy.validate()?;
     if witnesses.len() != old_policy.replicas.len() {
-        return Err(invalid("every old-policy replica must submit recovery evidence"));
+        return Err(invalid(
+            "every old-policy replica must submit recovery evidence",
+        ));
     }
     let mut seen = BTreeSet::new();
     let mut common: Option<FabricConsumerRecoveredSnapshot> = None;
@@ -1506,14 +1622,22 @@ pub(crate) fn validate_complete_old_policy_recovery(
             || !seen.insert(witness.replica)
             || witness.pending_sequence.is_some()
         {
-            return Err(invalid("missing, duplicate, foreign, or unresolved recovery witness"));
+            return Err(invalid(
+                "missing, duplicate, foreign, or unresolved recovery witness",
+            ));
         }
         if witness.history.len() as u64 != witness.committed_sequence
-            || witness.history.iter().enumerate().any(|(index, (sequence, digest))| {
-                *sequence != (index as u64 + 1) || digest.len() != 64
-            })
+            || witness
+                .history
+                .iter()
+                .enumerate()
+                .any(|(index, (sequence, digest))| {
+                    *sequence != (index as u64 + 1) || digest.len() != 64
+                })
         {
-            return Err(invalid("recovery witness has a missing or invalid metadata predecessor"));
+            return Err(invalid(
+                "recovery witness has a missing or invalid metadata predecessor",
+            ));
         }
         let candidate = FabricConsumerRecoveredSnapshot {
             committed_sequence: witness.committed_sequence,
@@ -1522,7 +1646,9 @@ pub(crate) fn validate_complete_old_policy_recovery(
         };
         if let Some(previous) = &common {
             if previous != &candidate {
-                return Err(invalid("old-policy replicas disagree on committed consumer metadata"));
+                return Err(invalid(
+                    "old-policy replicas disagree on committed consumer metadata",
+                ));
             }
         } else {
             common = Some(candidate);
@@ -1533,7 +1659,6 @@ pub(crate) fn validate_complete_old_policy_recovery(
     }
     common.ok_or_else(|| invalid("no old-policy consumer metadata recovery evidence"))
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1600,7 +1725,9 @@ mod tests {
     fn quorum_certificate_cannot_use_nonmembers_or_skip_leader() {
         let root = temp_root("certificate");
         let mut journal = FileFabricConsumerProgressJournal::open(&root).unwrap();
-        journal.prepare(change(1, 0, 1), policy(vec![10, 11, 12]), 1).unwrap();
+        journal
+            .prepare(change(1, 0, 1), policy(vec![10, 11, 12]), 1)
+            .unwrap();
         for invalid in [&[11, 12][..], &[10, 99][..], &[10][..], &[10, 10][..]] {
             assert!(journal.commit_with_acknowledgers(1, invalid).is_err());
             assert_eq!(journal.committed_cursor("orders", 0, "billing"), 0);
@@ -1670,9 +1797,15 @@ mod tests {
         let mut bad_epoch = change(1, 0, 1);
         bad_epoch.epoch = 2;
         assert!(journal.prepare(bad_epoch, policy(vec![10, 11]), 1).is_err());
-        assert!(journal.prepare(change(1, 0, 1), policy(vec![10, 10]), 1).is_err());
-        assert!(journal.prepare(change(1, 0, 1), policy(vec![11, 12]), 1).is_err());
-        assert!(journal.prepare(change(1, 0, 2), policy(vec![10, 11]), 1).is_err());
+        assert!(journal
+            .prepare(change(1, 0, 1), policy(vec![10, 10]), 1)
+            .is_err());
+        assert!(journal
+            .prepare(change(1, 0, 1), policy(vec![11, 12]), 1)
+            .is_err());
+        assert!(journal
+            .prepare(change(1, 0, 2), policy(vec![10, 11]), 1)
+            .is_err());
         assert_eq!(journal.pending_sequence(), None);
         let _ = fs::remove_dir_all(root);
     }
@@ -1695,7 +1828,6 @@ mod tests {
         assert!(FileFabricConsumerProgressJournal::open(&root).is_err());
         let _ = fs::remove_dir_all(root);
     }
-
 
     #[test]
     fn committed_ack_gaps_and_pending_proposals_survive_reopen() {
@@ -1726,7 +1858,9 @@ mod tests {
     fn policy_change_is_rejected_without_explicit_epoch_recovery() {
         let root = temp_root("policy");
         let mut journal = FileFabricConsumerProgressJournal::open(&root).unwrap();
-        journal.prepare(change(1, 0, 1), policy(vec![10, 11]), 1).unwrap();
+        journal
+            .prepare(change(1, 0, 1), policy(vec![10, 11]), 1)
+            .unwrap();
         journal.commit_with_acknowledgers(1, &[10, 11]).unwrap();
 
         let mut next = change(2, 1, 2);
@@ -1755,11 +1889,15 @@ mod tests {
 
         let mut different_partition = change(2, 1, 2);
         different_partition.partition = 1;
-        assert!(journal.prepare(different_partition, group.clone(), 2).is_err());
+        assert!(journal
+            .prepare(different_partition, group.clone(), 2)
+            .is_err());
 
         let mut same_partition_other_consumer = change(2, 1, 1);
         same_partition_other_consumer.consumer = "analytics".to_string();
-        journal.prepare(same_partition_other_consumer, group, 2).unwrap();
+        journal
+            .prepare(same_partition_other_consumer, group, 2)
+            .unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1767,7 +1905,9 @@ mod tests {
     fn two_replica_metadata_requires_both_durable_votes() {
         let root = temp_root("rf2");
         let mut journal = FileFabricConsumerProgressJournal::open(&root).unwrap();
-        journal.prepare(change(1, 0, 1), policy(vec![10, 11]), 1).unwrap();
+        journal
+            .prepare(change(1, 0, 1), policy(vec![10, 11]), 1)
+            .unwrap();
         assert!(journal.commit_with_acknowledgers(1, &[10]).is_err());
         assert_eq!(journal.committed_cursor("orders", 0, "billing"), 0);
         journal.commit_with_acknowledgers(1, &[10, 11]).unwrap();
@@ -1776,27 +1916,33 @@ mod tests {
     }
     #[test]
     fn follower_prepare_fsync_ack_is_observed_but_not_committed() {
-        use std::collections::{HashMap, HashSet};
-        use std::net::SocketAddr;
-        use std::sync::Arc;
         use crate::runtime::{
             DeterministicNetworkTransport, FabricStreamConfig, IncomingPacket, NodeId,
             OutgoingPacket, Runtime,
         };
+        use std::collections::{HashMap, HashSet};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
 
-        type Bus = Arc<parking_lot::Mutex<HashMap<
-            NodeId,
-            (
-                std::sync::mpsc::SyncSender<IncomingPacket>,
-                std::sync::mpsc::SyncSender<OutgoingPacket>,
-            ),
-        >>>;
+        type Bus = Arc<
+            parking_lot::Mutex<
+                HashMap<
+                    NodeId,
+                    (
+                        std::sync::mpsc::SyncSender<IncomingPacket>,
+                        std::sync::mpsc::SyncSender<OutgoingPacket>,
+                    ),
+                >,
+            >,
+        >;
         fn node(addr: SocketAddr, bus: Bus) -> Runtime {
             let mut runtime = Runtime::new();
             runtime.install_virtual_clock();
             let transport = DeterministicNetworkTransport::bind_with_bus(addr, bus).unwrap();
             transport.register_on_bus();
-            runtime.enable_distribution_with_transport(Box::new(transport)).unwrap();
+            runtime
+                .enable_distribution_with_transport(Box::new(transport))
+                .unwrap();
             runtime
         }
         let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
@@ -1806,8 +1952,16 @@ mod tests {
         let b_id = NodeId::new(&b_addr);
         let mut a = node(a_addr, bus.clone());
         let mut b = node(b_addr, bus);
-        a.distributed.cluster.as_mut().unwrap().handle_heartbeat(b_id, b_addr);
-        b.distributed.cluster.as_mut().unwrap().handle_heartbeat(a_id, a_addr);
+        a.distributed
+            .cluster
+            .as_mut()
+            .unwrap()
+            .handle_heartbeat(b_id, b_addr);
+        b.distributed
+            .cluster
+            .as_mut()
+            .unwrap()
+            .handle_heartbeat(a_id, a_addr);
         let placement = a.fabric_stream_placement("orders", 0, 2).unwrap();
         let a_root = temp_root("network-a");
         let b_root = temp_root("network-b");
@@ -1819,13 +1973,23 @@ mod tests {
             (&mut b, &mut a, &b_root, &a_root)
         };
 
-        leader.fabric_stream_create("orders", FabricStreamConfig::default()).unwrap();
-        leader.fabric_stream_replicated_append("orders", 0, 2, b"event").unwrap();
+        leader
+            .fabric_stream_create("orders", FabricStreamConfig::default())
+            .unwrap();
+        leader
+            .fabric_stream_replicated_append("orders", 0, 2, b"event")
+            .unwrap();
         follower.process_network();
         leader.process_network();
         follower.process_network();
-        assert_eq!(leader.fabric_stream_committed_sequence("orders").unwrap(), 1);
-        assert_eq!(follower.fabric_stream_committed_sequence("orders").unwrap(), 1);
+        assert_eq!(
+            leader.fabric_stream_committed_sequence("orders").unwrap(),
+            1
+        );
+        assert_eq!(
+            follower.fabric_stream_committed_sequence("orders").unwrap(),
+            1
+        );
 
         let change = FabricConsumerProgressChange {
             stream: "orders".into(),
@@ -1843,43 +2007,70 @@ mod tests {
         assert!(leader.fabric_consumer_progress_stage(nonphysical).is_err());
         leader.fabric_consumer_progress_stage(change).unwrap();
         assert_eq!(
-            leader.fabric_consumer_progress_observed_votes("orders", 0, 1).unwrap().len(), 1
+            leader
+                .fabric_consumer_progress_observed_votes("orders", 0, 1)
+                .unwrap()
+                .len(),
+            1
         );
         let installed = leader.consumer_progress_installed_policy("orders").unwrap();
         let wire = FabricConsumerProgressPrepareWire::new(
             FileFabricConsumerProgressJournal::open(
-                leader_root.join("orders").join("consumer_progress")
-            ).unwrap().pending_change().unwrap().0.clone(),
+                leader_root.join("orders").join("consumer_progress"),
+            )
+            .unwrap()
+            .pending_change()
+            .unwrap()
+            .0
+            .clone(),
             installed,
             1,
-        ).unwrap();
+        )
+        .unwrap();
         let follower_id = if placement.leader == a_id { b_id } else { a_id };
-        assert!(follower.fabric_consumer_progress_apply_prepare_from_peer(
-            &wire, follower_id,
-        ).is_err());
-        assert!(follower.fabric_consumer_progress_apply_prepare_from_peer(
-            &wire, NodeId(999_999),
-        ).is_err());
+        assert!(follower
+            .fabric_consumer_progress_apply_prepare_from_peer(&wire, follower_id,)
+            .is_err());
+        assert!(follower
+            .fabric_consumer_progress_apply_prepare_from_peer(&wire, NodeId(999_999),)
+            .is_err());
 
         // A transport partition can still enqueue a send, but it must not
         // create an application fsync receipt or committed consumer cursor.
-        leader.distributed.transport.as_mut().unwrap()
+        leader
+            .distributed
+            .transport
+            .as_mut()
+            .unwrap()
             .set_partition(HashSet::from([follower_id]));
         assert_eq!(
-            leader.fabric_consumer_progress_dispatch_prepare("orders", 0, 1).unwrap(),
+            leader
+                .fabric_consumer_progress_dispatch_prepare("orders", 0, 1)
+                .unwrap(),
             1
         );
         follower.process_network();
         leader.process_network();
         assert_eq!(
-            leader.fabric_consumer_progress_observed_votes("orders", 0, 1).unwrap().len(),
+            leader
+                .fabric_consumer_progress_observed_votes("orders", 0, 1)
+                .unwrap()
+                .len(),
             1
         );
-        assert!(leader.fabric_consumer_progress_commit_observed("orders", 0, 1).is_err());
-        leader.distributed.transport.as_mut().unwrap()
+        assert!(leader
+            .fabric_consumer_progress_commit_observed("orders", 0, 1)
+            .is_err());
+        leader
+            .distributed
+            .transport
+            .as_mut()
+            .unwrap()
             .set_partition(HashSet::new());
         assert_eq!(
-            leader.fabric_consumer_progress_dispatch_prepare("orders", 0, 1).unwrap(),
+            leader
+                .fabric_consumer_progress_dispatch_prepare("orders", 0, 1)
+                .unwrap(),
             1
         );
         follower.process_network();
@@ -1887,15 +2078,18 @@ mod tests {
         // if only the subsequent vote assertion fails, investigate return
         // transport, identity binding, or leader receipt fsync instead.
         let follower_prepared = FileFabricConsumerProgressJournal::open(
-            follower_root.join("orders").join("consumer_progress")
-        ).unwrap();
+            follower_root.join("orders").join("consumer_progress"),
+        )
+        .unwrap();
         assert_eq!(
             follower_prepared.pending_sequence(),
             Some(1),
             "follower did not durably accept retransmitted consumer metadata prepare",
         );
         leader.process_network();
-        let observed = leader.fabric_consumer_progress_observed_votes("orders", 0, 1).unwrap();
+        let observed = leader
+            .fabric_consumer_progress_observed_votes("orders", 0, 1)
+            .unwrap();
         assert_eq!(observed.len(), 2);
         assert!(observed.contains(&placement.leader));
         assert!(observed.contains(&follower_id));
@@ -1913,11 +2107,13 @@ mod tests {
             .is_err());
 
         let local = FileFabricConsumerProgressJournal::open(
-            leader_root.join("orders").join("consumer_progress")
-        ).unwrap();
+            leader_root.join("orders").join("consumer_progress"),
+        )
+        .unwrap();
         let remote = FileFabricConsumerProgressJournal::open(
-            follower_root.join("orders").join("consumer_progress")
-        ).unwrap();
+            follower_root.join("orders").join("consumer_progress"),
+        )
+        .unwrap();
         assert_eq!(local.pending_sequence(), Some(1));
         assert_eq!(remote.pending_sequence(), Some(1));
         assert_eq!(local.pending_change().unwrap().2, 1);
@@ -1927,33 +2123,48 @@ mod tests {
 
         // A lost COMMIT propagation must leave the follower pending; the
         // leader's fsynced decision can be redriven after network recovery.
-        leader.distributed.transport.as_mut().unwrap()
+        leader
+            .distributed
+            .transport
+            .as_mut()
+            .unwrap()
             .set_partition(HashSet::from([follower_id]));
         assert_eq!(
-            leader.fabric_consumer_progress_commit_observed("orders", 0, 1).unwrap(),
+            leader
+                .fabric_consumer_progress_commit_observed("orders", 0, 1)
+                .unwrap(),
             1
         );
         follower.process_network();
         let leader_after = FileFabricConsumerProgressJournal::open(
-            leader_root.join("orders").join("consumer_progress")
-        ).unwrap();
+            leader_root.join("orders").join("consumer_progress"),
+        )
+        .unwrap();
         let follower_before_redrive = FileFabricConsumerProgressJournal::open(
-            follower_root.join("orders").join("consumer_progress")
-        ).unwrap();
+            follower_root.join("orders").join("consumer_progress"),
+        )
+        .unwrap();
         assert_eq!(leader_after.committed_cursor("orders", 0, "billing"), 1);
-        assert_eq!(follower_before_redrive.committed_cursor("orders", 0, "billing"), 0);
+        assert_eq!(
+            follower_before_redrive.committed_cursor("orders", 0, "billing"),
+            0
+        );
 
-        leader.distributed.transport.as_mut().unwrap()
+        leader
+            .distributed
+            .transport
+            .as_mut()
+            .unwrap()
             .set_partition(HashSet::new());
         let committed = FileFabricConsumerProgressJournal::open(
-            leader_root.join("orders").join("consumer_progress")
-        ).unwrap();
-        let exact_commit = FabricConsumerProgressCommitWire::from_committed(
-            committed.last_commit().unwrap()
-        );
-        assert!(follower.fabric_consumer_progress_apply_commit_from_peer(
-            &exact_commit, follower_id,
-        ).is_err());
+            leader_root.join("orders").join("consumer_progress"),
+        )
+        .unwrap();
+        let exact_commit =
+            FabricConsumerProgressCommitWire::from_committed(committed.last_commit().unwrap());
+        assert!(follower
+            .fabric_consumer_progress_apply_commit_from_peer(&exact_commit, follower_id,)
+            .is_err());
         let forged = FabricConsumerProgressCommitAckWire {
             version: JOURNAL_FORMAT_VERSION,
             stream: "orders".into(),
@@ -1964,47 +2175,64 @@ mod tests {
             digest: "e".repeat(64),
             replica: follower_id.0,
         };
-        assert!(leader.fabric_consumer_progress_record_commit_receipt(
-            &forged, follower_id,
-        ).is_err());
-        assert!(leader.fabric_consumer_progress_record_commit_receipt(
-            &forged, placement.leader,
-        ).is_err());
+        assert!(leader
+            .fabric_consumer_progress_record_commit_receipt(&forged, follower_id,)
+            .is_err());
+        assert!(leader
+            .fabric_consumer_progress_record_commit_receipt(&forged, placement.leader,)
+            .is_err());
 
         // Drop only the follower -> leader COMMIT-fsync receipt.
         // The follower has persisted the decision, but the leader cannot
         // advertise even its private confirmed frontier without the receipt.
-        follower.distributed.transport.as_mut().unwrap()
+        follower
+            .distributed
+            .transport
+            .as_mut()
+            .unwrap()
             .set_partition(HashSet::from([placement.leader]));
         assert_eq!(
-            leader.fabric_consumer_progress_redrive_last_commit("orders").unwrap(),
+            leader
+                .fabric_consumer_progress_redrive_last_commit("orders")
+                .unwrap(),
             1
         );
         follower.process_network();
         leader.process_network();
         assert_eq!(
-            leader.fabric_consumer_progress_confirmed_commit("orders").unwrap(),
+            leader
+                .fabric_consumer_progress_confirmed_commit("orders")
+                .unwrap(),
             0
         );
         // Exact duplicate COMMIT is idempotent and retries its fsync receipt.
-        follower.distributed.transport.as_mut().unwrap()
+        follower
+            .distributed
+            .transport
+            .as_mut()
+            .unwrap()
             .set_partition(HashSet::new());
         assert_eq!(
-            leader.fabric_consumer_progress_redrive_last_commit("orders").unwrap(),
+            leader
+                .fabric_consumer_progress_redrive_last_commit("orders")
+                .unwrap(),
             1
         );
         follower.process_network();
         leader.process_network();
         assert_eq!(
-            leader.fabric_consumer_progress_confirmed_commit("orders").unwrap(),
+            leader
+                .fabric_consumer_progress_confirmed_commit("orders")
+                .unwrap(),
             1
         );
-        assert!(follower.fabric_consumer_progress_apply_commit_from_peer(
-            &exact_commit, placement.leader,
-        ).is_ok());
+        assert!(follower
+            .fabric_consumer_progress_apply_commit_from_peer(&exact_commit, placement.leader,)
+            .is_ok());
         let follower_after = FileFabricConsumerProgressJournal::open(
-            follower_root.join("orders").join("consumer_progress")
-        ).unwrap();
+            follower_root.join("orders").join("consumer_progress"),
+        )
+        .unwrap();
         assert_eq!(follower_after.committed_cursor("orders", 0, "billing"), 1);
         assert_eq!(
             follower_after.last_committed_metadata_sequence(),
@@ -2013,53 +2241,75 @@ mod tests {
 
         // A second metadata update exercises bounded chronological replay.
         // Its follower PREPARE is fsynced but its COMMIT message gets lost.
-        leader.fabric_consumer_progress_stage(FabricConsumerProgressChange {
-            stream: "orders".into(),
-            partition: 0,
-            consumer: "billing".into(),
-            epoch: 1,
-            generation: 1,
-            metadata_sequence: 2,
-            previous_metadata_sequence: 1,
-            committed_cursor: 1,
-            acked_gaps: vec![],
-        }).unwrap();
+        leader
+            .fabric_consumer_progress_stage(FabricConsumerProgressChange {
+                stream: "orders".into(),
+                partition: 0,
+                consumer: "billing".into(),
+                epoch: 1,
+                generation: 1,
+                metadata_sequence: 2,
+                previous_metadata_sequence: 1,
+                committed_cursor: 1,
+                acked_gaps: vec![],
+            })
+            .unwrap();
         assert_eq!(
-            leader.fabric_consumer_progress_dispatch_prepare("orders", 0, 2).unwrap(),
+            leader
+                .fabric_consumer_progress_dispatch_prepare("orders", 0, 2)
+                .unwrap(),
             1
         );
         follower.process_network();
         leader.process_network();
-        leader.distributed.transport.as_mut().unwrap()
+        leader
+            .distributed
+            .transport
+            .as_mut()
+            .unwrap()
             .set_partition(HashSet::from([follower_id]));
         assert_eq!(
-            leader.fabric_consumer_progress_commit_observed("orders", 0, 2).unwrap(),
+            leader
+                .fabric_consumer_progress_commit_observed("orders", 0, 2)
+                .unwrap(),
             1
         );
         follower.process_network();
         assert_eq!(
-            leader.fabric_consumer_progress_confirmed_commit("orders").unwrap(),
+            leader
+                .fabric_consumer_progress_confirmed_commit("orders")
+                .unwrap(),
             1
         );
-        leader.distributed.transport.as_mut().unwrap()
+        leader
+            .distributed
+            .transport
+            .as_mut()
+            .unwrap()
             .set_partition(HashSet::new());
         assert_eq!(
-            leader.fabric_consumer_progress_redrive_from(
-                "orders", follower_id, 2, 1
-            ).unwrap(),
+            leader
+                .fabric_consumer_progress_redrive_from("orders", follower_id, 2, 1)
+                .unwrap(),
             1
         );
         follower.process_network();
         leader.process_network();
         assert_eq!(
-            leader.fabric_consumer_progress_confirmed_commit("orders").unwrap(),
+            leader
+                .fabric_consumer_progress_confirmed_commit("orders")
+                .unwrap(),
             2
         );
         let follower_caught_up = FileFabricConsumerProgressJournal::open(
-            follower_root.join("orders").join("consumer_progress")
-        ).unwrap();
+            follower_root.join("orders").join("consumer_progress"),
+        )
+        .unwrap();
         assert_eq!(follower_caught_up.last_committed_metadata_sequence(), 2);
-        assert_eq!(follower_caught_up.committed_cursor("orders", 0, "billing"), 1);
+        assert_eq!(
+            follower_caught_up.committed_cursor("orders", 0, "billing"),
+            1
+        );
         let _ = fs::remove_dir_all(a_root);
         let _ = fs::remove_dir_all(b_root);
     }
@@ -2072,9 +2322,9 @@ mod tests {
         let mut journal = FileFabricConsumerProgressJournal::open(&root).unwrap();
         journal.prepare(proposed, group, 1).unwrap();
         let (change, policy, boundary) = journal.pending_change().unwrap();
-        let staged = FabricConsumerProgressPrepareWire::new(
-            change.clone(), policy.clone(), boundary
-        ).unwrap();
+        let staged =
+            FabricConsumerProgressPrepareWire::new(change.clone(), policy.clone(), boundary)
+                .unwrap();
         let mut update = FabricConsumerProgressCommitWire {
             version: JOURNAL_FORMAT_VERSION,
             stream: "orders".into(),
@@ -2087,7 +2337,8 @@ mod tests {
         };
         assert!(FabricConsumerProgressCommitWire::from_wire_bytes(
             &update.to_wire_bytes().unwrap()
-        ).is_ok());
+        )
+        .is_ok());
         update.digest = "e".repeat(64);
         assert!(journal.verify_commit_update(&update).is_err());
         update.digest = staged.digest;
@@ -2108,8 +2359,7 @@ mod tests {
 
         let original =
             FabricConsumerProgressPrepareWire::new(proposal.clone(), group.clone(), 1).unwrap();
-        let altered =
-            FabricConsumerProgressPrepareWire::new(proposal, group, 2).unwrap();
+        let altered = FabricConsumerProgressPrepareWire::new(proposal, group, 2).unwrap();
         assert_ne!(original.digest, altered.digest);
         let _ = fs::remove_dir_all(root);
     }
@@ -2118,12 +2368,11 @@ mod tests {
     fn prepare_wire_rejects_tampering_and_unmatched_sender() {
         let change = change(1, 0, 1);
         let policy = policy(vec![10, 11]);
-        let mut wire = FabricConsumerProgressPrepareWire::new(
-            change, policy, 1
-        ).unwrap();
-        assert!(FabricConsumerProgressPrepareWire::from_wire_bytes(
-            &wire.to_wire_bytes().unwrap()
-        ).is_ok());
+        let mut wire = FabricConsumerProgressPrepareWire::new(change, policy, 1).unwrap();
+        assert!(
+            FabricConsumerProgressPrepareWire::from_wire_bytes(&wire.to_wire_bytes().unwrap())
+                .is_ok()
+        );
         wire.change.committed_cursor = 2;
         assert!(wire.verify().is_err());
     }
@@ -2133,9 +2382,8 @@ mod tests {
         let root = temp_root("persist-votes");
         let group = policy(vec![10, 11, 12]);
         let proposal = change(1, 0, 2);
-        let wire = FabricConsumerProgressPrepareWire::new(
-            proposal.clone(), group.clone(), 2,
-        ).unwrap();
+        let wire =
+            FabricConsumerProgressPrepareWire::new(proposal.clone(), group.clone(), 2).unwrap();
         {
             let mut journal = FileFabricConsumerProgressJournal::open(&root).unwrap();
             journal.prepare(proposal, group, 2).unwrap();
@@ -2166,9 +2414,8 @@ mod tests {
         let root = temp_root("receipt-tamper");
         let group = policy(vec![10, 11, 12]);
         let proposal = change(1, 0, 1);
-        let wire = FabricConsumerProgressPrepareWire::new(
-            proposal.clone(), group.clone(), 1,
-        ).unwrap();
+        let wire =
+            FabricConsumerProgressPrepareWire::new(proposal.clone(), group.clone(), 1).unwrap();
         let mut journal = FileFabricConsumerProgressJournal::open(&root).unwrap();
         journal.prepare(proposal, group, 1).unwrap();
         journal.record_verified_receipt(11, &wire.digest).unwrap();
@@ -2177,10 +2424,7 @@ mod tests {
         let path = root.join("consumer_progress.log");
         let contents = fs::read_to_string(&path).unwrap();
         assert!(contents.contains("\"replica\":11"));
-        fs::write(
-            &path,
-            contents.replace("\"replica\":11", "\"replica\":99"),
-        ).unwrap();
+        fs::write(&path, contents.replace("\"replica\":11", "\"replica\":99")).unwrap();
         assert!(FileFabricConsumerProgressJournal::open(&root).is_err());
         let _ = fs::remove_dir_all(root);
     }
@@ -2190,16 +2434,14 @@ mod tests {
         let root = temp_root("receipt-scope");
         let group = policy(vec![10, 11]);
         let proposed = change(1, 0, 1);
-        let wire = FabricConsumerProgressPrepareWire::new(
-            proposed.clone(), group.clone(), 1,
-        ).unwrap();
+        let wire =
+            FabricConsumerProgressPrepareWire::new(proposed.clone(), group.clone(), 1).unwrap();
         let mut journal = FileFabricConsumerProgressJournal::open(&root).unwrap();
         journal.prepare(proposed.clone(), group, 1).unwrap();
         let mut changed = proposed;
         changed.committed_cursor = 0;
-        let other = FabricConsumerProgressPrepareWire::new(
-            changed, policy(vec![10, 11]), 1,
-        ).unwrap();
+        let other =
+            FabricConsumerProgressPrepareWire::new(changed, policy(vec![10, 11]), 1).unwrap();
         assert_ne!(wire.digest, other.digest);
         assert!(journal.record_verified_receipt(11, &other.digest).is_err());
         assert!(journal.commit_observed_quorum(1).is_err());
@@ -2212,9 +2454,8 @@ mod tests {
         let root = temp_root("commit-confirmed");
         let group = policy(vec![10, 11, 12]);
         let proposal = change(1, 0, 2);
-        let wire = FabricConsumerProgressPrepareWire::new(
-            proposal.clone(), group.clone(), 2,
-        ).unwrap();
+        let wire =
+            FabricConsumerProgressPrepareWire::new(proposal.clone(), group.clone(), 2).unwrap();
         {
             let mut journal = FileFabricConsumerProgressJournal::open(&root).unwrap();
             journal.prepare(proposal, group, 2).unwrap();
@@ -2244,9 +2485,8 @@ mod tests {
         let mut journal = FileFabricConsumerProgressJournal::open(&root).unwrap();
         for seq in 1..=3 {
             let proposal = change(seq, seq - 1, seq);
-            let wire = FabricConsumerProgressPrepareWire::new(
-                proposal.clone(), group.clone(), seq,
-            ).unwrap();
+            let wire = FabricConsumerProgressPrepareWire::new(proposal.clone(), group.clone(), seq)
+                .unwrap();
             journal.prepare(proposal, group.clone(), seq).unwrap();
             journal.record_verified_receipt(11, &wire.digest).unwrap();
             journal.commit_observed_quorum(seq).unwrap();
@@ -2262,11 +2502,17 @@ mod tests {
         let one = journal.committed_updates_from(1, 1).unwrap();
         let two = journal.committed_updates_from(2, 1).unwrap();
         let three = journal.committed_updates_from(3, 1).unwrap();
-        journal.record_commit_receipt(2, 11, &two[0].digest).unwrap();
+        journal
+            .record_commit_receipt(2, 11, &two[0].digest)
+            .unwrap();
         assert_eq!(journal.confirmed_commit_sequence(), 0);
-        journal.record_commit_receipt(1, 11, &one[0].digest).unwrap();
+        journal
+            .record_commit_receipt(1, 11, &one[0].digest)
+            .unwrap();
         assert_eq!(journal.confirmed_commit_sequence(), 2);
-        journal.record_commit_receipt(3, 12, &three[0].digest).unwrap();
+        journal
+            .record_commit_receipt(3, 12, &three[0].digest)
+            .unwrap();
         assert_eq!(journal.confirmed_commit_sequence(), 3);
         let reopened = FileFabricConsumerProgressJournal::open(&root).unwrap();
         assert_eq!(reopened.confirmed_commit_sequence(), 3);
@@ -2288,7 +2534,8 @@ mod tests {
         };
         assert!(FabricConsumerProgressCommitAckWire::from_wire_bytes(
             &ack.to_wire_bytes().unwrap(),
-        ).is_ok());
+        )
+        .is_ok());
         let mut invalid = ack.clone();
         invalid.leader = 11;
         assert!(invalid.to_wire_bytes().is_err());
@@ -2339,7 +2586,9 @@ mod tests {
             let root = temp_root(&format!("recovery-conflict-{replica}"));
             let mut journal = FileFabricConsumerProgressJournal::open(&root).unwrap();
             let cursor = if *replica == 10 { 1 } else { 2 };
-            journal.prepare(change(1, 0, cursor), group.clone(), 2).unwrap();
+            journal
+                .prepare(change(1, 0, cursor), group.clone(), 2)
+                .unwrap();
             journal.commit_with_acknowledgers(1, &[10, 11]).unwrap();
             reports.push(journal.recovery_witness(*replica, &group).unwrap());
             roots.push(root);
@@ -2355,5 +2604,4 @@ mod tests {
             let _ = fs::remove_dir_all(root);
         }
     }
-
 }
