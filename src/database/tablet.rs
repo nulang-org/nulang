@@ -251,6 +251,13 @@ pub(crate) struct VersionedValue {
     pub(crate) value: Option<Vec<u8>>,
 }
 
+/// Find the newest version visible at a snapshot in O(log n) comparisons.
+/// Committed per-key histories are stored in ascending sequence order.
+fn visible_version_at(versions: &[VersionedValue], snapshot: u64) -> Option<&VersionedValue> {
+    let first_newer = versions.partition_point(|version| version.sequence <= snapshot);
+    first_newer.checked_sub(1).and_then(|index| versions.get(index))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct TabletSnapshotRow {
     pub(crate) key: Vec<u8>,
@@ -498,11 +505,7 @@ impl MemoryTablet {
         }
 
         Ok(self.rows.get(key).and_then(|versions| {
-            versions
-                .iter()
-                .rev()
-                .find(|version| version.sequence <= snapshot)
-                .and_then(|version| version.value.as_deref())
+            visible_version_at(versions, snapshot).and_then(|version| version.value.as_deref())
         }))
     }
 
