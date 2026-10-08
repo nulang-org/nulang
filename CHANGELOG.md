@@ -1,4 +1,12 @@
 # Nulang Changelog
+### Stateless actor framework comparator — 2026-10-08
+- **A standalone Ractor 0.16.5 fixture now implements the same counting, ping-pong, ring, and fork-join message workloads used by the Nulang Savina harness.** The external Rust actor framework is built separately and classified distinctly from the Go/Rust primitive baselines.
+- **The cross-runtime runner fails closed on missing, duplicate, zero-duration, or incorrect-message-count measurements.** JSON schema 3 records comparator families, and focused Python ingestion tests precede benchmark execution in CI.
+- **The comparator is single-worker only, matching the current one-shard Nulang harness.** No multicore actor scaling or performance ranking is claimed without matched sharded workloads and repeated measurements on controlled hardware.
+
+### Ractor actor-density diagnostic — 2026-10-08
+- **Nulang's existing actor-density probe can now be run against a Ractor `spawn_instant` companion on the same host.** Fresh-process measurements report actor publication cost and Linux RSS after startup settlement; results retain explicit lifecycle comparability caveats.
+- **The new Python density runner validates actor counts, elapsed time, and RSS availability before collecting medians.** A 1,000-actor Ractor smoke test and parser unit tests run in the cross-runtime workflow; external framework dependencies are locked in their isolated Cargo workspace.
 
 ### Seeded cluster simulation peer ordering — 2026-10-07
 - **Cluster simulations with an injected deterministic RNG now canonicalize peer order for gossip targets, bounded gossip payloads, active-view repair, and heartbeat action emission.** This removes four sources of randomized Rust `HashMap` ordering while preserving the existing unseeded production path. Regression tests compare independently constructed cluster states under identical RNG seeds.
