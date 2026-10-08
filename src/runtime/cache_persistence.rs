@@ -1201,6 +1201,71 @@ mod tests {
     }
 
     #[test]
+    fn failed_delete_journal_preserves_live_value() {
+        let wal_path = test_path("delete-before-wal");
+        let wal = CacheWal::create_after(&wal_path, 0).unwrap();
+        let mut store = CacheStore::new();
+        store.set_integer(b"k", 42, None, 0);
+        let mut durable =
+            DurableCacheStore::with_wal(store, wal, CacheDurabilityMode::SyncedJournal).unwrap();
+
+        let readonly = OpenOptions::new().read(true).open(&wal_path).unwrap();
+        durable.wal.as_mut().unwrap().file = readonly;
+        assert!(matches!(
+            durable.delete_at(b"k", 0),
+            Err(CacheDurabilityError::Persistence(_))
+        ));
+        assert!(durable.is_poisoned());
+        assert_eq!(
+            durable.store().snapshot_entries(0).len(),
+            1,
+            "failed journal must leave committed key in memory"
+        );
+        let _ = fs::remove_file(wal_path);
+    }
+
+    #[test]
+    fn failed_multidelete_journal_never_exposes_partial_batch() {
+        let wal_path = test_path("del-batch-before-wal");
+        let wal = CacheWal::create_after(&wal_path, 0).unwrap();
+        let mut store = CacheStore::new();
+        store.set_integer(b"a", 1, None, 0);
+        store.set_integer(b"b", 2, None, 0);
+        let mut durable =
+            DurableCacheStore::with_wal(store, wal, CacheDurabilityMode::SyncedJournal).unwrap();
+
+        let readonly = OpenOptions::new().read(true).open(&wal_path).unwrap();
+        durable.wal.as_mut().unwrap().file = readonly;
+        assert!(matches!(
+            durable.delete_many_at(&[b"a".as_slice(), b"b".as_slice(), b"a".as_slice()], 0),
+            Err(CacheDurabilityError::Persistence(_))
+        ));
+        assert_eq!(durable.store().snapshot_entries(0).len(), 2);
+        assert!(durable.is_poisoned());
+        let _ = fs::remove_file(wal_path);
+    }
+
+    #[test]
+    fn failed_expiry_journal_does_not_change_existing_ttl() {
+        let wal_path = test_path("expire-before-wal");
+        let wal = CacheWal::create_after(&wal_path, 0).unwrap();
+        let mut store = CacheStore::new();
+        store.set_integer(b"session", 9, None, 0);
+        let mut durable =
+            DurableCacheStore::with_wal(store, wal, CacheDurabilityMode::SyncedJournal).unwrap();
+
+        let readonly = OpenOptions::new().read(true).open(&wal_path).unwrap();
+        durable.wal.as_mut().unwrap().file = readonly;
+        assert!(matches!(
+            durable.expire_ms(b"session", 500, 0, 1_000),
+            Err(CacheDurabilityError::Persistence(_))
+        ));
+        assert_eq!(durable.store().snapshot_entries(0)[0].remaining_ttl_ms, None);
+        assert!(durable.is_poisoned());
+        let _ = fs::remove_file(wal_path);
+    }
+
+    #[test]
     fn batch_wal_round_trip_preserves_atomic_record_boundary() {
         let mutation = CacheWalMutation::Batch {
             mutations: vec![
