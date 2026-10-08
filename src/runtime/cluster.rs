@@ -2718,4 +2718,64 @@ mod tests {
             .any(|a| matches!(a, ClusterAction::NodeRemoved { .. })));
         assert!(!cs.is_removed(b));
     }
+
+    #[test]
+    fn test_seeded_gossip_peer_order_independent_of_hash_map_seed() {
+        fn seeded_cluster() -> ClusterState {
+            let local = addr(9600);
+            let mut cluster = ClusterState::new(NodeId::new(&local), local);
+            cluster.set_rng(Box::new(crate::dst::DeterministicRng::new(42)));
+            for port in 9601..=9624 {
+                let peer = addr(port);
+                cluster.handle_heartbeat(NodeId::new(&peer), peer);
+            }
+            cluster
+        }
+
+        // Two independently allocated HashMaps use different random hash
+        // seeds, but an explicitly seeded simulation must draw identical
+        // peers from an identical logical membership set.
+        let mut first = seeded_cluster();
+        let mut second = seeded_cluster();
+        assert_eq!(
+            first.pick_gossip_targets(24),
+            second.pick_gossip_targets(24),
+            "seeded gossip order must not depend on HashMap iteration"
+        );
+    }
+
+    #[test]
+    fn test_seeded_repair_peer_order_independent_of_hash_map_seed() {
+        fn seeded_cluster() -> ClusterState {
+            let local = addr(9630);
+            let mut cluster = ClusterState::new(NodeId::new(&local), local);
+            cluster.set_rng(Box::new(crate::dst::DeterministicRng::new(43)));
+            for port in 9631..=9642 {
+                cluster.join_cluster(addr(port));
+            }
+            cluster
+        }
+
+        let mut first = seeded_cluster();
+        let mut second = seeded_cluster();
+        first.tick();
+        second.tick();
+        assert_eq!(
+            first.passive_view(),
+            second.passive_view(),
+            "seeded repair must not inherit HashMap iteration order"
+        );
+        assert_eq!(
+            first
+                .probationary()
+                .iter()
+                .map(|(node, _)| *node)
+                .collect::<Vec<_>>(),
+            second
+                .probationary()
+                .iter()
+                .map(|(node, _)| *node)
+                .collect::<Vec<_>>()
+        );
+    }
 }
