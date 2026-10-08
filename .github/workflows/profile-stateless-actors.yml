@@ -1,0 +1,22 @@
+name: Stateless actor profiler contracts
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/profile_stateless_actors.py'
+      - 'tests/test_profile_stateless_actors.py'
+      - '.github/workflows/profile-stateless-actors.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    name: Validate profiler commands and sample integrity
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate profiling contract
+        run: python3 -m unittest discover -s tests -p test_profile_stateless_actors.py -v
