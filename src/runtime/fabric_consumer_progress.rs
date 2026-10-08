@@ -137,6 +137,11 @@ enum FabricConsumerProgressEvent {
         metadata_sequence: u64,
         acknowledgers: Vec<u64>,
     },
+    CommitReceipt {
+        metadata_sequence: u64,
+        replica: u64,
+        digest: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -211,6 +216,8 @@ pub(crate) struct FileFabricConsumerProgressJournal {
     pending: Option<PendingConsumerProgress>,
     verified_voters: BTreeSet<u64>,
     last_commit: Option<LastConsumerProgressCommit>,
+    committed_history: BTreeMap<u64, LastConsumerProgressCommit>,
+    commit_receipts: BTreeMap<u64, BTreeSet<u64>>,
     committed: BTreeMap<(String, u16, String), FabricConsumerProgressChange>,
     committed_policy: Option<FabricConsumerProgressPolicy>,
 }
@@ -228,6 +235,8 @@ impl FileFabricConsumerProgressJournal {
             pending: None,
             verified_voters: BTreeSet::new(),
             last_commit: None,
+            committed_history: BTreeMap::new(),
+            commit_receipts: BTreeMap::new(),
             committed: BTreeMap::new(),
             committed_policy: None,
         };
@@ -274,6 +283,42 @@ impl FileFabricConsumerProgressJournal {
 
     fn last_commit(&self) -> Option<&LastConsumerProgressCommit> {
         self.last_commit.as_ref()
+    }
+
+    /// Conservative contiguous prefix for which this same leader has
+    /// durably observed a follower majority persisting each COMMIT decision.
+    /// This is not a quorum-certified successor-readiness proof.
+    pub(crate) fn confirmed_commit_sequence(&self) -> u64 {
+        let mut frontier = 0;
+        for (sequence, committed) in &self.committed_history {
+            if *sequence != frontier + 1 {
+                break;
+            }
+            let votes = match self.commit_receipts.get(sequence) {
+                Some(votes) => votes,
+                None => break,
+            };
+            let actors: Vec<u64> = votes.iter().copied().collect();
+            if committed.policy.validate_quorum(&actors).is_err() {
+                break;
+            }
+            frontier = *sequence;
+        }
+        frontier
+    }
+
+    /// Bounded, exact commit decisions for strictly ordered follower catch-up.
+    pub(crate) fn committed_updates_from(
+        &self,
+        start_sequence: u64,
+        limit: usize,
+    ) -> io::Result<Vec<FabricConsumerProgressCommitWire>> {
+        if start_sequence == 0 || limit == 0 || limit > 256 {
+            return Err(invalid("invalid bounded consumer-progress commit replay request"));
+        }
+        Ok(self.committed_history.range(start_sequence..).take(limit)
+            .map(|(_, committed)| FabricConsumerProgressCommitWire::from_committed(committed))
+            .collect())
     }
 
     /// Recover the exact pending proposal for idempotent network retry.
@@ -411,16 +456,39 @@ impl FileFabricConsumerProgressJournal {
                 )?;
                 let pending = self.pending.take().expect("validated pending metadata");
                 self.latest_sequence = *metadata_sequence;
-                self.last_commit = Some(LastConsumerProgressCommit {
+                let committed = LastConsumerProgressCommit {
                     change: pending.change.clone(),
                     policy: pending.policy.clone(),
                     stream_committed_through: pending.stream_committed_through,
                     digest: exact.digest,
                     acknowledgers: acknowledgers.clone(),
-                });
+                };
+                self.last_commit = Some(committed.clone());
+                self.committed_history.insert(*metadata_sequence, committed);
+                self.commit_receipts.insert(
+                    *metadata_sequence, BTreeSet::from([pending.policy.leader]),
+                );
                 self.committed_policy = Some(pending.policy);
                 self.committed.insert(pending.change.key(), pending.change);
                 self.verified_voters.clear();
+            }
+            FabricConsumerProgressEvent::CommitReceipt {
+                metadata_sequence, replica, digest,
+            } => {
+                let decision = self.committed_history.get(metadata_sequence)
+                    .ok_or_else(|| invalid("commit receipt has no durable committed decision"))?;
+                if *replica == decision.policy.leader
+                    || !decision.policy.replicas.contains(replica)
+                    || *digest != decision.digest
+                {
+                    return Err(invalid("commit receipt origin or exact digest mismatch"));
+                }
+                let accepted = self.commit_receipts.get_mut(metadata_sequence)
+                    .ok_or_else(|| invalid("missing commit receipt ledger"))?
+                    .insert(*replica);
+                if !accepted {
+                    return Err(invalid("duplicate durable commit receipt"));
+                }
             }
         }
         Ok(())
@@ -561,6 +629,35 @@ impl FileFabricConsumerProgressJournal {
         let voters = self.verified_voters();
         pending.policy.validate_quorum(&voters)?;
         self.commit_with_acknowledgers(metadata_sequence, &voters)
+    }
+
+    /// Record a follower's separate COMMIT-fsync receipt after the existing
+    /// transport validated its sender and exact committed proposal digest.
+    pub(crate) fn record_commit_receipt(
+        &mut self,
+        metadata_sequence: u64,
+        replica: u64,
+        digest: &str,
+    ) -> io::Result<()> {
+        self.ensure_writable()?;
+        let committed = self.committed_history.get(&metadata_sequence)
+            .ok_or_else(|| invalid("no durable metadata commit for follower receipt"))?;
+        if replica == committed.policy.leader
+            || !committed.policy.replicas.contains(&replica)
+            || digest != committed.digest
+        {
+            return Err(invalid("untrusted commit receipt or conflicting digest"));
+        }
+        if self.commit_receipts.get(&metadata_sequence)
+            .is_some_and(|voters| voters.contains(&replica))
+        {
+            return Ok(());
+        }
+        self.append_event(FabricConsumerProgressEvent::CommitReceipt {
+            metadata_sequence,
+            replica,
+            digest: digest.to_string(),
+        })
     }
 
     /// Verify exact predecessor and policy against a locally fsynced prepare.
