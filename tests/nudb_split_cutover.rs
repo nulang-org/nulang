@@ -146,7 +146,7 @@ fn published_manifest_fails_closed_when_child_wal_is_truncated() {
             .unwrap();
     }
     // A fresh-child sequence of zero must not excuse a truncated WAL.
-    fs::write(root.join("right.wal"), []).unwrap();
+    fs::write(root.join("right.wal"), b"").unwrap();
     assert!(matches!(
         SingleNodeSplitStore::open(&root, parent()),
         Err(SplitError::InvalidManifest(_))
@@ -161,7 +161,7 @@ fn published_manifest_fails_closed_when_parent_wal_is_truncated() {
         let mut store = SingleNodeSplitStore::open(&root, parent()).unwrap();
         store.commit(put(b"b", b"persist")).unwrap();
     }
-    fs::write(root.join("parent.wal"), []).unwrap();
+    fs::write(root.join("parent.wal"), b"").unwrap();
     assert!(matches!(
         SingleNodeSplitStore::open(&root, parent()),
         Err(SplitError::InvalidManifest(_))
