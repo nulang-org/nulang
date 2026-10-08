@@ -6,6 +6,7 @@
 
 pub mod checkpoint;
 pub mod store;
+pub mod split;
 pub mod tablet;
 pub mod wal;
 
