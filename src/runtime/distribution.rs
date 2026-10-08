@@ -75,7 +75,7 @@ pub(crate) fn queue_spawn_message(
         }
     };
     let sender = rt.current_actor.unwrap_or(0);
-    let trace_id = rt.current_trace.as_ref().map(|t| t.to_traceparent());
+    let trace_id = rt.outgoing_traceparent();
     rt.pending_spawn_messages
         .entry(request_id)
         .or_default()
