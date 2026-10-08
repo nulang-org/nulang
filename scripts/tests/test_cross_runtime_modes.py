@@ -16,6 +16,26 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import cross_runtime_bench as harness
 
 
+class CommandDiagnosticsTests(unittest.TestCase):
+    def test_failed_cargo_command_surfaces_captured_compiler_output(self):
+        import subprocess
+        from contextlib import redirect_stderr
+        from io import StringIO
+
+        simulated = subprocess.CompletedProcess(
+            args=["cargo", "build"],
+            returncode=101,
+            stdout="error[E0308]: mismatched types in native backend\\n",
+            stderr=None,
+        )
+        errors = StringIO()
+        with mock.patch.object(harness.subprocess, "run", return_value=simulated):
+            with redirect_stderr(errors):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    harness.command_output(["cargo", "build"])
+        self.assertIn("error[E0308]", errors.getvalue())
+
+
 class NativeBackendBuildTests(unittest.TestCase):
     def test_bytecode_and_aot_builds_use_distinct_saved_binaries(self):
         outputs = []
