@@ -41,13 +41,23 @@ This runner compiles Nulang with `--locked --profile savina
 frame pointers. Consequently it profiles **bytecode actor execution** and
 scheduler/mailbox overhead, not JIT or AOT actor execution.
 
+For `ping_pong`, the profiler uses the new opt-in `--reuse-setup` mode:
+source compilation, runtime creation, actor spawn and wiring occur exactly
+once before repeated message rounds. The pong counter is checked against
+`20,000 × iteration` after every round to catch lost, duplicated, or
+incomplete actor-message execution. The cross-runtime benchmark runner
+**does not use this mode**, preserving its original semantics. Other
+workloads still reconstruct their fixtures on every iteration, so their CPU
+samples include repeated compilation and cannot be interpreted as runtime-
+only percentages.
+
 **Important limitations:**
 
-1. Linux perf statistically samples the entire process, including benchmark
-   setup and source compilation, not only the timed scheduler region. Use
-   sufficient repetitions to amortize setup; compare CPU symbols and flame
-   stacks qualitatively. Do not interpret sampled percentages as exact
-   fractions of the timed `run_scheduler` section.
+1. Linux perf statistically samples the entire process, including initial
+   setup and source compilation, not only the timed scheduler region. Ping-pong
+   compiles only once; use sufficient repetitions to amortize that setup.
+   Other workloads still compile on each round. Inspect CPU stacks
+   qualitatively, not as exact percentages of `run_scheduler`.
 2. Debug symbols, forced frame pointers, perf sampling and single-CPU affinity
    can change throughput. Never compare these profiler timings against normal
    optimized builds or use them in performance regression gates.
