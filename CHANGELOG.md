@@ -1,4 +1,10 @@
 # Nulang Changelog
+
+### Leased Fabric consumer quorum safety — 2026-10-08
+- **Replicated leased consumers can only deliver and ACK quorum-committed records.** Raw local-tail reads remain available for replication and diagnostics, while standalone streams preserve existing local cursor behavior.
+- **Persisted pre-policy leases cannot advance consumers before quorum, and legacy cursors above the durable committed index fail closed.** Two-node restart/quorum regression and store-level upgrade-state tests specify these boundaries.
+- **Integration with #1421 is required before promotion.** This fix is stacked on the open durable consumer ACK/NACK implementation (#1070) and should be reconciled with #1421 during rebase.
+
 ### Durable Fabric consumer ACK/NACK delivery — 2026-09-25
 - **Fabric Streams now persist per-consumer delivery leases and delivery attempts.** Unacknowledged records become eligible again after their ACK deadline, explicit NACK makes a lease immediately redeliverable, and restart preserves in-flight state.
 - **Out-of-order ACKs cannot skip durable work.** ACK gaps are persisted and the consumer cursor advances only across the longest contiguous acknowledged prefix; already-committed ACKs remain idempotent.

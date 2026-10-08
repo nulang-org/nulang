@@ -1083,7 +1083,10 @@ impl FileFabricStreamStore {
         Ok(())
     }
 
-    /// Read records after the consumer's last committed sequence.
+    /// Read records after the consumer's last acknowledged sequence.
+    ///
+    /// Replicated application consumers see only the quorum-committed prefix.
+    /// Raw local records are available separately through read_from.
     pub fn read_consumer(
         &mut self,
         name: &str,
@@ -1091,7 +1094,34 @@ impl FileFabricStreamStore {
         limit: usize,
     ) -> io::Result<Vec<FabricStreamRecord>> {
         let cursor = self.cursor(name, consumer)?;
-        self.read_from(name, cursor.saturating_add(1), limit)
+        if self.consumer_committed_boundary(name, cursor)?.is_some() {
+            self.read_committed(name, cursor.saturating_add(1), limit)
+        } else {
+            self.read_from(name, cursor.saturating_add(1), limit)
+        }
+    }
+
+    /// Returns the durable consumer bound for replicated streams, or None for
+    /// standalone streams. A legacy cursor past the committed index must fail
+    /// closed until the operator resolves the inconsistent persisted state.
+    fn consumer_committed_boundary(
+        &mut self,
+        name: &str,
+        cursor: u64,
+    ) -> io::Result<Option<u64>> {
+        if self.replication_policy(name)?.is_none() {
+            return Ok(None);
+        }
+        let committed = self.committed_sequence(name)?;
+        if cursor > committed {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Fabric consumer cursor {cursor} exceeds quorum-committed sequence {committed}"
+                ),
+            ));
+        }
+        Ok(Some(committed))
     }
 
     /// Deliver records under a durable acknowledgement lease.
@@ -1143,6 +1173,7 @@ impl FileFabricStreamStore {
         })?;
 
         let cursor = self.cursor(name, consumer)?;
+        let replicated = self.consumer_committed_boundary(name, cursor)?.is_some();
         let path = self.stream_dir(name).join("deliveries.json");
         let mut delivery_file = read_consumer_deliveries(&path)?;
         let state = delivery_file
@@ -1158,7 +1189,11 @@ impl FileFabricStreamStore {
         const SCAN_BATCH: usize = 256;
 
         while delivered.len() < limit {
-            let records = self.read_from(name, start, SCAN_BATCH)?;
+            let records = if replicated {
+                self.read_committed(name, start, SCAN_BATCH)?
+            } else {
+                self.read_from(name, start, SCAN_BATCH)?
+            };
             if records.is_empty() {
                 break;
             }
@@ -1225,20 +1260,27 @@ impl FileFabricStreamStore {
         validate_name("consumer", consumer)?;
         self.ensure_state(name)?;
         let cursor = self.cursor(name, consumer)?;
+        let committed = self.consumer_committed_boundary(name, cursor)?;
         if sequence <= cursor {
             return Ok(());
         }
 
-        let tail = self
-            .states
-            .get(name)
-            .and_then(|state| state.next_sequence.checked_sub(1))
-            .filter(|&seq| seq > 0)
-            .unwrap_or(0);
+        let tail = committed.unwrap_or_else(|| {
+            self.states
+                .get(name)
+                .and_then(|state| state.next_sequence.checked_sub(1))
+                .filter(|&seq| seq > 0)
+                .unwrap_or(0)
+        });
         if sequence > tail {
+            let bound = if committed.is_some() {
+                "quorum-committed sequence"
+            } else {
+                "stream tail"
+            };
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("Fabric ACK {sequence} is beyond stream tail {tail}"),
+                format!("Fabric ACK {sequence} is beyond {bound} {tail}"),
             ));
         }
 
@@ -1313,21 +1355,30 @@ impl FileFabricStreamStore {
 
     /// Persist a consumer's last fully processed sequence.
     ///
-    /// Cursors are monotonic. Committing beyond the stream tail or moving a
-    /// cursor backwards is rejected.
+    /// Replicated cursors cannot exceed the durable quorum-committed prefix.
+    /// Standalone streams preserve the existing local-tail bound.
     pub fn commit_cursor(&mut self, name: &str, consumer: &str, sequence: u64) -> io::Result<()> {
         validate_name("consumer", consumer)?;
         self.ensure_state(name)?;
-        let last_sequence = self
-            .states
-            .get(name)
-            .and_then(|state| state.next_sequence.checked_sub(1))
-            .filter(|&seq| seq > 0)
-            .unwrap_or(0);
+        let replicated = self.replication_policy(name)?.is_some();
+        let last_sequence = if replicated {
+            self.committed_sequence(name)?
+        } else {
+            self.states
+                .get(name)
+                .and_then(|state| state.next_sequence.checked_sub(1))
+                .filter(|&seq| seq > 0)
+                .unwrap_or(0)
+        };
         if sequence > last_sequence {
+            let bound = if replicated {
+                "quorum-committed sequence"
+            } else {
+                "stream tail"
+            };
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("Fabric cursor {sequence} is beyond stream tail {last_sequence}"),
+                format!("Fabric cursor {sequence} is beyond {bound} {last_sequence}"),
             ));
         }
 
@@ -2518,6 +2569,76 @@ mod tests {
             restarted.fabric_stream_append("audit", b"second").unwrap(),
             2
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn leased_record_from_before_replication_policy_cannot_be_acked_early() {
+        let root = test_dir("lease-before-replication");
+        let mut store = FileFabricStreamStore::open(&root).unwrap();
+        store
+            .create_stream("events", FabricStreamConfig::default())
+            .unwrap();
+        store.append("events", b"pending").unwrap();
+        let instant = std::time::UNIX_EPOCH + Duration::from_secs(100);
+        let leased = store
+            .deliver_consumer_at("events", "worker", 1, Duration::from_secs(30), instant)
+            .unwrap();
+        assert_eq!(leased.len(), 1);
+
+        // Upgrade to a replicated policy while an old local lease is persisted.
+        store
+            .establish_replication_policy(
+                "events",
+                FabricStreamReplicationPolicy {
+                    partition: 0,
+                    epoch: FABRIC_STREAM_INITIAL_EPOCH,
+                    leader: 10,
+                    membership_fingerprint: 44,
+                    replication_factor: 2,
+                    replicas: vec![10, 11],
+                },
+            )
+            .unwrap();
+        assert!(store.ack_consumer("events", "worker", 1).is_err());
+        assert_eq!(store.cursor("events", "worker").unwrap(), 0);
+
+        store.commit_through("events", 1).unwrap();
+        store.ack_consumer("events", "worker", 1).unwrap();
+        assert_eq!(store.cursor("events", "worker").unwrap(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn leased_consumer_rejects_legacy_cursor_above_quorum_index() {
+        let root = test_dir("legacy-cursor-above-quorum");
+        let mut store = FileFabricStreamStore::open(&root).unwrap();
+        store
+            .create_stream("events", FabricStreamConfig::default())
+            .unwrap();
+        store.append("events", b"pending").unwrap();
+        store.commit_cursor("events", "worker", 1).unwrap();
+        store
+            .establish_replication_policy(
+                "events",
+                FabricStreamReplicationPolicy {
+                    partition: 0,
+                    epoch: FABRIC_STREAM_INITIAL_EPOCH,
+                    leader: 10,
+                    membership_fingerprint: 44,
+                    replication_factor: 2,
+                    replicas: vec![10, 11],
+                },
+            )
+            .unwrap();
+
+        let instant = std::time::UNIX_EPOCH + Duration::from_secs(100);
+        assert!(store.read_consumer("events", "worker", 10).is_err());
+        assert!(store.deliver_consumer_at(
+            "events", "worker", 10, Duration::from_secs(30), instant
+        ).is_err());
+        assert!(store.ack_consumer("events", "worker", 1).is_err());
+        assert_eq!(store.cursor("events", "worker").unwrap(), 1);
         let _ = fs::remove_dir_all(root);
     }
 }

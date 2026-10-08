@@ -59,18 +59,28 @@ record larger than the target is allowed to occupy its own segment.
 ### Consumer cursors and replay
 
 A cursor is the last contiguous fully processed stream sequence for a named
-consumer. Cursor commits are monotonic and cannot advance beyond the current
-stream tail.
+consumer. Cursor commits are monotonic. On standalone streams without a
+replication policy they retain the local-tail bound.
 
-`read_consumer(stream, consumer, limit)` remains the raw replay API from
-`cursor + 1`.
+For streams with a durable replication policy, `read_consumer` and
+`deliver_consumer` expose only the **quorum-committed prefix** after
+`cursor + 1`, and both `commit_cursor` and `ack_consumer` reject progress
+beyond the committed boundary. The raw `fabric_stream_read` / `read_from`
+interfaces may still expose locally fsynced but uncommitted records for
+replication or diagnostics. A consumer cursor already beyond the durable
+committed index fails closed; it is not silently repaired.
 
 For acknowledged delivery, `deliver_consumer` creates durable per-record
-leases. An unacknowledged record is hidden until its ACK deadline expires; a
-NACK expires the lease immediately. Redelivery increments the attempt counter.
-ACKs may arrive out of order, but the durable cursor advances only across a
-contiguous acknowledged prefix, so ACKing sequence 5 cannot skip an unprocessed
-sequence 4. Delivery state survives process restart through `deliveries.json`.
+leases for **eligible committed** records. An unacknowledged record is hidden
+until its ACK deadline expires; a NACK expires the lease immediately.
+Redelivery increments the attempt counter. ACKs may arrive out of order,
+but the durable cursor advances only across a contiguous acknowledged prefix,
+so ACKing sequence 5 cannot skip an unprocessed sequence 4. A lease created
+before installing a replication policy cannot be ACKed until its sequence is
+quorum-committed. Delivery state survives restart through `deliveries.json`.
+
+This safety requirement is shared with the standalone committed-consumer
+correction in PR #1421 and must be preserved when the branches are integrated.
 
 ## Runtime APIs
 
