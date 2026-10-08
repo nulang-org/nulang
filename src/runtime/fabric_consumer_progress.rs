@@ -1221,6 +1221,22 @@ mod tests {
         assert_eq!(remote.pending_change().unwrap().2, 1);
         assert_eq!(local.committed_cursor("orders", 0, "billing"), 0);
         assert_eq!(remote.committed_cursor("orders", 0, "billing"), 0);
+
+        // Persisted follower-fsync evidence is sufficient to request a local
+        // metadata commit, but only after the exact quorum receipts arrive.
+        assert_eq!(
+            leader.fabric_consumer_progress_commit_observed("orders", 0, 1).unwrap(),
+            1
+        );
+        follower.process_network();
+        let leader_after = FileFabricConsumerProgressJournal::open(
+            leader_root.join("orders").join("consumer_progress")
+        ).unwrap();
+        let follower_after = FileFabricConsumerProgressJournal::open(
+            follower_root.join("orders").join("consumer_progress")
+        ).unwrap();
+        assert_eq!(leader_after.committed_cursor("orders", 0, "billing"), 1);
+        assert_eq!(follower_after.committed_cursor("orders", 0, "billing"), 1);
         let _ = fs::remove_dir_all(a_root);
         let _ = fs::remove_dir_all(b_root);
     }
@@ -1255,6 +1271,57 @@ mod tests {
         ).is_ok());
         wire.change.committed_cursor = 2;
         assert!(wire.verify().is_err());
+    }
+
+    #[test]
+    fn persisted_peer_receipt_survives_reopen_but_unconfirmed_prepare_stays_pending() {
+        let root = temp_root("persist-votes");
+        let group = policy(vec![10, 11, 12]);
+        let proposal = change(1, 0, 2);
+        let wire = FabricConsumerProgressPrepareWire::new(
+            proposal.clone(), group.clone(), 2,
+        ).unwrap();
+        {
+            let mut journal = FileFabricConsumerProgressJournal::open(&root).unwrap();
+            journal.prepare(proposal, group, 2).unwrap();
+            assert!(journal.commit_observed_quorum(1).is_err());
+            assert!(journal.record_verified_receipt(99, &wire.digest).is_err());
+            assert!(journal.record_verified_receipt(11, "0").is_err());
+            journal.record_verified_receipt(11, &wire.digest).unwrap();
+            journal.record_verified_receipt(11, &wire.digest).unwrap();
+            assert_eq!(journal.verified_voters(), vec![10, 11]);
+        }
+        let mut recovered = FileFabricConsumerProgressJournal::open(&root).unwrap();
+        assert_eq!(recovered.pending_sequence(), Some(1));
+        assert_eq!(recovered.verified_voters(), vec![10, 11]);
+        assert_eq!(recovered.committed_cursor("orders", 0, "billing"), 0);
+        recovered.commit_observed_quorum(1).unwrap();
+        assert_eq!(recovered.committed_cursor("orders", 0, "billing"), 2);
+        let after = FileFabricConsumerProgressJournal::open(&root).unwrap();
+        assert_eq!(after.committed_cursor("orders", 0, "billing"), 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn quorum_proof_cannot_mix_votes_from_changed_pending_record() {
+        let root = temp_root("receipt-scope");
+        let group = policy(vec![10, 11]);
+        let proposed = change(1, 0, 1);
+        let wire = FabricConsumerProgressPrepareWire::new(
+            proposed.clone(), group.clone(), 1,
+        ).unwrap();
+        let mut journal = FileFabricConsumerProgressJournal::open(&root).unwrap();
+        journal.prepare(proposed.clone(), group, 1).unwrap();
+        let mut changed = proposed;
+        changed.committed_cursor = 0;
+        let other = FabricConsumerProgressPrepareWire::new(
+            changed, policy(vec![10, 11]), 1,
+        ).unwrap();
+        assert_ne!(wire.digest, other.digest);
+        assert!(journal.record_verified_receipt(11, &other.digest).is_err());
+        assert!(journal.commit_observed_quorum(1).is_err());
+        assert_eq!(journal.committed_cursor("orders", 0, "billing"), 0);
+        let _ = fs::remove_dir_all(root);
     }
 
 }
