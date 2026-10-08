@@ -130,11 +130,44 @@ enum Active {
     Poisoned,
 }
 
+/// The only crate-internal authority that can open WALs inside a managed root.
+/// The OS lock inode remains on disk even after this handle is dropped.
+#[derive(Debug)]
+pub(crate) struct OwnedDirectory {
+    root: PathBuf,
+    _lock: File,
+}
+
+impl OwnedDirectory {
+    fn acquire(root: &Path) -> Result<Self, SplitError> {
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(root.join(".nudb-owner.lock"))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self {
+                root: root.to_path_buf(),
+                _lock: file,
+            }),
+            Err(std::fs::TryLockError::WouldBlock) => Err(SplitError::OwnerBusy),
+            Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+        }
+    }
+
+    /// The coordinator constructs all tablet WAL paths directly inside its
+    /// canonical root; a token cannot be reused for another directory.
+    pub(crate) fn authorizes(&self, path: &Path) -> bool {
+        path.parent() == Some(self.root.as_path())
+    }
+}
+
 /// Single-node coordinator with an exclusive, advisory OS file lock.
 ///
-/// All other writers must open the same root through this coordinator.
-/// Direct raw WAL access bypasses the lock; distributed ownership and
-/// uncooperative process fencing remain explicitly out of scope.
+/// Public WAL APIs reject managed directories; only this coordinator's
+/// private managed-open path is authorized to mutate their tablet files.
+/// Distributed fencing and non-cooperating filesystem writers remain out
+/// of scope.
 #[derive(Debug)]
 pub struct SingleNodeSplitStore {
     root: PathBuf,
@@ -142,27 +175,17 @@ pub struct SingleNodeSplitStore {
     active: Active,
     // Never delete or rename the lock file, including on Drop. Locking a new
     // inode would allow another process to own the old inode simultaneously.
-    _owner_lock: File,
+    _owner_lock: OwnedDirectory,
 }
 
 impl SingleNodeSplitStore {
     pub fn open(root: impl AsRef<Path>, parent: TabletDescriptor) -> Result<Self, SplitError> {
-        let root = root.as_ref().to_path_buf();
-        fs::create_dir_all(&root)?;
-        // Lock BEFORE examining or initializing routing and tablet files.
-        // File::try_lock is OS-backed and nonblocking (Rust >= 1.89).
-        let owner_lock = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(root.join(".nudb-owner.lock"))?;
-        match owner_lock.try_lock() {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                return Err(SplitError::OwnerBusy);
-            }
-            Err(error) => return Err(error.into()),
-        }
+        let root = root.as_ref();
+        fs::create_dir_all(root)?;
+        let root = fs::canonicalize(root)?;
+        // The advisory lock is acquired before reading or initializing
+        // either the routing manifest or any tablet WAL.
+        let owner_lock = OwnedDirectory::acquire(&root)?;
         let manifest_path = root.join("route.manifest");
         let parent_wal = root.join("parent.wal");
         let active = if manifest_path.exists() {
@@ -170,7 +193,11 @@ impl SingleNodeSplitStore {
             match manifest.validate(&parent)? {
                 None => {
                     verify_published_wal(&parent_wal)?;
-                    Active::Parent(WalBackedTablet::open(parent.clone(), &parent_wal)?)
+                    Active::Parent(WalBackedTablet::open_managed(
+                        parent.clone(),
+                        &parent_wal,
+                        &owner_lock,
+                    )?)
                 }
                 Some((plan, sequence)) => {
                     // Never silently fall back to the parent after promotion.
@@ -182,8 +209,16 @@ impl SingleNodeSplitStore {
                             ));
                         }
                     }
-                    let left = WalBackedTablet::open(plan.left, root.join("left.wal"))?;
-                    let right = WalBackedTablet::open(plan.right, root.join("right.wal"))?;
+                    let left = WalBackedTablet::open_managed(
+                        plan.left,
+                        root.join("left.wal"),
+                        &owner_lock,
+                    )?;
+                    let right = WalBackedTablet::open_managed(
+                        plan.right,
+                        root.join("right.wal"),
+                        &owner_lock,
+                    )?;
                     if left.current_sequence() < sequence || right.current_sequence() < sequence {
                         return Err(SplitError::InvalidManifest(
                             "child state regressed behind split source sequence".into(),
@@ -213,7 +248,8 @@ impl SingleNodeSplitStore {
                     "tablet files exist without routing manifest".into(),
                 ));
             }
-            let parent_tablet = WalBackedTablet::open(parent.clone(), &parent_wal)?;
+            let parent_tablet =
+                WalBackedTablet::open_managed(parent.clone(), &parent_wal, &owner_lock)?;
             write_manifest(&manifest_path, &DiskManifest::for_parent(&parent), None)?;
             Active::Parent(parent_tablet)
         };
@@ -363,10 +399,16 @@ impl SingleNodeSplitStore {
         let wal_path = self.root.join(format!("{side}.wal"));
         let checkpoint_path = checkpoint::checkpoint_path_for_wal(&wal_path);
         checkpoint::write_checkpoint(&checkpoint_path, tablet)?;
-        FileWal::seed_from_checkpoint(&wal_path, tablet.descriptor(), tablet.current_sequence())?;
-        Ok(WalBackedTablet::open(
+        FileWal::seed_from_checkpoint(
+            &wal_path,
+            tablet.descriptor(),
+            tablet.current_sequence(),
+            &self._owner_lock,
+        )?;
+        Ok(WalBackedTablet::open_managed(
             tablet.descriptor().clone(),
             wal_path,
+            &self._owner_lock,
         )?)
     }
 }
@@ -527,7 +569,9 @@ impl fmt::Display for SplitError {
             Self::InvalidManifest(message) => write!(f, "invalid routing manifest: {message}"),
             Self::OutsideParentRange => f.write_str("key outside source tablet range"),
             Self::AlreadySplit => f.write_str("tablet has already been split"),
-            Self::OwnerBusy => f.write_str("another process currently owns this NuDB tablet directory"),
+            Self::OwnerBusy => {
+                f.write_str("another process currently owns this NuDB tablet directory")
+            }
             Self::Poisoned => f.write_str("tablet routing must be reopened after ambiguous split"),
             Self::Interrupted(message) => write!(f, "injected NuDB split interruption: {message}"),
         }
@@ -715,7 +759,10 @@ mod tests {
             let mut recovered = SingleNodeSplitStore::open(&root, parent.clone()).unwrap();
             assert_eq!(recovered.is_split(), published, "stage={stage}");
             assert_eq!(recovered.read_latest(b"b").unwrap(), Some(b"left".to_vec()));
-            assert_eq!(recovered.read_latest(b"n").unwrap(), Some(b"right".to_vec()));
+            assert_eq!(
+                recovered.read_latest(b"n").unwrap(),
+                Some(b"right".to_vec())
+            );
             let plan = parent
                 .plan_split(
                     b"m",

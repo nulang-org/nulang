@@ -55,6 +55,9 @@ Cross-tablet snapshot or atomic transaction semantics are **not provided**.
   refused while the first is alive, including after split publication
 - The stable lock inode persists after the owner drops so later processes
   cannot accidentally acquire distinct locks on different inodes
+- Public WAL and tablet opens are refused for managed directories even after
+  owner exit and child publication; old public handles cannot append, reclaim,
+  or checkpoint after the persistent owner marker appears
 
 The suite includes both injected in-process interruptions and a subprocess
 that terminates via `std::process::exit(72)` at each publication boundary,
@@ -72,10 +75,24 @@ filesystem reorderings, or storage hardware faults.
   owned until the store is dropped. An independent coordinator opening the
   same root fails with `OwnerBusy`. Never unlink or rotate that file, even
   after crash recovery.
-- **Raw storage bypass remains possible:** Direct `WalBackedTablet` or `FileWal`
-  writers do **not** acquire this lock and must not target the same directory.
-  The lock is advisory, applies to cooperating processes on a local filesystem,
-  and is not a distributed lease or a defense against malicious processes.
+- **Cooperative public WAL API fence:** `FileWal::open` and
+  `WalBackedTablet::open` fail closed when a persistent
+  `.nudb-owner.lock` or `route.manifest` is present, including when a
+  caller reaches the WAL through an ordinary file or directory symlink. Only
+  the crate-private managed-open path, scoped to a held `OwnedDirectory`
+  lock and the matching canonical root, can recover a managed tablet.
+  Previously opened public WAL handles recheck before append/reclamation,
+  and public tablet handles recheck before checkpoint publication.
+- **Advisory, not physical fencing:** An uncooperative process can still edit
+  underlying files directly; a public handle that passed its admission check
+  before a concurrent owner transition has a possible TOCTOU window.
+  Do not use this as distributed ownership fencing or a protection against
+  malicious filesystem writes. Multi-process migration requires a protocol
+  preventing takeover until old owners have stopped, with a durable
+  monotonically increasing fencing token validated at commit time. This
+  path-based check does not prevent hard-link aliases, manual file mutation,
+  or other operations outside the NuDB API, and adds filesystem metadata
+  checks on unowned WAL writes pending a measured lower-overhead protocol.
 - **No distributed fencing:** Add lease/consensus-backed ownership and durable
   tablet placement metadata before node migration or shared-storage failover.
 - **No global SQL transaction ordering:** Cross-tablet snapshots, two-phase
@@ -91,6 +108,8 @@ filesystem reorderings, or storage hardware faults.
 
 ```sh
 cargo fmt --all -- --check
+cargo test --no-default-features --test nudb_managed_wal_guard
+cargo test --no-default-features --test nudb_exclusive_owner
 cargo test --no-default-features --test nudb_split_cutover
 cargo test --no-default-features --test nudb_snapshot_scan_split
 cargo test --no-default-features --lib database::split
