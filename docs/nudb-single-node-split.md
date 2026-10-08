@@ -1,7 +1,8 @@
 # NuDB: Single-node durable tablet split cutover
 
-Status: experimental, **single-owner** prototype. This is a storage correctness
-milestone, not a distributed database protocol.
+Status: experimental, **single-node** prototype with advisory, exclusive
+process-level ownership. This is a storage correctness milestone, not a
+distributed database protocol.
 
 ## Contract
 
@@ -50,15 +51,31 @@ Cross-tablet snapshot or atomic transaction semantics are **not provided**.
 - Missing child checkpoint or WAL: fail closed, even at source sequence zero
 - Truncated parent or child WAL: fail closed before WAL auto-initialization
 - Child writes after promotion/restart preserve their independent sequence tails
+- A second `SingleNodeSplitStore` opener (same process or another process) is
+  refused while the first is alive, including after split publication
+- The stable lock inode persists after the owner drops so later processes
+  cannot accidentally acquire distinct locks on different inodes
 
-These tests simulate interrupted processes at defined boundaries. They do not
-simulate sudden power loss, filesystem reorderings, or storage hardware faults.
+The suite includes both injected in-process interruptions and a subprocess
+that terminates via `std::process::exit(72)` at each publication boundary,
+without running destructors. The parent process reopens the directory and
+verifies the authoritative manifest, values, and released advisory lock.
+
+These tests cover real process termination but **not sudden power loss**,
+filesystem reorderings, or storage hardware faults.
 
 ## Explicit exclusions and next gates
 
-- **No multi-process coordination:** A second process can currently open raw
-  tablet WALs. Add process-level ownership enforcement before permitting
-  multiple independent writers or long-running daemons sharing one directory.
+- **Advisory single-node process coordination:** `SingleNodeSplitStore::open`
+  acquires a nonblocking exclusive OS lock on the stable `.nudb-owner.lock`
+  inode **before** reading or mutating tablet storage; the `File` remains
+  owned until the store is dropped. An independent coordinator opening the
+  same root fails with `OwnerBusy`. Never unlink or rotate that file, even
+  after crash recovery.
+- **Raw storage bypass remains possible:** Direct `WalBackedTablet` or `FileWal`
+  writers do **not** acquire this lock and must not target the same directory.
+  The lock is advisory, applies to cooperating processes on a local filesystem,
+  and is not a distributed lease or a defense against malicious processes.
 - **No distributed fencing:** Add lease/consensus-backed ownership and durable
   tablet placement metadata before node migration or shared-storage failover.
 - **No global SQL transaction ordering:** Cross-tablet snapshots, two-phase

@@ -130,19 +130,37 @@ enum Active {
     Poisoned,
 }
 
-/// Single-owner, single-node coordinator. Not safe for concurrent independent
-/// processes opening the same root: an OS directory lease is a future task.
+/// Single-node coordinator with an exclusive, advisory OS file lock.
+///
+/// All other writers must open the same root through this coordinator.
+/// Direct raw WAL access bypasses the lock; distributed ownership and
+/// uncooperative process fencing remain explicitly out of scope.
 #[derive(Debug)]
 pub struct SingleNodeSplitStore {
     root: PathBuf,
     parent: TabletDescriptor,
     active: Active,
+    // Never delete or rename the lock file, including on Drop. Locking a new
+    // inode would allow another process to own the old inode simultaneously.
+    _owner_lock: File,
 }
 
 impl SingleNodeSplitStore {
     pub fn open(root: impl AsRef<Path>, parent: TabletDescriptor) -> Result<Self, SplitError> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
+        // Lock BEFORE examining or initializing routing and tablet files.
+        // File::try_lock is OS-backed and nonblocking (Rust >= 1.89).
+        let owner_lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(root.join(".nudb-owner.lock"))?;
+        match owner_lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Err(SplitError::OwnerBusy),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
         let manifest_path = root.join("route.manifest");
         let parent_wal = root.join("parent.wal");
         let active = if manifest_path.exists() {
@@ -201,6 +219,7 @@ impl SingleNodeSplitStore {
             root,
             parent,
             active,
+            _owner_lock: owner_lock,
         })
     }
 
@@ -465,6 +484,7 @@ pub enum SplitError {
     InvalidManifest(String),
     OutsideParentRange,
     AlreadySplit,
+    OwnerBusy,
     Poisoned,
     Interrupted(&'static str),
 }
@@ -505,6 +525,9 @@ impl fmt::Display for SplitError {
             Self::InvalidManifest(message) => write!(f, "invalid routing manifest: {message}"),
             Self::OutsideParentRange => f.write_str("key outside source tablet range"),
             Self::AlreadySplit => f.write_str("tablet has already been split"),
+            Self::OwnerBusy => {
+                f.write_str("another process currently owns this NuDB tablet directory")
+            }
             Self::Poisoned => f.write_str("tablet routing must be reopened after ambiguous split"),
             Self::Interrupted(message) => write!(f, "injected NuDB split interruption: {message}"),
         }
@@ -597,5 +620,119 @@ mod tests {
     #[test]
     fn crash_after_manifest_rename_recovers_children() {
         case(SplitStop::AfterManifestRename);
+    }
+
+    /// Run only in an isolated child process. `exit` deliberately skips Rust
+    /// destructors and releases the OS lock on process termination.
+    #[test]
+    #[ignore]
+    fn abrupt_exit_during_split_fixture() {
+        let root = std::env::var_os("NUDB_FAILSTOP_ROOT").unwrap();
+        let stop = match std::env::var("NUDB_FAILSTOP_STAGE").unwrap().as_str() {
+            "left" => SplitStop::AfterLeft,
+            "right" => SplitStop::AfterRight,
+            "manifest_sync" => SplitStop::AfterManifestTempSync,
+            "manifest_rename" => SplitStop::AfterManifestRename,
+            stage => panic!("unrecognized fail-stop stage: {stage}"),
+        };
+        let parent = TabletDescriptor::new(
+            TabletId::new(801).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            7,
+        )
+        .unwrap();
+        let plan = parent
+            .plan_split(
+                b"m",
+                TabletId::new(802).unwrap(),
+                TabletId::new(803).unwrap(),
+                8,
+            )
+            .unwrap();
+        let mut store = SingleNodeSplitStore::open(root, parent).unwrap();
+        assert!(matches!(
+            store.split_inner(&plan, Some(stop)),
+            Err(SplitError::Interrupted(_))
+        ));
+        std::process::exit(72);
+    }
+
+    #[test]
+    fn real_process_exit_recovers_parent_or_children_at_each_cutover_boundary() {
+        use std::process::Command;
+
+        for (stage, published) in [
+            ("left", false),
+            ("right", false),
+            ("manifest_sync", false),
+            ("manifest_rename", true),
+        ] {
+            let root = std::env::temp_dir().join(format!(
+                "nudb_failstop_split_{}_{}_{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed),
+                stage,
+            ));
+            let parent = TabletDescriptor::new(
+                TabletId::new(801).unwrap(),
+                KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+                7,
+            )
+            .unwrap();
+            {
+                let mut store = SingleNodeSplitStore::open(&root, parent.clone()).unwrap();
+                for (key, value) in [(&b"b"[..], &b"left"[..]), (&b"n"[..], &b"right"[..])] {
+                    store
+                        .commit(TabletMutation::Put {
+                            key: key.to_vec(),
+                            value: value.to_vec(),
+                        })
+                        .unwrap();
+                }
+            }
+
+            let child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "database::split::tests::abrupt_exit_during_split_fixture",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("NUDB_FAILSTOP_ROOT", &root)
+                .env("NUDB_FAILSTOP_STAGE", stage)
+                .output()
+                .unwrap();
+            assert_eq!(
+                child.status.code(),
+                Some(72),
+                "child must exit at {stage}: stdout={} stderr={}",
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr)
+            );
+            // The child never ran Drop. The OS releases its advisory lock;
+            // recovery must follow the catalog, not whichever tablet files
+            // happen to be present.
+            let mut recovered = SingleNodeSplitStore::open(&root, parent.clone()).unwrap();
+            assert_eq!(recovered.is_split(), published, "stage={stage}");
+            assert_eq!(recovered.read_latest(b"b").unwrap(), Some(b"left".to_vec()));
+            assert_eq!(
+                recovered.read_latest(b"n").unwrap(),
+                Some(b"right".to_vec())
+            );
+            let plan = parent
+                .plan_split(
+                    b"m",
+                    TabletId::new(802).unwrap(),
+                    TabletId::new(803).unwrap(),
+                    8,
+                )
+                .unwrap();
+            if !published {
+                recovered.split(&plan).unwrap();
+            }
+            assert!(recovered.is_split());
+            drop(recovered);
+            let _ = fs::remove_dir_all(root);
+        }
     }
 }
