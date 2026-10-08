@@ -55,6 +55,8 @@ use super::distributed_context::{FabricAdvertisement, FabricAdvertisementSnapsho
 use super::supervision::RemoteLink;
 use super::MessagePriority;
 use super::NodeId;
+#[cfg(feature = "tcp")]
+use crate::network_wakeup::NetworkWakeup;
 use crate::protocol::ProtocolId;
 use crate::vm::Value;
 
@@ -2010,6 +2012,15 @@ pub trait NetworkTransport: Send {
         TrackedSendOutcome::Unsupported
     }
     fn receive(&self) -> Vec<IncomingPacket>;
+    /// Snapshot a packet-admission generation before polling for work.
+    fn incoming_generation(&self) -> Option<u64> {
+        None
+    }
+    /// Await transport packet publication; unsupported transports fall back
+    /// to the distributed-node loop's existing bounded sleep.
+    fn wait_for_incoming(&self, _observed: u64, _timeout: std::time::Duration) -> bool {
+        false
+    }
     /// Drain asynchronous transport failures reported after a packet sequence
     /// was reserved. Transports without asynchronous failure reporting return
     /// an empty set.
@@ -2059,6 +2070,12 @@ impl NetworkTransport for Box<dyn NetworkTransport> {
     fn receive(&self) -> Vec<IncomingPacket> {
         (**self).receive()
     }
+    fn incoming_generation(&self) -> Option<u64> {
+        (**self).incoming_generation()
+    }
+    fn wait_for_incoming(&self, observed: u64, timeout: std::time::Duration) -> bool {
+        (**self).wait_for_incoming(observed, timeout)
+    }
     fn drain_send_failures(&mut self) -> Vec<TransportSendFailure> {
         (**self).drain_send_failures()
     }
@@ -2101,6 +2118,8 @@ pub struct TcpTransport {
     /// Cloneable send side of the incoming channel, handed to reader
     /// threads spawned for dialled outbound connections.
     incoming_tx: mpsc::SyncSender<IncomingPacket>,
+    /// Shared generation fence for transport readers and the node loop.
+    incoming_wakeup: Arc<NetworkWakeup>,
     /// Channel endpoint used to enqueue packets for transmission.
     outgoing_tx: mpsc::SyncSender<OutgoingPacket>,
     /// Transport-local failure queue. The sender thread reports connect/write
@@ -2150,6 +2169,7 @@ impl TcpTransport {
         let (incoming_tx, incoming_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let (outgoing_tx, outgoing_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let (send_failure_tx, send_failure_rx) = mpsc::channel();
+        let incoming_wakeup = Arc::new(NetworkWakeup::default());
 
         let connections: Arc<Mutex<HashMap<NodeId, TcpConnection>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -2162,13 +2182,14 @@ impl TcpTransport {
         {
             let flag = Arc::clone(&shutdown_flag);
             let in_tx = incoming_tx.clone();
+            let wakeup = Arc::clone(&incoming_wakeup);
             let conns = Arc::clone(&connections);
             let local_id = node_id;
             let tls = tls_config.clone();
             let handle = thread::Builder::new()
                 .name("nulang-net-listener".into())
                 .spawn(move || {
-                    listener_thread(listener, in_tx, conns, flag, local_id, tls);
+                    listener_thread(listener, in_tx, conns, flag, local_id, tls, wakeup);
                 })?;
             handles.push(handle);
         }
@@ -2181,12 +2202,22 @@ impl TcpTransport {
             let conns = Arc::clone(&connections);
             let local_id = node_id;
             let in_tx = incoming_tx.clone();
+            let wakeup = Arc::clone(&incoming_wakeup);
             let failure_tx = send_failure_tx.clone();
             let tls = tls_config.clone();
             let handle = thread::Builder::new()
                 .name("nulang-net-sender".into())
                 .spawn(move || {
-                    sender_thread(outgoing_rx, conns, flag, local_id, in_tx, failure_tx, tls);
+                    sender_thread(
+                        outgoing_rx,
+                        conns,
+                        flag,
+                        local_id,
+                        in_tx,
+                        failure_tx,
+                        tls,
+                        wakeup,
+                    );
                 })?;
             handles.push(handle);
         }
@@ -2197,6 +2228,7 @@ impl TcpTransport {
             connections,
             incoming_rx,
             incoming_tx,
+            incoming_wakeup,
             outgoing_tx,
             send_failure_tx,
             send_failure_rx,
@@ -2286,12 +2318,13 @@ impl TcpTransport {
             conns.insert(node_id, conn);
         }
         let in_tx = self.incoming_tx.clone();
+        let wakeup = Arc::clone(&self.incoming_wakeup);
         let conns = Arc::clone(&self.connections);
         let flag = Arc::clone(&self.shutdown_flag);
         let _ = thread::Builder::new()
             .name(format!("nulang-net-reader-out-{}", addr.port()))
             .spawn(move || {
-                connection_read_loop(read_stream, node_id, generation, in_tx, conns, flag)
+                connection_read_loop(read_stream, node_id, generation, in_tx, conns, flag, wakeup)
             });
         Ok(())
     }
@@ -2386,6 +2419,16 @@ impl TcpTransport {
         packets
     }
 
+    /// Snapshot the transport's admitted-packet generation.
+    pub fn incoming_generation(&self) -> u64 {
+        self.incoming_wakeup.generation()
+    }
+
+    /// Wait until a packet has been admitted since the observed generation.
+    pub fn wait_for_incoming(&self, observed: u64, timeout: Duration) -> bool {
+        self.incoming_wakeup.wait_for_change(observed, timeout)
+    }
+
     /// Get this node's ID.
     pub fn node_id(&self) -> NodeId {
         self.node_id
@@ -2471,6 +2514,7 @@ fn listener_thread(
     shutdown_flag: Arc<AtomicBool>,
     local_node_id: NodeId,
     tls_config: TlsConfig,
+    incoming_wakeup: Arc<NetworkWakeup>,
 ) {
     // Set a small accept timeout so we periodically check the shutdown flag.
     let _ = listener.set_nonblocking(true);
@@ -2485,11 +2529,21 @@ fn listener_thread(
                 let in_tx = incoming_tx.clone();
                 let conns = Arc::clone(&connections);
                 let flag = Arc::clone(&shutdown_flag);
+                let wakeup = Arc::clone(&incoming_wakeup);
                 let tls = tls_config.clone();
                 let _ = thread::Builder::new()
                     .name(format!("nulang-net-reader-{}", addr.port()))
                     .spawn(move || {
-                        connection_reader(stream, addr, in_tx, conns, flag, local_node_id, tls);
+                        connection_reader(
+                            stream,
+                            addr,
+                            in_tx,
+                            conns,
+                            flag,
+                            local_node_id,
+                            tls,
+                            wakeup,
+                        );
                     });
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -2518,6 +2572,7 @@ fn connection_reader(
     shutdown_flag: Arc<AtomicBool>,
     local_node_id: NodeId,
     tls_config: TlsConfig,
+    incoming_wakeup: Arc<NetworkWakeup>,
 ) {
     let _ = tcp.set_read_timeout(Some(IO_TIMEOUT));
     let _ = tcp.set_write_timeout(Some(IO_TIMEOUT));
@@ -2584,6 +2639,7 @@ fn connection_reader(
         incoming_tx,
         connections,
         shutdown_flag,
+        incoming_wakeup,
     );
 }
 
@@ -2601,6 +2657,7 @@ fn connection_read_loop(
     incoming_tx: mpsc::SyncSender<IncomingPacket>,
     connections: Arc<Mutex<HashMap<NodeId, TcpConnection>>>,
     shutdown_flag: Arc<AtomicBool>,
+    incoming_wakeup: Arc<NetworkWakeup>,
 ) {
     'read_loop: loop {
         if shutdown_flag.load(Ordering::Relaxed) {
@@ -2655,6 +2712,8 @@ fn connection_read_loop(
             if incoming_tx.send(incoming).is_err() {
                 break;
             }
+            // Signal only after successful admission to the packet channel.
+            incoming_wakeup.notify();
         }
     }
     {
@@ -2682,6 +2741,7 @@ fn sender_thread(
     incoming_tx: mpsc::SyncSender<IncomingPacket>,
     send_failure_tx: mpsc::Sender<TransportSendFailure>,
     tls_config: TlsConfig,
+    incoming_wakeup: Arc<NetworkWakeup>,
 ) {
     loop {
         if shutdown_flag.load(Ordering::Relaxed) && outgoing_rx.try_recv().is_err() {
@@ -2713,6 +2773,7 @@ fn sender_thread(
                 outgoing.to_node,
                 outgoing.to_addr,
                 &tls_config,
+                &incoming_wakeup,
             ) {
                 warn!(
                     "[nulang-net] Failed to connect to {:?} at {}: {}",
@@ -2779,6 +2840,7 @@ fn connect_in_sender(
     node_id: NodeId,
     addr: SocketAddr,
     tls_config: &TlsConfig,
+    incoming_wakeup: &Arc<NetworkWakeup>,
 ) -> io::Result<()> {
     let tcp = TcpStream::connect_timeout(&addr, IO_TIMEOUT)?;
     tcp.set_read_timeout(Some(IO_TIMEOUT))?;
@@ -2832,9 +2894,12 @@ fn connect_in_sender(
     let in_tx = incoming_tx.clone();
     let conns = Arc::clone(connections);
     let flag = Arc::clone(shutdown_flag);
+    let wakeup = Arc::clone(incoming_wakeup);
     let _ = thread::Builder::new()
         .name(format!("nulang-net-reader-out-{}", addr.port()))
-        .spawn(move || connection_read_loop(read_stream, node_id, generation, in_tx, conns, flag));
+        .spawn(move || {
+            connection_read_loop(read_stream, node_id, generation, in_tx, conns, flag, wakeup)
+        });
     Ok(())
 }
 
@@ -3525,6 +3590,7 @@ mod tests {
                 incoming_tx,
                 reader_connections,
                 reader_shutdown,
+                Arc::new(NetworkWakeup::default()),
             );
         });
 
@@ -3579,6 +3645,7 @@ mod tests {
                 incoming_tx,
                 reader_connections,
                 reader_shutdown,
+                Arc::new(NetworkWakeup::default()),
             );
         });
 
@@ -4092,6 +4159,12 @@ impl NetworkTransport for TcpTransport {
     }
     fn receive(&self) -> Vec<IncomingPacket> {
         self.receive()
+    }
+    fn incoming_generation(&self) -> Option<u64> {
+        Some(TcpTransport::incoming_generation(self))
+    }
+    fn wait_for_incoming(&self, observed: u64, timeout: Duration) -> bool {
+        TcpTransport::wait_for_incoming(self, observed, timeout)
     }
     fn drain_send_failures(&mut self) -> Vec<TransportSendFailure> {
         self.drain_send_failures()
