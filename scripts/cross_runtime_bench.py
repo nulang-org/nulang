@@ -57,12 +57,19 @@ def command_output(
     proc = subprocess.run(
         command,
         cwd=cwd,
-        check=True,
+        check=False,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         preexec_fn=preexec_fn,
     )
+    if proc.returncode != 0:
+        # AOT feature builds can fail in Rust codegen. Retain the actual Cargo
+        # diagnostics in the CI log instead of only showing CalledProcessError.
+        sys.stderr.write(proc.stdout)
+        raise subprocess.CalledProcessError(
+            proc.returncode, command, output=proc.stdout
+        )
     return proc.stdout
 
 
