@@ -14,7 +14,10 @@ pub enum UiActionDispatchError {
     InvalidEnvelope(String),
     InvalidDocument(String),
     DocumentMismatch,
-    RevisionMismatch { expected: Revision, found: Revision },
+    RevisionMismatch {
+        expected: Revision,
+        found: Revision,
+    },
     UnregisteredAction(String),
     UnexpectedPayload,
     ClientPlacement,
@@ -30,7 +33,9 @@ impl std::fmt::Display for UiActionDispatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidEnvelope(message) => write!(f, "invalid UI action envelope: {message}"),
-            Self::InvalidDocument(message) => write!(f, "invalid authoritative UI document: {message}"),
+            Self::InvalidDocument(message) => {
+                write!(f, "invalid authoritative UI document: {message}")
+            }
             Self::DocumentMismatch => f.write_str("UI action targets another document"),
             Self::RevisionMismatch { expected, found } => write!(
                 f,
