@@ -1202,10 +1202,30 @@ mod tests {
         ).unwrap();
         assert_eq!(local.pending_sequence(), Some(1));
         assert_eq!(remote.pending_sequence(), Some(1));
+        assert_eq!(local.pending_change().unwrap().2, 1);
+        assert_eq!(remote.pending_change().unwrap().2, 1);
         assert_eq!(local.committed_cursor("orders", 0, "billing"), 0);
         assert_eq!(remote.committed_cursor("orders", 0, "billing"), 0);
         let _ = fs::remove_dir_all(a_root);
         let _ = fs::remove_dir_all(b_root);
+    }
+
+    #[test]
+    fn pending_prepare_rejects_changed_commit_boundary_and_digest() {
+        let root = temp_root("fixed-boundary");
+        let group = policy(vec![10, 11]);
+        let mut journal = FileFabricConsumerProgressJournal::open(&root).unwrap();
+        let proposal = change(1, 0, 1);
+        journal.prepare(proposal.clone(), group.clone(), 1).unwrap();
+        // A retry must reproduce the exact same on-disk Prepare frame.
+        assert!(journal.prepare(proposal.clone(), group.clone(), 2).is_err());
+
+        let original =
+            FabricConsumerProgressPrepareWire::new(proposal.clone(), group.clone(), 1).unwrap();
+        let altered =
+            FabricConsumerProgressPrepareWire::new(proposal, group, 2).unwrap();
+        assert_ne!(original.digest, altered.digest);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
