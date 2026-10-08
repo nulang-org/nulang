@@ -1,12 +1,13 @@
 # Fabric replicated consumer progress: safety contract and implementation plan
 
-**Status:** Private journal foundation in draft #1445; **experimental
-metadata-prepare transport and observed follower-fsync receipts** in the
-stacked `feat/fabric-consumer-progress-prepare-transport-20261008` branch.
-**Quorum commit, failover metadata recovery, and public ACK integration are
-not implemented.** The current runtime still persists live consumer cursors,
-ACK gaps, and leases locally. Draft #1432 checks the locally installed
-leader epoch but does not prove live quorum.
+**Status:** Private journal (#1445), follower prepare/receipt transport
+(#1447), and an experimental **journaled quorum-vote / metadata commit
+propagation slice** in `feat/fabric-consumer-progress-quorum-ticket-20261008`.
+**Cluster-durable client ACKs, leader-failover metadata recovery, and
+cryptographically authenticated quorum certificates are NOT implemented.**
+The public consumer cursor, ACK gap, and lease APIs still use node-local
+storage. Draft #1432 checks the locally installed leader epoch but does
+not prove live quorum.
 
 ### Experimental transport slice
 
@@ -18,22 +19,46 @@ stream data covers the proposal, and fsync the exact pending metadata change
 before returning an application-level receipt. The leader validates the
 transport-visible replica identity, installed membership/epoch, pending
 metadata sequence and exact BLAKE3 proposal digest before recording a receipt
-in memory. Duplicate deliveries are idempotent.
+by appending a fsynced `Receipt` record to its local hash-chained
+journal. Duplicate deliveries are idempotent and cannot inflate the quorum.
 
-This network transport may not cryptographically authenticate node identity:
-the implementation binds to the identity exposed by `incoming.from_node`
-and the existing transport trust boundary, **not** a signature or mutually
-authenticated replica attestation. Receipts are volatile observations; they
-are **not durable quorum certificates**, do not invoke `Commit`, and do not
-update any application-consumer cursor. A new runtime loses the observed
-receipts even when the pending journal survives. The transport-level ACK is
-also explicitly **not** an application fsync receipt.
+### Experimental journaled quorum ticket and commit propagation
 
-The regression suite exercises RF=2 follower fsync/reply, leader receipt
-observation without commit, spoofed sender rejection, digest mismatch
-rejection, and persisted pending metadata on both nodes. The next step is
-a durable, retryable quorum ticket and commit-index propagation, plus
-proper transport authentication and recovery before advertising cluster ACKs.
+The leader's own fsynced `Prepare` is vote one. Each transport-validated
+follower fsync receipt appends a separate durable `Receipt` record scoped
+to the exact proposal digest, stream, metadata sequence, and replica ID.
+Reopening the journal reconstructs the verified vote set, so a lost
+in-memory response does not turn into fabricated committed progress.
+
+The private `fabric_consumer_progress_commit_observed` gate accepts a
+majority of those **persisted observations** and appends a separate
+fsynced `Commit` frame. A commit wire message carries the metadata digest,
+epoch/leader, sequence, and voter IDs. Followers accept only an exact
+locally pending proposal from their installed leader, with structurally
+valid membership, and fsync the commit. Duplicate exact updates are
+idempotent. A persisted leader decision can be redriven when a commit
+message is dropped, including after reopening the same leader's disk.
+
+**These are private metadata APIs only.** No public ACK/NACK/lease cursor
+uses this journal, and no client receives a cluster-durable success from it.
+A follower's pending metadata does not automatically become committed
+when an old leader crashes. A commit can be fsynced on the old leader but
+lost in transit to every follower; no replacement-leader recovery or
+durable-follower-commit-ack protocol exists yet. Only the *last* committed
+decision is redrivable from the current API; earlier missing decisions
+need a bounded sequential catch-up protocol before promotion.
+
+The transport checks identities against `incoming.from_node` under
+the **existing transport trust model**, which might not cryptographically
+authenticate peers. The vote ledger therefore records checked sender
+claims, **not unforgeable quorum certificates**. The wire hash is
+an integrity/correlation digest, not a signature. Transport ACKs are
+never treated as application fsync or metadata commit acknowledgements.
+
+Deterministic tests exercise RF=2 follower fsync, dropped prepares and
+commits, recovered vote sets, majority gating, exact digest matching,
+spoofed sender/wrong epoch rejection, and idempotent commit replay.
+No Rust tests have been executed locally in the development environment.
 
 ### Implemented storage-only foundation
 
@@ -54,13 +79,14 @@ majorities, restart recovery, pending-versus-committed visibility, corruption,
 epoch/policy rejection, partition-scoped journal isolation, and ACK-gap preservation.
 
 **This is not an authenticated quorum certificate or distributed durable
-consumer protocol.** The experimental replica prepare/receipt path is now
-connected to the existing actor transport but cannot prove cryptographic
-transport identity or persist a quorum decision. It is not wired to
-`fabric_stream_ack_consumer_fenced`, so existing customer-visible ACKs
+consumer protocol.** The private prepare/receipt/commit path now persists
+a leader-local quorum decision and propagates it best-effort to followers,
+but cannot attest cryptographic sender identity or prove that the commit
+decision itself survives failover. It is not wired to
+`fabric_stream_ack_consumer_fenced`; existing customer-visible ACKs
 remain node-local. The hashes detect accidental corruption but are not a
 signature or protection against an attacker who can rewrite the journal.
-No safe cluster-ACK success response has been introduced yet.
+No safe client-facing cluster-ACK success response has been introduced.
 
 ## Product-level contract
 
