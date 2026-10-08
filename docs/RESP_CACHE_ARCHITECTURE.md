@@ -197,6 +197,12 @@ The local acknowledgement model is now explicit through
   operation succeeds, without forcing a data sync;
 - `SyncedJournal`: append and `sync_data` before the operation succeeds.
 
+Journaled deletes (single or multi-key) and expiry changes now persist
+their mutations before changing live cache state. A WAL error therefore does
+not remove an existing value or alter its TTL, and poisons the wrapper.
+SET, MSET and INCR still mutate before journaling and require a separate
+admission/commit redesign before full write-ahead visibility is guaranteed.
+
 Multi-key mutations are encoded as one WAL batch record. If journaling fails
 after the in-memory mutation, the durability wrapper poisons itself and refuses
 all subsequent mutations. Because a shard executes one command at a time, this
