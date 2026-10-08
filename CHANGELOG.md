@@ -1,5 +1,11 @@
 # Nulang Changelog
 
+### Fabric consumer-progress quorum ticket and commit replay (experimental) — 2026-10-08
+- **Follower fsync receipts now become durable, proposal-digest-bound journal events.** A leader's locally persisted prepare is the initial vote, while only checked follower application receipts add durable remote votes; repeated receipts cannot inflate the quorum. Pending/verified votes survive restart without implying a committed cursor.
+- **An internal commit gate fsyncs metadata progress only after persisted majority observations.** It emits a leader/epoch/digest/sequence-scoped commit update to followers; they validate the exact pending proposal and persist the decision, while duplicates are idempotent. A dropped commit update can be redriven from the same leader's recovered log.
+- **Not a cluster-durable public ACK contract.** Votes depend on the existing transport identity trust boundary, only the last commit has explicit redrive, and no replacement-leader metadata quorum recovery or committed-decision receipt exists. No public consumer ACK API or lease state is changed.
+
+
 ### Fabric consumer metadata prepare transport (experimental) — 2026-10-08
 - **Leader-staged pending metadata can be dispatched to installed stream followers over existing Fabric system messages.** Followers validate the transport-exposed leader identity, durable installed policy/epoch promises, and local committed data prefix before fsyncing the identical consumer-progress prepare.
 - **Only a successful follower fsync produces an application-level receipt.** Leaders correlate received messages against the transport-exposed replica, policy membership, epoch, pending metadata sequence and proposal digest. Receipts remain volatile; transport ACKs are never counted as metadata fsync.
