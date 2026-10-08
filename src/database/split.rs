@@ -213,12 +213,12 @@ impl SingleNodeSplitStore {
                     ));
                 }
                 match fs::metadata(&parent_wal) {
-                    Ok(metadata) if metadata.len() > 64 => {
-                        return Err(SplitError::InvalidManifest(
-                            "preparing parent WAL contains possible committed records".into(),
-                        ));
-                    }
                     Ok(_) => {
+                        if !super::wal::is_fresh_initial_wal_header_prefix(&parent_wal)? {
+                            return Err(SplitError::InvalidManifest(
+                                "preparing parent WAL is not a fresh, uncommitted header".into(),
+                            ));
+                        }
                         fs::remove_file(&parent_wal)?;
                         sync_directory(&root)?;
                     }
@@ -792,9 +792,15 @@ mod tests {
             None,
         )
         .unwrap();
-        // Simulate a crash while the new parent's WAL header is incomplete.
+        // Simulate a crash during the real initial WAL-header write:
+        // truncate an actual checksummed fresh header, not arbitrary bytes.
         // No store was published, so no writes could have been acknowledged.
-        fs::write(root.join("parent.wal"), b"incomplete-bootstrap-header").unwrap();
+        let wal_path = root.join("parent.wal");
+        drop(FileWal::open(&wal_path).unwrap());
+        let file = OpenOptions::new().write(true).open(&wal_path).unwrap();
+        file.set_len(20).unwrap();
+        file.sync_data().unwrap();
+        drop(file);
 
         let mut reopened = SingleNodeSplitStore::open(&root, parent.clone()).unwrap();
         assert!(!reopened.is_split());
