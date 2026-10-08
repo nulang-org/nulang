@@ -70,7 +70,15 @@ encodings for hashes, sets, lists, and sorted sets.
 TTL work is separate from actor timers. The cache uses a multi-level hashed
 timing wheel with generation checks and lazy expiry on reads. Near-term TTLs
 stay in the base wheel while long-lived expirations are placed in coarser
-levels, avoiding repeated visits on every base-wheel rotation.
+levels, avoiding repeated visits on every base-wheel rotation. A compact,
+slot-indexed expiration handle now unlinks the previous wheel record in O(1)
+on TTL refresh, persistent overwrite, or delete. This keeps queued expiration
+records bounded by the number of live TTL-bearing entries rather than the
+number of TTL updates. The handle index is included in reserved-memory stats.
+
+Expiration sweeps still drain whole eligible buckets before applying the
+configured maximum number of deletions. A true candidate/CPU work budget and
+total-memory admission cap covering all metadata remain release blockers.
 
 ## RESP ingress and command execution
 
