@@ -97,6 +97,10 @@ perform IO.print("double(21) = " + perform Int.to_string(answer))`;
 			<span class="output-label">output</span>
 			<pre class="hero-output" aria-live="polite">Compiler loads on first run.</pre>
 		</div>
+		<p class="hero-native-note">
+			The browser runs Core language examples. Actors, supervision, and persistence require the
+			<a href="/getting-started/installation/">native runtime</a>.
+		</p>
 	</div>
 
 	<div class="hero-runtime-flow" aria-label="Nulang resilience model">
@@ -676,5 +680,19 @@ perform IO.print("double(21) = " + perform Int.to_string(answer))`;
 		.hero-source {
 			min-height: 12rem;
 		}
+	}
+
+	.hero-native-note {
+		margin: 0;
+		padding: 0.8rem 1rem 1rem;
+		font-size: 0.73rem;
+		line-height: 1.55;
+		color: #b6c2d1;
+		background: #090d14;
+	}
+
+	.hero-native-note a {
+		color: #93c5fd;
+		text-underline-offset: 0.2rem;
 	}
 </style>
