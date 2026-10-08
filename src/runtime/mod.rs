@@ -362,6 +362,9 @@ pub struct Runtime {
     /// stamp their outgoing `traceparent` as a child of this context, so
     /// causal chains span actor, shard, and node boundaries.
     pub current_trace: Option<TraceContext>,
+    // Cache only the W3C serialization, keyed by the complete context. The
+    // public current_trace field may change outside the send path.
+    traceparent_cache: Option<(TraceContext, String)>,
     // Fallback heap/GC for allocation performed OUTSIDE any actor's
     // behavior (e.g. `main()`'s own top-level bytecode: string
     // concatenation, `Int.to_string`, and similar). See
@@ -638,6 +641,22 @@ impl crate::backends::ForeignInterop for NoOpForeignInterop {
 }
 
 impl Runtime {
+    /// An outgoing message needs an owned traceparent string. Cache its
+    /// formatting across sends in the same context, but always compare the
+    /// full context because current_trace is externally mutable and a nested
+    /// synchronous ask temporarily replaces it with a child.
+    pub(crate) fn outgoing_traceparent(&mut self) -> Option<String> {
+        let trace = self.current_trace?;
+        if let Some((cached, value)) = &self.traceparent_cache {
+            if *cached == trace {
+                return Some(value.clone());
+            }
+        }
+        let value = trace.to_traceparent();
+        self.traceparent_cache = Some((trace, value.clone()));
+        Some(value)
+    }
+
     pub fn new() -> Self {
         Runtime {
             actors: HashMap::new(),
@@ -648,6 +667,7 @@ impl Runtime {
             scheduler: Scheduler::new(1),
             current_actor: None,
             current_trace: None,
+            traceparent_cache: None,
             main_heap: {
                 let mut heap = ActorHeap::new(64 * 1024);
                 heap.set_actor_id(MAIN_HEAP_ACTOR_ID);
@@ -1784,7 +1804,7 @@ impl Runtime {
         if self.shard_count > 1 {
             let target_shard = (target_id % self.shard_count as u64) as u16;
             if target_shard != self.shard_idx {
-                let out_trace = self.current_trace.as_ref().map(|t| t.to_traceparent());
+                let out_trace = self.outgoing_traceparent();
                 let _ = self.send_cross_shard_named_message(
                     target_id,
                     behavior,
@@ -2466,7 +2486,7 @@ impl Runtime {
         behavior_id: u16,
         args: &[Value],
     ) -> MessageAdmission {
-        let out_trace = self.current_trace.as_ref().map(|t| t.to_traceparent());
+        let out_trace = self.outgoing_traceparent();
         if self.shard_count > 1 {
             let target_shard = (target_id % self.shard_count as u64) as u16;
             if target_shard != self.shard_idx {
@@ -2515,7 +2535,7 @@ impl Runtime {
                 if sender != 0 {
                     self.current_actor = Some(sender);
                 }
-                let out_trace = self.current_trace.as_ref().map(|t| t.to_traceparent());
+                let out_trace = self.outgoing_traceparent();
                 self.send_cross_shard_message(
                     stable_id,
                     behavior_id,
@@ -2605,7 +2625,7 @@ impl Runtime {
         // the current span — not a synthetic child — must cross the wire; the
         // receiving side derives its own child. When no message is being
         // handled, the outgoing message starts a fresh trace on its own.
-        let out_trace = self.current_trace.as_ref().map(|t| t.to_traceparent());
+        let out_trace = self.outgoing_traceparent();
         // Cross-node routing by bare actor-ref value (RFC-0007 gap): a
         // spawn@node placeholder or reply-by-ref id whose hosting node we
         // know routes over the wire instead of the local mailbox. The
