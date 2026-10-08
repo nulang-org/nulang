@@ -218,3 +218,26 @@ fn enabling_iso_arena_after_module_load_recomputes_allocation_sites() {
     assert_eq!(stats.arena_allocs, 1);
     assert_eq!(stats.arena_resets, 1);
 }
+
+#[test]
+fn yielding_activation_preserves_arena_until_resume_completes() {
+    let (mut vm, stats) = with_iso_arena_vm();
+    vm.set_actor_callbacks(Box::new(TrackingCallbacks::new(stats.clone())));
+    let mut module = local_array_module(false);
+    let last = module.instructions.len() - 1;
+    module.instructions.insert(last, Instruction::new0(OpCode::Yield));
+    vm.load_module(module);
+
+    vm.run_from(0, 0).expect("first segment should yield");
+    assert!(vm.yield_pending);
+    {
+        let counts = stats.borrow();
+        assert_eq!(counts.arena_allocs, 1);
+        assert_eq!(counts.arena_resets, 0, "yield must not reclaim activation arena");
+    }
+
+    vm.resume().expect("resumed segment should complete");
+    assert!(!vm.yield_pending);
+    let counts = stats.borrow();
+    assert_eq!(counts.arena_resets, 1, "completion reclaims the arena once");
+}
