@@ -3075,7 +3075,9 @@ impl VM {
 
     fn iso_arena_bitmap(&self, module: &CodeModule) -> Vec<bool> {
         if !self.iso_arena_enabled {
-            return vec![false; module.instructions.len()];
+            // An empty bitmap is equivalent to all-false at every lookup.
+            // Avoid an O(bytecode length) allocation when the opt-in is off.
+            return Vec::new();
         }
         let qualifying = crate::iso_arena::qualifying_alloc_sites(module);
         (0..module.instructions.len())
