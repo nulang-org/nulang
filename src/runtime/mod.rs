@@ -4205,9 +4205,7 @@ impl Runtime {
                                     workflow_activation = Some(activation);
                                     atomic_workflow_turn = true;
                                 }
-                                Err(error)
-                                    if error.kind() == std::io::ErrorKind::Unsupported =>
-                                {
+                                Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
                                     // Backends without RFC 0022 support remain
                                     // on the explicit legacy compatibility path
                                     // until atomic history begins.
@@ -4358,12 +4356,9 @@ impl Runtime {
                 }
 
                 let step_name = self.step_name_for(actor_id, behavior_idx);
-                if let Err(error) = workflow::persist_step_completed(
-                    self,
-                    actor_id,
-                    workflow_activation,
-                    step_name,
-                ) {
+                if let Err(error) =
+                    workflow::persist_step_completed(self, actor_id, workflow_activation, step_name)
+                {
                     tracing::error!(
                         actor_id,
                         %error,
