@@ -1,6 +1,6 @@
 # Nulang Changelog
 ### Native AOT raw/boxed ABI correctness gate — 2026-10-08
-- **Unit/void-returning AOT functions remain boxed.** The existing native boxing wrapper always tags a raw return as Int; a tagged nil result must never be reinterpreted as Int zero.
+- **Unit/void-returning AOT functions remain boxed.** The existing native boxing wrapper always tags a raw return as Int; a tagged nil result must never be reinterpreted as Int zero. An explicit `Return(None)` also prevents raw codegen even if an externally constructed MIR function declares `Int`.
 - **Direct calls to other functions or closure locals keep the caller boxed** until a module-wide representation planner establishes matching raw native entry points. The existing raw self-recursion path stays eligible.
 - **Backend regression tests** reproduce nil-return corruption and an Int caller passing raw operands to a boxed division callee. Additional focused checks preserve self-recursion and reject local closure dispatch.
 - The fix is deliberately independent of the analysis-only native representation planner in #1406 and does not modify bytecode, scheduler, effects, or the wire protocol.
