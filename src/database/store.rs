@@ -88,8 +88,17 @@ impl WalBackedTablet {
 
     /// Durably commit one write before making it visible to readers.
     pub fn commit(&mut self, write: TabletWrite) -> Result<u64, WalBackedError> {
+        self.commit_inner(write, || {})
+    }
+
+    fn commit_inner(&mut self, write: TabletWrite, after_wal: impl FnOnce()) -> Result<u64, WalBackedError> {
+        // WAL durability, in-memory publication and acknowledgement form one
+        // fenced operation. Releasing the gate immediately after WAL fsync
+        // would allow a coordinator to assume ownership before commit returns.
+        let _gate = self.wal.acquire_public_io_gate()?;
         self.tablet.validate_write(&write)?;
-        self.wal.append_write(&write)?;
+        self.wal.append_write_under_held_gate(&write)?;
+        after_wal();
         Ok(self.tablet.publish_validated(write))
     }
 
