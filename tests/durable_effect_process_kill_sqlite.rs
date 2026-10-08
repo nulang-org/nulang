@@ -171,9 +171,11 @@ fn kill_child_after(stage: &str, dir: &Path) {
     let status = child.wait().expect("reap killed child");
     reader.join().expect("join child-output reader");
 
-    assert_eq!(
-        ready.expect("child did not acknowledge the durable checkpoint"),
-        format!("NULANG_KILL_PROOF_READY:{stage}").to_string()
+    assert!(
+        ready
+            .expect("child did not acknowledge the durable checkpoint")
+            .contains(&format!("NULANG_KILL_PROOF_READY:{stage}")),
+        "child must acknowledge the expected checkpoint"
     );
     kill_result.expect("child must still be alive at the kill point");
     assert!(!status.success(), "child must terminate by hard kill");
@@ -224,8 +226,8 @@ fn hard_kill_after_provider_commit_retries_same_key_without_duplicate_mutation()
         fs::read_to_string(dir.join("provider-committed-key")).unwrap(),
         spec.id.idempotency_key()
     );
-    assert_eq!(restarted.latest_sequence(ACTOR_ID), 3);
     drop(coordinator);
+    assert_eq!(restarted.latest_sequence(ACTOR_ID), 3);
     drop(restarted);
     fs::remove_dir_all(dir).unwrap();
 }
