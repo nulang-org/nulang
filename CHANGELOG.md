@@ -1,4 +1,10 @@
 # Nulang Changelog
+### Native AOT raw/boxed ABI correctness gate — 2026-10-08
+- **Unit/void-returning AOT functions remain boxed.** The existing native boxing wrapper always tags a raw return as Int; a tagged nil result must never be reinterpreted as Int zero.
+- **Direct calls to other functions or closure locals keep the caller boxed** until a module-wide representation planner establishes matching raw native entry points. The existing raw self-recursion path stays eligible.
+- **Backend regression tests** reproduce nil-return corruption and an Int caller passing raw operands to a boxed division callee. Additional focused checks preserve self-recursion and reject local closure dispatch.
+- The fix is deliberately independent of the analysis-only native representation planner in #1406 and does not modify bytecode, scheduler, effects, or the wire protocol.
+
 ### Receiver-acknowledged CRDT delta synchronization — 2026-10-07
 - **Per-peer CRDT frontiers now advance only after a matching NUL0 acknowledgement arrives from the intended receiver.** Dropped or unacknowledged batches remain retransmittable from that peer's last proven frontier instead of disappearing behind sender-side optimistic state.
 - **Peer recovery invalidates stale receiver knowledge.** A `Failed → Healthy` transition through heartbeat or authoritative gossip forgets prior CRDT frontier/correlation state so a restarted process receives fresh state.
