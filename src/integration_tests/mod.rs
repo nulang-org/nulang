@@ -20,20 +20,33 @@ mod tests {
     use std::collections::HashSet;
     use std::path::Path;
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     /// Thread-safe, shareable in-memory persistence store for tests that need
     /// to simulate a runtime restart while keeping the same underlying storage.
     #[derive(Debug, Clone)]
-    struct SharedMemoryStore(Arc<Mutex<MemoryStore>>, bool);
+    struct SharedMemoryStore(Arc<Mutex<MemoryStore>>, bool, Arc<AtomicBool>);
 
     impl SharedMemoryStore {
         fn new() -> Self {
-            Self(Arc::new(Mutex::new(MemoryStore::new())), false)
+            Self(
+                Arc::new(Mutex::new(MemoryStore::new())),
+                false,
+                Arc::new(AtomicBool::new(false)),
+            )
         }
 
         fn new_atomic() -> Self {
-            Self(Arc::new(Mutex::new(MemoryStore::new())), true)
+            Self(
+                Arc::new(Mutex::new(MemoryStore::new())),
+                true,
+                Arc::new(AtomicBool::new(false)),
+            )
+        }
+
+        fn reject_next_terminal_commit(&self) {
+            self.2.store(true, Ordering::SeqCst);
         }
     }
 
@@ -57,6 +70,17 @@ mod tests {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
                     "legacy shared test store intentionally has no atomic transitions",
+                ));
+            }
+            if transition.workflow_events.iter().any(|event| {
+                matches!(
+                    event,
+                    WorkflowEvent::StepCompleted { .. } | WorkflowEvent::StepFailed { .. }
+                )
+            }) && self.2.swap(false, Ordering::SeqCst)
+            {
+                return Err(std::io::Error::other(
+                    "injected one-shot terminal transition rejection",
                 ));
             }
             self.0.lock().unwrap().commit_transition(transition)
