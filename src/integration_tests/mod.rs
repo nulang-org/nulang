@@ -24,11 +24,24 @@ mod tests {
     /// Thread-safe, shareable in-memory persistence store for tests that need
     /// to simulate a runtime restart while keeping the same underlying storage.
     #[derive(Debug, Clone)]
-    struct SharedMemoryStore(Arc<Mutex<MemoryStore>>);
+    struct SharedMemoryStore(
+        Arc<Mutex<MemoryStore>>,
+        Arc<std::sync::atomic::AtomicBool>,
+    );
 
     impl SharedMemoryStore {
         fn new() -> Self {
-            Self(Arc::new(Mutex::new(MemoryStore::new())))
+            Self(
+                Arc::new(Mutex::new(MemoryStore::new())),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+        }
+
+        /// Inject a single failed terminal transition while allowing command
+        /// admission, signal receipt, and history reads to remain functional.
+        fn fail_next_terminal_transition(&self) {
+            self.1
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -37,6 +50,16 @@ mod tests {
             &mut self,
             transition: crate::runtime::DurableTransition,
         ) -> std::io::Result<crate::runtime::DurableCommit> {
+            if transition
+                .workflow_events
+                .iter()
+                .any(|event| matches!(event, WorkflowEvent::StepCompleted { .. }))
+                && self.1.swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(std::io::Error::other(
+                    "injected atomic StepCompleted write failure",
+                ));
+            }
             self.0.lock().unwrap().commit_transition(transition)
         }
         fn load_durable_tail_position(
