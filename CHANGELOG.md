@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Compiler-owned native representation planning (analysis only) — 2026-10-08
+- **A fresh-main replay of the conservative native representation and module call-graph planners from #1261** records typed MIR representations and rules out unboxed native ABIs at actor, effect, durable, FFI, heap, and unresolved-call boundaries.
+- **No native emitter, runtime ABI, bytecode, or AOT dispatch behavior changes.** The planner remains advisory until a separately tested codegen integration is ready.
+- **Tests** cover typed scalar representation, invalid callee targets, unit returns, runtime boundaries, recursive call graph proof, and boxed-callee invalidation.
+
 ### Receiver-acknowledged CRDT delta synchronization — 2026-10-07
 - **Per-peer CRDT frontiers now advance only after a matching NUL0 acknowledgement arrives from the intended receiver.** Dropped or unacknowledged batches remain retransmittable from that peer's last proven frontier instead of disappearing behind sender-side optimistic state.
 - **Peer recovery invalidates stale receiver knowledge.** A `Failed → Healthy` transition through heartbeat or authoritative gossip forgets prior CRDT frontier/correlation state so a restarted process receives fresh state.
