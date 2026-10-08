@@ -31,7 +31,8 @@ pub(crate) struct FabricConsumerProgressPolicy {
 
 impl FabricConsumerProgressPolicy {
     fn validate(&self) -> io::Result<()> {
-        if self.epoch == 0 || self.replicas.is_empty()
+        if self.epoch == 0
+            || self.replicas.is_empty()
             || !self.replicas.contains(&self.leader)
         {
             return Err(invalid("invalid consumer-progress replication policy"));
@@ -77,11 +78,14 @@ impl FabricConsumerProgressChange {
         stream_committed_through: u64,
     ) -> io::Result<()> {
         policy.validate()?;
-        if self.stream.is_empty() || self.stream.len() > 128
+        if self.stream.is_empty()
+            || self.stream.len() > 128
             || !self.stream.bytes().all(valid_name_char)
-            || self.consumer.is_empty() || self.consumer.len() > 128
+            || self.consumer.is_empty()
+            || self.consumer.len() > 128
             || !self.consumer.bytes().all(valid_name_char)
-            || self.epoch != policy.epoch || self.generation == 0
+            || self.epoch != policy.epoch
+            || self.generation == 0
             || self.metadata_sequence == 0
             || self.committed_cursor > stream_committed_through
             || self.acked_gaps.len() > MAX_ACK_GAPS
@@ -130,9 +134,11 @@ struct FabricConsumerProgressFrame {
 }
 
 impl FabricConsumerProgressFrame {
-    fn hash(version: u16, previous_hash: &str, event: &FabricConsumerProgressEvent)
-        -> io::Result<String>
-    {
+    fn hash(
+        version: u16,
+        previous_hash: &str,
+        event: &FabricConsumerProgressEvent,
+    ) -> io::Result<String> {
         let message = serde_json::to_vec(&(version, previous_hash, event))
             .map_err(|error| invalid(error.to_string()))?;
         Ok(blake3::hash(&message).to_hex().to_string())
@@ -151,9 +157,8 @@ impl FabricConsumerProgressFrame {
     fn validate(&self, expected_previous_hash: &str) -> io::Result<()> {
         if self.version != JOURNAL_FORMAT_VERSION
             || self.previous_hash != expected_previous_hash
-            || self.integrity_hash != Self::hash(
-                self.version, &self.previous_hash, &self.event,
-            )?
+            || self.integrity_hash
+                != Self::hash(self.version, &self.previous_hash, &self.event)?
         {
             return Err(invalid("Fabric consumer-progress journal integrity violation"));
         }
@@ -269,8 +274,9 @@ impl FileFabricConsumerProgressJournal {
         stream_committed_through: u64,
     ) -> io::Result<()> {
         change.validate(policy, stream_committed_through)?;
-        if change.metadata_sequence != self.latest_sequence.checked_add(1)
-            .ok_or_else(|| invalid("consumer-progress metadata index overflow"))?
+        let next_sequence = self.latest_sequence.checked_add(1)
+            .ok_or_else(|| invalid("consumer-progress metadata index overflow"))?;
+        if change.metadata_sequence != next_sequence
             || change.previous_metadata_sequence != self.latest_sequence
         {
             return Err(invalid("consumer-progress metadata predecessor does not match"));
@@ -279,7 +285,9 @@ impl FileFabricConsumerProgressJournal {
         // Epoch changes require a separate old-quorum recovery/transition
         // protocol, which is not implemented in this storage slice.
         if self.committed_policy.as_ref().is_some_and(|old| old != policy) {
-            return Err(invalid("consumer-progress epoch/policy transition requires quorum recovery"));
+            return Err(invalid(
+                "consumer-progress epoch/policy transition requires quorum recovery",
+            ));
         }
 
         if let Some(old) = self.committed.get(&change.key()) {
@@ -298,7 +306,9 @@ impl FileFabricConsumerProgressJournal {
     fn apply_event(&mut self, event: &FabricConsumerProgressEvent) -> io::Result<()> {
         match event {
             FabricConsumerProgressEvent::Prepare {
-                change, policy, stream_committed_through,
+                change,
+                policy,
+                stream_committed_through,
             } => {
                 if self.pending.is_some() {
                     return Err(invalid("consumer-progress journal has unresolved prepare"));
@@ -310,7 +320,8 @@ impl FileFabricConsumerProgressJournal {
                 });
             }
             FabricConsumerProgressEvent::Commit {
-                metadata_sequence, acknowledgers,
+                metadata_sequence,
+                acknowledgers,
             } => {
                 let pending = self.pending.as_ref().ok_or_else(|| {
                     invalid("consumer-progress commit has no durable predecessor")
@@ -386,7 +397,9 @@ impl FileFabricConsumerProgressJournal {
         }
         self.check_prepare(&change, &policy, stream_committed_through)?;
         self.append_event(FabricConsumerProgressEvent::Prepare {
-            change, policy, stream_committed_through,
+            change,
+            policy,
+            stream_committed_through,
         })
     }
 
