@@ -1074,7 +1074,7 @@ pub fn is_all_int(func: &mir::Function) -> bool {
     // A unit/void function instead returns tagged nil, so compiling it
     // unboxed would silently turn nil into integer zero at the entry point.
     matches!(
-        func.ret,
+        func.ret.as_ref(),
         Some(crate::types::Type::Primitive(
             crate::types::PrimitiveType::Int
         ))
