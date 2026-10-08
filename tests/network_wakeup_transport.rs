@@ -61,6 +61,9 @@ fn idle_tcp_transport_wait_times_out_without_fake_arrivals() {
         observed,
         Duration::from_millis(3),
     ));
-    assert_eq!(NetworkTransport::incoming_generation(&transport), Some(observed));
+    assert_eq!(
+        NetworkTransport::incoming_generation(&transport),
+        Some(observed)
+    );
     transport.shutdown();
 }
