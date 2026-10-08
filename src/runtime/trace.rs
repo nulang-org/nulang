@@ -19,15 +19,19 @@
 //! The optional `otel` feature can bridge those fields into real OTLP spans
 //! via `tracing-opentelemetry`.
 
+use rand_core::{OsRng, RngCore};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
-/// Thread-safe stateless PRNG for trace / span id generation.
+/// Lock-free trace / span ID generator initialized once from OS entropy.
 ///
-/// A monotonically incremented counter fed through splitmix64. Deterministic
-/// seeding is fine here — trace ids are correlation keys, not a security
-/// boundary, and this avoids pulling in `rand`/`getrandom`.
+/// A fixed seed repeats the same IDs in independently started processes and
+/// merges unrelated distributed traces. The OS-generated process seed and
+/// independent salts preserve cheap per-ID generation without that collision.
 struct Rng {
     state: AtomicU64,
+    root_salt: u64,
+    span_salt: u64,
 }
 
 impl Rng {
@@ -41,13 +45,23 @@ impl Rng {
     }
 }
 
-static RNG: Rng = Rng {
-    state: AtomicU64::new(0x4D59_5DF4_D0F3_3173),
-};
+static RNG: OnceLock<Rng> = OnceLock::new();
+
+fn rng() -> &'static Rng {
+    RNG.get_or_init(|| {
+        let mut entropy = OsRng;
+        Rng {
+            state: AtomicU64::new(entropy.next_u64()),
+            root_salt: entropy.next_u64(),
+            span_salt: entropy.next_u64(),
+        }
+    })
+}
 
 fn nonzero_u64() -> u64 {
+    let rng = rng();
     loop {
-        let v = RNG.next_u64();
+        let v = rng.next_u64() ^ rng.span_salt;
         if v != 0 {
             return v;
         }
@@ -55,13 +69,14 @@ fn nonzero_u64() -> u64 {
 }
 
 fn nonzero_u128() -> u128 {
-    let hi = nonzero_u64();
-    let lo = RNG.next_u64();
-    let v = ((hi as u128) << 64) | lo as u128;
-    if v == 0 {
-        1
-    } else {
-        v
+    let rng = rng();
+    loop {
+        let hi = rng.next_u64() ^ rng.root_salt;
+        let lo = rng.next_u64();
+        let v = ((hi as u128) << 64) | lo as u128;
+        if v != 0 {
+            return v;
+        }
     }
 }
 
