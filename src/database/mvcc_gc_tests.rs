@@ -1,6 +1,4 @@
-use super::mvcc_gc::{
-    plan_versions_for_floor, retain_versions_for_floor, MvccRetentionError,
-};
+use super::mvcc_gc::{plan_versions_for_floor, retain_versions_for_floor, MvccRetentionError};
 use super::tablet::VersionedValue;
 
 fn put(sequence: u64, value: &[u8]) -> VersionedValue {
@@ -57,10 +55,7 @@ fn retention_keeps_newest_baseline_below_floor_and_every_version_at_or_above_it(
 #[test]
 fn floor_zero_retains_complete_history() {
     let versions = vec![put(1, b"one"), tombstone(3), put(7, b"seven")];
-    assert_eq!(
-        retain_versions_for_floor(&versions, 0).unwrap(),
-        versions
-    );
+    assert_eq!(retain_versions_for_floor(&versions, 0).unwrap(), versions);
 }
 
 #[test]
