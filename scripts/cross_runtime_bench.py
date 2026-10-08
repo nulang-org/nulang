@@ -197,7 +197,7 @@ def build_commands(selected: list[str]) -> dict[str, list[str]]:
         manifest = FIXTURES / "ractor_baseline" / "Cargo.toml"
         # Isolated Cargo workspace: do not add Ractor to Nulang's dependencies.
         command_output(
-            [cargo, "build", "--release", "--manifest-path", str(manifest)]
+            [cargo, "build", "--locked", "--release", "--manifest-path", str(manifest)]
         )
         metadata = json.loads(
             command_output(
