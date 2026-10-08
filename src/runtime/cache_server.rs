@@ -25,9 +25,9 @@ use super::cache_dispatch::{
 use super::cache_persistence::{
     CacheDurabilityError, CacheDurabilityMode, CacheDurabilityStatus, DurableCacheStore,
 };
+use super::cache_pipeline::{CacheAskingUpdate, CachePipelineError, CacheResponsePipeline};
 use super::resp::RespArgs;
 use super::resp_cache::{CacheCommandError, CacheCommandTarget};
-use super::cache_pipeline::{CacheAskingUpdate, CachePipelineError, CacheResponsePipeline};
 
 const LISTENER_TOKEN: Token = Token(0);
 const WAKE_TOKEN: Token = Token(1);
