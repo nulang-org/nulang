@@ -192,6 +192,15 @@ fn duplicate_key_mutations_recover_as_one_mvcc_version_per_commit() {
         assert_eq!(tablet.commit(first).unwrap(), 1);
         assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"last"[..]));
 
+        // Recover from the unreclaimed WAL before any checkpoint exists.
+        // This exercises the same repeated-key coalescing on replay, not only
+        // on direct commit and subsequent checkpoint restoration.
+        drop(tablet);
+        let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
+        assert_eq!(tablet.current_sequence(), 1);
+        assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"last"[..]));
+        assert_eq!(tablet.read_latest(b"other"), Some(&b"independent"[..]));
+
         let second = tablet
             .prepare_write(
                 3,
