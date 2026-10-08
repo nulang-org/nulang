@@ -132,7 +132,8 @@ def build_commands(selected: list[str]) -> dict[str, list[str]]:
         isolated_binary = BUILD / (runtime + suffix)
         shutil.copy2(binary, isolated_binary)
         commands[runtime] = [
-            str(isolated_binary), "--backend", backend, "--format", "human"
+            str(isolated_binary), "--backend", backend, "--cross-runtime-only",
+            "--format", "human"
         ]
 
     if "rust" in selected:
