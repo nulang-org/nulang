@@ -233,11 +233,13 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Running isolated first consistently is easy to reproduce; repeat runs
     // and alternate externally if the benchmark is used in performance gates.
-    let isolated = measure(&root, false, &settings);
-    let shared = isolated.as_ref().map(|_| measure(&root, true, &settings));
+    let outcome = (|| -> io::Result<Vec<ModeResult>> {
+        let isolated = measure(&root, false, &settings)?;
+        let shared = measure(&root, true, &settings)?;
+        Ok(vec![isolated, shared])
+    })();
     let _ = fs::remove_dir_all(&root);
-    let result = vec![isolated?, shared??];
-    println!("{}", serde_json::to_string_pretty(&result)?);
+    println!("{}", serde_json::to_string_pretty(&outcome?)?);
     Ok(())
 }
 
