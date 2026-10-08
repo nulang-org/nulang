@@ -224,6 +224,108 @@ mod tests {
     }
 
     #[test]
+    fn rejects_local_closure_reassigned_before_call() {
+        let mut caller = FunctionBuilder::new("caller", Some(Type::int()));
+        let x = caller.add_param("x", Type::int());
+        let closure = caller.add_temp(Type::unit());
+        caller.assign(
+            closure,
+            RValue::Closure {
+                func: 1,
+                captures: vec![],
+            },
+        );
+        caller.assign(
+            closure,
+            RValue::Closure {
+                func: 2,
+                captures: vec![],
+            },
+        );
+        let out = caller.add_temp(Type::int());
+        caller.assign(
+            out,
+            RValue::Call {
+                func: FuncRef::Local(closure),
+                args: vec![x],
+            },
+        );
+        caller.terminate(Terminator::Return(Some(out)));
+        let mut module = Module::new("reassigned");
+        module.functions.push(caller.build());
+        module.functions.push(int_identity("first"));
+        module.functions.push(int_identity("second"));
+
+        let plan = NativeModulePlan::for_module(&module);
+        assert!(
+            !plan.is_unboxed_int_function(0),
+            "a multiply assigned closure local must never qualify for raw ABI calls"
+        );
+    }
+
+    #[test]
+    fn rejects_call_before_local_closure_definition() {
+        let mut caller = FunctionBuilder::new("caller", Some(Type::int()));
+        let x = caller.add_param("x", Type::int());
+        let closure = caller.add_temp(Type::unit());
+        let out = caller.add_temp(Type::int());
+        caller.assign(
+            out,
+            RValue::Call {
+                func: FuncRef::Local(closure),
+                args: vec![x],
+            },
+        );
+        caller.assign(
+            closure,
+            RValue::Closure {
+                func: 1,
+                captures: vec![],
+            },
+        );
+        caller.terminate(Terminator::Return(Some(out)));
+        let mut module = Module::new("call-before-binding");
+        module.functions.push(caller.build());
+        module.functions.push(int_identity("leaf"));
+
+        let plan = NativeModulePlan::for_module(&module);
+        assert!(
+            !plan.is_unboxed_int_function(0),
+            "a definition after the call does not prove a static callee"
+        );
+    }
+
+    #[test]
+    fn accepts_single_prior_local_closure_definition_in_same_block() {
+        let mut caller = FunctionBuilder::new("caller", Some(Type::int()));
+        let x = caller.add_param("x", Type::int());
+        let closure = caller.add_temp(Type::unit());
+        caller.assign(
+            closure,
+            RValue::Closure {
+                func: 1,
+                captures: vec![],
+            },
+        );
+        let out = caller.add_temp(Type::int());
+        caller.assign(
+            out,
+            RValue::Call {
+                func: FuncRef::Local(closure),
+                args: vec![x],
+            },
+        );
+        caller.terminate(Terminator::Return(Some(out)));
+        let mut module = Module::new("stable-direct-closure");
+        module.functions.push(caller.build());
+        module.functions.push(int_identity("leaf"));
+
+        let plan = NativeModulePlan::for_module(&module);
+        assert!(plan.is_unboxed_int_function(0));
+        assert!(plan.is_unboxed_int_function(1));
+    }
+
+    #[test]
     fn admits_pure_int_leaf() {
         let mut module = Module::new("leaf");
         module.functions.push(int_identity("leaf"));
