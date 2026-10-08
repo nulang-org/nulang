@@ -32,10 +32,15 @@ def validate_options(workload: str, repeat: int, frequency: int) -> None:
 
 def benchmark_command(binary: Path, workload: str, repeat: int) -> list[str]:
     validate_options(workload, repeat, 99)
-    return [
+    command = [
         str(binary), "--benchmark", workload,
         "--repeat", str(repeat), "--format", "jsonl",
     ]
+    # Profiling needs the actor dispatch hot path, not repeated compiler setup.
+    # The canonical Savina behavior is unchanged without this opt-in flag.
+    if workload == "ping_pong":
+        command.append("--reuse-setup")
+    return command
 
 
 def perf_command(
