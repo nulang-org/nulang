@@ -621,6 +621,12 @@ impl Runtime {
         &mut self,
         change: FabricConsumerProgressChange,
     ) -> io::Result<()> {
+        if change.partition != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "consumer-progress metadata currently supports only physical partition 0",
+            ));
+        }
         let policy = self.consumer_progress_validate_leader(&change.stream)?;
         let committed_through = self.fabric_stream_committed_sequence(&change.stream)?;
         let path = self.consumer_progress_directory(&change.stream)?;
@@ -718,6 +724,12 @@ impl Runtime {
         from: NodeId,
     ) -> io::Result<FabricConsumerProgressAckWire> {
         wire.verify()?;
+        if wire.change.partition != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "consumer-progress follower supports only physical partition 0",
+            ));
+        }
         let installed = self.consumer_progress_installed_policy(&wire.change.stream)?;
         let local = self.distributed.node_id.ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotConnected, "consumer-progress follower requires distribution")
