@@ -81,3 +81,23 @@ fn unboxed_caller_does_not_pass_raw_int_to_boxed_callee() {
         "raw Int arguments must not cross into a boxed callee ABI"
     );
 }
+
+#[test]
+fn declared_int_function_with_unit_terminator_must_not_retag_nil() {
+    // MIR may be built directly by a host or a compiler pass. A declared
+    // integer return type is not enough to prove the actual return value:
+    // Return(None) still emits the canonical tagged nil sentinel.
+    let mut main = FunctionBuilder::new("main", Some(Type::int()));
+    main.terminate(Terminator::Return(None));
+
+    let mut module = Module::new("native-mismatched-unit-return");
+    module.functions.push(main.build());
+
+    let compiled = AotModule::compile(&module).expect("native entry should compile");
+    let raw = compiled.run().expect("native entry should run");
+    assert_eq!(
+        raw,
+        Value::nil().as_raw(),
+        "unit terminator must preserve nil even with a declared Int return"
+    );
+}
