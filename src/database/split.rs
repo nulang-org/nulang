@@ -153,10 +153,8 @@ impl OwnedDirectory {
             .open(root.join(".nudb-write-gate.lock"))?;
         match gate.try_lock() {
             Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                return Err(SplitError::OwnerBusy);
-            }
-            Err(error) => return Err(error.into()),
+            Err(std::fs::TryLockError::WouldBlock) => return Err(SplitError::OwnerBusy),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
         }
         let file = OpenOptions::new()
             .create(true)
@@ -169,10 +167,8 @@ impl OwnedDirectory {
                 _io_gate: gate,
                 _lock: file,
             }),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                Err(SplitError::OwnerBusy)
-            }
-            Err(error) => Err(error.into()),
+            Err(std::fs::TryLockError::WouldBlock) => Err(SplitError::OwnerBusy),
+            Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
         }
     }
 
@@ -269,11 +265,8 @@ impl SingleNodeSplitStore {
                     "tablet files exist without routing manifest".into(),
                 ));
             }
-            let parent_tablet = WalBackedTablet::open_managed(
-                parent.clone(),
-                &parent_wal,
-                &owner_lock,
-            )?;
+            let parent_tablet =
+                WalBackedTablet::open_managed(parent.clone(), &parent_wal, &owner_lock)?;
             write_manifest(&manifest_path, &DiskManifest::for_parent(&parent), None)?;
             Active::Parent(parent_tablet)
         };
@@ -593,7 +586,9 @@ impl fmt::Display for SplitError {
             Self::InvalidManifest(message) => write!(f, "invalid routing manifest: {message}"),
             Self::OutsideParentRange => f.write_str("key outside source tablet range"),
             Self::AlreadySplit => f.write_str("tablet has already been split"),
-            Self::OwnerBusy => f.write_str("another process currently owns this NuDB tablet directory"),
+            Self::OwnerBusy => {
+                f.write_str("another process currently owns this NuDB tablet directory")
+            }
             Self::Poisoned => f.write_str("tablet routing must be reopened after ambiguous split"),
             Self::Interrupted(message) => write!(f, "injected NuDB split interruption: {message}"),
         }
@@ -781,7 +776,10 @@ mod tests {
             let mut recovered = SingleNodeSplitStore::open(&root, parent.clone()).unwrap();
             assert_eq!(recovered.is_split(), published, "stage={stage}");
             assert_eq!(recovered.read_latest(b"b").unwrap(), Some(b"left".to_vec()));
-            assert_eq!(recovered.read_latest(b"n").unwrap(), Some(b"right".to_vec()));
+            assert_eq!(
+                recovered.read_latest(b"n").unwrap(),
+                Some(b"right".to_vec())
+            );
             let plan = parent
                 .plan_split(
                     b"m",
