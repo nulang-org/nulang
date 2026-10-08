@@ -9,7 +9,6 @@
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, OnceLock};
 
-use super::cache::CacheStore;
 use super::cache_cluster::{
     execute_cluster_command, CacheClusterCommandError, CacheEndpointMap, CacheRoutingMode,
 };
@@ -508,7 +507,7 @@ impl CacheDispatcher {
 
 #[cfg(test)]
 mod tests {
-    use super::super::cache::{redis_slot, CacheValueView};
+    use super::super::cache::{redis_slot, CacheStore, CacheValueView};
     use super::super::cache_cluster::CacheAdvertisedEndpoint;
     use super::super::cache_routing::CacheSlotRange;
     use super::*;
