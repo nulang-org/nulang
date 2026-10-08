@@ -549,11 +549,21 @@ impl S3Fifo {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ExpirationLocation {
+    level: usize,
+    bucket: usize,
+    index: usize,
+}
+
 #[derive(Debug)]
 struct ExpirationWheel {
     tick_ms: u64,
     buckets_per_level: usize,
     levels: Vec<Vec<Vec<ExpirationRef>>>,
+    // One handle per entry slot keeps TTL overwrite/cancel O(1) and avoids
+    // accumulating stale expiration records under same-key write churn.
+    locations: Vec<Option<ExpirationLocation>>,
     last_tick: Option<u64>,
 }
 
@@ -568,6 +578,7 @@ impl ExpirationWheel {
             levels: (0..DEFAULT_WHEEL_LEVELS)
                 .map(|_| (0..bucket_count).map(|_| Vec::new()).collect())
                 .collect(),
+            locations: Vec::new(),
             last_tick: None,
         }
     }
@@ -576,7 +587,27 @@ impl ExpirationWheel {
         self.buckets_per_level.trailing_zeros()
     }
 
+    fn cancel(&mut self, slot: u32) {
+        let Some(location) = self
+            .locations
+            .get_mut(slot as usize)
+            .and_then(Option::take)
+        else {
+            return;
+        };
+
+        let bucket = &mut self.levels[location.level][location.bucket];
+        bucket.swap_remove(location.index);
+        if let Some(moved) = bucket.get(location.index) {
+            self.locations[moved.slot as usize]
+                .as_mut()
+                .expect("moved expiration must have a location")
+                .index = location.index;
+        }
+    }
+
     fn schedule(&mut self, item: ExpirationRef, now_ms: u64) {
+        self.cancel(item.slot);
         let now_tick = now_ms / self.tick_ms;
         let expires_tick = item.expires_at_ms / self.tick_ms;
         self.last_tick.get_or_insert(now_tick);
@@ -596,7 +627,17 @@ impl ExpirationWheel {
         let shift = bits.saturating_mul(level as u32);
         let coarse_tick = expires_tick >> shift;
         let bucket = (coarse_tick & (self.buckets_per_level as u64 - 1)) as usize;
+        let index = self.levels[level][bucket].len();
         self.levels[level][bucket].push(item);
+        let slot_index = item.slot as usize;
+        if slot_index >= self.locations.len() {
+            self.locations.resize(slot_index + 1, None);
+        }
+        self.locations[slot_index] = Some(ExpirationLocation {
+            level,
+            bucket,
+            index,
+        });
     }
 
     fn drain_level_range(
@@ -635,6 +676,7 @@ impl ExpirationWheel {
     }
 
     fn drain_candidates(&mut self, now_ms: u64, out: &mut Vec<ExpirationRef>) {
+        let output_start = out.len();
         let current = now_ms / self.tick_ms;
         let Some(last) = self.last_tick else {
             self.last_tick = Some(current);
@@ -670,12 +712,21 @@ impl ExpirationWheel {
             }
         }
 
+        // Bucket drains move records out of the wheel. Clear their handles
+        // before the caller can reschedule an unexpired candidate.
+        for item in &out[output_start..] {
+            self.locations[item.slot as usize] = None;
+        }
         self.last_tick = Some(current);
     }
 
     fn reserved_bytes(&self) -> usize {
-        self.levels
+        self.locations
             .capacity()
+            .saturating_mul(std::mem::size_of::<Option<ExpirationLocation>>())
+            .saturating_add(
+                self.levels
+                    .capacity()
             .saturating_mul(std::mem::size_of::<Vec<Vec<ExpirationRef>>>())
             .saturating_add(
                 self.levels
@@ -696,6 +747,7 @@ impl ExpirationWheel {
                             )
                     })
                     .sum::<usize>(),
+            ),
             )
     }
 }
@@ -840,7 +892,9 @@ impl CacheStore {
         let mut new_entries = 0usize;
         let mut arena_lengths = Vec::with_capacity(pairs.len().saturating_mul(2));
 
-        for (index, &(key, value)) in pairs.iter().enumerate() {
+        // Account for each unique key in expected O(n), even with duplicates.
+        let mut seen_keys = HashSet::with_capacity(pairs.len());
+        for &(key, value) in pairs {
             if key.len() > self.config.max_key_bytes {
                 return Err(CacheWriteError::KeyTooLarge);
             }
@@ -850,9 +904,7 @@ impl CacheStore {
 
             let hash = self.hash(key);
             let exists_in_store = self.find_slot(key, hash).is_some();
-            let exists_earlier_in_batch = pairs[..index]
-                .iter()
-                .any(|(previous_key, _)| *previous_key == key);
+            let exists_earlier_in_batch = !seen_keys.insert(key);
             if !exists_in_store && !exists_earlier_in_batch {
                 new_entries = new_entries.saturating_add(1);
                 arena_lengths.push(key.len());
@@ -1275,6 +1327,7 @@ impl CacheStore {
         let Some(entry) = slot.entry.take() else {
             return false;
         };
+        self.expiry.cancel(slot_id);
         self.remove_bucket(entry.hash, slot_id);
         self.eviction.record_remove(entry.eviction_queue);
         entry.key.release(&mut self.arena);
@@ -1309,6 +1362,8 @@ impl CacheStore {
                     },
                     now_ms,
                 );
+            } else {
+                self.expiry.cancel(slot_id);
             }
             self.stats.sets += 1;
             return;
