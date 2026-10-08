@@ -7,7 +7,7 @@
 //! authenticated cluster transport before supplying a certificate here.
 //! No cluster-durable success may be inferred merely from proposing locally.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -750,19 +750,9 @@ impl Runtime {
             wire.change.clone(),
             wire.policy.clone(),
             wire.stream_committed_through,
-        )?;
-        let key = (
-            wire.change.stream,
-            wire.change.partition,
-            wire.change.metadata_sequence,
-            wire.digest,
-        );
-        self.distributed
-            .fabric_consumer_progress_receipts
-            .entry(key)
-            .or_default()
-            .insert(NodeId(wire.policy.leader));
-        Ok(())
+        )
+        // The leader's own fsynced Prepare is included as the first local
+        // vote in the durable journal. No replica receipt is assumed.
     }
 
     /// Dispatch an already fsynced leader prepare to healthy installed followers.
@@ -896,7 +886,7 @@ impl Runtime {
             ));
         }
         let path = self.consumer_progress_directory(&receipt.stream)?;
-        let journal = FileFabricConsumerProgressJournal::open(path)?;
+        let mut journal = FileFabricConsumerProgressJournal::open(path)?;
         let (change, pending_policy, stage_bound) = journal.pending_change().ok_or_else(|| {
             invalid("consumer-progress replica receipt has no pending leader proposal")
         })?;
@@ -914,17 +904,10 @@ impl Runtime {
         if receipt.digest != wire.digest {
             return Err(invalid("consumer-progress replica receipt digest mismatch"));
         }
-        let key = (
-            receipt.stream.clone(), receipt.partition,
-            receipt.metadata_sequence, receipt.digest.clone(),
-        );
-        // Sender identity is validated against incoming transport before this
-        // method runs. These volatile observations are NOT durable certificates.
-        self.distributed.fabric_consumer_progress_receipts
-            .entry(key)
-            .or_insert_with(|| HashSet::from([local]))
-            .insert(from);
-        Ok(())
+        // The transport already checked incoming.from_node. Persist that
+        // fsynced receipt before it can count towards the commit gate. This
+        // is still trust in the existing transport, not cryptographic proof.
+        journal.record_verified_receipt(from.0, &receipt.digest)
     }
 
     pub(crate) fn fabric_consumer_progress_observed_votes(
@@ -942,14 +925,10 @@ impl Runtime {
         if change.partition != partition || change.metadata_sequence != metadata_sequence {
             return Err(invalid("consumer-progress vote query mismatched pending proposal"));
         }
-        let wire = FabricConsumerProgressPrepareWire::new(
+        let _wire = FabricConsumerProgressPrepareWire::new(
             change.clone(), policy, stage_bound,
         )?;
-        let key = (stream.to_string(), partition, metadata_sequence, wire.digest);
-        let mut votes: Vec<NodeId> = self.distributed.fabric_consumer_progress_receipts
-            .get(&key).map(|set| set.iter().copied().collect()).unwrap_or_default();
-        votes.sort_by_key(|id| id.0);
-        Ok(votes)
+        Ok(journal.verified_voters().into_iter().map(NodeId).collect())
     }
 }
 
