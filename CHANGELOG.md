@@ -8,6 +8,10 @@
 - **Peer recovery invalidates stale receiver knowledge.** A `Failed → Healthy` transition through heartbeat or authoritative gossip forgets prior CRDT frontier/correlation state so a restarted process receives fresh state.
 - **Tracked sends distinguish unsupported transports from explicit rejection.** Compatibility transports retain the legacy untracked fallback, while tracked-capable rejection cannot be reinterpreted as success and wrong-peer ACKs cannot advance another peer's frontier.
 
+### Poll-rate-independent cluster gossip — 2026-10-06
+- **Cluster gossip now runs on an explicit 100 ms cadence instead of every `Runtime::process_network()` poll.** This prevents hot remote-actor polling loops from amplifying membership traffic into bounded transport queue backpressure while preserving the deterministic cluster-maintenance cadence.
+- **A virtual-clock regression and stacked remote RTT probe pin the boundary.** Immediate repeated ticks suppress gossip, emission resumes at 100 ms, and the Healthy-membership loopback probe completes 2,000 roundtrips without the prior transport stall.
+
 ### Standalone SQLite feature dependency closure — 2026-10-02
 - **The standalone `sqlite` feature now enables Tokio directly because `LibsqlStore` owns a Tokio runtime.** Minimal `--no-default-features --features sqlite` builds no longer rely on unrelated default-profile features to supply that direct dependency.
 
