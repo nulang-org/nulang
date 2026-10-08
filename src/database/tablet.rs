@@ -361,12 +361,15 @@ impl MemoryTablet {
         }
         // TabletSplitPlan has public fields. Recompute its canonical shape,
         // including the split boundary, IDs and both ownership epochs.
-        let canonical = self.descriptor.plan_split(
-            &plan.split_key,
-            plan.left.id(),
-            plan.right.id(),
-            plan.left.ownership_epoch(),
-        )?;
+        let canonical = self
+            .descriptor
+            .plan_split(
+                &plan.split_key,
+                plan.left.id(),
+                plan.right.id(),
+                plan.left.ownership_epoch(),
+            )
+            .map_err(|_| TabletError::SplitPlanMismatch)?;
         if canonical != *plan {
             return Err(TabletError::SplitPlanMismatch);
         }
