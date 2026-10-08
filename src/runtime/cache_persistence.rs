@@ -181,6 +181,16 @@ impl DurableCacheStore {
         self.poisoned
     }
 
+    #[cfg(test)]
+    pub(crate) fn make_wal_readonly_for_test(&mut self, path: &Path) -> io::Result<()> {
+        let readonly = OpenOptions::new().read(true).open(path)?;
+        self.wal
+            .as_mut()
+            .expect("test requires a journal-backed store")
+            .file = readonly;
+        Ok(())
+    }
+
     pub fn durability_mode(&self) -> CacheDurabilityMode {
         self.mode
     }
