@@ -80,9 +80,9 @@ filesystem reorderings, or storage hardware faults.
   also hold the same gate through append/fsync, checkpoint publication, and
   WAL reclamation/reopen. Owner acquisition must take this gate first, so
   a mutation that acquired the gate before ownership change finishes before
-  ownership is granted; a competing mutation is rejected with
-  `WriteGateBusy` or `ManagedDirectory`. Managed coordinator WALs operate
-  under the coordinator's lifetime gate.
+  ownership is granted; a competing public mutation waits for the gate,
+  then fails with `ManagedDirectory` after publication. Managed coordinator
+  WALs operate under the coordinator's lifetime gate.
 - **Cooperative public WAL API fence:** `FileWal::open` and
   `WalBackedTablet::open` fail closed when a persistent
   `.nudb-owner.lock` or `route.manifest` is present, including when a
