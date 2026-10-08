@@ -941,4 +941,52 @@ mod transactional_receive_tests {
             "reset must rewind indexed cursors and clear tried state"
         );
     }
+    #[test]
+    fn sparse_reset_tracks_only_tried_candidates_in_deep_mailbox() {
+        let mut mb = Mailbox::new(0);
+        for sender in 0..4096u64 {
+            let behavior = if sender == 4095 { 9 } else { 1 };
+            mb.push_local(msg(behavior, sender, MessagePriority::Normal))
+                .unwrap();
+        }
+
+        let (_, candidate) = mb.receive_match(&[9]).expect("tail candidate");
+        assert_eq!(candidate[0].as_int(), Some(4095));
+        // A single guard attempt must not create reset work proportional to
+        // the 4095 unrelated messages staged in the same lane.
+        let indexes = mb.receive_indexes.as_ref().expect("lazy indexes");
+        assert_eq!(indexes.local.tried_positions.as_slice(), &[4095]);
+
+        mb.reset_receive_match();
+        assert!(mb
+            .receive_indexes
+            .as_ref()
+            .unwrap()
+            .local
+            .tried_positions
+            .is_empty());
+        assert_eq!(
+            mb.receive_match(&[9]).expect("reset exposes candidate").1[0].as_int(),
+            Some(4095)
+        );
+        assert_eq!(mb.len(), 4096);
+    }
+
+    #[test]
+    fn ordinary_pop_after_rejected_candidate_reindexes_remaining_messages() {
+        let mut mb = Mailbox::new(4);
+        mb.push_local(msg(7, 11, MessagePriority::Normal)).unwrap();
+        mb.push_local(msg(7, 22, MessagePriority::Normal)).unwrap();
+        mb.push_local(msg(7, 33, MessagePriority::Normal)).unwrap();
+
+        assert_eq!(mb.receive_match(&[7]).unwrap().1[0].as_int(), Some(11));
+        assert_eq!(mb.pop().expect("FIFO pop").sender, 11);
+        mb.reset_receive_match();
+
+        assert_eq!(mb.receive_match(&[7]).unwrap().1[0].as_int(), Some(22));
+        mb.commit_receive_match().expect("commit after pop");
+        assert_eq!(mb.pop().unwrap().sender, 33);
+        assert!(mb.is_empty());
+    }
+
 }
