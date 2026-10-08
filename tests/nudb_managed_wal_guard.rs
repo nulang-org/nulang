@@ -106,6 +106,37 @@ fn direct_parent_and_child_wal_open_are_rejected_after_promotion() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[cfg(unix)]
+#[test]
+fn public_wal_open_cannot_escape_managed_guard_via_symlink_aliases() {
+    use std::os::unix::fs::symlink;
+
+    let root = root("managed_target");
+    let alias_root = root("alias_location");
+    let owner = SingleNodeSplitStore::open(&root, descriptor()).unwrap();
+    fs::create_dir_all(&alias_root).unwrap();
+
+    // A link to an individual file and a link to its directory must both
+    // resolve to the managed root before public WAL admission.
+    let file_alias = alias_root.join("parent_alias.wal");
+    symlink(root.join("parent.wal"), &file_alias).unwrap();
+    assert!(matches!(
+        FileWal::open(&file_alias),
+        Err(WalError::ManagedDirectory)
+    ));
+
+    let dir_alias = alias_root.join("tablet_dir");
+    symlink(&root, &dir_alias).unwrap();
+    assert!(matches!(
+        FileWal::open(dir_alias.join("parent.wal")),
+        Err(WalError::ManagedDirectory)
+    ));
+
+    drop(owner);
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(alias_root);
+}
+
 #[test]
 fn preexisting_public_wal_handle_cannot_append_or_reclaim_after_directory_is_managed() {
     let root = root("old_handle");
