@@ -49,6 +49,8 @@ class NativeBackendBuildTests(unittest.TestCase):
         self.assertIn("--backend", commands["nulang"])
         self.assertIn("aot", commands["nulang-aot"])
         self.assertIn("bytecode", commands["nulang"])
+        self.assertIn("--cross-runtime-only", commands["nulang"])
+        self.assertIn("--cross-runtime-only", commands["nulang-aot"])
 
     def test_aot_results_are_not_accepted_as_bytecode(self):
         output = "\n".join(
@@ -64,6 +66,8 @@ class NativeBackendSourceContractTests(unittest.TestCase):
     def test_aot_backend_compiles_mir_and_registers_before_actor_spawn(self):
         source = (ROOT / "src/bin/nulang_savina.rs").read_text()
         self.assertIn("--backend", source)
+        self.assertIn("--cross-runtime-only", source)
+        self.assertIn("config.cross_runtime_only", source)
         self.assertIn("AotModule::compile(&mir)", source)
         self.assertIn("register_aot_module(aot)", source)
         self.assertIn("aot_targets", source)
