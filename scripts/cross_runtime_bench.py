@@ -298,7 +298,7 @@ def print_table(summary: dict[str, dict[str, dict[str, float | int]]]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--runs", type=int, default=5, help="measured runs per runtime")
+    parser.add_argument("--runs", type=int, default=8, help="measured runs per runtime")
     parser.add_argument("--warmup", type=int, default=1, help="discarded warm-up runs")
     parser.add_argument(
         "--runtimes",
