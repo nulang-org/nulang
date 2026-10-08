@@ -54,6 +54,9 @@ jobs:
       - name: Enable corepack
         run: corepack enable
 
+      - name: Validate documentation examples discovery
+        run: python3 -m unittest scripts.tests.test_verify_doc_examples
+
       - name: Install Rust for browser playground
         uses: dtolnay/rust-toolchain@master
         with:
