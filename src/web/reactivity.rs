@@ -529,6 +529,48 @@ pub fn inject_client_runtime_script(html: &str) -> String {
     }
 }
 
+/// Embed a validated, server-owned canonical UI snapshot ahead of the client
+/// runtime. This helper is opt-in: the HTTP host must supply a trusted document
+/// scoped to the current user/session; no browser-supplied metadata is trusted.
+/// The serialized JSON is safe inside an HTML script element and is read by
+/// `client_runtime.js` before action handlers become interactive.
+pub fn inject_client_runtime_script_with_document(
+    html: &str,
+    document: &nulang_ui_protocol::UiDocument,
+) -> Result<String, String> {
+    document
+        .validate()
+        .map_err(|error| format!("invalid UI bootstrap document: {error}"))?;
+    let message = nulang_ui_protocol::RuntimeToHostMessage::snapshot(document.clone());
+    let json = serde_json::to_string(&message)
+        .map_err(|error| format!("serialize UI bootstrap document: {error}"))?;
+    // Prevent a string value such as "</script>" from escaping the data block.
+    let safe_json = json
+        .replace('<', r"\u003c")
+        .replace('>', r"\u003e")
+        .replace('&', r"\u0026");
+    let bootstrap =
+        format!(r#"<script id="nulang-ui-bootstrap" type="application/json">{safe_json}</script>"#);
+    let loader = r#"<script src="/app.client.js"></script>"#;
+    let rendered = inject_client_runtime_script(html);
+    if let Some(pos) = rendered.find(loader) {
+        let mut output = String::with_capacity(rendered.len() + bootstrap.len());
+        output.push_str(&rendered[..pos]);
+        output.push_str(&bootstrap);
+        output.push_str(&rendered[pos..]);
+        Ok(output)
+    } else if let Some(pos) = rendered.rfind("</body>") {
+        let mut output = String::with_capacity(rendered.len() + bootstrap.len() + loader.len());
+        output.push_str(&rendered[..pos]);
+        output.push_str(&bootstrap);
+        output.push_str(loader);
+        output.push_str(&rendered[pos..]);
+        Ok(output)
+    } else {
+        Ok(format!("{rendered}{bootstrap}{loader}"))
+    }
+}
+
 /// Rewrite a module's HTML expressions so the client micro-runtime can hydrate
 /// signal reads and action handlers.
 ///
