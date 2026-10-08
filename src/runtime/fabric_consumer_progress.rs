@@ -183,6 +183,7 @@ pub(crate) struct FileFabricConsumerProgressJournal {
     last_hash: String,
     latest_sequence: u64,
     poisoned: bool,
+    scope: Option<(String, u16)>,
     pending: Option<PendingConsumerProgress>,
     committed: BTreeMap<(String, u16, String), FabricConsumerProgressChange>,
     committed_policy: Option<FabricConsumerProgressPolicy>,
@@ -197,6 +198,7 @@ impl FileFabricConsumerProgressJournal {
             last_hash: String::new(),
             latest_sequence: 0,
             poisoned: false,
+            scope: None,
             pending: None,
             committed: BTreeMap::new(),
             committed_policy: None,
@@ -274,6 +276,13 @@ impl FileFabricConsumerProgressJournal {
         stream_committed_through: u64,
     ) -> io::Result<()> {
         change.validate(policy, stream_committed_through)?;
+        if self.scope.as_ref().is_some_and(|(stream, partition)| {
+            stream != &change.stream || *partition != change.partition
+        }) {
+            return Err(invalid(
+                "consumer-progress journal cannot mix streams or partitions",
+            ));
+        }
         let next_sequence = self.latest_sequence.checked_add(1)
             .ok_or_else(|| invalid("consumer-progress metadata index overflow"))?;
         if change.metadata_sequence != next_sequence
@@ -314,6 +323,9 @@ impl FileFabricConsumerProgressJournal {
                     return Err(invalid("consumer-progress journal has unresolved prepare"));
                 }
                 self.check_prepare(change, policy, *stream_committed_through)?;
+                if self.scope.is_none() {
+                    self.scope = Some((change.stream.clone(), change.partition));
+                }
                 self.pending = Some(PendingConsumerProgress {
                     change: change.clone(),
                     policy: policy.clone(),
