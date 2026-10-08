@@ -29,7 +29,7 @@ class VerifyDocExamplesTests(unittest.TestCase):
             (root / "src").mkdir()
             for ext in extensions:
                 (docs / f"sample.{ext}").write_text(
-                    f"# Example\n\n\`\`\`nulang\n{source}\n\`\`\`\n",
+                    f"# Example\n\n```nulang\n{source}\n```\n",
                     encoding="utf-8",
                 )
 
