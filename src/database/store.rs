@@ -91,7 +91,11 @@ impl WalBackedTablet {
         self.commit_inner(write, || {})
     }
 
-    fn commit_inner(&mut self, write: TabletWrite, after_wal: impl FnOnce()) -> Result<u64, WalBackedError> {
+    fn commit_inner(
+        &mut self,
+        write: TabletWrite,
+        after_wal: impl FnOnce(),
+    ) -> Result<u64, WalBackedError> {
         // WAL durability, in-memory publication and acknowledgement form one
         // fenced operation. Releasing the gate immediately after WAL fsync
         // would allow a coordinator to assume ownership before commit returns.
