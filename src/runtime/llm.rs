@@ -520,10 +520,14 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
         // on the shared VM, which would clobber the frames an
         // un-captured suspend still needs. Runs on every path, so
         // wakes of other actors are not lost when THIS one suspends.
+        // Recovery precedes deferred wake dispatch so no other actor can
+        // observe the failed activation's speculative in-memory state.
+        if terminal_commit_failed {
+            (*self_ptr).recover_workflow_after_failed_terminal(actor_id);
+        }
         (*self_ptr).vm_exec_end();
     }
     if terminal_commit_failed {
-        rt.recover_workflow_after_failed_terminal(actor_id);
         return;
     }
     // The suspension resolved (completed or failed): if messages queued
