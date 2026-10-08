@@ -246,7 +246,9 @@ impl SingleNodeSplitStore {
                         }
                         let left = WalBackedTablet::open(plan.left, root.join("left.wal"))?;
                         let right = WalBackedTablet::open(plan.right, root.join("right.wal"))?;
-                        if left.current_sequence() < sequence || right.current_sequence() < sequence {
+                        if left.current_sequence() < sequence
+                            || right.current_sequence() < sequence
+                        {
                             return Err(SplitError::InvalidManifest(
                                 "child state regressed behind split source sequence".into(),
                             ));
@@ -462,11 +464,7 @@ enum SplitStop {
 // The helper is deliberately absent from release builds.
 #[cfg(test)]
 fn abort_bootstrap_at(stage: &str) {
-    if std::env::var("NUDB_BOOTSTRAP_FAILSTOP_STAGE")
-        .ok()
-        .as_deref()
-        == Some(stage)
-    {
+    if std::env::var("NUDB_BOOTSTRAP_FAILSTOP_STAGE").ok().as_deref() == Some(stage) {
         std::process::exit(74);
     }
 }
@@ -619,7 +617,9 @@ impl fmt::Display for SplitError {
             Self::InvalidManifest(message) => write!(f, "invalid routing manifest: {message}"),
             Self::OutsideParentRange => f.write_str("key outside source tablet range"),
             Self::AlreadySplit => f.write_str("tablet has already been split"),
-            Self::OwnerBusy => f.write_str("another process currently owns this NuDB tablet directory"),
+            Self::OwnerBusy => {
+                f.write_str("another process currently owns this NuDB tablet directory")
+            }
             Self::Poisoned => f.write_str("tablet routing must be reopened after ambiguous split"),
             Self::Interrupted(message) => write!(f, "injected NuDB split interruption: {message}"),
         }
