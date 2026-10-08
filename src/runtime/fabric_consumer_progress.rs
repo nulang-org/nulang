@@ -1311,8 +1311,10 @@ mod tests {
         assert_eq!(local.committed_cursor("orders", 0, "billing"), 0);
         assert_eq!(remote.committed_cursor("orders", 0, "billing"), 0);
 
-        // Persisted follower-fsync evidence is sufficient to request a local
-        // metadata commit, but only after the exact quorum receipts arrive.
+        // A lost COMMIT propagation must leave the follower pending; the
+        // leader's fsynced decision can be redriven after network recovery.
+        leader.distributed.transport.as_mut().unwrap()
+            .set_partition(HashSet::from([follower_id]));
         assert_eq!(
             leader.fabric_consumer_progress_commit_observed("orders", 0, 1).unwrap(),
             1
@@ -1321,13 +1323,61 @@ mod tests {
         let leader_after = FileFabricConsumerProgressJournal::open(
             leader_root.join("orders").join("consumer_progress")
         ).unwrap();
-        let follower_after = FileFabricConsumerProgressJournal::open(
+        let follower_before_redrive = FileFabricConsumerProgressJournal::open(
             follower_root.join("orders").join("consumer_progress")
         ).unwrap();
         assert_eq!(leader_after.committed_cursor("orders", 0, "billing"), 1);
+        assert_eq!(follower_before_redrive.committed_cursor("orders", 0, "billing"), 0);
+
+        leader.distributed.transport.as_mut().unwrap()
+            .set_partition(HashSet::new());
+        assert_eq!(
+            leader.fabric_consumer_progress_redrive_last_commit("orders").unwrap(),
+            1
+        );
+        follower.process_network();
+        let follower_after = FileFabricConsumerProgressJournal::open(
+            follower_root.join("orders").join("consumer_progress")
+        ).unwrap();
         assert_eq!(follower_after.committed_cursor("orders", 0, "billing"), 1);
+        assert_eq!(
+            follower_after.last_committed_metadata_sequence(),
+            leader_after.last_committed_metadata_sequence()
+        );
         let _ = fs::remove_dir_all(a_root);
         let _ = fs::remove_dir_all(b_root);
+    }
+
+    #[test]
+    fn commit_wire_rejects_changed_digest_and_membership() {
+        let root = temp_root("wire-commit");
+        let group = policy(vec![10, 11]);
+        let proposed = change(1, 0, 1);
+        let mut journal = FileFabricConsumerProgressJournal::open(&root).unwrap();
+        journal.prepare(proposed, group, 1).unwrap();
+        let (change, policy, boundary) = journal.pending_change().unwrap();
+        let staged = FabricConsumerProgressPrepareWire::new(
+            change.clone(), policy.clone(), boundary
+        ).unwrap();
+        let mut update = FabricConsumerProgressCommitWire {
+            version: JOURNAL_FORMAT_VERSION,
+            stream: "orders".into(),
+            partition: 0,
+            epoch: 1,
+            leader: 10,
+            metadata_sequence: 1,
+            digest: staged.digest.clone(),
+            acknowledgers: vec![10, 11],
+        };
+        assert!(FabricConsumerProgressCommitWire::from_wire_bytes(
+            &update.to_wire_bytes().unwrap()
+        ).is_ok());
+        update.digest = "e".repeat(64);
+        assert!(journal.verify_commit_update(&update).is_err());
+        update.digest = staged.digest;
+        update.acknowledgers = vec![10, 99];
+        assert!(journal.verify_commit_update(&update).is_err());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
