@@ -5,8 +5,8 @@
 //! inner storage and query loops remain ordinary local computation.
 
 pub mod checkpoint;
-pub mod store;
 pub mod split;
+pub mod store;
 pub mod tablet;
 pub mod wal;
 
