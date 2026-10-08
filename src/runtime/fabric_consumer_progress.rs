@@ -233,6 +233,26 @@ impl FileFabricConsumerProgressJournal {
         self.latest_sequence
     }
 
+    /// Recover the exact pending proposal for idempotent network retry.
+    pub(crate) fn pending_change(
+        &self,
+    ) -> Option<(&FabricConsumerProgressChange, &FabricConsumerProgressPolicy)> {
+        self.pending
+            .as_ref()
+            .map(|pending| (&pending.change, &pending.policy))
+    }
+
+    /// Recover ACK gaps as well as the committed contiguous cursor.
+    pub(crate) fn committed_change(
+        &self,
+        stream: &str,
+        partition: u16,
+        consumer: &str,
+    ) -> Option<&FabricConsumerProgressChange> {
+        self.committed
+            .get(&(stream.to_string(), partition, consumer.to_string()))
+    }
+
     /// Committed *local* progress only. Never treat an absent consumer as a
     /// cluster-proven cursor of zero following leader promotion.
     pub(crate) fn committed_cursor(&self, stream: &str, partition: u16, consumer: &str) -> u64 {
@@ -553,6 +573,51 @@ mod tests {
 
         fs::write(&path, b"{\"version\":1").unwrap();
         assert!(FileFabricConsumerProgressJournal::open(&root).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+
+    #[test]
+    fn committed_ack_gaps_and_pending_proposals_survive_reopen() {
+        let root = temp_root("restore");
+        let group = policy(vec![10, 11, 12]);
+        {
+            let mut journal = FileFabricConsumerProgressJournal::open(&root).unwrap();
+            let mut first = change(1, 0, 1);
+            first.acked_gaps = vec![3, 5];
+            journal.prepare(first, group.clone(), 5).unwrap();
+            journal.commit_with_acknowledgers(1, &[10, 11]).unwrap();
+
+            let mut pending = change(2, 1, 2);
+            pending.acked_gaps = vec![3, 5];
+            journal.prepare(pending, group, 5).unwrap();
+        }
+
+        let reopened = FileFabricConsumerProgressJournal::open(&root).unwrap();
+        assert_eq!(reopened.pending_sequence(), Some(2));
+        assert_eq!(reopened.pending_change().unwrap().0.committed_cursor, 2);
+        let committed = reopened.committed_change("orders", 0, "billing").unwrap();
+        assert_eq!(committed.committed_cursor, 1);
+        assert_eq!(committed.acked_gaps, vec![3, 5]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn policy_change_is_rejected_without_explicit_epoch_recovery() {
+        let root = temp_root("policy");
+        let mut journal = FileFabricConsumerProgressJournal::open(&root).unwrap();
+        journal.prepare(change(1, 0, 1), policy(vec![10, 11]), 1).unwrap();
+        journal.commit_with_acknowledgers(1, &[10, 11]).unwrap();
+
+        let mut next = change(2, 1, 2);
+        next.epoch = 2;
+        let changed_policy = FabricConsumerProgressPolicy {
+            epoch: 2,
+            leader: 11,
+            replicas: vec![11, 12],
+        };
+        assert!(journal.prepare(next, changed_policy, 2).is_err());
+        assert_eq!(journal.last_committed_metadata_sequence(), 1);
         let _ = fs::remove_dir_all(root);
     }
 
