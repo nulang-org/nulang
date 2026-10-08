@@ -112,6 +112,9 @@
       const named = node.properties && node.properties.name;
       if (!named || named.type !== 'string' ||
           !Object.prototype.hasOwnProperty.call(signalBindings, named.value)) continue;
+      // A compiler-created signal starts at WireValue::Null: keep the
+      // server-rendered DOM text until an actual signal value is published.
+      if (!node.properties.value || node.properties.value.type === 'null') continue;
       const value = wireText(node.properties.value);
       if (value === undefined) return false;
       changes.set(named.value, value);
