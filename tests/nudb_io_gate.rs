@@ -77,7 +77,7 @@ fn owner_gate_prevents_direct_public_open_from_initializing_wal() {
     let missing = root.join("other.wal");
     assert!(matches!(
         FileWal::open(&missing),
-        Err(WalError::WriteGateBusy | WalError::ManagedDirectory)
+        Err(WalError::ManagedDirectory)
     ));
     assert!(!missing.exists());
     drop(owner);
@@ -99,11 +99,11 @@ fn old_public_handle_cannot_append_or_reclaim_while_new_owner_has_gate() {
     let owner = SingleNodeSplitStore::open(&root, descriptor()).unwrap();
     assert!(matches!(
         stale.append_write(&put(1)),
-        Err(WalError::WriteGateBusy | WalError::ManagedDirectory)
+        Err(WalError::ManagedDirectory)
     ));
     assert!(matches!(
         stale.reclaim_through(1),
-        Err(WalError::WriteGateBusy | WalError::ManagedDirectory)
+        Err(WalError::ManagedDirectory)
     ));
     assert_eq!(stale.last_sequence(), 1);
     drop(owner);
@@ -139,26 +139,35 @@ fn unmanaged_wal_writes_and_reclamation_still_work_with_persistent_gate() {
 fn public_symlink_to_unmanaged_wal_uses_real_directory_gate() {
     use std::os::unix::fs::symlink;
 
-    let root = root("actual");
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let actual_root = root("actual");
     let aliases = root("aliases");
-    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&actual_root).unwrap();
     fs::create_dir_all(&aliases).unwrap();
-    let real = root.join("ordinary.wal");
+    let real = actual_root.join("ordinary.wal");
     let old = FileWal::open(&real).unwrap();
     drop(old);
 
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
-        .open(root.join(".nudb-write-gate.lock"))
+        .open(actual_root.join(".nudb-write-gate.lock"))
         .unwrap();
     lock.try_lock().unwrap();
 
     let alias = aliases.join("linked.wal");
     symlink(&real, &alias).unwrap();
-    assert!(matches!(FileWal::open(&alias), Err(WalError::WriteGateBusy)));
+    let (ready, done) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        ready.send(FileWal::open(&alias).is_ok()).unwrap();
+    });
+    // The public open must wait while the real target's lock is held.
+    assert!(matches!(done.recv_timeout(Duration::from_millis(100)), Err(mpsc::RecvTimeoutError::Timeout)));
     drop(lock);
-    FileWal::open(&alias).unwrap();
+    assert!(done.recv_timeout(Duration::from_secs(5)).unwrap());
+    reader.join().unwrap();
     let _ = fs::remove_dir_all(aliases);
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(actual_root);
 }
