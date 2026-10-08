@@ -718,6 +718,92 @@ mod tests {
     }
 
     #[test]
+    fn preparing_manifest_never_discards_possible_committed_wal_records() {
+        let root = std::env::temp_dir().join(format!(
+            "nudb_preparing_wal_records_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let parent = TabletDescriptor::new(
+            TabletId::new(901).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            7,
+        )
+        .unwrap();
+        fs::create_dir_all(&root).unwrap();
+        write_manifest(
+            &root.join("route.manifest"),
+            &DiskManifest::for_preparing_parent(&parent),
+            None,
+        )
+        .unwrap();
+        {
+            let mut wal = WalBackedTablet::open(parent.clone(), root.join("parent.wal")).unwrap();
+            let write = wal
+                .prepare_write(
+                    7,
+                    0,
+                    vec![TabletMutation::Put {
+                        key: b"b".to_vec(),
+                        value: b"must-not-discard".to_vec(),
+                    }],
+                )
+                .unwrap();
+            wal.commit(write).unwrap();
+        }
+        let recorded = fs::read(root.join("parent.wal")).unwrap();
+        assert!(recorded.len() > 64);
+        assert!(matches!(
+            SingleNodeSplitStore::open(&root, parent),
+            Err(SplitError::InvalidManifest(_))
+        ));
+        assert_eq!(fs::read(root.join("parent.wal")).unwrap(), recorded);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_manifest_with_lone_checkpoint_still_fails_closed() {
+        let root = std::env::temp_dir().join(format!(
+            "nudb_orphan_parent_checkpoint_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let checkpoint = root.join("parent.checkpoint");
+        fs::write(&checkpoint, b"unexpected-parent-checkpoint").unwrap();
+        let parent = TabletDescriptor::new(
+            TabletId::new(901).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            7,
+        )
+        .unwrap();
+        assert!(matches!(
+            SingleNodeSplitStore::open(&root, parent),
+            Err(SplitError::InvalidManifest(_))
+        ));
+        assert_eq!(
+            fs::read(&checkpoint).unwrap(),
+            b"unexpected-parent-checkpoint"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_manifest_without_preparing_flag_is_published() {
+        let parent = TabletDescriptor::new(
+            TabletId::new(901).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            7,
+        )
+        .unwrap();
+        let mut json = serde_json::to_value(DiskManifest::for_parent(&parent)).unwrap();
+        json.as_object_mut().unwrap().remove("preparing");
+        let legacy: DiskManifest = serde_json::from_value(json).unwrap();
+        assert!(!legacy.preparing);
+        assert!(legacy.validate(&parent).unwrap().is_none());
+    }
+
+    #[test]
     fn missing_published_manifest_must_not_reset_committed_parent() {
         let root = std::env::temp_dir().join(format!(
             "nudb_missing_published_manifest_{}_{}",
