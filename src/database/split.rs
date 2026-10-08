@@ -175,10 +175,8 @@ impl SingleNodeSplitStore {
             .open(root.join(".nudb-owner.lock"))?;
         match owner_lock.try_lock() {
             Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                return Err(SplitError::OwnerBusy);
-            }
-            Err(error) => return Err(error.into()),
+            Err(std::fs::TryLockError::WouldBlock) => return Err(SplitError::OwnerBusy),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
         }
         let manifest_path = root.join("route.manifest");
         let parent_wal = root.join("parent.wal");
@@ -246,8 +244,7 @@ impl SingleNodeSplitStore {
                         }
                         let left = WalBackedTablet::open(plan.left, root.join("left.wal"))?;
                         let right = WalBackedTablet::open(plan.right, root.join("right.wal"))?;
-                        if left.current_sequence() < sequence
-                            || right.current_sequence() < sequence
+                        if left.current_sequence() < sequence || right.current_sequence() < sequence
                         {
                             return Err(SplitError::InvalidManifest(
                                 "child state regressed behind split source sequence".into(),
@@ -464,7 +461,11 @@ enum SplitStop {
 // The helper is deliberately absent from release builds.
 #[cfg(test)]
 fn abort_bootstrap_at(stage: &str) {
-    if std::env::var("NUDB_BOOTSTRAP_FAILSTOP_STAGE").ok().as_deref() == Some(stage) {
+    if std::env::var("NUDB_BOOTSTRAP_FAILSTOP_STAGE")
+        .ok()
+        .as_deref()
+        == Some(stage)
+    {
         std::process::exit(74);
     }
 }
@@ -1154,7 +1155,10 @@ mod tests {
             let mut recovered = SingleNodeSplitStore::open(&root, parent.clone()).unwrap();
             assert_eq!(recovered.is_split(), published, "stage={stage}");
             assert_eq!(recovered.read_latest(b"b").unwrap(), Some(b"left".to_vec()));
-            assert_eq!(recovered.read_latest(b"n").unwrap(), Some(b"right".to_vec()));
+            assert_eq!(
+                recovered.read_latest(b"n").unwrap(),
+                Some(b"right".to_vec())
+            );
             let plan = parent
                 .plan_split(
                     b"m",
