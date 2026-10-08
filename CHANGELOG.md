@@ -1,5 +1,10 @@
 # Nulang Changelog
 
+### Fabric committed consumer delivery and ACK/NACK integration — 2026-10-08
+- **Durable consumer leases and ACK/NACK are available on the current runtime baseline.** Records have persisted delivery attempts, deadlines and redelivery, while ACK gaps advance the consumer cursor only across a contiguous acknowledged prefix.
+- **Replicated consumers cannot receive or ACK an uncommitted tail.** Leased delivery, replay, ACK and cursor commits honor the persisted quorum-committed boundary; explicit raw-log reads remain available to replication, and standalone streams preserve local-tail semantics.
+- **Crash/reopen, quorum and legacy-state regressions are included.** Tests cover RF=2 and RF=3 commit visibility, persisted in-flight leases, older cursors past the commit index, and a lease established before replication policy was installed.
+
 ### Seeded cluster simulation peer ordering — 2026-10-07
 - **Cluster simulations with an injected deterministic RNG now canonicalize peer order for gossip targets, bounded gossip payloads, active-view repair, and heartbeat action emission.** This removes four sources of randomized Rust `HashMap` ordering while preserving the existing unseeded production path. Regression tests compare independently constructed cluster states under identical RNG seeds.
 
