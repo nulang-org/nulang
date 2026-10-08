@@ -21,6 +21,7 @@ class VerifyDocExamplesTests(unittest.TestCase):
         extensions: tuple[str, ...],
         binary_exit_code: int = 0,
         source: str = HELLO_EXAMPLE,
+        reject_execution: bool = False,
     ):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -36,7 +37,10 @@ class VerifyDocExamplesTests(unittest.TestCase):
             call_log = root / "calls.txt"
             fake_nulang = root / "fake-nulang"
             fake_nulang.write_text(
-                f'#!/bin/sh\nprintf "%s\\n" "$*" >> "$NULANG_TEST_LOG"\nexit {binary_exit_code}\n',
+                '#!/bin/sh\n'
+                'printf "%s\\n" "$*" >> "$NULANG_TEST_LOG"\n'
+                + ('[ "$1" = "--check" ] || exit 33\n' if reject_execution else '')
+                + f'exit {binary_exit_code}\n',
                 encoding="utf-8",
             )
             fake_nulang.chmod(0o755)
@@ -60,10 +64,17 @@ class VerifyDocExamplesTests(unittest.TestCase):
     def test_verifies_both_markdown_and_mdx_examples(self):
         result, calls = self.run_verifier(("md", "mdx"))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("actors/sample.md#1 (run)", result.stdout)
-        self.assertIn("actors/sample.mdx#1 (run)", result.stdout)
+        self.assertIn("actors/sample.md#1 (check)", result.stdout)
+        self.assertIn("actors/sample.mdx#1 (check)", result.stdout)
         self.assertIn("2 passed, 0 failed", result.stdout)
         self.assertEqual(len(calls), 2)
+
+    def test_documentation_never_executes_user_code(self):
+        result, calls = self.run_verifier(("md",), reject_execution=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("actors/sample.md#1 (check)", result.stdout)
+        self.assertEqual(len(calls), 1, calls)
+        self.assertTrue(calls[0].startswith("--check "), calls)
 
     def test_markdown_compilation_failure_fails_verification(self):
         result, _ = self.run_verifier(("md",), binary_exit_code=1)
