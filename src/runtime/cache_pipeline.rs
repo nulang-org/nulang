@@ -143,14 +143,13 @@ impl CacheResponsePipeline {
         }
 
         self.direct_scratch.clear();
-        let Some(outcome) =
-            dispatcher.dispatch_frame_with_asking(
-                store,
-                input,
-                now_ms,
-                &mut self.direct_scratch,
-                asking,
-            )?
+        let Some(outcome) = dispatcher.dispatch_frame_with_asking(
+            store,
+            input,
+            now_ms,
+            &mut self.direct_scratch,
+            asking,
+        )?
         else {
             return Ok(None);
         };
