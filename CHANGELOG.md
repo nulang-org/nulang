@@ -4,6 +4,10 @@
 - **The cross-runtime runner fails closed on missing, duplicate, zero-duration, or incorrect-message-count measurements.** JSON schema 3 records comparator families, and focused Python ingestion tests precede benchmark execution in CI.
 - **The comparator is single-worker only, matching the current one-shard Nulang harness.** No multicore actor scaling or performance ranking is claimed without matched sharded workloads and repeated measurements on controlled hardware.
 
+### MPSC contention lower-bound diagnostics — 2026-10-08
+- **An opt-in many-to-one benchmark now stresses concurrent Nulang mailbox producers and Ractor actor-reference producers at 1/2/4/8 senders.** Both verify every logical message and exclude consumer handling from enqueue timing; machine-readable output includes CPU topology and retained raw samples.
+- **Reported comparisons explicitly distinguish raw `Mailbox::push` from higher-level `ActorRef::cast` rather than pretending they are semantically identical.** The new Python ingestion tests and small CI smoke check guard measurement integrity without enforcing cross-language speed rankings.
+
 ### Ractor actor-density diagnostic — 2026-10-08
 - **Nulang's existing actor-density probe can now be run against a Ractor `spawn_instant` companion on the same host.** Fresh-process measurements report actor publication cost and Linux RSS after startup settlement; results retain explicit lifecycle comparability caveats.
 - **The new Python density runner validates actor counts, elapsed time, and RSS availability before collecting medians.** A 1,000-actor Ractor smoke test and parser unit tests run in the cross-runtime workflow; external framework dependencies are locked in their isolated Cargo workspace.
