@@ -255,7 +255,9 @@ pub(crate) struct VersionedValue {
 /// Committed per-key histories are stored in ascending sequence order.
 fn visible_version_at(versions: &[VersionedValue], snapshot: u64) -> Option<&VersionedValue> {
     let first_newer = versions.partition_point(|version| version.sequence <= snapshot);
-    first_newer.checked_sub(1).and_then(|index| versions.get(index))
+    first_newer
+        .checked_sub(1)
+        .and_then(|index| versions.get(index))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
