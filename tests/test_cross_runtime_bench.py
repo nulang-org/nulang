@@ -14,6 +14,26 @@ def fixture_records(runtime="ractor"):
 
 
 class CrossRuntimeRecordsTest(unittest.TestCase):
+    def test_runtime_order_counterbalances_every_position(self):
+        runtimes = ["nulang", "erlang", "ractor", "go", "rust"]
+        rounds = [bench.runtime_order(runtimes, i) for i in range(len(runtimes))]
+        self.assertTrue(all(set(order) == set(runtimes) for order in rounds))
+        for position in range(len(runtimes)):
+            self.assertEqual(
+                {order[position] for order in rounds},
+                set(runtimes),
+                "each runtime should occupy each measured-order position once",
+            )
+
+    def test_runtime_order_is_deterministic_and_rejects_bad_inputs(self):
+        self.assertEqual(
+            bench.runtime_order(["nulang", "go"], 0),
+            bench.runtime_order(["nulang", "go"], 0),
+        )
+        for runtimes, index in (([], 0), (["nulang"], -1)):
+            with self.assertRaises(ValueError):
+                bench.runtime_order(runtimes, index)
+
     def test_valid_ractor_records_are_accepted(self):
         parsed = bench.parse_records(fixture_records(), "ractor")
         self.assertEqual(
