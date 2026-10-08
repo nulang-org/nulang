@@ -92,6 +92,66 @@ mod tests {
     }
 
     #[test]
+    fn test_signal_resume_terminal_commit_failure_recovers_safe_snapshot() {
+        let source = r#"
+            workflow SignalTerminalFailure {
+                step wait_for_go { perform Signal.wait("go") }
+            }
+            let w = spawn SignalTerminalFailure {} in { w }
+        "#;
+        let store = SharedMemoryStore::new();
+        let (module, _) = compile_source(source).unwrap();
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        rt.borrow_mut().persistence = Box::new(store.clone());
+
+        let value = {
+            let mut vm = VM::new();
+            vm.load_module(module);
+            vm.set_actor_callbacks(Box::new(RuntimeVmCallbacks::new(rt.clone())));
+            vm.run().unwrap()
+        };
+        let actor_id = value.as_actor_id().expect("spawn should return actor ref");
+        rt.borrow_mut().send_message_by_id(actor_id, 0, &[]);
+        rt.borrow_mut().run_scheduler();
+        assert!(
+            rt.borrow().actors[&actor_id].suspended_execution.is_some(),
+            "workflow must be suspended before injecting terminal failure"
+        );
+
+        let safe_snapshot = store.load_snapshot(actor_id).unwrap();
+        let admitted_tail = store
+            .load_durable_tail_position(actor_id)
+            .unwrap()
+            .expect("command admission should establish atomic tail");
+        assert!(safe_snapshot.sequence < admitted_tail.sequence);
+
+        // SignalReceived must persist; only the resumed StepCompleted commit
+        // fails. The actor may not expose speculative post-resume state.
+        store.fail_next_terminal_transition();
+        rt.borrow_mut().signal_workflow(actor_id, "go", None).unwrap();
+
+        assert!(
+            !store.read_workflow_events(actor_id).iter().any(|event| {
+                matches!(event, WorkflowEvent::StepCompleted { .. })
+            }),
+            "failed atomic StepCompleted must not become durable"
+        );
+        let snapshot = store.load_snapshot(actor_id).unwrap();
+        assert_eq!(snapshot.sequence, safe_snapshot.sequence);
+        assert_eq!(snapshot.state.get("step_index"), safe_snapshot.state.get("step_index"));
+        assert_eq!(
+            rt.borrow()
+                .actors
+                .get(&actor_id)
+                .expect("actor must recover after terminal storage error")
+                .get_state_field("step_index")
+                .and_then(|value| value.as_int()),
+            Some(0),
+            "resumed in-memory step must roll back to the safe boundary"
+        );
+    }
+
+    #[test]
     fn test_shared_memory_store_supports_atomic_tail_contract() {
         let mut store = SharedMemoryStore::new();
         let actor_id = 991_001;
