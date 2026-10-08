@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::ops::Bound::{Excluded, Included, Unbounded};
 
 /// Stable identifier for one logical tablet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -263,6 +264,17 @@ pub(crate) struct TabletSnapshotState {
     pub(crate) rows: Vec<TabletSnapshotRow>,
 }
 
+/// One owned key/value result from a fixed MVCC read sequence.
+///
+/// Results own their bytes so a later tablet write cannot change previously
+/// returned pages. The scan limit bounds the number of returned live rows,
+/// not the number of tombstones or historical versions inspected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabletScanRow {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+}
+
 /// Minimal single-node MVCC tablet used to prove transaction semantics before
 /// introducing WAL and replication.
 ///
@@ -337,6 +349,43 @@ impl MemoryTablet {
             current_sequence: state.current_sequence,
             rows,
         })
+    }
+
+    /// Materialize the complete parent MVCC history into two detached child
+    /// tablets. This is a pure preparation operation, NOT a routing cutover:
+    /// durable split publication requires a fenced, atomic catalog transition.
+    /// Both children inherit the source sequence as their initial predecessor.
+    pub fn materialize_split(
+        &self,
+        plan: &TabletSplitPlan,
+    ) -> Result<(Self, Self), TabletError> {
+        if plan.source != self.descriptor {
+            return Err(TabletError::SplitPlanMismatch);
+        }
+        // TabletSplitPlan has public fields. Recompute its canonical shape,
+        // including the split boundary, IDs and both ownership epochs.
+        let canonical = self.descriptor.plan_split(
+            &plan.split_key,
+            plan.left.id(),
+            plan.right.id(),
+            plan.left.ownership_epoch(),
+        )?;
+        if canonical != *plan {
+            return Err(TabletError::SplitPlanMismatch);
+        }
+
+        let mut left = Self::new(plan.left.clone());
+        let mut right = Self::new(plan.right.clone());
+        left.current_sequence = self.current_sequence;
+        right.current_sequence = self.current_sequence;
+        for (key, versions) in &self.rows {
+            if key.as_slice() < plan.split_key.as_slice() {
+                left.rows.insert(key.clone(), versions.clone());
+            } else {
+                right.rows.insert(key.clone(), versions.clone());
+            }
+        }
+        Ok((left, right))
     }
 
     pub fn prepare_write(
@@ -503,6 +552,57 @@ impl MemoryTablet {
         }))
     }
 
+    /// Scan a half-open key range at one committed MVCC sequence.
+    ///
+    /// Bounds must lie entirely inside this tablet. In particular, an
+    /// unbounded end is permitted only for a tablet with an unbounded end;
+    /// callers scanning multiple tablets must route each range separately.
+    /// Tombstones and values committed after `snapshot` are excluded.
+    pub fn scan_at(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        snapshot: u64,
+        limit: usize,
+    ) -> Result<Vec<TabletScanRow>, TabletError> {
+        if snapshot > self.current_sequence {
+            return Err(TabletError::SnapshotAhead {
+                committed: self.current_sequence,
+                requested: snapshot,
+            });
+        }
+        if end.is_some_and(|end| end <= start) {
+            return Err(TabletError::InvalidScanBounds);
+        }
+        if !self.descriptor.range.contains(start)
+            || match self.descriptor.range.end() {
+                Some(owned_end) => !end.is_some_and(|requested_end| requested_end <= owned_end),
+                None => false,
+            }
+        {
+            return Err(TabletError::KeyOutsideTabletRange);
+        }
+        let upper = end.map(Excluded).unwrap_or(Unbounded);
+        let mut rows = Vec::new();
+        for (key, versions) in self.rows.range::<[u8], _>((Included(start), upper)) {
+            if let Some(value) = versions
+                .iter()
+                .rev()
+                .find(|version| version.sequence <= snapshot)
+                .and_then(|version| version.value.as_ref())
+            {
+                if rows.len() == limit {
+                    break;
+                }
+                rows.push(TabletScanRow {
+                    key: key.clone(),
+                    value: value.clone(),
+                });
+            }
+        }
+        Ok(rows)
+    }
+
     /// Read the newest committed value. Out-of-range keys route as absent;
     /// callers that need a routing error can use `read_at`.
     pub fn read_latest(&self, key: &[u8]) -> Option<&[u8]> {
@@ -526,6 +626,8 @@ pub enum TabletError {
         current: u64,
         proposed: u64,
     },
+    SplitPlanMismatch,
+    InvalidScanBounds,
     StaleEpoch {
         current: u64,
         presented: u64,
@@ -574,6 +676,8 @@ impl fmt::Display for TabletError {
                 f,
                 "tablet split epoch {proposed} must be newer than current epoch {current}"
             ),
+            Self::SplitPlanMismatch => f.write_str("tablet split plan does not match the source descriptor"),
+            Self::InvalidScanBounds => f.write_str("tablet scan end must be strictly greater than start"),
             Self::StaleEpoch { current, presented } => write!(
                 f,
                 "stale tablet ownership epoch {presented}; current epoch is {current}"
