@@ -54,13 +54,17 @@ impl ActorVmCallbacks for BenchCallbacks {
     fn drop_ref(&mut self, ptr: *mut u8) {
         if !self.arena.contains(ptr) {
             // Mirror the actor runtime's ORCA release path for heap-backed values.
-            unsafe { self.gc.drop_local_ref(&mut self.heap, ptr) };
+            unsafe {
+                self.gc.drop_local_ref(&mut self.heap, ptr);
+            }
         }
     }
 
     fn retain_ref(&mut self, ptr: *mut u8) {
         if !self.arena.contains(ptr) {
-            unsafe { self.gc.local_ref(&self.heap, ptr) };
+            unsafe {
+                self.gc.local_ref(&self.heap, ptr);
+            }
         }
     }
 
