@@ -1266,13 +1266,15 @@ impl EffectChecker {
 ///
 /// Nulang recovery is checkpoint + journal re-drive, not full history replay:
 /// a step suspended on a signal or `LLM.ask` is re-run from its start after a
-/// crash (see `LLM_SUSPEND_MARKER` in runtime/mod.rs). An ambient effect
-/// executed before the suspension point would run again — nondeterministic
+/// crash. Legacy persistence uses `LLM_SUSPEND_MARKER`; RFC 0022 persistence
+/// identifies the same unfinished activation from command/terminal history while
+/// keeping the completed-state snapshot at the pre-command boundary. An ambient
+/// effect executed before the suspension point would run again — nondeterministic
 /// value sources (`Time.now*`, `Rand.*`) yield different results, and
 /// externally visible effects (`Net.*`, `FS.*`, stdio) duplicate their side
 /// effects. Exclusions: `Timer.sleep` is journaled as `TimerSet` and re-armed
-/// on recovery; `LLM.*` is allowed by design (a re-driven step starts a fresh
-/// background call, documented next to `LLM_SUSPEND_MARKER`).
+/// on recovery; `LLM.*` is allowed by design because a re-driven step starts a
+/// fresh background call.
 fn is_forbidden_in_durable(effect: &str, op: &str) -> bool {
     match effect {
         "Rand" => true,

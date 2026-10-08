@@ -175,13 +175,12 @@ fn timer_fired_handler(actor: &mut Actor, _args: &[Value]) {
 /// higher indices without colliding.
 fn bytecode_step_placeholder(_actor: &mut Actor, _args: &[Value]) {}
 
-/// Persisted `waiting_signal` marker for a workflow step suspended on a
-/// background LLM call.  A signal wait stores the awaited signal's name so
-/// recovery can re-trigger the in-flight step; an LLM suspend has no
-/// signal, so this reserved marker plays the same role.  The suspended VM
-/// state itself cannot be persisted, so recovery re-runs the step from
-/// its last pre-suspend checkpoint and the re-executed `LLM.ask` starts
-/// a fresh background call.
+/// Legacy persisted `waiting_signal` marker for a workflow step suspended
+/// on a background LLM call. Backends that have not entered RFC 0022 atomic
+/// history use this marker to re-drive the in-flight step from the last safe
+/// checkpoint. Once an atomic tail exists, recovery instead proves unfinished
+/// work from the admitted command and absence of a terminal transition; the
+/// completed-state snapshot is not rewritten merely to encode suspension.
 const LLM_SUSPEND_MARKER: &str = "__llm_ask_pending__";
 
 /// How often (in scheduler ticks) the runtime scans resident grain actors for
@@ -1635,6 +1634,18 @@ impl Runtime {
         self.draining_receive_wakes = false;
     }
 
+    /// Discard speculative state and replay an admitted command if a resumed
+    /// workflow step cannot durably record its terminal transition.
+    fn recover_workflow_after_failed_terminal(&mut self, actor_id: u64) {
+        self.actors.remove(&actor_id);
+        if self.recover_actor(actor_id).is_none() {
+            tracing::error!(
+                actor_id,
+                "nulang-workflow: actor recovery failed after resumed terminal commit failure"
+            );
+        }
+    }
+
     /// Resume a workflow actor that is suspended waiting for a signal.
     pub(crate) fn resume_suspended_workflow_step(&mut self, actor_id: u64) {
         let suspended = match self.actors.get_mut(&actor_id) {
@@ -1682,6 +1693,7 @@ impl Runtime {
             actor.waiting_signal = None;
         }
 
+        let mut terminal_commit_failed = false;
         match result {
             Ok(_) => {
                 if self.actor_is_workflow(actor_id) {
@@ -1703,6 +1715,7 @@ impl Runtime {
                             %error,
                             "nulang-workflow: signal-resume terminal commit failed"
                         );
+                        terminal_commit_failed = true;
                     }
                 }
             }
@@ -1756,7 +1769,17 @@ impl Runtime {
         // deferred wakes would clobber; the compensation arm runs nested
         // bytecode whose own begin/end must stay inside this window. Runs
         // on every path so wakes of other actors are not lost.
+        // Quarantine the speculative actor before dispatching deferred wakes.
+        // Recover only after leaving the VM execution window: legacy replay
+        // may itself enter the VM while rebuilding the actor.
+        if terminal_commit_failed {
+            self.actors.remove(&actor_id);
+        }
         self.vm_exec_end();
+        if terminal_commit_failed {
+            self.recover_workflow_after_failed_terminal(actor_id);
+            return;
+        }
         // The suspension resolved (completed or failed): drain any mail
         // that queued up while the step was suspended.
         self.requeue_if_mail_pending(actor_id);
@@ -4863,6 +4886,7 @@ impl Runtime {
             return;
         }
         self.restore_suspended_workflow_activation(actor_id, suspended.activation);
+        let mut terminal_commit_failed = false;
         let self_ptr: *mut Runtime = self;
         unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -4906,6 +4930,7 @@ impl Runtime {
                                 %error,
                                 "nulang-workflow: timer-resume terminal commit failed"
                             );
+                            terminal_commit_failed = true;
                         }
                     }
                 }
@@ -4932,7 +4957,14 @@ impl Runtime {
                     }
                 }
             }
+            if terminal_commit_failed {
+                (*self_ptr).actors.remove(&actor_id);
+            }
             (*self_ptr).vm_exec_end();
+        }
+        if terminal_commit_failed {
+            self.recover_workflow_after_failed_terminal(actor_id);
+            return;
         }
         // Re-enqueue so the scheduler can continue processing the actor.
         self.enqueue_actor(actor_id);
@@ -4961,6 +4993,7 @@ impl Runtime {
         }
 
         self.restore_suspended_workflow_activation(actor_id, suspended.activation);
+        let mut terminal_commit_failed = false;
         let self_ptr: *mut Runtime = self;
         unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -5004,6 +5037,7 @@ impl Runtime {
                                 %error,
                                 "nulang-workflow: receive-resume terminal commit failed"
                             );
+                            terminal_commit_failed = true;
                         }
                     }
                 }
@@ -5057,11 +5091,18 @@ impl Runtime {
             // on the shared VM, which would clobber the frames an
             // un-captured suspend still needs. Runs on every path, so
             // wakes of other actors are not lost when THIS one suspends.
+            if terminal_commit_failed {
+                (*self_ptr).actors.remove(&actor_id);
+            }
             (*self_ptr).vm_exec_end();
         }
         // The suspension resolved (completed or failed): if messages queued
         // up while the behavior was suspended, schedule the actor to drain
         // them - step_actor leaves mail untouched while a suspension is live.
+        if terminal_commit_failed {
+            self.recover_workflow_after_failed_terminal(actor_id);
+            return;
+        }
         self.requeue_if_mail_pending(actor_id);
     }
 
