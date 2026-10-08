@@ -87,6 +87,11 @@ run `python3 scripts/actor_density_cross_runtime.py --actors 1000,10000`.
 This reuses the existing Nulang density probe rather than duplicating it.
 See `benchmarks/cross_runtime/README.md` for startup and allocation caveats.
 
+The contended-admission companion is `scripts/mailbox_contention_cross_runtime.py`.
+It measures Nulang's raw `Mailbox::push` versus Ractor's higher-level
+`ActorRef::cast` with configurable producer counts. Since their API scopes
+differ, it must not be reported as a fair actor-runtime throughput ranking.
+
 ## Nulang shard scaling
 
 `nulang-shard-bench` measures best-case multicore runtime scaling independently
