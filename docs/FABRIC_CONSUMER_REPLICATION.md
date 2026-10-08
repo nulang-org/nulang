@@ -1,8 +1,9 @@
 # Fabric replicated consumer progress: safety contract and implementation plan
 
 **Status:** Private journal (#1445), follower prepare/receipt transport
-(#1447), and an experimental **journaled quorum-vote / metadata commit
-propagation slice** in `feat/fabric-consumer-progress-quorum-ticket-20261008`.
+(#1447), leader-local metadata quorum commits (#1448), and a separate
+**follower COMMIT-fsync confirmation / bounded history replay slice** on
+`feat/fabric-consumer-commit-confirmation-20261008`.
 **Cluster-durable client ACKs, leader-failover metadata recovery, and
 cryptographically authenticated quorum certificates are NOT implemented.**
 The public consumer cursor, ACK gap, and lease APIs still use node-local
@@ -39,21 +40,46 @@ valid membership, and fsync the commit. Duplicate exact updates are
 idempotent. A persisted leader decision can be redriven when a commit
 message is dropped, including after reopening the same leader's disk.
 
-**These are private metadata APIs only.** No public ACK/NACK/lease cursor
+### Follower COMMIT confirmation and bounded redrive (experimental)
+
+A follower now sends a distinct `COMMIT_ACK` application message **after**
+its matching metadata `Commit` frame is fsynced. The current leader binds
+the response to the existing transport's peer identity, installed replication
+membership and epoch, metadata index, and exact proposal digest, then fsyncs
+a separate `CommitReceipt` journal event. Duplicate valid receipts are
+idempotent; a false claim, nonmember or changed digest is rejected.
+
+Journal reopen rebuilds each committed decision's follower-receipt set.
+`confirmed_commit_sequence` advances only over a **contiguous** history of
+decisions whose post-COMMIT receipt sets contain an installed-policy majority.
+A missing acknowledgement for decision 1 prevents decision 2 from appearing
+confirmed even when 2 has its own majority. A dropped COMMIT receipt is
+recoverable by resending the exact same COMMIT, which is idempotent on the
+follower and produces a fresh receipt. Bounded leader-only
+`redrive_from(stream, replica, start_sequence, limit)` can resend at most
+256 stored decisions in historical order; the receiver rejects decisions
+without their exact locally persisted `Prepare` predecessor. Gaps or
+transport reordering require retry, not implicit skipping.
+
+**These are still private metadata APIs.** A leader's locally confirmed
+frontier is *not* independently recovered or quorum-elected by a successor.
+The current code does not collect old-policy frontiers across replicas,
+recover unresolved COMMIT/Prepare intents, establish cross-epoch quorum
+certificates, fence a partitioned old leader with a live grant, or implement
+automatic sequential metadata catch-up. No public ACK/NACK/lease cursor
 uses this journal, and no client receives a cluster-durable success from it.
 A follower's pending metadata does not automatically become committed
-when an old leader crashes. A commit can be fsynced on the old leader but
-lost in transit to every follower; no replacement-leader recovery or
-durable-follower-commit-ack protocol exists yet. Only the *last* committed
-decision is redrivable from the current API; earlier missing decisions
-need a bounded sequential catch-up protocol before promotion.
+when an old leader crashes. A commit on the old leader may still be lost to
+the surviving quorum; the replacement must fail closed until recovery is
+designed and verified.
 
 The transport checks identities against `incoming.from_node` under
 the **existing transport trust model**, which might not cryptographically
 authenticate peers. The vote ledger therefore records checked sender
 claims, **not unforgeable quorum certificates**. The wire hash is
 an integrity/correlation digest, not a signature. Transport ACKs are
-never treated as application fsync or metadata commit acknowledgements.
+never treated as application fsync, metadata commit, or post-COMMIT fsync
+acknowledgements.
 
 Deterministic tests exercise RF=2 follower fsync, dropped prepares and
 commits, recovered vote sets, majority gating, exact digest matching,

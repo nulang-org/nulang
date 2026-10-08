@@ -1,5 +1,11 @@
 # Nulang Changelog
 
+### Fabric consumer metadata COMMIT-fsync confirmations (experimental) — 2026-10-08
+- **Distinguished leader metadata COMMIT decisions from follower COMMIT fsync.** Followers reply with a separate commit-specific application receipt only after the exact decision is persisted; the leader checks peer identity, installed membership/epoch, sequence and digest before fsyncing a `CommitReceipt` event.
+- **A contiguous, restart-recoverable confirmation frontier prevents skipped metadata decisions.** Unique post-COMMIT follower votes are persisted per index; a gap keeps later decisions from being reported confirmed. A bounded history replay API resends up to 256 ordered committed metadata updates after packet loss.
+- **Deterministic regression coverage includes lost post-COMMIT receipts, retries, rejection of forged/mismatched votes, restart recovery and multiple consecutive decisions.** Commit confirmation remains a crate-private metadata status, not a public cluster-durable ACK or safe leader-promotion proof. No replacement-leader quorum recovery or automatic catch-up is implemented.
+
+
 ### Fabric consumer-progress quorum ticket and commit replay (experimental) — 2026-10-08
 - **Follower fsync receipts now become durable, proposal-digest-bound journal events.** A leader's locally persisted prepare is the initial vote, while only checked follower application receipts add durable remote votes; repeated receipts cannot inflate the quorum. Pending/verified votes survive restart without implying a committed cursor.
 - **An internal commit gate fsyncs metadata progress only after persisted majority observations.** It emits a leader/epoch/digest/sequence-scoped commit update to followers; they validate the exact pending proposal and persist the decision, while duplicates are idempotent. A dropped commit update can be redriven from the same leader's recovered log.
