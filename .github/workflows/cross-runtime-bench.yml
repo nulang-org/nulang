@@ -6,15 +6,15 @@ on:
       runs:
         description: Measured runs per runtime
         required: false
-        default: '10'
+        default: '12'
       warmup:
         description: Warm-up runs per runtime
         required: false
         default: '1'
       runtimes:
-        description: Comma-separated runtimes (bytecode/AOT/Rust/Go/Erlang)
+        description: Comma-separated runtimes (bytecode/warmed JIT/AOT/Rust/Go/Erlang)
         required: false
-        default: 'nulang,nulang-aot,rust,go,erlang'
+        default: 'nulang,nulang-jit,nulang-aot,rust,go,erlang'
       cpu_mode:
         description: CPU topology for measured runtime processes
         required: false
@@ -42,7 +42,7 @@ concurrency:
 
 jobs:
   compare:
-    name: Bytecode / AOT vs Rust / Go / Erlang
+    name: Bytecode / warmed JIT / AOT vs Rust / Go / Erlang
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -69,10 +69,10 @@ jobs:
 
       - name: Run cross-runtime baselines
         env:
-          RUNS: "${{ inputs.runs || '10' }}"
+          RUNS: "${{ inputs.runs || '12' }}"
           WARMUP: "${{ inputs.warmup || '1' }}"
           CPU_MODE: "${{ inputs.cpu_mode || 'single' }}"
-          RUNTIMES: "${{ inputs.runtimes || 'nulang,nulang-aot,rust,go,erlang' }}"
+          RUNTIMES: "${{ inputs.runtimes || 'nulang,nulang-jit,nulang-aot,rust,go,erlang' }}"
         run: |
           python3 scripts/cross_runtime_bench.py \
             --runs "$RUNS" \

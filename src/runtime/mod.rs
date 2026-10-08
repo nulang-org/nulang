@@ -3105,6 +3105,17 @@ impl Runtime {
             .max(1)
     }
 
+    /// Benchmark-only telemetry: count native regions compiled by the VM that
+    /// executes actor behaviors, excluding top-level source initialization.
+    /// Not compiled into normal production feature profiles.
+    #[cfg(all(feature = "savina-bench", feature = "native-codegen"))]
+    pub fn benchmark_jit_compiled_count(&self) -> usize {
+        self.vm
+            .as_ref()
+            .map(|vm| vm.jit_compiled_count())
+            .unwrap_or(0)
+    }
+
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn run_scheduler(&mut self) {
         let mut ticks: u64 = 0;
