@@ -295,6 +295,71 @@ mod tests {
     }
 
     #[test]
+    fn rejects_action_payload_disagreeing_with_posted_form() {
+        let message = nulang_ui_protocol::HostToRuntimeMessage::invoke_action(
+            nulang_ui_protocol::ActionRequest {
+                document_id: "app".into(),
+                revision: nulang_ui_protocol::Revision(1),
+                action_id: "save".into(),
+                placement: nulang_ui_protocol::ActionPlacement::Server,
+                correlation_id: "corr-1".into(),
+                idempotency_key: "idem-1".into(),
+                payload: nulang_ui_protocol::WireValue::Object(
+                    [("title".to_string(), nulang_ui_protocol::WireValue::from("forged"))]
+                        .into_iter()
+                        .collect(),
+                ),
+            },
+        );
+        let encoded = nulang_ui_protocol::encode_host_message(&message).unwrap();
+        let form = format!(
+            "title=actual&__nulang_action=save&__nulang_ui_message={}",
+            percent_encode_form_value(&encoded)
+        );
+        let headers = vec![(
+            "Content-Type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        )];
+        let captured = HttpRequestBindingInputs::capture("/", &headers, form.as_bytes());
+        assert!(captured.ui_message.is_none());
+        assert_eq!(
+            captured.ui_message_error,
+            Some(UiActionEnvelopeError::PayloadMismatch)
+        );
+    }
+
+    #[test]
+    fn accepts_action_payload_matching_posted_form() {
+        let message = nulang_ui_protocol::HostToRuntimeMessage::invoke_action(
+            nulang_ui_protocol::ActionRequest {
+                document_id: "app".into(),
+                revision: nulang_ui_protocol::Revision(1),
+                action_id: "save".into(),
+                placement: nulang_ui_protocol::ActionPlacement::Server,
+                correlation_id: "corr-1".into(),
+                idempotency_key: "idem-1".into(),
+                payload: nulang_ui_protocol::WireValue::Object(
+                    [("title".to_string(), nulang_ui_protocol::WireValue::from("actual"))]
+                        .into_iter()
+                        .collect(),
+                ),
+            },
+        );
+        let encoded = nulang_ui_protocol::encode_host_message(&message).unwrap();
+        let form = format!(
+            "title=actual&__nulang_action=save&__nulang_ui_message={}",
+            percent_encode_form_value(&encoded)
+        );
+        let headers = vec![(
+            "Content-Type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        )];
+        let captured = HttpRequestBindingInputs::capture("/", &headers, form.as_bytes());
+        assert_eq!(captured.ui_message, Some(message));
+        assert_eq!(captured.ui_message_error, None);
+    }
+
+    #[test]
     fn rejects_client_placement_over_server_transport() {
         let message = nulang_ui_protocol::HostToRuntimeMessage::invoke_action(
             nulang_ui_protocol::ActionRequest {
