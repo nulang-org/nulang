@@ -294,7 +294,8 @@ impl DurableCacheStore {
             .collect();
         self.record(CacheWalMutation::Batch { mutations })?;
         for key in &live {
-            debug_assert!(self.store.delete_at(key, store_now_ms));
+            let removed = self.store.delete_at(key, store_now_ms);
+            debug_assert!(removed, "preflighted live key disappeared during batch delete");
         }
         Ok(live.len())
     }
