@@ -1,10 +1,39 @@
 # Fabric replicated consumer progress: safety contract and implementation plan
 
-**Status:** Storage foundation implemented on draft branch
-`feat/fabric-consumer-progress-journal-20261008`; **network consensus and
-application ACK integration are not implemented.** The current runtime still
-persists live consumer cursors, ACK gaps, and leases locally. Draft #1432 only
-checks the locally installed leader epoch and does not prove live quorum.
+**Status:** Private journal foundation in draft #1445; **experimental
+metadata-prepare transport and observed follower-fsync receipts** in the
+stacked `feat/fabric-consumer-progress-prepare-transport-20261008` branch.
+**Quorum commit, failover metadata recovery, and public ACK integration are
+not implemented.** The current runtime still persists live consumer cursors,
+ACK gaps, and leases locally. Draft #1432 checks the locally installed
+leader epoch but does not prove live quorum.
+
+### Experimental transport slice
+
+The leader can stage a private metadata prepare and dispatch it over the
+existing NUL0 system-message path. Followers validate the transport-visible
+sender against the message identity and the locally installed stream leader,
+reject different policies or higher promised epochs, ensure their committed
+stream data covers the proposal, and fsync the exact pending metadata change
+before returning an application-level receipt. The leader validates the
+transport-visible replica identity, installed membership/epoch, pending
+metadata sequence and exact BLAKE3 proposal digest before recording a receipt
+in memory. Duplicate deliveries are idempotent.
+
+This network transport may not cryptographically authenticate node identity:
+the implementation binds to the identity exposed by `incoming.from_node`
+and the existing transport trust boundary, **not** a signature or mutually
+authenticated replica attestation. Receipts are volatile observations; they
+are **not durable quorum certificates**, do not invoke `Commit`, and do not
+update any application-consumer cursor. A new runtime loses the observed
+receipts even when the pending journal survives. The transport-level ACK is
+also explicitly **not** an application fsync receipt.
+
+The regression suite exercises RF=2 follower fsync/reply, leader receipt
+observation without commit, spoofed sender rejection, digest mismatch
+rejection, and persisted pending metadata on both nodes. The next step is
+a durable, retryable quorum ticket and commit-index propagation, plus
+proper transport authentication and recovery before advertising cluster ACKs.
 
 ### Implemented storage-only foundation
 
@@ -25,13 +54,13 @@ majorities, restart recovery, pending-versus-committed visibility, corruption,
 epoch/policy rejection, partition-scoped journal isolation, and ACK-gap preservation.
 
 **This is not an authenticated quorum certificate or distributed durable
-consumer protocol.** Replica IDs and their fsync claims are supplied by
-future trusted networking code; the storage module cannot verify their
-provenance. It is not wired to `fabric_stream_ack_consumer_fenced` or the
-replica message transport, so existing customer-visible ACKs remain
-node-local. The hashes detect accidental corruption but are not a signature
-or protection against an attacker who can rewrite the journal. No safe
-cluster-ACK success response has been introduced yet.
+consumer protocol.** The experimental replica prepare/receipt path is now
+connected to the existing actor transport but cannot prove cryptographic
+transport identity or persist a quorum decision. It is not wired to
+`fabric_stream_ack_consumer_fenced`, so existing customer-visible ACKs
+remain node-local. The hashes detect accidental corruption but are not a
+signature or protection against an attacker who can rewrite the journal.
+No safe cluster-ACK success response has been introduced yet.
 
 ## Product-level contract
 
