@@ -266,7 +266,10 @@ fn compile_run_with_runtime(
     #[cfg(feature = "native-codegen")]
     if backend == Backend::Aot {
         let rt = runtime.borrow();
-        assert!(!rt.actors.is_empty(), "bench: AOT workload spawned no actors");
+        assert!(
+            !rt.actors.is_empty(),
+            "bench: AOT workload spawned no actors"
+        );
         for actor in rt.actors.values() {
             // The AOT backend is allowed no silent fallback in this suite:
             // every declared behavior of every spawned actor must have a
