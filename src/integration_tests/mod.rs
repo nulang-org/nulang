@@ -8,8 +8,9 @@ mod tests {
     use crate::lexer::Lexer;
     use crate::parser::Parser;
     use crate::runtime::{
-        grain_actor_id, ActorSnapshot, DehydratePolicy, EventEntry, GrainId, JournalEntry,
-        MemoryStore, PersistenceStore, Runtime, RuntimeVmCallbacks, WorkflowEvent,
+        grain_actor_id, ActorSnapshot, DehydratePolicy, DurableCommit, DurableTailPosition,
+        DurableTransition, EventEntry, GrainId, JournalEntry, MemoryStore, PersistenceStore, Runtime,
+        RuntimeVmCallbacks, WorkflowEvent,
     };
     use crate::typechecker::TypeChecker;
     use crate::types::NuError;
@@ -24,11 +25,15 @@ mod tests {
     /// Thread-safe, shareable in-memory persistence store for tests that need
     /// to simulate a runtime restart while keeping the same underlying storage.
     #[derive(Debug, Clone)]
-    struct SharedMemoryStore(Arc<Mutex<MemoryStore>>);
+    struct SharedMemoryStore(Arc<Mutex<MemoryStore>>, bool);
 
     impl SharedMemoryStore {
         fn new() -> Self {
-            Self(Arc::new(Mutex::new(MemoryStore::new())))
+            Self(Arc::new(Mutex::new(MemoryStore::new())), false)
+        }
+
+        fn new_atomic() -> Self {
+            Self(Arc::new(Mutex::new(MemoryStore::new())), true)
         }
     }
 
@@ -44,6 +49,32 @@ mod tests {
     }
 
     impl PersistenceStore for SharedMemoryStore {
+        fn commit_transition(
+            &mut self,
+            transition: DurableTransition,
+        ) -> std::io::Result<DurableCommit> {
+            if !self.1 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "legacy shared test store intentionally has no atomic transitions",
+                ));
+            }
+            self.0.lock().unwrap().commit_transition(transition)
+        }
+
+        fn load_durable_tail_position(
+            &self,
+            actor_id: u64,
+        ) -> std::io::Result<Option<DurableTailPosition>> {
+            if !self.1 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "legacy shared test store intentionally has no atomic tail",
+                ));
+            }
+            self.0.lock().unwrap().load_durable_tail_position(actor_id)
+        }
+
         fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> std::io::Result<()> {
             self.0.lock().unwrap().save_snapshot(snapshot)
         }
