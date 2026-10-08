@@ -286,6 +286,47 @@ fn bench_selective_receive_reset(c: &mut Criterion) {
     group.finish();
 }
 
+/// Repeated terminal selective-receive commits must not re-index the
+/// thousands of untouched non-matching messages between matches.
+fn bench_selective_receive_tail_commit(c: &mut Criterion) {
+    const HIT: u16 = 60_000;
+    const ROUNDS: usize = 32;
+    let mut group = c.benchmark_group("actor/selective_receive_tail_commit");
+    group.throughput(Throughput::Elements(ROUNDS as u64));
+
+    for depth in [64usize, 1024, 16_384] {
+        group.bench_with_input(BenchmarkId::from_parameter(depth), &depth, |b, &depth| {
+            b.iter_batched_ref(
+                || {
+                    let mut mailbox = selective_receive_mailbox(depth, HIT);
+                    // Build the receive index outside the timed section; the
+                    // measured loop isolates repeated terminal commits.
+                    assert!(mailbox.receive_match(&[HIT]).is_some());
+                    mailbox.reset_receive_match();
+                    mailbox
+                },
+                |mailbox| {
+                    for _ in 0..ROUNDS {
+                        black_box(mailbox.receive_match(black_box(&[HIT])));
+                        black_box(mailbox.commit_receive_match());
+                        mailbox
+                            .push_local(Message {
+                                behavior_id: HIT,
+                                payload: MessagePayload::from_slice(&[Value::int(42)]),
+                                sender: 0,
+                                priority: MessagePriority::Normal,
+                                trace_id: None,
+                            })
+                            .expect("unbounded mailbox");
+                    }
+                },
+                BatchSize::SmallInput,
+            )
+        });
+    }
+    group.finish();
+}
+
 /// Rewrites to an existing actor field are on the hot behavior path.
 fn bench_actor_state_overwrite(c: &mut Criterion) {
     let mut actor = Actor::new(1, "counter", 0);
@@ -325,6 +366,7 @@ criterion_group!(
     bench_message_drain,
     bench_selective_receive,
     bench_selective_receive_reset,
+    bench_selective_receive_tail_commit,
     bench_actor_state_overwrite,
     bench_trace_dispatch_span
 );

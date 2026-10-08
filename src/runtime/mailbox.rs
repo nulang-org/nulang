@@ -161,8 +161,8 @@ enum MatchLane {
 /// Lazy positional index for one staged selective-receive lane.
 ///
 /// Positions remain stable while a receive transaction only appends arrivals
-/// and rejects guards. A successful commit or ordinary pop shifts VecDeque
-/// positions and invalidates the index, which is rebuilt lazily.
+/// and rejects guards. A tail commit also preserves positions. Middle removals
+/// and ordinary pops invalidate the index, which is rebuilt lazily.
 #[derive(Debug)]
 struct ReceiveLaneIndex {
     positions: FxHashMap<u16, Vec<usize>>,
@@ -197,6 +197,28 @@ impl ReceiveLaneIndex {
         self.positions.clear();
         self.cursors.clear();
         self.valid = false;
+    }
+
+    /// Removing the final staged element never shifts positions of preceding
+    /// messages. Prune only its index entry rather than rebuilding the whole
+    /// lane at the next receive. All attempted flags/cursors must be reset
+    /// before this is called.
+    fn remove_tail(&mut self, behavior_id: u16, position: usize) {
+        if !self.valid {
+            return;
+        }
+        debug_assert!(self.tried_positions.is_empty());
+        let Some(positions) = self.positions.get_mut(&behavior_id) else {
+            self.invalidate();
+            return;
+        };
+        if positions.pop() != Some(position) {
+            self.invalidate();
+            return;
+        }
+        if positions.is_empty() {
+            self.positions.remove(&behavior_id);
+        }
     }
 
     fn reset_attempts(&mut self, buffer: &mut VecDeque<(Message, bool)>) {
@@ -581,13 +603,33 @@ impl Mailbox {
         // Reset only attempted candidates while their positional indexes
         // still refer to the pre-commit buffers.
         self.clear_tried_flags();
-        let _removed = match lane {
+        let is_tail = match lane {
+            MatchLane::System => idx + 1 == self.system_skip_buffer.len(),
+            MatchLane::Local => idx + 1 == self.local_skip_buffer.len(),
+            MatchLane::Normal => idx + 1 == self.skip_buffer.len(),
+        };
+        let (removed, _) = match lane {
+            MatchLane::System if is_tail => self.system_skip_buffer.pop_back(),
+            MatchLane::Local if is_tail => self.local_skip_buffer.pop_back(),
+            MatchLane::Normal if is_tail => self.skip_buffer.pop_back(),
             MatchLane::System => self.system_skip_buffer.remove(idx),
             MatchLane::Local => self.local_skip_buffer.remove(idx),
             MatchLane::Normal => self.skip_buffer.remove(idx),
         }?;
         self.release_slot();
-        self.invalidate_receive_indexes();
+        if is_tail {
+            if let Some(indexes) = self.receive_indexes.as_mut() {
+                let index = match lane {
+                    MatchLane::System => &mut indexes.system,
+                    MatchLane::Local => &mut indexes.local,
+                    MatchLane::Normal => &mut indexes.normal,
+                };
+                index.remove_tail(removed.behavior_id, idx);
+            }
+        } else {
+            // A middle/head removal shifts the following VecDeque positions.
+            self.invalidate_receive_indexes();
+        }
         Some(payload)
     }
 
@@ -981,6 +1023,105 @@ mod transactional_receive_tests {
             Some(4095)
         );
         assert_eq!(mb.len(), 4096);
+    }
+
+    #[test]
+    fn tail_commit_preserves_index_for_deep_unmatched_lane() {
+        let mut mb = Mailbox::new(0);
+        for sender in 0..4096u64 {
+            mb.push_local(msg(1, sender, MessagePriority::Normal))
+                .unwrap();
+        }
+
+        for sender in 4096..4128u64 {
+            mb.push_local(msg(9, sender, MessagePriority::Normal))
+                .unwrap();
+            let (_, candidate) = mb.receive_match(&[9]).expect("tail match");
+            assert_eq!(candidate[0].as_int(), Some(sender as i64));
+            assert_eq!(
+                mb.commit_receive_match().unwrap()[0].as_int(),
+                Some(sender as i64)
+            );
+
+            let index = &mb.receive_indexes.as_ref().unwrap().local;
+            assert!(
+                index.valid,
+                "tail consumption must keep positional index valid"
+            );
+            assert_eq!(index.positions.get(&1).unwrap().len(), 4096);
+            assert!(!index.positions.contains_key(&9));
+            assert_eq!(mb.len(), 4096);
+        }
+
+        assert!(mb.receive_match(&[9]).is_none());
+        assert_eq!(mb.receive_match(&[1]).unwrap().1[0].as_int(), Some(0));
+    }
+
+    #[test]
+    fn terminal_commit_keeps_all_priority_lane_indexes_consistent() {
+        for lane in [MatchLane::System, MatchLane::Local, MatchLane::Normal] {
+            let mut mb = Mailbox::new(8);
+            let priority = if lane == MatchLane::System {
+                MessagePriority::System
+            } else {
+                MessagePriority::Normal
+            };
+
+            for sender in [1, 2] {
+                let message = msg(if sender == 1 { 1 } else { 9 }, sender, priority);
+                if lane == MatchLane::Local {
+                    mb.push_local(message).unwrap();
+                } else {
+                    mb.push(message).unwrap();
+                }
+            }
+
+            let (_, matched) = mb.receive_match(&[9]).expect("terminal candidate");
+            assert_eq!(matched[0].as_int(), Some(2));
+            assert!(mb.commit_receive_match().is_some());
+
+            let indexes = mb.receive_indexes.as_ref().unwrap();
+            assert!(indexes.system.valid);
+            assert!(indexes.local.valid);
+            assert!(indexes.normal.valid);
+            assert_eq!(mb.receive_match(&[1]).unwrap().1[0].as_int(), Some(1));
+            assert_eq!(mb.commit_receive_match().unwrap()[0].as_int(), Some(1));
+            assert!(mb.is_empty());
+        }
+    }
+
+    #[test]
+    fn tail_commit_preserves_earlier_guard_rejections() {
+        let mut mb = Mailbox::new(4);
+        mb.push_local(msg(9, 1, MessagePriority::Normal)).unwrap();
+        mb.push_local(msg(9, 2, MessagePriority::Normal)).unwrap();
+
+        assert_eq!(mb.receive_match(&[9]).unwrap().1[0].as_int(), Some(1));
+        assert_eq!(mb.receive_match(&[9]).unwrap().1[0].as_int(), Some(2));
+        assert_eq!(mb.commit_receive_match().unwrap()[0].as_int(), Some(2));
+        assert!(mb.receive_indexes.as_ref().unwrap().local.valid);
+
+        assert_eq!(mb.receive_match(&[9]).unwrap().1[0].as_int(), Some(1));
+        mb.commit_receive_match()
+            .expect("commit re-exposed candidate");
+        assert!(mb.is_empty());
+    }
+
+    #[test]
+    fn middle_commit_invalidates_index_and_retains_fifo() {
+        let mut mb = Mailbox::new(8);
+        for (behavior, sender) in [(1, 1), (9, 2), (1, 3)] {
+            mb.push_local(msg(behavior, sender, MessagePriority::Normal))
+                .unwrap();
+        }
+
+        assert_eq!(mb.receive_match(&[9]).unwrap().1[0].as_int(), Some(2));
+        mb.commit_receive_match().expect("middle commit");
+        assert!(!mb.receive_indexes.as_ref().unwrap().local.valid);
+        assert_eq!(mb.receive_match(&[1]).unwrap().1[0].as_int(), Some(1));
+        mb.commit_receive_match().expect("head commit");
+        assert_eq!(mb.pop().unwrap().sender, 3);
+        assert!(mb.is_empty());
     }
 
     #[test]
