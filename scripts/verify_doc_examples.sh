@@ -42,7 +42,7 @@ is_runnable() {
     echo "$first" | grep -qE '^(actor |behavior |fn |effect |type |workflow|agent |state |import |use |receive |@tool)' && return 1
     # Checking source is safe; executing examples that read input or call
     # external providers may hang CI, mutate state, or require credentials.
-    echo "$1" | grep -qE 'perform (IO\\.read|Http\\.|Inference\\.|Web\\.|Realtime\\.|Timer\\.sleep)' && return 1
+    echo "$1" | grep -qE 'perform (IO\.read|Http\.|Inference\.|Web\.|Realtime\.|Timer\.sleep)' && return 1
     return 0
 }
 
