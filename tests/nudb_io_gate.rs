@@ -6,9 +6,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use nulang::database::split::{SingleNodeSplitStore, SplitError};
-use nulang::database::tablet::{
-    KeyRange, TabletDescriptor, TabletId, TabletMutation, TabletWrite,
-};
+use nulang::database::tablet::{KeyRange, TabletDescriptor, TabletId, TabletMutation, TabletWrite};
 use nulang::database::wal::{FileWal, WalError};
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -138,7 +136,6 @@ fn unmanaged_wal_writes_and_reclamation_still_work_with_persistent_gate() {
 #[test]
 fn public_symlink_to_unmanaged_wal_uses_real_directory_gate() {
     use std::os::unix::fs::symlink;
-
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -159,12 +156,15 @@ fn public_symlink_to_unmanaged_wal_uses_real_directory_gate() {
 
     let alias = aliases.join("linked.wal");
     symlink(&real, &alias).unwrap();
-    let (ready, done) = mpsc::channel();
+    let (sender, done) = mpsc::channel();
     let reader = std::thread::spawn(move || {
-        ready.send(FileWal::open(&alias).is_ok()).unwrap();
+        sender.send(FileWal::open(&alias).is_ok()).unwrap();
     });
     // The public open must wait while the real target's lock is held.
-    assert!(matches!(done.recv_timeout(Duration::from_millis(100)), Err(mpsc::RecvTimeoutError::Timeout)));
+    assert!(matches!(
+        done.recv_timeout(Duration::from_millis(100)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
     drop(lock);
     assert!(done.recv_timeout(Duration::from_secs(5)).unwrap());
     reader.join().unwrap();
