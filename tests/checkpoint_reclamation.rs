@@ -158,3 +158,84 @@ fn checkpoint_ahead_of_wal_tail_fails_closed() {
     let _ = fs::remove_file(&wal_path);
     let _ = fs::remove_file(&checkpoint);
 }
+
+#[test]
+fn repeated_key_mutations_survive_wal_replay_and_checkpoint_reclamation() {
+    let wal_path = temp_wal("repeated_key");
+    let checkpoint = checkpoint_path(&wal_path);
+    let _ = fs::remove_file(&wal_path);
+    let _ = fs::remove_file(&checkpoint);
+
+    // One atomic tablet write may contain repeated keys. The final mutation
+    // determines the visible value at that sequence, including tombstones.
+    {
+        let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
+        let write = tablet
+            .prepare_write(
+                3,
+                0,
+                vec![
+                    TabletMutation::Put {
+                        key: b"k".to_vec(),
+                        value: b"first".to_vec(),
+                    },
+                    TabletMutation::Put {
+                        key: b"other".to_vec(),
+                        value: b"kept".to_vec(),
+                    },
+                    TabletMutation::Delete { key: b"k".to_vec() },
+                    TabletMutation::Put {
+                        key: b"k".to_vec(),
+                        value: b"final".to_vec(),
+                    },
+                ],
+            )
+            .unwrap();
+        tablet.commit(write).unwrap();
+        assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"final"[..]));
+    }
+
+    // Replay the original WAL before creating a checkpoint. This must not
+    // duplicate MVCC sequence numbers for the repeated key.
+    {
+        let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
+        assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"final"[..]));
+        tablet.checkpoint().unwrap();
+        let wal = FileWal::open(&wal_path).unwrap();
+        assert_eq!(wal.base_sequence(), 1);
+    }
+
+    // A checkpoint must reopen successfully after the WAL history was
+    // reclaimed, preserving both the final write and its sequence.
+    {
+        let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
+        assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"final"[..]));
+        assert_eq!(tablet.read_latest(b"other"), Some(&b"kept"[..]));
+
+        let write = tablet
+            .prepare_write(
+                3,
+                1,
+                vec![
+                    TabletMutation::Put {
+                        key: b"k".to_vec(),
+                        value: b"temporary".to_vec(),
+                    },
+                    TabletMutation::Delete { key: b"k".to_vec() },
+                ],
+            )
+            .unwrap();
+        tablet.commit(write).unwrap();
+        assert_eq!(tablet.read_latest(b"k"), None);
+        tablet.checkpoint().unwrap();
+    }
+
+    let reopened = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
+    assert_eq!(reopened.current_sequence(), 2);
+    assert_eq!(reopened.read_at(b"k", 1).unwrap(), Some(&b"final"[..]));
+    assert_eq!(reopened.read_at(b"k", 2).unwrap(), None);
+    assert_eq!(reopened.read_latest(b"other"), Some(&b"kept"[..]));
+
+    let _ = fs::remove_file(&wal_path);
+    let _ = fs::remove_file(&checkpoint);
+}
