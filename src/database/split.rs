@@ -22,6 +22,9 @@ use super::wal::{FileWal, WalError};
 
 const MANIFEST_MAGIC: &[u8; 8] = b"NUDBRT01";
 const MANIFEST_VERSION: u16 = 1;
+// A preparation record must be rejected by older readers that ignore the
+// unknown serde field, rather than being mistaken for a published route.
+const PREPARING_MANIFEST_VERSION: u16 = 2;
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -79,6 +82,7 @@ impl DiskManifest {
 
     fn for_preparing_parent(parent: &TabletDescriptor) -> Self {
         Self {
+            version: PREPARING_MANIFEST_VERSION,
             preparing: true,
             ..Self::for_parent(parent)
         }
@@ -186,7 +190,7 @@ impl SingleNodeSplitStore {
                 // WAL header may be discarded; any WAL records, checkpoint,
                 // or child artifacts mean recovery is ambiguous and must
                 // fail closed instead of silently losing committed data.
-                if manifest.version != MANIFEST_VERSION
+                if manifest.version != PREPARING_MANIFEST_VERSION
                     || manifest.parent != DiskDescriptor::from_tablet(&parent)
                     || manifest.split.is_some()
                 {
