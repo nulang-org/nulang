@@ -2180,4 +2180,60 @@ mod tests {
         assert!(invalid.to_wire_bytes().is_err());
     }
 
+    #[test]
+    fn replacement_recovery_requires_every_old_member_and_matching_history() {
+        let group = policy(vec![10, 11, 12]);
+        let mut roots = Vec::new();
+        let mut reports = Vec::new();
+        for replica in &group.replicas {
+            let root = temp_root(&format!("recovery-{replica}"));
+            let mut journal = FileFabricConsumerProgressJournal::open(&root).unwrap();
+            let proposal = change(1, 0, 2);
+            journal.prepare(proposal, group.clone(), 2).unwrap();
+            journal.commit_with_acknowledgers(1, &[10, 11]).unwrap();
+            reports.push(journal.recovery_witness(*replica, &group).unwrap());
+            roots.push(root);
+        }
+        let ready = validate_complete_old_policy_recovery(&group, &reports).unwrap();
+        assert_eq!(ready.committed_sequence, 1);
+        assert_eq!(ready.committed_cursor("orders", 0, "billing"), 2);
+
+        // A majority of 2/3 is not enough: the missing node might have
+        // observed an old leader's unpropagated committed decision.
+        assert!(validate_complete_old_policy_recovery(&group, &reports[..2]).is_err());
+        let mut duplicate = reports.clone();
+        duplicate[2] = duplicate[1].clone();
+        assert!(validate_complete_old_policy_recovery(&group, &duplicate).is_err());
+
+        for root in roots {
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn replacement_recovery_rejects_conflicting_or_pending_old_metadata() {
+        let group = policy(vec![10, 11]);
+        let mut roots = Vec::new();
+        let mut reports = Vec::new();
+        for replica in &group.replicas {
+            let root = temp_root(&format!("recovery-conflict-{replica}"));
+            let mut journal = FileFabricConsumerProgressJournal::open(&root).unwrap();
+            let cursor = if *replica == 10 { 1 } else { 2 };
+            journal.prepare(change(1, 0, cursor), group.clone(), 2).unwrap();
+            journal.commit_with_acknowledgers(1, &[10, 11]).unwrap();
+            reports.push(journal.recovery_witness(*replica, &group).unwrap());
+            roots.push(root);
+        }
+        assert!(validate_complete_old_policy_recovery(&group, &reports).is_err());
+
+        let mut journal = FileFabricConsumerProgressJournal::open(&roots[1]).unwrap();
+        journal.prepare(change(2, 1, 2), group.clone(), 2).unwrap();
+        reports[1] = journal.recovery_witness(11, &group).unwrap();
+        assert!(validate_complete_old_policy_recovery(&group, &reports).is_err());
+
+        for root in roots {
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
 }
