@@ -152,21 +152,16 @@ impl SingleNodeSplitStore {
             let manifest = read_manifest(&manifest_path)?;
             match manifest.validate(&parent)? {
                 None => {
-                    if !parent_wal.exists() {
-                        return Err(SplitError::InvalidManifest(
-                            "published parent WAL is missing".into(),
-                        ));
-                    }
+                    verify_published_wal(&parent_wal)?;
                     Active::Parent(WalBackedTablet::open(parent.clone(), &parent_wal)?)
                 }
                 Some((plan, sequence)) => {
                     // Never silently fall back to the parent after promotion.
                     for child in ["left", "right"] {
-                        if !root.join(format!("{child}.wal")).exists()
-                            || !root.join(format!("{child}.checkpoint")).exists()
-                        {
+                        verify_published_wal(&root.join(format!("{child}.wal")))?;
+                        if !root.join(format!("{child}.checkpoint")).exists() {
                             return Err(SplitError::InvalidManifest(
-                                "published child files are missing".into(),
+                                "published child checkpoint is missing".into(),
                             ));
                         }
                     }
@@ -421,6 +416,29 @@ fn read_manifest(path: &Path) -> Result<DiskManifest, SplitError> {
     }
     serde_json::from_slice(&payload)
         .map_err(|error| SplitError::InvalidManifest(error.to_string()))
+}
+
+/// FileWal::open intentionally creates/reinitializes empty files for fresh
+/// stores. Published catalog entries may not use that path: an absent or
+/// truncated WAL must fail closed rather than become an empty live tablet.
+fn verify_published_wal(path: &Path) -> Result<(), SplitError> {
+    let size = match fs::metadata(path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(SplitError::InvalidManifest(
+                "published tablet WAL is missing".into(),
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    // NuDB WAL header: magic 8 + base sequence 8 + tablet ID 8
+    // + ownership epoch 8 + BLAKE3 digest 32.
+    if size < 64 {
+        return Err(SplitError::InvalidManifest(
+            "published tablet WAL header is missing or truncated".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn sync_directory(path: &Path) -> io::Result<()> {
