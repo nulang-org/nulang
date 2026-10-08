@@ -93,13 +93,10 @@ fn lock_public_io_gate(path: &Path) -> Result<File, WalError> {
         .read(true)
         .write(true)
         .open(canonical_dir.join(".nudb-write-gate.lock"))?;
-    match gate.try_lock() {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-            return Err(WalError::WriteGateBusy);
-        }
-        Err(error) => return Err(error.into()),
-    }
+    // Standalone WALs in the same directory can operate concurrently; wait
+    // for the current short mutation instead of spuriously failing tests or
+    // caller writes. Coordinator acquisition remains nonblocking.
+    gate.lock()?;
     // This second check is essential: publication could occur between
     // the fast preflight and our acquisition of the stable gate inode.
     if is_managed_directory(path)? {
@@ -988,7 +985,6 @@ pub enum WalError {
     },
     /// An unmanaged public WAL handle attempted I/O inside a coordinator root.
     ManagedDirectory,
-    WriteGateBusy,
     Poisoned,
 }
 
@@ -1089,9 +1085,6 @@ impl fmt::Display for WalError {
             Self::ManagedDirectory => f.write_str(
                 "NuDB WAL belongs to a managed tablet directory; use the owning coordinator",
             ),
-            Self::WriteGateBusy => {
-                f.write_str("NuDB WAL write gate is held by another process")
-            }
             Self::Poisoned => f.write_str(
                 "NuDB WAL handle is poisoned after an ambiguous storage mutation; reopen before retrying",
             ),
