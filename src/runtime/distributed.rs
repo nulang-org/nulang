@@ -43,6 +43,10 @@ use std::time::{Duration, Instant};
 // Imports from sibling modules in the runtime
 // ---------------------------------------------------------------------------
 
+use super::fabric_consumer_progress::{
+    FabricConsumerProgressAckWire, FabricConsumerProgressPrepareWire,
+    FABRIC_CONSUMER_PROGRESS_ACK_BEHAVIOR, FABRIC_CONSUMER_PROGRESS_PREPARE_BEHAVIOR,
+};
 use super::fabric_stream_cluster::{
     FabricStreamCommitUpdate, FabricStreamReplicaAck, FabricStreamReplicaAppend,
     FABRIC_STREAM_COMMIT_BEHAVIOR, FABRIC_STREAM_REPLICA_ACK_BEHAVIOR,
@@ -1612,6 +1616,115 @@ pub fn process_network_packets(
                 // RFC 0014 §3: store the replica, do NOT instantiate it.
                 // The shadow re-spawns from it only on confirmed removal.
                 runtime.store_shadow_replica(actor_id, nbc_bytes, snapshot_json, epoch);
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+            }
+            Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name,
+                object_table,
+                sender_node,
+                ..
+            } if behavior_name == FABRIC_CONSUMER_PROGRESS_PREPARE_BEHAVIOR => {
+                let result = if sender_node != incoming.from_node {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Fabric consumer-progress sender identity does not match transport peer",
+                    ))
+                } else {
+                    match object_table.as_slice() {
+                        [(0, bytes)] => {
+                            FabricConsumerProgressPrepareWire::from_wire_bytes(bytes)
+                                .and_then(|prepare| {
+                                    runtime.fabric_consumer_progress_apply_prepare_from_peer(
+                                        &prepare,
+                                        incoming.from_node,
+                                    )
+                                })
+                        }
+                        _ => Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Fabric consumer-progress prepare requires one object with id 0",
+                        )),
+                    }
+                };
+                match result {
+                    Ok(receipt) => {
+                        // A receipt is emitted only after the follower has
+                        // durably fsynced the exact pending prepare. This is
+                        // not a metadata commit or a client ACK.
+                        if let Ok(bytes) = receipt.to_wire_bytes() {
+                            let target = incoming.from_node;
+                            let address = cluster
+                                .get_node(target)
+                                .map(|member| member.address)
+                                .or_else(|| transport.connection_addr(target));
+                            if let Some(address) = address {
+                                if let Some(local) = runtime.distributed.node_id {
+                                    transport.send(
+                                        target,
+                                        address,
+                                        Packet::ActorMessage {
+                                            target_actor: 0,
+                                            behavior_name:
+                                                FABRIC_CONSUMER_PROGRESS_ACK_BEHAVIOR.to_string(),
+                                            content_hash: None,
+                                            required_protocol_id: None,
+                                            payload: Vec::new(),
+                                            string_table: Vec::new(),
+                                            object_table: vec![(0, bytes)],
+                                            sender_actor: 0,
+                                            sender_node: local,
+                                            priority: MessagePriority::System,
+                                            trace_id: None,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => warn!(
+                        "nulang-fabric-consumer: rejected metadata prepare from {:?}: {}",
+                        incoming.from_node, error
+                    ),
+                }
+                // Transport ACK is unrelated to durable metadata acknowledgement.
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+            }
+            Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name,
+                object_table,
+                sender_node,
+                ..
+            } if behavior_name == FABRIC_CONSUMER_PROGRESS_ACK_BEHAVIOR => {
+                let result = if sender_node != incoming.from_node {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Fabric consumer-progress receipt sender is not transport peer",
+                    ))
+                } else {
+                    match object_table.as_slice() {
+                        [(0, bytes)] => {
+                            FabricConsumerProgressAckWire::from_wire_bytes(bytes)
+                                .and_then(|receipt| {
+                                    runtime.fabric_consumer_progress_record_replica_receipt(
+                                        &receipt,
+                                        incoming.from_node,
+                                    )
+                                })
+                        }
+                        _ => Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Fabric consumer-progress receipt requires one object with id 0",
+                        )),
+                    }
+                };
+                if let Err(error) = result {
+                    warn!(
+                        "nulang-fabric-consumer: rejected metadata fsync receipt from {:?}: {}",
+                        incoming.from_node, error
+                    );
+                }
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
             Packet::ActorMessage {
