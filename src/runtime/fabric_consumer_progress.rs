@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -177,6 +177,7 @@ pub(crate) struct FileFabricConsumerProgressJournal {
     root: PathBuf,
     last_hash: String,
     latest_sequence: u64,
+    poisoned: bool,
     pending: Option<PendingConsumerProgress>,
     committed: BTreeMap<(String, u16, String), FabricConsumerProgressChange>,
     committed_policy: Option<FabricConsumerProgressPolicy>,
@@ -190,26 +191,31 @@ impl FileFabricConsumerProgressJournal {
             root,
             last_hash: String::new(),
             latest_sequence: 0,
+            poisoned: false,
             pending: None,
             committed: BTreeMap::new(),
             committed_policy: None,
         };
         let path = journal.root.join("consumer_progress.log");
         if path.exists() {
-            let bytes = fs::read(&path)?;
-            // A final partial write is not silently accepted. Quorum repair
-            // must recover the correct predecessor before writing again.
-            if !bytes.is_empty() && !bytes.ends_with(b"\n") {
-                return Err(invalid("truncated consumer-progress journal tail"));
-            }
-            for line in bytes.split(|byte| *byte == b'\n') {
-                if line.is_empty() {
-                    continue;
+            let mut reader = BufReader::new(File::open(&path)?);
+            let mut line = Vec::new();
+            loop {
+                line.clear();
+                let read = reader.read_until(b'\n', &mut line)?;
+                if read == 0 {
+                    break;
                 }
-                if line.len() > MAX_FRAME_BYTES {
-                    return Err(invalid("consumer-progress journal frame exceeds limit"));
+                // A torn tail, empty interior frame, or oversized record
+                // must be repaired from a trusted source, never ignored.
+                if line.len() > MAX_FRAME_BYTES
+                    || line.last() != Some(&b'\n')
+                    || line.len() == 1
+                {
+                    return Err(invalid("invalid or truncated consumer-progress frame"));
                 }
-                let frame: FabricConsumerProgressFrame = serde_json::from_slice(line)
+                line.pop();
+                let frame: FabricConsumerProgressFrame = serde_json::from_slice(&line)
                     .map_err(|error| invalid(error.to_string()))?;
                 frame.validate(&journal.last_hash)?;
                 journal.apply_event(&frame.event)?;
@@ -302,7 +308,17 @@ impl FileFabricConsumerProgressJournal {
         Ok(())
     }
 
+    fn ensure_writable(&self) -> io::Result<()> {
+        if self.poisoned {
+            return Err(invalid(
+                "consumer-progress journal has an uncertain write; reopen and recover first",
+            ));
+        }
+        Ok(())
+    }
+
     fn append_event(&mut self, event: FabricConsumerProgressEvent) -> io::Result<()> {
+        self.ensure_writable()?;
         let frame = FabricConsumerProgressFrame::new(self.last_hash.clone(), event)?;
         let mut bytes = serde_json::to_vec(&frame)
             .map_err(|error| invalid(error.to_string()))?;
@@ -316,12 +332,19 @@ impl FileFabricConsumerProgressJournal {
         if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_data()) {
             // An uncertain local fsync result requires reopening before any
             // further operation; do not act on cached state.
+            self.poisoned = true;
             return Err(error);
         }
         if created {
-            File::open(&self.root)?.sync_all()?;
+            if let Err(error) = File::open(&self.root).and_then(|dir| dir.sync_all()) {
+                self.poisoned = true;
+                return Err(error);
+            }
         }
-        self.apply_event(&frame.event)?;
+        if let Err(error) = self.apply_event(&frame.event) {
+            self.poisoned = true;
+            return Err(error);
+        }
         self.last_hash = frame.integrity_hash;
         Ok(())
     }
@@ -333,6 +356,7 @@ impl FileFabricConsumerProgressJournal {
         policy: FabricConsumerProgressPolicy,
         stream_committed_through: u64,
     ) -> io::Result<()> {
+        self.ensure_writable()?;
         if let Some(pending) = &self.pending {
             // Same exact prepare is idempotent and must not add another frame.
             if pending.change == change && pending.policy == policy {
@@ -356,6 +380,7 @@ impl FileFabricConsumerProgressJournal {
         metadata_sequence: u64,
         acknowledgers: &[u64],
     ) -> io::Result<()> {
+        self.ensure_writable()?;
         let pending = self.pending.as_ref().ok_or_else(|| {
             invalid("consumer-progress commit has no pending durable record")
         })?;
