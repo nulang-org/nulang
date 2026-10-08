@@ -1261,6 +1261,93 @@ mod tests {
     }
 
     #[test]
+    fn failed_set_journal_retains_preexisting_value() {
+        let wal_path = test_path("set-before-wal");
+        let wal = CacheWal::create_after(&wal_path, 0).unwrap();
+        let mut store = CacheStore::new();
+        store.set_bytes(b"k", b"before", None, 0);
+        let mut durable =
+            DurableCacheStore::with_wal(store, wal, CacheDurabilityMode::SyncedJournal).unwrap();
+        let readonly = OpenOptions::new().read(true).open(&wal_path).unwrap();
+        durable.wal.as_mut().unwrap().file = readonly;
+        assert!(matches!(
+            durable.set_bytes(b"k", b"after", None, 0, 0),
+            Err(CacheDurabilityError::Persistence(_))
+        ));
+        assert_eq!(
+            durable.store().snapshot_entries(0)[0].value,
+            CacheSnapshotValue::Bytes(b"before".to_vec())
+        );
+        assert!(durable.is_poisoned());
+        let _ = fs::remove_file(wal_path);
+    }
+
+    #[test]
+    fn failed_mset_journal_keeps_all_prior_keys_and_values() {
+        let wal_path = test_path("mset-before-wal");
+        let wal = CacheWal::create_after(&wal_path, 0).unwrap();
+        let mut store = CacheStore::new();
+        store.set_bytes(b"a", b"one", None, 0);
+        let mut durable =
+            DurableCacheStore::with_wal(store, wal, CacheDurabilityMode::SyncedJournal).unwrap();
+        let readonly = OpenOptions::new().read(true).open(&wal_path).unwrap();
+        durable.wal.as_mut().unwrap().file = readonly;
+        let pairs = [
+            (b"a".as_slice(), b"two".as_slice()),
+            (b"b".as_slice(), b"three".as_slice()),
+        ];
+        assert!(matches!(
+            durable.set_many_bytes(&pairs, 0, 0),
+            Err(CacheDurabilityError::Persistence(_))
+        ));
+        let state = durable.store().snapshot_entries(0);
+        assert_eq!(state.len(), 1);
+        assert_eq!(state[0].value, CacheSnapshotValue::Bytes(b"one".to_vec()));
+        let _ = fs::remove_file(wal_path);
+    }
+
+    #[test]
+    fn failed_increment_journal_keeps_integer_and_ttl() {
+        let wal_path = test_path("increment-before-wal");
+        let wal = CacheWal::create_after(&wal_path, 0).unwrap();
+        let mut store = CacheStore::new();
+        store.set_integer(b"counter", 4, Some(5_000), 0);
+        let mut durable =
+            DurableCacheStore::with_wal(store, wal, CacheDurabilityMode::SyncedJournal).unwrap();
+        let readonly = OpenOptions::new().read(true).open(&wal_path).unwrap();
+        durable.wal.as_mut().unwrap().file = readonly;
+        assert!(matches!(
+            durable.increment(b"counter", 1, 0, 0),
+            Err(CacheDurabilityError::Persistence(_))
+        ));
+        let state = durable.store().snapshot_entries(0);
+        assert_eq!(state[0].value, CacheSnapshotValue::Integer(4));
+        assert_eq!(state[0].remaining_ttl_ms, Some(5_000));
+        let _ = fs::remove_file(wal_path);
+    }
+
+    #[test]
+    fn journaled_set_preflight_rejects_before_appending() {
+        let wal_path = test_path("write-preflight");
+        let wal = CacheWal::create_after(&wal_path, 0).unwrap();
+        let store = CacheStore::with_config(CacheConfig {
+            max_key_bytes: 2,
+            max_value_bytes: 2,
+            max_entries: 1,
+            max_arena_bytes: 1024,
+        });
+        let mut durable =
+            DurableCacheStore::with_wal(store, wal, CacheDurabilityMode::SyncedJournal).unwrap();
+        assert!(matches!(
+            durable.set_bytes(b"excess", b"x", None, 0, 0),
+            Err(CacheDurabilityError::Store(CacheWriteError::KeyTooLarge))
+        ));
+        assert_eq!(durable.durability_status().wal_last_sequence, Some(0));
+        assert!(!durable.is_poisoned());
+        let _ = fs::remove_file(wal_path);
+    }
+
+    #[test]
     fn journal_before_delete_batch_keeps_duplicate_key_semantics() {
         let wal_path = test_path("delete-dedup");
         let wal = CacheWal::create_after(&wal_path, 0).unwrap();
