@@ -12,6 +12,7 @@ mod gc_bench;
 mod interp_bench;
 #[cfg(feature = "native-codegen")]
 mod jit_bench;
+mod nudb_mvcc_bench;
 mod persist_bench;
 mod scheduler_bench;
 mod vm_bench;
@@ -29,6 +30,7 @@ criterion_main!(
     gc_bench::benches,
     dist_bench::benches,
     persist_bench::benches,
+    nudb_mvcc_bench::benches,
     scheduler_bench::benches,
 );
 
@@ -41,5 +43,6 @@ criterion_main!(
     gc_bench::benches,
     dist_bench::benches,
     persist_bench::benches,
+    nudb_mvcc_bench::benches,
     scheduler_bench::benches,
 );
