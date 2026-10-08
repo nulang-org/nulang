@@ -31,7 +31,14 @@ function boot({ withAction = false, fetchResponse, bootstrapSnapshot } = {}) {
     window: { location: { href: '/tasks', reload() { reloaded++; } } },
     document,
     URLSearchParams,
-    FormData: class { forEach() {} },
+    FormData: class {
+      constructor(form, submitter) { this.submitter = submitter; }
+      forEach(fn) {
+        if (this.submitter && this.submitter.name) {
+          fn(this.submitter.value, this.submitter.name);
+        }
+      }
+    },
     fetch: async (_, request) => { posted = request; return fetchResponse; },
     console,
     crypto: { randomUUID: () => 'test-id' },
@@ -150,6 +157,28 @@ test('POST preserves canonical payload and consumes patch without reload', async
   const message = JSON.parse(ctx.posted().body.get('__nulang_ui_message'));
   assert.equal(message.request.revision, '0');
   assert.equal(message.request.document_id, 'app');
+});
+
+test('submitting a form includes the clicked submit button in canonical payload', async () => {
+  const response = { ok: true, headers: { get: () => 'text/html' } };
+  const ctx = boot({ withAction: true, fetchResponse: response });
+  ctx.listeners.get('submit')({
+    preventDefault() {},
+    submitter: { tagName: 'BUTTON', name: 'intent', value: 'save' }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const body = ctx.posted().body;
+  assert.equal(body.get('intent'), 'save');
+  const message = JSON.parse(body.get('__nulang_ui_message'));
+  assert.equal(message.request.payload.value.intent.value, 'save');
+});
+
+test('preserves SSR content for an uninitialized signal value', () => {
+  const initial = snapshot('12', 'unused');
+  initial.document.nodes[1].properties.value = { type: 'null' };
+  const { app, span } = boot({ bootstrapSnapshot: initial });
+  assert.equal(app.uiRevision(), '12');
+  assert.equal(span.textContent, '0');
 });
 
 test('legacy HTML server action response falls back to reload', async () => {
