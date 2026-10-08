@@ -1052,6 +1052,55 @@ mod transactional_receive_tests {
     }
 
     #[test]
+    fn terminal_commit_keeps_all_priority_lane_indexes_consistent() {
+        for lane in [MatchLane::System, MatchLane::Local, MatchLane::Normal] {
+            let mut mb = Mailbox::new(8);
+            let priority = if lane == MatchLane::System {
+                MessagePriority::System
+            } else {
+                MessagePriority::Normal
+            };
+
+            for sender in [1, 2] {
+                let message = msg(if sender == 1 { 1 } else { 9 }, sender, priority);
+                if lane == MatchLane::Local {
+                    mb.push_local(message).unwrap();
+                } else {
+                    mb.push(message).unwrap();
+                }
+            }
+
+            let (_, matched) = mb.receive_match(&[9]).expect("terminal candidate");
+            assert_eq!(matched[0].as_int(), Some(2));
+            assert!(mb.commit_receive_match().is_some());
+
+            let indexes = mb.receive_indexes.as_ref().unwrap();
+            assert!(indexes.system.valid);
+            assert!(indexes.local.valid);
+            assert!(indexes.normal.valid);
+            assert_eq!(mb.receive_match(&[1]).unwrap().1[0].as_int(), Some(1));
+            assert_eq!(mb.commit_receive_match().unwrap()[0].as_int(), Some(1));
+            assert!(mb.is_empty());
+        }
+    }
+
+    #[test]
+    fn tail_commit_preserves_earlier_guard_rejections() {
+        let mut mb = Mailbox::new(4);
+        mb.push_local(msg(9, 1, MessagePriority::Normal)).unwrap();
+        mb.push_local(msg(9, 2, MessagePriority::Normal)).unwrap();
+
+        assert_eq!(mb.receive_match(&[9]).unwrap().1[0].as_int(), Some(1));
+        assert_eq!(mb.receive_match(&[9]).unwrap().1[0].as_int(), Some(2));
+        assert_eq!(mb.commit_receive_match().unwrap()[0].as_int(), Some(2));
+        assert!(mb.receive_indexes.as_ref().unwrap().local.valid);
+
+        assert_eq!(mb.receive_match(&[9]).unwrap().1[0].as_int(), Some(1));
+        mb.commit_receive_match().expect("commit re-exposed candidate");
+        assert!(mb.is_empty());
+    }
+
+    #[test]
     fn middle_commit_invalidates_index_and_retains_fifo() {
         let mut mb = Mailbox::new(8);
         for (behavior, sender) in [(1, 1), (9, 2), (1, 3)] {
