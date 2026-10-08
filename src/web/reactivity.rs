@@ -782,135 +782,7 @@ fn data_attr(name: &str, value: &str, span: Span) -> Expr {
 /// actions from server-rendered HTML. Bindings are discovered once from
 /// `data-signal` and `data-action` attributes emitted by the compiler.
 pub fn generate_client_runtime() -> String {
-    r#"(function () {
-  const signals = {};
-  const signalBindings = Object.create(null);
-
-  function refreshSignal(name) {
-    const bindings = signalBindings[name];
-    if (!bindings) return;
-    bindings.forEach(function (el) {
-      el.textContent = signals[name];
-    });
-  }
-
-  function runClientAction(handler) {
-    if (window.nulangActions && typeof window.nulangActions[handler] === 'function') {
-      window.nulangActions[handler]();
-    } else {
-      console.warn('nulang: missing client action handler', handler);
-    }
-  }
-
-  function actionMessageId(prefix) {
-    if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
-      return prefix + ':' + globalThis.crypto.randomUUID();
-    }
-    return prefix + ':' + Date.now() + ':' + Math.random().toString(16).slice(2);
-  }
-
-  function wireFormPayload(body) {
-    const fields = {};
-    body.forEach(function (value, key) {
-      if (typeof value === 'string') {
-        fields[key] = { type: 'string', value: value };
-      }
-    });
-    return { type: 'object', value: fields };
-  }
-
-  function createActionMessage(handler, placement, body) {
-    const correlationId = actionMessageId('corr');
-    return {
-      type: 'invoke_action',
-      protocol: 'nulang-ui-msg/1',
-      request: {
-        document_id: 'app',
-        revision: '0',
-        action_id: handler,
-        placement: placement,
-        correlation_id: correlationId,
-        idempotency_key: actionMessageId('idem'),
-        payload: wireFormPayload(body)
-      }
-    };
-  }
-
-  function formBody(form) {
-    const body = new URLSearchParams();
-    if (!form) return body;
-    new FormData(form).forEach(function (value, key) {
-      if (typeof value === 'string') {
-        body.append(key, value);
-      }
-    });
-    return body;
-  }
-
-  async function runServerAction(handler, el) {
-    const form = el.closest('form');
-    const body = formBody(form);
-    const message = createActionMessage(handler, 'server', body);
-    body.append('__nulang_action', handler);
-    body.append('__nulang_ui_message', JSON.stringify(message));
-    const response = await fetch(window.location.href, { method: 'POST', body: body });
-    if (!response.ok) {
-      throw new Error('server action failed: ' + response.status);
-    }
-    window.location.reload();
-  }
-
-  function hydrate() {
-    document.querySelectorAll('[data-signal]').forEach(function (el) {
-      const name = el.dataset.signal;
-      if (!(name in signals)) {
-        signals[name] = el.textContent;
-      }
-      if (!signalBindings[name]) {
-        signalBindings[name] = [];
-      }
-      signalBindings[name].push(el);
-    });
-
-    document.querySelectorAll('[data-action]').forEach(function (el) {
-      const handler = el.dataset.action;
-      const placement = el.dataset.actionPlacement;
-      const listener = function (e) {
-        e.preventDefault();
-        if (placement === 'server') {
-          runServerAction(handler, el).catch(function (err) {
-            console.error('nulang: server action failed', err);
-          });
-        } else {
-          runClientAction(handler);
-        }
-      };
-      el.addEventListener('click', listener);
-      if (el.tagName === 'FORM') {
-        el.addEventListener('submit', listener);
-      }
-    });
-  }
-
-  window.nulang = {
-    signal: function (name) {
-      return {
-        get: function () { return signals[name]; },
-        set: function (value) {
-          signals[name] = value;
-          refreshSignal(name);
-        }
-      };
-    }
-  };
-
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', hydrate);
-  } else {
-    hydrate();
-  }
-})();"#
-        .to_string()
+    include_str!("client_runtime.js").to_string()
 }
 
 fn wrap_signal_read(name: &str, span: Span) -> Expr {
@@ -1109,8 +981,11 @@ fn view() -> Html {
         );
         assert!(
             js.contains("window.location.reload"),
-            "server actions should reload the page after POST"
+            "legacy HTML action responses must retain reload fallback"
         );
+        assert!(js.contains("receiveUiMessage"));
+        assert!(js.contains("base_revision"));
+        assert!(js.contains("el.tagName === 'FORM' ? 'submit' : 'click'"));
     }
 
     #[test]
