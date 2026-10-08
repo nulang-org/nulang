@@ -158,8 +158,7 @@ pub fn resolve_document_zero_arg_action(
     }
     let registered = document.nodes.iter().any(|node| {
         node.actions.iter().any(|binding| {
-            binding.action_id == request.action_id
-                && binding.placement == ActionPlacement::Server
+            binding.action_id == request.action_id && binding.placement == ActionPlacement::Server
         })
     });
     if !registered {
@@ -332,7 +331,10 @@ mod tests {
             &document,
             &action_message("save", ActionPlacement::Server),
         );
-        assert!(matches!(result, Err(UiActionDispatchError::InvalidDocument(_))));
+        assert!(matches!(
+            result,
+            Err(UiActionDispatchError::InvalidDocument(_))
+        ));
     }
 
     #[test]
