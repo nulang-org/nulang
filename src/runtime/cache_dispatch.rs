@@ -13,7 +13,9 @@ use super::cache_cluster::{
     execute_cluster_command, CacheClusterCommandError, CacheEndpointMap, CacheRoutingMode,
 };
 use super::cache_routing::{CacheShardOwner, CacheSlotMap};
-use super::resp::{parse_command, write_ask, write_error, write_moved, write_simple, RespParseError};
+use super::resp::{
+    parse_command, write_ask, write_error, write_moved, write_simple, RespParseError,
+};
 use super::resp_cache::{
     command_key_presence, command_slot, execute_command, execute_frame, CacheCommandKeyPresence,
     CacheCommandTarget, RespCommandSlot,
@@ -341,10 +343,7 @@ impl CacheDispatcher {
                 write_simple(out, b"OK");
                 return Ok(Some(CacheDispatchOutcome::AskingEnabled { consumed }));
             }
-            write_error(
-                out,
-                b"ERR wrong number of arguments for 'asking' command",
-            );
+            write_error(out, b"ERR wrong number of arguments for 'asking' command");
             return Ok(Some(CacheDispatchOutcome::Executed { consumed }));
         }
 
@@ -383,10 +382,7 @@ impl CacheDispatcher {
 
         // ASKING authorizes exactly one command on the importing target while
         // authoritative ownership still points at the source.
-        if asking
-            && migration
-                .is_some_and(|migration| migration.target == local_owner)
-        {
+        if asking && migration.is_some_and(|migration| migration.target == local_owner) {
             execute_command(store, command, now_ms, out);
             return Ok(Some(CacheDispatchOutcome::Executed { consumed }));
         }
@@ -812,7 +808,10 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert!(matches!(outcome, CacheDispatchOutcome::AskingEnabled { .. }));
+        assert!(matches!(
+            outcome,
+            CacheDispatchOutcome::AskingEnabled { .. }
+        ));
         assert_eq!(out, b"+OK\r\n");
         assert!(store.is_empty());
     }
