@@ -39,7 +39,7 @@ is_runnable() {
     local first
     first=$(echo "$1" | head -1)
     # Declaration keywords → fragment, not standalone
-    echo "$first" | grep -qE '^(actor |behavior |fn |effect |type |workflow|agent |state |import |use |receive )' && return 1
+    echo "$first" | grep -qE '^(actor |behavior |fn |effect |type |workflow|agent |state |import |use |receive |@tool)' && return 1
     return 0
 }
 
