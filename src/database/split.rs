@@ -197,14 +197,14 @@ impl SingleNodeSplitStore {
                 ));
             }
             let parent_tablet = WalBackedTablet::open(parent.clone(), &parent_wal)?;
-            write_manifest(&manifest_path, &DiskManifest::for_parent(&parent), false)?;
+            write_manifest(&manifest_path, &DiskManifest::for_parent(&parent), None)?;
             Active::Parent(parent_tablet)
         };
         Ok(Self { root, parent, active })
     }
 
     pub fn is_split(&self) -> bool {
-        matches!(self.active, Active::Children { .. })
+        matches!(&self.active, Active::Children { .. })
     }
 
     fn select(&self, key: &[u8]) -> Result<&WalBackedTablet, SplitError> {
@@ -324,7 +324,7 @@ impl SingleNodeSplitStore {
         write_manifest(
             &self.root.join("route.manifest"),
             &new_manifest,
-            stop == Some(SplitStop::AfterManifestRename),
+            stop,
         )?;
         self.active = Active::Children {
             split_key: plan.split_key.clone(),
@@ -358,13 +358,14 @@ impl SingleNodeSplitStore {
 enum SplitStop {
     AfterLeft,
     AfterRight,
+    AfterManifestTempSync,
     AfterManifestRename,
 }
 
 fn write_manifest(
     path: &Path,
     manifest: &DiskManifest,
-    interrupt_after_rename: bool,
+    interrupt: Option<SplitStop>,
 ) -> Result<(), SplitError> {
     let payload = serde_json::to_vec(manifest)
         .map_err(|error| SplitError::InvalidManifest(error.to_string()))?;
@@ -383,8 +384,11 @@ fn write_manifest(
     file.write_all(blake3::hash(&payload).as_bytes())?;
     file.sync_data()?;
     drop(file);
+    if interrupt == Some(SplitStop::AfterManifestTempSync) {
+        return Err(SplitError::Interrupted("after manifest temp fsync"));
+    }
     fs::rename(&temp_path, path)?;
-    if interrupt_after_rename {
+    if interrupt == Some(SplitStop::AfterManifestRename) {
         return Err(SplitError::Interrupted("after routing manifest rename"));
     }
     sync_directory(path.parent().unwrap_or_else(|| Path::new(".")))?;
@@ -551,6 +555,11 @@ mod tests {
     #[test]
     fn crash_after_right_checkpoint_recovers_parent() {
         case(SplitStop::AfterRight);
+    }
+
+    #[test]
+    fn crash_after_manifest_temp_sync_keeps_parent_active() {
+        case(SplitStop::AfterManifestTempSync);
     }
 
     #[test]
