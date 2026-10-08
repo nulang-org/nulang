@@ -135,11 +135,29 @@ enum Active {
 #[derive(Debug)]
 pub(crate) struct OwnedDirectory {
     root: PathBuf,
+    // Public WAL I/O must lock this inode during every mutation. Owning it
+    // for the entire coordinator lifetime serializes acquisition with old
+    // handles whose marker check preceded adoption.
+    _io_gate: File,
     _lock: File,
 }
 
 impl OwnedDirectory {
     fn acquire(root: &Path) -> Result<Self, SplitError> {
+        // Lock order is always write-gate -> owner. Public WAL handles only
+        // lock the write-gate, so they cannot race with owner publication.
+        let gate = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(root.join(".nudb-write-gate.lock"))?;
+        match gate.try_lock() {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                return Err(SplitError::OwnerBusy);
+            }
+            Err(error) => return Err(error.into()),
+        }
         let file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -148,6 +166,7 @@ impl OwnedDirectory {
         match file.try_lock() {
             Ok(()) => Ok(Self {
                 root: root.to_path_buf(),
+                _io_gate: gate,
                 _lock: file,
             }),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
