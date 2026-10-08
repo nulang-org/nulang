@@ -75,7 +75,7 @@ fn scan_at_preserves_historical_values_tombstones_order_and_limit() {
     assert!(tablet.scan_at(b"a", Some(b"z"), 2, 0).unwrap().is_empty());
 
     commit(&mut tablet, vec![put(b"b", b"newer")]);
-    assert_eq!(snapshot_one[0].value, b"old");
+    assert_eq!(snapshot_one[0].value.as_slice(), b"old");
     assert_eq!(
         tablet.scan_at(b"a", Some(b"z"), 1, 10).unwrap(),
         snapshot_one
@@ -111,7 +111,7 @@ fn scan_at_rejects_invalid_snapshots_and_cross_tablet_ranges() {
 }
 
 #[test]
-fn split_materialization_preserves_every_mvcc_version_and_fences_children() {
+fn split_materialization_preserves_mvcc_history_and_rejects_stale_child_epochs() {
     let mut source = MemoryTablet::new(descriptor());
     commit(&mut source, vec![put(b"a", b"a1"), put(b"m", b"m1"), put(b"y", b"y1")]);
     commit(
@@ -171,12 +171,25 @@ fn wal_recovery_and_checkpoint_keep_historical_scans_stable() {
 
     {
         let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
-        let first = tablet.prepare_write(4, 0, vec![put(b"b", b"first"), put(b"m", b"first")]).unwrap();
+        let first = tablet
+            .prepare_write(4, 0, vec![put(b"b", b"first"), put(b"m", b"first")])
+            .unwrap();
         tablet.commit(first).unwrap();
-        let second = tablet.prepare_write(4, 1, vec![put(b"b", b"second"), TabletMutation::Delete { key: b"m".to_vec() }]).unwrap();
+        let second = tablet
+            .prepare_write(
+                4,
+                1,
+                vec![
+                    put(b"b", b"second"),
+                    TabletMutation::Delete { key: b"m".to_vec() },
+                ],
+            )
+            .unwrap();
         tablet.commit(second).unwrap();
         tablet.checkpoint().unwrap();
-        let third = tablet.prepare_write(4, 2, vec![put(b"y", b"third")]).unwrap();
+        let third = tablet
+            .prepare_write(4, 2, vec![put(b"y", b"third")])
+            .unwrap();
         tablet.commit(third).unwrap();
     }
 
