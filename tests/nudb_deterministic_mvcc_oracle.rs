@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use nulang::database::store::WalBackedTablet;
@@ -62,7 +62,7 @@ fn temporary_wal(seed: u64) -> PathBuf {
     ))
 }
 
-fn cleanup(path: &PathBuf) {
+fn cleanup(path: &Path) {
     let _ = fs::remove_file(path);
     let _ = fs::remove_file(path.with_extension("checkpoint"));
 }
