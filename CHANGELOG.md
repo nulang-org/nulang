@@ -1,4 +1,8 @@
 # Nulang Changelog
+
+### WASM package capability forwarding — 2026-10-07
+- **Canonical package WASM compilation preserves manifest capabilities** for both `nula build-wasm` and the optional WASM artifact emitted by `nula deploy`. The compiler receives the package's explicit `--with` grants. A `wasm-backend` integration test requires a net-gated package to compile into `.nula/dist/<package>.wasm` (fixes #148).
+
 ### Receiver-acknowledged CRDT delta synchronization — 2026-10-07
 - **Per-peer CRDT frontiers now advance only after a matching NUL0 acknowledgement arrives from the intended receiver.** Dropped or unacknowledged batches remain retransmittable from that peer's last proven frontier instead of disappearing behind sender-side optimistic state.
 - **Peer recovery invalidates stale receiver knowledge.** A `Failed → Healthy` transition through heartbeat or authoritative gossip forgets prior CRDT frontier/correlation state so a restarted process receives fresh state.
