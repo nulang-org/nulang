@@ -560,6 +560,57 @@ impl FileFabricConsumerProgressJournal {
         pending.policy.validate_quorum(&voters)?;
         self.commit_with_acknowledgers(metadata_sequence, &voters)
     }
+
+    /// Verify exact predecessor and policy against a locally fsynced prepare.
+    /// A follower trusts the sender's already committed decision; the
+    /// supplied vote list is structurally checked, not independently signed.
+    fn verify_commit_update(&self, update: &FabricConsumerProgressCommitWire) -> io::Result<()> {
+        update.validate_shape()?;
+        if let Some(pending) = &self.pending {
+            let exact = FabricConsumerProgressPrepareWire::new(
+                pending.change.clone(),
+                pending.policy.clone(),
+                pending.stream_committed_through,
+            )?;
+            if update.stream != pending.change.stream
+                || update.partition != pending.change.partition
+                || update.epoch != pending.change.epoch
+                || update.leader != pending.policy.leader
+                || update.metadata_sequence != pending.change.metadata_sequence
+                || update.digest != exact.digest
+            {
+                return Err(invalid("consumer-progress commit does not match prepared record"));
+            }
+            return pending.policy.validate_quorum(&update.acknowledgers);
+        }
+
+        // Idempotent re-delivery of the *same* committed decision is safe;
+        // changed certificates or older index updates are not accepted.
+        if let Some(last) = &self.last_commit {
+            if update.stream == last.change.stream
+                && update.partition == last.change.partition
+                && update.epoch == last.change.epoch
+                && update.leader == last.policy.leader
+                && update.metadata_sequence == last.change.metadata_sequence
+                && update.digest == last.digest
+                && update.acknowledgers == last.acknowledgers
+            {
+                return Ok(());
+            }
+        }
+        Err(invalid("consumer-progress commit has no matching pending prepare"))
+    }
+
+    fn apply_committed_update(&mut self, update: &FabricConsumerProgressCommitWire)
+        -> io::Result<()>
+    {
+        self.ensure_writable()?;
+        self.verify_commit_update(update)?;
+        if self.pending.is_none() {
+            return Ok(());
+        }
+        self.commit_with_acknowledgers(update.metadata_sequence, &update.acknowledgers)
+    }
 }
 
 
@@ -626,6 +677,69 @@ impl FabricConsumerProgressPrepareWire {
             serde_json::from_slice(bytes).map_err(|error| invalid(error.to_string()))?;
         wire.verify()?;
         Ok(wire)
+    }
+}
+
+/// Leader's persisted metadata commit decision, not a cryptographic
+/// quorum certificate or independently verified follower fsync proof.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct FabricConsumerProgressCommitWire {
+    version: u16,
+    stream: String,
+    partition: u16,
+    epoch: u64,
+    leader: u64,
+    metadata_sequence: u64,
+    digest: String,
+    acknowledgers: Vec<u64>,
+}
+
+impl FabricConsumerProgressCommitWire {
+    fn from_committed(last: &LastConsumerProgressCommit) -> Self {
+        Self {
+            version: JOURNAL_FORMAT_VERSION,
+            stream: last.change.stream.clone(),
+            partition: last.change.partition,
+            epoch: last.change.epoch,
+            leader: last.policy.leader,
+            metadata_sequence: last.change.metadata_sequence,
+            digest: last.digest.clone(),
+            acknowledgers: last.acknowledgers.clone(),
+        }
+    }
+
+    pub(crate) fn to_wire_bytes(&self) -> io::Result<Vec<u8>> {
+        self.validate_shape()?;
+        let bytes = serde_json::to_vec(self).map_err(|error| invalid(error.to_string()))?;
+        if bytes.len() > MAX_FRAME_BYTES {
+            return Err(invalid("consumer-progress commit frame exceeds wire limit"));
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn from_wire_bytes(bytes: &[u8]) -> io::Result<Self> {
+        if bytes.len() > MAX_FRAME_BYTES {
+            return Err(invalid("consumer-progress commit frame exceeds wire limit"));
+        }
+        let wire: Self = serde_json::from_slice(bytes)
+            .map_err(|error| invalid(error.to_string()))?;
+        wire.validate_shape()?;
+        Ok(wire)
+    }
+
+    fn validate_shape(&self) -> io::Result<()> {
+        if self.version != JOURNAL_FORMAT_VERSION
+            || self.stream.is_empty()
+            || self.partition != 0
+            || self.epoch == 0
+            || self.metadata_sequence == 0
+            || self.digest.len() != 64
+            || self.acknowledgers.is_empty()
+            || self.acknowledgers.len() > 64
+        {
+            return Err(invalid("invalid consumer-progress commit envelope"));
+        }
+        Ok(())
     }
 }
 
