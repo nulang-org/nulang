@@ -37,6 +37,7 @@ struct Config {
     format: OutputFormat,
     benchmark: Option<String>,
     repeat: u32,
+    reuse_setup: bool,
 }
 
 #[derive(Debug)]
@@ -75,6 +76,22 @@ fn main() -> ExitCode {
         }
     }
 
+    // The canonical cross-runtime suite always constructs a fresh fixture.
+    // Profilers may opt in to persistent actors to avoid sampling compilation
+    // and actor startup repeatedly; this is NOT a comparative baseline.
+    if config.reuse_setup {
+        if config.benchmark.as_deref() != Some("ping_pong") {
+            eprintln!("--reuse-setup currently requires --benchmark ping_pong");
+            return ExitCode::from(2);
+        }
+        let (runtime, pinger, ponger) = ping_pong_fixture();
+        for iteration in 1..=config.repeat {
+            let measurement = run_ping_pong(&runtime, pinger, ponger, iteration);
+            emit(&measurement, iteration, config.format);
+        }
+        return ExitCode::SUCCESS;
+    }
+
     for iteration in 1..=config.repeat {
         for &name in BENCHMARKS {
             if config
@@ -104,6 +121,7 @@ fn parse_args() -> Result<Option<Config>, String> {
     let mut format = OutputFormat::Human;
     let mut benchmark = None;
     let mut repeat = 1u32;
+    let mut reuse_setup = false;
     let mut args = env::args().skip(1);
 
     while let Some(arg) = args.next() {
@@ -135,6 +153,9 @@ fn parse_args() -> Result<Option<Config>, String> {
                     return Err("--repeat must be at least 1".to_string());
                 }
             }
+            "--reuse-setup" => {
+                reuse_setup = true;
+            }
             "--list" => {
                 for name in BENCHMARKS {
                     println!("{name}");
@@ -153,12 +174,13 @@ fn parse_args() -> Result<Option<Config>, String> {
         format,
         benchmark,
         repeat,
+        reuse_setup,
     }))
 }
 
 fn print_usage() {
     eprintln!(
-        "Usage: nulang-savina [--format human|jsonl] [--benchmark NAME] [--repeat N] [--list]"
+        "Usage: nulang-savina [--format human|jsonl] [--benchmark NAME] [--repeat N] [--reuse-setup] [--list]"
     );
 }
 
@@ -256,8 +278,8 @@ fn bench_counting() -> Measurement {
     }
 }
 
-fn bench_ping_pong() -> Measurement {
-    const N: i64 = 20_000;
+/// Compile and wire the two benchmark actors once.
+fn ping_pong_fixture() -> (Rc<RefCell<Runtime>>, u64, u64) {
     let source = r#"
         actor Ping {
             state ponger = nil
@@ -303,6 +325,19 @@ fn bench_ping_pong() -> Measurement {
 
     rt.borrow_mut().run_scheduler();
 
+    (rt, pinger, ponger)
+}
+
+/// Time only the actor-to-actor message round; after each round the same
+/// actors remain live, and the expected cumulative count proves correctness.
+fn run_ping_pong(
+    rt: &Rc<RefCell<Runtime>>,
+    pinger: u64,
+    ponger: u64,
+    iteration: u32,
+) -> Measurement {
+    const N: i64 = 20_000;
+
     let start = Instant::now();
     rt.borrow_mut()
         .send_message(pinger, "kick", &[Value::int(N)]);
@@ -315,13 +350,25 @@ fn bench_ping_pong() -> Measurement {
         .get(&ponger)
         .and_then(|a| a.get_state_field("count"))
         .and_then(|v| v.as_int());
-    assert_eq!(count, Some(N), "ponger must receive exactly N pings");
+    let expected = N
+        .checked_mul(i64::from(iteration))
+        .expect("ping_pong cumulative message count overflow");
+    assert_eq!(
+        count,
+        Some(expected),
+        "persistent ponger must receive exactly N more pings on each round"
+    );
 
     Measurement {
         benchmark: "ping_pong",
         messages: 2 * N as u64 + 1,
         elapsed,
     }
+}
+
+fn bench_ping_pong() -> Measurement {
+    let (runtime, pinger, ponger) = ping_pong_fixture();
+    run_ping_pong(&runtime, pinger, ponger, 1)
 }
 
 fn bench_thread_ring() -> Measurement {
