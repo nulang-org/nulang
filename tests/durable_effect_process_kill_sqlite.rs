@@ -120,13 +120,37 @@ fn durable_kill_proof_child() {
         }
     );
 
-    if stage != "prepared" {
-        let receipt = provider_execute(&dir, spec.id);
-        if stage == "completed" {
-            coordinator.complete(spec.id, REQUEST, receipt).unwrap();
-        } else {
-            assert_eq!(stage, "provider-committed");
+    match stage.as_str() {
+        "prepared" => {}
+        "takeover" => {
+            // A different activation must commit a fresh durable transition
+            // before an old prepared intent can be replayed by its owner.
+            drop(coordinator);
+            let site = effect_site_id(
+                "durable-kill-proof",
+                EffectSiteOwnerKind::Behavior,
+                "Checkout.run",
+                "Payment.charge",
+                0,
+            );
+            let successor = DurableEffectSpec::new(
+                DurableEffectId::derive_from_site(ACTOR_ID, "checkout/order-43", site, 0),
+                "Payment.charge",
+                EffectBoundary::External,
+                DeliverySemantics::EffectivelyOnceWithDeduplication,
+            );
+            DurableEffectCoordinator::new(&mut store, ACTOR_ID, 2)
+                .begin(successor, b"checkout:order-43")
+                .unwrap();
         }
+        "provider-committed" => {
+            let _ = provider_execute(&dir, spec.id);
+        }
+        "completed" => {
+            let receipt = provider_execute(&dir, spec.id);
+            coordinator.complete(spec.id, REQUEST, receipt).unwrap();
+        }
+        other => panic!("unknown crash stage: {other}"),
     }
 
     // Only signal after every operation associated with this stage returned.
@@ -275,6 +299,44 @@ fn hard_kill_after_prepared_intent_replays_without_losing_actor_state() {
     );
     assert!(!dir.join("provider-committed-key").exists());
     assert_eq!(recovered.latest_sequence(ACTOR_ID), 2);
+    drop(recovered);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn hard_kill_after_takeover_rejects_stale_owner_before_provider_dispatch() {
+    let (dir, db) = paths("fenced-takeover");
+    kill_child_after("takeover", &dir);
+
+    let original = operation();
+    let mut recovered = LibsqlStore::new(&db).unwrap();
+    assert_actor_state_unchanged(&recovered);
+    assert_eq!(recovered.latest_sequence(ACTOR_ID), 3);
+    let tail = recovered
+        .load_durable_tail_position(ACTOR_ID)
+        .unwrap()
+        .expect("takeover must commit its new epoch");
+    assert_eq!(tail.activation_epoch, 2);
+
+    let error = DurableEffectCoordinator::new(&mut recovered, ACTOR_ID, 1)
+        .begin(original.clone(), REQUEST)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        nulang::durable_effect_runtime::DurableEffectRuntimeError::Storage(ref source)
+            if source.kind() == std::io::ErrorKind::PermissionDenied
+    ));
+
+    assert_eq!(
+        DurableEffectCoordinator::new(&mut recovered, ACTOR_ID, 2)
+            .begin(original.clone(), REQUEST)
+            .unwrap(),
+        DurableEffectDispatchDecision::DispatchWithDeduplication {
+            operation_id: original.id
+        }
+    );
+    assert!(!dir.join("provider-committed-key").exists());
+    assert_eq!(recovered.latest_sequence(ACTOR_ID), 3);
     drop(recovered);
     fs::remove_dir_all(dir).unwrap();
 }
