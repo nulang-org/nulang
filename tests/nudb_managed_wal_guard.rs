@@ -7,9 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use nulang::database::split::SingleNodeSplitStore;
 use nulang::database::store::{WalBackedError, WalBackedTablet};
-use nulang::database::tablet::{
-    KeyRange, TabletDescriptor, TabletId, TabletMutation, TabletWrite,
-};
+use nulang::database::tablet::{KeyRange, TabletDescriptor, TabletId, TabletMutation, TabletWrite};
 use nulang::database::wal::{FileWal, WalError};
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -60,10 +58,12 @@ fn direct_wal_and_tablet_open_are_rejected_for_coordinator_directories() {
         Err(WalBackedError::Wal(WalError::ManagedDirectory))
     ));
 
-    owner.commit(TabletMutation::Put {
-        key: b"b".to_vec(),
-        value: b"owner".to_vec(),
-    }).unwrap();
+    owner
+        .commit(TabletMutation::Put {
+            key: b"b".to_vec(),
+            value: b"owner".to_vec(),
+        })
+        .unwrap();
     assert_eq!(owner.read_latest(b"b").unwrap(), Some(b"owner".to_vec()));
     drop(owner);
 
@@ -83,24 +83,36 @@ fn direct_wal_and_tablet_open_are_rejected_for_coordinator_directories() {
 fn direct_parent_and_child_wal_open_are_rejected_after_promotion() {
     let root = root("promoted");
     let mut owner = SingleNodeSplitStore::open(&root, descriptor()).unwrap();
-    owner.commit(TabletMutation::Put {
-        key: b"b".to_vec(),
-        value: b"before".to_vec(),
-    }).unwrap();
+    owner
+        .commit(TabletMutation::Put {
+            key: b"b".to_vec(),
+            value: b"before".to_vec(),
+        })
+        .unwrap();
     let plan = descriptor()
-        .plan_split(b"m", TabletId::new(902).unwrap(), TabletId::new(903).unwrap(), 4)
+        .plan_split(
+            b"m",
+            TabletId::new(902).unwrap(),
+            TabletId::new(903).unwrap(),
+            4,
+        )
         .unwrap();
     owner.split(&plan).unwrap();
     for name in ["parent.wal", "left.wal", "right.wal"] {
-        assert!(matches!(
-            FileWal::open(root.join(name)),
-            Err(WalError::ManagedDirectory)
-        ), "direct open must reject {name}");
+        assert!(
+            matches!(
+                FileWal::open(root.join(name)),
+                Err(WalError::ManagedDirectory)
+            ),
+            "direct open must reject {name}"
+        );
     }
-    owner.commit(TabletMutation::Put {
-        key: b"n".to_vec(),
-        value: b"child".to_vec(),
-    }).unwrap();
+    owner
+        .commit(TabletMutation::Put {
+            key: b"n".to_vec(),
+            value: b"child".to_vec(),
+        })
+        .unwrap();
     assert_eq!(owner.read_latest(b"n").unwrap(), Some(b"child".to_vec()));
     drop(owner);
     let _ = fs::remove_dir_all(root);
@@ -166,14 +178,16 @@ fn preexisting_public_tablet_handle_cannot_publish_checkpoint_after_management()
     fs::create_dir_all(&root).unwrap();
     let path = root.join("ordinary.wal");
     let mut legacy = WalBackedTablet::open(descriptor(), &path).unwrap();
-    let committed = legacy.prepare_write(
-        3,
-        0,
-        vec![TabletMutation::Put {
-            key: b"b".to_vec(),
-            value: b"initial".to_vec(),
-        }],
-    ).unwrap();
+    let committed = legacy
+        .prepare_write(
+            3,
+            0,
+            vec![TabletMutation::Put {
+                key: b"b".to_vec(),
+                value: b"initial".to_vec(),
+            }],
+        )
+        .unwrap();
     legacy.commit(committed).unwrap();
 
     fs::write(root.join(".nudb-owner.lock"), b"").unwrap();
