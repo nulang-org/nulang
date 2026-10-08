@@ -161,14 +161,14 @@ fn duplicate_canonical_action_form_fields_fail_over_real_http() {
 
     let form = "title=admin&title=user&__nulang_ui_message=invalid";
     let request = format!(
-        "POST /legacy HTTP/1.1\\r\\nHost: localhost\\r\\nContent-Type: application/x-www-form-urlencoded\\r\\nContent-Length: {}\\r\\nConnection: close\\r\\n\\r\\n{}",
+        "POST /legacy HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         form.len(),
         form
     );
     let response = send_raw_request(server.port, &request);
 
     assert!(
-        response.starts_with("HTTP/1.1 400 Bad Request\\r\\n"),
+        response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
         "{response}"
     );
     assert!(response_body(&response).contains("duplicate field 'title'"));
