@@ -1769,9 +1769,12 @@ impl Runtime {
         // deferred wakes would clobber; the compensation arm runs nested
         // bytecode whose own begin/end must stay inside this window. Runs
         // on every path so wakes of other actors are not lost.
-        self.vm_exec_end();
+        // Recover before deferred wake dispatch can observe uncommitted state.
         if terminal_commit_failed {
             self.recover_workflow_after_failed_terminal(actor_id);
+        }
+        self.vm_exec_end();
+        if terminal_commit_failed {
             return;
         }
         // The suspension resolved (completed or failed): drain any mail
@@ -4951,10 +4954,12 @@ impl Runtime {
                     }
                 }
             }
+            if terminal_commit_failed {
+                (*self_ptr).recover_workflow_after_failed_terminal(actor_id);
+            }
             (*self_ptr).vm_exec_end();
         }
         if terminal_commit_failed {
-            self.recover_workflow_after_failed_terminal(actor_id);
             return;
         }
         // Re-enqueue so the scheduler can continue processing the actor.
@@ -5082,13 +5087,15 @@ impl Runtime {
             // on the shared VM, which would clobber the frames an
             // un-captured suspend still needs. Runs on every path, so
             // wakes of other actors are not lost when THIS one suspends.
+            if terminal_commit_failed {
+                (*self_ptr).recover_workflow_after_failed_terminal(actor_id);
+            }
             (*self_ptr).vm_exec_end();
         }
         // The suspension resolved (completed or failed): if messages queued
         // up while the behavior was suspended, schedule the actor to drain
         // them - step_actor leaves mail untouched while a suspension is live.
         if terminal_commit_failed {
-            self.recover_workflow_after_failed_terminal(actor_id);
             return;
         }
         self.requeue_if_mail_pending(actor_id);
