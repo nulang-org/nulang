@@ -63,6 +63,15 @@ Performance PRs should use the same-runner Nulang A/B workflow below as the
 primary before/after evidence; a fixed self-hosted runner is preferred when
 longitudinal absolute numbers matter.
 
+## Controlled non-durable actor profiling
+
+`benchmarks/STATELESS_ACTOR_PROFILING.md` documents the opt-in Linux `perf`
+runner for the existing Savina actor workloads. It records sampled hot paths,
+exact workload-completion records, CPU affinity, toolchains and build flags.
+Profiler builds use symbols and frame pointers; their absolute timings are
+**not** regression evidence. Use the exact-parent `scripts/nulang_ab_bench.py`
+to confirm any runtime optimization separately.
+
 ## Cross-runtime Savina baselines
 
 `benchmarks/cross_runtime/` contains an opt-in comparison harness for the
