@@ -37,7 +37,7 @@ class CrossRuntimeExecutionOrderTests(unittest.TestCase):
             argv = [
                 "cross_runtime_bench.py",
                 "--runs", "8",
-                "--warmup", "0",
+                "--warmup", "1",
                 "--cpu-mode", "host",
                 "--output", str(report_path),
             ]
@@ -50,7 +50,9 @@ class CrossRuntimeExecutionOrderTests(unittest.TestCase):
             ):
                 self.assertEqual(cross_runtime_bench.main(), 0)
 
-            rounds = [observed[i:i + 4] for i in range(0, len(observed), 4)]
+            self.assertEqual(observed[:4], runtimes)  # independent warmup
+            measured = observed[4:]
+            rounds = [measured[i:i + 4] for i in range(0, len(measured), 4)]
             self.assertEqual(len(rounds), 8)
             self.assertEqual(rounds[0], runtimes)
             self.assertEqual(rounds[1], list(reversed(runtimes)))
