@@ -1038,10 +1038,16 @@ mod transactional_receive_tests {
                 .unwrap();
             let (_, candidate) = mb.receive_match(&[9]).expect("tail match");
             assert_eq!(candidate[0].as_int(), Some(sender as i64));
-            assert_eq!(mb.commit_receive_match().unwrap()[0].as_int(), Some(sender as i64));
+            assert_eq!(
+                mb.commit_receive_match().unwrap()[0].as_int(),
+                Some(sender as i64)
+            );
 
             let index = &mb.receive_indexes.as_ref().unwrap().local;
-            assert!(index.valid, "tail consumption must keep positional index valid");
+            assert!(
+                index.valid,
+                "tail consumption must keep positional index valid"
+            );
             assert_eq!(index.positions.get(&1).unwrap().len(), 4096);
             assert!(!index.positions.contains_key(&9));
             assert_eq!(mb.len(), 4096);
@@ -1096,7 +1102,8 @@ mod transactional_receive_tests {
         assert!(mb.receive_indexes.as_ref().unwrap().local.valid);
 
         assert_eq!(mb.receive_match(&[9]).unwrap().1[0].as_int(), Some(1));
-        mb.commit_receive_match().expect("commit re-exposed candidate");
+        mb.commit_receive_match()
+            .expect("commit re-exposed candidate");
         assert!(mb.is_empty());
     }
 
@@ -1104,7 +1111,8 @@ mod transactional_receive_tests {
     fn middle_commit_invalidates_index_and_retains_fifo() {
         let mut mb = Mailbox::new(8);
         for (behavior, sender) in [(1, 1), (9, 2), (1, 3)] {
-            mb.push_local(msg(behavior, sender, MessagePriority::Normal)).unwrap();
+            mb.push_local(msg(behavior, sender, MessagePriority::Normal))
+                .unwrap();
         }
 
         assert_eq!(mb.receive_match(&[9]).unwrap().1[0].as_int(), Some(2));
