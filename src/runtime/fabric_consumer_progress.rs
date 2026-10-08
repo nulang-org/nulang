@@ -22,6 +22,8 @@ pub(crate) const FABRIC_CONSUMER_PROGRESS_ACK_BEHAVIOR: &str =
     "__nulang_fabric_consumer_progress_ack_v1";
 pub(crate) const FABRIC_CONSUMER_PROGRESS_COMMIT_BEHAVIOR: &str =
     "__nulang_fabric_consumer_progress_commit_v1";
+pub(crate) const FABRIC_CONSUMER_PROGRESS_COMMIT_ACK_BEHAVIOR: &str =
+    "__nulang_fabric_consumer_progress_commit_ack_v1";
 
 const JOURNAL_FORMAT_VERSION: u16 = 1;
 const MAX_FRAME_BYTES: usize = 1_048_576;
@@ -842,6 +844,56 @@ impl FabricConsumerProgressCommitWire {
     }
 }
 
+/// Application receipt emitted only after the follower fsyncs a matching
+/// COMMIT frame, distinct from transport ACKs and Prepare-fsync receipts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct FabricConsumerProgressCommitAckWire {
+    version: u16,
+    stream: String,
+    partition: u16,
+    epoch: u64,
+    leader: u64,
+    metadata_sequence: u64,
+    digest: String,
+    replica: u64,
+}
+
+impl FabricConsumerProgressCommitAckWire {
+    pub(crate) fn to_wire_bytes(&self) -> io::Result<Vec<u8>> {
+        self.validate_shape()?;
+        let bytes = serde_json::to_vec(self)
+            .map_err(|error| invalid(error.to_string()))?;
+        if bytes.len() > MAX_FRAME_BYTES {
+            return Err(invalid("consumer-progress commit ACK wire frame is oversized"));
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn from_wire_bytes(bytes: &[u8]) -> io::Result<Self> {
+        if bytes.len() > MAX_FRAME_BYTES {
+            return Err(invalid("consumer-progress commit ACK wire frame is oversized"));
+        }
+        let receipt: Self = serde_json::from_slice(bytes)
+            .map_err(|error| invalid(error.to_string()))?;
+        receipt.validate_shape()?;
+        Ok(receipt)
+    }
+
+    fn validate_shape(&self) -> io::Result<()> {
+        if self.version != JOURNAL_FORMAT_VERSION
+            || self.stream.is_empty()
+            || self.partition != 0
+            || self.epoch == 0
+            || self.metadata_sequence == 0
+            || self.digest.len() != 64
+            || self.leader == self.replica
+        {
+            return Err(invalid("invalid follower commit-fsync receipt envelope"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct FabricConsumerProgressAckWire {
     version: u16,
@@ -1238,7 +1290,7 @@ impl Runtime {
         &mut self,
         wire: &FabricConsumerProgressCommitWire,
         from: NodeId,
-    ) -> io::Result<()> {
+    ) -> io::Result<FabricConsumerProgressCommitAckWire> {
         wire.validate_shape()?;
         let policy = self.consumer_progress_installed_policy(&wire.stream)?;
         let local = self.distributed.node_id.ok_or_else(|| {
@@ -1257,7 +1309,119 @@ impl Runtime {
         }
         let path = self.consumer_progress_directory(&wire.stream)?;
         let mut journal = FileFabricConsumerProgressJournal::open(path)?;
-        journal.apply_committed_update(wire)
+        journal.apply_committed_update(wire)?;
+        Ok(FabricConsumerProgressCommitAckWire {
+            version: JOURNAL_FORMAT_VERSION,
+            stream: wire.stream.clone(),
+            partition: wire.partition,
+            epoch: wire.epoch,
+            leader: wire.leader,
+            metadata_sequence: wire.metadata_sequence,
+            digest: wire.digest.clone(),
+            replica: local.0,
+        })
+    }
+
+    /// Accept only a separate post-COMMIT fsync receipt from an installed
+    /// follower, for the leader's exact persisted commit decision.
+    pub(crate) fn fabric_consumer_progress_record_commit_receipt(
+        &mut self,
+        receipt: &FabricConsumerProgressCommitAckWire,
+        from: NodeId,
+    ) -> io::Result<()> {
+        receipt.validate_shape()?;
+        let policy = self.consumer_progress_validate_leader(&receipt.stream)?;
+        if receipt.leader != policy.leader
+            || receipt.epoch != policy.epoch
+            || receipt.replica != from.0
+            || receipt.replica == policy.leader
+            || !policy.replicas.contains(&from.0)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unauthorized or stale consumer-progress commit receipt",
+            ));
+        }
+        let path = self.consumer_progress_directory(&receipt.stream)?;
+        let mut journal = FileFabricConsumerProgressJournal::open(path)?;
+        let exact = journal.committed_history.get(&receipt.metadata_sequence)
+            .ok_or_else(|| invalid("commit-fsync receipt has no local durable commit"))?;
+        if exact.change.stream != receipt.stream
+            || exact.change.partition != receipt.partition
+            || exact.change.epoch != receipt.epoch
+            || exact.policy != policy
+            || exact.digest != receipt.digest
+        {
+            return Err(invalid("commit-fsync receipt does not match durable decision"));
+        }
+        journal.record_commit_receipt(
+            receipt.metadata_sequence, from.0, &receipt.digest
+        )
+    }
+
+    /// Local leader's persisted contiguous follower-confirmed frontier.
+    /// Not safe to use directly as a successor's recovered frontier.
+    pub(crate) fn fabric_consumer_progress_confirmed_commit(
+        &mut self,
+        stream: &str,
+    ) -> io::Result<u64> {
+        self.consumer_progress_validate_leader(stream)?;
+        let journal = FileFabricConsumerProgressJournal::open(
+            self.consumer_progress_directory(stream)?
+        )?;
+        Ok(journal.confirmed_commit_sequence())
+    }
+
+    /// Bounded replay from the leader's hash-checked durable history.
+    /// Exact sequence order must be preserved by receivers; lost messages
+    /// require callers to explicitly redrive from the missing sequence.
+    pub(crate) fn fabric_consumer_progress_redrive_from(
+        &mut self,
+        stream: &str,
+        target: NodeId,
+        start_sequence: u64,
+        limit: usize,
+    ) -> io::Result<usize> {
+        let policy = self.consumer_progress_validate_leader(stream)?;
+        if target.0 == policy.leader || !policy.replicas.contains(&target.0) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "invalid consumer-progress metadata catch-up destination",
+            ));
+        }
+        let journal = FileFabricConsumerProgressJournal::open(
+            self.consumer_progress_directory(stream)?
+        )?;
+        let updates = journal.committed_updates_from(start_sequence, limit)?;
+        let Some(address) = self.distributed.cluster.as_ref()
+            .and_then(|cluster| cluster.get_node(target))
+            .filter(|member| matches!(member.status, NodeStatus::Healthy | NodeStatus::Joining))
+            .map(|member| member.address)
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "metadata catch-up target is not a healthy installed replica",
+            ));
+        };
+        let transport = self.distributed.transport.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "metadata catch-up needs transport")
+        })?;
+        for update in &updates {
+            transport.send(target, address, Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name: FABRIC_CONSUMER_PROGRESS_COMMIT_BEHAVIOR.to_string(),
+                content_hash: None,
+                required_protocol_id: None,
+                payload: Vec::new(),
+                string_table: Vec::new(),
+                object_table: vec![(0, update.to_wire_bytes()?)],
+                sender_actor: 0,
+                sender_node: NodeId(policy.leader),
+                priority: MessagePriority::System,
+                trace_id: None,
+            });
+        }
+        Ok(updates.len())
     }
 }
 
