@@ -114,6 +114,25 @@ fn published_manifest_fails_closed_when_child_data_is_missing() {
 }
 
 #[test]
+fn published_manifest_fails_closed_when_child_wal_is_missing_at_sequence_zero() {
+    let root = temp_root("missing_zero_sequence_child");
+    {
+        let mut store = SingleNodeSplitStore::open(&root, parent()).unwrap();
+        store
+            .split(
+                &parent()
+                    .plan_split(b"m", TabletId::new(402).unwrap(), TabletId::new(403).unwrap(), 8)
+                    .unwrap(),
+            )
+            .unwrap();
+    }
+
+    fs::remove_file(root.join("right.wal")).unwrap();
+    assert!(SingleNodeSplitStore::open(&root, parent()).is_err());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn corrupted_manifest_fails_closed_instead_of_reopening_parent() {
     let root = temp_root("corrupt_catalog");
     {
