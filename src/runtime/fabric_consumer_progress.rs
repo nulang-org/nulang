@@ -1135,6 +1135,9 @@ mod tests {
             committed_cursor: 1,
             acked_gaps: vec![],
         };
+        let mut nonphysical = change.clone();
+        nonphysical.partition = 1;
+        assert!(leader.fabric_consumer_progress_stage(nonphysical).is_err());
         leader.fabric_consumer_progress_stage(change).unwrap();
         assert_eq!(
             leader.fabric_consumer_progress_observed_votes("orders", 0, 1).unwrap().len(), 1
