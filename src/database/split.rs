@@ -286,8 +286,14 @@ impl SingleNodeSplitStore {
                 &DiskManifest::for_preparing_parent(&parent),
                 None,
             )?;
+            #[cfg(test)]
+            abort_bootstrap_at("preparing");
             let parent_tablet = WalBackedTablet::open(parent.clone(), &parent_wal)?;
+            #[cfg(test)]
+            abort_bootstrap_at("wal_header");
             write_manifest(&manifest_path, &DiskManifest::for_parent(&parent), None)?;
+            #[cfg(test)]
+            abort_bootstrap_at("published");
             Active::Parent(parent_tablet)
         };
         Ok(Self {
@@ -450,6 +456,19 @@ enum SplitStop {
     AfterRight,
     AfterManifestTempSync,
     AfterManifestRename,
+}
+
+// Exercise actual process termination at every durable bootstrap boundary.
+// The helper is deliberately absent from release builds.
+#[cfg(test)]
+fn abort_bootstrap_at(stage: &str) {
+    if std::env::var("NUDB_BOOTSTRAP_FAILSTOP_STAGE")
+        .ok()
+        .as_deref()
+        == Some(stage)
+    {
+        std::process::exit(74);
+    }
 }
 
 fn write_manifest(
