@@ -83,6 +83,9 @@ fn replicated_consumer_requires_leader_and_matching_delivery_epoch() {
         .fabric_stream_replicated_append("fenced", 0, 2, b"effect")
         .unwrap();
     assert!(!appended.status.committed);
+    assert!(leader
+        .fabric_stream_commit_cursor_fenced("fenced", "worker", 1, 1)
+        .is_err());
     follower.process_network();
     leader.process_network();
     follower.process_network();
