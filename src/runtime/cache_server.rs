@@ -27,9 +27,6 @@ use super::cache_persistence::{
 };
 use super::resp::RespArgs;
 use super::resp_cache::{CacheCommandError, CacheCommandTarget};
-use super::cache_dispatch::{
-    CacheDispatchConfigError, CacheDispatchWake, CacheDispatcher, CacheShardInbox,
-};
 use super::cache_pipeline::{CacheAskingUpdate, CachePipelineError, CacheResponsePipeline};
 
 const LISTENER_TOKEN: Token = Token(0);
