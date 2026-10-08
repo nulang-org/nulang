@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::runtime::Runtime;
+use crate::runtime::{NodeStatus, Runtime};
 
 const STREAM_FORMAT_VERSION: u16 = 1;
 const SEGMENT_MAGIC: &[u8; 4] = b"FSTR";
@@ -71,6 +71,9 @@ pub struct FabricConsumerDelivery {
     pub attempt: u32,
     pub redelivered: bool,
     pub ack_deadline_unix_ms: u64,
+    /// Replicated delivery epoch assigned by the leader runtime. None for
+    /// standalone/local stores and direct low-level storage reads.
+    pub leader_epoch: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1229,6 +1232,7 @@ impl FileFabricStreamStore {
                             attempt: lease.attempt,
                             redelivered: true,
                             ack_deadline_unix_ms: deadline_ms,
+                            leader_epoch: None,
                         });
                     }
                     None => {
@@ -1245,6 +1249,7 @@ impl FileFabricStreamStore {
                             attempt: 1,
                             redelivered: false,
                             ack_deadline_unix_ms: deadline_ms,
+                            leader_epoch: None,
                         });
                     }
                 }
@@ -1438,6 +1443,78 @@ impl FileFabricStreamStore {
 }
 
 impl Runtime {
+    /// Check that replicated application consumer operations run on the
+    /// installed stream leader and have not been fenced by a newer promise.
+    ///
+    /// This checks locally durable leader evidence. It does not establish
+    /// live quorum by itself, and consumer cursor/lease state is not
+    /// replicated to followers.
+    fn fabric_stream_consumer_leader_epoch(&mut self, name: &str) -> io::Result<Option<u64>> {
+        let Some(policy) = self.fabric_stream_store_mut()?.replication_policy(name)? else {
+            return Ok(None);
+        };
+        let local = self.distributed.node_id.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "replicated Fabric consumers require a distributed leader runtime",
+            )
+        })?;
+        if local.0 != policy.leader {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "only the installed Fabric stream leader may operate replicated consumers",
+            ));
+        }
+        if let Some(promise) = self.fabric_stream_store_mut()?.epoch_promise(name)? {
+            if promise.epoch > policy.epoch {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Fabric stream consumer is fenced by a higher promised epoch",
+                ));
+            }
+        }
+        let locally_healthy = self
+            .distributed
+            .cluster
+            .as_ref()
+            .and_then(|cluster| cluster.get_node(local))
+            .map(|node| matches!(node.status, NodeStatus::Healthy | NodeStatus::Joining))
+            .unwrap_or(false);
+        if !locally_healthy {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Fabric stream consumer leader is not locally healthy",
+            ));
+        }
+        Ok(Some(policy.epoch))
+    }
+
+    /// Reject the legacy sequence-only mutation on replicated streams.
+    /// A delivery epoch is required for ACK/NACK and cursor progress.
+    fn fabric_stream_require_unfenced_local(&mut self, name: &str) -> io::Result<()> {
+        if self.fabric_stream_consumer_leader_epoch(name)?.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "replicated Fabric consumer progress requires an explicit leader epoch",
+            ));
+        }
+        Ok(())
+    }
+
+    fn fabric_stream_require_consumer_epoch(
+        &mut self,
+        name: &str,
+        expected_epoch: u64,
+    ) -> io::Result<()> {
+        if self.fabric_stream_consumer_leader_epoch(name)? != Some(expected_epoch) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Fabric consumer ACK/NACK epoch does not match the installed leader epoch",
+            ));
+        }
+        Ok(())
+    }
+
     /// Enable durable local Fabric stream storage rooted at `path`.
     pub fn fabric_stream_open(&mut self, path: impl AsRef<Path>) -> io::Result<()> {
         self.distributed.fabric_streams = Some(FileFabricStreamStore::open(path)?);
@@ -1466,12 +1543,15 @@ impl Runtime {
             .read_from(name, start_sequence, limit)
     }
 
+    /// Read application-consumer records only on the installed stream leader.
+    /// Use fabric_stream_read_committed for replica diagnostics.
     pub fn fabric_stream_read_consumer(
         &mut self,
         name: &str,
         consumer: &str,
         limit: usize,
     ) -> io::Result<Vec<FabricStreamRecord>> {
+        self.fabric_stream_consumer_leader_epoch(name)?;
         self.fabric_stream_store_mut()?
             .read_consumer(name, consumer, limit)
     }
@@ -1483,16 +1563,38 @@ impl Runtime {
         limit: usize,
         ack_wait: Duration,
     ) -> io::Result<Vec<FabricConsumerDelivery>> {
-        self.fabric_stream_store_mut()?
-            .deliver_consumer(name, consumer, limit, ack_wait)
+        let epoch = self.fabric_stream_consumer_leader_epoch(name)?;
+        let mut deliveries = self.fabric_stream_store_mut()?
+            .deliver_consumer(name, consumer, limit, ack_wait)?;
+        for delivery in &mut deliveries {
+            delivery.leader_epoch = epoch;
+        }
+        Ok(deliveries)
     }
 
+    /// Legacy sequence-only ACK is valid only on standalone streams.
+    /// Replicated ACKs must supply the epoch on their delivery receipt.
     pub fn fabric_stream_ack_consumer(
         &mut self,
         name: &str,
         consumer: &str,
         sequence: u64,
     ) -> io::Result<()> {
+        self.fabric_stream_require_unfenced_local(name)?;
+        self.fabric_stream_store_mut()?
+            .ack_consumer(name, consumer, sequence)
+    }
+
+    /// ACK a replicated consumer delivery only in its installed leader epoch.
+    /// This is not a quorum-replicated ACK: failover may replay the record.
+    pub fn fabric_stream_ack_consumer_fenced(
+        &mut self,
+        name: &str,
+        consumer: &str,
+        sequence: u64,
+        leader_epoch: u64,
+    ) -> io::Result<()> {
+        self.fabric_stream_require_consumer_epoch(name, leader_epoch)?;
         self.fabric_stream_store_mut()?
             .ack_consumer(name, consumer, sequence)
     }
@@ -1503,6 +1605,19 @@ impl Runtime {
         consumer: &str,
         sequence: u64,
     ) -> io::Result<()> {
+        self.fabric_stream_require_unfenced_local(name)?;
+        self.fabric_stream_store_mut()?
+            .nack_consumer(name, consumer, sequence)
+    }
+
+    pub fn fabric_stream_nack_consumer_fenced(
+        &mut self,
+        name: &str,
+        consumer: &str,
+        sequence: u64,
+        leader_epoch: u64,
+    ) -> io::Result<()> {
+        self.fabric_stream_require_consumer_epoch(name, leader_epoch)?;
         self.fabric_stream_store_mut()?
             .nack_consumer(name, consumer, sequence)
     }
@@ -1513,6 +1628,19 @@ impl Runtime {
         consumer: &str,
         sequence: u64,
     ) -> io::Result<()> {
+        self.fabric_stream_require_unfenced_local(name)?;
+        self.fabric_stream_store_mut()?
+            .commit_cursor(name, consumer, sequence)
+    }
+
+    pub fn fabric_stream_commit_cursor_fenced(
+        &mut self,
+        name: &str,
+        consumer: &str,
+        sequence: u64,
+        leader_epoch: u64,
+    ) -> io::Result<()> {
+        self.fabric_stream_require_consumer_epoch(name, leader_epoch)?;
         self.fabric_stream_store_mut()?
             .commit_cursor(name, consumer, sequence)
     }
