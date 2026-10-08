@@ -1937,3 +1937,110 @@ fn installed_policy_ignores_unrelated_cluster_growth_during_quorum_commit() {
         let _ = std::fs::remove_dir_all(root);
     }
 }
+
+#[test]
+fn replicated_consumers_do_not_read_or_ack_uncommitted_records() {
+    let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addr_a: SocketAddr = "127.0.0.1:39101".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:39102".parse().unwrap();
+    let node_a = NodeId::new(&addr_a);
+    let node_b = NodeId::new(&addr_b);
+    let mut a = runtime(addr_a, bus.clone());
+    let mut b = runtime(addr_b, bus);
+
+    a.distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_b, addr_b);
+    b.distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_a, addr_a);
+
+    let placement = a
+        .fabric_stream_placement("consumer-visibility", 0, 2)
+        .unwrap();
+    let root_a = temp_dir("consumer-visibility-a");
+    let root_b = temp_dir("consumer-visibility-b");
+    a.fabric_stream_open(&root_a).unwrap();
+    b.fabric_stream_open(&root_b).unwrap();
+    let (leader, follower) = if placement.leader == node_a {
+        (&mut a, &mut b)
+    } else {
+        (&mut b, &mut a)
+    };
+    leader
+        .fabric_stream_create("consumer-visibility", FabricStreamConfig::default())
+        .unwrap();
+    let appended = leader
+        .fabric_stream_replicated_append("consumer-visibility", 0, 2, b"pending-effect")
+        .unwrap();
+    assert!(!appended.status.committed);
+
+    // The replication/log interface may inspect the local uncommitted tail.
+    assert_eq!(
+        leader.fabric_stream_read("consumer-visibility", 1, 10).unwrap().len(),
+        1
+    );
+    // But application consumers must never execute or acknowledge pending data.
+    assert!(leader
+        .fabric_stream_read_consumer("consumer-visibility", "effect-worker", 10)
+        .unwrap()
+        .is_empty());
+    assert!(leader
+        .fabric_stream_commit_cursor("consumer-visibility", "effect-worker", 1)
+        .is_err());
+    assert_eq!(
+        leader.fabric_stream_cursor("consumer-visibility", "effect-worker").unwrap(),
+        0
+    );
+
+    follower.process_network();
+    leader.process_network();
+
+    assert_eq!(
+        leader.fabric_stream_committed_sequence("consumer-visibility").unwrap(),
+        1
+    );
+    let available = leader
+        .fabric_stream_read_consumer("consumer-visibility", "effect-worker", 10)
+        .unwrap();
+    assert_eq!(available.len(), 1);
+    assert_eq!(available[0].payload, b"pending-effect");
+    leader
+        .fabric_stream_commit_cursor("consumer-visibility", "effect-worker", 1)
+        .unwrap();
+    assert!(leader
+        .fabric_stream_read_consumer("consumer-visibility", "effect-worker", 10)
+        .unwrap()
+        .is_empty());
+
+    let _ = std::fs::remove_dir_all(root_a);
+    let _ = std::fs::remove_dir_all(root_b);
+}
+
+#[test]
+fn local_unreplicated_consumers_keep_existing_cursor_behavior() {
+    let root = temp_dir("local-consumer-compat");
+    let mut rt = Runtime::new();
+    rt.fabric_stream_open(&root).unwrap();
+    rt.fabric_stream_create("local-consumer", FabricStreamConfig::default())
+        .unwrap();
+    let sequence = rt.fabric_stream_append("local-consumer", b"local").unwrap();
+    assert_eq!(sequence, 1);
+    assert_eq!(
+        rt.fabric_stream_read_consumer("local-consumer", "worker", 10)
+            .unwrap()[0]
+            .payload,
+        b"local"
+    );
+    rt.fabric_stream_commit_cursor("local-consumer", "worker", sequence)
+        .unwrap();
+    assert!(rt
+        .fabric_stream_read_consumer("local-consumer", "worker", 10)
+        .unwrap()
+        .is_empty());
+    let _ = std::fs::remove_dir_all(root);
+}
