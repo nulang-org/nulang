@@ -25,6 +25,8 @@ on:
       - 'benchmarks/cross_runtime/**'
       - 'benchmarks/README.md'
       - 'scripts/cross_runtime_bench.py'
+      - 'scripts/cross_runtime_order.py'
+      - 'scripts/tests/test_cross_runtime*.py'
       - 'src/benchmarks.rs'
       - 'src/bin/nulang_savina.rs'
       - 'benchmarks/SAVINA.md'
@@ -41,6 +43,9 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
+
+      - name: Test comparative benchmark ordering
+        run: python3 -m unittest discover -s scripts/tests -p 'test_cross_runtime*.py' -v
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
