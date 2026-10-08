@@ -3,6 +3,7 @@
 - **A fresh-main replay of the conservative native representation and module call-graph planners from #1261** records typed MIR representations and rules out unboxed native ABIs at actor, effect, durable, FFI, heap, and unresolved-call boundaries.
 - **No native emitter, runtime ABI, bytecode, or AOT dispatch behavior changes.** The planner remains advisory until a separately tested codegen integration is ready.
 - **Tests** cover typed scalar representation, invalid callee targets, unit returns, runtime boundaries, recursive call graph proof, and boxed-callee invalidation.
+- **Static closure call proof is deliberately local and conservative:** a capture-free closure must be the local's only assignment, and its definition must precede the call in the same basic block. Reassignment and forward references fail closed until dominance analysis is available.
 
 ### Receiver-acknowledged CRDT delta synchronization — 2026-10-07
 - **Per-peer CRDT frontiers now advance only after a matching NUL0 acknowledgement arrives from the intended receiver.** Dropped or unacknowledged batches remain retransmittable from that peer's last proven frontier instead of disappearing behind sender-side optimistic state.
