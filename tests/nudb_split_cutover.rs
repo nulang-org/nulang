@@ -44,7 +44,12 @@ fn split_cutover_survives_restart_and_routes_independent_child_sequences() {
         store.commit(put(b"y", b"right")).unwrap();
 
         let plan = parent()
-            .plan_split(b"m", TabletId::new(402).unwrap(), TabletId::new(403).unwrap(), 8)
+            .plan_split(
+                b"m",
+                TabletId::new(402).unwrap(),
+                TabletId::new(403).unwrap(),
+                8,
+            )
             .unwrap();
         store.split(&plan).unwrap();
         assert!(store.is_split());
@@ -57,16 +62,34 @@ fn split_cutover_survives_restart_and_routes_independent_child_sequences() {
         assert_eq!(store.commit(put(b"b", b"left-after")).unwrap(), 4);
         assert_eq!(store.commit(put(b"m", b"right-after")).unwrap(), 4);
         assert_eq!(store.commit(put(b"b", b"left-again")).unwrap(), 5);
-        assert_eq!(store.read_at(b"b", 4).unwrap(), Some(b"left-after".to_vec()));
-        assert_eq!(store.read_at(b"m", 4).unwrap(), Some(b"right-after".to_vec()));
+        assert_eq!(
+            store.read_at(b"b", 4).unwrap(),
+            Some(b"left-after".to_vec())
+        );
+        assert_eq!(
+            store.read_at(b"m", 4).unwrap(),
+            Some(b"right-after".to_vec())
+        );
     }
 
     let mut recovered = SingleNodeSplitStore::open(&root, parent()).unwrap();
     assert!(recovered.is_split());
-    assert_eq!(recovered.read_latest(b"b").unwrap(), Some(b"left-again".to_vec()));
-    assert_eq!(recovered.read_at(b"b", 1).unwrap(), Some(b"before".to_vec()));
-    assert_eq!(recovered.read_latest(b"m").unwrap(), Some(b"right-after".to_vec()));
-    assert_eq!(recovered.read_at(b"m", 2).unwrap(), Some(b"middle".to_vec()));
+    assert_eq!(
+        recovered.read_latest(b"b").unwrap(),
+        Some(b"left-again".to_vec())
+    );
+    assert_eq!(
+        recovered.read_at(b"b", 1).unwrap(),
+        Some(b"before".to_vec())
+    );
+    assert_eq!(
+        recovered.read_latest(b"m").unwrap(),
+        Some(b"right-after".to_vec())
+    );
+    assert_eq!(
+        recovered.read_at(b"m", 2).unwrap(),
+        Some(b"middle".to_vec())
+    );
     assert_eq!(recovered.commit(put(b"y", b"after-recovery")).unwrap(), 5);
 
     let _ = fs::remove_dir_all(root);
@@ -80,16 +103,27 @@ fn invalid_cutover_plan_does_not_change_parent_state() {
         store.commit(put(b"b", b"still-here")).unwrap();
 
         let mut plan = parent()
-            .plan_split(b"m", TabletId::new(402).unwrap(), TabletId::new(403).unwrap(), 8)
+            .plan_split(
+                b"m",
+                TabletId::new(402).unwrap(),
+                TabletId::new(403).unwrap(),
+                8,
+            )
             .unwrap();
         plan.right = plan.left.clone();
         assert!(store.split(&plan).is_err());
         assert!(!store.is_split());
-        assert_eq!(store.read_latest(b"b").unwrap(), Some(b"still-here".to_vec()));
+        assert_eq!(
+            store.read_latest(b"b").unwrap(),
+            Some(b"still-here".to_vec())
+        );
     }
     let reopened = SingleNodeSplitStore::open(&root, parent()).unwrap();
     assert!(!reopened.is_split());
-    assert_eq!(reopened.read_latest(b"b").unwrap(), Some(b"still-here".to_vec()));
+    assert_eq!(
+        reopened.read_latest(b"b").unwrap(),
+        Some(b"still-here".to_vec())
+    );
     let _ = fs::remove_dir_all(root);
 }
 
@@ -99,12 +133,18 @@ fn published_manifest_fails_closed_when_child_data_is_missing() {
     {
         let mut store = SingleNodeSplitStore::open(&root, parent()).unwrap();
         store.commit(put(b"b", b"persist")).unwrap();
-        store.split(
-            &parent()
-                .plan_split(b"m", TabletId::new(402).unwrap(), TabletId::new(403).unwrap(), 8)
-                .unwrap(),
-        )
-        .unwrap();
+        store
+            .split(
+                &parent()
+                    .plan_split(
+                        b"m",
+                        TabletId::new(402).unwrap(),
+                        TabletId::new(403).unwrap(),
+                        8,
+                    )
+                    .unwrap(),
+            )
+            .unwrap();
     }
 
     // The catalog must never silently route reads back to a stale parent.
@@ -121,7 +161,12 @@ fn published_manifest_fails_closed_when_child_wal_is_missing_at_sequence_zero() 
         store
             .split(
                 &parent()
-                    .plan_split(b"m", TabletId::new(402).unwrap(), TabletId::new(403).unwrap(), 8)
+                    .plan_split(
+                        b"m",
+                        TabletId::new(402).unwrap(),
+                        TabletId::new(403).unwrap(),
+                        8,
+                    )
                     .unwrap(),
             )
             .unwrap();
@@ -140,7 +185,12 @@ fn published_manifest_fails_closed_when_child_wal_is_truncated() {
         store
             .split(
                 &parent()
-                    .plan_split(b"m", TabletId::new(402).unwrap(), TabletId::new(403).unwrap(), 8)
+                    .plan_split(
+                        b"m",
+                        TabletId::new(402).unwrap(),
+                        TabletId::new(403).unwrap(),
+                        8,
+                    )
                     .unwrap(),
             )
             .unwrap();
