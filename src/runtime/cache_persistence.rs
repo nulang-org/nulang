@@ -204,14 +204,27 @@ impl DurableCacheStore {
         wall_now_ms: u64,
     ) -> Result<(), CacheDurabilityError> {
         self.ensure_healthy()?;
+        if self.mode == CacheDurabilityMode::Memory {
+            return self
+                .store
+                .try_set_bytes(key, value, ttl_ms, store_now_ms)
+                .map_err(CacheDurabilityError::Store);
+        }
+        // A journaled write may not evict other entries ahead of the WAL.
+        // Reject admission that would require unjournaled evictions.
         self.store
-            .try_set_bytes(key, value, ttl_ms, store_now_ms)
+            .validate_bytes_write(key, value)
             .map_err(CacheDurabilityError::Store)?;
         self.record(CacheWalMutation::SetBytes {
             key: key.to_vec(),
             value: value.to_vec(),
             expires_unix_ms: ttl_ms.map(|ttl| wall_now_ms.saturating_add(ttl)),
-        })
+        })?;
+        let result = self.store.try_set_bytes(key, value, ttl_ms, store_now_ms);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result.map_err(CacheDurabilityError::Store)
     }
 
     pub fn set_integer(
@@ -223,25 +236,42 @@ impl DurableCacheStore {
         wall_now_ms: u64,
     ) -> Result<(), CacheDurabilityError> {
         self.ensure_healthy()?;
+        if self.mode == CacheDurabilityMode::Memory {
+            return self
+                .store
+                .try_set_integer(key, value, ttl_ms, store_now_ms)
+                .map_err(CacheDurabilityError::Store);
+        }
         self.store
-            .try_set_integer(key, value, ttl_ms, store_now_ms)
+            .validate_integer_write(key)
             .map_err(CacheDurabilityError::Store)?;
         self.record(CacheWalMutation::SetInteger {
             key: key.to_vec(),
             value,
             expires_unix_ms: ttl_ms.map(|ttl| wall_now_ms.saturating_add(ttl)),
-        })
+        })?;
+        let result = self.store.try_set_integer(key, value, ttl_ms, store_now_ms);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result.map_err(CacheDurabilityError::Store)
     }
 
     pub fn set_many_bytes(
         &mut self,
         pairs: &[(&[u8], &[u8])],
         store_now_ms: u64,
-        wall_now_ms: u64,
+        _wall_now_ms: u64,
     ) -> Result<(), CacheDurabilityError> {
         self.ensure_healthy()?;
+        if self.mode == CacheDurabilityMode::Memory {
+            return self
+                .store
+                .try_set_many_bytes(pairs, None, store_now_ms)
+                .map_err(CacheDurabilityError::Store);
+        }
         self.store
-            .try_set_many_bytes(pairs, None, store_now_ms)
+            .validate_bytes_batch(pairs)
             .map_err(CacheDurabilityError::Store)?;
         let mutations = pairs
             .iter()
@@ -251,8 +281,12 @@ impl DurableCacheStore {
                 expires_unix_ms: None,
             })
             .collect();
-        let _ = wall_now_ms;
-        self.record(CacheWalMutation::Batch { mutations })
+        self.record(CacheWalMutation::Batch { mutations })?;
+        let result = self.store.try_set_many_bytes(pairs, None, store_now_ms);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result.map_err(CacheDurabilityError::Store)
     }
 
     pub fn delete_at(
@@ -331,25 +365,32 @@ impl DurableCacheStore {
         wall_now_ms: u64,
     ) -> Result<i64, CacheDurabilityError> {
         self.ensure_healthy()?;
-        let value = self
+        if self.mode == CacheDurabilityMode::Memory {
+            return self
+                .store
+                .increment(key, delta, store_now_ms)
+                .map_err(CacheDurabilityError::Increment);
+        }
+        let (next, remaining_ttl_ms) = self
             .store
-            .increment(key, delta, store_now_ms)
+            .preview_increment(key, delta, store_now_ms)
             .map_err(CacheDurabilityError::Increment)?;
-        let expires_unix_ms = match self.store.ttl(key, store_now_ms) {
-            CacheTtl::Persistent => None,
-            CacheTtl::RemainingMs(remaining) => Some(wall_now_ms.saturating_add(remaining)),
-            CacheTtl::Missing => {
-                return Err(CacheDurabilityError::InvalidMode(
-                    "increment succeeded but cache entry disappeared before journaling",
-                ));
-            }
-        };
         self.record(CacheWalMutation::SetInteger {
             key: key.to_vec(),
-            value,
-            expires_unix_ms,
+            value: next,
+            expires_unix_ms: remaining_ttl_ms
+                .map(|remaining| wall_now_ms.saturating_add(remaining)),
         })?;
-        Ok(value)
+        // The same shard owns the entire preflight -> record -> apply
+        // sequence, so successful preflight guarantees the value and admission
+        // stay unchanged. Unexpected apply failures still poison the shard.
+        let result = self.store.increment(key, delta, store_now_ms);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        let applied = result.map_err(CacheDurabilityError::Increment)?;
+        debug_assert_eq!(applied, next);
+        Ok(applied)
     }
 
     pub fn snapshot_and_rotate(
