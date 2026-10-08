@@ -844,7 +844,7 @@ impl ClusterState {
         // active, probationary, or passive. Anything else (a Joining
         // seed awaiting its first heartbeat, a demoted probationary)
         // goes to the passive pool so the repair path can find it.
-        let homeless: Vec<NodeId> = self
+        let mut homeless: Vec<NodeId> = self
             .members
             .values()
             .filter(|info| {
@@ -856,6 +856,12 @@ impl ClusterState {
             })
             .map(|info| info.node_id)
             .collect();
+        // The simulator installs a seeded RNG, but HashMap has an
+        // independent random iteration order. Canonicalize the input to
+        // seeded repair choices without adding sort cost in production.
+        if self.rng.is_some() {
+            homeless.sort_unstable();
+        }
         for node_id in homeless {
             if self.passive_view.len() < self.passive_view_size {
                 self.passive_view.push(node_id);
@@ -1454,6 +1460,11 @@ impl ClusterState {
             .collect();
         if healthy.is_empty() {
             return Vec::new();
+        }
+        // Seeded simulations must select from a stable candidate order.
+        // Unseeded production keeps the existing O(N) collection path.
+        if self.rng.is_some() {
+            healthy.sort_unstable_by_key(|(node_id, _)| *node_id);
         }
 
         // Partial Fisher-Yates: swap a random remaining element into
