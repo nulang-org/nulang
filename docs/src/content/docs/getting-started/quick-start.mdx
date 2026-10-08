@@ -15,12 +15,12 @@ Actors, networking, FFI, and JIT execution still require the native runtime.
 :::
 
 
-After [building from source](/getting-started/installation/), run these commands from the `nulang` repository root with the release binary:
+After [building from source](/getting-started/installation/), run these commands from the `nulang` repository root using the release configuration:
 
 Run a one-liner:
 
 ```bash
-./target/release/nulang --eval 'perform IO.print("Hello, Nulang!")'
+cargo run --release -- --eval 'perform IO.print("Hello, Nulang!")'
 ```
 
 ```
@@ -30,7 +30,7 @@ Hello, Nulang!
 Or start the REPL for an interactive session:
 
 ```bash
-./target/release/nulang --repl
+cargo run --release -- --repl
 ```
 
 ## Variables and Functions
