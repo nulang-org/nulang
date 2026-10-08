@@ -329,7 +329,7 @@ impl FileWal {
         Ok(())
     }
 
-    fn check_public_write_authority(&self) -> Result<(), WalError> {
+    pub(crate) fn check_public_write_authority(&self) -> Result<(), WalError> {
         if !self.managed && is_managed_directory(&self.path)? {
             return Err(WalError::ManagedDirectory);
         }
