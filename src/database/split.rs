@@ -790,6 +790,26 @@ mod tests {
     }
 
     #[test]
+    fn older_readers_reject_the_preparing_manifest_format() {
+        let parent = TabletDescriptor::new(
+            TabletId::new(901).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            7,
+        )
+        .unwrap();
+        let mut preparing = DiskManifest::for_preparing_parent(&parent);
+        assert_eq!(preparing.version, PREPARING_MANIFEST_VERSION);
+
+        // An older reader ignores unknown serde fields, including
+        // `preparing`. The separate format version must still reject it.
+        preparing.preparing = false;
+        assert!(matches!(
+            preparing.validate(&parent),
+            Err(SplitError::InvalidManifest(_))
+        ));
+    }
+
+    #[test]
     fn legacy_manifest_without_preparing_flag_is_published() {
         let parent = TabletDescriptor::new(
             TabletId::new(901).unwrap(),
