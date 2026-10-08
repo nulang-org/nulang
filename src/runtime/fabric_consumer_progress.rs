@@ -1135,9 +1135,9 @@ mod tests {
         );
         let installed = leader.consumer_progress_installed_policy("orders").unwrap();
         let wire = FabricConsumerProgressPrepareWire::new(
-            leader
-                .fabric_consumer_progress_pending_change("orders")
-                .unwrap(),
+            FileFabricConsumerProgressJournal::open(
+                leader_root.join("orders").join("consumer_progress")
+            ).unwrap().pending_change().unwrap().0.clone(),
             installed,
             1,
         ).unwrap();
