@@ -681,7 +681,7 @@ mod tests {
             .unwrap();
             {
                 let mut store = SingleNodeSplitStore::open(&root, parent.clone()).unwrap();
-                for (key, value) in [(b"b", b"left"), (b"n", b"right")] {
+                for (key, value) in [(&b"b"[..], &b"left"[..]), (&b"n"[..], &b"right"[..])] {
                     store
                         .commit(TabletMutation::Put {
                             key: key.to_vec(),
