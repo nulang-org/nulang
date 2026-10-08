@@ -154,23 +154,24 @@ fn measure(root: &Path, shared: bool, settings: &Settings) -> io::Result<ModeRes
             root.join("isolated").join(format!("worker-{worker}"))
         };
         let path = dir.join(format!("tablet-{worker}.wal"));
-        handles.push(thread::spawn(move || -> io::Result<Worker> {
-            fs::create_dir_all(&dir)?;
-            let id = TabletId::new(100 + worker as u64).map_err(as_io_error)?;
-            let range = KeyRange::new(b"a".to_vec(), Some(b"z".to_vec()))
+        // Complete fallible preparation before spawning workers. Otherwise
+        // one thread could fail before the barrier and strand other threads.
+        fs::create_dir_all(&dir)?;
+        let id = TabletId::new(100 + worker as u64).map_err(as_io_error)?;
+        let range = KeyRange::new(b"a".to_vec(), Some(b"z".to_vec()))
+            .map_err(as_io_error)?;
+        let descriptor = TabletDescriptor::new(id, range, 3).map_err(as_io_error)?;
+        let mut wal = FileWal::open(path).map_err(as_io_error)?;
+        let mut sequence = 0_u64;
+        for _ in 0..warmup {
+            wal.append_write(&write(&descriptor, sequence, worker)?)
                 .map_err(as_io_error)?;
-            let descriptor = TabletDescriptor::new(id, range, 3).map_err(as_io_error)?;
-            let mut wal = FileWal::open(path).map_err(as_io_error)?;
-            let mut sequence = 0_u64;
+            sequence += 1;
+        }
 
-            for _ in 0..warmup {
-                wal.append_write(&write(&descriptor, sequence, worker)?)
-                    .map_err(as_io_error)?;
-                sequence += 1;
-            }
-
+        handles.push(thread::spawn(move || -> io::Result<Worker> {
             // All writers start measuring in the same phase, without counting
-            // WAL setup/creation or uneven compiler/runtime warmup.
+            // WAL setup/creation or warmup.
             gate.wait();
             let first_write = Instant::now();
             let mut latencies = Vec::with_capacity(iterations);
