@@ -231,27 +231,27 @@ impl SingleNodeSplitStore {
                         Active::Parent(WalBackedTablet::open(parent.clone(), &parent_wal)?)
                     }
                     Some((plan, sequence)) => {
-                    // Never silently fall back to the parent after promotion.
-                    for child in ["left", "right"] {
-                        verify_published_wal(&root.join(format!("{child}.wal")))?;
-                        if !root.join(format!("{child}.checkpoint")).exists() {
+                        // Never silently fall back to the parent after promotion.
+                        for child in ["left", "right"] {
+                            verify_published_wal(&root.join(format!("{child}.wal")))?;
+                            if !root.join(format!("{child}.checkpoint")).exists() {
+                                return Err(SplitError::InvalidManifest(
+                                    "published child checkpoint is missing".into(),
+                                ));
+                            }
+                        }
+                        let left = WalBackedTablet::open(plan.left, root.join("left.wal"))?;
+                        let right = WalBackedTablet::open(plan.right, root.join("right.wal"))?;
+                        if left.current_sequence() < sequence || right.current_sequence() < sequence {
                             return Err(SplitError::InvalidManifest(
-                                "published child checkpoint is missing".into(),
+                                "child state regressed behind split source sequence".into(),
                             ));
                         }
-                    }
-                    let left = WalBackedTablet::open(plan.left, root.join("left.wal"))?;
-                    let right = WalBackedTablet::open(plan.right, root.join("right.wal"))?;
-                    if left.current_sequence() < sequence || right.current_sequence() < sequence {
-                        return Err(SplitError::InvalidManifest(
-                            "child state regressed behind split source sequence".into(),
-                        ));
-                    }
-                    Active::Children {
-                        split_key: plan.split_key,
-                        left,
-                        right,
-                    }
+                        Active::Children {
+                            split_key: plan.split_key,
+                            left,
+                            right,
+                        }
                     }
                 }
             }
@@ -259,6 +259,7 @@ impl SingleNodeSplitStore {
             // A missing manifest is not proof of a fresh store. In particular,
             // a lost manifest after promotion cannot resurrect an old parent.
             if parent_wal.exists()
+                || root.join("parent.checkpoint").exists()
                 || [
                     "left.wal",
                     "right.wal",
