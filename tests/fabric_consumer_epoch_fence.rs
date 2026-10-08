@@ -167,3 +167,141 @@ fn unreplicated_runtime_consumer_preserves_unfenced_ack() {
     assert_eq!(runtime.fabric_stream_cursor("local", "worker").unwrap(), 1);
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[test]
+fn abrupt_leader_termination_fences_old_ack_epoch_after_manual_removal() {
+    let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addrs: Vec<SocketAddr> = ["127.0.0.1:39141", "127.0.0.1:39142", "127.0.0.1:39143"]
+        .into_iter()
+        .map(|addr| addr.parse().unwrap())
+        .collect();
+    let ids: Vec<NodeId> = addrs.iter().map(NodeId::new).collect();
+    let mut nodes: Vec<Runtime> = addrs
+        .iter()
+        .copied()
+        .map(|addr| node(addr, bus.clone()))
+        .collect();
+    for i in 0..nodes.len() {
+        for j in 0..nodes.len() {
+            if i != j {
+                nodes[i]
+                    .distributed
+                    .cluster
+                    .as_mut()
+                    .unwrap()
+                    .handle_heartbeat(ids[j], addrs[j]);
+            }
+        }
+    }
+
+    let initial = nodes[0].fabric_stream_placement("crash-fence", 0, 3).unwrap();
+    let old_leader = ids.iter().position(|id| *id == initial.leader).unwrap();
+    let survivors: Vec<usize> = (0..3).filter(|i| *i != old_leader).collect();
+    let roots: Vec<PathBuf> = (0..3)
+        .map(|i| temp_dir(&format!("crash-{i}")))
+        .collect();
+    for (runtime, root) in nodes.iter_mut().zip(&roots) {
+        runtime.fabric_stream_open(root).unwrap();
+    }
+    nodes[old_leader]
+        .fabric_stream_create("crash-fence", FabricStreamConfig::default())
+        .unwrap();
+    nodes[old_leader]
+        .fabric_stream_replicated_append("crash-fence", 0, 3, b"committed")
+        .unwrap();
+    for index in &survivors {
+        nodes[*index].process_network();
+    }
+    nodes[old_leader].process_network();
+    nodes[old_leader].process_network();
+    for index in &survivors {
+        nodes[*index].process_network();
+        nodes[*index].process_network();
+        assert_eq!(
+            nodes[*index]
+                .fabric_stream_committed_sequence("crash-fence")
+                .unwrap(),
+            1
+        );
+    }
+    let first = nodes[old_leader]
+        .fabric_stream_deliver_consumer(
+            "crash-fence",
+            "worker",
+            1,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].leader_epoch, Some(1));
+    nodes[old_leader]
+        .fabric_stream_ack_consumer_fenced("crash-fence", "worker", 1, 1)
+        .unwrap();
+
+    // Abruptly terminate without sending a graceful NodeGoodbye.
+    let dead = std::mem::replace(&mut nodes[old_leader], Runtime::new());
+    drop(dead);
+
+    // An external failure detector confirms the missing node. The test does
+    // NOT prove automated removal or quorum-loss detection.
+    for index in &survivors {
+        nodes[*index]
+            .distributed
+            .cluster
+            .as_mut()
+            .unwrap()
+            .mark_removed(ids[old_leader]);
+    }
+    let new_placement = nodes[survivors[0]]
+        .fabric_stream_placement("crash-fence", 0, 2)
+        .unwrap();
+    let candidate = survivors
+        .iter()
+        .copied()
+        .find(|i| ids[*i] == new_placement.leader)
+        .unwrap();
+    let voter = survivors
+        .iter()
+        .copied()
+        .find(|i| *i != candidate)
+        .unwrap();
+
+    let starting = nodes[candidate]
+        .fabric_stream_begin_epoch_transition("crash-fence", 0, 2)
+        .unwrap();
+    assert_eq!(starting.to_epoch, 2);
+    nodes[voter].process_network();
+    nodes[candidate].process_network();
+    nodes[voter].process_network();
+
+    assert_eq!(nodes[candidate].fabric_stream_epoch("crash-fence").unwrap(), Some(2));
+    assert_eq!(
+        nodes[candidate]
+            .fabric_stream_committed_sequence("crash-fence")
+            .unwrap(),
+        1
+    );
+
+    // The new leader replays an ACKed record because the old cursor is local,
+    // but it cannot accept the previous leader epoch as an ACK token.
+    let replay = nodes[candidate]
+        .fabric_stream_deliver_consumer(
+            "crash-fence",
+            "worker",
+            1,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+    assert_eq!(replay.len(), 1);
+    assert_eq!(replay[0].leader_epoch, Some(2));
+    assert!(nodes[candidate]
+        .fabric_stream_ack_consumer_fenced("crash-fence", "worker", 1, 1)
+        .is_err());
+    nodes[candidate]
+        .fabric_stream_ack_consumer_fenced("crash-fence", "worker", 1, 2)
+        .unwrap();
+
+    for root in roots {
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
