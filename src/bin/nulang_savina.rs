@@ -37,6 +37,8 @@ struct Config {
     format: OutputFormat,
     benchmark: Option<String>,
     repeat: u32,
+    reuse_setup: bool,
+    phase_profile: bool,
 }
 
 #[derive(Debug)]
@@ -44,6 +46,7 @@ struct Measurement {
     benchmark: &'static str,
     messages: u64,
     elapsed: Duration,
+    phases: Option<(Duration, Duration)>,
 }
 
 impl Measurement {
@@ -67,12 +70,35 @@ fn main() -> ExitCode {
         }
     };
 
+    if config.phase_profile
+        && !matches!(config.benchmark.as_deref(), Some("counting" | "fork_join"))
+    {
+        eprintln!("--phase-profile requires --benchmark counting or fork_join");
+        return ExitCode::from(2);
+    }
+
     if let Some(name) = config.benchmark.as_deref() {
         if !BENCHMARKS.contains(&name) {
             eprintln!("unknown benchmark: {name}");
             eprintln!("available: {}", BENCHMARKS.join(", "));
             return ExitCode::from(2);
         }
+    }
+
+    // The canonical cross-runtime suite always constructs a fresh fixture.
+    // Profilers may opt in to persistent actors to avoid sampling compilation
+    // and actor startup repeatedly; this is NOT a comparative baseline.
+    if config.reuse_setup {
+        if config.benchmark.as_deref() != Some("ping_pong") {
+            eprintln!("--reuse-setup currently requires --benchmark ping_pong");
+            return ExitCode::from(2);
+        }
+        let (runtime, pinger, ponger) = ping_pong_fixture();
+        for iteration in 1..=config.repeat {
+            let measurement = run_ping_pong(&runtime, pinger, ponger, iteration);
+            emit(&measurement, iteration, config.format, config.phase_profile);
+        }
+        return ExitCode::SUCCESS;
     }
 
     for iteration in 1..=config.repeat {
@@ -93,7 +119,7 @@ fn main() -> ExitCode {
                 "skynet" => bench_skynet(),
                 _ => unreachable!("benchmark list and dispatcher must stay in sync"),
             };
-            emit(&measurement, iteration, config.format);
+            emit(&measurement, iteration, config.format, config.phase_profile);
         }
     }
 
@@ -104,6 +130,8 @@ fn parse_args() -> Result<Option<Config>, String> {
     let mut format = OutputFormat::Human;
     let mut benchmark = None;
     let mut repeat = 1u32;
+    let mut reuse_setup = false;
+    let mut phase_profile = false;
     let mut args = env::args().skip(1);
 
     while let Some(arg) = args.next() {
@@ -135,6 +163,12 @@ fn parse_args() -> Result<Option<Config>, String> {
                     return Err("--repeat must be at least 1".to_string());
                 }
             }
+            "--reuse-setup" => {
+                reuse_setup = true;
+            }
+            "--phase-profile" => {
+                phase_profile = true;
+            }
             "--list" => {
                 for name in BENCHMARKS {
                     println!("{name}");
@@ -153,16 +187,18 @@ fn parse_args() -> Result<Option<Config>, String> {
         format,
         benchmark,
         repeat,
+        reuse_setup,
+        phase_profile,
     }))
 }
 
 fn print_usage() {
     eprintln!(
-        "Usage: nulang-savina [--format human|jsonl] [--benchmark NAME] [--repeat N] [--list]"
+        "Usage: nulang-savina [--format human|jsonl] [--benchmark NAME] [--repeat N] [--reuse-setup] [--phase-profile] [--list]"
     );
 }
 
-fn emit(measurement: &Measurement, iteration: u32, format: OutputFormat) {
+fn emit(measurement: &Measurement, iteration: u32, format: OutputFormat, phase_profile: bool) {
     match format {
         OutputFormat::Human => {
             println!(
@@ -183,20 +219,31 @@ fn emit(measurement: &Measurement, iteration: u32, format: OutputFormat) {
         OutputFormat::Jsonl => {
             let elapsed_ns = u64::try_from(measurement.elapsed.as_nanos())
                 .expect("benchmark duration must fit in u64 nanoseconds");
-            println!(
-                "{}",
-                json!({
-                    "schema": 1,
-                    "runtime": "nulang",
-                    "suite": "savina-style",
-                    "benchmark": measurement.benchmark,
-                    "iteration": iteration,
-                    "messages": measurement.messages,
-                    "elapsed_ns": elapsed_ns,
-                    "messages_per_second": measurement.messages_per_second(),
-                    "ns_per_message": measurement.ns_per_message(),
-                })
-            );
+            let mut record = json!({
+                "schema": 1,
+                "runtime": "nulang",
+                "suite": "savina-style",
+                "benchmark": measurement.benchmark,
+                "iteration": iteration,
+                "messages": measurement.messages,
+                "elapsed_ns": elapsed_ns,
+                "messages_per_second": measurement.messages_per_second(),
+                "ns_per_message": measurement.ns_per_message(),
+            });
+            if phase_profile {
+                let (admission, scheduler) = measurement
+                    .phases
+                    .expect("phase profiling must use a supported workload");
+                record["phase_admission_ns"] = json!(
+                    u64::try_from(admission.as_nanos())
+                        .expect("admission phase duration must fit u64 nanoseconds")
+                );
+                record["phase_scheduler_ns"] = json!(
+                    u64::try_from(scheduler.as_nanos())
+                        .expect("scheduler phase duration must fit u64 nanoseconds")
+                );
+            }
+            println!("{record}");
         }
     }
 }
@@ -238,8 +285,10 @@ fn bench_counting() -> Measurement {
     for _ in 0..N {
         rt.borrow_mut().send_message(actor_id, "inc", &[]);
     }
+    let admission = start.elapsed();
     rt.borrow_mut().run_scheduler();
     let elapsed = start.elapsed();
+    let scheduler = elapsed.saturating_sub(admission);
 
     let count = rt
         .borrow()
@@ -253,11 +302,12 @@ fn bench_counting() -> Measurement {
         benchmark: "counting",
         messages: N as u64,
         elapsed,
+        phases: Some((admission, scheduler)),
     }
 }
 
-fn bench_ping_pong() -> Measurement {
-    const N: i64 = 20_000;
+/// Compile and wire the two benchmark actors once.
+fn ping_pong_fixture() -> (Rc<RefCell<Runtime>>, u64, u64) {
     let source = r#"
         actor Ping {
             state ponger = nil
@@ -303,6 +353,19 @@ fn bench_ping_pong() -> Measurement {
 
     rt.borrow_mut().run_scheduler();
 
+    (rt, pinger, ponger)
+}
+
+/// Time only the actor-to-actor message round; after each round the same
+/// actors remain live, and the expected cumulative count proves correctness.
+fn run_ping_pong(
+    rt: &Rc<RefCell<Runtime>>,
+    pinger: u64,
+    ponger: u64,
+    iteration: u32,
+) -> Measurement {
+    const N: i64 = 20_000;
+
     let start = Instant::now();
     rt.borrow_mut()
         .send_message(pinger, "kick", &[Value::int(N)]);
@@ -315,13 +378,26 @@ fn bench_ping_pong() -> Measurement {
         .get(&ponger)
         .and_then(|a| a.get_state_field("count"))
         .and_then(|v| v.as_int());
-    assert_eq!(count, Some(N), "ponger must receive exactly N pings");
+    let expected = N
+        .checked_mul(i64::from(iteration))
+        .expect("ping_pong cumulative message count overflow");
+    assert_eq!(
+        count,
+        Some(expected),
+        "persistent ponger must receive exactly N more pings on each round"
+    );
 
     Measurement {
         benchmark: "ping_pong",
         messages: 2 * N as u64 + 1,
         elapsed,
+        phases: None,
     }
+}
+
+fn bench_ping_pong() -> Measurement {
+    let (runtime, pinger, ponger) = ping_pong_fixture();
+    run_ping_pong(&runtime, pinger, ponger, 1)
 }
 
 fn bench_thread_ring() -> Measurement {
@@ -386,6 +462,7 @@ let s = spawn Sink {} in
         benchmark: "thread_ring",
         messages: HOPS as u64,
         elapsed,
+        phases: None,
     }
 }
 
@@ -440,8 +517,10 @@ let s = spawn Sink {} in
         rt.borrow_mut()
             .send_message(worker, "task", &[Value::int(i)]);
     }
+    let admission = start.elapsed();
     rt.borrow_mut().run_scheduler();
     let elapsed = start.elapsed();
+    let scheduler = elapsed.saturating_sub(admission);
 
     let count = rt
         .borrow()
@@ -455,6 +534,7 @@ let s = spawn Sink {} in
         benchmark: "fork_join",
         messages: 2 * TASKS as u64,
         elapsed,
+        phases: Some((admission, scheduler)),
     }
 }
 
@@ -518,5 +598,22 @@ spawn Skynet {}
         benchmark: "skynet",
         messages: EXPECTED as u64 - 1,
         elapsed,
+        phases: None,
+    }
+}
+
+#[cfg(test)]
+mod profiling_tests {
+    use super::*;
+
+    #[test]
+    fn persistent_ping_pong_processes_every_round_without_recompilation() {
+        let (runtime, pinger, ponger) = ping_pong_fixture();
+        for iteration in 1..=3 {
+            let measured = run_ping_pong(&runtime, pinger, ponger, iteration);
+            assert_eq!(measured.benchmark, "ping_pong");
+            assert_eq!(measured.messages, 40_001);
+            assert!(measured.elapsed.as_nanos() > 0);
+        }
     }
 }
