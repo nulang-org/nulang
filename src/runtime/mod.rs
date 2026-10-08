@@ -33,6 +33,10 @@ mod cluster;
 mod distributed;
 mod distributed_context;
 mod fabric_stream;
+// This storage-only quorum metadata journal is intentionally not yet wired
+// into the public consumer ACK path or authenticated replica transport.
+#[allow(dead_code)]
+mod fabric_consumer_progress;
 mod fabric_stream_cluster;
 mod fabric_stream_epoch;
 mod grain;

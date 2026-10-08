@@ -1,5 +1,11 @@
 # Nulang Changelog
 
+### Fabric consumer progress metadata journal (storage foundation) — 2026-10-08
+- **Added a private append-only, hash-chained consumer metadata journal.** Pending proposals do not advance committed consumer progress; a distinct persisted commit frame validates unique majority membership certificates supplied by future authenticated replica transport.
+- **Recovery replays pending proposals, committed cursors, and ACK gaps while rejecting corrupt or partial journal tails.** The journal enforces metadata predecessors, monotonic cursors, sorted/bounded gaps, policy identity, and fail-closed epoch changes. Ten unit regressions specify the core invariants.
+- **No distributed ACK durability claim.** Network-authenticated replica fsync ACKs, quorum recovery on leadership change, live old-leader fencing, and the public ticketed ACK API are not integrated; the existing runtime consumer ACK contract remains node-local.
+
+
 ### Fabric consumer installed-epoch fencing — 2026-10-08
 - **Runtime application-consumer reads and leased deliveries now require the installed stream leader on replicated streams.** A partitioned follower with a committed replica cannot deliver or ACK application work.
 - **Replicated ACK/NACK and explicit cursor commits require an epoch token.** Deliveries carry `leader_epoch`; `fabric_stream_ack_consumer_fenced`, `fabric_stream_nack_consumer_fenced`, and `fabric_stream_commit_cursor_fenced` reject an epoch different from the locally installed stream policy. Unfenced sequence-only mutations remain supported for standalone streams.
