@@ -15,6 +15,49 @@ def row(benchmark="ping_pong", iteration=1, elapsed_ns=123456):
 
 
 class ProfileContractTests(unittest.TestCase):
+    def test_phase_records_require_verified_split_and_runtime(self):
+        records = [
+            {
+                "runtime": "nulang", "suite": "savina-style", "schema": 1,
+                "benchmark": "counting", "iteration": 1, "messages": 200000,
+                "elapsed_ns": 80000, "phase_admission_ns": 25000,
+                "phase_scheduler_ns": 55000,
+            },
+            {
+                "runtime": "nulang", "suite": "savina-style", "schema": 1,
+                "benchmark": "counting", "iteration": 2, "messages": 200000,
+                "elapsed_ns": 75000, "phase_admission_ns": 23000,
+                "phase_scheduler_ns": 52000,
+            },
+        ]
+        summary = profile.validate_phase_samples(
+            "\\n".join(json.dumps(row) for row in records),
+            "counting", 2, 200000,
+        )
+        self.assertEqual(summary["samples"], 2)
+        self.assertEqual(summary["median_admission_ns"], 24000)
+        self.assertEqual(summary["median_scheduler_ns"], 53500)
+        self.assertAlmostEqual(summary["scheduler_fraction"], 53500 / 77500)
+
+    def test_phase_records_reject_missing_or_misaligned_counts(self):
+        row = {
+            "runtime": "nulang", "suite": "savina-style", "schema": 1,
+            "benchmark": "fork_join", "iteration": 1, "messages": 100000,
+            "elapsed_ns": 1000, "phase_admission_ns": 250,
+            "phase_scheduler_ns": 750,
+        }
+        for updates in (
+            {"phase_scheduler_ns": 900},
+            {"phase_admission_ns": -1},
+            {"messages": 99999},
+            {"runtime": "ractor"},
+            {"iteration": 2},
+        ):
+            with self.subTest(case=updates), self.assertRaises(RuntimeError):
+                profile.validate_phase_samples(
+                    json.dumps(dict(row, **updates)), "fork_join", 1, 100000
+                )
+
     def test_refuses_invalid_workload(self):
         with self.assertRaisesRegex(ValueError, "workload"):
             profile.validate_options("unknown", 3, 99)
