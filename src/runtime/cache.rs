@@ -564,6 +564,10 @@ struct ExpirationWheel {
     // One handle per entry slot keeps TTL overwrite/cancel O(1) and avoids
     // accumulating stale expiration records under same-key write churn.
     locations: Vec<Option<ExpirationLocation>>,
+    // Eligible buckets stay queued until their records have been examined;
+    // a bounded sweep never needs to materialize a whole TTL bucket.
+    pending_buckets: VecDeque<(u8, u16)>,
+    queued_buckets: Vec<Vec<bool>>,
     last_tick: Option<u64>,
 }
 
@@ -579,6 +583,8 @@ impl ExpirationWheel {
                 .map(|_| (0..bucket_count).map(|_| Vec::new()).collect())
                 .collect(),
             locations: Vec::new(),
+            pending_buckets: VecDeque::new(),
+            queued_buckets: vec![vec![false; bucket_count]; DEFAULT_WHEEL_LEVELS],
             last_tick: None,
         }
     }
@@ -636,13 +642,23 @@ impl ExpirationWheel {
         });
     }
 
-    fn drain_level_range(
-        level: &mut [Vec<ExpirationRef>],
-        bucket_count: usize,
+    fn enqueue_bucket(&mut self, level: usize, bucket: usize) {
+        if self.levels[level][bucket].is_empty() || self.queued_buckets[level][bucket] {
+            return;
+        }
+        self.queued_buckets[level][bucket] = true;
+        self.pending_buckets.push_back((
+            u8::try_from(level).expect("wheel level exceeds u8"),
+            u16::try_from(bucket).expect("wheel bucket exceeds u16"),
+        ));
+    }
+
+    fn enqueue_level_range(
+        &mut self,
+        level: usize,
         start_tick: u64,
         end_tick: u64,
         include_start: bool,
-        out: &mut Vec<ExpirationRef>,
     ) {
         if end_tick < start_tick {
             return;
@@ -658,20 +674,34 @@ impl ExpirationWheel {
         }
 
         let elapsed = end_tick.saturating_sub(first).saturating_add(1);
-        if elapsed >= bucket_count as u64 {
-            for bucket in level {
-                out.append(bucket);
+        if elapsed >= self.buckets_per_level as u64 {
+            for bucket in 0..self.buckets_per_level {
+                self.enqueue_bucket(level, bucket);
             }
-            return;
-        }
-
-        let mask = bucket_count as u64 - 1;
-        for tick in first..=end_tick {
-            out.append(&mut level[(tick & mask) as usize]);
+        } else {
+            let mask = self.buckets_per_level as u64 - 1;
+            for tick in first..=end_tick {
+                self.enqueue_bucket(level, (tick & mask) as usize);
+            }
         }
     }
 
+    #[cfg(test)]
     fn drain_candidates(&mut self, now_ms: u64, out: &mut Vec<ExpirationRef>) {
+        self.drain_candidates_bounded(now_ms, out, usize::MAX);
+    }
+
+    /// Examine at most max_candidates records per call. Eligible buckets are
+    /// retained in a finite pending queue so work resumes on the next sweep.
+    fn drain_candidates_bounded(
+        &mut self,
+        now_ms: u64,
+        out: &mut Vec<ExpirationRef>,
+        max_candidates: usize,
+    ) {
+        if max_candidates == 0 {
+            return;
+        }
         let output_start = out.len();
         let current = now_ms / self.tick_ms;
         let Some(last) = self.last_tick else {
@@ -686,34 +716,41 @@ impl ExpirationWheel {
             let current_coarse = current >> shift;
 
             if level_index == 0 {
-                // Revisit the current base bucket so sub-tick expirations
-                // scheduled after the previous sweep can still be observed.
-                Self::drain_level_range(
-                    &mut self.levels[level_index],
-                    self.buckets_per_level,
-                    last_coarse,
-                    current_coarse,
-                    true,
-                    out,
-                );
+                // Revisit the base bucket for sub-tick TTLs, including those
+                // scheduled after the previous sweep at this same clock tick.
+                self.enqueue_level_range(level_index, last_coarse, current_coarse, true);
             } else if current_coarse > last_coarse {
-                Self::drain_level_range(
-                    &mut self.levels[level_index],
-                    self.buckets_per_level,
-                    last_coarse,
-                    current_coarse,
-                    false,
-                    out,
-                );
+                self.enqueue_level_range(level_index, last_coarse, current_coarse, false);
             }
         }
-
-        // Bucket drains move records out of the wheel. Clear their handles
-        // before the caller can reschedule an unexpired candidate.
-        for item in &out[output_start..] {
-            self.locations[item.slot as usize] = None;
-        }
         self.last_tick = Some(current);
+
+        while out.len() - output_start < max_candidates {
+            let Some((level, bucket)) = self.pending_buckets.pop_front() else {
+                break;
+            };
+            let level = level as usize;
+            let bucket = bucket as usize;
+            self.queued_buckets[level][bucket] = false;
+
+            while out.len() - output_start < max_candidates {
+                let Some(item) = self.levels[level][bucket].pop() else {
+                    break;
+                };
+                self.locations[item.slot as usize] = None;
+                out.push(item);
+            }
+
+            if !self.levels[level][bucket].is_empty() {
+                // Round-robin between eligible buckets instead of starving
+                // other TTLs behind one full bucket.
+                self.queued_buckets[level][bucket] = true;
+                self.pending_buckets.push_back((
+                    u8::try_from(level).expect("wheel level exceeds u8"),
+                    u16::try_from(bucket).expect("wheel bucket exceeds u16"),
+                ));
+            }
+        }
     }
 
     fn reserved_bytes(&self) -> usize {
@@ -744,9 +781,29 @@ impl ExpirationWheel {
                     )
             })
             .sum::<usize>();
+        let pending_bytes = self
+            .pending_buckets
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(u8, u16)>());
+        let queued_bytes = self
+            .queued_buckets
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Vec<bool>>())
+            .saturating_add(
+                self.queued_buckets
+                    .iter()
+                    .map(|buckets| {
+                        buckets
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<bool>())
+                    })
+                    .sum::<usize>(),
+            );
         handles_bytes
             .saturating_add(levels_bytes)
             .saturating_add(buckets_bytes)
+            .saturating_add(pending_bytes)
+            .saturating_add(queued_bytes)
     }
 }
 
@@ -1583,9 +1640,12 @@ impl CacheStore {
     }
 
     pub fn purge_expired(&mut self, now_ms: u64, max_items: usize) -> usize {
+        if max_items == 0 {
+            return 0;
+        }
         self.expiry_scratch.clear();
         self.expiry
-            .drain_candidates(now_ms, &mut self.expiry_scratch);
+            .drain_candidates_bounded(now_ms, &mut self.expiry_scratch, max_items);
 
         let mut expired = 0usize;
         let mut candidates = std::mem::take(&mut self.expiry_scratch);
@@ -2432,5 +2492,46 @@ mod tests {
         );
         assert_eq!(ready[0].expires_at_ms, 3_000);
         assert!(wheel.locations[7].is_none());
+    }
+
+    #[test]
+    fn expiry_sweep_limits_candidate_buffer_not_only_deletions() {
+        let mut store = CacheStore::new();
+        for key in 0..512 {
+            store.set_integer(format!("ttl-{key}").as_bytes(), key, Some(100), 0);
+        }
+
+        assert_eq!(store.purge_expired(100, 3), 3);
+        assert!(
+            store.expiry_scratch.capacity() <= 8,
+            "a three-candidate sweep must not materialize the entire due bucket"
+        );
+        assert_eq!(store.len(), 509);
+
+        let mut purged = 3;
+        while purged < 512 {
+            let n = store.purge_expired(100, 3);
+            assert!(n > 0 && n <= 3, "pending expired entries must make progress");
+            purged += n;
+        }
+        assert_eq!(purged, 512);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn expiry_sweep_resumes_coarse_bucket_and_tolerates_cancelled_entries() {
+        let mut store = CacheStore::new();
+        for key in 0..25 {
+            store.set_integer(format!("long-{key}").as_bytes(), key, Some(2_600), 0);
+        }
+
+        assert_eq!(store.purge_expired(2_560, 2), 0);
+        assert!(store.delete_at(b"long-17", 2_560));
+        let mut expired = 0;
+        for _ in 0..25 {
+            expired += store.purge_expired(2_600, 2);
+        }
+        assert_eq!(expired, 24);
+        assert!(store.is_empty());
     }
 }

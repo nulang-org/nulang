@@ -52,6 +52,7 @@ version + migration.*
 ## Stable tier
 
 ### RESP cache memory/TTL hardening and Valkey differential gate — 2026-09-24
+- **Expiration sweeps now enforce a candidate budget**, retaining partially drained due buckets in a bounded round-robin wheel queue; candidate scratch buffers no longer grow to the size of an entire expiration burst.
 - **TTL overwrite/cancel now unlinks stale hierarchical-wheel records in O(1)** using compact slot-indexed handles, preventing TTL-refresh churn from accumulating queued metadata; wheel-handle reservation is included in memory accounting.
 - **MSET admission now counts distinct keys with hash-based preflight**, eliminating quadratic previous-key scans for large batches while retaining fail-before-mutate entry limits and last-write-wins duplicate semantics.
 - **The experimental RESP cache now uses keyed hashing, bounded admission, S3-FIFO eviction, segmented size-class slabs, and pressure-triggered empty-slab reclamation** instead of relying on one relocatable arena backing buffer.
