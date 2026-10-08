@@ -4675,6 +4675,82 @@ match { a: 2, b: 9 } with {
         assert_eq!(store.latest_sequence(actor_id), tail.sequence);
     }
 
+    /// #1389: a failed atomic terminal commit must never expose speculative
+    /// step state or claim the command completed.
+    #[test]
+    fn test_workflow_timer_resume_terminal_commit_failure_recovers_safe_state() {
+        let source = r#"
+            workflow TimerResumeCommitFailure {
+                step wait { perform Timer.sleep(50) }
+            }
+            spawn TimerResumeCommitFailure {}
+        "#;
+        let store = SharedMemoryStore::new_atomic();
+        let (module, _ty) = compile_source(source).unwrap();
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        rt.borrow_mut().persistence = Box::new(store.clone());
+        rt.borrow_mut().install_virtual_clock();
+
+        let actor_id = {
+            let mut vm = VM::new();
+            vm.load_module(module);
+            vm.set_actor_callbacks(Box::new(RuntimeVmCallbacks::new(rt.clone())));
+            vm.run()
+                .unwrap()
+                .as_actor_id()
+                .expect("workflow actor reference")
+        };
+        rt.borrow_mut().send_message_by_id(actor_id, 0, &[]);
+        rt.borrow_mut().step_actor(actor_id);
+        assert!(
+            rt.borrow()
+                .actors
+                .get(&actor_id)
+                .unwrap()
+                .suspended_execution
+                .is_some(),
+            "workflow must suspend before the injected terminal failure"
+        );
+
+        let safe_snapshot = store.load_snapshot(actor_id).unwrap();
+        let admitted_tail = store
+            .load_durable_tail_position(actor_id)
+            .unwrap()
+            .expect("workflow command must be admitted atomically");
+        assert!(safe_snapshot.sequence < admitted_tail.sequence);
+
+        store.reject_next_terminal_commit();
+        rt.borrow_mut()
+            .advance_time(std::time::Duration::from_millis(100));
+        rt.borrow_mut().tick_timers();
+
+        let recovered = rt.borrow();
+        let actor = recovered
+            .actors
+            .get(&actor_id)
+            .expect("failed terminal commit must recover the actor");
+        assert_eq!(
+            actor.get_state_field("step_index").and_then(|value| value.as_int()),
+            Some(0),
+            "speculative timer-resumed state must not be visible after failed commit"
+        );
+        assert_eq!(
+            store.load_snapshot(actor_id).unwrap().sequence,
+            safe_snapshot.sequence
+        );
+        assert_eq!(
+            store.load_durable_tail_position(actor_id).unwrap().unwrap().sequence,
+            admitted_tail.sequence,
+            "failed terminal must not advance the RFC 0022 tail"
+        );
+        assert!(
+            !store.read_workflow_events(actor_id).iter().any(|event| {
+                matches!(event, WorkflowEvent::StepCompleted { .. })
+            }),
+            "failed terminal commit must not claim successful workflow completion"
+        );
+    }
+
     #[test]
     fn test_workflow_parallel_branches_normal() {
         // A simple parallel block with no suspension: both branches run in one
