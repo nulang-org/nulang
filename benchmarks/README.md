@@ -82,6 +82,11 @@ host-mode fork-join results must not be presented as a fair multicore
 comparison. These are language/runtime baselines, not a universal framework
 ranking; see the cross-runtime README for the full interpretation constraints.
 
+For separate idle-actor spawn and Linux RSS diagnostics against Ractor,
+run `python3 scripts/actor_density_cross_runtime.py --actors 1000,10000`.
+This reuses the existing Nulang density probe rather than duplicating it.
+See `benchmarks/cross_runtime/README.md` for startup and allocation caveats.
+
 ## Nulang shard scaling
 
 `nulang-shard-bench` measures best-case multicore runtime scaling independently
