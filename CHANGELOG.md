@@ -1,5 +1,11 @@
 # Nulang Changelog
 
+### Fabric consumer metadata prepare transport (experimental) — 2026-10-08
+- **Leader-staged pending metadata can be dispatched to installed stream followers over existing Fabric system messages.** Followers validate the transport-exposed leader identity, durable installed policy/epoch promises, and local committed data prefix before fsyncing the identical consumer-progress prepare.
+- **Only a successful follower fsync produces an application-level receipt.** Leaders correlate received messages against the transport-exposed replica, policy membership, epoch, pending metadata sequence and proposal digest. Receipts remain volatile; transport ACKs are never counted as metadata fsync.
+- **The consumer committed cursor remains unchanged.** No quorum metadata commit, authenticated durable certificate, failover cursor recovery, or client durable-ACK API is wired in. Deterministic network regressions cover RF=2, dropped prepares, spoofed senders, mismatched digests and pending-only progress.
+
+
 ### Fabric consumer progress metadata journal (storage foundation) — 2026-10-08
 - **Added a private append-only, hash-chained consumer metadata journal.** Pending proposals do not advance committed consumer progress; a distinct persisted commit frame validates unique majority membership certificates supplied by future authenticated replica transport.
 - **Recovery replays pending proposals, committed cursors, and ACK gaps while rejecting corrupt or partial journal tails.** The journal enforces metadata predecessors, monotonic cursors, sorted/bounded gaps, policy identity, and fail-closed epoch changes. Ten unit regressions specify the core invariants.
