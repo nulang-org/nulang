@@ -1,9 +1,37 @@
 # Fabric replicated consumer progress: safety contract and implementation plan
 
-**Status:** Design proposal — **not implemented**. The current runtime only
-persists `deliveries.json`, ACK gaps, and `cursors.json` on the node that
-handles the consumer. The leader-epoch APIs in draft #1432 validate the locally
-installed epoch, but **do not prove live quorum or replicate consumer progress**.
+**Status:** Storage foundation implemented on draft branch
+`feat/fabric-consumer-progress-journal-20261008`; **network consensus and
+application ACK integration are not implemented.** The current runtime still
+persists live consumer cursors, ACK gaps, and leases locally. Draft #1432 only
+checks the locally installed leader epoch and does not prove live quorum.
+
+### Implemented storage-only foundation
+
+`src/runtime/fabric_consumer_progress.rs` is a private, append-only
+`consumer_progress.log` journal with versioned, BLAKE3 hash-chained frames.
+`Prepare` fsyncs an exact metadata record but does **not** advance the
+committed cursor. `Commit` validates the membership/epoch structure of a
+majority acknowledgement certificate and fsyncs a separate commit frame.
+Restart replays the full journal and reconstructs the pending proposal,
+committed cursor, and acknowledged gaps. Incomplete/corrupt records fail
+closed, and uncertain local writes poison that journal instance until reopen.
+
+The journal enforces metadata predecessor continuity, monotonic cursor
+updates, bounded and sorted ACK gaps, unique policy members, and majority
+certificate cardinality. It explicitly rejects policy/epoch transitions
+until a proper old-quorum recovery protocol exists. Unit tests cover RF=2/3
+majorities, restart recovery, pending-versus-committed visibility, corruption,
+epoch/policy rejection, and ACK-gap preservation.
+
+**This is not an authenticated quorum certificate or distributed durable
+consumer protocol.** Replica IDs and their fsync claims are supplied by
+future trusted networking code; the storage module cannot verify their
+provenance. It is not wired to `fabric_stream_ack_consumer_fenced` or the
+replica message transport, so existing customer-visible ACKs remain
+node-local. The hashes detect accidental corruption but are not a signature
+or protection against an attacker who can rewrite the journal. No safe
+cluster-ACK success response has been introduced yet.
 
 ## Product-level contract
 
