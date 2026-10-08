@@ -134,7 +134,11 @@ pub fn plan_rows_for_floor(
         stats.versions_before += row.versions.len();
         stats.versions_retained += plan.retained().len();
         stats.versions_obsolete += plan.obsolete().len();
-        if plan.retained().first().is_some_and(|version| version.value.is_none()) {
+        if plan
+            .retained()
+            .first()
+            .is_some_and(|version| version.value.is_none())
+        {
             stats.tombstone_barriers += 1;
         }
         retained_rows.push(TabletSnapshotRow {
