@@ -1465,6 +1465,17 @@ impl Runtime {
                 "only the installed Fabric stream leader may operate replicated consumers",
             ));
         }
+        // The stream-data epoch transition does NOT currently recover
+        // consumer cursors, ACK gaps, or outstanding leases from the old
+        // replication quorum. A successor must not silently re-serve work
+        // from its empty node-local consumer files. There is deliberately
+        // no override until a separately verified recovery protocol exists.
+        if policy.epoch > FABRIC_STREAM_INITIAL_EPOCH {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "consumer progress is unverified after leader replacement; quorum metadata recovery required",
+            ));
+        }
         if let Some(promise) = self.fabric_stream_store_mut()?.epoch_promise(name)? {
             if promise.epoch > policy.epoch {
                 return Err(io::Error::new(
