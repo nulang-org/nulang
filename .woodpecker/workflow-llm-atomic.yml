@@ -10,6 +10,7 @@ when:
       include:
         - "src/runtime/llm.rs"
         - "src/runtime/mod.rs"
+        - "src/runtime/tests.rs"
         - "src/runtime/workflow_impl.rs"
         - "src/integration_tests/mod.rs"
         - "Cargo.toml"
@@ -30,5 +31,6 @@ steps:
       - rustup component add rustfmt
       - cargo fmt --all -- --check
       - cargo test test_workflow_inference_ask_step_records_completion
+      - cargo test test_failed_resumed_workflow_terminal_rolls_back_uncommitted_state
       - cargo test test_workflow_inference_ask_step_redriven_after_restart
       - git diff --check
