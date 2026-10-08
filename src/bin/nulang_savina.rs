@@ -27,6 +27,21 @@ const BENCHMARKS: &[&str] = &[
     "skynet",
 ];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Backend {
+    Bytecode,
+    Aot,
+}
+
+impl Backend {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Bytecode => "nulang",
+            Self::Aot => "nulang-aot",
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum OutputFormat {
     Human,
@@ -34,6 +49,7 @@ enum OutputFormat {
 }
 
 struct Config {
+    backend: Backend,
     format: OutputFormat,
     benchmark: Option<String>,
     repeat: u32,
@@ -86,14 +102,14 @@ fn main() -> ExitCode {
             }
 
             let measurement = match name {
-                "counting" => bench_counting(),
-                "ping_pong" => bench_ping_pong(),
-                "thread_ring" => bench_thread_ring(),
-                "fork_join" => bench_fork_join(),
-                "skynet" => bench_skynet(),
+                "counting" => bench_counting(config.backend),
+                "ping_pong" => bench_ping_pong(config.backend),
+                "thread_ring" => bench_thread_ring(config.backend),
+                "fork_join" => bench_fork_join(config.backend),
+                "skynet" => bench_skynet(config.backend),
                 _ => unreachable!("benchmark list and dispatcher must stay in sync"),
             };
-            emit(&measurement, iteration, config.format);
+            emit(&measurement, iteration, config.format, config.backend);
         }
     }
 
@@ -102,12 +118,20 @@ fn main() -> ExitCode {
 
 fn parse_args() -> Result<Option<Config>, String> {
     let mut format = OutputFormat::Human;
+    let mut backend = Backend::Bytecode;
     let mut benchmark = None;
     let mut repeat = 1u32;
     let mut args = env::args().skip(1);
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--backend" => {
+                backend = match args.next().as_deref() {
+                    Some("bytecode") => Backend::Bytecode,
+                    Some("aot") => Backend::Aot,
+                    _ => return Err("--backend requires bytecode or aot".to_string()),
+                };
+            }
             "--format" => {
                 let value = args
                     .next()
@@ -149,7 +173,12 @@ fn parse_args() -> Result<Option<Config>, String> {
         }
     }
 
+    if backend == Backend::Aot && !cfg!(feature = "native-codegen") {
+        return Err("AOT backend requires --features native-codegen".to_string());
+    }
+
     Ok(Some(Config {
+        backend,
         format,
         benchmark,
         repeat,
@@ -158,11 +187,11 @@ fn parse_args() -> Result<Option<Config>, String> {
 
 fn print_usage() {
     eprintln!(
-        "Usage: nulang-savina [--format human|jsonl] [--benchmark NAME] [--repeat N] [--list]"
+        "Usage: nulang-savina [--backend bytecode|aot] [--format human|jsonl] [--benchmark NAME] [--repeat N] [--list]"
     );
 }
 
-fn emit(measurement: &Measurement, iteration: u32, format: OutputFormat) {
+fn emit(measurement: &Measurement, iteration: u32, format: OutputFormat, backend: Backend) {
     match format {
         OutputFormat::Human => {
             println!(
@@ -174,7 +203,8 @@ fn emit(measurement: &Measurement, iteration: u32, format: OutputFormat) {
                 measurement.ns_per_message()
             );
             println!(
-                "[cross-bench] runtime=nulang benchmark={} messages={} elapsed_ns={}",
+                "[cross-bench] runtime={} benchmark={} messages={} elapsed_ns={}",
+                backend.label(),
                 measurement.benchmark,
                 measurement.messages,
                 measurement.elapsed.as_nanos()
@@ -187,7 +217,7 @@ fn emit(measurement: &Measurement, iteration: u32, format: OutputFormat) {
                 "{}",
                 json!({
                     "schema": 1,
-                    "runtime": "nulang",
+                    "runtime": backend.label(),
                     "suite": "savina-style",
                     "benchmark": measurement.benchmark,
                     "iteration": iteration,
@@ -201,7 +231,11 @@ fn emit(measurement: &Measurement, iteration: u32, format: OutputFormat) {
     }
 }
 
-fn compile_run_with_runtime(source: &str, runtime: Rc<RefCell<Runtime>>) -> Value {
+fn compile_run_with_runtime(
+    source: &str,
+    runtime: Rc<RefCell<Runtime>>,
+    backend: Backend,
+) -> Value {
     let mut lexer = Lexer::new(source);
     let tokens = lexer.lex().expect("bench: lex failed");
     let mut parser = Parser::new(tokens);
@@ -212,15 +246,44 @@ fn compile_run_with_runtime(source: &str, runtime: Rc<RefCell<Runtime>>) -> Valu
         .expect("bench: typecheck failed");
     let hir = nulang::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
     let mut mir = nulang::mir_lower::lower_module(&hir).expect("bench: MIR lower failed");
+    #[cfg(feature = "native-codegen")]
+    if backend == Backend::Aot {
+        // Compile the identical MIR that the bytecode companion uses. Register
+        // native actor targets before VM-created actors are spawned.
+        let aot = nulang::aot::AotModule::compile(&mir)
+            .expect("bench: AOT compilation failed (not a bytecode fallback)");
+        runtime.borrow_mut().register_aot_module(aot);
+    }
+    #[cfg(not(feature = "native-codegen"))]
+    assert_eq!(backend, Backend::Bytecode, "AOT requires native-codegen");
+
     let module =
         nulang::mir_codegen::compile_mir(&mut mir, "savina").expect("bench: codegen failed");
     let mut vm = VM::new();
     vm.load_module(module);
     vm.set_actor_callbacks(Box::new(RuntimeVmCallbacks::new(runtime)));
-    vm.run().expect("bench: VM run failed")
+    let value = vm.run().expect("bench: VM run failed");
+    #[cfg(feature = "native-codegen")]
+    if backend == Backend::Aot {
+        let rt = runtime.borrow();
+        assert!(!rt.actors.is_empty(), "bench: AOT workload spawned no actors");
+        for actor in rt.actors.values() {
+            // The AOT backend is allowed no silent fallback in this suite:
+            // every declared behavior of every spawned actor must have a
+            // registered native dispatch target before measurement.
+            assert!(
+                !actor.aot_targets.is_empty()
+                    && actor.aot_targets.iter().all(Option::is_some)
+                    && actor.aot_targets.len() == actor.bytecode_offsets.len(),
+                "bench: actor {} lacks full AOT behavior coverage",
+                actor.name,
+            );
+        }
+    }
+    value
 }
 
-fn bench_counting() -> Measurement {
+fn bench_counting(backend: Backend) -> Measurement {
     const N: i64 = 200_000;
     let source = r#"
         actor Counter {
@@ -230,7 +293,7 @@ fn bench_counting() -> Measurement {
         spawn Counter {}
     "#;
     let rt = Rc::new(RefCell::new(Runtime::new()));
-    let actor_id = compile_run_with_runtime(source, rt.clone())
+    let actor_id = compile_run_with_runtime(source, rt.clone(), backend)
         .as_actor_id()
         .expect("spawn returns an actor ref");
 
@@ -256,7 +319,7 @@ fn bench_counting() -> Measurement {
     }
 }
 
-fn bench_ping_pong() -> Measurement {
+fn bench_ping_pong(backend: Backend) -> Measurement {
     const N: i64 = 20_000;
     let source = r#"
         actor Ping {
@@ -289,7 +352,7 @@ fn bench_ping_pong() -> Measurement {
         }
     "#;
     let rt = Rc::new(RefCell::new(Runtime::new()));
-    let pinger = compile_run_with_runtime(source, rt.clone())
+    let pinger = compile_run_with_runtime(source, rt.clone(), backend)
         .as_actor_id()
         .expect("spawn returns an actor ref");
     let ponger = {
@@ -324,7 +387,7 @@ fn bench_ping_pong() -> Measurement {
     }
 }
 
-fn bench_thread_ring() -> Measurement {
+fn bench_thread_ring(backend: Backend) -> Measurement {
     const RING: usize = 10;
     const HOPS: i64 = 20_000;
 
@@ -358,7 +421,7 @@ let s = spawn Sink {} in
     source.push_str("r0\n}\n");
 
     let rt = Rc::new(RefCell::new(Runtime::new()));
-    let r0 = compile_run_with_runtime(&source, rt.clone())
+    let r0 = compile_run_with_runtime(&source, rt.clone(), backend)
         .as_actor_id()
         .expect("spawn returns an actor ref");
     let sink = {
@@ -389,7 +452,7 @@ let s = spawn Sink {} in
     }
 }
 
-fn bench_fork_join() -> Measurement {
+fn bench_fork_join(backend: Backend) -> Measurement {
     const WORKERS: usize = 8;
     const TASKS: i64 = 50_000;
 
@@ -420,7 +483,7 @@ let s = spawn Sink {} in
     source.push_str("s\n}\n");
 
     let rt = Rc::new(RefCell::new(Runtime::new()));
-    let sink = compile_run_with_runtime(&source, rt.clone())
+    let sink = compile_run_with_runtime(&source, rt.clone(), backend)
         .as_actor_id()
         .expect("spawn returns an actor ref");
     let worker_ids: Vec<u64> = rt
@@ -458,7 +521,7 @@ let s = spawn Sink {} in
     }
 }
 
-fn bench_skynet() -> Measurement {
+fn bench_skynet(backend: Backend) -> Measurement {
     const DEPTH: i64 = 3;
     const EXPECTED: i64 = 1111;
 
@@ -496,7 +559,7 @@ spawn Skynet {}
     );
 
     let rt = Rc::new(RefCell::new(Runtime::new()));
-    let root = compile_run_with_runtime(&source, rt.clone())
+    let root = compile_run_with_runtime(&source, rt.clone(), backend)
         .as_actor_id()
         .expect("spawn returns an actor ref");
 
