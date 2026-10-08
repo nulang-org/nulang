@@ -32,8 +32,12 @@ class ProfileContractTests(unittest.TestCase):
         )
         self.assertEqual(command, [
             "/tmp/nulang-savina", "--benchmark", "ping_pong",
-            "--repeat", "3", "--format", "jsonl",
+            "--repeat", "3", "--format", "jsonl", "--reuse-setup",
         ])
+
+    def test_other_workloads_keep_existing_fresh_fixture_semantics(self):
+        command = profile.benchmark_command(Path("/tmp/nulang-savina"), "fork_join", 3)
+        self.assertNotIn("--reuse-setup", command)
 
     def test_parses_all_samples_with_contiguous_iterations(self):
         records = profile.parse_samples(
@@ -71,7 +75,7 @@ class ProfileContractTests(unittest.TestCase):
             "/usr/bin/perf", "record", "--call-graph", "fp",
             "--freq", "99", "--output", "/tmp/capture.data", "--",
             "/tmp/nulang-savina", "--benchmark", "ping_pong",
-            "--repeat", "2", "--format", "jsonl",
+            "--repeat", "2", "--format", "jsonl", "--reuse-setup",
         ])
 
 
