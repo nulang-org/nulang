@@ -89,18 +89,17 @@ impl HttpRequestBindingInputs {
         };
         // A canonical action must have a single unambiguous interpretation.
         // The legacy form path remains unchanged until its own contract migrates.
-        let (ui_message, ui_message_error) =
-            if form.contains_key("__nulang_ui_message") {
-                match find_duplicate_form_field(body) {
-                    Some(name) => (
-                        None,
-                        Some(UiActionEnvelopeError::DuplicateFormField { name }),
-                    ),
-                    None => capture_ui_action_message(&form),
-                }
-            } else {
-                (None, None)
-            };
+        let (ui_message, ui_message_error) = if form.contains_key("__nulang_ui_message") {
+            match find_duplicate_form_field(body) {
+                Some(name) => (
+                    None,
+                    Some(UiActionEnvelopeError::DuplicateFormField { name }),
+                ),
+                None => capture_ui_action_message(&form),
+            }
+        } else {
+            (None, None)
+        };
 
         Self {
             query,
