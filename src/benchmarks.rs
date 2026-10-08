@@ -395,7 +395,7 @@ fn bench_ab_aot_actor_drain() {
     }
     bytecode_rt.run_scheduler();
     let jit_compiled_regions = bytecode_rt.benchmark_jit_compiled_count();
-    let jit_execution_verified = jit_compiled_regions > 0;
+    let jit_compilation_verified = jit_compiled_regions > 0;
     bytecode_rt
         .actors
         .get_mut(&bytecode_actor)
@@ -421,7 +421,7 @@ fn bench_ab_aot_actor_drain() {
     );
     report_ab("bytecode_actor_drain_warm", N as u64, bytecode_elapsed);
     println!(
-        "[backend-provenance] workload=actor_drain jit_compiled_regions={jit_compiled_regions} jit_execution_verified={jit_execution_verified}"
+        "[backend-provenance] workload=actor_drain jit_compiled_regions={jit_compiled_regions} jit_compilation_verified={jit_compilation_verified}"
     );
 
     // AOT path over the exact same source and bytecode companion module.
@@ -464,7 +464,7 @@ fn bench_ab_aot_actor_drain() {
     let bytecode_ns = bytecode_elapsed.as_nanos() as f64;
     let aot_ns = aot_elapsed.as_nanos() as f64;
     println!(
-        "[backend-bench] workload=actor_drain messages={N} jit_enabled_bytecode_ns={} aot_ns={} aot_speedup_x={:.3} jit_compiled_regions={jit_compiled_regions} jit_execution_verified={jit_execution_verified}",
+        "[backend-bench] workload=actor_drain messages={N} jit_enabled_bytecode_ns={} aot_ns={} aot_speedup_x={:.3} jit_compiled_regions={jit_compiled_regions} jit_compilation_verified={jit_compilation_verified}",
         bytecode_elapsed.as_nanos(),
         aot_elapsed.as_nanos(),
         bytecode_ns / aot_ns
