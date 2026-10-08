@@ -108,7 +108,8 @@ mod tests {
     use super::*;
     use crate::bytecode::{Constant, DebugFunctionInfo, Instruction, OpCode};
     use nulang_ui_protocol::{
-        ActionRequest, CorrelationId, DocumentId, IdempotencyKey, Revision, WireValue,
+        ActionBinding, ActionRequest, CorrelationId, DocumentId, IdempotencyKey, Revision,
+        UiDocument, UiNode, WireValue,
     };
 
     fn module_with_action(name: &str, params: Vec<usize>) -> CodeModule {
@@ -144,6 +145,101 @@ mod tests {
             idempotency_key: IdempotencyKey::from("idem-1"),
             payload: WireValue::Null,
         })
+    }
+
+    fn trusted_document(action: &str, placement: ActionPlacement) -> UiDocument {
+        let mut root = UiNode::new("root", "interaction_root");
+        root.actions.push(ActionBinding {
+            event: "activate".to_owned(),
+            action_id: action.into(),
+            placement,
+        });
+        UiDocument::new("app", Revision(1), "root", vec![root])
+    }
+
+    #[test]
+    fn document_bound_action_executes_only_a_registered_server_handler() {
+        let module = module_with_action("save", Vec::new());
+        let document = trusted_document("save", ActionPlacement::Server);
+        let message = action_message("save", ActionPlacement::Server);
+
+        let resolved = resolve_document_zero_arg_action(&module, &document, &message)
+            .expect("trusted document registers the server handler");
+        assert_eq!(resolved.action_id, "save");
+
+        let value = invoke_document_zero_arg_action(&module, &document, &message)
+            .expect("registered zero-argument handler executes");
+        assert!(value.is_unit());
+    }
+
+    #[test]
+    fn document_bound_action_rejects_unregistered_and_client_only_bindings() {
+        let module = module_with_action("save", Vec::new());
+        let message = action_message("save", ActionPlacement::Server);
+
+        let document = trusted_document("other", ActionPlacement::Server);
+        assert_eq!(
+            resolve_document_zero_arg_action(&module, &document, &message),
+            Err(UiActionDispatchError::UnregisteredAction("save".to_owned()))
+        );
+
+        let document = trusted_document("save", ActionPlacement::Client);
+        assert_eq!(
+            resolve_document_zero_arg_action(&module, &document, &message),
+            Err(UiActionDispatchError::UnregisteredAction("save".to_owned()))
+        );
+    }
+
+    #[test]
+    fn document_bound_action_rejects_stale_and_foreign_documents() {
+        let module = module_with_action("save", Vec::new());
+        let document = trusted_document("save", ActionPlacement::Server);
+
+        let mut stale = action_message("save", ActionPlacement::Server);
+        let HostToRuntimeMessage::InvokeAction { request, .. } = &mut stale;
+        request.revision = Revision(0);
+        assert_eq!(
+            resolve_document_zero_arg_action(&module, &document, &stale),
+            Err(UiActionDispatchError::RevisionMismatch {
+                expected: Revision(1),
+                found: Revision(0),
+            })
+        );
+
+        let mut foreign = action_message("save", ActionPlacement::Server);
+        let HostToRuntimeMessage::InvokeAction { request, .. } = &mut foreign;
+        request.document_id = "foreign".into();
+        assert_eq!(
+            resolve_document_zero_arg_action(&module, &document, &foreign),
+            Err(UiActionDispatchError::DocumentMismatch)
+        );
+    }
+
+    #[test]
+    fn document_bound_action_rejects_payload_without_an_argument_contract() {
+        let module = module_with_action("save", Vec::new());
+        let document = trusted_document("save", ActionPlacement::Server);
+        let mut message = action_message("save", ActionPlacement::Server);
+        let HostToRuntimeMessage::InvokeAction { request, .. } = &mut message;
+        request.payload = WireValue::from("unexpected");
+
+        assert_eq!(
+            resolve_document_zero_arg_action(&module, &document, &message),
+            Err(UiActionDispatchError::UnexpectedPayload)
+        );
+    }
+
+    #[test]
+    fn document_bound_action_rejects_invalid_authoritative_document() {
+        let module = module_with_action("save", Vec::new());
+        let mut document = trusted_document("save", ActionPlacement::Server);
+        document.root = "missing".into();
+        let result = resolve_document_zero_arg_action(
+            &module,
+            &document,
+            &action_message("save", ActionPlacement::Server),
+        );
+        assert!(matches!(result, Err(UiActionDispatchError::InvalidDocument(_))));
     }
 
     #[test]
