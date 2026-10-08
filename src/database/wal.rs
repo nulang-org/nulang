@@ -261,6 +261,34 @@ impl FileWal {
         })
     }
 
+    /// Seed a new per-tablet WAL from an already fsynced MVCC checkpoint.
+    ///
+    /// This path must not exist: a seed must never overwrite an existing WAL
+    /// tail. The caller is responsible for ensuring the checkpoint carries
+    /// exactly `base_sequence` and is durably published before invoking this.
+    /// The checksummed WAL header records the tablet identity, fencing epoch
+    /// and the inherited predecessor sequence.
+    pub(crate) fn seed_from_checkpoint(
+        path: &Path,
+        descriptor: &TabletDescriptor,
+        base_sequence: u64,
+    ) -> Result<(), WalError> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path)?;
+        let header = encode_wal_header(
+            base_sequence,
+            Some(descriptor.id()),
+            Some(descriptor.ownership_epoch()),
+        );
+        file.write_all(&header)?;
+        file.sync_data()?;
+        drop(file);
+        sync_parent_directory(path)?;
+        Ok(())
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
