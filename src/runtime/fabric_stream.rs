@@ -2563,4 +2563,66 @@ mod tests {
         );
         let _ = fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn leased_record_from_before_replication_policy_cannot_be_acked_early() {
+        let root = test_dir("lease-before-replication");
+        let mut store = FileFabricStreamStore::open(&root).unwrap();
+        store.create_stream("events", FabricStreamConfig::default()).unwrap();
+        store.append("events", b"pending").unwrap();
+        let instant = std::time::UNIX_EPOCH + Duration::from_secs(100);
+        let leased = store
+            .deliver_consumer_at("events", "worker", 1, Duration::from_secs(30), instant)
+            .unwrap();
+        assert_eq!(leased.len(), 1);
+
+        // Upgrade to a replicated policy while an old local lease is persisted.
+        store.establish_replication_policy(
+            "events",
+            FabricStreamReplicationPolicy {
+                partition: 0,
+                epoch: FABRIC_STREAM_INITIAL_EPOCH,
+                leader: 10,
+                membership_fingerprint: 44,
+                replication_factor: 2,
+                replicas: vec![10, 11],
+            },
+        ).unwrap();
+        assert!(store.ack_consumer("events", "worker", 1).is_err());
+        assert_eq!(store.cursor("events", "worker").unwrap(), 0);
+
+        store.commit_through("events", 1).unwrap();
+        store.ack_consumer("events", "worker", 1).unwrap();
+        assert_eq!(store.cursor("events", "worker").unwrap(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn leased_consumer_rejects_legacy_cursor_above_quorum_index() {
+        let root = test_dir("legacy-cursor-above-quorum");
+        let mut store = FileFabricStreamStore::open(&root).unwrap();
+        store.create_stream("events", FabricStreamConfig::default()).unwrap();
+        store.append("events", b"pending").unwrap();
+        store.commit_cursor("events", "worker", 1).unwrap();
+        store.establish_replication_policy(
+            "events",
+            FabricStreamReplicationPolicy {
+                partition: 0,
+                epoch: FABRIC_STREAM_INITIAL_EPOCH,
+                leader: 10,
+                membership_fingerprint: 44,
+                replication_factor: 2,
+                replicas: vec![10, 11],
+            },
+        ).unwrap();
+
+        let instant = std::time::UNIX_EPOCH + Duration::from_secs(100);
+        assert!(store.read_consumer("events", "worker", 10).is_err());
+        assert!(store.deliver_consumer_at(
+            "events", "worker", 10, Duration::from_secs(30), instant
+        ).is_err());
+        assert!(store.ack_consumer("events", "worker", 1).is_err());
+        assert_eq!(store.cursor("events", "worker").unwrap(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
 }
