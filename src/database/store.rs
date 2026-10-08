@@ -203,7 +203,6 @@ mod ownership_tests {
     use super::super::tablet::{KeyRange, TabletId};
     use super::*;
     use std::fs::{self, OpenOptions};
-    use std::io;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -242,10 +241,10 @@ mod ownership_tests {
                     .write(true)
                     .open(root.join(".nudb-write-gate.lock"))
                     .unwrap();
-                assert_eq!(
-                    contender.try_lock().unwrap_err().kind(),
-                    io::ErrorKind::WouldBlock
-                );
+                assert!(matches!(
+                    contender.try_lock(),
+                    Err(std::fs::TryLockError::WouldBlock)
+                ));
             })
             .unwrap();
         assert_eq!(tablet.read_latest(b"b"), Some(&b"ack"[..]));
