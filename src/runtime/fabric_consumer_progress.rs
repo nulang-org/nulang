@@ -1,7 +1,374 @@
-//! Durable, staged consumer metadata journal.
+//! Durable, hash-chained **local** consumer metadata journal.
 //!
-//! Intentionally not yet wired to network authentication or the public
-//! Fabric ACK APIs. This module is a storage/state-machine building block.
+//! This is a storage/state-machine building block, not a network consensus
+//! protocol. In particular, this module does not authenticate replica ACK
+//! origins and is NOT connected to the public Fabric ACK APIs. A caller must
+//! verify every replica's identity and fsync acknowledgement through the
+//! authenticated cluster transport before supplying a certificate here.
+//! No cluster-durable success may be inferred merely from proposing locally.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+const JOURNAL_FORMAT_VERSION: u16 = 1;
+const MAX_FRAME_BYTES: usize = 1_048_576;
+const MAX_ACK_GAPS: usize = 1024;
+
+fn invalid(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FabricConsumerProgressPolicy {
+    pub epoch: u64,
+    pub leader: u64,
+    pub replicas: Vec<u64>,
+}
+
+impl FabricConsumerProgressPolicy {
+    fn validate(&self) -> io::Result<()> {
+        if self.epoch == 0 || self.replicas.is_empty()
+            || !self.replicas.contains(&self.leader)
+        {
+            return Err(invalid("invalid consumer-progress replication policy"));
+        }
+        let members: BTreeSet<u64> = self.replicas.iter().copied().collect();
+        if members.len() != self.replicas.len() {
+            return Err(invalid("duplicate consumer-progress replica member"));
+        }
+        Ok(())
+    }
+
+    fn validate_quorum(&self, acknowledge: &[u64]) -> io::Result<()> {
+        self.validate()?;
+        let votes: BTreeSet<u64> = acknowledge.iter().copied().collect();
+        if votes.len() != acknowledge.len()
+            || votes.len() <= self.replicas.len() / 2
+            || !votes.contains(&self.leader)
+            || !votes.iter().all(|v| self.replicas.contains(v))
+        {
+            return Err(invalid("consumer-progress quorum certificate is not valid"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FabricConsumerProgressChange {
+    pub stream: String,
+    pub partition: u16,
+    pub consumer: String,
+    pub epoch: u64,
+    pub generation: u64,
+    pub metadata_sequence: u64,
+    pub previous_metadata_sequence: u64,
+    pub committed_cursor: u64,
+    pub acked_gaps: Vec<u64>,
+}
+
+impl FabricConsumerProgressChange {
+    fn validate(
+        &self,
+        policy: &FabricConsumerProgressPolicy,
+        stream_committed_through: u64,
+    ) -> io::Result<()> {
+        policy.validate()?;
+        if self.stream.is_empty() || self.stream.len() > 128
+            || !self.stream.bytes().all(valid_name_char)
+            || self.consumer.is_empty() || self.consumer.len() > 128
+            || !self.consumer.bytes().all(valid_name_char)
+            || self.epoch != policy.epoch || self.generation == 0
+            || self.metadata_sequence == 0
+            || self.committed_cursor > stream_committed_through
+            || self.acked_gaps.len() > MAX_ACK_GAPS
+        {
+            return Err(invalid("invalid consumer-progress metadata or record boundary"));
+        }
+
+        let mut last = self.committed_cursor;
+        for gap in &self.acked_gaps {
+            if *gap <= last || *gap > stream_committed_through {
+                return Err(invalid("consumer-progress ACK gaps must be ordered and committed"));
+            }
+            last = *gap;
+        }
+        Ok(())
+    }
+
+    fn key(&self) -> (String, u16, String) {
+        (self.stream.clone(), self.partition, self.consumer.clone())
+    }
+}
+
+fn valid_name_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum FabricConsumerProgressEvent {
+    Prepare {
+        change: FabricConsumerProgressChange,
+        policy: FabricConsumerProgressPolicy,
+        stream_committed_through: u64,
+    },
+    Commit {
+        metadata_sequence: u64,
+        acknowledgers: Vec<u64>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FabricConsumerProgressFrame {
+    version: u16,
+    previous_hash: String,
+    integrity_hash: String,
+    event: FabricConsumerProgressEvent,
+}
+
+impl FabricConsumerProgressFrame {
+    fn hash(version: u16, previous_hash: &str, event: &FabricConsumerProgressEvent)
+        -> io::Result<String>
+    {
+        let message = serde_json::to_vec(&(version, previous_hash, event))
+            .map_err(|error| invalid(error.to_string()))?;
+        Ok(blake3::hash(&message).to_hex().to_string())
+    }
+
+    fn new(previous_hash: String, event: FabricConsumerProgressEvent) -> io::Result<Self> {
+        let integrity_hash = Self::hash(JOURNAL_FORMAT_VERSION, &previous_hash, &event)?;
+        Ok(Self {
+            version: JOURNAL_FORMAT_VERSION,
+            previous_hash,
+            integrity_hash,
+            event,
+        })
+    }
+
+    fn validate(&self, expected_previous_hash: &str) -> io::Result<()> {
+        if self.version != JOURNAL_FORMAT_VERSION
+            || self.previous_hash != expected_previous_hash
+            || self.integrity_hash != Self::hash(
+                self.version, &self.previous_hash, &self.event,
+            )?
+        {
+            return Err(invalid("Fabric consumer-progress journal integrity violation"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PendingConsumerProgress {
+    change: FabricConsumerProgressChange,
+    policy: FabricConsumerProgressPolicy,
+}
+
+/// Local append-only journal, ready for later authenticated replica transport.
+///
+/// Only committed frames affect observable state. A pending prepare survives
+/// restart, but does not advance the consumer cursor. Hash-chain tampering or a
+/// partial final frame **fails closed**, pending an explicit repair protocol.
+#[derive(Debug)]
+pub(crate) struct FileFabricConsumerProgressJournal {
+    root: PathBuf,
+    last_hash: String,
+    latest_sequence: u64,
+    pending: Option<PendingConsumerProgress>,
+    committed: BTreeMap<(String, u16, String), FabricConsumerProgressChange>,
+    committed_policy: Option<FabricConsumerProgressPolicy>,
+}
+
+impl FileFabricConsumerProgressJournal {
+    pub(crate) fn open(root: impl AsRef<Path>) -> io::Result<Self> {
+        let root = root.as_ref().to_path_buf();
+        fs::create_dir_all(&root)?;
+        let mut journal = Self {
+            root,
+            last_hash: String::new(),
+            latest_sequence: 0,
+            pending: None,
+            committed: BTreeMap::new(),
+            committed_policy: None,
+        };
+        let path = journal.root.join("consumer_progress.log");
+        if path.exists() {
+            let bytes = fs::read(&path)?;
+            // A final partial write is not silently accepted. Quorum repair
+            // must recover the correct predecessor before writing again.
+            if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+                return Err(invalid("truncated consumer-progress journal tail"));
+            }
+            for line in bytes.split(|byte| *byte == b'\n') {
+                if line.is_empty() {
+                    continue;
+                }
+                if line.len() > MAX_FRAME_BYTES {
+                    return Err(invalid("consumer-progress journal frame exceeds limit"));
+                }
+                let frame: FabricConsumerProgressFrame = serde_json::from_slice(line)
+                    .map_err(|error| invalid(error.to_string()))?;
+                frame.validate(&journal.last_hash)?;
+                journal.apply_event(&frame.event)?;
+                journal.last_hash = frame.integrity_hash;
+            }
+        }
+        Ok(journal)
+    }
+
+    pub(crate) fn pending_sequence(&self) -> Option<u64> {
+        self.pending.as_ref().map(|pending| pending.change.metadata_sequence)
+    }
+
+    pub(crate) fn last_committed_metadata_sequence(&self) -> u64 {
+        self.latest_sequence
+    }
+
+    /// Committed *local* progress only. Never treat an absent consumer as a
+    /// cluster-proven cursor of zero following leader promotion.
+    pub(crate) fn committed_cursor(&self, stream: &str, partition: u16, consumer: &str) -> u64 {
+        self.committed
+            .get(&(stream.to_string(), partition, consumer.to_string()))
+            .map(|entry| entry.committed_cursor)
+            .unwrap_or(0)
+    }
+
+    fn check_prepare(
+        &self,
+        change: &FabricConsumerProgressChange,
+        policy: &FabricConsumerProgressPolicy,
+        stream_committed_through: u64,
+    ) -> io::Result<()> {
+        change.validate(policy, stream_committed_through)?;
+        if change.metadata_sequence != self.latest_sequence.checked_add(1)
+            .ok_or_else(|| invalid("consumer-progress metadata index overflow"))?
+            || change.previous_metadata_sequence != self.latest_sequence
+        {
+            return Err(invalid("consumer-progress metadata predecessor does not match"));
+        }
+
+        // Epoch changes require a separate old-quorum recovery/transition
+        // protocol, which is not implemented in this storage slice.
+        if self.committed_policy.as_ref().is_some_and(|old| old != policy) {
+            return Err(invalid("consumer-progress epoch/policy transition requires quorum recovery"));
+        }
+
+        if let Some(old) = self.committed.get(&change.key()) {
+            if change.generation != old.generation
+                || change.committed_cursor < old.committed_cursor
+                || old.acked_gaps.iter().any(|gap| {
+                    *gap > change.committed_cursor && !change.acked_gaps.contains(gap)
+                })
+            {
+                return Err(invalid("consumer progress would regress or discard ACK gaps"));
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_event(&mut self, event: &FabricConsumerProgressEvent) -> io::Result<()> {
+        match event {
+            FabricConsumerProgressEvent::Prepare {
+                change, policy, stream_committed_through,
+            } => {
+                if self.pending.is_some() {
+                    return Err(invalid("consumer-progress journal has unresolved prepare"));
+                }
+                self.check_prepare(change, policy, *stream_committed_through)?;
+                self.pending = Some(PendingConsumerProgress {
+                    change: change.clone(),
+                    policy: policy.clone(),
+                });
+            }
+            FabricConsumerProgressEvent::Commit {
+                metadata_sequence, acknowledgers,
+            } => {
+                let pending = self.pending.as_ref().ok_or_else(|| {
+                    invalid("consumer-progress commit has no durable predecessor")
+                })?;
+                if *metadata_sequence != pending.change.metadata_sequence {
+                    return Err(invalid("consumer-progress commit index mismatch"));
+                }
+                pending.policy.validate_quorum(acknowledgers)?;
+                let pending = self.pending.take().expect("validated pending metadata");
+                self.latest_sequence = *metadata_sequence;
+                self.committed_policy = Some(pending.policy);
+                self.committed.insert(pending.change.key(), pending.change);
+            }
+        }
+        Ok(())
+    }
+
+    fn append_event(&mut self, event: FabricConsumerProgressEvent) -> io::Result<()> {
+        let frame = FabricConsumerProgressFrame::new(self.last_hash.clone(), event)?;
+        let mut bytes = serde_json::to_vec(&frame)
+            .map_err(|error| invalid(error.to_string()))?;
+        bytes.push(b'\n');
+        if bytes.len() > MAX_FRAME_BYTES {
+            return Err(invalid("consumer-progress journal frame exceeds limit"));
+        }
+        let path = self.root.join("consumer_progress.log");
+        let created = !path.exists();
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_data()) {
+            // An uncertain local fsync result requires reopening before any
+            // further operation; do not act on cached state.
+            return Err(error);
+        }
+        if created {
+            File::open(&self.root)?.sync_all()?;
+        }
+        self.apply_event(&frame.event)?;
+        self.last_hash = frame.integrity_hash;
+        Ok(())
+    }
+
+    /// Durably stage a record but do not publish its cursor as committed.
+    pub(crate) fn prepare(
+        &mut self,
+        change: FabricConsumerProgressChange,
+        policy: FabricConsumerProgressPolicy,
+        stream_committed_through: u64,
+    ) -> io::Result<()> {
+        if let Some(pending) = &self.pending {
+            // Same exact prepare is idempotent and must not add another frame.
+            if pending.change == change && pending.policy == policy {
+                return Ok(());
+            }
+            return Err(invalid("different consumer-progress record already pending"));
+        }
+        self.check_prepare(&change, &policy, stream_committed_through)?;
+        self.append_event(FabricConsumerProgressEvent::Prepare {
+            change, policy, stream_committed_through,
+        })
+    }
+
+    /// Storage-only quorum-certificate validation and durable commit.
+    ///
+    /// Calling code MUST authenticate member IDs and verify that each vote
+    /// represents a replica fsync of this exact record. This function does
+    /// not do network IO, authenticate peers, or prove a live quorum itself.
+    pub(crate) fn commit_with_acknowledgers(
+        &mut self,
+        metadata_sequence: u64,
+        acknowledgers: &[u64],
+    ) -> io::Result<()> {
+        let pending = self.pending.as_ref().ok_or_else(|| {
+            invalid("consumer-progress commit has no pending durable record")
+        })?;
+        if pending.change.metadata_sequence != metadata_sequence {
+            return Err(invalid("consumer-progress commit index mismatch"));
+        }
+        pending.policy.validate_quorum(acknowledgers)?;
+        self.append_event(FabricConsumerProgressEvent::Commit {
+            metadata_sequence,
+            acknowledgers: acknowledgers.to_vec(),
+        })
+    }
+}
 
 #[cfg(test)]
 mod tests {
