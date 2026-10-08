@@ -105,13 +105,20 @@ are still required for failover safety. The token also does not identify a
 particular delivery attempt: a worker can ACK after its lease expires and
 the same epoch redelivers the record to another worker.
 
-A three-replica deterministic test demonstrates confirmed old-leader removal,
-successor epoch promotion, committed-record continuity, and replay of an
-ACKed record whose consumer state was not replicated. Abrupt crash and
-stale-leader/partition scenarios still need dedicated coverage. Before
-advertising durable consumer failover, replicate or quorum-checkpoint consumer
-progress and lease ownership, fence old epochs/attempts, and test a stopped
-leader plus restart and network partitions.
+After a leader-epoch transition, replicated application consumer reads,
+delivery, ACK/NACK, and cursor mutations **fail closed**. The successor
+may have a quorum-committed stream log, but it cannot reconstruct ACK gaps,
+consumer cursors or outstanding leases from the predecessor's node-local
+files. A correct epoch token is not a recovery proof, so epoch-2 operations
+remain blocked without an override in this slice. Standalone streams and
+raw stream diagnostics are unaffected.
+
+Deterministic three-replica tests cover leader removal, successor epoch
+promotion, committed-stream continuity, and rejection of unsafe consumer
+replay and ACK mutation. Automatic unannounced failure detection, live old
+leader fencing, metadata catch-up and actual failover admission remain
+unimplemented. Never claim cluster-durable consumer continuity or
+exactly-once delivery until those protocols pass crash and partition tests.
 
 ## Runtime APIs
 

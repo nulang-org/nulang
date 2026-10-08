@@ -1107,11 +1107,7 @@ impl FileFabricStreamStore {
     /// Returns the durable consumer bound for replicated streams, or None for
     /// standalone streams. A legacy cursor past the committed index must fail
     /// closed until the operator resolves the inconsistent persisted state.
-    fn consumer_committed_boundary(
-        &mut self,
-        name: &str,
-        cursor: u64,
-    ) -> io::Result<Option<u64>> {
+    fn consumer_committed_boundary(&mut self, name: &str, cursor: u64) -> io::Result<Option<u64>> {
         if self.replication_policy(name)?.is_none() {
             return Ok(None);
         }
@@ -1465,6 +1461,17 @@ impl Runtime {
                 "only the installed Fabric stream leader may operate replicated consumers",
             ));
         }
+        // The stream-data epoch transition does NOT currently recover
+        // consumer cursors, ACK gaps, or outstanding leases from the old
+        // replication quorum. A successor must not silently re-serve work
+        // from its empty node-local consumer files. There is deliberately
+        // no override until a separately verified recovery protocol exists.
+        if policy.epoch > FABRIC_STREAM_INITIAL_EPOCH {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "consumer progress is unverified after leader replacement; quorum metadata recovery required",
+            ));
+        }
         if let Some(promise) = self.fabric_stream_store_mut()?.epoch_promise(name)? {
             if promise.epoch > policy.epoch {
                 return Err(io::Error::new(
@@ -1564,7 +1571,8 @@ impl Runtime {
         ack_wait: Duration,
     ) -> io::Result<Vec<FabricConsumerDelivery>> {
         let epoch = self.fabric_stream_consumer_leader_epoch(name)?;
-        let mut deliveries = self.fabric_stream_store_mut()?
+        let mut deliveries = self
+            .fabric_stream_store_mut()?
             .deliver_consumer(name, consumer, limit, ack_wait)?;
         for delivery in &mut deliveries {
             delivery.leader_epoch = epoch;
@@ -2777,9 +2785,9 @@ mod tests {
 
         let instant = std::time::UNIX_EPOCH + Duration::from_secs(100);
         assert!(store.read_consumer("events", "worker", 10).is_err());
-        assert!(store.deliver_consumer_at(
-            "events", "worker", 10, Duration::from_secs(30), instant
-        ).is_err());
+        assert!(store
+            .deliver_consumer_at("events", "worker", 10, Duration::from_secs(30), instant)
+            .is_err());
         assert!(store.ack_consumer("events", "worker", 1).is_err());
         assert_eq!(store.cursor("events", "worker").unwrap(), 1);
         let _ = fs::remove_dir_all(root);
