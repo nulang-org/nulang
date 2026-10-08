@@ -16,6 +16,7 @@ use nulang::vm::{ActorVmCallbacks, Value, VM};
 const ALLOCATIONS: usize = 256;
 const ARRAY_ELEMENTS: usize = 8;
 
+#[derive(Debug)]
 struct BenchCallbacks {
     heap: ActorHeap,
     arena: IsoArena,
