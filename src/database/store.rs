@@ -15,7 +15,8 @@ use std::path::{Path, PathBuf};
 
 use super::checkpoint::{self, CheckpointError};
 use super::tablet::{
-    MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletScanRow, TabletSplitPlan, TabletWrite,
+    MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletScanRow, TabletSplitPlan,
+    TabletWrite,
 };
 use super::wal::{FileWal, WalError};
 
