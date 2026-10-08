@@ -268,7 +268,15 @@ impl FileWal {
         if !managed && is_managed_directory(path)? {
             return Err(WalError::ManagedDirectory);
         }
-        let path = path.to_path_buf();
+        // Reclaim replaces the WAL by rename. For a symlink alias, retain
+        // the real target path rather than replacing the alias itself with
+        // a new file (which would strand the original committed WAL).
+        let path = match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(path)?,
+            Ok(_) => path.to_path_buf(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => path.to_path_buf(),
+            Err(error) => return Err(error.into()),
+        };
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
