@@ -1883,6 +1883,17 @@ mod tests {
             1
         );
         follower.process_network();
+        // If this fails, the follower rejected/dropped the metadata prepare;
+        // if only the subsequent vote assertion fails, investigate return
+        // transport, identity binding, or leader receipt fsync instead.
+        let follower_prepared = FileFabricConsumerProgressJournal::open(
+            follower_root.join("orders").join("consumer_progress")
+        ).unwrap();
+        assert_eq!(
+            follower_prepared.pending_sequence(),
+            Some(1),
+            "follower did not durably accept retransmitted consumer metadata prepare",
+        );
         leader.process_network();
         let observed = leader.fabric_consumer_progress_observed_votes("orders", 0, 1).unwrap();
         assert_eq!(observed.len(), 2);
