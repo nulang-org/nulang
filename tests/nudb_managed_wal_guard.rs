@@ -130,6 +130,36 @@ fn preexisting_public_wal_handle_cannot_append_or_reclaim_after_directory_is_man
 }
 
 #[test]
+fn preexisting_public_tablet_handle_cannot_publish_checkpoint_after_management() {
+    let root = root("old_tablet");
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("ordinary.wal");
+    let mut legacy = WalBackedTablet::open(descriptor(), &path).unwrap();
+    let committed = legacy.prepare_write(
+        3,
+        0,
+        vec![TabletMutation::Put {
+            key: b"b".to_vec(),
+            value: b"initial".to_vec(),
+        }],
+    ).unwrap();
+    legacy.commit(committed).unwrap();
+
+    fs::write(root.join(".nudb-owner.lock"), b"").unwrap();
+    assert!(matches!(
+        legacy.publish_checkpoint(),
+        Err(WalBackedError::Wal(WalError::ManagedDirectory))
+    ));
+    assert!(matches!(
+        legacy.checkpoint(),
+        Err(WalBackedError::Wal(WalError::ManagedDirectory))
+    ));
+    assert!(!path.with_extension("checkpoint").exists());
+    drop(legacy);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn public_wal_api_retains_unmanaged_directory_compatibility() {
     let root = root("legacy");
     fs::create_dir_all(&root).unwrap();
