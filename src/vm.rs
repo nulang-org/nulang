@@ -2756,7 +2756,7 @@ impl VM {
             jit_candidate_pcs: Vec::new(),
             iso_arena_sites: Vec::new(),
             iso_arena_enabled: std::env::var("NULANG_ISO_ARENA")
-                .map(|value| !value.is_empty() && value != "0")
+                .map(|value| Self::iso_arena_env_opt_in(&value))
                 .unwrap_or(false),
             jit_pending_error: None,
             node_id: 0,
@@ -3058,6 +3058,16 @@ impl VM {
         self.iso_arena_sites.push(iso_arena_sites);
         #[cfg(feature = "native-codegen")]
         self.jit_candidate_pcs.push(jit_candidates);
+    }
+
+    /// Opt-in must never turn on merely because a false-like env value was set.
+    /// Keep parsing allocation-free during VM initialization.
+    fn iso_arena_env_opt_in(value: &str) -> bool {
+        let value = value.trim();
+        value == "1"
+            || value.eq_ignore_ascii_case("true")
+            || value.eq_ignore_ascii_case("yes")
+            || value.eq_ignore_ascii_case("on")
     }
 
     /// Enable or disable activation-local arena allocation.
