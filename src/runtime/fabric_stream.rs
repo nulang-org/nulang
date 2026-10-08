@@ -1273,7 +1273,11 @@ impl FileFabricStreamStore {
                 .unwrap_or(0)
         });
         if sequence > tail {
-            let bound = if committed.is_some() { "quorum-committed sequence" } else { "stream tail" };
+            let bound = if committed.is_some() {
+                "quorum-committed sequence"
+            } else {
+                "stream tail"
+            };
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("Fabric ACK {sequence} is beyond {bound} {tail}"),
@@ -1367,7 +1371,11 @@ impl FileFabricStreamStore {
                 .unwrap_or(0)
         };
         if sequence > last_sequence {
-            let bound = if replicated { "quorum-committed sequence" } else { "stream tail" };
+            let bound = if replicated {
+                "quorum-committed sequence"
+            } else {
+                "stream tail"
+            };
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("Fabric cursor {sequence} is beyond {bound} {last_sequence}"),
@@ -2568,7 +2576,9 @@ mod tests {
     fn leased_record_from_before_replication_policy_cannot_be_acked_early() {
         let root = test_dir("lease-before-replication");
         let mut store = FileFabricStreamStore::open(&root).unwrap();
-        store.create_stream("events", FabricStreamConfig::default()).unwrap();
+        store
+            .create_stream("events", FabricStreamConfig::default())
+            .unwrap();
         store.append("events", b"pending").unwrap();
         let instant = std::time::UNIX_EPOCH + Duration::from_secs(100);
         let leased = store
@@ -2577,17 +2587,19 @@ mod tests {
         assert_eq!(leased.len(), 1);
 
         // Upgrade to a replicated policy while an old local lease is persisted.
-        store.establish_replication_policy(
-            "events",
-            FabricStreamReplicationPolicy {
-                partition: 0,
-                epoch: FABRIC_STREAM_INITIAL_EPOCH,
-                leader: 10,
-                membership_fingerprint: 44,
-                replication_factor: 2,
-                replicas: vec![10, 11],
-            },
-        ).unwrap();
+        store
+            .establish_replication_policy(
+                "events",
+                FabricStreamReplicationPolicy {
+                    partition: 0,
+                    epoch: FABRIC_STREAM_INITIAL_EPOCH,
+                    leader: 10,
+                    membership_fingerprint: 44,
+                    replication_factor: 2,
+                    replicas: vec![10, 11],
+                },
+            )
+            .unwrap();
         assert!(store.ack_consumer("events", "worker", 1).is_err());
         assert_eq!(store.cursor("events", "worker").unwrap(), 0);
 
@@ -2601,20 +2613,24 @@ mod tests {
     fn leased_consumer_rejects_legacy_cursor_above_quorum_index() {
         let root = test_dir("legacy-cursor-above-quorum");
         let mut store = FileFabricStreamStore::open(&root).unwrap();
-        store.create_stream("events", FabricStreamConfig::default()).unwrap();
+        store
+            .create_stream("events", FabricStreamConfig::default())
+            .unwrap();
         store.append("events", b"pending").unwrap();
         store.commit_cursor("events", "worker", 1).unwrap();
-        store.establish_replication_policy(
-            "events",
-            FabricStreamReplicationPolicy {
-                partition: 0,
-                epoch: FABRIC_STREAM_INITIAL_EPOCH,
-                leader: 10,
-                membership_fingerprint: 44,
-                replication_factor: 2,
-                replicas: vec![10, 11],
-            },
-        ).unwrap();
+        store
+            .establish_replication_policy(
+                "events",
+                FabricStreamReplicationPolicy {
+                    partition: 0,
+                    epoch: FABRIC_STREAM_INITIAL_EPOCH,
+                    leader: 10,
+                    membership_fingerprint: 44,
+                    replication_factor: 2,
+                    replicas: vec![10, 11],
+                },
+            )
+            .unwrap();
 
         let instant = std::time::UNIX_EPOCH + Duration::from_secs(100);
         assert!(store.read_consumer("events", "worker", 10).is_err());
