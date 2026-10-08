@@ -153,6 +153,28 @@ fn invalid_typed_query_is_problem_json_over_real_http() {
 }
 
 #[test]
+fn duplicate_canonical_action_form_fields_fail_over_real_http() {
+    let mut route = legacy_route();
+    route.method = HttpMethod::Post;
+    let server = WebDevServer::bind(0, None, None, vec![route])
+        .expect("bind WebDevServer");
+
+    let form = "title=admin&title=user&__nulang_ui_message=invalid";
+    let request = format!(
+        "POST /legacy HTTP/1.1\\r\\nHost: localhost\\r\\nContent-Type: application/x-www-form-urlencoded\\r\\nContent-Length: {}\\r\\nConnection: close\\r\\n\\r\\n{}",
+        form.len(),
+        form
+    );
+    let response = send_raw_request(server.port, &request);
+
+    assert!(
+        response.starts_with("HTTP/1.1 400 Bad Request\\r\\n"),
+        "{response}"
+    );
+    assert!(response_body(&response).contains("duplicate field 'title'"));
+}
+
+#[test]
 fn legacy_route_still_falls_back_over_real_http() {
     let server =
         WebDevServer::bind(0, None, None, vec![legacy_route()]).expect("bind legacy WebDevServer");
