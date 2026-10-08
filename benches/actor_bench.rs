@@ -146,6 +146,36 @@ fn bench_message_enqueue(c: &mut Criterion) {
     group.finish();
 }
 
+/// This isolates the outgoing traceparent-serialization cost inside the
+/// normal message-enqueue path, separately for a first send and fan-out.
+fn bench_traced_message_enqueue(c: &mut Criterion) {
+    let mut group = c.benchmark_group("actor/traced_message_enqueue");
+    for send_count in [1usize, 100usize] {
+        group.throughput(Throughput::Elements(send_count as u64));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(send_count),
+            &send_count,
+            |b, &send_count| {
+                b.iter_batched_ref(
+                    || {
+                        let (mut rt, actor_id) = runtime_with_consumer();
+                        rt.current_trace = Some(TraceContext::root());
+                        (rt, actor_id)
+                    },
+                    |(rt, actor_id)| {
+                        for _ in 0..send_count {
+                            rt.send_message_by_id(*actor_id, 0, black_box(&[]));
+                        }
+                        black_box(rt);
+                    },
+                    BatchSize::SmallInput,
+                )
+            },
+        );
+    }
+    group.finish();
+}
+
 /// Scheduler + native-handler execution cost for an already-enqueued batch.
 ///
 /// Enqueueing is performed in setup, outside the timed section. Primitive
@@ -298,6 +328,19 @@ fn bench_actor_state_overwrite(c: &mut Criterion) {
     });
 }
 
+/// Quantify the unconditional per-dispatch context creation separately from
+/// span formatting. This is diagnostic only: root creation still happens on
+/// every dispatched message to preserve Runtime.current_trace semantics.
+fn bench_trace_context_creation(c: &mut Criterion) {
+    c.bench_function("actor/trace_context_root", |b| {
+        b.iter(|| black_box(TraceContext::root()));
+    });
+    let parent = TraceContext::root();
+    c.bench_function("actor/trace_context_child", |b| {
+        b.iter(|| black_box(parent.child()));
+    });
+}
+
 /// Compare tracing-disabled dispatch to TRACE-enabled formatting separately.
 /// Do not interpret the latter as normal production message throughput.
 fn bench_trace_dispatch_span(c: &mut Criterion) {
@@ -322,9 +365,11 @@ criterion_group!(
     bench_spawn_idle_batch,
     bench_spawn_send_receive,
     bench_message_enqueue,
+    bench_traced_message_enqueue,
     bench_message_drain,
     bench_selective_receive,
     bench_selective_receive_reset,
     bench_actor_state_overwrite,
+    bench_trace_context_creation,
     bench_trace_dispatch_span
 );

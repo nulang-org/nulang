@@ -291,6 +291,40 @@ fn test_send_carries_current_trace_span() {
 }
 
 #[test]
+fn test_outgoing_traceparent_cache_tracks_explicit_context_replacements() {
+    let mut rt = Runtime::new();
+    let receiver = rt.spawn_actor(Box::new(|| vec![]));
+    let first = TraceContext::root();
+    rt.current_trace = Some(first);
+
+    for _ in 0..4 {
+        rt.send_message_by_id(receiver, 0, &[]);
+    }
+    let cache = rt.traceparent_cache.as_ref().expect("cache after first send");
+    assert_eq!(cache.0, first);
+    assert_eq!(cache.1, first.to_traceparent());
+
+    // The public trace field can be replaced externally, or temporarily
+    // overridden by nested synchronous asks. Never stamp stale parentage.
+    let child = first.child();
+    rt.current_trace = Some(child);
+    rt.send_message_by_id(receiver, 0, &[]);
+    assert_eq!(rt.traceparent_cache.as_ref().unwrap().0, child);
+
+    rt.current_trace = None;
+    rt.send_message_by_id(receiver, 0, &[]);
+
+    let actor = rt.actors.get_mut(&receiver).unwrap();
+    for _ in 0..4 {
+        let message = actor.receive().unwrap();
+        assert_eq!(message.trace_id.as_deref(), Some(first.to_traceparent().as_str()));
+    }
+    let changed = actor.receive().unwrap();
+    assert_eq!(changed.trace_id.as_deref(), Some(child.to_traceparent().as_str()));
+    assert_eq!(actor.receive().unwrap().trace_id, None);
+}
+
+#[test]
 fn test_delivery_establishes_child_context_and_inherits() {
     let mut rt = Runtime::new();
     let a = rt.spawn_actor(Box::new(|| vec![]));

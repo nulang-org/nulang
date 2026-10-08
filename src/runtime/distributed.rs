@@ -869,7 +869,7 @@ pub fn send_distributed(
             // remote side continues the same causal chain. The current span
             // (not a synthetic child) crosses because `traceparent` has no
             // parent field — the receiver creates its own child span.
-            let trace_id = runtime.current_trace.as_ref().map(|t| t.to_traceparent());
+            let trace_id = runtime.outgoing_traceparent();
             let packet = resolver.build_packet(
                 actor_id,
                 behavior,
