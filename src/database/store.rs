@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use super::checkpoint::{self, CheckpointError};
 use super::tablet::{
-    MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletScanRow, TabletWrite,
+    MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletScanRow, TabletSplitPlan, TabletWrite,
 };
 use super::wal::{FileWal, WalError};
 
@@ -90,6 +90,18 @@ impl WalBackedTablet {
         limit: usize,
     ) -> Result<Vec<TabletScanRow>, TabletError> {
         self.tablet.scan_at(start, end, snapshot, limit)
+    }
+
+    /// Derive detached child MVCC tablets from the recovered durable state.
+    ///
+    /// No WAL, routing table or ownership fence is written here. A future
+    /// split coordinator must durably publish the cutover before child writes
+    /// are admitted or the parent is retired.
+    pub fn materialize_split(
+        &self,
+        plan: &TabletSplitPlan,
+    ) -> Result<(MemoryTablet, MemoryTablet), TabletError> {
+        self.tablet.materialize_split(plan)
     }
 
     /// Atomically publish a checkpoint without reclaiming the WAL.
