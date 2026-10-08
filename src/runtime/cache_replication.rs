@@ -358,11 +358,7 @@ impl CacheReplicaAckTracker {
     /// A requirement of zero means local acknowledgement only, so the local
     /// WAL tail is the commit index. Otherwise this returns the Nth-highest
     /// replica acknowledgement, capped by the local sequence.
-    pub fn committed_sequence(
-        &self,
-        local_sequence: u64,
-        required_replicas: usize,
-    ) -> Option<u64> {
+    pub fn committed_sequence(&self, local_sequence: u64, required_replicas: usize) -> Option<u64> {
         if required_replicas == 0 {
             return Some(local_sequence);
         }
@@ -1111,8 +1107,7 @@ mod tests {
     fn bootstrap_rejects_corrupted_snapshot_at_final_checksum() {
         let mut source = CacheStore::new();
         source.set_integer(b"k", 1, None, 0);
-        let (manifest, snapshot) =
-            capture_replica_bootstrap(9, &source, 4, 0, 1_000).unwrap();
+        let (manifest, snapshot) = capture_replica_bootstrap(9, &source, 4, 0, 1_000).unwrap();
         let mut chunks = replica_bootstrap_chunks(&manifest, &snapshot, snapshot.len()).unwrap();
         chunks[0].data[0] ^= 0x01;
 
