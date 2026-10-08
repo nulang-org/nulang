@@ -130,6 +130,7 @@ impl WalBackedTablet {
     /// This is a valid crash state and is intentionally public so operators can
     /// separate checkpoint publication from later space reclamation.
     pub fn publish_checkpoint(&self) -> Result<(), WalBackedError> {
+        self.wal.check_public_write_authority()?;
         checkpoint::write_checkpoint(&self.checkpoint_path, &self.tablet)?;
         Ok(())
     }
