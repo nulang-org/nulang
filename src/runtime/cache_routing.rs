@@ -45,10 +45,18 @@ pub enum CachePlacementError {
         proposed: u64,
     },
     InvalidMigrationSlot(u16),
-    MigrationAlreadyInProgress { slot: u16 },
-    MigrationInProgress { slot: u16 },
-    NoMigration { slot: u16 },
-    MigrationTargetMatchesSource { slot: u16 },
+    MigrationAlreadyInProgress {
+        slot: u16,
+    },
+    MigrationInProgress {
+        slot: u16,
+    },
+    NoMigration {
+        slot: u16,
+    },
+    MigrationTargetMatchesSource {
+        slot: u16,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
