@@ -45,7 +45,10 @@ fn row(key: &[u8], value: &[u8]) -> TabletScanRow {
 #[test]
 fn scan_at_preserves_historical_values_tombstones_order_and_limit() {
     let mut tablet = MemoryTablet::new(descriptor());
-    commit(&mut tablet, vec![put(b"b", b"old"), put(b"m", b"one"), put(b"t", b"t1")]);
+    commit(
+        &mut tablet,
+        vec![put(b"b", b"old"), put(b"m", b"one"), put(b"t", b"t1")],
+    );
     commit(
         &mut tablet,
         vec![
@@ -87,7 +90,10 @@ fn scan_at_rejects_invalid_snapshots_and_cross_tablet_ranges() {
     let tablet = MemoryTablet::new(descriptor());
     assert_eq!(
         tablet.scan_at(b"a", Some(b"z"), 1, 10).unwrap_err(),
-        TabletError::SnapshotAhead { committed: 0, requested: 1 }
+        TabletError::SnapshotAhead {
+            committed: 0,
+            requested: 1
+        }
     );
     assert_eq!(
         tablet.scan_at(b"m", Some(b"m"), 0, 10).unwrap_err(),
@@ -113,14 +119,25 @@ fn scan_at_rejects_invalid_snapshots_and_cross_tablet_ranges() {
 #[test]
 fn split_materialization_preserves_mvcc_history_and_rejects_stale_child_epochs() {
     let mut source = MemoryTablet::new(descriptor());
-    commit(&mut source, vec![put(b"a", b"a1"), put(b"m", b"m1"), put(b"y", b"y1")]);
     commit(
         &mut source,
-        vec![TabletMutation::Delete { key: b"a".to_vec() }, put(b"m", b"m2")],
+        vec![put(b"a", b"a1"), put(b"m", b"m1"), put(b"y", b"y1")],
+    );
+    commit(
+        &mut source,
+        vec![
+            TabletMutation::Delete { key: b"a".to_vec() },
+            put(b"m", b"m2"),
+        ],
     );
 
     let plan = descriptor()
-        .plan_split(b"m", TabletId::new(52).unwrap(), TabletId::new(53).unwrap(), 5)
+        .plan_split(
+            b"m",
+            TabletId::new(52).unwrap(),
+            TabletId::new(53).unwrap(),
+            5,
+        )
         .unwrap();
     let (mut left, right) = source.materialize_split(&plan).unwrap();
 
@@ -131,17 +148,30 @@ fn split_materialization_preserves_mvcc_history_and_rejects_stale_child_epochs()
     assert_eq!(right.read_at(b"m", 1).unwrap(), Some(&b"m1"[..]));
     assert_eq!(right.read_at(b"m", 2).unwrap(), Some(&b"m2"[..]));
     assert_eq!(right.read_at(b"y", 2).unwrap(), Some(&b"y1"[..]));
-    assert_eq!(left.read_at(b"m", 2).unwrap_err(), TabletError::KeyOutsideTabletRange);
-    assert_eq!(right.read_at(b"a", 2).unwrap_err(), TabletError::KeyOutsideTabletRange);
-    assert_eq!(left.scan_at(b"a", Some(b"m"), 1, 10).unwrap(), vec![row(b"a", b"a1")]);
+    assert_eq!(
+        left.read_at(b"m", 2).unwrap_err(),
+        TabletError::KeyOutsideTabletRange
+    );
+    assert_eq!(
+        right.read_at(b"a", 2).unwrap_err(),
+        TabletError::KeyOutsideTabletRange
+    );
+    assert_eq!(
+        left.scan_at(b"a", Some(b"m"), 1, 10).unwrap(),
+        vec![row(b"a", b"a1")]
+    );
     assert_eq!(
         right.scan_at(b"m", Some(b"z"), 1, 10).unwrap(),
         vec![row(b"m", b"m1"), row(b"y", b"y1")]
     );
 
     assert_eq!(
-        left.prepare_write(4, 2, vec![put(b"b", b"stale")]).unwrap_err(),
-        TabletError::StaleEpoch { current: 5, presented: 4 }
+        left.prepare_write(4, 2, vec![put(b"b", b"stale")])
+            .unwrap_err(),
+        TabletError::StaleEpoch {
+            current: 5,
+            presented: 4
+        }
     );
     let write = left.prepare_write(5, 2, vec![put(b"b", b"new")]).unwrap();
     left.commit(write).unwrap();
@@ -206,7 +236,12 @@ fn wal_recovery_and_checkpoint_keep_historical_scans_stable() {
     // Splitting an already recovered WAL-backed source must preserve
     // historical values, tombstones and the committed predecessor sequence.
     let plan = descriptor()
-        .plan_split(b"m", TabletId::new(52).unwrap(), TabletId::new(53).unwrap(), 5)
+        .plan_split(
+            b"m",
+            TabletId::new(52).unwrap(),
+            TabletId::new(53).unwrap(),
+            5,
+        )
         .unwrap();
     let (left, right) = reopened.materialize_split(&plan).unwrap();
     assert_eq!(left.current_sequence(), 3);
@@ -241,7 +276,9 @@ fn repeated_mutations_to_one_key_restore_as_one_committed_mvcc_version() {
 
     {
         let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
-        let initial = tablet.prepare_write(4, 0, vec![put(b"b", b"first")]).unwrap();
+        let initial = tablet
+            .prepare_write(4, 0, vec![put(b"b", b"first")])
+            .unwrap();
         tablet.commit(initial).unwrap();
         let repeated = tablet
             .prepare_write(
