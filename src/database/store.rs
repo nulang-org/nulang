@@ -200,8 +200,8 @@ impl std::error::Error for WalBackedError {}
 
 #[cfg(test)]
 mod ownership_tests {
-    use super::*;
     use super::super::tablet::{KeyRange, TabletId};
+    use super::*;
     use std::fs::{self, OpenOptions};
     use std::io;
     use std::sync::atomic::{AtomicU64, Ordering};
