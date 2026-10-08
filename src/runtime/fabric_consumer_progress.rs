@@ -1861,6 +1861,56 @@ mod tests {
             follower_after.last_committed_metadata_sequence(),
             leader_after.last_committed_metadata_sequence()
         );
+
+        // A second metadata update exercises bounded chronological replay.
+        // Its follower PREPARE is fsynced but its COMMIT message gets lost.
+        leader.fabric_consumer_progress_stage(FabricConsumerProgressChange {
+            stream: "orders".into(),
+            partition: 0,
+            consumer: "billing".into(),
+            epoch: 1,
+            generation: 1,
+            metadata_sequence: 2,
+            previous_metadata_sequence: 1,
+            committed_cursor: 1,
+            acked_gaps: vec![],
+        }).unwrap();
+        assert_eq!(
+            leader.fabric_consumer_progress_dispatch_prepare("orders", 0, 2).unwrap(),
+            1
+        );
+        follower.process_network();
+        leader.process_network();
+        leader.distributed.transport.as_mut().unwrap()
+            .set_partition(HashSet::from([follower_id]));
+        assert_eq!(
+            leader.fabric_consumer_progress_commit_observed("orders", 0, 2).unwrap(),
+            1
+        );
+        follower.process_network();
+        assert_eq!(
+            leader.fabric_consumer_progress_confirmed_commit("orders").unwrap(),
+            1
+        );
+        leader.distributed.transport.as_mut().unwrap()
+            .set_partition(HashSet::new());
+        assert_eq!(
+            leader.fabric_consumer_progress_redrive_from(
+                "orders", follower_id, 2, 1
+            ).unwrap(),
+            1
+        );
+        follower.process_network();
+        leader.process_network();
+        assert_eq!(
+            leader.fabric_consumer_progress_confirmed_commit("orders").unwrap(),
+            2
+        );
+        let follower_caught_up = FileFabricConsumerProgressJournal::open(
+            follower_root.join("orders").join("consumer_progress")
+        ).unwrap();
+        assert_eq!(follower_caught_up.last_committed_metadata_sequence(), 2);
+        assert_eq!(follower_caught_up.committed_cursor("orders", 0, "billing"), 1);
         let _ = fs::remove_dir_all(a_root);
         let _ = fs::remove_dir_all(b_root);
     }
@@ -2073,6 +2123,32 @@ mod tests {
         assert_eq!(reopened.confirmed_commit_sequence(), 3);
         assert_eq!(reopened.committed_updates_from(1, 2).unwrap().len(), 2);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn commit_ack_wire_rejects_wrong_digest_epoch_and_origin() {
+        let ack = FabricConsumerProgressCommitAckWire {
+            version: JOURNAL_FORMAT_VERSION,
+            stream: "orders".to_string(),
+            partition: 0,
+            epoch: 1,
+            leader: 10,
+            metadata_sequence: 1,
+            digest: "c".repeat(64),
+            replica: 11,
+        };
+        assert!(FabricConsumerProgressCommitAckWire::from_wire_bytes(
+            &ack.to_wire_bytes().unwrap(),
+        ).is_ok());
+        let mut invalid = ack.clone();
+        invalid.leader = 11;
+        assert!(invalid.to_wire_bytes().is_err());
+        invalid = ack.clone();
+        invalid.epoch = 0;
+        assert!(invalid.to_wire_bytes().is_err());
+        invalid = ack;
+        invalid.digest = "not-a-digest".into();
+        assert!(invalid.to_wire_bytes().is_err());
     }
 
 }
