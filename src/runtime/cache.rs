@@ -2263,4 +2263,82 @@ mod tests {
             Err(CacheWriteError::ArenaLimitReached)
         );
     }
+
+    #[test]
+    fn repeated_ttl_overwrites_keep_one_live_expiration_record() {
+        let mut store = CacheStore::new();
+        for step in 0..1_000i64 {
+            store.set_integer(b"session", step, Some(10_000), step as u64);
+        }
+
+        let queued: usize = store
+            .expiry
+            .levels
+            .iter()
+            .flat_map(|level| level.iter())
+            .map(Vec::len)
+            .sum();
+        assert_eq!(queued, 1, "each overwrite must unlink the previous TTL record");
+        assert_eq!(
+            store.get(b"session", 1_000),
+            Some(CacheValueView::Integer(999))
+        );
+        assert_eq!(store.purge_expired(10_999, 10), 1);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn clearing_or_deleting_ttl_unlinks_record_without_harming_neighbor() {
+        let mut store = CacheStore::new();
+        store.set_integer(b"first", 1, Some(200), 0);
+        store.set_integer(b"second", 2, Some(200), 0);
+        store.set_integer(b"third", 3, Some(200), 0);
+
+        // Unlink from the middle of the same bucket (swap-remove bookkeeping).
+        assert!(store.delete_at(b"second", 0));
+        store.set_integer(b"third", 30, Some(500), 0);
+        store.set_integer(b"first", 10, None, 0);
+
+        let queued: usize = store
+            .expiry
+            .levels
+            .iter()
+            .flat_map(|level| level.iter())
+            .map(Vec::len)
+            .sum();
+        assert_eq!(queued, 1, "only the third key still has a TTL");
+        assert_eq!(store.purge_expired(200, 10), 0);
+        assert_eq!(store.get(b"first", 501), Some(CacheValueView::Integer(10)));
+        assert_eq!(store.get(b"third", 501), None);
+    }
+
+    #[test]
+    fn large_mset_preflight_counts_distinct_keys_and_last_duplicate_wins() {
+        let mut store = CacheStore::with_config(CacheConfig {
+            max_key_bytes: 64,
+            max_value_bytes: 64,
+            max_entries: 256,
+            max_arena_bytes: 4096,
+        });
+        let keys: Vec<Vec<u8>> = (0..255)
+            .map(|index| format!("key-{index}").into_bytes())
+            .collect();
+        let mut pairs: Vec<(&[u8], &[u8])> = keys
+            .iter()
+            .map(|key| (key.as_slice(), b"old".as_slice()))
+            .collect();
+        pairs.extend((0..256).map(|_| (b"repeat".as_slice(), b"new".as_slice())));
+
+        assert_eq!(store.try_set_many_bytes(&pairs, None, 0), Ok(()));
+        assert_eq!(store.len(), 256);
+        assert_eq!(store.get(b"repeat", 0), Some(CacheValueView::Bytes(b"new")));
+
+        let overflow = [(b"additional".as_slice(), b"value".as_slice())];
+        assert_eq!(
+            store.try_set_many_bytes(&overflow, None, 0),
+            Err(CacheWriteError::EntryLimitReached)
+        );
+        assert_eq!(store.get(b"additional", 0), None);
+        assert_eq!(store.len(), 256);
+    }
 }
