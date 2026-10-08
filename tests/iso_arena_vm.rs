@@ -225,7 +225,9 @@ fn yielding_activation_preserves_arena_until_resume_completes() {
     vm.set_actor_callbacks(Box::new(TrackingCallbacks::new(stats.clone())));
     let mut module = local_array_module(false);
     let last = module.instructions.len() - 1;
-    module.instructions.insert(last, Instruction::new0(OpCode::Yield));
+    module
+        .instructions
+        .insert(last, Instruction::new0(OpCode::Yield));
     vm.load_module(module);
 
     vm.run_from(0, 0).expect("first segment should yield");
@@ -233,7 +235,10 @@ fn yielding_activation_preserves_arena_until_resume_completes() {
     {
         let counts = stats.borrow();
         assert_eq!(counts.arena_allocs, 1);
-        assert_eq!(counts.arena_resets, 0, "yield must not reclaim activation arena");
+        assert_eq!(
+            counts.arena_resets, 0,
+            "yield must not reclaim activation arena"
+        );
     }
 
     vm.resume().expect("resumed segment should complete");
