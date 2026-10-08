@@ -1505,6 +1505,7 @@ mod tests {
             leader.fabric_consumer_progress_observed_votes("orders", 0, 1).unwrap().len(),
             1
         );
+        assert!(leader.fabric_consumer_progress_commit_observed("orders", 0, 1).is_err());
         leader.distributed.transport.as_mut().unwrap()
             .set_partition(HashSet::new());
         assert_eq!(
@@ -1563,11 +1564,23 @@ mod tests {
 
         leader.distributed.transport.as_mut().unwrap()
             .set_partition(HashSet::new());
+        let committed = FileFabricConsumerProgressJournal::open(
+            leader_root.join("orders").join("consumer_progress")
+        ).unwrap();
+        let exact_commit = FabricConsumerProgressCommitWire::from_committed(
+            committed.last_commit().unwrap()
+        );
+        assert!(follower.fabric_consumer_progress_apply_commit_from_peer(
+            &exact_commit, follower_id,
+        ).is_err());
         assert_eq!(
             leader.fabric_consumer_progress_redrive_last_commit("orders").unwrap(),
             1
         );
         follower.process_network();
+        assert!(follower.fabric_consumer_progress_apply_commit_from_peer(
+            &exact_commit, placement.leader,
+        ).is_ok());
         let follower_after = FileFabricConsumerProgressJournal::open(
             follower_root.join("orders").join("consumer_progress")
         ).unwrap();
