@@ -203,6 +203,27 @@ fn wal_recovery_and_checkpoint_keep_historical_scans_stable() {
         vec![row(b"b", b"second"), row(b"y", b"third")]
     );
 
+    // Splitting an already recovered WAL-backed source must preserve
+    // historical values, tombstones and the committed predecessor sequence.
+    let plan = descriptor()
+        .plan_split(b"m", TabletId::new(52).unwrap(), TabletId::new(53).unwrap(), 5)
+        .unwrap();
+    let (left, right) = reopened.materialize_split(&plan).unwrap();
+    assert_eq!(left.current_sequence(), 3);
+    assert_eq!(right.current_sequence(), 3);
+    assert_eq!(
+        left.scan_at(b"a", Some(b"m"), 1, 10).unwrap(),
+        vec![row(b"b", b"first")]
+    );
+    assert_eq!(
+        right.scan_at(b"m", Some(b"z"), 1, 10).unwrap(),
+        vec![row(b"m", b"first")]
+    );
+    assert_eq!(
+        right.scan_at(b"m", Some(b"z"), 3, 10).unwrap(),
+        vec![row(b"y", b"third")]
+    );
+
     let _ = fs::remove_file(&wal_path);
     let _ = fs::remove_file(&checkpoint);
 }
