@@ -328,6 +328,19 @@ fn bench_actor_state_overwrite(c: &mut Criterion) {
     });
 }
 
+/// Quantify the unconditional per-dispatch context creation separately from
+/// span formatting. This is diagnostic only: root creation still happens on
+/// every dispatched message to preserve Runtime.current_trace semantics.
+fn bench_trace_context_creation(c: &mut Criterion) {
+    c.bench_function("actor/trace_context_root", |b| {
+        b.iter(|| black_box(TraceContext::root()));
+    });
+    let parent = TraceContext::root();
+    c.bench_function("actor/trace_context_child", |b| {
+        b.iter(|| black_box(parent.child()));
+    });
+}
+
 /// Compare tracing-disabled dispatch to TRACE-enabled formatting separately.
 /// Do not interpret the latter as normal production message throughput.
 fn bench_trace_dispatch_span(c: &mut Criterion) {
@@ -357,5 +370,6 @@ criterion_group!(
     bench_selective_receive,
     bench_selective_receive_reset,
     bench_actor_state_overwrite,
+    bench_trace_context_creation,
     bench_trace_dispatch_span
 );
