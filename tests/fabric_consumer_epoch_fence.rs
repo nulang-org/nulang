@@ -1,7 +1,7 @@
 //! Replicated consumer effects must be associated with the installed leader epoch.
 //! These tests do not claim consumer ACK state is replicated across leader changes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -87,6 +87,16 @@ fn replicated_consumer_requires_leader_and_matching_delivery_epoch() {
     leader.process_network();
     follower.process_network();
     assert_eq!(leader.fabric_stream_committed_sequence("fenced").unwrap(), 1);
+    assert_eq!(follower.fabric_stream_committed_sequence("fenced").unwrap(), 1);
+
+    // Isolate the committed follower from the leader. A replica with a valid
+    // durable log must not start serving application consumer side effects.
+    follower
+        .distributed
+        .transport
+        .as_mut()
+        .unwrap()
+        .set_partition(HashSet::from([placement.leader]));
 
     // The follower stores the same committed record but cannot act as leader.
     assert!(follower
