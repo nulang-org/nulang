@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::runtime::{MessagePriority, NodeId, NodeStatus, Packet, Runtime};
+use crate::runtime::{ClusterState, MessagePriority, NodeId, NodeStatus, Packet, Runtime};
 
 pub(crate) const FABRIC_CONSUMER_PROGRESS_PREPARE_BEHAVIOR: &str =
     "__nulang_fabric_consumer_progress_prepare_v1";
@@ -1093,6 +1093,41 @@ impl Runtime {
         Ok(policy)
     }
 
+    /// Packet processing holds the current membership outside Runtime while
+    /// dispatching incoming messages. Validate against that same membership
+    /// rather than self.distributed.cluster (temporarily None), so a healthy
+    /// installed leader does not reject legitimate follower fsync receipts.
+    fn consumer_progress_validate_leader_from_cluster(
+        &mut self,
+        stream: &str,
+        cluster: &ClusterState,
+    ) -> io::Result<FabricConsumerProgressPolicy> {
+        let policy = self.consumer_progress_installed_policy(stream)?;
+        let local = self.distributed.node_id.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "consumer-progress receipt requires a distributed leader",
+            )
+        })?;
+        if local.0 != policy.leader {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "only the installed consumer-progress leader may receive replica fsync receipts",
+            ));
+        }
+        let healthy = cluster
+            .get_node(local)
+            .map(|member| matches!(member.status, NodeStatus::Healthy | NodeStatus::Joining))
+            .unwrap_or(false);
+        if !healthy {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "consumer-progress receipt leader is not healthy in current cluster",
+            ));
+        }
+        Ok(policy)
+    }
+
     /// Stage a storage-only prepare on the leader. It is not a committed ACK.
     pub(crate) fn fabric_consumer_progress_stage(
         &mut self,
@@ -1255,6 +1290,33 @@ impl Runtime {
         from: NodeId,
     ) -> io::Result<()> {
         let policy = self.consumer_progress_validate_leader(&receipt.stream)?;
+        self.fabric_consumer_progress_record_replica_receipt_with_policy(
+            receipt, from, policy,
+        )
+    }
+
+    /// Network-specific path: the caller supplies the current membership
+    /// moved out of Runtime for the duration of packet dispatch.
+    pub(crate) fn fabric_consumer_progress_record_replica_receipt_from_cluster(
+        &mut self,
+        receipt: &FabricConsumerProgressAckWire,
+        from: NodeId,
+        cluster: &ClusterState,
+    ) -> io::Result<()> {
+        let policy = self.consumer_progress_validate_leader_from_cluster(
+            &receipt.stream, cluster,
+        )?;
+        self.fabric_consumer_progress_record_replica_receipt_with_policy(
+            receipt, from, policy,
+        )
+    }
+
+    fn fabric_consumer_progress_record_replica_receipt_with_policy(
+        &mut self,
+        receipt: &FabricConsumerProgressAckWire,
+        from: NodeId,
+        policy: FabricConsumerProgressPolicy,
+    ) -> io::Result<()> {
         let local = NodeId(policy.leader);
         if receipt.replica != from.0
             || from == local
@@ -1461,8 +1523,33 @@ impl Runtime {
         receipt: &FabricConsumerProgressCommitAckWire,
         from: NodeId,
     ) -> io::Result<()> {
-        receipt.validate_shape()?;
         let policy = self.consumer_progress_validate_leader(&receipt.stream)?;
+        self.fabric_consumer_progress_record_commit_receipt_with_policy(
+            receipt, from, policy,
+        )
+    }
+
+    pub(crate) fn fabric_consumer_progress_record_commit_receipt_from_cluster(
+        &mut self,
+        receipt: &FabricConsumerProgressCommitAckWire,
+        from: NodeId,
+        cluster: &ClusterState,
+    ) -> io::Result<()> {
+        let policy = self.consumer_progress_validate_leader_from_cluster(
+            &receipt.stream, cluster,
+        )?;
+        self.fabric_consumer_progress_record_commit_receipt_with_policy(
+            receipt, from, policy,
+        )
+    }
+
+    fn fabric_consumer_progress_record_commit_receipt_with_policy(
+        &mut self,
+        receipt: &FabricConsumerProgressCommitAckWire,
+        from: NodeId,
+        policy: FabricConsumerProgressPolicy,
+    ) -> io::Result<()> {
+        receipt.validate_shape()?;
         if receipt.leader != policy.leader
             || receipt.epoch != policy.epoch
             || receipt.replica != from.0
