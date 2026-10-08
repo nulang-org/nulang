@@ -127,6 +127,7 @@ pub use scheduler::*;
 pub use supervisor::*;
 pub use timer::*;
 
+use crate::crdt_peer_sync::PeerCrdtFrontiers;
 use crate::types::{ExitReason, NuError, Span, VmSuspension};
 use crate::vm::Value;
 
@@ -409,6 +410,15 @@ pub struct Runtime {
 
     // CRDT manager (v0.6)
     pub crdt_manager: Option<CrdtManager>,
+    /// Receiver-specific CRDT knowledge. A peer frontier advances only after
+    /// the transport ACK for the packet carrying that logical batch arrives.
+    pub(crate) crdt_peer_frontiers: PeerCrdtFrontiers,
+    /// Tracked NUL0 packet sequence -> (peer id, logical CRDT batch id).
+    ///
+    /// At most the newest tracked batch per peer is retained. Ignoring an
+    /// older late ACK can cause a harmless retransmission; accepting an ACK
+    /// for a packet we no longer track could incorrectly advance knowledge.
+    pub(crate) pending_crdt_sync_acks: HashMap<u64, (u64, u64)>,
 
     // Number of `sync_crdts` calls made; delta-state syncs run on most
     // rounds, with a full-state repair sync every CRDT_FULL_SYNC_INTERVAL.
@@ -660,6 +670,8 @@ impl Runtime {
             // `state crdt` fields register and `Crdt.*` ops work without
             // distribution enabled.
             crdt_manager: Some(CrdtManager::new(0)),
+            crdt_peer_frontiers: PeerCrdtFrontiers::new(),
+            pending_crdt_sync_acks: HashMap::new(),
             virtual_clock: None,
             metrics: None,
             #[cfg(feature = "python")]
@@ -4628,7 +4640,14 @@ impl Runtime {
     /// Re-arm a timer from the durable journal without appending a new event.
     /// Used during recovery to restore timers that have not yet fired.
     pub(crate) fn rearm_timer(&mut self, actor_id: u64, name: &str, duration_ms: u64) {
-        let behavior_id = self.behavior_id_for(actor_id, "__timer_fired").unwrap_or(0);
+        let Some(behavior_id) = self.behavior_id_for(actor_id, "__timer_fired") else {
+            tracing::warn!(
+                actor_id,
+                timer_name = name,
+                "refusing to re-arm workflow timer without __timer_fired behavior"
+            );
+            return;
+        };
         self.timer_wheel.send_after_with_context(
             std::time::Duration::from_millis(duration_ms),
             actor_id,
@@ -5170,7 +5189,7 @@ impl Runtime {
             } else {
                 let idx = vm.modules.len();
                 vm.load_module(
-                    module_to_load.expect("module must exist when bytecode_module_idx is absent"),
+                    *module_to_load.expect("module must exist when bytecode_module_idx is absent"),
                 );
                 if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
                     actor.bytecode_module_idx = Some(idx);
@@ -5454,15 +5473,16 @@ impl Runtime {
             .map(|meta| meta.is_agent)
             .unwrap_or(false);
 
-        // RFC 0022 Phase B: classify only the narrow crash window already
-        // covered by atomic native workflow turns. If the committed atomic tail
-        // is ahead of the last safe snapshot and the record at that exact tail
-        // is a command, the process died after admission but before a later
-        // atomic transition could close or advance the activation.
+        // RFC 0022 activation recovery: durable-effect transitions can move
+        // the atomic tail beyond the admitted command while the last completed
+        // snapshot intentionally remains at the pre-command boundary. Replay-
+        // identified intermediate workflow records may then extend beyond that
+        // tail without representing completed state.
         //
-        // Do not generalize this to commands below the atomic tail: a later
-        // tail may represent an intermediate event/effect that requires the
-        // broader activation replay contract tracked by #836.
+        // Recover only when one admitted command can be proven. Post-tail
+        // history is accepted solely for replay-identified intermediate records
+        // belonging to that same activation; every other mixed-history shape
+        // fails closed.
         let pending_atomic_workflow_replay = if is_workflow {
             match self.persistence.load_durable_tail_position(actor_id) {
                 Ok(Some(tail)) if tail.sequence > snapshot.sequence => {
@@ -5474,7 +5494,38 @@ impl Runtime {
                         return None;
                     }
 
-                    let activation = WorkflowActivationId::new(actor_id, tail.sequence);
+                    let journal = self.persistence.read_journal(actor_id);
+                    if journal.iter().any(|entry| entry.sequence > tail.sequence) {
+                        warn!(
+                            "nulang-recover: refusing workflow actor {}: command journal extends beyond atomic tail {}",
+                            actor_id, tail.sequence
+                        );
+                        return None;
+                    }
+
+                    let mut candidates: Vec<_> = journal
+                        .into_iter()
+                        .filter(|entry| {
+                            entry.sequence > snapshot.sequence && entry.sequence <= tail.sequence
+                        })
+                        .collect();
+
+                    if candidates.len() > 1 {
+                        warn!(
+                            "nulang-recover: refusing workflow actor {}: {} admitted commands exist between safe snapshot {} and atomic tail {}",
+                            actor_id,
+                            candidates.len(),
+                            snapshot.sequence,
+                            tail.sequence
+                        );
+                        return None;
+                    }
+
+                    let Some(entry) = candidates.pop() else {
+                        return None;
+                    };
+                    let activation = WorkflowActivationId::new(actor_id, entry.sequence);
+
                     let terminal_recorded = workflow_events.iter().any(|event| {
                         matches!(
                             event,
@@ -5487,16 +5538,46 @@ impl Runtime {
                             } if *id == activation
                         )
                     });
-
                     if terminal_recorded {
-                        None
-                    } else {
-                        self.persistence
-                            .read_journal(actor_id)
-                            .into_iter()
-                            .find(|entry| entry.sequence == tail.sequence)
-                            .map(|entry| (activation, entry))
+                        warn!(
+                            "nulang-recover: refusing workflow actor {}: activation {} is terminal but safe snapshot {} still trails atomic tail {}",
+                            actor_id,
+                            activation.command_sequence,
+                            snapshot.sequence,
+                            tail.sequence
+                        );
+                        return None;
                     }
+
+                    let unsafe_post_tail_workflow_history = workflow_events.iter().any(|event| {
+                        event.sequence() > tail.sequence
+                            && !matches!(
+                                event.replay_id(),
+                                Some(replay_id) if replay_id.activation == activation
+                            )
+                    });
+                    if unsafe_post_tail_workflow_history {
+                        warn!(
+                            "nulang-recover: refusing workflow actor {}: unproven workflow history extends beyond atomic tail {}",
+                            actor_id, tail.sequence
+                        );
+                        return None;
+                    }
+
+                    if self
+                        .persistence
+                        .read_events(actor_id)
+                        .iter()
+                        .any(|event| event.sequence > tail.sequence)
+                    {
+                        warn!(
+                            "nulang-recover: refusing workflow actor {}: domain-event history extends beyond atomic tail {}",
+                            actor_id, tail.sequence
+                        );
+                        return None;
+                    }
+
+                    Some((activation, entry))
                 }
                 Ok(_) => None,
                 Err(error) if error.kind() == std::io::ErrorKind::Unsupported => None,
@@ -5684,7 +5765,7 @@ impl Runtime {
         }
         // Restore bytecode metadata registered for recovery.
         if let Some((module, offsets, comp_offsets)) = self.recovery_modules.get(&actor_id) {
-            actor.bytecode_module = Some(module.clone());
+            actor.bytecode_module = Some(Box::new(module.clone()));
             actor.bytecode_offsets = offsets.clone();
             actor.compensation_offsets = comp_offsets.clone();
         }
@@ -5906,7 +5987,7 @@ impl Runtime {
             actor.activation_epoch = snapshot.activation_epoch;
             actor.waiting_signal = snapshot.waiting_signal.clone();
             actor.install_authority_manifest(&authority_manifest);
-            actor.bytecode_module = Some(module.clone());
+            actor.bytecode_module = Some(Box::new(module.clone()));
             actor.bytecode_offsets = module
                 .behaviors
                 .iter()
@@ -5967,7 +6048,7 @@ impl Runtime {
         actor.activation_epoch = snapshot.activation_epoch;
         actor.waiting_signal = snapshot.waiting_signal.clone();
         actor.install_authority_manifest(&authority_manifest);
-        actor.bytecode_module = Some(module.clone());
+        actor.bytecode_module = Some(Box::new(module.clone()));
         actor.bytecode_offsets = offsets;
         actor.compensation_offsets = compensation_offsets;
         Self::restore_state_models_from_snapshot(&mut actor, Some(meta), snapshot);
@@ -6060,7 +6141,7 @@ impl Runtime {
         } else {
             let mut actor = Actor::new(stable_actor_id, grain_id.actor_name(), 0);
             actor.persistent = true;
-            actor.bytecode_module = Some(grain_type.module.clone());
+            actor.bytecode_module = Some(Box::new(grain_type.module.clone()));
             actor.bytecode_offsets = grain_type.bytecode_offsets.clone();
             actor.compensation_offsets = grain_type.compensation_offsets.clone();
             actor.state_models = grain_type
@@ -6930,7 +7011,7 @@ impl Runtime {
                 .iter()
                 .map(|entry| (entry.name.clone(), entry.handler_fn))
                 .collect(),
-            bytecode_module: actor.bytecode_module.clone(),
+            bytecode_module: actor.bytecode_module.as_deref().cloned(),
             bytecode_offsets: actor.bytecode_offsets.clone(),
             compensation_offsets: actor.compensation_offsets.clone(),
             persistent: actor.persistent,
@@ -7387,7 +7468,7 @@ impl Runtime {
         let module = match self
             .actors
             .get(&actor_id)
-            .and_then(|a| a.bytecode_module.clone())
+            .and_then(|a| a.bytecode_module.as_deref().cloned())
             .or_else(|| {
                 self.recovery_modules
                     .get(&actor_id)

@@ -10,7 +10,7 @@
 //! ```c
 //! uint64_t nulang_fn_N(uint64_t arg0, uint64_t arg1, ...);
 //! ```
-//! All arguments and return values are `u64` (NaN-tagged when type is
+//! All arguments and return values are `u64` (canonical tagged words when type is
 //! unknown, raw bits when unboxed). The AOT runtime trampoline handles
 //! boxing/unboxing at function boundaries.
 
