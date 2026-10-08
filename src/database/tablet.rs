@@ -509,21 +509,26 @@ impl MemoryTablet {
     }
 
     fn apply_mutations(&mut self, sequence: u64, mutations: Vec<TabletMutation>) {
+        // A commit has exactly one visible MVCC version per key. Coalescing
+        // repeated mutations within the batch preserves last-write-wins
+        // semantics and keeps snapshot histories strictly sequence-ordered
+        // across checkpoint, recovery and split materialization.
+        let mut final_values = BTreeMap::new();
         for mutation in mutations {
             match mutation {
                 TabletMutation::Put { key, value } => {
-                    self.rows.entry(key).or_default().push(VersionedValue {
-                        sequence,
-                        value: Some(value),
-                    });
+                    final_values.insert(key, Some(value));
                 }
                 TabletMutation::Delete { key } => {
-                    self.rows.entry(key).or_default().push(VersionedValue {
-                        sequence,
-                        value: None,
-                    });
+                    final_values.insert(key, None);
                 }
             }
+        }
+        for (key, value) in final_values {
+            self.rows
+                .entry(key)
+                .or_default()
+                .push(VersionedValue { sequence, value });
         }
         self.current_sequence = sequence;
     }
