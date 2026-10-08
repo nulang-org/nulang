@@ -24,6 +24,8 @@ mod interruption;
 #[cfg(test)]
 mod mvcc_gc_tests;
 #[cfg(test)]
+mod snapshot_reopen_tests;
+#[cfg(test)]
 mod snapshot_tests;
 #[cfg(test)]
 mod sstable_indexed_tests;

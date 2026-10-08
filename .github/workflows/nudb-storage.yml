@@ -39,7 +39,9 @@ jobs:
           cargo test --locked --no-default-features --lib database::owner::tests
           cargo test --locked --no-default-features --test tablet_owner_admission
       - name: Snapshot floor contract
-        run: cargo test --locked --no-default-features --lib database::snapshot_tests
+        run: |
+          cargo test --locked --no-default-features --lib database::snapshot_tests
+          cargo test --locked --no-default-features --lib database::snapshot_reopen_tests
       - name: MVCC retention contract
         run: cargo test --locked --no-default-features --lib database::mvcc_gc_tests
       - name: Memtable rotation contract
