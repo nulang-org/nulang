@@ -603,6 +603,83 @@ mod tests {
     }
 
     #[test]
+    fn preparing_manifest_recovers_from_interrupted_parent_wal_creation() {
+        let root = std::env::temp_dir().join(format!(
+            "nudb_bootstrap_recovery_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let parent = TabletDescriptor::new(
+            TabletId::new(901).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            7,
+        )
+        .unwrap();
+        fs::create_dir_all(&root).unwrap();
+        write_manifest(
+            &root.join("route.manifest"),
+            &DiskManifest::for_preparing_parent(&parent),
+            None,
+        )
+        .unwrap();
+        // Simulate a crash while the new parent's WAL header is incomplete.
+        // No store was published, so no writes could have been acknowledged.
+        fs::write(root.join("parent.wal"), b"incomplete-bootstrap-header").unwrap();
+
+        let mut reopened = SingleNodeSplitStore::open(&root, parent.clone()).unwrap();
+        assert!(!reopened.is_split());
+        assert_eq!(reopened.read_latest(b"b").unwrap(), None);
+        assert_eq!(
+            reopened
+                .commit(TabletMutation::Put {
+                    key: b"b".to_vec(),
+                    value: b"committed-after-recovery".to_vec(),
+                })
+                .unwrap(),
+            1
+        );
+        drop(reopened);
+
+        let replayed = SingleNodeSplitStore::open(&root, parent).unwrap();
+        assert_eq!(
+            replayed.read_latest(b"b").unwrap(),
+            Some(b"committed-after-recovery".to_vec())
+        );
+        drop(replayed);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_published_manifest_must_not_reset_committed_parent() {
+        let root = std::env::temp_dir().join(format!(
+            "nudb_missing_published_manifest_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let parent = TabletDescriptor::new(
+            TabletId::new(901).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            7,
+        )
+        .unwrap();
+        {
+            let mut first = SingleNodeSplitStore::open(&root, parent.clone()).unwrap();
+            first
+                .commit(TabletMutation::Put {
+                    key: b"b".to_vec(),
+                    value: b"already-acknowledged".to_vec(),
+                })
+                .unwrap();
+        }
+        fs::remove_file(root.join("route.manifest")).unwrap();
+        assert!(matches!(
+            SingleNodeSplitStore::open(&root, parent),
+            Err(SplitError::InvalidManifest(_))
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn crash_after_left_checkpoint_recovers_parent() {
         case(SplitStop::AfterLeft);
     }
