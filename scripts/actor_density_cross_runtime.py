@@ -156,9 +156,9 @@ def build_commands(selected: list[str]) -> dict[str, list[str]]:
 
     if "ractor" in selected:
         manifest = shared.FIXTURES / "ractor_baseline" / "Cargo.toml"
-        # Lockfile is generated in the independent workspace until pinned in git.
+        # Use the committed isolated workspace lockfile for repeatable comparisons.
         shared.command_output([
-            cargo, "build", "--release", "--manifest-path", str(manifest),
+            cargo, "build", "--locked", "--release", "--manifest-path", str(manifest),
             "--bin", "density",
         ])
         metadata = json.loads(shared.command_output([
