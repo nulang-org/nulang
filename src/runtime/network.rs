@@ -2209,7 +2209,14 @@ impl TcpTransport {
                 .name("nulang-net-sender".into())
                 .spawn(move || {
                     sender_thread(
-                        outgoing_rx, conns, flag, local_id, in_tx, failure_tx, tls, wakeup,
+                        outgoing_rx,
+                        conns,
+                        flag,
+                        local_id,
+                        in_tx,
+                        failure_tx,
+                        tls,
+                        wakeup,
                     );
                 })?;
             handles.push(handle);
@@ -2528,7 +2535,14 @@ fn listener_thread(
                     .name(format!("nulang-net-reader-{}", addr.port()))
                     .spawn(move || {
                         connection_reader(
-                            stream, addr, in_tx, conns, flag, local_node_id, tls, wakeup,
+                            stream,
+                            addr,
+                            in_tx,
+                            conns,
+                            flag,
+                            local_node_id,
+                            tls,
+                            wakeup,
                         );
                     });
             }
