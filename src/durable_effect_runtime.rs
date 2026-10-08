@@ -113,6 +113,10 @@ impl<'a> DurableEffectCoordinator<'a> {
         request: &[u8],
     ) -> Result<DurableEffectDispatchDecision, DurableEffectRuntimeError> {
         if let Some(existing) = self.store.load_durable_effect(self.actor_id, spec.id)? {
+            // An existing intent does not perform a new commit, so it must
+            // verify that this activation already owns the committed epoch
+            // before permitting another external provider dispatch.
+            self.require_committed_activation()?;
             self.validate_existing(&spec, request, existing.effect())?;
             return Ok(decision(existing.effect()));
         }
@@ -139,6 +143,9 @@ impl<'a> DurableEffectCoordinator<'a> {
             return Err(DurableEffectRuntimeError::MissingPreparedEffect { effect_id });
         };
 
+        // Even a duplicate completion may return a committed receipt without
+        // writing. Do not let an obsolete activation consume that result.
+        self.require_committed_activation()?;
         existing.effect().validate_request(request)?;
 
         if let DurableEffectRecoveryAction::ReplayRecordedResult(recorded) =
@@ -154,6 +161,30 @@ impl<'a> DurableEffectCoordinator<'a> {
         };
         self.commit_record(DurableEffectPersistenceRecord::from_effect(completed))?;
         Ok(durable_result)
+    }
+
+    /// Require an already-committed ownership epoch for effect recovery paths
+    /// that can return without going through commit_transition's CAS fence.
+    ///
+    /// A new activation must first commit a fenced transition establishing
+    /// its epoch. Reading an effect record alone is not proof of ownership.
+    fn require_committed_activation(&self) -> Result<(), DurableEffectRuntimeError> {
+        let Some(tail) = self.store.load_durable_tail_position(self.actor_id)? else {
+            return Err(DurableEffectRuntimeError::Storage(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "durable effect exists without a committed activation tail",
+            )));
+        };
+        if self.activation_epoch != tail.activation_epoch {
+            return Err(DurableEffectRuntimeError::Storage(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "durable effect activation epoch {} is not the committed epoch {}",
+                    self.activation_epoch, tail.activation_epoch
+                ),
+            )));
+        }
+        Ok(())
     }
 
     fn validate_existing(
