@@ -4337,6 +4337,7 @@ fn test_legacy_checkpoint_is_rejected_after_atomic_workflow_tail_begins() {
     );
 }
 
+
 #[test]
 fn test_compiled_workflow_turn_closes_on_atomic_tail() {
     use crate::bytecode::{Instruction, OpCode};
