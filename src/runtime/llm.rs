@@ -443,6 +443,7 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
     }
 
     rt.restore_suspended_workflow_activation(actor_id, suspended.activation);
+    let mut terminal_commit_failed = false;
     let self_ptr: *mut Runtime = rt;
     unsafe {
         let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -483,6 +484,7 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
                             %error,
                             "nulang-workflow: LLM-resume terminal commit failed"
                         );
+                        terminal_commit_failed = true;
                     }
                 }
             }
@@ -519,6 +521,10 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
         // un-captured suspend still needs. Runs on every path, so
         // wakes of other actors are not lost when THIS one suspends.
         (*self_ptr).vm_exec_end();
+    }
+    if terminal_commit_failed {
+        rt.recover_workflow_after_failed_terminal(actor_id);
+        return;
     }
     // The suspension resolved (completed or failed): if messages queued
     // up while the behavior was suspended, schedule the actor to drain
