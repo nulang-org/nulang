@@ -252,6 +252,13 @@ fn three_replica_stream_commits_on_majority() {
     assert_eq!(result.status.quorum, 2);
     assert_eq!(result.status.acknowledgements, 1);
     assert!(!result.status.committed);
+    assert!(nodes[leader_index]
+        .fabric_stream_read_consumer("majority", "analytics", 10)
+        .unwrap()
+        .is_empty());
+    assert!(nodes[leader_index]
+        .fabric_stream_commit_cursor("majority", "analytics", 1)
+        .is_err());
 
     // Process exactly one follower. Leader + this follower is a majority of 3.
     let follower_index = (0..3).find(|index| *index != leader_index).unwrap();
@@ -271,6 +278,16 @@ fn three_replica_stream_commits_on_majority() {
             .len(),
         1
     );
+    assert_eq!(
+        nodes[leader_index]
+            .fabric_stream_read_consumer("majority", "analytics", 10)
+            .unwrap()
+            .len(),
+        1
+    );
+    nodes[leader_index]
+        .fabric_stream_commit_cursor("majority", "analytics", 1)
+        .unwrap();
 
     for root in roots {
         let _ = std::fs::remove_dir_all(root);
