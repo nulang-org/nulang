@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### WASM component host authority parity — 2026-10-08
+- Replace the WASM component backend's separate boolean `Capabilities` flags with canonical typed `AuthorityManifest` grants. Component runtimes deny host imports by default, link only exact `IO::Log` / `Time::Now` / `Random::U64` permissions, and recheck authority at dispatch.
+- Add a regression requiring sibling authority (`Time::Now`) to reject a guest importing `IO::Log` before guest instantiation. This is a clean current-main port of the unmerged security slice from #876; it does not claim complete authority equivalence for all bytecode/native/WASM APIs.
+
 ### Seeded cluster simulation peer ordering — 2026-10-07
 - **Cluster simulations with an injected deterministic RNG now canonicalize peer order for gossip targets, bounded gossip payloads, active-view repair, and heartbeat action emission.** This removes four sources of randomized Rust `HashMap` ordering while preserving the existing unseeded production path. Regression tests compare independently constructed cluster states under identical RNG seeds.
 
