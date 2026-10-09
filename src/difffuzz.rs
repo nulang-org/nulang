@@ -908,14 +908,7 @@ pub fn run_campaign(
                 }
             }
             Err(message) => {
-                record_divergence(
-                    &mut stats,
-                    seed,
-                    source,
-                    message,
-                    crasher_dir,
-                    verbose,
-                );
+                record_divergence(&mut stats, seed, source, message, crasher_dir, verbose);
             }
         }
     }
