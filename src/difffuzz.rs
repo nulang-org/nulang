@@ -1011,4 +1011,41 @@ mod tests {
             "WASM-enabled differential smoke executed zero WASM programs"
         );
     }
+    /// A previously recognized overflow class must remain an ordinary fatal
+    /// backend mismatch, with a reproducible seed and source at the root.
+    #[test]
+    fn historical_overflow_is_fatal_and_keeps_seed_reproducer() {
+        let seed = 0xD1FF_0009u64;
+        let source = "fn main() { 1 + 2 }".to_string();
+        let message = "backend disagrees: exceeds the 48-bit range".to_string();
+        let dir = std::env::temp_dir().join(format!(
+            "nulang-difffuzz-fatal-overflow-{}-{seed}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut stats = CampaignStats::default();
+
+        record_divergence(
+            &mut stats,
+            seed,
+            source.clone(),
+            message.clone(),
+            Some(&dir),
+            false,
+        );
+
+        assert_eq!(stats.divergences.len(), 1);
+        assert_eq!(stats.divergences[0].seed, seed);
+        let path = dir.join(format!("seed_{seed:016x}.nula"));
+        let saved = std::fs::read_to_string(&path).expect("fatal crasher must be saved");
+        assert!(saved.contains(&source));
+        assert!(saved.contains(&message));
+        assert!(saved.contains(&format!("--seed-base {seed}")));
+        assert!(
+            !dir.join("known-overflow").exists(),
+            "no category may suppress ordinary fatal divergences"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
