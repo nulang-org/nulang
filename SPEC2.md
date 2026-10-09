@@ -1914,7 +1914,11 @@ module Math {
 }
 ```
 
-Module-level visibility enforcement and multi-file compilation units are planned.
+Source modules now record an explicit export set from `pub` declarations, and
+the resolver preserves that metadata across imports. The current compiler still
+lowers imported files into one flat compilation unit, so namespace isolation and
+fully enforced private-name hiding remain planned; private implementation
+dependencies must stay available while compiling exported declarations.
 
 ## 7.8 Generics in Declarations
 
@@ -1935,11 +1939,26 @@ type Tree[T] = Leaf | Node((Tree[T], T, Tree[T]))
 
 ## 7.9 Visibility
 
-All declarations are visible throughout the program; there is currently no visibility enforcement. The `pub` keyword is accepted before any declaration for forward compatibility, and `priv` is reserved as a keyword for the planned visibility system:
+Named declarations are private-by-default in the source module's **export
+metadata**. Prefixing a named declaration with `pub` records its name in that
+module's explicit export set:
 
 ```nulang
 pub fn exported(x: Int) -> Int { x + 1 }
+pub actor Worker { behavior run() { unit } }
 ```
+
+This export metadata is preserved by parsing, formatting, and import resolution
+and is used to validate selective-import requests in the resolver. It is not yet
+a complete namespace/access-control boundary: ordinary file imports are still
+compiled by flattening the imported implementation into the caller's compilation
+unit, so private helper declarations must remain present for exported code that
+depends on them. Full private-name hiding requires the planned namespace-aware
+name-resolution pass rather than deleting private declarations from the AST.
+
+`pub` is rejected on anonymous declarations that cannot form an export (for
+example an `import` or `impl` declaration). There is no `priv` keyword;
+private is the default and `priv` lexes as an ordinary identifier.
 
 ## 7.10 Documentation
 
