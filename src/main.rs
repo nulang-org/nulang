@@ -177,7 +177,17 @@ fn main() {
         }
     }
 
-    // `nulang nula <cmd>` dispatches to the package manager.
+    // Adoption-friendly package shortcuts. Keep `nulang nula <cmd>` as the
+    // complete package-manager surface, while making the common first-run
+    // path discoverable directly from the main executable.
+    if matches!(args[1].as_str(), "new" | "dev") {
+        if let Err(e) = nulang::package::commands::run(&args[1..]) {
+            print_error(&e, true);
+            std::process::exit(exit_code(&e));
+        }
+        return;
+    }
+
     if args[1] == "fmt" {
         let mut check_mode = false;
         let mut file_arg: Option<&str> = None;
@@ -1125,6 +1135,8 @@ fn print_help() {
     println!("       nulang --check <FILE>");
     println!("       nulang --lsp");
     println!("       nulang --dap");
+    println!("       nulang new <path> [--template <name>]");
+    println!("       nulang dev [--port <port>]");
     println!("       nulang fmt [--check] [<file>]");
     println!("       nulang node --listen <ADDR> [--seed <ADDR>] [--expected-nodes <N>]");
     println!("       nulang --doc");
@@ -1173,8 +1185,10 @@ fn print_help() {
     println!(
         "  --verify <src>   When running a .nbc artifact, verify its source hash against <src>"
     );
+    println!("  new <path>       Scaffold a package (shortcut for 'nula new')");
+    println!("  dev              Start package dev server (shortcut for 'nula dev')");
     println!(
-        "  nula <cmd>       Package manager (new, init, build, build-wasm, test, run, add, remove, watch, doc, list, clean)"
+        "  nula <cmd>       Full package manager (new, init, build, build-wasm, test, run, add, remove, publish, deploy, watch, doc, list, clean)"
     );
     println!("  --version, -V    Print version and exit");
     println!("  init <name>      Scaffold experiment");
