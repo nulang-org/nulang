@@ -356,6 +356,9 @@ pub(crate) fn finish_resumed_workflow_step(
     let Some(actor) = rt.actors.get_mut(&actor_id) else {
         return false;
     };
+    // Clearing the active suspension marker belongs to terminal completion,
+    // not to an individual LLM/signal/timer resume adapter.
+    actor.waiting_signal = None;
     if let Some(step) = actor
         .get_state_field("step_index")
         .and_then(|value| value.as_int())
