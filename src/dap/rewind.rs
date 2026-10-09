@@ -18,6 +18,12 @@
 //! Stepping forward from a rewound position replays the next recorded
 //! events (`N -> N+1`) — again from recorded values, never by re-execution.
 //!
+//! A rewind can also be captured as a [`DurableBranch`]. A branch is an
+//! immutable counterfactual view with explicit lineage metadata. It does not
+//! mutate the live entity or allocate a new runtime actor yet; that separation
+//! keeps debugger branching deterministic while the runtime-level branch
+//! activation contract (identity, code version, CRDT/workflow state) evolves.
+//!
 //! Limitations (single-node, single-entity dev/staging feature):
 //! - `durable` (non-event-sourced) fields are only known at snapshot
 //!   granularity; their intermediate values between snapshots are not
@@ -28,7 +34,7 @@
 //!   `.nulang/store/`); with the default in-memory store there is nothing
 //!   to rewind.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use crate::runtime::{EventEntry, JournalEntry, JsonFileStore, PersistedValue, PersistenceStore};
@@ -51,6 +57,42 @@ pub struct RewoundState {
     pub journal: Vec<JournalEntry>,
     /// Event-sourcing events with `sequence <= self.sequence`.
     pub events: Vec<EventEntry>,
+}
+
+/// Immutable counterfactual branch captured from an entity's durable history.
+///
+/// This is deliberately a *view*, not a newly activated actor. Runtime-level
+/// activation needs stronger guarantees than debugger rewind currently has:
+/// stable code-version identity, workflow suspension state, CRDT lineage and
+/// cluster-wide ownership must all be explicit before a branch may execute.
+/// Keeping the first primitive immutable makes it safe to use for inspection,
+/// state comparison, speculative planning and future shadow-replay tooling.
+#[derive(Debug, Clone)]
+pub struct DurableBranch {
+    /// Caller-defined stable branch identifier (for example a UUID or slug).
+    pub branch_id: String,
+    /// Entity whose history this branch derives from.
+    pub parent_actor_id: u64,
+    /// Historical sequence at which the branch diverges.
+    pub fork_sequence: u64,
+    /// Parent head when the branch was captured.
+    pub parent_latest_sequence: u64,
+    /// Snapshot sequence used as the reconstruction base.
+    pub snapshot_sequence: u64,
+    /// Reconstructed field state at the fork point.
+    pub state: BTreeMap<String, PersistedValue>,
+    /// Parent message history through the fork point.
+    pub journal: Vec<JournalEntry>,
+    /// Parent event-sourcing history through the fork point.
+    pub events: Vec<EventEntry>,
+}
+
+/// One field-level difference between two reconstructed durable states.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StateDiff {
+    pub field: String,
+    pub before: Option<PersistedValue>,
+    pub after: Option<PersistedValue>,
 }
 
 /// Reconstruct the state of `actor_id` as of message `target_seq`:
@@ -97,6 +139,71 @@ pub fn rewind_entity(store: &dyn PersistenceStore, actor_id: u64, target_seq: u6
         journal,
         events,
     }
+}
+
+/// Capture an immutable durable branch at `target_seq`.
+///
+/// The target follows rewind semantics and is clamped to the parent head.
+/// No persistence is written and the live parent is never mutated. This API
+/// intentionally separates deterministic branch *construction* from branch
+/// *activation*, which will require code-version and distributed-ownership
+/// contracts before it is safe in production.
+pub fn fork_entity_view(
+    store: &dyn PersistenceStore,
+    actor_id: u64,
+    target_seq: u64,
+    branch_id: impl Into<String>,
+) -> DurableBranch {
+    let rewound = rewind_entity(store, actor_id, target_seq);
+    DurableBranch {
+        branch_id: branch_id.into(),
+        parent_actor_id: rewound.actor_id,
+        fork_sequence: rewound.sequence,
+        parent_latest_sequence: rewound.latest_sequence,
+        snapshot_sequence: rewound.snapshot_sequence,
+        state: rewound.state,
+        journal: rewound.journal,
+        events: rewound.events,
+    }
+}
+
+/// Compute a deterministic field-level diff between two reconstructed states.
+///
+/// The result is sorted by field name because both inputs are `BTreeMap`s and
+/// the union is collected into a `BTreeSet`. Equal fields are omitted.
+pub fn diff_states(
+    before: &BTreeMap<String, PersistedValue>,
+    after: &BTreeMap<String, PersistedValue>,
+) -> Vec<StateDiff> {
+    let keys: BTreeSet<&String> = before.keys().chain(after.keys()).collect();
+    keys.into_iter()
+        .filter_map(|field| {
+            let old = before.get(field);
+            let new = after.get(field);
+            if old == new {
+                None
+            } else {
+                Some(StateDiff {
+                    field: field.clone(),
+                    before: old.cloned(),
+                    after: new.cloned(),
+                })
+            }
+        })
+        .collect()
+}
+
+/// Compare a branch point with the parent's current durable head.
+///
+/// This is useful for debugger UIs and shadow-migration tooling: it answers
+/// "what changed on the real timeline after this branch diverged?" without
+/// executing user code.
+pub fn diff_branch_from_parent_head(
+    store: &dyn PersistenceStore,
+    branch: &DurableBranch,
+) -> Vec<StateDiff> {
+    let parent_head = rewind_entity(store, branch.parent_actor_id, u64::MAX);
+    diff_states(&branch.state, &parent_head.state)
 }
 
 /// Step forward one message from a rewound position: replays the recorded
@@ -171,6 +278,28 @@ impl RewoundState {
             "snapshotSequence": self.snapshot_sequence,
             "state": state,
             "journal": journal,
+        })
+    }
+}
+
+impl DurableBranch {
+    /// JSON view intended for debugger and Cloud timeline clients.
+    pub fn to_json(&self) -> serde_json::Value {
+        let state: serde_json::Map<String, serde_json::Value> = self
+            .state
+            .iter()
+            .map(|(k, v)| (k.clone(), persisted_value_json(v)))
+            .collect();
+        serde_json::json!({
+            "branchId": self.branch_id,
+            "parentActorId": self.parent_actor_id,
+            "forkSequence": self.fork_sequence,
+            "parentLatestSequence": self.parent_latest_sequence,
+            "snapshotSequence": self.snapshot_sequence,
+            "state": state,
+            "journalLength": self.journal.len(),
+            "eventLength": self.events.len(),
+            "executable": false,
         })
     }
 }
@@ -295,5 +424,77 @@ mod tests {
         let st = rewind_entity(&store, 9, 1);
         assert_eq!(st.snapshot_sequence, 0);
         assert_eq!(st.state.get("seen"), Some(&PersistedValue::Bool(true)));
+    }
+
+    #[test]
+    fn fork_view_captures_lineage_without_mutating_parent() {
+        let store = sample_store();
+        let branch = fork_entity_view(&store, 7, 3, "candidate-a");
+
+        assert_eq!(branch.branch_id, "candidate-a");
+        assert_eq!(branch.parent_actor_id, 7);
+        assert_eq!(branch.fork_sequence, 3);
+        assert_eq!(branch.parent_latest_sequence, 5);
+        assert_eq!(branch.snapshot_sequence, 2);
+        assert_eq!(branch.state.get("count"), Some(&PersistedValue::Int(11)));
+        assert_eq!(branch.journal.len(), 1);
+        assert_eq!(branch.events.len(), 1);
+
+        // Capturing a branch is read-only: the parent remains at its head.
+        let parent = rewind_entity(&store, 7, u64::MAX);
+        assert_eq!(parent.sequence, 5);
+        assert_eq!(parent.state.get("count"), Some(&PersistedValue::Int(13)));
+    }
+
+    #[test]
+    fn branch_diff_reports_parent_changes_after_divergence() {
+        let store = sample_store();
+        let branch = fork_entity_view(&store, 7, 3, "candidate-a");
+        let diff = diff_branch_from_parent_head(&store, &branch);
+
+        assert_eq!(
+            diff,
+            vec![StateDiff {
+                field: "count".to_string(),
+                before: Some(PersistedValue::Int(11)),
+                after: Some(PersistedValue::Int(13)),
+            }]
+        );
+    }
+
+    #[test]
+    fn diff_states_reports_added_removed_and_changed_fields_in_order() {
+        let before = BTreeMap::from([
+            ("changed".to_string(), PersistedValue::Int(1)),
+            ("removed".to_string(), PersistedValue::Bool(true)),
+            ("same".to_string(), PersistedValue::String("x".to_string())),
+        ]);
+        let after = BTreeMap::from([
+            ("added".to_string(), PersistedValue::Int(9)),
+            ("changed".to_string(), PersistedValue::Int(2)),
+            ("same".to_string(), PersistedValue::String("x".to_string())),
+        ]);
+
+        let diff = diff_states(&before, &after);
+        assert_eq!(
+            diff,
+            vec![
+                StateDiff {
+                    field: "added".to_string(),
+                    before: None,
+                    after: Some(PersistedValue::Int(9)),
+                },
+                StateDiff {
+                    field: "changed".to_string(),
+                    before: Some(PersistedValue::Int(1)),
+                    after: Some(PersistedValue::Int(2)),
+                },
+                StateDiff {
+                    field: "removed".to_string(),
+                    before: Some(PersistedValue::Bool(true)),
+                    after: None,
+                },
+            ]
+        );
     }
 }
