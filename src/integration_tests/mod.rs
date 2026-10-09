@@ -8432,6 +8432,60 @@ match { a: 2, b: 9 } with {
         );
     }
 
+    /// An immediately completing compiled workflow must not commit its
+    /// mutated state ahead of StepCompleted. If the terminal append fails,
+    /// neither the actor nor an advanced snapshot may be observable.
+    #[test]
+    fn test_workflow_immediate_step_terminal_append_failure_keeps_safe_snapshot() {
+        let source = r#"
+            workflow ImmediateRejectTerminal {
+                step write { self.answer = "uncommitted" }
+            }
+            let w = spawn ImmediateRejectTerminal {} in { w }
+        "#;
+        let backing = SharedMemoryStore::new();
+        let (module, _ty) = compile_source(source).unwrap();
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        rt.borrow_mut().persistence = Box::new(RejectStepCompletedStore(backing.clone()));
+
+        let value = {
+            let mut vm = VM::new();
+            vm.load_module(module);
+            vm.set_actor_callbacks(Box::new(RuntimeVmCallbacks::new(rt.clone())));
+            vm.run().unwrap()
+        };
+        let actor_id = value.as_actor_id().expect("spawn should return actor ref");
+        let safe = backing
+            .load_snapshot(actor_id)
+            .expect("safe initial snapshot");
+
+        rt.borrow_mut().send_message_by_id(actor_id, 0, &[]);
+        rt.borrow_mut().run_scheduler();
+
+        assert!(
+            !rt.borrow().actors.contains_key(&actor_id),
+            "failed terminal persistence must quarantine the completed actor"
+        );
+        assert!(
+            !backing.read_workflow_events(actor_id).iter().any(|event| {
+                matches!(event, WorkflowEvent::StepCompleted { step_name, .. } if step_name == "write")
+            }),
+            "rejected completion must never appear as a durable terminal event"
+        );
+        let recovered = backing
+            .load_snapshot(actor_id)
+            .expect("initial snapshot intact");
+        assert_eq!(
+            recovered.sequence, safe.sequence,
+            "unsuspended step must not checkpoint uncommitted mutations"
+        );
+        assert_eq!(
+            recovered.state.get("step_index"),
+            safe.state.get("step_index")
+        );
+        assert_eq!(recovered.state.get("answer"), safe.state.get("answer"));
+    }
+
     /// Crash-and-recover for a workflow step suspended on `Inference.ask`: the
     /// persisted suspension marker lets recovery re-drive the interrupted
     /// step, which re-issues the call on the new runtime and completes the

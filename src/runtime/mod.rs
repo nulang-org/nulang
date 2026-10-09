@@ -4218,7 +4218,12 @@ impl Runtime {
                 self.suspend_enabled = saved_suspend;
                 match result {
                     Ok(_) => {
-                        self.checkpoint_actor(actor_id);
+                        // A compiled workflow has not committed its terminal
+                        // StepCompleted yet. Publishing an advanced snapshot
+                        // here would make an uncommitted step appear durable.
+                        if !self.actor_is_workflow(actor_id) {
+                            self.checkpoint_actor(actor_id);
+                        }
                         processed = true;
                     }
                     Err(crate::types::NuError::Suspended(_)) => {
@@ -4298,15 +4303,29 @@ impl Runtime {
                     }
                 } else {
                     let seq = self.next_sequence(actor_id);
-                    let _ = self.persistence.append_workflow_event(
-                        actor_id,
-                        WorkflowEvent::StepCompleted {
-                            sequence: seq,
-                            activation: workflow_activation,
-                            step_name,
-                        },
-                    );
-                    self.checkpoint_actor(actor_id);
+                    let terminal_result = self
+                        .persistence
+                        .append_workflow_event(
+                            actor_id,
+                            WorkflowEvent::StepCompleted {
+                                sequence: seq,
+                                activation: workflow_activation,
+                                step_name,
+                            },
+                        )
+                        .and_then(|_| workflow::try_checkpoint_actor(self, actor_id));
+                    if let Err(error) = terminal_result {
+                        tracing::error!(
+                            actor_id,
+                            %error,
+                            "nulang-workflow: compiled terminal persistence failed; quarantining uncommitted actor"
+                        );
+                        self.actors.remove(&actor_id);
+                        self.pending_receive_wakes
+                            .retain(|queued| *queued != actor_id);
+                        self.current_actor = None;
+                        return;
+                    }
                 }
             }
             let actor = match self.actors.get_mut(&actor_id) {
