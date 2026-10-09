@@ -8444,6 +8444,10 @@ fn resumed_workflow_step_records_completion_and_checkpoint_together_on_success()
         )
         .unwrap();
 
+    // Regression: LLM and signal resumes previously left the suspension
+    // marker visible after the terminal workflow step committed.
+    rt.actors.get_mut(&actor_id).unwrap().waiting_signal =
+        Some("__llm_ask_pending__".to_string());
     assert!(workflow::finish_resumed_workflow_step(
         &mut rt,
         actor_id,
@@ -8462,6 +8466,11 @@ fn resumed_workflow_step_records_completion_and_checkpoint_together_on_success()
         rt.persistence.read_workflow_events(actor_id).last(),
         Some(WorkflowEvent::StepCompleted { step_name, .. }) if step_name == "wait"
     ));
+    assert_eq!(
+        rt.actors.get(&actor_id).unwrap().waiting_signal,
+        None,
+        "terminal completion must remove the active suspension marker"
+    );
 }
 
 #[test]
