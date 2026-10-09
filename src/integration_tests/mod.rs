@@ -72,6 +72,52 @@ mod tests {
         }
     }
 
+    /// Real VM-resume failure injection: only the terminal StepCompleted
+    /// append is rejected. Command admission, suspension journaling, and the
+    /// actor's initial checkpoint still use the real shared memory backend.
+    #[derive(Clone)]
+    struct RejectStepCompletedStore(SharedMemoryStore);
+
+    impl PersistenceStore for RejectStepCompletedStore {
+        fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> std::io::Result<()> {
+            self.0.save_snapshot(snapshot)
+        }
+        fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+            self.0.load_snapshot(actor_id)
+        }
+        fn append_journal(&mut self, actor_id: u64, entry: JournalEntry) -> std::io::Result<()> {
+            self.0.append_journal(actor_id, entry)
+        }
+        fn read_journal(&self, actor_id: u64) -> Vec<JournalEntry> {
+            self.0.read_journal(actor_id)
+        }
+        fn append_workflow_event(
+            &mut self,
+            actor_id: u64,
+            event: WorkflowEvent,
+        ) -> std::io::Result<()> {
+            if matches!(event, WorkflowEvent::StepCompleted { .. }) {
+                return Err(std::io::Error::other("injected terminal workflow append failure"));
+            }
+            self.0.append_workflow_event(actor_id, event)
+        }
+        fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
+            self.0.read_workflow_events(actor_id)
+        }
+        fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> std::io::Result<()> {
+            self.0.append_event(actor_id, entry)
+        }
+        fn read_events(&self, actor_id: u64) -> Vec<EventEntry> {
+            self.0.read_events(actor_id)
+        }
+        fn latest_sequence(&self, actor_id: u64) -> u64 {
+            self.0.latest_sequence(actor_id)
+        }
+        fn clear(&mut self, actor_id: u64) -> std::io::Result<()> {
+            self.0.clear(actor_id)
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Test helpers
     // -----------------------------------------------------------------------
