@@ -63,6 +63,8 @@ pub mod bytecode;
 pub mod format;
 #[path = "../../../src/mir.rs"]
 pub mod mir;
+#[path = "../../../src/compiler_intrinsics.rs"]
+pub mod compiler_intrinsics;
 #[path = "../../../src/content_identity.rs"]
 pub mod content_identity;
 #[path = "../../../src/semantic_identity.rs"]
