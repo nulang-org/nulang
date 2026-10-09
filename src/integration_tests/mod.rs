@@ -97,7 +97,9 @@ mod tests {
             event: WorkflowEvent,
         ) -> std::io::Result<()> {
             if matches!(event, WorkflowEvent::StepCompleted { .. }) {
-                return Err(std::io::Error::other("injected terminal workflow append failure"));
+                return Err(std::io::Error::other(
+                    "injected terminal workflow append failure",
+                ));
             }
             self.0.append_workflow_event(actor_id, event)
         }
@@ -8239,7 +8241,11 @@ match { a: 2, b: 9 } with {
             "rejected StepCompleted must not appear in committed history"
         );
         assert_eq!(
-            backing.load_snapshot(actor_id).unwrap().state.get("step_index"),
+            backing
+                .load_snapshot(actor_id)
+                .unwrap()
+                .state
+                .get("step_index"),
             Some(&crate::runtime::PersistedValue::Int(0)),
             "the uncommitted resumed step_index must not appear in the durable snapshot"
         );
@@ -8270,12 +8276,19 @@ match { a: 2, b: 9 } with {
         rt.borrow_mut().send_message_by_id(actor_id, 0, &[]);
         rt.borrow_mut().run_scheduler();
         assert_eq!(
-            rt.borrow().actors.get(&actor_id).unwrap().waiting_signal.as_deref(),
+            rt.borrow()
+                .actors
+                .get(&actor_id)
+                .unwrap()
+                .waiting_signal
+                .as_deref(),
             Some("go"),
             "must suspend before failure injection reaches the terminal event"
         );
 
-        rt.borrow_mut().signal_workflow(actor_id, "go", None).unwrap();
+        rt.borrow_mut()
+            .signal_workflow(actor_id, "go", None)
+            .unwrap();
 
         assert!(
             !rt.borrow().actors.contains_key(&actor_id),
@@ -8287,7 +8300,11 @@ match { a: 2, b: 9 } with {
             })
         );
         assert_eq!(
-            backing.load_snapshot(actor_id).unwrap().state.get("step_index"),
+            backing
+                .load_snapshot(actor_id)
+                .unwrap()
+                .state
+                .get("step_index"),
             Some(&crate::runtime::PersistedValue::Int(0))
         );
     }
