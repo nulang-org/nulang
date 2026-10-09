@@ -811,31 +811,58 @@ pub struct CampaignStats {
     /// Generated program failed to compile — a generator or frontend bug
     /// worth reporting (kept as sources for inspection).
     pub compile_failures: Vec<(u64, String)>,
-    /// Divergences in the known 48-bit-overflow semantics gap: the
-    /// interpreter raises a checked-overflow error while the JIT/AOT
-    /// backends wrap (AOT pins this in
-    /// `aot::codegen::tests::test_aot_float_pow_and_int_pow_overflow`),
-    /// record-and-continue with nil, or raise at a different op. Tracked
-    /// and persisted separately from unknown divergences so campaigns
-    /// stay signal-rich; see docs/DIFFERENTIAL_FUZZING.md "Findings".
-    pub known_overflow: Vec<Divergence>,
+    /// Any disagreement between the bytecode oracle and an accepted backend.
+    /// Historical bug classes are fatal too; no divergence whitelist exists.
     pub divergences: Vec<Divergence>,
 }
 
-/// A divergence belongs to the known overflow-semantics class iff the
-/// checked 48-bit overflow error appears on at least one side of the
-/// disagreement (the oracle message embeds each backend's outcome).
-pub fn is_overflow_semantics_divergence(message: &str) -> bool {
-    message.contains("exceeds the 48-bit range")
+/// Record every backend mismatch as a fatal campaign divergence.
+///
+/// Keep the seed and exact program at the ordinary crasher path. Persistence
+/// errors are surfaced instead of silently discarding the reproducer.
+fn record_divergence(
+    stats: &mut CampaignStats,
+    seed: u64,
+    source: String,
+    message: String,
+    crasher_dir: Option<&std::path::Path>,
+    verbose: bool,
+) {
+    if verbose {
+        eprintln!("DIVERGENCE seed={seed:#x}: {message}");
+    }
+
+    if let Some(dir) = crasher_dir {
+        if let Err(error) = std::fs::create_dir_all(dir) {
+            eprintln!("DIVERGENCE seed={seed:#x}: cannot create crasher directory: {error}");
+        } else {
+            let path = dir.join(format!("seed_{seed:016x}.nula"));
+            let body = format!(
+                "// Differential fuzzer crasher\n// seed: {0} (0x{0:x})\n// {1}\n// reproduce: nula_difffuzz --seeds 1 --seed-base {0}\n\n{2}\n",
+                seed,
+                message.replace('\n', "\n// "),
+                source
+            );
+            if let Err(error) = std::fs::write(&path, body) {
+                eprintln!(
+                    "DIVERGENCE seed={seed:#x}: failed to save crasher {}: {error}",
+                    path.display()
+                );
+            }
+        }
+    }
+    stats.divergences.push(Divergence {
+        seed,
+        source,
+        message,
+    });
 }
 
 /// Run a differential campaign over seeds `base_seed .. base_seed + count`
 /// (stopping early at `deadline` when given). On divergence the source is
 /// persisted to `crasher_dir/<seed>.nula` with the oracle message in a
-/// header comment, and the seed is printed on stdout. Divergences in the
-/// known 48-bit-overflow semantics class (`is_overflow_semantics_divergence`)
-/// are persisted under `crasher_dir/known-overflow/` and tallied apart from
-/// untriaged divergences.
+/// header comment, and the seed is printed on stdout. No historical or
+/// known divergence class is excluded from the fatal campaign result.
 pub fn run_campaign(
     base_seed: u64,
     count: u64,
@@ -881,47 +908,14 @@ pub fn run_campaign(
                 }
             }
             Err(message) => {
-                let known = is_overflow_semantics_divergence(&message);
-                if verbose {
-                    eprintln!(
-                        "{} seed={:#x}: {}",
-                        if known {
-                            "KNOWN-OVERFLOW"
-                        } else {
-                            "DIVERGENCE"
-                        },
-                        seed,
-                        message
-                    );
-                }
-                if let Some(dir) = crasher_dir {
-                    // Known-class crashers go to a subdirectory so the top
-                    // level only ever holds untriaged divergences.
-                    let dir = if known {
-                        dir.join("known-overflow")
-                    } else {
-                        dir.to_path_buf()
-                    };
-                    let _ = std::fs::create_dir_all(&dir);
-                    let path = dir.join(format!("seed_{:016x}.nula", seed));
-                    let body = format!(
-                        "// Differential fuzzer crasher\n// seed: {0} (0x{0:x})\n// {1}\n// reproduce: nula_difffuzz --seeds 1 --seed-base {0}\n\n{2}\n",
-                        seed,
-                        message.replace('\n', "\n// "),
-                        source
-                    );
-                    let _ = std::fs::write(path, body);
-                }
-                let d = Divergence {
+                record_divergence(
+                    &mut stats,
                     seed,
                     source,
                     message,
-                };
-                if known {
-                    stats.known_overflow.push(d);
-                } else {
-                    stats.divergences.push(d);
-                }
+                    crasher_dir,
+                    verbose,
+                );
             }
         }
     }
@@ -975,14 +969,13 @@ mod tests {
     fn differential_smoke_50_seeds() {
         let stats = run_campaign(0xD1FF_0000, 50, None, None, false);
         eprintln!(
-            "difffuzz smoke: {} generated, {} agreed ({} with AOT, {} with WASM), {} uncomparable, {} compile failures, {} known-overflow, {} divergences",
+            "difffuzz smoke: {} generated, {} agreed ({} with AOT, {} with WASM), {} uncomparable, {} compile failures, {} divergences",
             stats.generated,
             stats.agreed,
             stats.aot_agreed,
             stats.wasm_agreed,
             stats.uncomparable,
             stats.compile_failures.len(),
-            stats.known_overflow.len(),
             stats.divergences.len()
         );
         assert!(
