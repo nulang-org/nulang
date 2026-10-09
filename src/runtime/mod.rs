@@ -4321,7 +4321,8 @@ impl Runtime {
                             "nulang-workflow: compiled terminal persistence failed; quarantining uncommitted actor"
                         );
                         self.actors.remove(&actor_id);
-                        self.pending_receive_wakes.retain(|queued| *queued != actor_id);
+                        self.pending_receive_wakes
+                            .retain(|queued| *queued != actor_id);
                         self.current_actor = None;
                         return;
                     }
