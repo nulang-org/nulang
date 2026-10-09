@@ -8620,10 +8620,17 @@ fn workflow_recovery_accepts_terminal_event_covered_by_completed_snapshot() {
         "wait".to_string(),
     ));
     let safe_snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
-    assert_eq!(safe_snapshot.state.get("step_index"), Some(&PersistedValue::Int(1)));
-    assert!(rt.persistence.read_workflow_events(actor_id).iter().any(|event| {
-        matches!(event, WorkflowEvent::StepCompleted { step_name, .. } if step_name == "wait")
-    }));
+    assert_eq!(
+        safe_snapshot.state.get("step_index"),
+        Some(&PersistedValue::Int(1))
+    );
+    assert!(rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .iter()
+        .any(|event| {
+            matches!(event, WorkflowEvent::StepCompleted { step_name, .. } if step_name == "wait")
+        }));
 
     rt.actors.remove(&actor_id);
     assert_eq!(
