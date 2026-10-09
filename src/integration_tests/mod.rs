@@ -8455,7 +8455,9 @@ match { a: 2, b: 9 } with {
             vm.run().unwrap()
         };
         let actor_id = value.as_actor_id().expect("spawn should return actor ref");
-        let safe = backing.load_snapshot(actor_id).expect("safe initial snapshot");
+        let safe = backing
+            .load_snapshot(actor_id)
+            .expect("safe initial snapshot");
 
         rt.borrow_mut().send_message_by_id(actor_id, 0, &[]);
         rt.borrow_mut().run_scheduler();
@@ -8470,12 +8472,17 @@ match { a: 2, b: 9 } with {
             }),
             "rejected completion must never appear as a durable terminal event"
         );
-        let recovered = backing.load_snapshot(actor_id).expect("initial snapshot intact");
+        let recovered = backing
+            .load_snapshot(actor_id)
+            .expect("initial snapshot intact");
         assert_eq!(
             recovered.sequence, safe.sequence,
             "unsuspended step must not checkpoint uncommitted mutations"
         );
-        assert_eq!(recovered.state.get("step_index"), safe.state.get("step_index"));
+        assert_eq!(
+            recovered.state.get("step_index"),
+            safe.state.get("step_index")
+        );
         assert_eq!(recovered.state.get("answer"), safe.state.get("answer"));
     }
 
