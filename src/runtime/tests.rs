@@ -8433,6 +8433,66 @@ fn workflow_broken_json_store() -> (JsonFileStore, std::path::PathBuf) {
 }
 
 #[test]
+fn resumed_workflow_step_records_completion_and_checkpoint_together_on_success() {
+    let mut rt = Runtime::new();
+    let models = HashMap::from([("step_index".to_string(), StateModel::Durable)]);
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "resume_success",
+            Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+            models,
+        )
+        .unwrap();
+
+    assert!(workflow::finish_resumed_workflow_step(
+        &mut rt,
+        actor_id,
+        None,
+        "wait".to_string(),
+    ));
+    assert_eq!(
+        rt.persistence
+            .load_snapshot(actor_id)
+            .unwrap()
+            .state
+            .get("step_index"),
+        Some(&PersistedValue::Int(1)),
+    );
+    assert!(matches!(
+        rt.persistence.read_workflow_events(actor_id).last(),
+        Some(WorkflowEvent::StepCompleted { step_name, .. }) if step_name == "wait"
+    ));
+}
+
+#[test]
+fn resumed_workflow_terminal_append_failure_quarantines_uncommitted_actor() {
+    let mut rt = Runtime::new();
+    let models = HashMap::from([("step_index".to_string(), StateModel::Durable)]);
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "resume_terminal_rejected",
+            Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+            models,
+        )
+        .unwrap();
+    let (store, path) = workflow_broken_json_store();
+    rt.persistence = Box::new(store);
+
+    assert!(!workflow::finish_resumed_workflow_step(
+        &mut rt,
+        actor_id,
+        None,
+        "wait".to_string(),
+    ));
+    assert!(
+        !rt.actors.contains_key(&actor_id),
+        "a workflow must not dispatch uncommitted resumed state after terminal persistence fails"
+    );
+    assert!(rt.persistence.read_workflow_events(actor_id).is_empty());
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn workflow_command_is_not_executed_when_durable_admission_fails() {
     let mut rt = Runtime::new();
     let actor_id = rt
