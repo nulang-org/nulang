@@ -1,0 +1,193 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nulang.org/spec/agent/v1/execution.schema.json",
+  "title": "NLAP v1 Execution",
+  "type": "object",
+  "properties": {
+    "session": { "$ref": "#/$defs/agent_session" },
+    "run": { "$ref": "#/$defs/agent_run" },
+    "task_attempt": { "$ref": "#/$defs/task_attempt" },
+    "workspace_lease": { "$ref": "#/$defs/workspace_lease" },
+    "change_set": { "$ref": "#/$defs/change_set" },
+    "artifact": { "$ref": "#/$defs/artifact" },
+    "evidence": { "$ref": "#/$defs/evidence" },
+    "tool_call": { "$ref": "#/$defs/tool_call" },
+    "checkpoint": { "$ref": "#/$defs/checkpoint" }
+  },
+  "$defs": {
+    "usage": {
+      "type": "object",
+      "required": ["input_tokens", "output_tokens", "cached_input_tokens", "cost_usd"],
+      "properties": {
+        "input_tokens": { "type": "integer", "minimum": 0 },
+        "output_tokens": { "type": "integer", "minimum": 0 },
+        "cached_input_tokens": { "type": "integer", "minimum": 0 },
+        "cost_usd": { "type": "number", "minimum": 0 }
+      }
+    },
+    "agent_session": {
+      "type": "object",
+      "required": ["id", "project_id", "agent_id", "model_profile", "status", "created_at", "updated_at"],
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "project_id": { "type": "string" },
+        "conversation_id": { "type": ["string", "null"], "format": "uuid" },
+        "parent_session_id": { "type": ["string", "null"], "format": "uuid" },
+        "agent_id": { "type": "string" },
+        "model_profile": { "type": "string" },
+        "status": { "enum": ["created", "running", "paused", "completed", "failed", "cancelled"] },
+        "created_at": { "type": "string", "format": "date-time" },
+        "updated_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "agent_run": {
+      "type": "object",
+      "required": ["id", "session_id", "sequence", "status", "usage", "created_at"],
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "session_id": { "type": "string", "format": "uuid" },
+        "task_attempt_id": { "type": ["string", "null"], "format": "uuid" },
+        "sequence": { "type": "integer", "minimum": 0 },
+        "status": { "enum": ["created", "running", "completed", "failed", "cancelled"] },
+        "usage": { "$ref": "#/$defs/usage" },
+        "created_at": { "type": "string", "format": "date-time" },
+        "started_at": { "type": ["string", "null"], "format": "date-time" },
+        "completed_at": { "type": ["string", "null"], "format": "date-time" }
+      }
+    },
+    "task_attempt": {
+      "type": "object",
+      "required": [
+        "id", "task_id", "attempt_number", "session_id", "agent_id", "workspace_id",
+        "base_revision", "status", "evidence_ids", "created_at", "updated_at"
+      ],
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "task_id": { "type": "string", "format": "uuid" },
+        "attempt_number": { "type": "integer", "minimum": 1 },
+        "session_id": { "type": "string", "format": "uuid" },
+        "agent_id": { "type": "string" },
+        "workspace_id": { "type": "string" },
+        "workspace_lease_id": { "type": ["string", "null"], "format": "uuid" },
+        "base_revision": { "type": "string" },
+        "status": {
+          "enum": ["created", "preparing", "running", "blocked", "verifying", "completed", "failed", "cancelled", "stale"]
+        },
+        "change_set_id": { "type": ["string", "null"], "format": "uuid" },
+        "evidence_ids": { "type": "array", "items": { "type": "string", "format": "uuid" } },
+        "failure": { "type": ["string", "null"] },
+        "created_at": { "type": "string", "format": "date-time" },
+        "started_at": { "type": ["string", "null"], "format": "date-time" },
+        "heartbeat_at": { "type": ["string", "null"], "format": "date-time" },
+        "completed_at": { "type": ["string", "null"], "format": "date-time" },
+        "updated_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "workspace_lease": {
+      "type": "object",
+      "required": [
+        "id", "project_id", "workspace_id", "holder_attempt_id", "base_revision",
+        "lease_epoch", "status", "acquired_at"
+      ],
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "project_id": { "type": "string" },
+        "workspace_id": { "type": "string" },
+        "holder_attempt_id": { "type": "string", "format": "uuid" },
+        "base_revision": { "type": "string" },
+        "lease_epoch": { "type": "integer", "minimum": 0 },
+        "status": { "enum": ["active", "released", "expired", "revoked"] },
+        "acquired_at": { "type": "string", "format": "date-time" },
+        "expires_at": { "type": ["string", "null"], "format": "date-time" },
+        "released_at": { "type": ["string", "null"], "format": "date-time" }
+      }
+    },
+    "anchored_edit": {
+      "type": "object",
+      "required": ["file_uri", "observed_revision", "observed_hash", "replacement"],
+      "properties": {
+        "file_uri": { "type": "string" },
+        "observed_revision": { "type": "string" },
+        "observed_hash": { "type": "string" },
+        "before_anchor": { "type": ["string", "null"] },
+        "after_anchor": { "type": ["string", "null"] },
+        "replacement": { "type": "string" }
+      }
+    },
+    "change_set": {
+      "type": "object",
+      "required": ["id", "attempt_id", "workspace_id", "base_revision", "edits", "status", "created_at", "updated_at"],
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "attempt_id": { "type": "string", "format": "uuid" },
+        "workspace_id": { "type": "string" },
+        "base_revision": { "type": "string" },
+        "resulting_revision": { "type": ["string", "null"] },
+        "edits": { "type": "array", "items": { "$ref": "#/$defs/anchored_edit" } },
+        "status": { "enum": ["proposed", "applied", "rejected", "superseded"] },
+        "created_at": { "type": "string", "format": "date-time" },
+        "updated_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "required": ["id", "attempt_id", "kind", "uri", "media_type", "digest", "created_at"],
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "attempt_id": { "type": "string", "format": "uuid" },
+        "kind": {
+          "enum": ["diff", "test_report", "diagnostics", "build_log", "screenshot", "browser_recording", "benchmark", "security_report", "review", "other"]
+        },
+        "uri": { "type": "string" },
+        "media_type": { "type": "string" },
+        "digest": { "type": "string" },
+        "label": { "type": ["string", "null"] },
+        "created_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["id", "attempt_id", "kind", "status", "summary", "created_at"],
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "attempt_id": { "type": "string", "format": "uuid" },
+        "kind": { "enum": ["test", "diagnostics", "build", "lint", "typecheck", "browser", "benchmark", "security", "review", "other"] },
+        "status": { "enum": ["pending", "passed", "failed", "inconclusive"] },
+        "summary": { "type": "string" },
+        "artifact_id": { "type": ["string", "null"], "format": "uuid" },
+        "criterion": { "type": ["string", "null"] },
+        "created_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "tool_call": {
+      "type": "object",
+      "required": ["id", "attempt_id", "tool_name", "arguments", "idempotency_key", "status", "prepared_at"],
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "attempt_id": { "type": "string", "format": "uuid" },
+        "tool_name": { "type": "string" },
+        "arguments": {},
+        "idempotency_key": { "type": "string" },
+        "status": { "enum": ["prepared", "running", "completed", "failed", "cancelled"] },
+        "result": {},
+        "error": { "type": ["string", "null"] },
+        "prepared_at": { "type": "string", "format": "date-time" },
+        "started_at": { "type": ["string", "null"], "format": "date-time" },
+        "completed_at": { "type": ["string", "null"], "format": "date-time" }
+      }
+    },
+    "checkpoint": {
+      "type": "object",
+      "required": ["id", "session_id", "sequence", "state_digest", "created_at"],
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "session_id": { "type": "string", "format": "uuid" },
+        "task_attempt_id": { "type": ["string", "null"], "format": "uuid" },
+        "sequence": { "type": "integer", "minimum": 0 },
+        "state_uri": { "type": ["string", "null"] },
+        "state_digest": { "type": "string" },
+        "created_at": { "type": "string", "format": "date-time" }
+      }
+    }
+  }
+}
