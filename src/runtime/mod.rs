@@ -5594,6 +5594,33 @@ impl Runtime {
             None
         };
 
+        // Legacy compiled workflows append a terminal event and then save a
+        // snapshot as two independent writes. A crash between those writes
+        // leaves a terminal marker ahead of the last safe state checkpoint.
+        // Applying only StepCompleted/StepFailed would publish an advanced
+        // step_index without the handler's nonjournaled durable mutations.
+        //
+        // Until RFC 0022 activation replay can reconstruct that full state,
+        // fail closed. Unfinished atomic activations are handled separately
+        // above and must not be rejected merely for having intermediate
+        // replay-identified events beyond the safe snapshot.
+        if is_workflow
+            && pending_atomic_workflow_replay.is_none()
+            && workflow_events.iter().any(|event| {
+                event.sequence() > snapshot.sequence
+                    && matches!(
+                        event,
+                        WorkflowEvent::StepCompleted { .. } | WorkflowEvent::StepFailed { .. }
+                    )
+            })
+        {
+            warn!(
+                "nulang-recover: refusing workflow actor {}: terminal workflow event exists beyond safe snapshot sequence {}; legacy terminal/checkpoint pair may be partial",
+                actor_id, snapshot.sequence
+            );
+            return None;
+        }
+
         let journal_to_replay: Vec<JournalEntry> = if is_workflow {
             Vec::new()
         } else {

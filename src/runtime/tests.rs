@@ -8589,6 +8589,98 @@ fn resumed_workflow_checkpoint_failure_quarantines_partial_terminal_history() {
         Some(&PersistedValue::Int(0)),
         "the failed checkpoint must not commit the advanced step_index"
     );
+    // A terminal marker alone cannot reconstruct the nonjournaled state
+    // mutations of the step. The old recovery implementation applied the
+    // marker on top of the old snapshot and re-published a corrupt actor.
+    assert!(
+        rt.recover_actor(actor_id).is_none(),
+        "an orphan terminal event must not resurrect a partial workflow step"
+    );
+    assert!(
+        !rt.actors.contains_key(&actor_id),
+        "recovery must leave the actor quarantined"
+    );
+}
+
+#[test]
+fn workflow_recovery_accepts_terminal_event_covered_by_completed_snapshot() {
+    let mut rt = Runtime::new();
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "safe_terminal_recovery",
+            Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+            HashMap::from([("step_index".to_string(), StateModel::Durable)]),
+        )
+        .unwrap();
+
+    assert!(workflow::finish_resumed_workflow_step(
+        &mut rt,
+        actor_id,
+        None,
+        "wait".to_string(),
+    ));
+    let safe_snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(
+        safe_snapshot.state.get("step_index"),
+        Some(&PersistedValue::Int(1))
+    );
+    assert!(rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .iter()
+        .any(|event| {
+            matches!(event, WorkflowEvent::StepCompleted { step_name, .. } if step_name == "wait")
+        }));
+
+    rt.actors.remove(&actor_id);
+    assert_eq!(
+        rt.recover_actor(actor_id),
+        Some(actor_id),
+        "a terminal record covered by a committed snapshot remains recoverable"
+    );
+    assert_eq!(
+        rt.actors[&actor_id]
+            .get_state_field("step_index")
+            .and_then(|value| value.as_int()),
+        Some(1)
+    );
+}
+
+#[test]
+fn workflow_recovery_rejects_failed_terminal_event_beyond_safe_snapshot() {
+    let mut rt = Runtime::new();
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "failed_step_orphan",
+            Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+            HashMap::from([("step_index".to_string(), StateModel::Durable)]),
+        )
+        .unwrap();
+    let safe_snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    let sequence = rt.persistence.latest_sequence(actor_id) + 1;
+    rt.persistence
+        .append_workflow_event(
+            actor_id,
+            WorkflowEvent::StepFailed {
+                sequence,
+                activation: None,
+                step_name: "write".to_string(),
+                error: "injected failure before checkpoint".to_string(),
+            },
+        )
+        .unwrap();
+
+    rt.actors.remove(&actor_id);
+    assert!(
+        rt.recover_actor(actor_id).is_none(),
+        "a failed step marker without committed state must not be replayed as completed"
+    );
+    assert!(!rt.actors.contains_key(&actor_id));
+    assert_eq!(
+        rt.persistence.load_snapshot(actor_id).unwrap().sequence,
+        safe_snapshot.sequence,
+        "failed recovery must preserve the last safe checkpoint"
+    );
 }
 
 #[test]
