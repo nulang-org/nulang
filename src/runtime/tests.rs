@@ -8647,6 +8647,43 @@ fn workflow_recovery_accepts_terminal_event_covered_by_completed_snapshot() {
 }
 
 #[test]
+fn workflow_recovery_rejects_failed_terminal_event_beyond_safe_snapshot() {
+    let mut rt = Runtime::new();
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "failed_step_orphan",
+            Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+            HashMap::from([("step_index".to_string(), StateModel::Durable)]),
+        )
+        .unwrap();
+    let safe_snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    let sequence = rt.persistence.latest_sequence(actor_id) + 1;
+    rt.persistence
+        .append_workflow_event(
+            actor_id,
+            WorkflowEvent::StepFailed {
+                sequence,
+                activation: None,
+                step_name: "write".to_string(),
+                error: "injected failure before checkpoint".to_string(),
+            },
+        )
+        .unwrap();
+
+    rt.actors.remove(&actor_id);
+    assert!(
+        rt.recover_actor(actor_id).is_none(),
+        "a failed step marker without committed state must not be replayed as completed"
+    );
+    assert!(!rt.actors.contains_key(&actor_id));
+    assert_eq!(
+        rt.persistence.load_snapshot(actor_id).unwrap().sequence,
+        safe_snapshot.sequence,
+        "failed recovery must preserve the last safe checkpoint"
+    );
+}
+
+#[test]
 fn workflow_command_is_not_executed_when_durable_admission_fails() {
     let mut rt = Runtime::new();
     let actor_id = rt
