@@ -53,6 +53,22 @@ impl WalBackedTablet {
         self.tablet.current_sequence()
     }
 
+    /// Estimated logical bytes in the active mutable memtable.
+    pub fn mutable_memtable_bytes(&self) -> usize {
+        self.tablet.mutable_memtable_bytes()
+    }
+
+    /// Number of frozen in-memory generations awaiting a future flush path.
+    pub fn immutable_memtable_count(&self) -> usize {
+        self.tablet.immutable_memtable_count()
+    }
+
+    /// Freeze the active mutable generation when it reaches the supplied byte target.
+    /// Rotation is in-memory only; persistence and WAL reclamation are unchanged.
+    pub fn rotate_memtable_if_bytes_at_least(&mut self, min_bytes: usize) -> bool {
+        self.tablet.rotate_memtable_if_bytes_at_least(min_bytes)
+    }
+
     pub fn prepare_write(
         &self,
         presented_epoch: u64,
