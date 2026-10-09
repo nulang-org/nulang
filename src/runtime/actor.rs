@@ -497,8 +497,10 @@ impl Actor {
             vm,
             module_hash,
         )?;
+        let stored_bytes = crate::compression::encode_blob(&bytes)
+            .map_err(|error| format!("failed to encode hibernation continuation: {error}"))?;
         self.hibernation_state = Some(HibernationState {
-            continuation_bytes: bytes.clone(),
+            continuation_bytes: stored_bytes.clone(),
             module_hash: *module_hash,
             hibernated_at_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -506,7 +508,7 @@ impl Actor {
                 .as_millis() as u64,
             state_fields: self.state_data.clone(),
         });
-        Ok(bytes)
+        Ok(stored_bytes)
     }
 
     /// Wake this actor from hibernation: deserialize and restore VM state.
@@ -519,8 +521,11 @@ impl Actor {
         if hibernation.continuation_bytes.is_empty() {
             return Ok(());
         }
+        let continuation_bytes =
+            crate::compression::decode_blob_or_raw(&hibernation.continuation_bytes)
+                .map_err(|error| format!("failed to decode hibernation continuation: {error}"))?;
         let (cont, handlers) = crate::runtime::heap_serialize::deserialize_continuation(
-            &hibernation.continuation_bytes,
+            continuation_bytes.as_ref(),
             vm,
         )?;
         // Restore VM state
@@ -755,6 +760,39 @@ impl Actor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wake_from_hibernation_accepts_legacy_unwrapped_nlcs_continuation() {
+        let mut vm = crate::vm::VM::new();
+        let continuation = crate::vm::Continuation {
+            frames: vec![crate::vm::Frame::new(None, 0)],
+            current_frame_idx: 0,
+            resume_pc: 0,
+            resume_dst: 0,
+            step_count: 0,
+            handler_stack_snapshot: Vec::new(),
+        };
+        let module_hash = [0u8; 32];
+        let legacy_bytes = crate::runtime::heap_serialize::serialize_continuation(
+            &continuation,
+            &[],
+            &vm,
+            &module_hash,
+        )
+        .unwrap();
+        assert!(legacy_bytes.starts_with(b"NLCS"));
+
+        let mut actor = Actor::new(1, "legacy", 0);
+        actor.hibernation_state = Some(HibernationState {
+            continuation_bytes: legacy_bytes,
+            module_hash,
+            hibernated_at_ms: 0,
+            state_fields: std::collections::HashMap::new(),
+        });
+
+        actor.wake_from_hibernation(&mut vm).unwrap();
+        assert!(!actor.is_hibernated());
+    }
 
     #[test]
     fn test_actor_new() {
