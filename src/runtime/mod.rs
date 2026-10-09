@@ -1682,27 +1682,10 @@ impl Runtime {
             actor.waiting_signal = None;
         }
 
+        let mut completed_workflow_step = false;
         match result {
             Ok(_) => {
-                if self.actor_is_workflow(actor_id) {
-                    if let Some(actor) = self.actors.get_mut(&actor_id) {
-                        if let Some(n) =
-                            actor.get_state_field("step_index").and_then(|v| v.as_int())
-                        {
-                            actor.set_state_field("step_index", Value::int(n + 1));
-                        }
-                    }
-                    let seq = self.next_sequence(actor_id);
-                    let _ = self.persistence.append_workflow_event(
-                        actor_id,
-                        WorkflowEvent::StepCompleted {
-                            sequence: seq,
-                            activation: suspended.activation,
-                            step_name,
-                        },
-                    );
-                    self.checkpoint_actor(actor_id);
-                }
+                completed_workflow_step = self.actor_is_workflow(actor_id);
             }
             Err(crate::types::NuError::Suspended(_)) => {
                 // Suspended again - waiting for another signal OR on a
@@ -1734,7 +1717,7 @@ impl Runtime {
                                 vm_state,
                                 behavior_idx,
                                 activation: suspended.activation,
-                                step_name,
+                                step_name: step_name.clone(),
                             });
                     }
                     // A chained receive-after suspend arms its timeout
@@ -1754,7 +1737,18 @@ impl Runtime {
         // deferred wakes would clobber; the compensation arm runs nested
         // bytecode whose own begin/end must stay inside this window. Runs
         // on every path so wakes of other actors are not lost.
+        // Commit outside the shared VM borrow, before draining deferred wakes.
+        let committed = !completed_workflow_step
+            || workflow::finish_resumed_workflow_step(
+                self,
+                actor_id,
+                suspended.activation,
+                step_name,
+            );
         self.vm_exec_end();
+        if !committed {
+            return;
+        }
         // The suspension resolved (completed or failed): drain any mail
         // that queued up while the step was suspended.
         self.requeue_if_mail_pending(actor_id);
@@ -4802,6 +4796,7 @@ impl Runtime {
             return;
         }
         self.restore_suspended_workflow_activation(actor_id, suspended.activation);
+        let mut completed_workflow_step = false;
         let self_ptr: *mut Runtime = self;
         unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -4820,31 +4815,7 @@ impl Runtime {
             // Mirrors resume_suspended_llm_step.
             match result {
                 Ok(_) => {
-                    // The sleeping step ran to completion. For workflow
-                    // actors record the completion the same way the other
-                    // resume paths do: advance step_index, append
-                    // StepCompleted, and checkpoint. Without this the
-                    // step's body finishes but the workflow never advances
-                    // — SPEC2 known-issue #4's permanent stall.
-                    if (*self_ptr).actor_is_workflow(actor_id) {
-                        if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
-                            if let Some(n) =
-                                actor.get_state_field("step_index").and_then(|v| v.as_int())
-                            {
-                                actor.set_state_field("step_index", Value::int(n + 1));
-                            }
-                        }
-                        let seq = (*self_ptr).next_sequence(actor_id);
-                        let _ = (*self_ptr).persistence.append_workflow_event(
-                            actor_id,
-                            crate::runtime::WorkflowEvent::StepCompleted {
-                                sequence: seq,
-                                activation: suspended.activation,
-                                step_name: suspended.step_name.clone(),
-                            },
-                        );
-                        (*self_ptr).checkpoint_actor(actor_id);
-                    }
+                    completed_workflow_step = (*self_ptr).actor_is_workflow(actor_id);
                 }
                 Err(crate::types::NuError::Suspended(_)) => {
                     // Re-suspended (e.g. a chained Timer.sleep): re-capture
@@ -4869,7 +4840,19 @@ impl Runtime {
                     }
                 }
             }
-            (*self_ptr).vm_exec_end();
+        }
+        // Do not let the deferred-wake drain dispatch this actor until the
+        // terminal event and checkpoint have both succeeded.
+        let committed = !completed_workflow_step
+            || workflow::finish_resumed_workflow_step(
+                self,
+                actor_id,
+                suspended.activation,
+                suspended.step_name.clone(),
+            );
+        self.vm_exec_end();
+        if !committed {
+            return;
         }
         // Re-enqueue so the scheduler can continue processing the actor.
         self.enqueue_actor(actor_id);
@@ -4898,6 +4881,7 @@ impl Runtime {
         }
 
         self.restore_suspended_workflow_activation(actor_id, suspended.activation);
+        let mut completed_workflow_step = false;
         let self_ptr: *mut Runtime = self;
         unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -4924,22 +4908,8 @@ impl Runtime {
                     if (*self_ptr).actor_is_workflow(actor_id) {
                         if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
                             actor.waiting_signal = None;
-                            if let Some(n) =
-                                actor.get_state_field("step_index").and_then(|v| v.as_int())
-                            {
-                                actor.set_state_field("step_index", Value::int(n + 1));
-                            }
                         }
-                        let seq = (*self_ptr).next_sequence(actor_id);
-                        let _ = (*self_ptr).persistence.append_workflow_event(
-                            actor_id,
-                            WorkflowEvent::StepCompleted {
-                                sequence: seq,
-                                activation: suspended.activation,
-                                step_name: suspended.step_name,
-                            },
-                        );
-                        (*self_ptr).checkpoint_actor(actor_id);
+                        completed_workflow_step = true;
                     }
                 }
                 Err(crate::types::NuError::Suspended(VmSuspension::ReceiveWait)) => {
@@ -4956,7 +4926,7 @@ impl Runtime {
                                     vm_state,
                                     behavior_idx: suspended.behavior_idx,
                                     activation: suspended.activation,
-                                    step_name: suspended.step_name,
+                                    step_name: suspended.step_name.clone(),
                                 });
                         }
                         (*self_ptr).maybe_schedule_receive_wait(actor_id, timeout);
@@ -4978,7 +4948,7 @@ impl Runtime {
                                     vm_state,
                                     behavior_idx: suspended.behavior_idx,
                                     activation: suspended.activation,
-                                    step_name: suspended.step_name,
+                                    step_name: suspended.step_name.clone(),
                                 });
                         }
                     }
@@ -4992,7 +4962,19 @@ impl Runtime {
             // on the shared VM, which would clobber the frames an
             // un-captured suspend still needs. Runs on every path, so
             // wakes of other actors are not lost when THIS one suspends.
-            (*self_ptr).vm_exec_end();
+        }
+        // The VM borrow has ended; durable failure must quarantine the actor
+        // before vm_exec_end can process queued receive wakes.
+        let committed = !completed_workflow_step
+            || workflow::finish_resumed_workflow_step(
+                self,
+                actor_id,
+                suspended.activation,
+                suspended.step_name.clone(),
+            );
+        self.vm_exec_end();
+        if !committed {
+            return;
         }
         // The suspension resolved (completed or failed): if messages queued
         // up while the behavior was suspended, schedule the actor to drain
