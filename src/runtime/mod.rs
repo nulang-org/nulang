@@ -3105,6 +3105,16 @@ impl Runtime {
             .max(1)
     }
 
+    /// Compiler-verified actor JIT regions observed by the scheduler VM.
+    /// Exposed only in the library test harness; release runtime APIs are unchanged.
+    #[cfg(all(test, feature = "native-codegen"))]
+    pub(crate) fn benchmark_jit_compiled_count(&self) -> usize {
+        self.vm
+            .as_ref()
+            .map(|vm| vm.jit_compiled_count())
+            .unwrap_or(0)
+    }
+
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn run_scheduler(&mut self) {
         let mut ticks: u64 = 0;
