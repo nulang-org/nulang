@@ -27,6 +27,14 @@ backend correctness bug.
 
 ## Oracle
 
+All observed differences between the bytecode reference and an accepted backend
+are fatal. Historical 48-bit integer overflow discrepancies are **not** exempt;
+a regression produces a regular divergence, a nonzero campaign exit, and a
+seed/source crasher in the ordinary directory. This does not claim that every
+previous overflow disagreement has already been fixed; it makes regressions
+blocking instead of masking them.
+
+
 `fuzz::differential_fuzz_one(source)`:
 
 - Compile once (lex → parse → typecheck → HIR → MIR → bytecode). Programs
@@ -194,16 +202,13 @@ Reproduce any of these: `scripts/difffuzz.sh --seeds 1 --seed-base 0xD1FF0009`
 `seed * 0x9E3779B97F4A7C15 ^ 0xA5A55A5AD3C3B4A5`; earlier handoff seeds
 do not reproduce).
 
-Classification: every program that executes an overflowing int op is a
-divergence under the current backends, so the campaign classifies any
-divergence whose oracle message contains `exceeds the 48-bit range` into
-`CampaignStats::known_overflow` and persists it under
-`fuzz/differential/crashers/known-overflow/`; the top-level crashers
-directory remains reserved for untriaged classes. Per PLAN.md Phase 1,
-checked 48-bit arithmetic is Frozen-tier surface — this is a Sev-1
-correctness gap, not a fuzzer artifact. It needs a deliberate semantic
-decision (checked-everywhere vs wrap-everywhere) plus a JIT/AOT
-implementation pass; it is not fixable as a small generator-side change.
+Historical classification: the initial campaign separated overflow
+mismatches into a `known_overflow` bucket, which allowed a nominally
+successful campaign despite semantic disagreement. That exemption is removed.
+All backends must follow the bytecode reference for checked integer arithmetic;
+any recurrence is a fatal correctness regression, not a generator artifact.
+Prior published seed counts below describe the original campaign, not a
+current verified compatibility result.
 
 #### Finding 2 (fixed in generator): float division by zero — interp nil vs AOT value
 
