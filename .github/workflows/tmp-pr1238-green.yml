@@ -1,0 +1,110 @@
+name: Temporary PR1238 RED-GREEN validation
+
+on:
+  push:
+    branches:
+      - fix/remote-spawn-failure-1238
+
+permissions:
+  contents: write
+
+jobs:
+  red-green-commit:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Add remote-spawn failure regression
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path("src/runtime/callbacks.rs")
+          source = path.read_text()
+          marker = "#[cfg(test)]\nmod migration_authority_tests {"
+          if source.count(marker) != 1:
+              raise SystemExit("unexpected callbacks test insertion marker")
+          test = r'''
+#[cfg(test)]
+mod remote_spawn_failure_tests {
+    use super::BytecodeDistributedCallbacks;
+    use crate::runtime::Runtime;
+    use crate::vm::DistributedVmCallbacks;
+
+    #[test]
+    fn remote_spawn_without_distributed_runtime_returns_nil() {
+        let mut runtime = Runtime::new();
+        let runtime_ptr: *mut Runtime = &mut runtime;
+        let mut callbacks = BytecodeDistributedCallbacks {
+            runtime: runtime_ptr,
+        };
+
+        let result = callbacks.remote_spawn(42, "Worker", &[]);
+
+        assert!(
+            result.is_nil(),
+            "failed remote spawn must not manufacture a truthy ActorRef(0)"
+        );
+    }
+}
+
+'''
+          path.write_text(source.replace(marker, test + marker, 1))
+
+      - name: Prove regression is RED
+        shell: bash
+        run: |
+          set +e
+          cargo test --locked remote_spawn_without_distributed_runtime_returns_nil -- --nocapture 2>&1 | tee /tmp/red.log
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -ne 0
+          grep -F "failed remote spawn must not manufacture a truthy ActorRef(0)" /tmp/red.log
+
+      - name: Apply scoped failure-sentinel fix
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path("src/runtime/callbacks.rs")
+          source = path.read_text()
+          impl_marker = "impl DistributedVmCallbacks for BytecodeDistributedCallbacks {"
+          impl_start = source.index(impl_marker)
+          method_start = source.index("    fn remote_spawn(\n", impl_start)
+          method_end = source.index("    fn gossip(\n", method_start)
+          method = source[method_start:method_end]
+          old = "        } else {\n            Value::actor_ref(0)\n        };"
+          new = "        } else {\n            Value::nil()\n        };"
+          if method.count(old) != 1:
+              raise SystemExit("unexpected BytecodeDistributedCallbacks::remote_spawn failure arm")
+          patched_method = method.replace(old, new, 1)
+          path.write_text(source[:method_start] + patched_method + source[method_end:])
+
+      - name: Format patched source
+        run: cargo fmt --all
+
+      - name: Regression is GREEN
+        run: cargo test --locked remote_spawn_without_distributed_runtime_returns_nil -- --nocapture
+
+      - name: No-default-features check
+        run: cargo check --locked --no-default-features
+
+      - name: Verify narrow production/test diff
+        shell: bash
+        run: |
+          git diff --check
+          git diff -- src/runtime/callbacks.rs
+
+      - name: Commit validated patch and remove validator
+        shell: bash
+        run: |
+          rm .github/workflows/tmp-pr1238-green.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/runtime/callbacks.rs .github/workflows/tmp-pr1238-green.yml
+          git diff --cached --check
+          git commit -m "fix(runtime): fail remote spawn without actor-ref sentinel"
+          git push origin HEAD:fix/remote-spawn-failure-1238
