@@ -6,9 +6,7 @@
 #![cfg(all(feature = "sqlite", unix))]
 
 use nulang::durable_effect::{DurableEffectId, DurableEffectSpec};
-use nulang::durable_effect_runtime::{
-    DurableEffectCoordinator, DurableEffectDispatchDecision,
-};
+use nulang::durable_effect_runtime::{DurableEffectCoordinator, DurableEffectDispatchDecision};
 use nulang::primitives::{DeliverySemantics, EffectBoundary};
 use nulang::runtime::{
     ActorSnapshot, DurableTransition, LibsqlStore, PersistedValue, PersistenceStore,
@@ -63,7 +61,9 @@ fn init_actor_state(store: &mut LibsqlStore) {
     snapshot.actor_id = ACTOR_ID;
     snapshot.sequence = 1;
     snapshot.activation_epoch = 1;
-    snapshot.state.insert("balance".into(), PersistedValue::Int(100));
+    snapshot
+        .state
+        .insert("balance".into(), PersistedValue::Int(100));
     store
         .commit_transition(DurableTransition {
             version: DURABLE_TRANSITION_VERSION,
@@ -92,7 +92,8 @@ fn provider_execute(dir: &Path, id: DurableEffectId) -> Vec<u8> {
         return RESULT.to_vec();
     }
     let mut file = File::create(&path).expect("create provider mutation");
-    file.write_all(key.as_bytes()).expect("persist provider key");
+    file.write_all(key.as_bytes())
+        .expect("persist provider key");
     file.sync_all().expect("fsync provider mutation");
     File::open(dir)
         .expect("open provider directory")
@@ -235,7 +236,9 @@ fn hard_kill_after_provider_commit_retries_same_key_without_duplicate_mutation()
         );
         let deduplicated = provider_execute(&dir, spec.id);
         assert_eq!(deduplicated, RESULT);
-        coordinator.complete(spec.id, REQUEST, deduplicated).unwrap();
+        coordinator
+            .complete(spec.id, REQUEST, deduplicated)
+            .unwrap();
     }
     assert_eq!(recovered.latest_sequence(ACTOR_ID), 3);
     drop(recovered);
