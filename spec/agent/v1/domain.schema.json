@@ -12,6 +12,15 @@
     },
     "conversation": {
       "$ref": "#/$defs/conversation"
+    },
+    "artifact": {
+      "$ref": "#/$defs/artifact"
+    },
+    "evidence": {
+      "$ref": "#/$defs/evidence"
+    },
+    "budget": {
+      "$ref": "#/$defs/budget"
     }
   },
   "$defs": {
@@ -142,9 +151,6 @@
         "budget_usd": {
           "type": "number"
         },
-        "timeout": {
-          "type": "integer"
-        },
         "status": {
           "enum": [
             "created",
@@ -171,6 +177,9 @@
         "updated_at": {
           "type": "string",
           "format": "date-time"
+        },
+        "timeout_secs": {
+          "type": "integer"
         }
       }
     },
@@ -231,6 +240,150 @@
         "updated_at": {
           "type": "string",
           "format": "date-time"
+        }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "required": [
+        "id",
+        "goal_id",
+        "artifact_type",
+        "uri",
+        "created_at"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "goal_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "task_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "artifact_type": {
+          "type": "string"
+        },
+        "uri": {
+          "type": "string"
+        },
+        "mime_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "digest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metadata": {
+          "type": "object"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "required": [
+        "id",
+        "goal_id",
+        "evidence_type",
+        "summary",
+        "created_at"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "goal_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "task_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "artifact_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "evidence_type": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "passed": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "metadata": {
+          "type": "object"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "budget": {
+      "type": "object",
+      "properties": {
+        "max_cost_usd": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "max_duration_secs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "max_model_calls": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "max_tool_calls": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "max_parallel_agents": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
         }
       }
     }
