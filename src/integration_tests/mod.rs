@@ -8199,6 +8199,99 @@ match { a: 2, b: 9 } with {
         );
     }
 
+    /// Exercises the actual background LLM worker and shared VM resume:
+    /// a StepCompleted journal error must quarantine the actor, not make the
+    /// response or advanced step_index available for later dispatch.
+    #[cfg(feature = "ai-runtime")]
+    #[test]
+    fn test_workflow_llm_resume_terminal_append_failure_quarantines_actor() {
+        let source = r#"
+            workflow LlmRejectTerminal {
+                step ask_step { self.answer = perform Inference.ask("hello") }
+            }
+            let w = spawn LlmRejectTerminal {} in { w }
+        "#;
+        let backing = SharedMemoryStore::new();
+        let (module, _ty) = compile_source(source).unwrap();
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        rt.borrow_mut().persistence = Box::new(RejectStepCompletedStore(backing.clone()));
+        rt.borrow_mut()
+            .set_llm_client(Box::new(nulang_ai::MockLlmClient::text("world")));
+
+        let value = {
+            let mut vm = VM::new();
+            vm.load_module(module);
+            vm.set_actor_callbacks(Box::new(RuntimeVmCallbacks::new(rt.clone())));
+            vm.run().unwrap()
+        };
+        let actor_id = value.as_actor_id().expect("spawn should return actor ref");
+        rt.borrow_mut().send_message_by_id(actor_id, 0, &[]);
+        rt.borrow_mut().run_scheduler();
+
+        assert!(
+            !rt.borrow().actors.contains_key(&actor_id),
+            "a terminal-commit failure after LLM resume must quarantine the live actor"
+        );
+        assert!(
+            !backing.read_workflow_events(actor_id).iter().any(|event| {
+                matches!(event, WorkflowEvent::StepCompleted { step_name, .. } if step_name == "ask_step")
+            }),
+            "rejected StepCompleted must not appear in committed history"
+        );
+        assert_eq!(
+            backing.load_snapshot(actor_id).unwrap().state.get("step_index"),
+            Some(&crate::runtime::PersistedValue::Int(0)),
+            "the uncommitted resumed step_index must not appear in the durable snapshot"
+        );
+    }
+
+    /// The signal path resumes the compiled VM synchronously. A rejected
+    /// terminal event must not leave the resumed actor runnable.
+    #[test]
+    fn test_workflow_signal_resume_terminal_append_failure_quarantines_actor() {
+        let source = r#"
+            workflow SignalRejectTerminal {
+                step wait_step { (perform Signal.wait("go"), self.answer = "done") }
+            }
+            let w = spawn SignalRejectTerminal {} in { w }
+        "#;
+        let backing = SharedMemoryStore::new();
+        let (module, _ty) = compile_source(source).unwrap();
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        rt.borrow_mut().persistence = Box::new(RejectStepCompletedStore(backing.clone()));
+
+        let value = {
+            let mut vm = VM::new();
+            vm.load_module(module);
+            vm.set_actor_callbacks(Box::new(RuntimeVmCallbacks::new(rt.clone())));
+            vm.run().unwrap()
+        };
+        let actor_id = value.as_actor_id().expect("spawn should return actor ref");
+        rt.borrow_mut().send_message_by_id(actor_id, 0, &[]);
+        rt.borrow_mut().run_scheduler();
+        assert_eq!(
+            rt.borrow().actors.get(&actor_id).unwrap().waiting_signal.as_deref(),
+            Some("go"),
+            "must suspend before failure injection reaches the terminal event"
+        );
+
+        rt.borrow_mut().signal_workflow(actor_id, "go", None).unwrap();
+
+        assert!(
+            !rt.borrow().actors.contains_key(&actor_id),
+            "the signal-resumed actor must not dispatch after terminal journal rejection"
+        );
+        assert!(
+            !backing.read_workflow_events(actor_id).iter().any(|event| {
+                matches!(event, WorkflowEvent::StepCompleted { step_name, .. } if step_name == "wait_step")
+            })
+        );
+        assert_eq!(
+            backing.load_snapshot(actor_id).unwrap().state.get("step_index"),
+            Some(&crate::runtime::PersistedValue::Int(0))
+        );
+    }
+
     /// Crash-and-recover for a workflow step suspended on `Inference.ask`: the
     /// persisted suspension marker lets recovery re-drive the interrupted
     /// step, which re-issues the call on the new runtime and completes the
