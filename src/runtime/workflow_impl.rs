@@ -356,7 +356,10 @@ pub(crate) fn finish_resumed_workflow_step(
     let Some(actor) = rt.actors.get_mut(&actor_id) else {
         return false;
     };
-    if let Some(step) = actor.get_state_field("step_index").and_then(|value| value.as_int()) {
+    if let Some(step) = actor
+        .get_state_field("step_index")
+        .and_then(|value| value.as_int())
+    {
         actor.set_state_field("step_index", Value::int(step + 1));
     }
 
@@ -380,7 +383,8 @@ pub(crate) fn finish_resumed_workflow_step(
             "nulang-workflow: resumed terminal persistence failed; quarantining uncommitted actor"
         );
         rt.actors.remove(&actor_id);
-        rt.pending_receive_wakes.retain(|queued| *queued != actor_id);
+        rt.pending_receive_wakes
+            .retain(|queued| *queued != actor_id);
         return false;
     }
     true
