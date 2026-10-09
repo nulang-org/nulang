@@ -8309,6 +8309,129 @@ match { a: 2, b: 9 } with {
         );
     }
 
+    /// The Timer.sleep callback must complete through the shared fallible
+    /// persistence boundary rather than exposing a successful resumed step.
+    /// This drives a compiled VM continuation on a deterministic clock.
+    #[test]
+    fn test_workflow_timer_sleep_resume_terminal_append_failure_quarantines_actor() {
+        let source = r#"
+            workflow TimerRejectTerminal {
+                step wait { perform Timer.sleep(50) }
+            }
+            let w = spawn TimerRejectTerminal {} in { w }
+        "#;
+        let backing = SharedMemoryStore::new();
+        let (module, _ty) = compile_source(source).unwrap();
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        rt.borrow_mut().persistence = Box::new(RejectStepCompletedStore(backing.clone()));
+        rt.borrow_mut().install_virtual_clock();
+
+        let value = {
+            let mut vm = VM::new();
+            vm.load_module(module);
+            vm.set_actor_callbacks(Box::new(RuntimeVmCallbacks::new(rt.clone())));
+            vm.run().unwrap()
+        };
+        let actor_id = value.as_actor_id().expect("spawn should return actor ref");
+        rt.borrow_mut().send_message_by_id(actor_id, 0, &[]);
+        rt.borrow_mut().step_actor(actor_id);
+        assert!(
+            rt.borrow()
+                .actors
+                .get(&actor_id)
+                .unwrap()
+                .suspended_execution
+                .is_some(),
+            "Timer.sleep must suspend before terminal persistence is rejected"
+        );
+
+        rt.borrow_mut()
+            .advance_time(std::time::Duration::from_millis(100));
+        rt.borrow_mut().tick_timers();
+
+        assert!(
+            !rt.borrow().actors.contains_key(&actor_id),
+            "Timer.sleep resume must quarantine after terminal event rejection"
+        );
+        assert!(
+            !backing.read_workflow_events(actor_id).iter().any(|event| {
+                matches!(event, WorkflowEvent::StepCompleted { step_name, .. } if step_name == "wait")
+            }),
+            "rejected completion must not be visible in durable history"
+        );
+        assert_eq!(
+            backing
+                .load_snapshot(actor_id)
+                .unwrap()
+                .state
+                .get("step_index"),
+            Some(&crate::runtime::PersistedValue::Int(0))
+        );
+    }
+
+    /// Timed selective receive must also fail closed when the after clause
+    /// resolves through a suspended VM continuation. Using the workflow step
+    /// itself as a valid receive arm keeps the mailbox empty until timeout.
+    #[test]
+    fn test_workflow_timed_receive_resume_terminal_append_failure_quarantines_actor() {
+        let source = r#"
+            workflow ReceiveRejectTerminal {
+                step wait_step {
+                    self.answer = receive {
+                        | wait_step() => 1
+                    } after 50 => 4242
+                }
+            }
+            let w = spawn ReceiveRejectTerminal {} in { w }
+        "#;
+        let backing = SharedMemoryStore::new();
+        let (module, _ty) = compile_source(source).unwrap();
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        rt.borrow_mut().persistence = Box::new(RejectStepCompletedStore(backing.clone()));
+        rt.borrow_mut().install_virtual_clock();
+
+        let value = {
+            let mut vm = VM::new();
+            vm.load_module(module);
+            vm.set_actor_callbacks(Box::new(RuntimeVmCallbacks::new(rt.clone())));
+            vm.run().unwrap()
+        };
+        let actor_id = value.as_actor_id().expect("spawn should return actor ref");
+        rt.borrow_mut().send_message_by_id(actor_id, 0, &[]);
+        rt.borrow_mut().step_actor(actor_id);
+        assert!(
+            rt.borrow()
+                .actors
+                .get(&actor_id)
+                .unwrap()
+                .suspended_execution
+                .is_some(),
+            "timed receive must suspend before the timeout resolves the step"
+        );
+
+        rt.borrow_mut()
+            .advance_time(std::time::Duration::from_millis(100));
+        rt.borrow_mut().tick_timers();
+
+        assert!(
+            !rt.borrow().actors.contains_key(&actor_id),
+            "timed receive must quarantine on failed terminal persistence"
+        );
+        assert!(
+            !backing.read_workflow_events(actor_id).iter().any(|event| {
+                matches!(event, WorkflowEvent::StepCompleted { step_name, .. } if step_name == "wait_step")
+            })
+        );
+        assert_eq!(
+            backing
+                .load_snapshot(actor_id)
+                .unwrap()
+                .state
+                .get("step_index"),
+            Some(&crate::runtime::PersistedValue::Int(0))
+        );
+    }
+
     /// Crash-and-recover for a workflow step suspended on `Inference.ask`: the
     /// persisted suspension marker lets recovery re-drive the interrupted
     /// step, which re-issues the call on the new runtime and completes the
