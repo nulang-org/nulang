@@ -7,22 +7,23 @@ Welcome to Nulang! This tutorial walks you through the language from first princ
 
 ## 1. Installation
 
-Install Nulang by building from source:
+For zero-install evaluation, open the [browser playground](/playground/).
+
+For the full native runtime, download a checksummed release archive from
+[GitHub Releases](https://github.com/nulang-org/nulang/releases) and put the
+executable on your `PATH`. The tagged release matrix covers Linux
+x86_64/aarch64, macOS Apple Silicon, and Windows x86_64.
+
+Verify the native runtime:
 
 ```bash
-git clone https://github.com/nulang-org/nulang.git
-cd nulang
-cargo build --release
+nulang --version
+nulang --repl
 ```
 
-Verify your installation:
-
-```bash
-cargo run -- --version
-cargo run -- --repl
-```
-
-For detailed platform-specific instructions, see the [Installation](/getting-started/installation/) page.
+Build from source when contributing or customizing the runtime. See the
+[Installation](/getting-started/installation/) page for source prerequisites
+and feature flags.
 
 ## 2. Hello, World!
 
@@ -35,13 +36,13 @@ perform IO.print("Hello, Nulang!")
 Run it:
 
 ```bash
-cargo run -- --eval 'perform IO.print("Hello, Nulang!")'
+nulang --eval 'perform IO.print("Hello, Nulang!")'
 ```
 
 Or start the REPL and type interactively:
 
 ```bash
-cargo run -- --repl
+nulang --repl
 nulang> perform IO.print("Hello, Nulang!")
 ```
 

@@ -40,13 +40,13 @@ instructions/state live.
   @vscode/vsce package` → attach `nulang-0.1.0.vsix` to the GitHub release.
   Marketplace publication is optional for launch day; a `.vsix` on the
   release plus the README's manual-install steps is enough.
-- [ ] **Playground**: local version works via `python3 playground/server.py`
-  (README documents it). Hosted nulang.org/playground is "coming soon" —
-  either deploy it before launch (Cloudflare config exists: `wrangler.toml`,
-  `registry-worker/`) or make sure every post links the local-run
-  instructions, not the dead hosted URL. Branch
-  `fix/playground-backend-and-sandboxing` exists — check its status before
-  promising anything hosted.
+- [ ] **Playground production verification**: the real browser playground
+  (compiler frontend + CoreVM in WASM) is now part of the docs build at
+  `/playground/`, with CI coverage and deployment documentation in
+  `docs/PLAYGROUND_DEPLOY.md`. Before launch, verify the deployed
+  `https://nulang.org/playground/` URL from a clean browser and run the
+  smoke case against the built WASM bundle. Do not fall back to the legacy
+  local Python playground as the primary launch link.
 - [ ] **Registry seeding**: follow `docs/REGISTRY_SEEDING.md` — publish at
   least the priority wave (`json`, `json-ext`, `http-client`, `test-utils`)
   with `nula publish` against `nulang registry serve`. (Note: there is no
