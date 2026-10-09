@@ -24,6 +24,18 @@ jobs:
       RUST_BACKTRACE: "1"
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Pull requests normally check out a synthetic merge ref; this safety
+          # gate must execute the immutable code revision under review.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Prove immutable test head
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          actual="$(git rev-parse HEAD)"
+          echo "Exact code head: $actual"
+          test "$actual" = "$EXPECTED_HEAD"
 
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@stable
