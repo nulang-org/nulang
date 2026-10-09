@@ -8446,8 +8446,7 @@ fn resumed_workflow_step_records_completion_and_checkpoint_together_on_success()
 
     // Regression: LLM and signal resumes previously left the suspension
     // marker visible after the terminal workflow step committed.
-    rt.actors.get_mut(&actor_id).unwrap().waiting_signal =
-        Some("__llm_ask_pending__".to_string());
+    rt.actors.get_mut(&actor_id).unwrap().waiting_signal = Some("__llm_ask_pending__".to_string());
     assert!(workflow::finish_resumed_workflow_step(
         &mut rt,
         actor_id,
