@@ -1,0 +1,53 @@
+name: Transport stage benchmark
+
+on:
+  pull_request:
+    paths:
+      - 'benches/dist_bench.rs'
+      - 'benches/bench_main.rs'
+      - 'src/runtime/network.rs'
+      - 'tests/transport_stage_bench_contract.rs'
+      - '.github/workflows/transport-stage-bench-pr.yml'
+
+concurrency:
+  group: transport-stage-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  transport-roundtrip:
+    name: TCP/NUL0 transport RTT
+    if: github.head_ref == 'perf/transport-stage-rtt-current-main-20261004'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify measurement boundary contract
+        run: cargo test --locked --test transport_stage_bench_contract
+
+      - name: Measure transport-only request/return RTT
+        run: |
+          set -o pipefail
+          cargo bench --locked --bench bench_main -- 'dist/transport_roundtrip' --noplot | tee benchmark-output.txt
+
+      - name: Upload benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: transport-stage-rtt-${{ github.sha }}
+          path: |
+            benchmark-output.txt
+            target/criterion/dist/transport_roundtrip/tcp_plaintext_heartbeat/new/estimates.json
+          if-no-files-found: error
+          retention-days: 14
