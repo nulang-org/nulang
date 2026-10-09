@@ -47,11 +47,7 @@ fn component_host_grant(namespace: &str, operation: &str) -> AuthorityGrant {
 }
 
 #[cfg(feature = "wasm-backend")]
-fn allows_component_host(
-    authority: &AuthorityManifest,
-    namespace: &str,
-    operation: &str,
-) -> bool {
+fn allows_component_host(authority: &AuthorityManifest, namespace: &str, operation: &str) -> bool {
     authority.allows(&component_host_grant(namespace, operation))
 }
 
@@ -114,10 +110,7 @@ impl ComponentRuntime {
     ///
     /// Only WIT host functions whose exact grant is present are linked. A
     /// component importing any other host function fails instantiation.
-    pub fn new_with_authority(
-        wasm_bytes: &[u8],
-        authority: AuthorityManifest,
-    ) -> NuResult<Self> {
+    pub fn new_with_authority(wasm_bytes: &[u8], authority: AuthorityManifest) -> NuResult<Self> {
         let config = component_config();
         let engine = Engine::new(&config).map_err(|e| NuError::VMError {
             msg: format!("wasmtime engine: {}", e),
@@ -287,9 +280,11 @@ mod tests {
     "#;
 
     fn manifest(grants: &[(&str, &str)]) -> AuthorityManifest {
-        AuthorityManifest::from_grants(grants.iter().map(|(namespace, operation)| {
-            component_host_grant(namespace, operation)
-        }))
+        AuthorityManifest::from_grants(
+            grants
+                .iter()
+                .map(|(namespace, operation)| component_host_grant(namespace, operation)),
+        )
     }
 
     #[test]
@@ -304,8 +299,7 @@ mod tests {
                 log_messages: Vec::new(),
             },
         );
-        let linker =
-            ComponentRuntime::build_linker(&engine, &rt.authority).expect("linker");
+        let linker = ComponentRuntime::build_linker(&engine, &rt.authority).expect("linker");
         let component = wasmtime::component::Component::new(&engine, &wasm).expect("component");
         let err = linker
             .instantiate(&mut store, &component)
@@ -331,8 +325,7 @@ mod tests {
                 log_messages: Vec::new(),
             },
         );
-        let linker =
-            ComponentRuntime::build_linker(&engine, &rt.authority).expect("linker");
+        let linker = ComponentRuntime::build_linker(&engine, &rt.authority).expect("linker");
         let component = wasmtime::component::Component::new(&engine, &wasm).expect("component");
         let _instance = linker
             .instantiate(&mut store, &component)
@@ -353,8 +346,7 @@ mod tests {
                 log_messages: Vec::new(),
             },
         );
-        let linker =
-            ComponentRuntime::build_linker(&engine, &rt.authority).expect("linker");
+        let linker = ComponentRuntime::build_linker(&engine, &rt.authority).expect("linker");
         let component = wasmtime::component::Component::new(&engine, &wasm).expect("component");
         linker
             .instantiate(&mut store, &component)
