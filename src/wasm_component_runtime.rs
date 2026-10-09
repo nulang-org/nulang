@@ -335,4 +335,23 @@ mod tests {
             .instantiate(&mut store, &component)
             .expect("should succeed with log capability");
     }
+
+    #[test]
+    fn typed_wasm_authority_rejects_sibling_grant_before_guest_instantiation() {
+        use crate::authority::{AuthorityGrant, AuthorityManifest};
+
+        let wasm = wat::parse_str(LOG_IMPORT_WAT).expect("parse WAT");
+        let wrong_grant = AuthorityGrant::Other {
+            namespace: "Time".to_string(),
+            operation: "Now".to_string(),
+            argument: None,
+        };
+        let manifest = AuthorityManifest::from_grants([wrong_grant]);
+        let runtime = ComponentRuntime::new_with_authority(&wasm, manifest)
+            .expect("create typed-authority runtime");
+        assert!(
+            runtime.checkout().is_err(),
+            "Time::Now must not authorize IO::Log or instantiate the importing guest"
+        );
+    }
 }
