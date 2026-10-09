@@ -167,6 +167,9 @@ enum MatchLane {
 struct ReceiveLaneIndex {
     positions: FxHashMap<u16, Vec<usize>>,
     cursors: FxHashMap<u16, usize>,
+    /// Only candidate positions whose guards/patterns were attempted need
+    /// their tried bit reset; unrelated staged messages are left untouched.
+    tried_positions: Vec<usize>,
     valid: bool,
 }
 
@@ -175,6 +178,7 @@ impl ReceiveLaneIndex {
         Self {
             positions: FxHashMap::default(),
             cursors: FxHashMap::default(),
+            tried_positions: Vec::new(),
             valid: true,
         }
     }
@@ -187,12 +191,20 @@ impl ReceiveLaneIndex {
     }
 
     fn invalidate(&mut self) {
+        // Index positions cannot survive a VecDeque pop or middle removal;
+        // all attempted candidates must be reset before that mutation.
+        debug_assert!(self.tried_positions.is_empty());
         self.positions.clear();
         self.cursors.clear();
         self.valid = false;
     }
 
-    fn reset_cursors(&mut self) {
+    fn reset_attempts(&mut self, buffer: &mut VecDeque<(Message, bool)>) {
+        for idx in self.tried_positions.drain(..) {
+            if let Some((_, tried)) = buffer.get_mut(idx) {
+                *tried = false;
+            }
+        }
         self.cursors.clear();
     }
 
@@ -375,6 +387,11 @@ impl Mailbox {
 
     /// Pop the highest-priority queued message.
     pub fn pop(&mut self) -> Option<Message> {
+        // Ordinary receive ends any selective-receive attempt. Clear tried
+        // positions BEFORE popping from VecDeque (which shifts positions).
+        if self.receive_indexes.is_some() {
+            self.clear_tried_flags();
+        }
         // Staged messages predate newly-arrived messages in the same lane, so
         // they must remain ahead of the concurrent queue after a rejected
         // selective receive.
@@ -443,6 +460,7 @@ impl Mailbox {
         let (arm_pos, message_idx) = index.next_candidate(buffer, behavior_ids)?;
         let (message, tried) = buffer.get_mut(message_idx)?;
         *tried = true;
+        index.tried_positions.push(message_idx);
         Some((arm_pos, message_idx, message.payload.to_shared()))
     }
 
@@ -540,19 +558,10 @@ impl Mailbox {
     }
 
     fn clear_tried_flags(&mut self) {
-        for (_, tried) in self.system_skip_buffer.iter_mut() {
-            *tried = false;
-        }
-        for (_, tried) in self.local_skip_buffer.iter_mut() {
-            *tried = false;
-        }
-        for (_, tried) in self.skip_buffer.iter_mut() {
-            *tried = false;
-        }
         if let Some(indexes) = self.receive_indexes.as_mut() {
-            indexes.system.reset_cursors();
-            indexes.local.reset_cursors();
-            indexes.normal.reset_cursors();
+            indexes.system.reset_attempts(&mut self.system_skip_buffer);
+            indexes.local.reset_attempts(&mut self.local_skip_buffer);
+            indexes.normal.reset_attempts(&mut self.skip_buffer);
         }
     }
 
@@ -569,6 +578,9 @@ impl Mailbox {
     /// after the pattern+guard succeeds.
     pub fn commit_receive_match(&mut self) -> Option<Arc<Vec<Value>>> {
         let (lane, idx, payload) = self.active_match.take()?;
+        // Reset only attempted candidates while their positional indexes
+        // still refer to the pre-commit buffers.
+        self.clear_tried_flags();
         let _removed = match lane {
             MatchLane::System => self.system_skip_buffer.remove(idx),
             MatchLane::Local => self.local_skip_buffer.remove(idx),
@@ -576,7 +588,6 @@ impl Mailbox {
         }?;
         self.release_slot();
         self.invalidate_receive_indexes();
-        self.clear_tried_flags();
         Some(payload)
     }
 
@@ -940,5 +951,52 @@ mod transactional_receive_tests {
             Some(11),
             "reset must rewind indexed cursors and clear tried state"
         );
+    }
+    #[test]
+    fn sparse_reset_tracks_only_tried_candidates_in_deep_mailbox() {
+        let mut mb = Mailbox::new(0);
+        for sender in 0..4096u64 {
+            let behavior = if sender == 4095 { 9 } else { 1 };
+            mb.push_local(msg(behavior, sender, MessagePriority::Normal))
+                .unwrap();
+        }
+
+        let (_, candidate) = mb.receive_match(&[9]).expect("tail candidate");
+        assert_eq!(candidate[0].as_int(), Some(4095));
+        // A single guard attempt must not create reset work proportional to
+        // the 4095 unrelated messages staged in the same lane.
+        let indexes = mb.receive_indexes.as_ref().expect("lazy indexes");
+        assert_eq!(indexes.local.tried_positions.as_slice(), &[4095]);
+
+        mb.reset_receive_match();
+        assert!(mb
+            .receive_indexes
+            .as_ref()
+            .unwrap()
+            .local
+            .tried_positions
+            .is_empty());
+        assert_eq!(
+            mb.receive_match(&[9]).expect("reset exposes candidate").1[0].as_int(),
+            Some(4095)
+        );
+        assert_eq!(mb.len(), 4096);
+    }
+
+    #[test]
+    fn ordinary_pop_after_rejected_candidate_reindexes_remaining_messages() {
+        let mut mb = Mailbox::new(4);
+        mb.push_local(msg(7, 11, MessagePriority::Normal)).unwrap();
+        mb.push_local(msg(7, 22, MessagePriority::Normal)).unwrap();
+        mb.push_local(msg(7, 33, MessagePriority::Normal)).unwrap();
+
+        assert_eq!(mb.receive_match(&[7]).unwrap().1[0].as_int(), Some(11));
+        assert_eq!(mb.pop().expect("FIFO pop").sender, 11);
+        mb.reset_receive_match();
+
+        assert_eq!(mb.receive_match(&[7]).unwrap().1[0].as_int(), Some(22));
+        mb.commit_receive_match().expect("commit after pop");
+        assert_eq!(mb.pop().unwrap().sender, 33);
+        assert!(mb.is_empty());
     }
 }

@@ -611,14 +611,11 @@ impl Actor {
     /// incremental persistence (only dirty fields are re-serialized on
     /// the next checkpoint).
     pub fn set_state_field(&mut self, name: impl Into<String>, value: Value) {
-        let name_str = name.into();
-        self.dirty_fields.insert(name_str.clone());
-        self.state_data.insert(name_str.clone(), value);
-
-        // Auto-sync CRDT fields on mutation
-        if let Some(StateModel::Crdt(_crdt_type)) = self.state_models.get(&name_str) {
-            self.dirty_fields.insert(name_str.clone());
-        }
+        let name = name.into();
+        // All state models (including CRDT fields) already use the same dirty
+        // set. A second CRDT lookup/insert did no additional synchronization.
+        self.dirty_fields.insert(name.clone());
+        self.state_data.insert(name, value);
     }
 
     /// Get a named state field.
@@ -788,6 +785,22 @@ mod tests {
         actor.set_state_field("key", Value::int(1));
         actor.set_state_field("key", Value::int(2));
         assert_eq!(actor.get_state_field("key"), Some(Value::int(2)));
+    }
+
+    #[test]
+    fn state_updates_remain_dirty_across_rewrites_and_checkpoints() {
+        let mut actor = Actor::new(1, "state", 0);
+        actor.set_state_field("count", Value::int(1));
+        actor.set_state_field("count", Value::int(2));
+        assert_eq!(actor.get_state_field("count"), Some(Value::int(2)));
+        assert_eq!(actor.dirty_fields.len(), 1);
+        assert!(actor.dirty_fields.contains("count"));
+
+        actor.dirty_fields.clear();
+        actor.set_state_field(String::from("count"), Value::int(3));
+        assert_eq!(actor.get_state_field("count"), Some(Value::int(3)));
+        assert_eq!(actor.dirty_fields.len(), 1);
+        assert!(actor.dirty_fields.contains("count"));
     }
 
     #[test]

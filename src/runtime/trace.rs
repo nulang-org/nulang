@@ -19,6 +19,7 @@
 //! The optional `otel` feature can bridge those fields into real OTLP spans
 //! via `tracing-opentelemetry`.
 
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Thread-safe stateless PRNG for trace / span id generation.
@@ -62,6 +63,25 @@ fn nonzero_u128() -> u128 {
         1
     } else {
         v
+    }
+}
+
+/// Allocation-free W3C field formatters. Tracing visitors consume these
+/// synchronously when an enabled span is constructed, so there is no need to
+/// allocate three intermediate hex strings per actor dispatch.
+struct TraceHexId(u128);
+
+impl fmt::Display for TraceHexId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:032x}", self.0)
+    }
+}
+
+struct SpanHexId(u64);
+
+impl fmt::Display for SpanHexId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:016x}", self.0)
     }
 }
 
@@ -165,13 +185,13 @@ impl TraceContext {
     /// the explicit `parent_span_id` field, which an OTel bridge can use to
     /// rebuild the true hierarchy.
     ///
-    /// The hex strings are allocated eagerly, so callers SHOULD gate this on
-    /// [`tracing::enabled!`](tracing::enabled) (see
-    /// [`enter_dispatch_span`](TraceContext::enter_dispatch_span)).
+    /// The W3C fields are formatted directly into the tracing visitor
+    /// without allocating temporary String values. The dispatch helper also
+    /// guards against constructing disabled spans.
     pub fn tracing_span(&self, actor_id: u64, behavior_idx: usize) -> tracing::Span {
-        let trace = format!("{:032x}", self.trace_id);
-        let span = format!("{:016x}", self.span_id);
-        let parent = format!("{:016x}", self.parent_span_id);
+        let trace = TraceHexId(self.trace_id);
+        let span = SpanHexId(self.span_id);
+        let parent = SpanHexId(self.parent_span_id);
         tracing::span!(
             parent: None,
             tracing::Level::TRACE,
@@ -202,6 +222,19 @@ impl TraceContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formatted_trace_ids_keep_w3c_width_without_heap_strings() {
+        assert_eq!(
+            format!("{}", TraceHexId(0xabu128)),
+            format!("{:032x}", 0xabu128)
+        );
+        assert_eq!(
+            format!("{}", SpanHexId(0xabu64)),
+            format!("{:016x}", 0xabu64)
+        );
+        assert_eq!(format!("{}", SpanHexId(0)), "0000000000000000");
+    }
 
     #[test]
     fn test_traceparent_roundtrip() {

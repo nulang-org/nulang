@@ -642,7 +642,10 @@ impl Runtime {
         Runtime {
             actors: HashMap::new(),
             supervisors: HashMap::new(),
-            scheduler: Scheduler::new(4),
+            // Each runtime shard has exactly one owning scheduler thread.
+            // Extra worker-local queues were never consumed by this path and
+            // added empty-queue probes to adaptive turn sizing.
+            scheduler: Scheduler::new(1),
             current_actor: None,
             current_trace: None,
             main_heap: {

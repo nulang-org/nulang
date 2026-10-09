@@ -117,9 +117,27 @@ fn bench_peer_steal_dispatch(c: &mut Criterion) {
     group.finish();
 }
 
+/// Adaptive actor-turn sizing checks for runnable work. The live runtime
+/// owns one worker slot per shard, not four mostly-empty peer deques.
+fn bench_ready_work_probe(c: &mut Criterion) {
+    let mut group = c.benchmark_group("scheduler/has_ready_work_empty");
+    for workers in [1usize, 4] {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(workers),
+            &workers,
+            |b, &workers| {
+                let scheduler = Scheduler::new(workers);
+                b.iter(|| black_box(scheduler.has_ready_work()));
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_global_owner_dispatch,
     bench_mixed_priority_owner_dispatch,
-    bench_peer_steal_dispatch
+    bench_peer_steal_dispatch,
+    bench_ready_work_probe
 );

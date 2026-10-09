@@ -574,6 +574,14 @@ mod scheduler_tests {
     use std::sync::Arc;
 
     #[test]
+    fn runtime_shard_uses_only_its_owned_scheduler_slot() {
+        // A Runtime has one scheduler thread per shard; generic schedulers
+        // may still have multiple true workers for peer-stealing users.
+        let runtime = crate::runtime::Runtime::new();
+        assert_eq!(runtime.scheduler.worker_count(), 1);
+    }
+
+    #[test]
     fn test_enqueue_dequeue() {
         let s = Scheduler::new(2);
         s.enqueue(42);
