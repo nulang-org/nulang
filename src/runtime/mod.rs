@@ -335,9 +335,7 @@ enum CrossShardMsg {
         object_holds: ObjectRefLease,
     },
     /// Enqueue an actor on the target shard (wake from idle/waiting).
-    EnqueueActor {
-        actor_id: u64,
-    },
+    EnqueueActor { actor_id: u64 },
 }
 
 /// Admission result for a local-process actor delivery.
@@ -1415,8 +1413,8 @@ impl Runtime {
             if target_shard != self.shard_idx {
                 let tx = self.cross_shard_tx.as_ref().unwrap();
                 // We do not preserve handoff across shards
-                let _ = tx[target_shard as usize]
-                    .try_send(CrossShardMsg::EnqueueActor { actor_id });
+                let _ =
+                    tx[target_shard as usize].try_send(CrossShardMsg::EnqueueActor { actor_id });
                 return;
             }
         }
@@ -1429,23 +1427,30 @@ impl Runtime {
         }
         actor.run_state = ActorRunState::Queued;
         let priority = actor.priority;
-        
+
         if is_handoff {
             if let Some(existing_id) = self.next_run_slot {
-                let existing_priority = self.actors.get(&existing_id).map(|a| a.priority).unwrap_or(ActorPriority::Normal);
+                let existing_priority = self
+                    .actors
+                    .get(&existing_id)
+                    .map(|a| a.priority)
+                    .unwrap_or(ActorPriority::Normal);
                 if priority < existing_priority {
                     // New actor has higher priority (e.g. High > Normal). Swap them.
                     self.next_run_slot = Some(actor_id);
-                    self.scheduler.enqueue_local_with_priority(0, existing_id, existing_priority);
+                    self.scheduler
+                        .enqueue_local_with_priority(0, existing_id, existing_priority);
                 } else {
                     // Slot full with equal or higher priority, queue the new actor normally.
-                    self.scheduler.enqueue_local_with_priority(0, actor_id, priority);
+                    self.scheduler
+                        .enqueue_local_with_priority(0, actor_id, priority);
                 }
             } else {
                 self.next_run_slot = Some(actor_id);
             }
         } else {
-            self.scheduler.enqueue_local_with_priority(0, actor_id, priority);
+            self.scheduler
+                .enqueue_local_with_priority(0, actor_id, priority);
         }
     }
 

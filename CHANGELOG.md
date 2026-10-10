@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### Actor scheduler LIFO handoff and lifecycle pooling — 2026-10-10
+- **Performance:** Optimized actor scheduler LIFO handoff with strict
+  priority gating, and added actor lifecycle pooling.
+
 ### Seeded cluster simulation peer ordering — 2026-10-07
 - **Cluster simulations with an injected deterministic RNG now canonicalize peer order for gossip targets, bounded gossip payloads, active-view repair, and heartbeat action emission.** This removes four sources of randomized Rust `HashMap` ordering while preserving the existing unseeded production path. Regression tests compare independently constructed cluster states under identical RNG seeds.
 

@@ -317,7 +317,8 @@ impl Mailbox {
         while let Some(_) = self.normal_queue.pop() {}
         self.local_queue.clear();
         self.capacity = capacity;
-        self.queued_count.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.queued_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         self.system_skip_buffer.clear();
         self.local_skip_buffer.clear();
         self.skip_buffer.clear();
