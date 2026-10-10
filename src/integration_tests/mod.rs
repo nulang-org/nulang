@@ -72,6 +72,54 @@ mod tests {
         }
     }
 
+    /// Real VM-resume failure injection: only the terminal StepCompleted
+    /// append is rejected. Command admission, suspension journaling, and the
+    /// actor's initial checkpoint still use the real shared memory backend.
+    #[derive(Clone)]
+    struct RejectStepCompletedStore(SharedMemoryStore);
+
+    impl PersistenceStore for RejectStepCompletedStore {
+        fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> std::io::Result<()> {
+            self.0.save_snapshot(snapshot)
+        }
+        fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+            self.0.load_snapshot(actor_id)
+        }
+        fn append_journal(&mut self, actor_id: u64, entry: JournalEntry) -> std::io::Result<()> {
+            self.0.append_journal(actor_id, entry)
+        }
+        fn read_journal(&self, actor_id: u64) -> Vec<JournalEntry> {
+            self.0.read_journal(actor_id)
+        }
+        fn append_workflow_event(
+            &mut self,
+            actor_id: u64,
+            event: WorkflowEvent,
+        ) -> std::io::Result<()> {
+            if matches!(event, WorkflowEvent::StepCompleted { .. }) {
+                return Err(std::io::Error::other(
+                    "injected terminal workflow append failure",
+                ));
+            }
+            self.0.append_workflow_event(actor_id, event)
+        }
+        fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
+            self.0.read_workflow_events(actor_id)
+        }
+        fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> std::io::Result<()> {
+            self.0.append_event(actor_id, entry)
+        }
+        fn read_events(&self, actor_id: u64) -> Vec<EventEntry> {
+            self.0.read_events(actor_id)
+        }
+        fn latest_sequence(&self, actor_id: u64) -> u64 {
+            self.0.latest_sequence(actor_id)
+        }
+        fn clear(&mut self, actor_id: u64) -> std::io::Result<()> {
+            self.0.clear(actor_id)
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Test helpers
     // -----------------------------------------------------------------------
@@ -8150,6 +8198,237 @@ match { a: 2, b: 9 } with {
         assert!(
             events.iter().any(|e| matches!(e, WorkflowEvent::StepCompleted { step_name, .. } if step_name == "ask_step")),
             "StepCompleted event should be persisted after the LLM call resumes"
+        );
+    }
+
+    /// Exercises the actual background LLM worker and shared VM resume:
+    /// a StepCompleted journal error must quarantine the actor, not make the
+    /// response or advanced step_index available for later dispatch.
+    #[cfg(feature = "ai-runtime")]
+    #[test]
+    fn test_workflow_llm_resume_terminal_append_failure_quarantines_actor() {
+        let source = r#"
+            workflow LlmRejectTerminal {
+                step ask_step { self.answer = perform Inference.ask("hello") }
+            }
+            let w = spawn LlmRejectTerminal {} in { w }
+        "#;
+        let backing = SharedMemoryStore::new();
+        let (module, _ty) = compile_source(source).unwrap();
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        rt.borrow_mut().persistence = Box::new(RejectStepCompletedStore(backing.clone()));
+        rt.borrow_mut()
+            .set_llm_client(Box::new(nulang_ai::MockLlmClient::text("world")));
+
+        let value = {
+            let mut vm = VM::new();
+            vm.load_module(module);
+            vm.set_actor_callbacks(Box::new(RuntimeVmCallbacks::new(rt.clone())));
+            vm.run().unwrap()
+        };
+        let actor_id = value.as_actor_id().expect("spawn should return actor ref");
+        rt.borrow_mut().send_message_by_id(actor_id, 0, &[]);
+        rt.borrow_mut().run_scheduler();
+
+        assert!(
+            !rt.borrow().actors.contains_key(&actor_id),
+            "a terminal-commit failure after LLM resume must quarantine the live actor"
+        );
+        assert!(
+            !backing.read_workflow_events(actor_id).iter().any(|event| {
+                matches!(event, WorkflowEvent::StepCompleted { step_name, .. } if step_name == "ask_step")
+            }),
+            "rejected StepCompleted must not appear in committed history"
+        );
+        assert_eq!(
+            backing
+                .load_snapshot(actor_id)
+                .unwrap()
+                .state
+                .get("step_index"),
+            Some(&crate::runtime::PersistedValue::Int(0)),
+            "the uncommitted resumed step_index must not appear in the durable snapshot"
+        );
+    }
+
+    /// The signal path resumes the compiled VM synchronously. A rejected
+    /// terminal event must not leave the resumed actor runnable.
+    #[test]
+    fn test_workflow_signal_resume_terminal_append_failure_quarantines_actor() {
+        let source = r#"
+            workflow SignalRejectTerminal {
+                step wait_step { (perform Signal.wait("go"), self.answer = "done") }
+            }
+            let w = spawn SignalRejectTerminal {} in { w }
+        "#;
+        let backing = SharedMemoryStore::new();
+        let (module, _ty) = compile_source(source).unwrap();
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        rt.borrow_mut().persistence = Box::new(RejectStepCompletedStore(backing.clone()));
+
+        let value = {
+            let mut vm = VM::new();
+            vm.load_module(module);
+            vm.set_actor_callbacks(Box::new(RuntimeVmCallbacks::new(rt.clone())));
+            vm.run().unwrap()
+        };
+        let actor_id = value.as_actor_id().expect("spawn should return actor ref");
+        rt.borrow_mut().send_message_by_id(actor_id, 0, &[]);
+        rt.borrow_mut().run_scheduler();
+        assert_eq!(
+            rt.borrow()
+                .actors
+                .get(&actor_id)
+                .unwrap()
+                .waiting_signal
+                .as_deref(),
+            Some("go"),
+            "must suspend before failure injection reaches the terminal event"
+        );
+
+        rt.borrow_mut()
+            .signal_workflow(actor_id, "go", None)
+            .unwrap();
+
+        assert!(
+            !rt.borrow().actors.contains_key(&actor_id),
+            "the signal-resumed actor must not dispatch after terminal journal rejection"
+        );
+        assert!(
+            !backing.read_workflow_events(actor_id).iter().any(|event| {
+                matches!(event, WorkflowEvent::StepCompleted { step_name, .. } if step_name == "wait_step")
+            })
+        );
+        assert_eq!(
+            backing
+                .load_snapshot(actor_id)
+                .unwrap()
+                .state
+                .get("step_index"),
+            Some(&crate::runtime::PersistedValue::Int(0))
+        );
+    }
+
+    /// The Timer.sleep callback must complete through the shared fallible
+    /// persistence boundary rather than exposing a successful resumed step.
+    /// This drives a compiled VM continuation on a deterministic clock.
+    #[test]
+    fn test_workflow_timer_sleep_resume_terminal_append_failure_quarantines_actor() {
+        let source = r#"
+            workflow TimerRejectTerminal {
+                step wait { perform Timer.sleep(50) }
+            }
+            let w = spawn TimerRejectTerminal {} in { w }
+        "#;
+        let backing = SharedMemoryStore::new();
+        let (module, _ty) = compile_source(source).unwrap();
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        rt.borrow_mut().persistence = Box::new(RejectStepCompletedStore(backing.clone()));
+        rt.borrow_mut().install_virtual_clock();
+
+        let value = {
+            let mut vm = VM::new();
+            vm.load_module(module);
+            vm.set_actor_callbacks(Box::new(RuntimeVmCallbacks::new(rt.clone())));
+            vm.run().unwrap()
+        };
+        let actor_id = value.as_actor_id().expect("spawn should return actor ref");
+        rt.borrow_mut().send_message_by_id(actor_id, 0, &[]);
+        rt.borrow_mut().step_actor(actor_id);
+        assert!(
+            rt.borrow()
+                .actors
+                .get(&actor_id)
+                .unwrap()
+                .suspended_execution
+                .is_some(),
+            "Timer.sleep must suspend before terminal persistence is rejected"
+        );
+
+        rt.borrow_mut()
+            .advance_time(std::time::Duration::from_millis(100));
+        rt.borrow_mut().tick_timers();
+
+        assert!(
+            !rt.borrow().actors.contains_key(&actor_id),
+            "Timer.sleep resume must quarantine after terminal event rejection"
+        );
+        assert!(
+            !backing.read_workflow_events(actor_id).iter().any(|event| {
+                matches!(event, WorkflowEvent::StepCompleted { step_name, .. } if step_name == "wait")
+            }),
+            "rejected completion must not be visible in durable history"
+        );
+        assert_eq!(
+            backing
+                .load_snapshot(actor_id)
+                .unwrap()
+                .state
+                .get("step_index"),
+            Some(&crate::runtime::PersistedValue::Int(0))
+        );
+    }
+
+    /// Timed selective receive must also fail closed when the after clause
+    /// resolves through a suspended VM continuation. Using the workflow step
+    /// itself as a valid receive arm keeps the mailbox empty until timeout.
+    #[test]
+    fn test_workflow_timed_receive_resume_terminal_append_failure_quarantines_actor() {
+        let source = r#"
+            workflow ReceiveRejectTerminal {
+                step wait_step {
+                    self.answer = receive {
+                        | wait_step() => 1
+                    } after 50 => 4242
+                }
+            }
+            let w = spawn ReceiveRejectTerminal {} in { w }
+        "#;
+        let backing = SharedMemoryStore::new();
+        let (module, _ty) = compile_source(source).unwrap();
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        rt.borrow_mut().persistence = Box::new(RejectStepCompletedStore(backing.clone()));
+        rt.borrow_mut().install_virtual_clock();
+
+        let value = {
+            let mut vm = VM::new();
+            vm.load_module(module);
+            vm.set_actor_callbacks(Box::new(RuntimeVmCallbacks::new(rt.clone())));
+            vm.run().unwrap()
+        };
+        let actor_id = value.as_actor_id().expect("spawn should return actor ref");
+        rt.borrow_mut().send_message_by_id(actor_id, 0, &[]);
+        rt.borrow_mut().step_actor(actor_id);
+        assert!(
+            rt.borrow()
+                .actors
+                .get(&actor_id)
+                .unwrap()
+                .suspended_execution
+                .is_some(),
+            "timed receive must suspend before the timeout resolves the step"
+        );
+
+        rt.borrow_mut()
+            .advance_time(std::time::Duration::from_millis(100));
+        rt.borrow_mut().tick_timers();
+
+        assert!(
+            !rt.borrow().actors.contains_key(&actor_id),
+            "timed receive must quarantine on failed terminal persistence"
+        );
+        assert!(
+            !backing.read_workflow_events(actor_id).iter().any(|event| {
+                matches!(event, WorkflowEvent::StepCompleted { step_name, .. } if step_name == "wait_step")
+            })
+        );
+        assert_eq!(
+            backing
+                .load_snapshot(actor_id)
+                .unwrap()
+                .state
+                .get("step_index"),
+            Some(&crate::runtime::PersistedValue::Int(0))
         );
     }
 
