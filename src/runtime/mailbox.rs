@@ -311,6 +311,21 @@ impl Mailbox {
         }
     }
 
+    /// Reset this mailbox for reuse.
+    pub fn reset(&mut self, capacity: usize) {
+        while let Some(_) = self.system_queue.pop() {}
+        while let Some(_) = self.normal_queue.pop() {}
+        self.local_queue.clear();
+        self.capacity = capacity;
+        self.queued_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.system_skip_buffer.clear();
+        self.local_skip_buffer.clear();
+        self.skip_buffer.clear();
+        self.receive_indexes = None;
+        self.active_match = None;
+    }
+
     /// Reserve one logical mailbox slot.
     ///
     /// System messages and unbounded mailboxes always reserve successfully.
