@@ -526,10 +526,10 @@ fn test_actor_set_priority_changes_scheduling() {
 
 #[test]
 fn test_lifo_handoff_slot_does_not_preempt_queued_high_priority() {
-    // LIFO handoff parks the receiver of a behavior-context send in
-    // `next_run_slot`. Strict priority must still hold: a High actor queued
-    // after a Normal actor was parked must run first, and the parked Normal
-    // must not preempt it.
+    // LIFO handoff parks a receiver in `next_run_slot`. Strict priority must
+    // still hold for queued work: a parked Normal actor may not preempt a
+    // High actor enqueued from a non-handoff source (spawn/timer/network).
+    // The claim must take the queued High actor and leave the slot parked.
     let mut rt = Runtime::new();
     let a = rt.spawn_actor(Box::new(|| vec![]));
     let b = rt.spawn_actor(Box::new(|| vec![]));
@@ -553,21 +553,22 @@ fn test_lifo_handoff_slot_does_not_preempt_queued_high_priority() {
         Some(Value::nil())
     );
 
-    // Simulate a behavior-context send from a -> b: the handoff parks b.
-    rt.current_actor = Some(a);
-    rt.actors.get_mut(&a).unwrap().run_state = ActorRunState::Running;
-    rt.send_message(b, "noop", &[]);
-    assert_eq!(rt.next_run_slot, Some(b), "handoff should park the receiver");
+    // Park b (Normal) in the LIFO slot, then enqueue c (High) normally.
+    rt.enqueue_actor_handoff(b);
+    assert_eq!(rt.next_run_slot, Some(b), "handoff should park b");
+    rt.enqueue_actor(c);
 
-    // A queued High-priority send must not be preempted by the parked Normal.
-    rt.send_message(c, "noop", &[]);
-    rt.current_actor = None;
+    // The claim must fire the priority gate: dequeued High c, slot untouched.
     assert_eq!(
         rt.claim_next_ready_actor(),
         Some(c),
         "queued High must run before parked Normal"
     );
-    rt.step_actor(c);
+    assert_eq!(
+        rt.next_run_slot,
+        Some(b),
+        "gate must preserve the parked slot while High work is queued"
+    );
     rt.finish_actor_turn(c);
 
     // With the High queue drained, the parked Normal slot is claimable.
@@ -576,7 +577,6 @@ fn test_lifo_handoff_slot_does_not_preempt_queued_high_priority() {
         Some(b),
         "parked Normal runs once no higher priority work is queued"
     );
-    rt.step_actor(b);
     rt.finish_actor_turn(b);
 }
 
