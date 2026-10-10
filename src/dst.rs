@@ -305,6 +305,95 @@ mod tests {
         assert_ne!(v1, v2);
     }
 
+    fn actor_trace(seed: u64, registration_order: &[u64]) -> Vec<u64> {
+        let mut sim = Simulator::new(seed);
+        for &id in registration_order {
+            sim.register_actor(id, "worker");
+        }
+        for &id in registration_order {
+            for _ in 0..3 {
+                sim.send(0, id, "work", vec![]);
+            }
+        }
+
+        let mut trace = Vec::new();
+        loop {
+            match sim.step() {
+                StepResult::MessageProcessed { actor, .. } => trace.push(actor),
+                StepResult::Quiescent => return trace,
+                StepResult::NoProgress => panic!("simulation exhausted its step budget"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_dst_same_seed_same_actor_trace_regardless_of_registration_order() {
+        let ascending: Vec<u64> = (1..=8).collect();
+        let descending: Vec<u64> = ascending.iter().rev().copied().collect();
+
+        // Separate HashMaps receive independent randomized hash states. Their
+        // bucket iteration order must not influence seeded scheduling.
+        for seed in 0..32 {
+            let expected = actor_trace(seed, &ascending);
+            assert_eq!(expected.len(), 24);
+            assert_eq!(
+                expected,
+                actor_trace(seed, &descending),
+                "seed {seed} yielded an insertion/hash-order-dependent trace"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dst_run_until_quiescence_fires_future_timer() {
+        let mut sim = Simulator::new(42);
+        sim.register_actor(1, "timer-worker");
+        sim.timers.push((
+            25,
+            1,
+            SimMessage {
+                sender: 0,
+                target: 1,
+                behavior: "wake".to_string(),
+                payload: vec![],
+            },
+        ));
+
+        sim.run_until_quiescence();
+
+        assert_eq!(sim.clock_ms(), 25);
+        assert!(sim.timers.is_empty(), "future timer was never fired");
+        assert!(sim.actors[&1].mailbox.is_empty(), "fired timer was not processed");
+        assert_eq!(sim.step_count(), 2, "one message step and one quiescence step");
+    }
+
+    #[test]
+    fn test_dst_timer_uses_earliest_deadline_not_insertion_order() {
+        let mut sim = Simulator::new(42);
+        sim.register_actor(1, "timer-worker");
+        for (deadline, name) in [(100, "late"), (20, "early")] {
+            sim.timers.push((
+                deadline,
+                1,
+                SimMessage {
+                    sender: 0,
+                    target: 1,
+                    behavior: name.to_string(),
+                    payload: vec![],
+                },
+            ));
+        }
+
+        assert!(matches!(
+            sim.step(),
+            StepResult::MessageProcessed { actor: 1, ref behavior } if behavior == "early"
+        ));
+        assert_eq!(sim.clock_ms(), 20);
+        sim.run_until_quiescence();
+        assert!(sim.timers.is_empty());
+        assert_eq!(sim.clock_ms(), 100);
+    }
+
     #[test]
     fn test_quiescence_detection() {
         let mut sim = Simulator::new(0).with_max_steps(100);
