@@ -3070,8 +3070,25 @@ impl Runtime {
     /// invariant as the production scheduler instead of mutating the raw queue.
     pub(crate) fn claim_next_ready_actor(&mut self) -> Option<u64> {
         loop {
-            let actor_id = if let Some(id) = self.next_run_slot.take() {
-                id
+            let actor_id = if let Some(id) = self.next_run_slot {
+                // Preserve the strict High > Normal > Low contract: a parked
+                // (LIFO handoff) actor may never preempt queued work of a
+                // strictly-higher priority level. Peek rather than claim when
+                // such work exists.
+                let parked_priority = self
+                    .actors
+                    .get(&id)
+                    .map(|actor| actor.priority)
+                    .unwrap_or(ActorPriority::Normal);
+                let higher_queued = parked_priority
+                    .prior()
+                    .iter()
+                    .any(|&level| self.scheduler.peek_has_priority_work(level));
+                if higher_queued {
+                    self.scheduler.dequeue()?
+                } else {
+                    self.next_run_slot.take().unwrap()
+                }
             } else {
                 self.scheduler.dequeue()?
             };

@@ -47,6 +47,18 @@ pub enum ActorPriority {
     Low,
 }
 
+impl ActorPriority {
+    /// Strictly-higher priority levels, in High → Normal → Low order.
+    /// `prior()` is empty for High.
+    pub fn prior(self) -> &'static [ActorPriority] {
+        match self {
+            ActorPriority::High => &[],
+            ActorPriority::Normal => &[ActorPriority::High],
+            ActorPriority::Low => &[ActorPriority::High, ActorPriority::Normal],
+        }
+    }
+}
+
 /// Scheduler ownership state for an actor.
 ///
 /// The owning runtime shard is the only writer. A queued/running actor already

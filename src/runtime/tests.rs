@@ -525,6 +525,62 @@ fn test_actor_set_priority_changes_scheduling() {
 }
 
 #[test]
+fn test_lifo_handoff_slot_does_not_preempt_queued_high_priority() {
+    // LIFO handoff parks the receiver of a behavior-context send in
+    // `next_run_slot`. Strict priority must still hold: a High actor queued
+    // after a Normal actor was parked must run first, and the parked Normal
+    // must not preempt it.
+    let mut rt = Runtime::new();
+    let a = rt.spawn_actor(Box::new(|| vec![]));
+    let b = rt.spawn_actor(Box::new(|| vec![]));
+    let c = rt.spawn_actor(Box::new(|| vec![]));
+    declare_test_behavior(&mut rt, a, "noop");
+    declare_test_behavior(&mut rt, b, "noop");
+    declare_test_behavior(&mut rt, c, "noop");
+
+    // Drain the spawn-time Normal-priority tokens.
+    let mut drained = std::collections::HashSet::new();
+    for _ in 0..3 {
+        let id = rt.claim_next_ready_actor().expect("spawned actor token");
+        rt.finish_actor_turn(id);
+        drained.insert(id);
+    }
+    assert_eq!(drained, [a, b, c].into_iter().collect());
+
+    // Boost c to High via the builtin-effect path.
+    assert_eq!(
+        rt.perform_actor_builtin(Some(c), Some("set_priority"), &[], &[Value::int(0)]),
+        Some(Value::nil())
+    );
+
+    // Simulate a behavior-context send from a -> b: the handoff parks b.
+    rt.current_actor = Some(a);
+    rt.actors.get_mut(&a).unwrap().run_state = ActorRunState::Running;
+    rt.send_message(b, "noop", &[]);
+    assert_eq!(rt.next_run_slot, Some(b), "handoff should park the receiver");
+
+    // A queued High-priority send must not be preempted by the parked Normal.
+    rt.send_message(c, "noop", &[]);
+    rt.current_actor = None;
+    assert_eq!(
+        rt.claim_next_ready_actor(),
+        Some(c),
+        "queued High must run before parked Normal"
+    );
+    rt.step_actor(c);
+    rt.finish_actor_turn(c);
+
+    // With the High queue drained, the parked Normal slot is claimable.
+    assert_eq!(
+        rt.claim_next_ready_actor(),
+        Some(b),
+        "parked Normal runs once no higher priority work is queued"
+    );
+    rt.step_actor(b);
+    rt.finish_actor_turn(b);
+}
+
+#[test]
 fn test_anonymous_actor_accepts_untyped_mailbox_delivery_without_handler_alias() {
     let mut rt = Runtime::new();
     let actor_id = rt.spawn_actor(Box::new(|| vec![]));
