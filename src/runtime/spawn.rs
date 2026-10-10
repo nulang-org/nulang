@@ -158,7 +158,12 @@ fn try_spawn_actor_with_id(
         None
     };
 
-    let mut actor = Actor::new(id, format!("actor_{}", id), 0);
+    let mut actor = if let Some(mut pooled) = rt.actor_pool.pop() {
+        pooled.reset(id, format!("actor_{}", id), 0);
+        pooled
+    } else {
+        Actor::new(id, format!("actor_{}", id), 0)
+    };
     let state_fields = init();
     for (name, value) in state_fields {
         actor.set_state_field(name, value);
