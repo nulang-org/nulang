@@ -91,6 +91,77 @@ pub fn lower_module(hir: &hir::Module) -> NuResult<mir::Module> {
 
     let mut module = ctx.finish()?;
     crate::mir_inline::inline_local_closures(&mut module);
+    for func in module
+        .functions
+        .iter_mut()
+        .chain(module.behaviors.iter_mut())
+    {
+        // `TypeMetadata` is built optimistically from each local's declared
+        // type, but a local's RUNTIME value is not constrained by that type:
+        // `1 % 0`, `1 / 0`, negative-`**` exponents, out-of-bounds
+        // field/array reads, and nil-returning calls all legally produce nil,
+        // and a function name used as a value is a function-table index, not
+        // an integer. The AOT backend compiles raw register ops
+        // (sext48/tag/negate/compare) on "known" registers, so claiming Int
+        // for such a register corrupts the tag: `-(1 % 0)` returned int 0
+        // (nil's zero payload re-tagged) instead of the interpreter's type
+        // error. Mirror the JIT's `infer_reg_types` (IDiv/IMod results are
+        // Unknown) by under-approximating "known" on the final MIR, and
+        // propagate through `Load` copies (`let x = 1 % 0; -(x)`).
+        let mut nil_legal: Vec<bool> = vec![false; func.locals.len()];
+        let local_base = mir::FunctionBuilder::LOCAL_BASE as usize;
+        let nil_legal_op = |op: &mir::RValue, declared_unit: bool| -> bool {
+            match op {
+                mir::RValue::Binary(
+                    crate::ast::BinOp::Div | crate::ast::BinOp::Mod | crate::ast::BinOp::Pow,
+                    _,
+                    _,
+                ) => true,
+                mir::RValue::LoadFieldPos { .. }
+                | mir::RValue::ArrayLoad { .. }
+                | mir::RValue::Call { .. }
+                | mir::RValue::Closure { .. }
+                | mir::RValue::Migrate { .. } => true,
+                // A top-level function used as a value lowers to its raw
+                // function-table index in a Unit-typed local.
+                mir::RValue::Const(crate::bytecode::Constant::Int(_)) => declared_unit,
+                _ => false,
+            }
+        };
+        loop {
+            let mut changed = false;
+            for block in &func.blocks {
+                for stmt in &block.stmts {
+                    if let mir::Stmt::Assign { dst, op } = stmt {
+                        let li = dst.0 as usize;
+                        if nil_legal[li] {
+                            continue;
+                        }
+                        let declared_unit = func
+                            .locals
+                            .get(li)
+                            .map(|l| l.ty == crate::types::Type::unit())
+                            .unwrap_or(false);
+                        let direct = nil_legal_op(op, declared_unit);
+                        let via_load = matches!(op, mir::RValue::Load(src) if (src.0 as usize) < nil_legal.len() && nil_legal[src.0 as usize]);
+                        if direct || via_load {
+                            nil_legal[li] = true;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        for (li, legal) in nil_legal.iter().enumerate() {
+            if *legal {
+                func.type_metadata
+                    .set_type(local_base + li, crate::type_metadata::KnownType::Unknown);
+            }
+        }
+    }
     Ok(module)
 }
 

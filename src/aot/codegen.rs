@@ -4666,7 +4666,7 @@ mod tests {
         );
     }
 
-    fn aot_compile_source(source: &str) -> crate::aot::AotModule {
+    fn compile_source_mir(source: &str) -> crate::mir::Module {
         use crate::effect_checker::{CapContext, CapabilityAnalyzer, EffectChecker};
         use crate::lexer::Lexer;
         use crate::parser::Parser;
@@ -4685,7 +4685,11 @@ mod tests {
             }
         }
         let hir = crate::hir_lower::lower_module(&ast, &tc.inferred_decl_types);
-        let mir_module = crate::mir_lower::lower_module(&hir).unwrap();
+        crate::mir_lower::lower_module(&hir).unwrap()
+    }
+
+    fn aot_compile_source(source: &str) -> crate::aot::AotModule {
+        let mir_module = compile_source_mir(source);
         crate::aot::AotModule::compile(&mir_module).expect("AOT compile")
     }
 
@@ -5431,5 +5435,35 @@ mod tests {
         builder.terminate(mir::Terminator::Return(Some(tmp)));
         let func = builder.build();
         assert!(is_all_int(&func));
+    }
+
+    #[test]
+    fn test_aot_neg_of_nil_capable_int_matches_interpreter() {
+        // Nightly differential fuzz (2026-10-10) found interpreter/AOT
+        // divergences on unary `neg` of statically-Int values that are NIL at
+        // runtime: `-(1 % 0)` compiled boxed with the nil-producing local
+        // marked `KnownType::Int`, so `Unary Neg` emitted raw
+        // `sext48 → ineg → tag` instead of the checking `nulang_ineg`
+        // helper — nil's zero payload re-tagged as int 0 (Ok("0")). The
+        // interpreter raises a type error. MIR metadata is now conservative
+        // (Div/Mod/Pow results, calls, closures, function values, and
+        // migrated values stay Unknown), so boxed `neg` routes through
+        // `nulang_ineg`, which records the same type error.
+        for src in [
+            r#"fn main() { -(1 % 0) }"#,
+            r#"fn main() { -3 ** -2 }"#,
+            r#"fn main() { let x = 1 % 0; -(x) }"#,
+        ] {
+            let aot = aot_compile_source(src);
+            let err = aot
+                .run()
+                .expect_err("neg of nil must be a type error, matching the interpreter");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("type error") && msg.contains("neg"),
+                "expected neg type error, got: {}",
+                msg
+            );
+        }
     }
 }

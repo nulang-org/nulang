@@ -1,5 +1,16 @@
 # Nulang Changelog
 
+### Runtime soundness — native/AOT backend parity — 2026-10-10
+- **AOT no longer claims raw-Int/Float registers for values that can be nil
+  at runtime.** Nightly differential fuzz caught interpreter/AOT divergences
+  on `-(1 % 0)`, `-3 ** -2`, and `-fn(x, y) { x + y }`: statically-Int
+  locals produced by div/mod/pow-by-zero, nil-returning calls, closures, and
+  function references were marked `KnownType::Int`, so the AOT emitted raw
+  `sext48/ineg/tag` instead of the checking `nulang_ineg` helper — nil's zero
+  payload came back as int 0. MIR type metadata is now conservative for such
+  locals (mirroring the JIT's `infer_reg_types`), with `Load` copies
+  propagated, so AOT routes them through the interpreter-parity helpers.
+
 ### Actor scheduler LIFO handoff and lifecycle pooling — 2026-10-10
 - **Performance:** Optimized actor scheduler LIFO handoff with strict
   priority gating, and added actor lifecycle pooling.
