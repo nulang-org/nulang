@@ -116,7 +116,7 @@ pub enum SimValue {
 pub enum StepResult {
     /// An actor processed a message.
     MessageProcessed { actor: u64, behavior: String },
-    /// No actor could make progress (potential deadlock).
+    /// The configured simulation step budget has been exhausted.
     NoProgress,
     /// All mailboxes are empty and no timers are pending.
     Quiescent,
@@ -190,59 +190,60 @@ impl Simulator {
             }
         }
 
-        // Check for timer firings
-        let now = self.clock_ms;
-        let mut fired = Vec::new();
-        self.timers.retain(|(fire_at, actor_id, msg)| {
-            if *fire_at <= now {
-                fired.push((*actor_id, msg.clone()));
-                false
-            } else {
-                true
-            }
-        });
-        for (actor_id, msg) in fired {
-            if let Some(actor) = self.actors.get_mut(&actor_id) {
-                actor.mailbox.push_back(msg);
-            }
-        }
-
-        // Collect actors with non-empty mailboxes
-        let ready: Vec<u64> = self
-            .actors
-            .iter()
-            .filter(|(_, a)| !a.mailbox.is_empty())
-            .map(|(id, _)| *id)
-            .collect();
-
-        if ready.is_empty() && self.timers.is_empty() {
-            return StepResult::Quiescent;
-        }
-
-        if ready.is_empty() {
-            // Advance clock to next timer
-            if let Some((fire_at, _, _)) = self.timers.first() {
-                self.clock_ms = *fire_at;
-            }
-            return StepResult::NoProgress;
-        }
-
-        // Deterministically pick an actor
-        let actor_id = *self.rng.pick(&ready).unwrap();
-        if let Some(actor) = self.actors.get_mut(&actor_id) {
-            if let Some(msg) = actor.mailbox.pop_front() {
-                let behavior = msg.behavior.clone();
-                // In a real implementation, this would execute the behavior.
-                // For DST, we just record the step.
-                StepResult::MessageProcessed {
-                    actor: actor_id,
-                    behavior,
+        // Timer callbacks become runnable at the current virtual time. When
+        // all actors are idle, jump to the *earliest* deadline and try again
+        // within this step, so run_until_quiescence cannot stop prematurely.
+        // Timers targeting stopped/missing actors are consumed as well.
+        loop {
+            let now = self.clock_ms;
+            let mut fired = Vec::new();
+            self.timers.retain(|(fire_at, actor_id, msg)| {
+                if *fire_at <= now {
+                    fired.push((*actor_id, msg.clone()));
+                    false
+                } else {
+                    true
                 }
-            } else {
-                StepResult::NoProgress
+            });
+            for (actor_id, msg) in fired {
+                if let Some(actor) = self.actors.get_mut(&actor_id) {
+                    actor.mailbox.push_back(msg);
+                }
             }
-        } else {
-            StepResult::NoProgress
+
+            // A HashMap's randomized iteration order cannot define the seeded
+            // scheduler's choice set. Sort IDs before consuming the RNG.
+            let mut ready: Vec<u64> = self
+                .actors
+                .iter()
+                .filter(|(_, actor)| !actor.mailbox.is_empty())
+                .map(|(id, _)| *id)
+                .collect();
+            ready.sort_unstable();
+
+            if let Some(&actor_id) = self.rng.pick(&ready) {
+                let actor = self
+                    .actors
+                    .get_mut(&actor_id)
+                    .expect("ready actor must still be registered");
+                let msg = actor
+                    .mailbox
+                    .pop_front()
+                    .expect("ready actor must have a message");
+                // This lightweight harness records delivery only; separate
+                // real-runtime DST suites execute actual Nulang behaviors.
+                return StepResult::MessageProcessed {
+                    actor: actor_id,
+                    behavior: msg.behavior,
+                };
+            }
+
+            match self.timers.iter().map(|(fire_at, _, _)| *fire_at).min() {
+                Some(next_deadline) => {
+                    self.clock_ms = self.clock_ms.max(next_deadline);
+                }
+                None => return StepResult::Quiescent,
+            }
         }
     }
 
