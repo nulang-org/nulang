@@ -364,8 +364,15 @@ mod tests {
 
         assert_eq!(sim.clock_ms(), 25);
         assert!(sim.timers.is_empty(), "future timer was never fired");
-        assert!(sim.actors[&1].mailbox.is_empty(), "fired timer was not processed");
-        assert_eq!(sim.step_count(), 2, "one message step and one quiescence step");
+        assert!(
+            sim.actors[&1].mailbox.is_empty(),
+            "fired timer was not processed"
+        );
+        assert_eq!(
+            sim.step_count(),
+            2,
+            "one message step and one quiescence step"
+        );
     }
 
     #[test]
