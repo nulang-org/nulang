@@ -202,6 +202,9 @@ jobs:
       - name: Run nula test
         run: cd test-pkg && ../target/release/nulang nula test
 
+      - name: Test documentation example discovery
+        run: bash scripts/test_verify_doc_examples.sh
+
       - name: Verify documentation examples
         run: NULANG_BIN=./target/release/nulang bash scripts/verify_doc_examples.sh
   # -----------------------------------------------------------------------
