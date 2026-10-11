@@ -6,31 +6,31 @@ from zero to a running Nulang program in about five minutes.
 
 ## Installation
 
-Nulang is written in Rust. The fastest way to get started is to build from
-source:
+The fastest way to evaluate Nulang is the hosted
+[browser playground](https://nulang.org/playground/), which runs the compiler
+frontend + CoreVM locally in WebAssembly without an install.
+
+For the native runtime, download a checksummed archive from the
+[GitHub Releases page](https://github.com/nulang-org/nulang/releases). The
+tagged release matrix covers Linux x86_64/aarch64, macOS Apple Silicon
+(aarch64), and Windows x86_64.
+
+Verify a native installation:
+
+```bash
+nulang --version
+```
+
+Build from source when contributing or customizing the runtime:
 
 ```bash
 git clone https://github.com/nulang-org/nulang.git
 cd nulang
 cargo build --release
+./target/release/nulang --version
 ```
 
-The binary lands at `target/release/nulang`. Add it to your `PATH` or symlink
-it somewhere convenient:
-
-```bash
-ln -s "$(pwd)/target/release/nulang" ~/.local/bin/nulang
-```
-
-Prebuilt binaries are available on the [GitHub Releases
-page](https://github.com/nulang-org/nulang/releases) for Linux (x86_64, aarch64)
-and macOS (x86_64, aarch64).
-
-Verify your installation:
-
-```bash
-nulang --version
-```
+Source builds use Rust 1.95.0, pinned by `rust-toolchain.toml`.
 
 ## Your First Program
 

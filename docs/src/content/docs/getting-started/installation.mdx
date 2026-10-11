@@ -1,28 +1,69 @@
 ---
 title: Installation
-description: Build Nulang from source and set up your development environment.
+description: Try Nulang in the browser, install a release binary, or build from source.
 ---
 import CopyMarkdown from '../../../components/CopyMarkdown.astro';
 
-## Prerequisites
+## Fastest Path
 
 <CopyMarkdown />
 
-- **Rust** 1.95.0 (pinned by `rust-toolchain.toml`; [rustup](https://rustup.rs))
-- **Python 3** development headers (for PyO3 interop)
-- **Linux** or **macOS**. Windows is not supported yet — use
-  [WSL](https://learn.microsoft.com/windows/wsl/) and build inside a Linux environment.
-- A C compiler and linker (GCC/Clang + GNU `bfd` linker on Linux)
+Want to evaluate the language before installing anything? Open the
+[browser playground](/playground/). It runs the compiler frontend + CoreVM
+locally in WebAssembly.
+
+Actors, networking, FFI, and JIT execution require the native runtime.
+
+## Pre-built Binaries
+
+Tagged releases publish checksummed native archives for the release CI matrix:
+
+- **Linux x86_64** — `nulang-linux-x86_64.tar.gz`
+- **Linux aarch64** — `nulang-linux-aarch64.tar.gz`
+- **macOS Apple Silicon (aarch64)** — `nulang-macos-aarch64.tar.gz`
+- **Windows x86_64** — `nulang-windows-x86_64.tar.gz`
+
+Download the archive and matching `.sha256` file from
+[GitHub Releases](https://github.com/nulang-org/nulang/releases), verify the
+published digest, extract the executable, and place it on your `PATH`.
+
+Linux x86_64 example:
+
+```bash
+sha256sum nulang-linux-x86_64.tar.gz
+cat nulang-linux-x86_64.tar.gz.sha256
+tar xzf nulang-linux-x86_64.tar.gz
+install -m 0755 nulang-linux-x86_64 ~/.local/bin/nulang
+nulang --version
+```
+
+On Windows, extract the platform-qualified executable, rename it to
+`nulang.exe`, and place it in a directory on `PATH`.
+
+Other platform/architecture combinations are not release-tested yet.
 
 ## Building from Source
+
+Use the source path when contributing to Nulang, enabling custom feature
+combinations, or building an unsupported platform.
+
+### Source-build prerequisites
+
+- **Rust 1.95.0** (pinned by `rust-toolchain.toml`; [rustup](https://rustup.rs))
+- **Python 3 development headers** for the default PyO3 interop feature
+- A C compiler and linker (GCC/Clang + GNU `bfd` linker on Linux)
+- Linux, macOS, or another environment that can satisfy the native build dependencies
 
 ```bash
 git clone https://github.com/nulang-org/nulang.git
 cd nulang
 cargo build --release
+./target/release/nulang --version
 ```
 
-The release build uses `opt-level=3`, LTO, and single codegen-unit for maximum performance. A debug build (`cargo build`) is faster to compile but runs ~10x slower.
+The release build uses `opt-level=3`, LTO, and a single codegen unit. A debug
+build (`cargo build`) compiles faster but is not representative of release
+runtime performance.
 
 ### Feature Flags
 
@@ -49,43 +90,35 @@ cargo build --release --all-features
 | `tls` | On | TLS support for the TCP transport |
 | `ffi` | On | Dynamic native library loading (`extern` FFI) via libloading/libffi |
 | `tcp` | On | Raw TCP networking — distributed-actor transport, HTTP server, metrics/registry/DAP servers |
-| `ureq` | On | Synchronous HTTP client for `Http.get`/`Http.post`, the registry client, and `nula deploy` |
-| `wasm-backend` | Off | WASM compiler + Wasmtime runtime (enables `--backend wasm\|wasm-run\|wasm-aot`) |
-| `wasmfx-backend` | Off | WasmFX stack-switching backend for suspending effects (requires `wasm-backend`) |
+| `ureq` | On | Synchronous HTTP client for `Http.get`/`Http.post`, the registry client, and package tooling |
+| `wasm-backend` | Off | WASM compiler + Wasmtime runtime |
+| `wasmfx-backend` | Off | Experimental WasmFX stack-switching backend |
 | `http-client` | Off | Async HTTP client (reqwest) |
 | `rocksdb` | Off | RocksDB persistence backend |
 | `postgres` | Off | PostgreSQL persistence backend |
 | `otel` | Off | OpenTelemetry observability |
 | `difffuzz` | Off | Differential fuzzing driver binary |
 
-## Verifying the Build
+## Verifying a Source Build
 
 ```bash
-# Run the test suite
 cargo test
-
-# Start the REPL
-cargo run -- --repl
-
-# Run a Nulang program
-cargo run -- examples/fibonacci.nula
+./target/release/nulang --repl
+./target/release/nulang examples/01_hello.nula
 ```
 
-## System-Specific Notes
+## System-Specific Source Notes
 
 ### Fedora Linux
-
-Install Python development headers:
 
 ```bash
 sudo dnf install python3-devel
 ```
 
-The `build.rs` script automatically creates a `libpythonX.Y.so` symlink for PyO3 linking.
+The `build.rs` script handles the libpython symlink needed by the default
+PyO3 build.
 
 ### macOS
-
-Install Python via Homebrew:
 
 ```bash
 brew install python@3.14
@@ -93,4 +126,8 @@ brew install python@3.14
 
 ## Next Steps
 
-Now that Nulang is installed, follow the [Quick Start](/getting-started/quick-start/) guide to write your first program, and set up your editor with the [VS Code extension](/getting-started/editor-setup/) or the [language server](/tooling/language-server/).
+Follow the [Quick Start](/getting-started/quick-start/) guide to write your
+first program, or use the [browser playground](/playground/) before installing
+the native runtime. Set up your editor with the
+[VS Code extension](/getting-started/editor-setup/) or
+[language server](/tooling/language-server/).
