@@ -57,7 +57,7 @@ mobile-runtime = []
 # Enables the standalone Savina-style actor benchmark runner without pulling optional subsystems.
 savina-bench = []
 python = ["dep:pyo3"]
-sqlite = ["dep:libsql"]
+sqlite = ["dep:libsql", "dep:tokio"]
 lsp = ["dep:tower-lsp", "dep:tokio", "dep:futures", "dep:tower-service"]
 ai-runtime = ["dep:nulang-ai", "dep:nulang-ai-local", "dep:uuid", "dep:reqwest", "dep:tokio"]
 wasm-backend = ["native-codegen", "dep:wasm-encoder", "dep:wasmtime", "dep:wat", "dep:borsh"]
@@ -164,13 +164,14 @@ libffi = { version = "5", optional = true }
 # AI runtime crate (optional; enabled by the `ai-runtime` feature).
 nulang-ai = { path = "crates/nulang-ai", version = "0.1.0", optional = true }
 nulang-ai-local = { path = "crates/nulang-ai-local", version = "0.1.0", optional = true }
+nulang-ui-protocol = { path = "crates/nulang-ui-protocol", version = "0.1.0" }
 uuid = { version = "1", features = ["serde", "v4"], optional = true }
 reqwest = { version = "0.12", features = ["json"], optional = true }
 wasm-encoder = { version = "0.220", optional = true }
 # Borsh serialization for the WASM component boundary (optional, see [features])
 borsh = { version = "1.5", optional = true, features = ["derive"] }
 # WASM runtime using Wasmtime (optional, see [features])
-wasmtime = { version = "48.0.3", optional = true, default-features = false, features = ["cranelift", "runtime", "std", "anyhow", "component-model", "wat"] }
+wasmtime = { version = "48.0.5", optional = true, default-features = false, features = ["cranelift", "runtime", "std", "anyhow", "component-model", "wat"] }
 wat = { version = "1.254", optional = true }
 blake3 = "1.8"
 rustls = { version = "0.23.45", default-features = false, features = ["std", "tls12", "ring", "logging"] }
@@ -205,6 +206,11 @@ required-features = ["native-codegen"]
 [[bin]]
 name = "nulang-savina"
 path = "src/bin/nulang_savina.rs"
+required-features = ["savina-bench"]
+
+[[bin]]
+name = "nulang-shard-bench"
+path = "src/bin/nulang_shard_bench.rs"
 required-features = ["savina-bench"]
 
 [profile.release]

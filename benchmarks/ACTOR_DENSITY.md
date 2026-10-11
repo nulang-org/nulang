@@ -58,6 +58,39 @@ Run modes in separate processes. Allocators may retain freed pages, so running
 `construct` and `idle` sequentially in the same process would contaminate
 RSS comparisons.
 
+## Exact-base Nulang A/B
+
+For a candidate performance branch, prefer the paired exact-base comparator to
+independent before/after runs:
+
+```bash
+python3 scripts/actor_density_ab_bench.py \
+  --base-ref <exact-parent-sha> \
+  --actors 10000 \
+  --runs 5 \
+  --warmup 1 \
+  --cpu-mode single \
+  --no-default-features \
+  --output actor-density-ab.json
+```
+
+The comparator builds the base and candidate into separate Cargo target
+directories, then runs `construct` and `idle` in fresh processes. Measurement
+rounds counterbalance base/candidate and mode ordering so monotonic thermal or
+host-load drift is less likely to correlate with one revision. Reported
+comparisons include paired construction/spawn latency, RSS delta per actor when
+Linux reports a positive measurable delta for every pair, and the exact fixed
+`Actor` layout change.
+
+A zero or unavailable RSS delta is treated as an unavailable RSS comparison,
+not as an infinite improvement/regression. Timing and fixed layout evidence
+remain valid in that case.
+
+The `Actor density A/B` workflow uses the same harness for actor
+representation/spawn PRs. Its shared-runner output is useful same-host A/B
+evidence, but publication-quality 100k-1M residency claims still belong on a
+controlled otherwise-idle host using the density ladder below.
+
 ## Same-host BEAM comparator
 
 `benchmarks/beam/actor_density.escript` provides matching spawn and fan-out
