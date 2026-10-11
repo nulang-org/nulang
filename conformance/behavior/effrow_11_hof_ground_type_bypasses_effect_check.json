@@ -1,1 +1,5 @@
-{"exit_code": 0, "stdout": "only io"}
+{
+  "exit_code": 4,
+  "stdout": "",
+  "proves": "An effectful callback cannot satisfy a pure callback parameter. NTIR's lossy hash must not bypass source function-effect unification."
+}
