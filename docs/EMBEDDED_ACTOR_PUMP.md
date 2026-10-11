@@ -24,6 +24,43 @@ let turns_processed = rt.pump_ready(8);
 assert_eq!(turns_processed, 1);
 ```
 
+## Host-owned local actor lifecycle (stacked proposal)
+
+`runtime::embedded_host::EmbeddedActorHost` provides a small Rust facade over
+`Runtime::pump_ready`, with an explicit actor-creation quota, integer-only
+initial state and message arguments, trusted native function-pointer behaviors,
+and idempotent shutdown.
+
+```rust
+use nulang::runtime::embedded_host::EmbeddedActorHost;
+use nulang::runtime::Actor;
+use nulang::vm::Value;
+
+fn increment(actor: &mut Actor, args: &[Value]) {
+    let by = args.first().and_then(Value::as_int).unwrap_or(0);
+    let current = actor.get_state_field("count").and_then(|v| v.as_int()).unwrap_or(0);
+    actor.set_state_field("count", Value::int(current + by));
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut host = EmbeddedActorHost::new(32);
+    let actor = host.spawn(vec![("count".to_string(), 0)])?;
+    host.register_behavior(actor, "increment", increment)?;
+    host.send_int(actor, "increment", &[5])?;
+    assert_eq!(host.poll(1)?, 1);
+    assert_eq!(host.get_int_field(actor, "count")?, Some(5));
+    host.shutdown();
+    Ok(())
+}
+```
+
+The facade rejects invalid actor IDs, unregistered behaviors, duplicate
+registrations, exceeding the configured actor quota, integer truncation, and
+operations after shutdown. `send_int` explicitly returns `HostError::MailboxFull`
+if local mailbox admission fails due to backpressure. An accepted message is
+**not** proof of behavior execution or durable delivery. This is not a
+persistent-storage API, a C ABI, or an async executor.
+
 ## Behavior and limitations
 
 - **No idle wait:** if no actors are ready, the method returns 0 even with
