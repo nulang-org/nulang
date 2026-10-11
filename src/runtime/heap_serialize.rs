@@ -791,7 +791,10 @@ fn read_frames(
 ) -> Result<Vec<Frame>, String> {
     let mut frames = Vec::with_capacity(count as usize);
     for _ in 0..count {
-        if *offset + 15 > bytes.len() {
+        // Fixed-width frame header before optional closure data/registers:
+        // pc(4) + module_idx(2) + return_dst(1) + caller_idx(4)
+        // + has_closure(1) + num_regs(2) = 14 bytes.
+        if *offset + 14 > bytes.len() {
             return Err("truncated frame header".into());
         }
         let pc = read_u32(bytes, offset)? as usize;
