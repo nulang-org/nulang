@@ -18,6 +18,7 @@
 //! 5. `instantiate` creates fresh type variables from schemes
 
 use crate::ast::*;
+use crate::effect_row_solver::EffectRowSolver;
 use crate::types::*;
 use std::collections::HashSet;
 
@@ -242,9 +243,9 @@ fn compose_subst(s2: &Substitution, s1: &Substitution) -> Substitution {
 // Unification (Most General Unifier)
 // ---------------------------------------------------------------------------
 
-/// Check if two effect rows are compatible (can be unified).
-/// For closed rows, they must have exactly the same effects.
-/// For open rows, we check that the fixed effects are compatible.
+/// Check when two effect rows can be equated without a row substitution.
+/// Unlike directional assignment, an unresolved open tail is never known to
+/// equal a closed effect set. Application-scoped solving must supply the proof.
 fn effect_row_compatible(e1: &EffectRow, e2: &EffectRow) -> bool {
     match (e1, e2) {
         (EffectRow::Closed(a), EffectRow::Closed(b)) => {
@@ -254,8 +255,8 @@ fn effect_row_compatible(e1: &EffectRow, e2: &EffectRow) -> bool {
             b_sorted.sort();
             a_sorted == b_sorted
         }
-        (EffectRow::Open(a, _), EffectRow::Closed(b))
-        | (EffectRow::Closed(b), EffectRow::Open(a, _)) => b.iter().all(|e| a.contains(e)),
+        (EffectRow::Open(_, _), EffectRow::Closed(_))
+        | (EffectRow::Closed(_), EffectRow::Open(_, _)) => false,
         (EffectRow::Open(a, r1), EffectRow::Open(b, r2)) => {
             // Matching explicit effects are not enough: unrelated tails
             // cannot be equated without carrying a row substitution. Until
@@ -393,6 +394,160 @@ fn unify_actor_ref_attenuation(
     Ok(subst)
 }
 
+/// Merge minimum required effect-row allowances. Closed requirements
+/// contribute concrete effects; open requirements retain their unknown tail.
+/// Distinct unresolved actual tails cannot be combined without a row-union
+/// constraint, so fail closed rather than inventing a fresh unbound tail.
+fn merge_callback_minima(
+    prior: &EffectRow,
+    incoming: &EffectRow,
+    span: Span,
+) -> NuResult<EffectRow> {
+    let mut effects: Vec<Effect> = prior
+        .effects()
+        .iter()
+        .chain(incoming.effects())
+        .cloned()
+        .collect();
+    effects.sort();
+    effects.dedup();
+    match (prior, incoming) {
+        (EffectRow::Closed(_), EffectRow::Closed(_)) => Ok(EffectRow::Closed(effects)),
+        (EffectRow::Open(_, tail), EffectRow::Closed(_))
+        | (EffectRow::Closed(_), EffectRow::Open(_, tail)) => {
+            Ok(EffectRow::Open(effects, *tail))
+        }
+        (EffectRow::Open(_, first), EffectRow::Open(_, second)) if first == second => {
+            Ok(EffectRow::Open(effects, *first))
+        }
+        _ => Err(NuError::type_error(
+            "cannot join independent unresolved callback effect tails".to_string(),
+            span,
+        )),
+    }
+}
+
+/// Specialize a callback parameter's open *allowance* for one application.
+///
+/// Assignment gives a *lower bound* on an expected open row variable, not an
+/// equality constraint for each individual argument. Collect all lower bounds
+/// first; solving an exact equality after the first argument would reject a
+/// later, compatible callback with additional effects. The completed witness
+/// is substituted into the call signature only after every argument checks.
+fn constrain_callback_argument(
+    found: &Type,
+    expected: &Type,
+    span: Span,
+    solver: &EffectRowSolver,
+    minima: &mut FxHashMap<Region, EffectRow>,
+) -> NuResult<Substitution> {
+    let solve_error = |error: crate::effect_row_solver::EffectRowSolveError| {
+        NuError::type_error(format!("effect-row constraint: {error}"), span)
+    };
+    let actual = solver.apply_to_type(found).map_err(solve_error)?;
+    let permitted = solver.apply_to_type(expected).map_err(solve_error)?;
+    let (
+        Type::Function {
+            effect: actual_row, ..
+        },
+        Type::Function {
+            effect: allowed_row, ..
+        },
+    ) = (&actual, &permitted)
+    else {
+        return mgu_assignable(&actual, &permitted, span);
+    };
+
+    // A single argument can demand additional effects of the expected row,
+    // but must never eliminate the unknown tail on an actual callback.
+    let mut proposed = minima.clone();
+    match allowed_row {
+        EffectRow::Closed(_) => {
+            if !crate::effect_checker::effect_row_subset(actual_row, allowed_row) {
+                return Err(NuError::type_mismatch(
+                    format!("callback with effects {allowed_row}"),
+                    format!("callback with effects {actual_row}"),
+                    span,
+                ));
+            }
+        }
+        EffectRow::Open(allowed_known, allowed_tail) => {
+            let mut extra: Vec<Effect> = actual_row
+                .effects()
+                .iter()
+                .filter(|eff| !allowed_known.contains(eff))
+                .cloned()
+                .collect();
+            extra.sort();
+            extra.dedup();
+
+            // The same unknown tail cannot justify additional fixed
+            // effects in a different position without an explicit row-lacks
+            // or inclusion proof. Preserve the fail-closed rule.
+            if matches!(actual_row, EffectRow::Open(_, tail) if tail == allowed_tail) {
+                if !crate::effect_checker::effect_row_subset(actual_row, allowed_row) {
+                    return Err(NuError::type_mismatch(
+                        format!("callback with effects {allowed_row}"),
+                        format!("callback with effects {actual_row}"),
+                        span,
+                    ));
+                }
+            } else {
+                let demand = match actual_row {
+                    EffectRow::Closed(_) => EffectRow::Closed(extra),
+                    EffectRow::Open(_, tail) => EffectRow::Open(extra, *tail),
+                };
+                let combined = match proposed.get(allowed_tail) {
+                    Some(prior) => merge_callback_minima(prior, &demand, span)?,
+                    None => demand,
+                };
+                proposed.insert(*allowed_tail, combined);
+            }
+        }
+    }
+
+    // Check the *aggregate* requirements against the original callback
+    // contracts; only publish the updated minima once the structural
+    // parameter, return, and capability checks also pass.
+    let mut candidate = solver.clone();
+    for (tail, demand) in &proposed {
+        candidate.bind(*tail, demand.clone()).map_err(solve_error)?;
+    }
+    let actual = candidate.apply_to_type(&actual).map_err(solve_error)?;
+    let permitted = candidate.apply_to_type(&permitted).map_err(solve_error)?;
+    let (
+        Type::Function {
+            param,
+            ret,
+            cap,
+            effect: actual_effect,
+        },
+        Type::Function {
+            effect: allowed_effect,
+            ..
+        },
+    ) = (&actual, &permitted)
+    else {
+        unreachable!("row substitutions preserve the function type constructor")
+    };
+    if !crate::effect_checker::effect_row_subset(actual_effect, allowed_effect) {
+        return Err(NuError::type_mismatch(
+            format!("callback with effects {allowed_effect}"),
+            format!("callback with effects {actual_effect}"),
+            span,
+        ));
+    }
+    let adapted = Type::Function {
+        param: param.clone(),
+        ret: ret.clone(),
+        effect: allowed_effect.clone(),
+        cap: *cap,
+    };
+    let subst = mgu(&adapted, &permitted, span)?;
+    *minima = proposed;
+    Ok(subst)
+}
+
 fn mgu_assignable(found: &Type, expected: &Type, span: Span) -> NuResult<Substitution> {
     if let (Some(advertised), Some(required)) =
         (found.actor_ref_protocol(), expected.actor_ref_protocol())
@@ -405,8 +560,10 @@ fn mgu_assignable(found: &Type, expected: &Type, span: Span) -> NuResult<Substit
     // satisfy a closed pure contract.
     if let (
         Type::Function {
+            param,
+            ret,
             effect: found_effect,
-            ..
+            cap,
         },
         Type::Function {
             effect: expected_effect,
@@ -421,6 +578,17 @@ fn mgu_assignable(found: &Type, expected: &Type, span: Span) -> NuResult<Substit
                 span,
             ));
         }
+        // Directional inclusion is established only for the outer callback
+        // effect row. Keep its actual parameter/return/capability types and
+        // delegate all nested comparisons to strict symmetric unification.
+        // Otherwise unknown inner callback effects could be erased.
+        let adapted = Type::Function {
+            param: param.clone(),
+            ret: ret.clone(),
+            effect: expected_effect.clone(),
+            cap: *cap,
+        };
+        return mgu(&adapted, expected, span);
     }
     mgu(found, expected, span)
 }
@@ -2348,6 +2516,9 @@ impl TypeChecker {
         let (s1, func_ty) = self.infer_expr(ctx, func)?;
         let mut subst = s1;
         let mut arg_types = vec![];
+        // Rows are specialized per call, never across unrelated invocations.
+        let mut row_solver = EffectRowSolver::new();
+        let mut callback_minima: FxHashMap<Region, EffectRow> = FxHashMap::default();
 
         // Infer each argument
         for arg in args {
@@ -2430,11 +2601,25 @@ impl TypeChecker {
                         || (matches!(found, Type::Function { .. })
                             && matches!(expected, Type::Function { .. }))
                     {
-                        let s_att = mgu_assignable(
-                            &apply_subst(found, &subst),
-                            &apply_subst(expected, &subst),
-                            span,
-                        )?;
+                        let resolved_found = row_solver
+                            .apply_to_type(&apply_subst(found, &subst))
+                            .map_err(|e| NuError::type_error(format!("effect-row constraint: {e}"), span))?;
+                        let resolved_expected = row_solver
+                            .apply_to_type(&apply_subst(expected, &subst))
+                            .map_err(|e| NuError::type_error(format!("effect-row constraint: {e}"), span))?;
+                        let s_att = if matches!((&resolved_found, &resolved_expected),
+                            (Type::Function { .. }, Type::Function { .. }))
+                        {
+                            constrain_callback_argument(
+                                &resolved_found,
+                                &resolved_expected,
+                                span,
+                                &row_solver,
+                                &mut callback_minima,
+                            )?
+                        } else {
+                            mgu_assignable(&resolved_found, &resolved_expected, span)?
+                        };
                         subst = compose_subst(&s_att, &subst);
                         // The directional check above proved that this wider
                         // reference is safe at the required narrower view.
@@ -2447,6 +2632,15 @@ impl TypeChecker {
             }
         }
 
+        // Solve the combined lower bounds only after every callback argument
+        // has been checked; early binding would turn a minimum into an
+        // incorrect exact constraint and reject compatible later callbacks.
+        for (tail, demand) in callback_minima {
+            row_solver
+                .bind(tail, demand)
+                .map_err(|e| NuError::type_error(format!("effect-row constraint: {e}"), span))?;
+        }
+
         // Create a fresh result type
         let result_ty = Type::Var(TypeVar::fresh());
 
@@ -2456,11 +2650,18 @@ impl TypeChecker {
         } else {
             Type::Tuple(arg_types)
         };
+        // Apply the same proven tail equations on both sides of the final
+        // symmetric unification; returning a solved type alone is too late.
+        let param_ty = row_solver
+            .apply_to_type(&param_ty)
+            .map_err(|e| NuError::type_error(format!("effect-row constraint: {e}"), span))?;
 
         // Preserve the function's effect row instead of forcing it to empty.
         // If the function type is not yet known, use a fresh open row so that
         // row-polymorphic functions can still unify.
-        let func_ty_subst = apply_subst(&func_ty, &subst);
+        let func_ty_subst = row_solver
+            .apply_to_type(&apply_subst(&func_ty, &subst))
+            .map_err(|e| NuError::type_error(format!("effect-row constraint: {e}"), span))?;
         let expected_effect = match &func_ty_subst {
             Type::Function { effect, .. } => effect.clone(),
             _ => EffectRow::Open(vec![], Region::fresh()),
@@ -2477,7 +2678,10 @@ impl TypeChecker {
         let s2 = mgu(&func_ty_subst, &expected, span)?;
         let final_subst = compose_subst(&s2, &subst);
 
-        Ok((final_subst.clone(), apply_subst(&result_ty, &final_subst)))
+        let resolved_ret = row_solver
+            .apply_to_type(&apply_subst(&result_ty, &final_subst))
+            .map_err(|e| NuError::type_error(format!("effect-row constraint: {e}"), span))?;
+        Ok((final_subst, resolved_ret))
     }
 
     /// Infer the type of a let binding.
@@ -5129,6 +5333,372 @@ mod tests {
         assert!(
             check_src(source).is_err(),
             "open callback effects cannot be discarded at a pure function boundary"
+        );
+    }
+
+    // Scoped row specialization at an application boundary must not leak
+    // beyond the call or erase structural callback type constraints.
+    fn effect_callback(effects: EffectRow) -> Type {
+        Type::Function {
+            param: Box::new(Type::unit()),
+            ret: Box::new(Type::unit()),
+            effect: effects,
+            cap: Capability::Ref,
+        }
+    }
+
+    fn row_callback_consumer(tail: Region) -> Type {
+        Type::Function {
+            param: Box::new(effect_callback(EffectRow::Open(vec![Effect::IO], tail))),
+            ret: Box::new(effect_callback(EffectRow::Open(vec![], tail))),
+            effect: EffectRow::empty(),
+            cap: Capability::Ref,
+        }
+    }
+
+    fn invoke_callback(consumer: &str, cb: &str) -> Expr {
+        Expr::App {
+            func: Box::new(var(consumer)),
+            args: vec![var(cb)],
+            span: sp(),
+        }
+    }
+
+    #[test]
+    fn test_call_specializes_open_callback_row_in_return_type() {
+        let tail = Region::fresh();
+        let mut ctx = TypeContext::new();
+        ctx.bind(
+            "consume".to_string(),
+            row_callback_consumer(tail),
+            Capability::Ref,
+            false,
+        );
+        ctx.bind(
+            "io_fs".to_string(),
+            effect_callback(EffectRow::Closed(vec![Effect::IO, Effect::FS])),
+            Capability::Ref,
+            false,
+        );
+        let mut tc = TypeChecker::new();
+        let (s, inferred) = tc.infer_expr(&ctx, &invoke_callback("consume", "io_fs")).unwrap();
+        match apply_subst(&inferred, &s) {
+            Type::Function { effect, .. } => {
+                assert_eq!(effect, EffectRow::Closed(vec![Effect::FS]));
+            }
+            ty => panic!("expected function result, got {ty:?}"),
+        }
+    }
+
+    #[test]
+    fn test_call_specializes_expected_tail_without_erasing_actual_open_tail() {
+        let expected_tail = Region::fresh();
+        let actual_tail = Region::fresh();
+        let mut ctx = TypeContext::new();
+        ctx.bind(
+            "consume".to_string(),
+            row_callback_consumer(expected_tail),
+            Capability::Ref,
+            false,
+        );
+        ctx.bind(
+            "unknown_fs".to_string(),
+            effect_callback(EffectRow::Open(vec![Effect::FS], actual_tail)),
+            Capability::Ref,
+            false,
+        );
+        let mut tc = TypeChecker::new();
+        let (_, result) = tc
+            .infer_expr(&ctx, &invoke_callback("consume", "unknown_fs"))
+            .unwrap();
+        match result {
+            Type::Function { effect, .. } => {
+                assert_eq!(effect, EffectRow::Open(vec![Effect::FS], actual_tail));
+            }
+            ty => panic!("expected function result, got {ty:?}"),
+        }
+    }
+
+    #[test]
+    fn test_two_callback_arguments_share_constraints_within_one_call() {
+        let tail = Region::fresh();
+        let consumer = Type::Function {
+            param: Box::new(Type::Tuple(vec![
+                effect_callback(EffectRow::Open(vec![Effect::IO], tail)),
+                effect_callback(EffectRow::Open(vec![Effect::FS], tail)),
+            ])),
+            ret: Box::new(effect_callback(EffectRow::Open(vec![], tail))),
+            effect: EffectRow::empty(),
+            cap: Capability::Ref,
+        };
+        let mut ctx = TypeContext::new();
+        ctx.bind("consume".to_string(), consumer, Capability::Ref, false);
+        ctx.bind(
+            "first".to_string(),
+            effect_callback(EffectRow::Closed(vec![Effect::IO, Effect::FS])),
+            Capability::Ref,
+            false,
+        );
+        ctx.bind(
+            "conflicting".to_string(),
+            effect_callback(EffectRow::Closed(vec![Effect::FS, Effect::Net])),
+            Capability::Ref,
+            false,
+        );
+        ctx.bind(
+            "compatible".to_string(),
+            effect_callback(EffectRow::singleton(Effect::FS)),
+            Capability::Ref,
+            false,
+        );
+        let mut tc = TypeChecker::new();
+        let run = |second| Expr::App {
+            func: Box::new(var("consume")),
+            args: vec![var("first"), var(second)],
+            span: sp(),
+        };
+        let (_, combined) = tc.infer_expr(&ctx, &run("conflicting")).unwrap();
+        match combined {
+            Type::Function { effect, .. } => {
+                assert_eq!(
+                    effect,
+                    EffectRow::Closed(vec![Effect::FS, Effect::Net])
+                );
+            }
+            ty => panic!("expected function result, got {ty:?}"),
+        }
+        let (_, result) = tc.infer_expr(&ctx, &run("compatible")).unwrap();
+        match result {
+            Type::Function { effect, .. } => {
+                assert_eq!(effect, EffectRow::Closed(vec![Effect::FS]));
+            }
+            ty => panic!("expected function result, got {ty:?}"),
+        }
+    }
+
+    #[test]
+    fn test_independent_unknown_callback_tails_are_not_equated() {
+        let tail = Region::fresh();
+        let first_tail = Region::fresh();
+        let second_tail = Region::fresh();
+        let consumer = Type::Function {
+            param: Box::new(Type::Tuple(vec![
+                effect_callback(EffectRow::Open(vec![Effect::IO], tail)),
+                effect_callback(EffectRow::Open(vec![Effect::FS], tail)),
+            ])),
+            ret: Box::new(Type::unit()),
+            effect: EffectRow::empty(),
+            cap: Capability::Ref,
+        };
+        let mut ctx = TypeContext::new();
+        ctx.bind("consume".to_string(), consumer, Capability::Ref, false);
+        ctx.bind(
+            "first".to_string(),
+            effect_callback(EffectRow::Open(vec![Effect::Net], first_tail)),
+            Capability::Ref,
+            false,
+        );
+        ctx.bind(
+            "second".to_string(),
+            effect_callback(EffectRow::Open(vec![Effect::Net], second_tail)),
+            Capability::Ref,
+            false,
+        );
+        let call = Expr::App {
+            func: Box::new(var("consume")),
+            args: vec![var("first"), var("second")],
+            span: sp(),
+        };
+        let mut tc = TypeChecker::new();
+        assert!(
+            tc.infer_expr(&ctx, &call).is_err(),
+            "independent unknown tails cannot be silently combined or closed"
+        );
+    }
+
+    #[test]
+    fn test_nested_record_callback_rows_stay_conservative_without_recursive_solver() {
+        // Call-scoped row specialization currently operates on direct
+        // callback parameters, not callback functions nested in records.
+        // Reject rather than silently equate an unresolved expected tail
+        // with a different closed effect set.
+        let expected_tail = Region::fresh();
+        let consumer = Type::Function {
+            param: Box::new(Type::Record(vec![(
+                "cb".to_string(),
+                effect_callback(EffectRow::Open(vec![Effect::IO], expected_tail)),
+            )])),
+            ret: Box::new(Type::unit()),
+            effect: EffectRow::empty(),
+            cap: Capability::Ref,
+        };
+        let nested_arg = Type::Record(vec![(
+            "cb".to_string(),
+            effect_callback(EffectRow::Closed(vec![Effect::IO, Effect::FS])),
+        )]);
+        let mut ctx = TypeContext::new();
+        ctx.bind("consume".to_string(), consumer, Capability::Ref, false);
+        ctx.bind("record".to_string(), nested_arg, Capability::Ref, false);
+        let call = Expr::App {
+            func: Box::new(var("consume")),
+            args: vec![var("record")],
+            span: sp(),
+        };
+        let mut tc = TypeChecker::new();
+        assert!(
+            tc.infer_expr(&ctx, &call).is_err(),
+            "nested callback effects require recursive, scoped row constraints"
+        );
+    }
+
+    #[test]
+    fn test_call_row_specialization_is_transaction_local() {
+        let tail = Region::fresh();
+        let mut ctx = TypeContext::new();
+        ctx.bind(
+            "consume".to_string(),
+            row_callback_consumer(tail),
+            Capability::Ref,
+            false,
+        );
+        for (name, extra) in [("io_fs", Effect::FS), ("io_net", Effect::Net)] {
+            ctx.bind(
+                name.to_string(),
+                effect_callback(EffectRow::Closed(vec![Effect::IO, extra])),
+                Capability::Ref,
+                false,
+            );
+        }
+        let mut tc = TypeChecker::new();
+        for (name, expected_effect) in [("io_fs", Effect::FS), ("io_net", Effect::Net)] {
+            let (_, result) = tc.infer_expr(&ctx, &invoke_callback("consume", name)).unwrap();
+            match result {
+                Type::Function { effect, .. } => {
+                    assert_eq!(effect, EffectRow::singleton(expected_effect));
+                }
+                ty => panic!("expected function result, got {ty:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_callback_row_specialization_preserves_return_type_mismatch() {
+        let mut ctx = TypeContext::new();
+        ctx.bind(
+            "consume".to_string(),
+            row_callback_consumer(Region::fresh()),
+            Capability::Ref,
+            false,
+        );
+        ctx.bind(
+            "wrong_return".to_string(),
+            Type::Function {
+                param: Box::new(Type::unit()),
+                ret: Box::new(Type::int()),
+                effect: EffectRow::Closed(vec![Effect::IO, Effect::FS]),
+                cap: Capability::Ref,
+            },
+            Capability::Ref,
+            false,
+        );
+        let mut tc = TypeChecker::new();
+        assert!(
+            tc.infer_expr(&ctx, &invoke_callback("consume", "wrong_return"))
+                .is_err(),
+            "row specialization must not erase the callback's return type"
+        );
+    }
+
+    #[test]
+    fn test_unknown_open_callback_cannot_specialize_to_closed_purity() {
+        let tail = Region::fresh();
+        let mut ctx = TypeContext::new();
+        ctx.bind(
+            "pure_consumer".to_string(),
+            Type::Function {
+                param: Box::new(effect_callback(EffectRow::empty())),
+                ret: Box::new(Type::unit()),
+                effect: EffectRow::empty(),
+                cap: Capability::Ref,
+            },
+            Capability::Ref,
+            false,
+        );
+        ctx.bind(
+            "unknown".to_string(),
+            effect_callback(EffectRow::Open(vec![Effect::IO], tail)),
+            Capability::Ref,
+            false,
+        );
+        let mut tc = TypeChecker::new();
+        assert!(
+            tc.infer_expr(&ctx, &invoke_callback("pure_consumer", "unknown"))
+                .is_err(),
+            "unresolved actual callback effects must not be made pure"
+        );
+    }
+
+    #[test]
+    fn test_mgu_rejects_unknown_open_effect_tail_against_closed_row() {
+        let callback = |effect| Type::Function {
+            param: Box::new(Type::unit()),
+            ret: Box::new(Type::unit()),
+            effect,
+            cap: Capability::Ref,
+        };
+        let open = callback(EffectRow::Open(vec![Effect::IO], Region::fresh()));
+        let closed = callback(EffectRow::singleton(Effect::IO));
+        assert!(
+            mgu(&open, &closed, sp()).is_err(),
+            "unresolved open effects must not equal closed effects"
+        );
+        assert!(
+            mgu(&closed, &open, sp()).is_err(),
+            "open/closed equality must be symmetric and fail closed"
+        );
+    }
+
+    #[test]
+    fn test_nested_open_callback_cannot_satisfy_pure_callback() {
+        let outer = |nested: Type| Type::Function {
+            param: Box::new(nested),
+            ret: Box::new(Type::unit()),
+            effect: EffectRow::empty(),
+            cap: Capability::Ref,
+        };
+        let inner = |effect| Type::Function {
+            param: Box::new(Type::unit()),
+            ret: Box::new(Type::unit()),
+            effect,
+            cap: Capability::Ref,
+        };
+        let actual = outer(inner(EffectRow::Open(
+            vec![Effect::IO],
+            Region::fresh(),
+        )));
+        let expected = outer(inner(EffectRow::empty()));
+        assert!(
+            mgu_assignable(&actual, &expected, sp()).is_err(),
+            "nested unresolved callback effects must never satisfy purity"
+        );
+    }
+
+    #[test]
+    fn test_assignable_closed_callback_can_fit_a_wider_open_allowance() {
+        let callback = |effect| Type::Function {
+            param: Box::new(Type::unit()),
+            ret: Box::new(Type::unit()),
+            effect,
+            cap: Capability::Ref,
+        };
+        let pure_actual = callback(EffectRow::empty());
+        let wide_expected = callback(EffectRow::Open(
+            vec![Effect::IO],
+            Region::fresh(),
+        ));
+        assert!(
+            mgu_assignable(&pure_actual, &wide_expected, sp()).is_ok(),
+            "directional assignment permits a proven pure callback in an open allowance"
         );
     }
 
