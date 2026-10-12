@@ -9,7 +9,9 @@ fn main() {
     let pairs = zip(["alice", "bob"], [10, 20])
     let first = pairs[0]
     let second = pairs[1]
-    perform IO.print("zip=" + first.0 + ":" + perform Int.to_string(first.1) + "," + second.0 + ":" + perform Int.to_string(second.1))
+    let first_number = perform Int.to_string(first.1)
+    let second_number = perform Int.to_string(second.1)
+    perform IO.print("zip=" + first.0 + ":" + first_number + "," + second.0 + ":" + second_number)
 
     let indexed = enumerate(["north", "south"])
     let second_indexed = indexed[1]
