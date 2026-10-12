@@ -82,12 +82,12 @@ let r = sqrt(25.0)       // ~5.0
 
 List/array operations over native arrays. Functions fall into two categories:
 
-- **Int-only** (annotated `[Int]`): `sum`, `fold`, `max_of`, `min_of`,
-  `sort`, `append`, `zip`, `enumerate`, and `uniq`.
+- **Int-only** (annotated `[Int]`): `sum`, `max_of`, `min_of`, `sort`, and `uniq`.
 
 - **Polymorphic** (no element-type annotation): `length`, `contains`, `index_of`,
   `find`, `any`, `all`, `map`, `filter`, `reverse`, `take`, `drop`,
-  and `range`. These accept arrays of any compatible element type.
+  `range`, `fold`, `append`, `zip`, and `enumerate`. `fold` may use an accumulator
+  type different from the element type; `zip` accepts different left/right types.
 
 ### Traversal functions
 
@@ -100,7 +100,7 @@ List/array operations over native arrays. Functions fall into two categories:
 | `find` | `fn find(pred, xs) -> Option[T]` | First matching element, or `None`. |
 | `any` | `fn any(pred, xs) -> Bool` | True if any element satisfies the predicate. |
 | `all` | `fn all(pred, xs) -> Bool` | True if all elements satisfy the predicate. |
-| `fold` | `fn fold(f, init: Int, xs: [Int]) -> Int` | Left fold: `fold(f, init, [a,b,c])` = `f(f(f(init, a), b), c)`. |
+| `fold` | `fn fold(f, init, xs)` | Polymorphic left fold, with an accumulator type independent of the element type. |
 | `max_of` | `fn max_of(xs: [Int]) -> Option[Int]` | Maximum element, or `None` for an empty array. |
 | `min_of` | `fn min_of(xs: [Int]) -> Option[Int]` | Minimum element, or `None` for an empty array. |
 
@@ -138,7 +138,7 @@ let rest    = drop(2, xs)        // [3, 4, 5]
 let r       = range(4)           // [0, 1, 2, 3]
 ```
 
-Polymorphic functions work with strings, records, and any element type:
+Polymorphic functions work with strings, records, and any compatible element type:
 
 ```nula
 import stdlib::list

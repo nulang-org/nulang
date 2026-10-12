@@ -339,29 +339,25 @@ f(10).1              // → 11
 
 Stdlib `list` functions fall into two categories:
 
-- **Polymorphic** (no `[Int]` annotation): `map`, `filter`, `reverse`,
-  `take`, `drop`, `range` — work with any element type (strings,
-  records, tuples, etc.).
+- **Polymorphic**: `length`, `contains`, `index_of`, `find`, `any`, `all`,
+  `map`, `filter`, `reverse`, `take`, `drop`, `range`, `fold`, `append`,
+  `zip`, `enumerate` — work with compatible element types (strings,
+  records, tuples, etc.). `fold` supports a different accumulator type,
+  and `zip` accepts two different element types.
 
-- **Int-only** (annotated `[Int]`): `length`, `sum`, `contains`,
-  `index_of`, `find`, `any`, `all`, `fold`, `max_of`, `min_of`,
-  `sort`, `append`, `zip`, `enumerate` — produce a type error when
-  passed non-Int arrays.
+- **Int-only** (annotated `[Int]`): `sum`, `max_of`, `min_of`, `sort`,
+  `uniq` — require integer arrays.
 
 ```nula
 import stdlib::list
 
-// ❌ length expects [Int]
-let n = length(["x", "y", "z"])
-// Error: Type mismatch: expected Int, found String
-
-// ❌ fold expects init: Int, xs: [Int]
+// ✅ polymorphic functions work with any compatible type
+let n = length(["x", "y", "z"])  // 3
+let words = append(["hello"], ["world"])
+let pairings = zip(["a", "b"], [1, 2])
 let r = fold(fn(acc, s) { acc + " " + s }, "hello", ["world"])
-// Error: Type mismatch: expected Int, found String
-
-// ✅ polymorphic functions work with any type
-let excited = map(fn(s) { s + "!" }, ["a", "b", "c"])  // ["a!", "b!", "c!"]
-let pos = filter(fn(r) { r.x > 0 }, [{x: 1}, {x: -1}, {x: 2}])  // [{x:1}, {x:2}]
+let excited = map(fn(s) { s + "!" }, ["a", "b", "c"])
+let pos = filter(fn(r) { r.x > 0 }, [{x: 1}, {x: -1}, {x: 2}])
 ```
 
 ---
