@@ -71,3 +71,44 @@ pub fn values(m) {
     };
     result
 }
+
+/// Convert a list of (key, value) tuples into a value-style map.
+/// Duplicate keys use the last supplied value, keeping the first key position.
+/// Construction is O(n^2) for n distinct keys with this array-backed format.
+pub fn from_pairs(entries) {
+    var result = empty();
+    for entry in entries {
+        result = insert(entry.0, entry.1, result)
+    };
+    result
+}
+
+/// Return a list of (key, value) tuples in insertion order.
+/// Each result is a fresh array; this map uses no mutable hash-table storage.
+pub fn to_pairs(m) {
+    var result = [];
+    for entry in m {
+        result = perform Array.push(result, (entry.key, entry.value))
+    };
+    result
+}
+
+/// Merge two value-style maps without changing either input.
+/// Keys from right replace keys in left; all other entries are retained.
+/// Complexity is O((n + m) * (n + m)) in the worst case, not a hash-map merge.
+pub fn merge(left, right) {
+    var result = left;
+    for entry in right {
+        result = insert(entry.key, entry.value, result)
+    };
+    result
+}
+
+/// Return the mapped value, or a provided fallback if the key is absent.
+/// Unlike the VM's mutable Map effect, the value-style get returns Option.
+pub fn get_or(k, m, fallback) {
+    match get(k, m) {
+        Some(value) => value,
+        None => fallback,
+    }
+}
