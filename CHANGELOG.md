@@ -233,6 +233,16 @@ version + migration.*
 
 ## Stable tier
 
+### Secret value confidentiality — 2026-09-21
+- **Opaque `Secret[T]` type** (Experimental, `src/types.rs`, `src/parser.rs`,
+  `src/typechecker.rs`). Secret values are a confidentiality property
+  independent from reference capabilities such as `lineariso`.
+  `Secret.get/read(name)` infer `Secret[String]`; secret-bearing values
+  cannot cross non-`Secret` effect boundaries, actor-message boundaries, or
+  durable-event boundaries, including when nested inside containers. Pure code
+  may carry and return `Secret[T]` values normally. This phase is compiler
+  enforcement only; a runtime secret broker/opaque-handle representation is
+  follow-up work.
 ### Zero-copy non-reentrant JIT register entry — 2026-09-24
 - **Cranelift regions that cannot re-enter the VM now execute directly against the active frame's 256-register array**, eliminating the previous 2 KiB snapshot before native entry and 2 KiB copy-back afterward. `Value` is explicitly `repr(transparent)` over `u64` so the native register ABI has a documented layout guarantee.
 - **Compiled-region metadata now records whether native execution may grow or replace the VM frame stack.** Regions containing helper-backed direct calls retain the detached register snapshot because re-entrant interpreter calls may reallocate `VM::frames`; typed, SIMD, and scalar non-call regions use the direct-frame path.
