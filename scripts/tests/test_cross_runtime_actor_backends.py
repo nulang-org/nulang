@@ -3,10 +3,14 @@ from __future__ import annotations
 
 import sys
 import unittest
+from contextlib import redirect_stderr
+from io import StringIO
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import cross_runtime_bench as harness
 from cross_runtime_bench import COMPUTE_BENCHMARKS, paired_backend_speedups, parse_records
 
 
@@ -50,6 +54,44 @@ class ActorComputeBackendTests(unittest.TestCase):
         record = "[cross-bench] runtime=nulang-aot benchmark=counting messages=200000 elapsed_ns=100"
         with self.assertRaisesRegex(RuntimeError, "did not emit"):
             parse_records(record, "nulang-aot", COMPUTE_BENCHMARKS)
+
+    def test_savina_rejects_uncompiled_jit_before_any_cargo_build(self):
+        stderr = StringIO()
+        with (
+            mock.patch.object(
+                sys, "argv",
+                ["cross_runtime_bench.py", "--workloads", "savina",
+                 "--runtimes", "nulang,nulang-jit,nulang-aot"],
+            ),
+            mock.patch.object(
+                harness, "build_commands",
+                side_effect=AssertionError("must fail before building"),
+            ),
+            redirect_stderr(stderr),
+            self.assertRaises(SystemExit) as failure,
+        ):
+            harness.main()
+        self.assertEqual(failure.exception.code, 2)
+        self.assertIn("not verified", stderr.getvalue())
+
+    def test_compute_rejects_external_runtimes_before_building(self):
+        stderr = StringIO()
+        with (
+            mock.patch.object(
+                sys, "argv",
+                ["cross_runtime_bench.py", "--workloads", "actor_compute",
+                 "--runtimes", "nulang,go"],
+            ),
+            mock.patch.object(
+                harness, "build_commands",
+                side_effect=AssertionError("must fail before building"),
+            ),
+            redirect_stderr(stderr),
+            self.assertRaises(SystemExit) as failure,
+        ):
+            harness.main()
+        self.assertEqual(failure.exception.code, 2)
+        self.assertIn("Nulang-only", stderr.getvalue())
 
     def test_paired_speedups_align_same_round_samples(self):
         samples = {
