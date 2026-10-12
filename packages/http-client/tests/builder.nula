@@ -93,5 +93,20 @@ fn main() {
     Ok(_) => fail_with("checked send should reject unsupported headers"),
   }
 
+  // Feature-disabled standalone VM returns this legacy diagnostic as a String
+  // rather than nil. It must not be mistaken for a successful response body.
+  match normalize_legacy_response("HTTP client disabled (feature 'ureq' not enabled)") {
+    Error(msg) => assert(msg == "HTTP client unavailable (ureq feature disabled)", "disabled feature fails closed"),
+    Ok(_) => fail_with("disabled HTTP feature must not count as successful response"),
+  }
+  match normalize_legacy_response(nil) {
+    Error(_) => assert(true, "nil is an HTTP failure"),
+    Ok(_) => fail_with("nil cannot be a successful body"),
+  }
+  match normalize_legacy_response("legitimate body") {
+    Ok(body) => assert(body == "legitimate body", "ordinary successful response retained"),
+    Error(_) => fail_with("valid body must remain successful"),
+  }
+
   perform IO.print("http-client builder tests passed")
 }
