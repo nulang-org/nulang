@@ -327,6 +327,98 @@ fn test_delivery_establishes_child_context_and_inherits() {
     assert_eq!(child.span_id(), ctx.span_id());
 }
 
+/// An untraced actor turn must not manufacture an outgoing W3C trace when
+/// TRACE collection is disabled. Exercise the real mailbox/scheduler path,
+/// not just TraceContext::for_dispatch in isolation.
+#[test]
+fn test_untraced_delivery_keeps_outgoing_message_untraced() {
+    tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+        let mut rt = Runtime::new();
+        let receiver = rt.spawn_actor(Box::new(Vec::new));
+        rt.send_message_by_id(receiver, 0, &[]);
+        run_ready_actor_turn(&mut rt, receiver);
+
+        assert!(
+            rt.current_trace.is_none(),
+            "untraced dispatch must not create a synthetic root span"
+        );
+
+        let outgoing = rt.spawn_actor(Box::new(Vec::new));
+        rt.send_message_by_id(outgoing, 0, &[]);
+        let message = rt
+            .actors
+            .get_mut(&outgoing)
+            .unwrap()
+            .receive()
+            .expect("outgoing actor message admitted");
+        assert!(
+            message.trace_id.is_none(),
+            "untraced dispatch must not stamp a synthetic traceparent on sends"
+        );
+    });
+}
+
+/// A previous traced turn must not leak its context into a later untraced
+/// delivery on the same runtime. Incoming traces still propagate (covered by
+/// test_delivery_establishes_child_context_and_inherits above).
+#[test]
+fn test_untraced_delivery_clears_previous_actor_trace_context() {
+    tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+        let mut rt = Runtime::new();
+        let traced = rt.spawn_actor(Box::new(Vec::new));
+        let incoming = TraceContext::root();
+        rt.actors
+            .get_mut(&traced)
+            .unwrap()
+            .mailbox
+            .push(Message {
+                behavior_id: 0,
+                payload: MessagePayload::from_slice(&[]),
+                sender: 0,
+                priority: MessagePriority::Normal,
+                trace_id: Some(incoming.to_traceparent()),
+            })
+            .expect("traced message admitted");
+        run_ready_actor_turn(&mut rt, traced);
+        assert_eq!(
+            rt.current_trace.expect("incoming trace is preserved").trace_id(),
+            incoming.trace_id()
+        );
+
+        let untraced = rt.spawn_actor(Box::new(Vec::new));
+        rt.actors
+            .get_mut(&untraced)
+            .unwrap()
+            .mailbox
+            .push(Message {
+                behavior_id: 0,
+                payload: MessagePayload::from_slice(&[]),
+                sender: 0,
+                priority: MessagePriority::Normal,
+                trace_id: None,
+            })
+            .expect("untraced message admitted");
+        run_ready_actor_turn(&mut rt, untraced);
+        assert!(
+            rt.current_trace.is_none(),
+            "untraced turn must clear the previous actor's trace context"
+        );
+
+        let outgoing = rt.spawn_actor(Box::new(Vec::new));
+        rt.send_message_by_id(outgoing, 0, &[]);
+        let message = rt
+            .actors
+            .get_mut(&outgoing)
+            .unwrap()
+            .receive()
+            .expect("outgoing actor message admitted");
+        assert!(
+            message.trace_id.is_none(),
+            "outgoing message must not inherit the previous actor's traceparent"
+        );
+    });
+}
+
 #[test]
 fn test_metrics_snapshot_topology_and_crdt() {
     let mut rt = Runtime::new();
