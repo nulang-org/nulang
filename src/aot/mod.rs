@@ -79,7 +79,7 @@ impl AotModule {
 
         let mut jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
 
-        // Register NaN-tag-aware runtime helpers.
+        // Register tagged-word-aware runtime helpers.
         register_runtime_helpers(&mut jit_builder);
 
         let mut jit_module = JITModule::new(jit_builder);
@@ -450,6 +450,11 @@ impl AotModule {
                 span: Span::default(),
             })?;
 
+        // JIT helpers share this thread-local channel but JIT execution does not
+        // consume it. A prior tiered-JIT type error must not poison this fresh
+        // AOT invocation.
+        let _ = crate::jit::runtime::aot_take_pending_error();
+
         // Set up standalone heap for AOT runtime helpers.
         let mut heap = crate::runtime::heap::ActorHeap::new(1024 * 1024);
         heap.set_actor_id(0);
@@ -542,6 +547,10 @@ impl AotModule {
                     span: crate::types::Span::default(),
                 })?;
         let constants = self.constants.clone();
+
+        // See `run`: the channel is also written by tiered-JIT helpers and
+        // must be empty at the boundary of a new native invocation.
+        let _ = crate::jit::runtime::aot_take_pending_error();
 
         // Register the AOT module and its bytecode grains with the runtime.
         let module_ptr = rt.register_aot_module(self);
@@ -2027,5 +2036,26 @@ mod tests {
         crate::jit::runtime::aot_clear_constants();
         let _ = crate::jit::runtime::aot_take_heap();
         assert_eq!(s.as_deref(), Some("hello23"));
+    }
+
+    #[test]
+    fn test_aot_run_clears_stale_jit_pending_error() {
+        // Tiered-JIT helpers share the AOT pending-error TLS but do not consume
+        // it. A later independent AOT run must start with a clean channel.
+        crate::jit::runtime::aot_set_pending_error("stale JIT error".into());
+
+        let tokens = crate::lexer::Lexer::new("true").lex().unwrap();
+        let ast = crate::parser::Parser::new(tokens).parse_module().unwrap();
+        let mut tc = crate::typechecker::TypeChecker::new();
+        tc.check_module(&ast).unwrap();
+        let hir = crate::hir_lower::lower_module(&ast, &tc.inferred_decl_types);
+        let mir = crate::mir_lower::lower_module(&hir).unwrap();
+        let aot = super::AotModule::compile(&mir).expect("AOT compile");
+
+        let result = aot.run().expect("stale error must not poison AOT run");
+        assert_eq!(
+            unsafe { crate::vm::Value::from_raw(result) }.as_bool(),
+            Some(true)
+        );
     }
 }

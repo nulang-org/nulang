@@ -67,6 +67,30 @@ pub enum TieredAction {
     CompiledSimdAndRan,
 }
 
+/// Aggregate native compilation telemetry exposed uniformly by JIT backends.
+///
+/// These counters measure compiler wall time only. They deliberately exclude
+/// interpretation before tier-up and execution of generated code so benchmark
+/// tooling can report compile latency separately from runtime payoff.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JitCompileStats {
+    pub fast_compiles: u64,
+    pub fast_compile_ns: u64,
+    pub optimized_compiles: u64,
+    pub optimized_compile_ns: u64,
+}
+
+impl JitCompileStats {
+    pub fn total_compiles(self) -> u64 {
+        self.fast_compiles + self.optimized_compiles
+    }
+
+    pub fn total_compile_ns(self) -> u64 {
+        self.fast_compile_ns
+            .saturating_add(self.optimized_compile_ns)
+    }
+}
+
 /// A JIT backend compiles hot bytecode regions into native code for faster
 /// execution. The default implementation uses Cranelift (`src/jit/`). A future
 /// runtime could implement this trait with LLVM, GCC JIT, or whatever
@@ -96,11 +120,29 @@ pub trait JitBackend {
     /// Number of bytecode instructions in the compiled region at `(module_idx, pc)`.
     fn compiled_region_len(&self, module_idx: usize, pc: usize) -> Option<usize>;
 
+    /// Whether native execution of this region may re-enter the VM and grow
+    /// or replace its frame stack. Backends default to the conservative answer
+    /// so alternative implementations keep using detached register storage.
+    ///
+    /// The VM uses this to decide whether it is sound to expose the active
+    /// frame's register array directly to native code. A backend may return
+    /// `false` only when every helper reachable from the compiled region is
+    /// proven not to access or mutate VM frame storage.
+    fn compiled_region_requires_vm_reentry(&self, _module_idx: usize, _pc: usize) -> bool {
+        true
+    }
+
     /// Number of regions compiled (scalar path).
     fn compiled_count(&self) -> usize;
 
     /// Number of regions compiled through the type-directed path.
     fn typed_compiled_count(&self) -> usize;
+
+    /// Aggregate compiler-only latency telemetry. Backends that do not expose
+    /// compiler timing may keep the zero-valued default.
+    fn compile_stats(&self) -> JitCompileStats {
+        JitCompileStats::default()
+    }
 
     /// Reset hot counters.
     fn reset_hot_counters(&mut self);
