@@ -105,6 +105,9 @@ jobs:
         # the default-feature test selection.
         run: cargo nextest run --locked
 
+      - name: Test compact ORCA header with native backends
+        run: cargo test --locked --features compact-orca-header --lib
+
       - name: Test doctests
         # nextest intentionally does not execute rustdoc tests.
         run: cargo test --locked --doc
@@ -235,6 +238,9 @@ jobs:
 
       - name: Test
         run: cargo test --locked --no-default-features
+
+      - name: Test compact ORCA header with minimal runtime
+        run: cargo test --locked --no-default-features --features compact-orca-header --lib
 
       - name: Check zero warnings
         run: cargo check --locked --tests --no-default-features
