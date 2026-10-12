@@ -98,15 +98,23 @@ def git(*args: str) -> str:
     return subprocess.check_output(["git", *args], text=True).strip()
 
 
+def assert_checkout_matches(commit: str, allow_dirty: bool) -> None:
+    """Prevent mixing different code revisions or unapproved worktree changes."""
+    current = git("rev-parse", "HEAD")
+    if current != commit:
+        raise RuntimeError(f"HEAD moved during paired comparison: {commit} -> {current}")
+    if not allow_dirty and git("status", "--porcelain"):
+        raise RuntimeError(
+            "Refusing to benchmark a dirty worktree; commit changes or "
+            "use --allow-dirty (the override is included in the report)."
+        )
+
+
 def run(out: Path, cycles: int, allow_dirty: bool) -> None:
     root = Path(__file__).resolve().parent.parent
     os.chdir(root)
     commit = git("rev-parse", "HEAD")
-    if not allow_dirty and git("status", "--porcelain"):
-        raise SystemExit(
-            "Refusing to benchmark a dirty worktree; commit your changes "
-            "or use --allow-dirty (results will record that override)."
-        )
+    assert_checkout_matches(commit, allow_dirty)
     out = out.resolve()
     out.mkdir(parents=True, exist_ok=True)
     samples: list[dict[str, Any]] = []
@@ -122,6 +130,7 @@ def run(out: Path, cycles: int, allow_dirty: bool) -> None:
                 shutil.rmtree(criterion_dir)
             env = dict(os.environ, CARGO_TARGET_DIR=str(target_dir))
             for benchmark_filter in FILTERS:
+                assert_checkout_matches(commit, allow_dirty)
                 command = [
                     "cargo", "bench", "--locked", "--bench", "bench_main",
                     *features, "--", benchmark_filter,
@@ -129,6 +138,7 @@ def run(out: Path, cycles: int, allow_dirty: bool) -> None:
                 print(f"cycle={cycle + 1} step={step + 1} profile={profile}: "
                       + " ".join(command), flush=True)
                 subprocess.run(command, env=env, check=True)
+                assert_checkout_matches(commit, allow_dirty)
             estimates = criterion_means(criterion_dir)
             sample = {
                 "cycle": cycle + 1,
