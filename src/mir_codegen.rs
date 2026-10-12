@@ -1565,7 +1565,7 @@ fn binary_opcode(op: &crate::ast::BinOp, is_float: bool) -> NuResult<OpCode> {
 /// call results, array/record loads — are not tracked, and operations on
 /// them keep the legacy integer opcodes. That is a limitation, not a
 /// regression: pre-fix behavior for those cases was the same.
-fn float_locals(func: &mir::Function) -> Vec<bool> {
+pub(crate) fn float_locals(func: &mir::Function) -> Vec<bool> {
     let mut is_float = vec![false; func.locals.len()];
     for local in &func.locals {
         if local.ty == Type::Primitive(PrimitiveType::Float) {
