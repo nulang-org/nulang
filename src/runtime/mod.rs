@@ -3263,14 +3263,22 @@ impl Runtime {
     /// local scheduler in an infinite loop.  This method never returns
     /// under normal circumstances; the node terminates on SIGINT/SIGTERM.
     pub fn run_distributed_node(&mut self) {
+        // Bound maintenance latency for timers, send failures, and custom
+        // transports that cannot signal incoming work. TCP arrivals wake
+        // immediately via the transport's inbound channel.
+        const MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
         loop {
             self.process_network();
             self.run_scheduler();
-            // run_scheduler returns when the local queue is quiescent.
-            // Network packets may have arrived while we ran, so loop
-            // again after a brief pause to avoid busy-waiting when
-            // truly idle.
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            // The scheduler is quiescent; wait on the inbound channel rather
+            // than imposing an unconditional 10ms delay on remote messages.
+            // recv_timeout stages the wakeup packet for process_network's
+            // next receive, preserving FIFO and avoiding lost notifications.
+            if let Some(transport) = self.distributed.transport.as_ref() {
+                transport.wait_for_activity(MAINTENANCE_INTERVAL);
+            } else {
+                std::thread::sleep(MAINTENANCE_INTERVAL);
+            }
         }
     }
 
