@@ -3,7 +3,7 @@
 </p>
 <h1 align="center">Nulang</h1>
 <p align="center">
-  An actor-based language with algebraic effects, capability-based types, durable actors, and experimental distribution for building resilient software.
+  A typed language for concurrent, durable, and distributed software with algebraic effects, reference capabilities, actors, and durable execution.
 </p>
 <p align="center">
   <a href="https://nulang.org">Website</a> •
@@ -22,19 +22,28 @@
 
 ---
 
+**New to Nulang?** [Try Core in the browser](https://nulang.org/playground/) (no install) · [Install a checksummed release](https://nulang.org/getting-started/installation/) · [Run the quick start](https://nulang.org/getting-started/quick-start/). Native actors, networking, and durable runtime features require a local binary.
+
 ## What is Nulang?
 
-Nulang is an actor-based programming language with algebraic effects and
-capability-based types. It fuses Erlang-style fault-tolerant actors with a
-Hindley-Milner type system, reference capabilities (`iso`/`trn`/`ref`/`val`/`box`/`tag`/`lineariso`),
-and row-polymorphic algebraic effects. The compiler pipeline (AST → HIR → MIR)
+Nulang is a programming language for concurrent, durable, and distributed
+software. Its semantic core combines a Hindley-Milner type system, reference
+capabilities (`iso`/`trn`/`ref`/`val`/`box`/`tag`/`lineariso`), and
+row-polymorphic algebraic effects. Erlang-style fault-tolerant actors are the
+first-class abstraction for independently addressable isolated state; ordinary
+local computation remains ordinary computation rather than being modeled as an
+actor. The compiler pipeline (AST → HIR → MIR)
 uses the register-based bytecode VM as the semantic reference implementation.
 Hot regions can tier into a Cranelift JIT; WASM is the canonical portable/cloud
 execution target; and native AOT remains a secondary backend until full semantic
 parity is demonstrated. An experimental WasmFX backend explores stack-switching
-for suspending effects. The runtime is a multi-threaded work-stealing executor
-with supervision trees, ORCA garbage collection, durable persistence, and
-experimental location-transparent distribution.
+for suspending effects. The runtime supports sharded multi-threaded execution: each `Runtime` shard has
+one owning cooperative scheduler thread, and `NULANG_SHARDS>1` runs shards in
+parallel with bounded cross-shard channels. The scheduler implementation retains
+Chase-Lev work-stealing APIs for multi-worker callers, but the live per-shard
+`run_scheduler()` path currently uses one worker slot. Supervision trees, ORCA
+garbage collection, durable persistence, and experimental location-transparent
+distribution are integrated into that model.
 
 ---
 
@@ -55,8 +64,7 @@ checksum, then put the extracted executable on your PATH.
 Linux x86_64 example:
 
 ```bash
-sha256sum nulang-linux-x86_64.tar.gz
-cat nulang-linux-x86_64.tar.gz.sha256  # compare the published digest
+sha256sum -c nulang-linux-x86_64.tar.gz.sha256
 tar xzf nulang-linux-x86_64.tar.gz
 install -m 0755 nulang-linux-x86_64 ~/.local/bin/nulang
 ```
@@ -116,11 +124,11 @@ perform IO.print("Hello, " + name + "!")
 ## Feature Highlights
 
 - **Algebraic effects** — `perform Effect.op(args)` / `handle body with { | Effect.op(x) => ... }` with resume semantics. Effect dependencies are explicit in function signatures via `!` rows.
-- **Capability-based types** — `iso`, `trn`, `ref`, `val`, `box`, `tag`, and `lineariso` guarantee memory safety and data-race freedom. Checked at compile time; erased at runtime.
+- **Reference-capability types** — `iso`, `trn`, `ref`, `val`, `box`, `tag`, and `lineariso` govern aliasing, mutation, ownership, and cross-actor sendability. They are distinct from external authority grants.
 - **Hindley-Milner type inference** — full Algorithm W with row-polymorphic records, variant types, and algebraic effect rows.
 - **Actors** — `spawn`, `send`/`!`, `ask`, selective `receive` with `after` timeout, links, monitors, supervision trees, process groups, and actor priority scheduling.
 - **Typed actor protocols** — structural `ActorRef[P]` contracts can restrict public actor APIs to required behaviors. Compiler-derived protocol fingerprints, a trusted schema registry, directional compatibility checks, and pre-mailbox admission are implemented as *Experimental* protocol hardening.
-- **Entities & workflows** — `entity` declarations are durable-first and event-sourced by default. The higher-level `workflow` declaration surface supports steps, timers, signals, and saga compensation, and remains *Experimental* while that API evolves.
+- **Entities & workflows** — `entity` declarations are durable-first and event-sourced by default. The higher-level `workflow` declaration surface supports steps, timers, signals, and saga compensation on the reference bytecode runtime and remains *Experimental*. The canonical portable/cloud WASM backend currently rejects `workflow` declarations fail-closed until it can preserve those durable semantics end to end.
 - **`let` and `var`** — immutable and mutable bindings. Records with `{ field: value }` syntax and `{ base .. field = new_val }` update syntax. Pattern matching with guards, alias patterns, and recursive sub-patterns. `**` exponentiation. Multi-line `"""..."""` strings with `\u{...}` unicode escapes. Pipe operator `|>`.
 - **Error handling** — `catch expr fallback` (prefix or postfix), `fail Error(...)` for structured short-circuit return, `T ! E` return types, `?` unwrap.
 - **FS file I/O** — `perform FS.read(path)`, `perform FS.write(path, content)`, `perform FS.append(path, content)`, `perform FS.exists(path)`.
@@ -142,6 +150,7 @@ perform IO.print("Hello, " + name + "!")
 | Document | Description |
 |----------|-------------|
 | [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md) | Installation, values, effects, actors, pattern matching — with runnable code snippets |
+| [`docs/ADOPTION_PILOT.md`](docs/ADOPTION_PILOT.md) | Independent-developer pilot protocol and measurable adoption gate (#809) |
 | [`docs/TUTORIAL.md`](docs/TUTORIAL.md) | **Tutorial:** Build a Weather CLI step by step — variables, functions, HTTP, JSON, pattern matching, records, file I/O |
 | [`docs/PITFALLS.md`](docs/PITFALLS.md) | Common mistakes: `::` vs `.`, `let` vs `var`, `perform` keyword, `catch`/`fail`, record syntax, and more |
 | [`examples/`](examples/) + [`README`](examples/README.md) | 17 verified, self-contained example programs |
@@ -149,10 +158,12 @@ perform IO.print("Hello, " + name + "!")
 | [`CHANGELOG.md`](CHANGELOG.md) | Changelog organized by stability tier (Frozen / Stable / Experimental) |
 | [`GOVERNANCE.md`](GOVERNANCE.md) | Stability tiers, RFC process, and language versioning |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | Implementation architecture and module map |
+| [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) | Concise current-`main` matrix: shipped backends, actor runtime, durability, distribution, and status boundaries |
 | [`docs/SEMANTIC_STABILIZATION_CONTRACT.md`](docs/SEMANTIC_STABILIZATION_CONTRACT.md) | Current semantic-source-of-truth, backend, durability, and production-validation contract |
 | [`docs/FABRIC.md`](docs/FABRIC.md) | Experimental distributed messaging and durable stream substrate |
 | [`docs/RESP_CACHE_ARCHITECTURE.md`](docs/RESP_CACHE_ARCHITECTURE.md) | Experimental RESP-compatible cache architecture and cluster-routing invariants |
 | [`editors/vscode/`](editors/vscode/) | VS Code extension (syntax highlighting, language essentials, snippets) — build a `.vsix` or install manually |
+| [`RFC/0024-orthogonal-execution-model.md`](RFC/0024-orthogonal-execution-model.md) | Orthogonal model for local computation, scoped tasks, actors, persistence, and identity |
 | [`RFC/`](RFC/) | RFC proposals (format stability, frozen core, deprecation cycles, roadmap) |
 
 ### Docs auto-sync and DeepWiki
@@ -193,14 +204,17 @@ nulang nula doc              # generate Markdown API docs
 
 ## Project Status & Stability
 
-Nulang is **alpha software**. The language version is `1.0.0-frozen`
-(RFC 0001/0002). Every public surface is classified into one of three tiers
-(see [`GOVERNANCE.md`](GOVERNANCE.md) for the full definitions):
+Nulang is **alpha software**. Existing v1 artifacts still carry the historical
+`1.0.0-frozen` language metadata, but accepted RFC 0021 no longer treats
+pre-adoption source semantics as permanently Frozen. Published formats remain
+archival compatibility obligations, while source semantics stay Stable until
+the external-adoption freeze gate is satisfied. See
+[`GOVERNANCE.md`](GOVERNANCE.md) for the full definitions:
 
 | Tier | Scope |
 |------|-------|
-| **Frozen** | Never breaks — `.nbc` bytecode format, NUL0 wire protocol, value layout, Nulang Core, and the `IO`/`Spawn`/`Send`/`Receive` built-in effects. |
-| **Stable** | HM type system, effect rows, capability lattice, actor surface. Breaking changes require an RFC and a deprecation cycle. |
+| **Frozen** | Published v1 compatibility contracts: `.nbc` format v1, NUL0 v1, value layout v1, plus any explicitly Frozen effect contracts. Old versions are never silently reinterpreted; future versions may evolve behind explicit version boundaries. |
+| **Stable** | Nulang Core (pre-adoption), HM type system, effect rows, capability lattice, actor surface. Breaking changes require an RFC, an explicit version transition, diagnostics, and a migration path. |
 | **Experimental** | Everything else — including `wasm-backend`/`wasmfx-backend`, `cache-server`, the AI runtime, Fabric, typed actor-protocol hardening, multi-node distribution, CRDTs (Rust-level only so far), optional persistence backends, and other items marked Experimental in [`CHANGELOG.md`](CHANGELOG.md). |
 
 > **Pre-1.0 disclaimer:** Nulang does not have external users yet. The tier
@@ -208,8 +222,10 @@ Nulang is **alpha software**. The language version is `1.0.0-frozen`
 > breaking changes before v1.0** — any guarantee may be revised until the
 > language sees real-world use.
 
-1550+ tests pass with `cargo test`. Add `--features wasm-backend` for the
-WASM backend test suite.
+The required GitHub Actions matrix is the release-readiness source of truth for
+build, test, lint, audit, documentation, formal-spec, minimal-feature, and
+WASM-backend validation. For local validation, run `cargo test --locked`; add
+`--features wasm-backend` for the WASM backend suite.
 
 ---
 
@@ -242,6 +258,7 @@ dependencies.
 - **Questions & discussion:** [GitHub Discussions](https://github.com/nulang-org/nulang/discussions)
 - **Bugs & feature requests:** [Issue tracker](https://github.com/nulang-org/nulang/issues/new/choose)
 - **Contributing:** see [CONTRIBUTING.md](CONTRIBUTING.md) and our [Code of Conduct](CODE_OF_CONDUCT.md)
+- **External developer pilot:** follow [the adoption protocol](docs/ADOPTION_PILOT.md) and report anonymized findings to [issue #809](https://github.com/nulang-org/nulang/issues/809).
 
 ---
 

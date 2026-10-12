@@ -55,8 +55,8 @@ use super::fabric_stream_epoch::{
     FABRIC_STREAM_EPOCH_PULL_REQUEST_BEHAVIOR, FABRIC_STREAM_EPOCH_PULL_RESPONSE_BEHAVIOR,
     FABRIC_STREAM_EPOCH_REPAIR_BEHAVIOR, FABRIC_STREAM_EPOCH_VOTE_BEHAVIOR,
 };
-use super::mailbox::{Message, MessagePriority};
-use super::network::{NetworkTransport, Packet};
+use super::mailbox::{Message, MessagePayload, MessagePriority};
+use super::network::{NetworkTransport, Packet, TrackedSendOutcome, TransportSendFailureReason};
 use super::{ClusterState, NodeId, NodeStatus};
 use crate::runtime::Runtime;
 use crate::types::ExitReason;
@@ -598,7 +598,7 @@ impl AddressResolver {
 
                 let msg = Message {
                     behavior_id: 0, // resolved from behavior_name at delivery
-                    payload: Arc::new(payload),
+                    payload: MessagePayload::from_vec(payload),
                     sender: sender_actor,
                     priority,
                     trace_id,
@@ -774,19 +774,22 @@ impl<'a> DistributedRuntime for DistributedRuntimeImpl<'a> {
         &mut self,
         _transport: &mut dyn NetworkTransport,
         node: NodeId,
-        _behavior_name: &str,
-        _initial_state: Vec<(String, Value)>,
+        behavior_name: &str,
+        initial_state: Vec<(String, Value)>,
     ) -> ActorAddress {
-        // The trait method doesn't receive cluster/resolver, so we can
-        // only handle local spawns here. For remote spawns, use the
-        // `spawn_on_node` free function which takes all components.
+        // This trait method has enough context for a real local spawn. Remote
+        // spawn still requires the free function's cluster/resolver inputs.
         if node == NodeId::LOCAL {
-            // Local spawn would need the behavior_name and initial_state.
-            // This is a limitation of the trait API — use the free function.
-            ActorAddress::local(0)
+            let handler = self.runtime.spawnable_behaviors.get(behavior_name).copied();
+            let id = self.runtime.spawn_actor(Box::new(move || initial_state));
+            if let Some(handler) = handler {
+                if let Some(actor) = self.runtime.actors.get_mut(&id) {
+                    actor.register_behavior(behavior_name.to_string(), handler);
+                }
+            }
+            ActorAddress::local(id)
         } else {
-            // Cannot determine if node is local without resolver.
-            // Return a placeholder; callers should use the free function.
+            // Remote failure/placeholder semantics are tracked separately in #1238.
             ActorAddress::remote(node, 0)
         }
     }
@@ -902,13 +905,40 @@ pub fn send_distributed(
     }
 }
 
+/// Notify a sender that an asynchronous transport send failed.
+///
+/// Transport failures keep top-level delivery-failure code 8 and use the
+/// second payload slot for the transport outcome:
+/// 0=connect failed before any write, 1=write failed with delivery unconfirmed,
+/// 2=sender thread was already shut down before enqueue.
+/// This distinction prevents callers from treating an ambiguous write as a
+/// known-safe retry.
+fn notify_transport_send_failed(
+    runtime: &mut Runtime,
+    sender_id: u64,
+    reason: TransportSendFailureReason,
+) {
+    if sender_id == 0 || runtime.actors.get(&sender_id).is_none() {
+        return;
+    }
+
+    let subtype = match reason {
+        TransportSendFailureReason::Connect => 0,
+        TransportSendFailureReason::Write => 1,
+        TransportSendFailureReason::SenderShutdown => 2,
+    };
+    let fail_payload = vec![Value::int(8), Value::int(subtype)];
+    runtime.send_message_by_id(sender_id, 0, &fail_payload);
+}
+
 /// Notify a sender that their message could not be delivered.
 ///
 /// Delivers a system message (behavior 0) to the sender actor with a
 /// failure code in the payload: `[failure_code: Int, _reserved: Nil]`.
 /// Codes: 0=unresolvable, 1=node left cluster, 2=string payload unresolvable,
 /// 3=string intern failed on receiver, 4=target actor not found,
-/// 6=object ref unresolvable, 7=object intern failed on receiver, 5=unknown.
+/// 6=object ref unresolvable, 7=object intern failed on receiver,
+/// 8=transport send failed, 5=unknown.
 /// Non-existent senders (id 0) are silently skipped.
 pub(crate) fn notify_delivery_failed(runtime: &mut Runtime, sender_id: u64, reason: &str) {
     if sender_id == 0 {
@@ -932,6 +962,7 @@ fn delivery_failure_code(reason: &str) -> i64 {
         "target actor not found" => 4,
         "object ref unresolvable" => 6,
         "object intern failed on receiver" => 7,
+        "transport send failed" => 8,
         _ => 5,
     }
 }
@@ -1051,11 +1082,27 @@ pub fn process_network_packets(
     cluster: &mut ClusterState,
     resolver: &mut AddressResolver,
 ) {
+    for failure in transport.drain_send_failures() {
+        warn!(
+            "nulang-net: transport send to {:?} failed at sequence {} ({:?})",
+            failure.to_node, failure.packet_seq, failure.reason
+        );
+        if let Some(sender) = failure.sender_actor {
+            notify_transport_send_failed(runtime, sender, failure.reason);
+        }
+    }
+
     let packets = transport.receive();
     for incoming in packets {
         match incoming.packet {
             Packet::Heartbeat { node_id, .. } => {
                 let cluster_node_id = NodeId(node_id.0);
+                // A Failed -> Healthy transition may be the same NodeId coming
+                // back as a fresh process. Receiver-specific CRDT knowledge
+                // from the old process is therefore no longer trustworthy.
+                let was_failed = cluster
+                    .get_node(cluster_node_id)
+                    .is_some_and(|info| info.status == NodeStatus::Failed);
                 // The IncomingPacket doesn't carry the sender's address
                 // directly, so prefer the address already recorded in the
                 // membership table. For a previously-unknown node (e.g. a
@@ -1068,6 +1115,13 @@ pub fn process_network_packets(
                     .or_else(|| transport.connection_addr(cluster_node_id));
                 if let Some(addr) = known_addr {
                     cluster.handle_heartbeat(cluster_node_id, addr);
+                    if was_failed
+                        && cluster
+                            .get_node(cluster_node_id)
+                            .is_some_and(|info| info.status == NodeStatus::Healthy)
+                    {
+                        super::distribution::forget_crdt_peer_state(runtime, cluster_node_id);
+                    }
                 }
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
@@ -1076,7 +1130,31 @@ pub fn process_network_packets(
                 directory,
                 fabric,
             } => {
+                // A recovered peer may advertise Healthy through its
+                // authoritative gossip self-entry before its next heartbeat.
+                // If our previous view was Failed, the peer may be a fresh
+                // process with no CRDT state, so old receiver knowledge must
+                // not survive the transition.
+                let recovering_failed_nodes: Vec<NodeId> = members
+                    .iter()
+                    .filter_map(|member| {
+                        cluster
+                            .get_node(member.node_id)
+                            .is_some_and(|info| info.status == NodeStatus::Failed)
+                            .then_some(member.node_id)
+                    })
+                    .collect();
+
                 cluster.merge_membership_from_sender(members, incoming.from_node);
+
+                for node in recovering_failed_nodes {
+                    if cluster
+                        .get_node(node)
+                        .is_some_and(|info| info.status == NodeStatus::Healthy)
+                    {
+                        super::distribution::forget_crdt_peer_state(runtime, node);
+                    }
+                }
                 if !directory.is_empty() {
                     cluster.merge_directory(directory);
                     // A re-joined node may have been replaced while away:
@@ -1233,6 +1311,19 @@ pub fn process_network_packets(
             }
             Packet::Ack { packet_seq } => {
                 runtime.acked_packets.insert(packet_seq);
+                if let Some((peer_id, batch_id)) =
+                    runtime.pending_crdt_sync_acks.get(&packet_seq).copied()
+                {
+                    // A transport sequence proves receiver knowledge only
+                    // when the ACK came from the peer that was sent the
+                    // corresponding CRDT batch. A matching sequence from any
+                    // other node is unrelated and must leave the correlation
+                    // pending.
+                    if peer_id == incoming.from_node.0 {
+                        runtime.pending_crdt_sync_acks.remove(&packet_seq);
+                        runtime.crdt_peer_frontiers.acknowledge(peer_id, batch_id);
+                    }
+                }
             }
             Packet::FetchBehaviorRequest { content_hash } => {
                 let mut nbc_bytes: Option<Vec<u8>> = None;
@@ -1343,7 +1434,7 @@ pub fn process_network_packets(
                                     };
                                     msg.behavior_id = behavior_id;
                                     // Intern string and object payloads, then deliver
-                                    let mut payload_vec = (*msg.payload).clone();
+                                    let mut payload_vec = msg.payload.to_vec();
                                     if !intern_wire_strings(
                                         runtime,
                                         target_actor,
@@ -1369,10 +1460,10 @@ pub fn process_network_packets(
                                         );
                                         continue;
                                     }
-                                    msg.payload = Arc::new(payload_vec);
+                                    msg.payload = MessagePayload::from_vec(payload_vec);
                                     if let Some(actor) = runtime.actors.get_mut(&target_actor) {
                                         let _ = actor.mailbox.push(msg);
-                                        runtime.scheduler.enqueue(target_actor);
+                                        runtime.enqueue_actor(target_actor);
                                     } else {
                                         notify_delivery_failed(
                                             runtime,
@@ -2263,7 +2354,7 @@ pub fn process_network_packets(
                     // dangling pool ids.
                     // Clone the Arc payload into a mutable Vec, intern the
                     // strings, then wrap the result back into a fresh Arc.
-                    let mut payload_vec = (*msg.payload).clone();
+                    let mut payload_vec = msg.payload.to_vec();
                     if !intern_wire_strings(runtime, target_actor, &mut payload_vec, &string_table)
                     {
                         warn!(
@@ -2289,10 +2380,10 @@ pub fn process_network_packets(
                         );
                         continue;
                     }
-                    msg.payload = Arc::new(payload_vec);
+                    msg.payload = MessagePayload::from_vec(payload_vec);
                     if let Some(actor) = runtime.actors.get_mut(&target_actor) {
                         let _ = actor.mailbox.push(msg);
-                        runtime.scheduler.enqueue(target_actor);
+                        runtime.enqueue_actor(target_actor);
                     } else {
                         notify_delivery_failed(runtime, msg.sender, "target actor not found");
                     }
@@ -2321,7 +2412,7 @@ fn hot_reload_behavior(
     // Rebuild bytecode offsets from the cached module (compressed to the
     // actor's own behaviors for workflow actors — local step ids).
     let offsets = crate::runtime::spawn::bytecode_offsets_for(module, actor.is_workflow);
-    actor.bytecode_module = Some(module.clone());
+    actor.bytecode_module = Some(Box::new(module.clone()));
     actor.bytecode_offsets = offsets;
     warn!(
         "nulang-net: hot-reloaded bytecode module for actor {} ({} behaviors)",
@@ -2342,19 +2433,83 @@ pub fn sync_crdts_delta(runtime: &mut Runtime) {
     if !runtime.distributed.enabled {
         return;
     }
-    let ops = match &mut runtime.crdt_manager {
-        Some(m) => m.generate_delta_sync_ops(),
-        None => return,
-    };
-    if ops.is_empty() {
+
+    let targets: Vec<(u64, NodeId, std::net::SocketAddr)> = runtime
+        .distributed
+        .cluster
+        .as_ref()
+        .map(|cluster| {
+            cluster
+                .healthy_members()
+                .iter()
+                .map(|member| (member.node_id.0, NodeId(member.node_id.0), member.address))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if targets.is_empty() {
         return;
     }
-    let packet = Packet::CrdtDeltaSync { ops: Arc::new(ops) };
-    if let Some(cluster) = &runtime.distributed.cluster {
-        for member in cluster.healthy_members() {
-            if let Some(transport) = &mut runtime.distributed.transport {
-                let net_node_id = NodeId(member.node_id.0);
-                transport.send(net_node_id, member.address, packet.clone());
+
+    // Generate each receiver's batch from that receiver's last explicitly
+    // acknowledged frontier. Generation itself never advances knowledge, so a
+    // lost packet remains retransmittable on the next ordinary sync round.
+    let batches: Vec<_> = {
+        let Some(manager) = runtime.crdt_manager.as_ref() else {
+            return;
+        };
+        targets
+            .into_iter()
+            .filter_map(|(peer_id, node_id, address)| {
+                runtime
+                    .crdt_peer_frontiers
+                    .generate(manager, peer_id)
+                    .map(|batch| (peer_id, node_id, address, batch))
+            })
+            .collect()
+    };
+
+    for (peer_id, node_id, address, batch) in batches {
+        let packet = Packet::CrdtDeltaSync {
+            ops: Arc::new(batch.ops),
+        };
+
+        let tracked_outcome = runtime
+            .distributed
+            .transport
+            .as_mut()
+            .map(|transport| transport.send_tracked(node_id, address, packet.clone()));
+
+        match tracked_outcome {
+            Some(TrackedSendOutcome::Sent(packet_seq)) => {
+                // Retain only the newest tracked attempt for this peer. If an
+                // older packet later succeeds its ACK is conservatively
+                // ignored, which can only cause a retransmission; it cannot
+                // advance the frontier past unproven receiver state.
+                runtime
+                    .pending_crdt_sync_acks
+                    .retain(|_, (pending_peer, _)| *pending_peer != peer_id);
+                runtime
+                    .pending_crdt_sync_acks
+                    .insert(packet_seq, (peer_id, batch.batch_id));
+            }
+            Some(TrackedSendOutcome::Unsupported) => {
+                if let Some(transport) = runtime.distributed.transport.as_mut() {
+                    // Compatibility path for custom transports that cannot
+                    // expose a NUL0 sequence. The default implementation
+                    // performs no send, so fall back exactly once and retain
+                    // the historical optimistic frontier behavior.
+                    transport.send(node_id, address, packet);
+                    runtime
+                        .crdt_peer_frontiers
+                        .acknowledge(peer_id, batch.batch_id);
+                }
+            }
+            Some(TrackedSendOutcome::Rejected) | None => {
+                // A tracked-capable transport explicitly rejected the packet,
+                // or distribution lost its transport between target discovery
+                // and send. In either case no receiver knowledge was proved.
+                // Leave the frontier unchanged so the next sync retries.
             }
         }
     }
@@ -2558,7 +2713,7 @@ fn ensure_actor_module_idx(runtime: &mut Runtime, actor_id: u64) -> Option<usize
     }
     let vm = runtime.vm.as_mut().expect("VM was just ensured");
     let idx = vm.modules.len();
-    vm.load_module(module.clone());
+    vm.load_module((*module).clone());
     runtime.register_module_grains(&module);
     if let Some(actor) = runtime.actors.get_mut(&actor_id) {
         actor.bytecode_module_idx = Some(idx);
@@ -2672,7 +2827,7 @@ mod tests {
 
         {
             let actor = runtime.actors.get_mut(&actor_id).unwrap();
-            actor.bytecode_module = Some(module_with_hash([0xAA; 32]));
+            actor.bytecode_module = Some(Box::new(module_with_hash([0xAA; 32])));
             actor.bytecode_offsets = vec![0];
         }
 
@@ -3297,7 +3452,9 @@ mod tests {
             &mut cluster_b,
             &mut resolver_b,
         );
+        assert_eq!(runtime_b.claim_next_ready_actor(), Some(actor_b));
         runtime_b.step_actor(actor_b);
+        runtime_b.finish_actor_turn(actor_b);
         let count = runtime_b
             .actors
             .get(&actor_b)
@@ -3327,7 +3484,10 @@ mod tests {
             &mut cluster_b,
             &mut resolver_b,
         );
-        runtime_b.step_actor(actor_b);
+        assert!(
+            runtime_b.claim_next_ready_actor().is_none(),
+            "unknown behavior must not create a ready token"
+        );
         let count = runtime_b
             .actors
             .get(&actor_b)
@@ -3338,6 +3498,145 @@ mod tests {
         assert_eq!(
             count, 5,
             "unknown behavior name must leave target state unchanged"
+        );
+
+        transport_a.shutdown();
+        transport_b.shutdown();
+    }
+
+    // -- 17b. Cross-node duplicate behavior names stay target-schema scoped --
+
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn test_remote_send_duplicate_behavior_name_uses_target_schema() {
+        use crate::lexer::Lexer;
+        use crate::parser::Parser;
+        use crate::typechecker::TypeChecker;
+        use std::time::{Duration, Instant};
+
+        let source = r#"
+            actor First {
+                state marker: Int = 0
+                behavior hit() { self.marker = 1 }
+            }
+
+            actor Second {
+                state marker: Int = 0
+                behavior hit() { self.marker = 2 }
+            }
+        "#;
+        let tokens = Lexer::new(source).lex().expect("lex");
+        let ast = Parser::new(tokens).parse_module().expect("parse");
+        let mut typechecker = TypeChecker::new();
+        typechecker.check_module(&ast).expect("typecheck");
+        let hir = crate::hir_lower::lower_module(&ast, &typechecker.inferred_decl_types);
+        let mut mir = crate::mir_lower::lower_module(&hir).expect("MIR lowering");
+        let module =
+            crate::mir_codegen::compile_mir(&mut mir, "remote_nominal_behavior").expect("codegen");
+
+        let second_hit = *module
+            .actor_metadata
+            .iter()
+            .find(|meta| meta.name == "Second")
+            .and_then(|meta| meta.behavior_indices.first())
+            .expect("Second.hit index");
+
+        let mut runtime_b = Runtime::new();
+        let actor_b = runtime_b
+            .spawn_from_module(&module, second_hit, vec![])
+            .as_actor_id()
+            .expect("spawn Second");
+        assert_eq!(runtime_b.actors[&actor_b].name, "Second");
+
+        let mut transport_a = crate::runtime::network::TcpTransport::bind(
+            addr(0),
+            crate::runtime::network::TlsConfig::PlaintextInsecure,
+        )
+        .unwrap();
+        let mut transport_b = crate::runtime::network::TcpTransport::bind(
+            addr(0),
+            crate::runtime::network::TlsConfig::PlaintextInsecure,
+        )
+        .unwrap();
+        let node_b = transport_b.node_id();
+        let addr_b = transport_b.listen_addr();
+
+        let mut cluster_a = ClusterState::new(transport_a.node_id(), transport_a.listen_addr());
+        cluster_a.handle_heartbeat(node_b, addr_b);
+        let mut resolver_a = AddressResolver::new(transport_a.node_id());
+        let mut runtime_a = Runtime::new();
+        let mut cluster_b = ClusterState::new(node_b, addr_b);
+        let mut resolver_b = AddressResolver::new(node_b);
+        let target = ActorAddress::remote(node_b, actor_b);
+
+        let deliver = |runtime_b: &mut Runtime,
+                       transport_b: &mut dyn NetworkTransport,
+                       cluster_b: &mut ClusterState,
+                       resolver_b: &mut AddressResolver| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                process_network_packets(runtime_b, transport_b, cluster_b, resolver_b);
+                if runtime_b
+                    .actors
+                    .get(&actor_b)
+                    .is_some_and(|actor| !actor.mailbox.is_empty())
+                {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        };
+
+        send_distributed(
+            &mut runtime_a,
+            &mut transport_a,
+            &cluster_a,
+            &mut resolver_a,
+            target,
+            "hit",
+            &[],
+        );
+        deliver(
+            &mut runtime_b,
+            &mut transport_b,
+            &mut cluster_b,
+            &mut resolver_b,
+        );
+        assert_eq!(runtime_b.claim_next_ready_actor(), Some(actor_b));
+        runtime_b.step_actor(actor_b);
+        runtime_b.finish_actor_turn(actor_b);
+        assert_eq!(
+            runtime_b.actors[&actor_b]
+                .get_state_field("marker")
+                .and_then(|value| value.as_int()),
+            Some(2),
+            "remote short-name dispatch to Second must execute Second.hit, never First.hit"
+        );
+
+        send_distributed(
+            &mut runtime_a,
+            &mut transport_a,
+            &cluster_a,
+            &mut resolver_a,
+            target,
+            "First.hit",
+            &[],
+        );
+        deliver(
+            &mut runtime_b,
+            &mut transport_b,
+            &mut cluster_b,
+            &mut resolver_b,
+        );
+        assert!(
+            runtime_b.claim_next_ready_actor().is_none(),
+            "remote delivery must reject a qualified behavior owned by another actor schema"
+        );
+        assert_eq!(
+            runtime_b.actors[&actor_b]
+                .get_state_field("marker")
+                .and_then(|value| value.as_int()),
+            Some(2)
         );
 
         transport_a.shutdown();
@@ -3417,7 +3716,7 @@ mod tests {
         let actor_id = rt.spawn_actor(Box::new(|| vec![]));
         {
             let actor = rt.actors.get_mut(&actor_id).unwrap();
-            actor.bytecode_module = Some(module);
+            actor.bytecode_module = Some(Box::new(module));
         }
 
         // First intern: lazy-loads the actor's module and appends the
@@ -3502,7 +3801,7 @@ mod tests {
             runtime_b.spawn_actor(Box::new(|| vec![("received".to_string(), Value::nil())]));
         {
             let actor = runtime_b.actors.get_mut(&actor_b).unwrap();
-            actor.bytecode_module = Some(module_b);
+            actor.bytecode_module = Some(Box::new(module_b));
             actor.register_behavior("store", |actor, args| {
                 let v = args.get(0).copied().unwrap_or(Value::nil());
                 actor.set_state_field("received", v);
@@ -3570,7 +3869,9 @@ mod tests {
             "string message was not delivered to the remote actor's mailbox"
         );
 
+        assert_eq!(runtime_b.claim_next_ready_actor(), Some(actor_b));
         runtime_b.step_actor(actor_b);
+        runtime_b.finish_actor_turn(actor_b);
 
         let stored = runtime_b
             .actors

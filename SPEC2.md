@@ -8,17 +8,17 @@
 
 This document defines the Nulang programming language, version 2.0. It is intended as the authoritative reference for both language implementers and users, providing a complete and precise account of Nulang's syntax, semantics, type system, runtime model, and standard library.
 
-Nulang 2.0 represents a significant architectural evolution from the 1.x series. Where the earlier specification treated AI agents, distributed computing, and persistence as separate subsystems accessed through domain-specific keywords (`agent`, `cluster`, `store`), version 2.0 unifies these concerns under a single, coherent abstraction: the actor. In Nulang 2.0, all concurrent and distributed computation is expressed through actors. AI capabilities are granted to actors through the capability system, not through a separate agent DSL. Durability is a property of actors, not a separate storage layer. Distribution is an emergent property of the actor runtime, not a bolt-on framework.
+Nulang 2.0 represents a significant architectural evolution from the 1.x series. Where the earlier specification treated AI agents, distributed computing, and persistence as separate subsystems accessed through domain-specific keywords (`agent`, `cluster`, `store`), version 2.0 moves toward one typed semantic core with **orthogonal execution properties**. Ordinary local computation, scoped concurrent tasks, and independently addressable actors are distinct execution forms. Persistence, identity, placement, effects, reference capabilities, and external authority compose with those forms rather than defining mutually exclusive runtime species.
 
-This unification yields a language with fewer primitives and greater compositional power. A programmer learns one abstraction—the actor with behaviors, state, and effects—and applies it uniformly from a single-threaded script to a globally distributed, durable workflow. AI agents are one composition of these primitives; they are not a separate language surface.
+Actors remain the primary abstraction for isolated state, asynchronous messaging, supervision, and distributed identity. Current durable entities and workflow syntax are still implemented through actor-backed lowering where documented, but that implementation strategy is not the semantic definition of every durable computation. AI capabilities are expressed through effects/authority and libraries rather than requiring a separate concurrency model. See RFC 0024 for the orthogonal execution model and RFC 0019 for the semantic-closure requirements.
 
 The specification is organized into five conceptual layers:
 
 1. **The Language Layer** (Chapters 1–7) defines the core language: syntax, types, algebraic effects, capability-based security, expressions, and declarations. This layer is self-contained and can be implemented independently of any runtime.
 
-2. **The Actor Runtime Layer** (Chapter 8) defines the actor model: how actors are declared, how they communicate via asynchronous message passing, how they manage state, and how they are supervised. This layer is the foundation upon which all higher layers are built.
+2. **The Actor Runtime Layer** (Chapter 8) defines the actor model: how actors are declared, how they communicate via asynchronous message passing, how they manage state, and how they are supervised. Actors are the addressable-isolation model; they are not required for ordinary local computation. Scoped-task/structured-concurrency semantics are tracked separately by RFC 0024 and remain Planned until their lowering/runtime contract is complete.
 
-3. **The Durable Execution Layer** (Chapter 9) extends the actor runtime with persistence. Persistent actors survive process restarts through automatic checkpointing, event journaling, deterministic replay, and snapshotting.
+3. **The Durable Execution Layer** (Chapter 9) defines persistence, history, replay, and recovery semantics. The current implementation applies these primarily to persistent actors/entities/workflows, while the long-term semantic model treats durability as orthogonal to the execution host.
 
 4. **The Distributed Platform Layer** (Chapter 12) extends the durable actor runtime across machine boundaries. Virtual actors are transparently activated on any cluster node (**Planned**). Messages are routed across the network. CRDT state converges automatically (**Planned** — the CRDT replication machinery is implemented and tested at the Rust level, but `state crdt` fields are not yet wired to it and behave as `durable`; see §9.10 and §12.5). Faults are contained and recovered.
 
@@ -2255,9 +2255,15 @@ so *every* field silently reverted to the `Local` default the moment
 an actor recovered once -- a second crash would have dropped `durable`
 fields from the snapshot entirely, and `event_sourced` fields would
 have stopped accumulating altogether (the "+1 per emit" bump above
-iterates `state_models` to find which fields to bump). Fixed by
-restoring `state_models` from the recovery module's `actor_metadata`
-in the same place `bytecode_module`/`bytecode_offsets` are restored.
+iterates `state_models` to find which fields to bump). Recovery now
+restores declared models from the recovery module's `actor_metadata`
+and also reconstructs missing runtime-created models from existing
+durable records without changing the snapshot format: snapshot state
+implies Durable unless its CRDT field/id/type metadata identifies a
+specific CRDT model, while event-journal field names imply EventSourced.
+This preserves persistence semantics across repeated recovery even when
+the actor was created through the runtime API rather than a source-level
+actor declaration.
 
 ## 9.7 Deterministic Replay
 
@@ -2309,14 +2315,12 @@ entry. `read` materializes the value back into `state_data`, so `self.field`
 reads stay consistent. `.nula`-level conformance coverage lives in
 `conformance/behavior/crdt_*.nula`.
 
-**Recovery limitation:** `recover_actor` restores the materialized
-`state_data` value and the `CrdtManager` entries from `crdt_snapshot`, but
-does not rebuild `CrdtManager.field_map` (the `(actor_id, field_name) →
-CrdtId` link is not persisted). On a recovered actor, `self.field` still
-reads the materialized value, but `perform Crdt.*` is a silent nil no-op
-until the field is re-registered. Pinned by
-`test_crdt_field_survives_recovery` (a post-recovery `Crdt.increment`
-leaves `state_data["count"]` unchanged).
+**Recovery status (fixed):** snapshots persist both CRDT replica state and
+the per-actor field-to-`CrdtId` mapping. `recover_actor` restores the CRDT
+entries, rebuilds `CrdtManager.field_map` and `field_reverse`, then
+idempotently re-registers declared CRDT fields after actor metadata is restored.
+As a result, `perform Crdt.*` continues to target the same recovered replica
+instead of degrading to a silent nil no-op after restart.
 ---
 
 # Chapter 10: Workflows

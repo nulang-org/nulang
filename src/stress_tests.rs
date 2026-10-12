@@ -16,6 +16,15 @@ use crate::typechecker::TypeChecker;
 use crate::types::ExitReason;
 use crate::vm::{Value, VM};
 
+fn noop_stress_behavior(_actor: &mut Actor, _args: &[Value]) {}
+
+fn declare_stress_behavior(rt: &mut Runtime, actor_id: u64, name: &str) {
+    rt.actors
+        .get_mut(&actor_id)
+        .expect("stress-test actor exists")
+        .register_behavior(name, noop_stress_behavior);
+}
+
 // ---------------------------------------------------------------------------
 // Helper: TestContext
 // ---------------------------------------------------------------------------
@@ -405,6 +414,10 @@ fn stress_scheduler_with_mixed_workload() {
         ]
     }));
 
+    declare_stress_behavior(&mut rt, sink, "collect");
+    declare_stress_behavior(&mut rt, cpu_actor, "compute");
+    declare_stress_behavior(&mut rt, io_actor, "io_op");
+
     // Seed workloads: send messages to each actor type
     for i in 0..50 {
         rt.send_message(
@@ -480,7 +493,7 @@ fn stress_mailbox_never_drops_system_messages() {
     for i in 0..1_000 {
         let msg = Message {
             behavior_id: 1,
-            payload: Arc::new(vec![Value::int(i)]),
+            payload: MessagePayload::from_slice(&[Value::int(i)]),
             sender: 0,
             priority: MessagePriority::Normal,
             trace_id: None,
@@ -494,7 +507,7 @@ fn stress_mailbox_never_drops_system_messages() {
     for i in 0..100 {
         let msg = Message {
             behavior_id: 0,
-            payload: Arc::new(vec![Value::int(1000 + i)]),
+            payload: MessagePayload::from_slice(&[Value::int(1000 + i)]),
             sender: 0,
             priority: MessagePriority::System,
             trace_id: None,
@@ -508,7 +521,7 @@ fn stress_mailbox_never_drops_system_messages() {
     for i in 0..50 {
         let msg = Message {
             behavior_id: 2,
-            payload: Arc::new(vec![Value::int(2000 + i)]),
+            payload: MessagePayload::from_slice(&[Value::int(2000 + i)]),
             sender: 0,
             priority: MessagePriority::Bulk,
             trace_id: None,
@@ -644,6 +657,9 @@ fn stress_reduction_quota_fairness() {
         ]
     }));
 
+    declare_stress_behavior(&mut rt, actor_a, "work");
+    declare_stress_behavior(&mut rt, actor_b, "work");
+
     const MSG_COUNT: usize = 100;
     for i in 0..MSG_COUNT {
         rt.send_message(actor_a, "work", &[Value::int(i as i64)]);
@@ -684,6 +700,8 @@ fn stress_effect_resume_after_mailbox_pressure() {
             ("effect".into(), Value::int(41)), // 41 = "SimulatedRead"
         ]
     }));
+    declare_stress_behavior(&mut rt, effect_actor, "start_effect");
+    declare_stress_behavior(&mut rt, effect_actor, "flood");
 
     // Start an effect on the actor
     rt.send_message(effect_actor, "start_effect", &[]);
@@ -1153,6 +1171,7 @@ fn stress_gc_foreign_ref_churn() {
     let mut rt = Runtime::new();
     let source = rt.spawn_actor(Box::new(|| vec![("name".into(), Value::int(800))]));
     let target = rt.spawn_actor(Box::new(|| vec![("name".into(), Value::int(801))]));
+    declare_stress_behavior(&mut rt, target, "ref");
 
     rt.current_actor = Some(source);
 
@@ -1193,6 +1212,7 @@ fn stress_gc_foreign_ref_churn() {
 fn stress_distribution_local_fallback_when_disabled() {
     let mut rt = Runtime::new();
     let actor = rt.spawn_actor(Box::new(|| vec![("name".into(), Value::int(900))]));
+    declare_stress_behavior(&mut rt, actor, "ping");
 
     assert!(!rt.distributed.enabled);
 
@@ -1227,6 +1247,7 @@ fn stress_reduction_yield_under_pressure() {
                 ("quota".into(), Value::int(5)),
             ]
         }));
+        declare_stress_behavior(&mut rt, id, "work");
         actors.push(id);
     }
 
@@ -1389,7 +1410,7 @@ fn stress_mailbox_system_priority_preservation() {
     for i in 0..1_000 {
         let msg = Message {
             behavior_id: 1,
-            payload: Arc::new(vec![Value::int(i)]),
+            payload: MessagePayload::from_slice(&[Value::int(i)]),
             sender: 0,
             priority: MessagePriority::Normal,
             trace_id: None,
@@ -1402,7 +1423,7 @@ fn stress_mailbox_system_priority_preservation() {
     for i in 0..10 {
         let msg = Message {
             behavior_id: 0,
-            payload: Arc::new(vec![Value::int(1000 + i)]),
+            payload: MessagePayload::from_slice(&[Value::int(1000 + i)]),
             sender: 0,
             priority: MessagePriority::System,
             trace_id: None,
@@ -1653,6 +1674,7 @@ fn stress_actor_ping_pong_messaging() {
     let pinger = rt.spawn_actor(Box::new(|| vec![("name".into(), Value::int(100))]));
 
     let ponger = rt.spawn_actor(Box::new(|| vec![("name".into(), Value::int(101))]));
+    declare_stress_behavior(&mut rt, pinger, "pong");
 
     // Pre-load the pinger's mailbox with 10,000 "pong" messages
     // that each carry a decrementing counter.

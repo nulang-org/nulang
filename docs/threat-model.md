@@ -62,7 +62,7 @@
 | ID | Threat | Mitigation | Status |
 |---|---|---|---|
 | V1 | **JIT code injection** | JIT compilation is from MIR bytecode, not arbitrary machine code. `compile_region` stops at `Ret`. | Implemented. |
-| V2 | **Type confusion in JIT** | `typed_compiler` strips NaN-tag guards only when `TypeMetadata` proves register types. Falls back to scalar compilation on ambiguity. | Implemented. |
+| V2 | **Type confusion in JIT** | `typed_compiler` strips tagged-value guards only when `TypeMetadata` proves register types. Falls back to scalar compilation on ambiguity. | Implemented. |
 | V3 | **Division-by-zero in JIT** | `IDiv`/`IMod` always emit runtime-helper calls (`nulang_idiv`/`nulang_imod`), never raw `sdiv`. | Implemented. |
 | V4 | **SIMD out-of-bounds access** | SIMD lowering only processes `ArrayLen`-bounded loops. Scalar epilogue handles remainder. | Implemented. |
 
