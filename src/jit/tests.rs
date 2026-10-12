@@ -3,6 +3,23 @@
 use super::*;
 use crate::bytecode::*;
 
+extern "C" fn noop_jit_region(_regs: *mut u64, _constants: *const u64) {}
+
+#[test]
+fn call_free_compiled_execution_skips_leaf_table_install() {
+    let mut jit = make_jit();
+    jit.store_compiled(0, 0, noop_jit_region as *const u8, 1);
+    crate::jit::runtime::reset_jit_leaf_table_installs_for_test();
+    let mut regs = [0u64; 256];
+    let action = crate::backends::JitBackend::execute_compiled(&mut jit, 0, 0, &mut regs, &[]);
+    assert_eq!(action, crate::backends::TieredAction::RanJit);
+    assert_eq!(
+        crate::jit::runtime::jit_leaf_table_installs_for_test(),
+        0,
+        "call-free compiled regions must not install or allocate native-leaf dispatch state"
+    );
+}
+
 fn make_jit() -> JitSession {
     JitSession::new().expect("JIT must be available on test host")
 }
@@ -652,6 +669,214 @@ fn test_jit_direct_call_loop_tiers_up() {
 }
 
 #[test]
+fn test_jit_direct_call_compiles_leaf_callee_natively_and_preserves_caller_regs() {
+    use crate::hir_lower::lower_module;
+    use crate::lexer::Lexer;
+    use crate::mir_codegen::compile_mir;
+    use crate::mir_lower::lower_module as lower_mir;
+    use crate::parser::Parser;
+    use crate::typechecker::TypeChecker;
+    use crate::vm::VM;
+
+    let source = r#"
+        fn add(x: Int, y: Int) -> Int { x + y }
+        fn main() -> Int {
+            var sentinel = 123456;
+            var sum = 0;
+            var i = 0;
+            while i < 20000 {
+                sum = add(sum, 1);
+                i = i + 1
+            };
+            sentinel + sum
+        }
+    "#;
+    let tokens = Lexer::new(source).lex().expect("lex");
+    let ast = Parser::new(tokens).parse_module().expect("parse");
+    let mut tc = TypeChecker::new();
+    tc.check_module(&ast).expect("typecheck");
+    let hir = lower_module(&ast, &tc.inferred_decl_types);
+    let mut mir = lower_mir(&hir).expect("mir");
+    let module = compile_mir(&mut mir, "jit_native_leaf_call").expect("codegen");
+
+    let mut interp = VM::new_without_jit();
+    interp.load_module(module.clone());
+    let expected = interp.run().expect("interpreter should run");
+
+    let mut jit_vm = VM::new();
+    jit_vm.load_module(module);
+    let actual = jit_vm.run().expect("JIT should run");
+
+    assert_eq!(
+        actual.as_int(),
+        expected.as_int(),
+        "native leaf direct calls must preserve caller registers"
+    );
+    assert_eq!(expected.as_int(), Some(143456));
+
+    let stats = jit_vm.jit_compile_stats();
+    assert_eq!(
+        stats.fast_compiles, 2,
+        "the hot loop and its simple direct leaf callee should each receive one fast native compilation"
+    );
+    assert_eq!(
+        stats.optimized_compiles, 0,
+        "the first execution should not require a tier-2 compile for this regression"
+    );
+}
+
+#[test]
+fn test_jit_native_leaf_direct_calls_support_0_1_4_and_8_args() {
+    use crate::hir_lower::lower_module;
+    use crate::lexer::Lexer;
+    use crate::mir_codegen::compile_mir;
+    use crate::mir_lower::lower_module as lower_mir;
+    use crate::parser::Parser;
+    use crate::typechecker::TypeChecker;
+    use crate::vm::VM;
+
+    let source = r#"
+        fn f0() -> Int { 7 }
+        fn f1(a: Int) -> Int { a + 1 }
+        fn f4(a: Int, b: Int, c: Int, d: Int) -> Int { a + b + c + d }
+        fn f8(a: Int, b: Int, c: Int, d: Int, e: Int, f: Int, g: Int, h: Int) -> Int {
+            a + b + c + d + e + f + g + h
+        }
+        fn main() -> Int {
+            var sum = 0;
+            var i = 0;
+            while i < 2000 {
+                sum = sum + f0();
+                sum = sum + f1(1);
+                sum = sum + f4(1, 2, 3, 4);
+                sum = sum + f8(1, 2, 3, 4, 5, 6, 7, 8);
+                i = i + 1
+            };
+            sum
+        }
+    "#;
+    let tokens = Lexer::new(source).lex().expect("lex");
+    let ast = Parser::new(tokens).parse_module().expect("parse");
+    let mut tc = TypeChecker::new();
+    tc.check_module(&ast).expect("typecheck");
+    let hir = lower_module(&ast, &tc.inferred_decl_types);
+    let mut mir = lower_mir(&hir).expect("mir");
+    let module = compile_mir(&mut mir, "jit_native_leaf_arities").expect("codegen");
+
+    let mut interp = VM::new_without_jit();
+    interp.load_module(module.clone());
+    let expected = interp.run().expect("interpreter should run");
+
+    let mut jit_vm = VM::new();
+    jit_vm.load_module(module);
+    let actual = jit_vm.run().expect("JIT should run");
+
+    assert_eq!(actual.as_int(), expected.as_int());
+    assert_eq!(expected.as_int(), Some(110_000));
+    assert_eq!(
+        jit_vm.jit_compile_stats().fast_compiles,
+        5,
+        "the outer loop plus four eligible leaf callees should compile natively"
+    );
+}
+
+#[test]
+fn test_jit_direct_call_branchy_leaf_keeps_interpreter_fallback() {
+    use crate::hir_lower::lower_module;
+    use crate::lexer::Lexer;
+    use crate::mir_codegen::compile_mir;
+    use crate::mir_lower::lower_module as lower_mir;
+    use crate::parser::Parser;
+    use crate::typechecker::TypeChecker;
+    use crate::vm::VM;
+
+    let source = r#"
+        fn choose(x: Int) -> Int {
+            if x < 0 then { 1 } else { x + 1 }
+        }
+        fn main() -> Int {
+            var sum = 0;
+            var i = 0;
+            while i < 20000 {
+                sum = choose(sum);
+                i = i + 1
+            };
+            sum
+        }
+    "#;
+    let tokens = Lexer::new(source).lex().expect("lex");
+    let ast = Parser::new(tokens).parse_module().expect("parse");
+    let mut tc = TypeChecker::new();
+    tc.check_module(&ast).expect("typecheck");
+    let hir = lower_module(&ast, &tc.inferred_decl_types);
+    let mut mir = lower_mir(&hir).expect("mir");
+    let module = compile_mir(&mut mir, "jit_branchy_leaf_fallback").expect("codegen");
+
+    let mut interp = VM::new_without_jit();
+    interp.load_module(module.clone());
+    let expected = interp.run().expect("interpreter should run");
+
+    let mut jit_vm = VM::new();
+    jit_vm.load_module(module);
+    let actual = jit_vm.run().expect("JIT should run");
+
+    assert_eq!(actual.as_int(), expected.as_int());
+    assert_eq!(expected.as_int(), Some(20000));
+    assert_eq!(
+        jit_vm.jit_compile_stats().fast_compiles,
+        1,
+        "branchy callees are outside the first native-leaf envelope and must keep the interpreter fallback"
+    );
+}
+
+#[test]
+fn branchy_hot_loop_compiles_a_native_region() {
+    use crate::hir_lower::lower_module;
+    use crate::lexer::Lexer;
+    use crate::mir_codegen::compile_mir;
+    use crate::mir_lower::lower_module as lower_mir;
+    use crate::parser::Parser;
+    use crate::typechecker::TypeChecker;
+    use crate::vm::VM;
+
+    // Same control-flow shape as the branch_loop JIT telemetry workload, but
+    // short enough for a focused regression test while still exceeding the
+    // first-tier HOT_THRESHOLD.
+    let source = "var sum = 0; var i = 0; while i < 5000 { if i < 2500 then { sum = sum + i } else { sum = sum - 1 }; i = i + 1; }; sum";
+    let tokens = Lexer::new(source).lex().expect("lex");
+    let ast = Parser::new(tokens).parse_module().expect("parse");
+    let mut tc = TypeChecker::new();
+    tc.check_module(&ast).expect("typecheck");
+    let hir = lower_module(&ast, &tc.inferred_decl_types);
+    let mut mir = lower_mir(&hir).expect("mir");
+    let module = compile_mir(&mut mir, "jit_branch_loop_coverage").expect("codegen");
+    let instructions = module.instructions.clone();
+
+    let mut interp = VM::new_without_jit();
+    interp.load_module(module.clone());
+    let expected = interp.run().expect("interpreter branch loop should run");
+
+    let mut jit_vm = VM::new();
+    jit_vm.load_module(module);
+    let actual = jit_vm.run().expect("JIT branch loop should run");
+
+    assert_eq!(
+        actual.as_int(),
+        expected.as_int(),
+        "branch-containing hot loop must preserve interpreter semantics"
+    );
+    assert_eq!(
+        expected.as_int(),
+        Some(3_121_250),
+        "branch-loop result is wrong"
+    );
+    assert!(
+        jit_vm.jit_compiled_count() > 0,
+        "a hot loop with an internal conditional branch should compile at least one native region; instructions={instructions:?}"
+    );
+}
+
+#[test]
 fn test_jit_direct_call_recursion_stays_interpreter() {
     // Recursive calls (fib -> fib) are in a direct-call cycle and must NOT be
     // folded into a compiled region: the re-entrant helper consumes native
@@ -768,6 +993,59 @@ fn test_jit_compile_bitwise_ops() {
     let ptr =
         unsafe { jit.compile_region(0, 0, 6, &instructions, &std::collections::HashMap::new()) };
     assert!(ptr.is_some());
+}
+
+#[test]
+fn test_jit_region_reentry_metadata_tracks_direct_calls() {
+    let mut plain = make_jit();
+    let plain_instructions = vec![
+        Instruction::new3(OpCode::IAdd, 0, 1, 2),
+        Instruction::new3(OpCode::IAdd, 2, 1, 2),
+        Instruction::new0(OpCode::Halt),
+    ];
+    unsafe {
+        plain.compile_region(
+            0,
+            0,
+            plain_instructions.len(),
+            &plain_instructions,
+            &std::collections::HashMap::new(),
+        )
+    }
+    .expect("plain region should compile");
+    assert!(
+        !plain
+            .compiled_entry(0, 0)
+            .expect("plain cache entry")
+            .requires_vm_reentry,
+        "regions without VM-reentrant helpers should be eligible for direct frame registers"
+    );
+
+    let mut calling = make_jit();
+    let call_instructions = vec![
+        Instruction::new3(OpCode::Call, 254, 1, 0),
+        Instruction::new0(OpCode::Nop),
+        Instruction::new0(OpCode::Halt),
+    ];
+    let mut native_calls = std::collections::HashMap::new();
+    native_calls.insert(0usize, 0usize);
+    unsafe {
+        calling.compile_region(
+            0,
+            0,
+            call_instructions.len(),
+            &call_instructions,
+            &native_calls,
+        )
+    }
+    .expect("direct-call region should compile");
+    assert!(
+        calling
+            .compiled_entry(0, 0)
+            .expect("direct-call cache entry")
+            .requires_vm_reentry,
+        "helper-backed direct calls must retain detached register storage"
+    );
 }
 
 #[test]
@@ -1538,6 +1816,7 @@ fn test_tier2_counter_increments() {
         5,
         CompilationTier::Simd,
         CodegenOptimization::Optimized,
+        false,
         0,
     );
 
@@ -1574,6 +1853,7 @@ fn test_tier2_counters_are_per_session() {
         3,
         CompilationTier::Simd,
         CodegenOptimization::Optimized,
+        false,
         0,
     );
     jit_b.store_compiled_with_metadata(
@@ -1583,6 +1863,7 @@ fn test_tier2_counters_are_per_session() {
         3,
         CompilationTier::Simd,
         CodegenOptimization::Optimized,
+        false,
         0,
     );
 
@@ -1595,6 +1876,61 @@ fn test_tier2_counters_are_per_session() {
     assert!(
         jit_b.tier2_counters.get(&(0, 200)).is_none(),
         "session B should have no counter since we never called record_tier2 on it"
+    );
+}
+
+#[test]
+fn test_loop_region_promotes_on_first_compiled_reentry() {
+    let mut module = CodeModule::new("tier2_loop_reentry");
+    module.emit(Instruction::new1(OpCode::Const0, 0));
+    module.emit(Instruction::new1(OpCode::Const1, 1));
+    module.emit(Instruction::new3(OpCode::IAdd, 0, 1, 0));
+    module.emit(Instruction::new3(OpCode::ICmpLt, 0, 1, 2));
+    let back: i16 = -2; // pc4 -> pc2, an internal loop back-edge.
+    module.emit(Instruction::new3(
+        OpCode::JmpT,
+        2,
+        ((back as u16) >> 8) as u8,
+        (back as u16 & 0xFF) as u8,
+    ));
+    module.emit(Instruction::new0(OpCode::Halt));
+    module.entry_point = Some(0);
+
+    let mut jit = make_jit();
+    let start = 2;
+    let len = 3;
+    unsafe {
+        jit.compile_region(
+            0,
+            start,
+            len,
+            &module.instructions,
+            &std::collections::HashMap::new(),
+        )
+    }
+    .expect("loop region should compile");
+
+    assert_eq!(
+        jit.compiled_optimization(0, start),
+        Some(CodegenOptimization::Fast),
+        "first-tier compilation should still minimize startup latency"
+    );
+
+    // One compiled re-entry can represent an arbitrarily large amount of
+    // native loop work because the back-edge remains inside the region.
+    // Requiring 10k region entries therefore leaves hot loops stranded on
+    // the low-optimization Cranelift tier.
+    jit.record_tier2_and_maybe_promote(0, start, &module);
+
+    assert_eq!(
+        jit.compiled_optimization(0, start),
+        Some(CodegenOptimization::Optimized),
+        "an internal-loop region should promote on its first compiled re-entry"
+    );
+    assert_eq!(
+        jit.tier2_counters.get(&(0, start)).copied(),
+        Some(0),
+        "successful loop promotion should reset the tier-2 counter"
     );
 }
 
@@ -1660,6 +1996,16 @@ fn test_tier2_replaces_baseline_with_typed_code() {
         jit.is_typed_compiled(0, start),
         "promoted region should be recorded as type-directed"
     );
+    let stats = crate::backends::JitBackend::compile_stats(&jit);
+    assert_eq!(stats.fast_compiles, 1);
+    assert_eq!(stats.optimized_compiles, 1);
+    assert_eq!(stats.total_compiles(), 2);
+    assert_eq!(
+        stats.total_compile_ns(),
+        stats
+            .fast_compile_ns
+            .saturating_add(stats.optimized_compile_ns)
+    );
 }
 
 #[test]
@@ -1696,6 +2042,7 @@ fn test_tier2_replaces_typed_region_with_simd_code() {
         module.instructions.len(),
         CompilationTier::Typed,
         CodegenOptimization::Optimized,
+        false,
         0,
     );
     jit.typed_regions.insert((0, 0));

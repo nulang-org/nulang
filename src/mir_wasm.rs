@@ -1132,12 +1132,44 @@ impl WasmBackend {
                 body.instruction(&Instruction::LocalGet(self.mir_local(l, func)));
             }
             RValue::Binary(op, a, b) => {
+                use crate::ast::BinOp;
+
+                let float_arithmetic = self.is_float_local(a, func) || self.is_float_local(b, func);
+                let numeric = matches!(
+                    op,
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Pow
+                );
+
+                // Mirror mir_codegen's type-directed F* opcode selection.
+                // For a statically-float operation, normalize tagged runtime
+                // fallbacks before calling the existing host arithmetic ABI:
+                // FAdd/FSub/FMul/FPow use 0.0; FDiv/FMod use 1.0 for a
+                // non-float denominator. This matters when an earlier FDiv
+                // returns nil but the enclosing expression remains Float.
+                if numeric && float_arithmetic {
+                    self.emit_float_operand(body, a, 0.0, func);
+                    let rhs_fallback = if matches!(op, BinOp::Div | BinOp::Mod) {
+                        1.0
+                    } else {
+                        0.0
+                    };
+                    self.emit_float_operand(body, b, rhs_fallback, func);
+
+                    let import = match op {
+                        BinOp::Add => IMPORT_ARITH_ADD,
+                        BinOp::Sub => IMPORT_ARITH_SUB,
+                        BinOp::Mul => IMPORT_ARITH_MUL,
+                        BinOp::Div => IMPORT_ARITH_DIV,
+                        BinOp::Mod => IMPORT_ARITH_MOD,
+                        BinOp::Pow => IMPORT_POW,
+                        _ => unreachable!(),
+                    };
+                    body.instruction(&Instruction::Call(import));
+                    return;
+                }
+
                 body.instruction(&Instruction::LocalGet(self.mir_local(a, func)));
                 body.instruction(&Instruction::LocalGet(self.mir_local(b, func)));
-                use crate::ast::BinOp;
-                // Numeric ops route through host helpers so float operands
-                // (raw bit patterns the inline integer path would corrupt) get
-                // f64 arithmetic, matching the interpreter. Comparisons too.
                 let import = match op {
                     BinOp::Add => Some(IMPORT_ARITH_ADD),
                     BinOp::Sub => Some(IMPORT_ARITH_SUB),
@@ -2118,6 +2150,60 @@ impl WasmBackend {
         func.name == "__main" || func.name == "main"
     }
 
+    fn is_float_local(&self, id: &mir::LocalId, func: &mir::Function) -> bool {
+        func.locals
+            .get(id.0 as usize)
+            .map(|local| {
+                local.ty == crate::types::Type::Primitive(crate::types::PrimitiveType::Float)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Push a raw f64 bit-pattern for a MIR operand, matching the VM's
+    /// `Value::as_float().unwrap_or(fallback)` semantics without adding a
+    /// new host import. Tagged values occupy NaN payload space; canonical
+    /// float NaN is the one accepted NaN representation.
+    fn emit_float_operand(
+        &self,
+        body: &mut Function,
+        id: &mir::LocalId,
+        fallback: f64,
+        func: &mir::Function,
+    ) {
+        const EXPONENT_MASK: i64 = 0x7FF0_0000_0000_0000u64 as i64;
+        const MANTISSA_MASK: i64 = 0x000F_FFFF_FFFF_FFFFu64 as i64;
+        let local = self.mir_local(id, func);
+
+        // is_float_raw(raw):
+        // exponent != all-ones || mantissa == 0 (infinity) || canonical NaN.
+        body.instruction(&Instruction::LocalGet(local));
+        body.instruction(&Instruction::I64Const(EXPONENT_MASK));
+        body.instruction(&Instruction::I64And);
+        body.instruction(&Instruction::I64Const(EXPONENT_MASK));
+        body.instruction(&Instruction::I64Ne);
+
+        body.instruction(&Instruction::LocalGet(local));
+        body.instruction(&Instruction::I64Const(MANTISSA_MASK));
+        body.instruction(&Instruction::I64And);
+        body.instruction(&Instruction::I64Eqz);
+        body.instruction(&Instruction::I32Or);
+
+        body.instruction(&Instruction::LocalGet(local));
+        body.instruction(&Instruction::I64Const(
+            value_layout::CANONICAL_NAN_BITS as i64,
+        ));
+        body.instruction(&Instruction::I64Eq);
+        body.instruction(&Instruction::I32Or);
+
+        body.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+        body.instruction(&Instruction::LocalGet(local));
+        body.instruction(&Instruction::Else);
+        body.instruction(&Instruction::I64Const(
+            value_layout::float_bits(fallback) as i64
+        ));
+        body.instruction(&Instruction::End);
+    }
+
     fn compile_unary(
         &self,
         body: &mut Function,
@@ -2136,14 +2222,7 @@ impl WasmBackend {
                 // carry Float for comparisons in this pipeline, even though the
                 // runtime comparison result is a tagged Bool; that path is still
                 // FNeg in the VM and must produce -0.0 for the Bool fallback.
-                let is_float = func
-                    .locals
-                    .get(a.0 as usize)
-                    .map(|local| {
-                        local.ty
-                            == crate::types::Type::Primitive(crate::types::PrimitiveType::Float)
-                    })
-                    .unwrap_or(false);
+                let is_float = self.is_float_local(a, func);
                 body.instruction(&Instruction::Call(if is_float {
                     IMPORT_ARITH_FNEG
                 } else {
@@ -3084,6 +3163,20 @@ mod tests {
         let value = runtime.run()?;
         let last = runtime.take_last_dispatch();
         Ok((value, last))
+    }
+
+    #[test]
+    #[cfg(all(test, feature = "wasm-backend"))]
+    fn test_wasm_float_add_after_zero_division_matches_bytecode_fallbacks() {
+        // Regression from the 2026-09-25 differential-fuzz nightly.
+        // Bytecode selects FDiv/FAdd/FNeg from MIR type information:
+        // 1.0 / 0.0 -> nil, FAdd(0.1, nil) treats nil as 0.0, then FNeg -> -0.1.
+        let value = run_source("let x = 0.1; let y = 0.2; -(x + 1.0 / 0.0)").expect("run");
+        let got = value.as_float().expect("result must remain Float");
+        assert!(
+            (got - (-0.1)).abs() < f64::EPSILON,
+            "WASM float arithmetic must preserve bytecode fallback semantics, got {got}"
+        );
     }
 
     #[test]

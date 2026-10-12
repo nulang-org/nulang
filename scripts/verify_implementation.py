@@ -77,6 +77,7 @@ def check_warnings():
         and check_warnings_for(["--all-features"], "(--all-features)")
     )
 
+
 def check_stdlib_manifest():
     """Fail when canonical stdlib metadata or generated mirrors drift."""
     print("Checking canonical stdlib manifest and generated artifacts...")
@@ -140,6 +141,25 @@ def check_verification_tooling_tests():
             print(res.stderr)
         return False
     print("Success: verification tooling unit tests passed.")
+
+
+def check_architecture_boundaries():
+    """Fail if hosted Cloud control-plane policy re-enters Nulang's graph."""
+    print("Checking Nulang/Nulang Cloud architecture ownership boundaries...")
+    res = subprocess.run(
+        [sys.executable, "scripts/check_architecture_boundaries.py", "--root", "."],
+        capture_output=True,
+        text=True,
+    )
+    if res.returncode != 0:
+        print("Error: architecture ownership boundary validation failed.")
+        if res.stdout:
+            print(res.stdout)
+        if res.stderr:
+            print(res.stderr)
+        return False
+    if res.stdout:
+        print(res.stdout.strip())
     return True
 
 
@@ -246,6 +266,9 @@ def verify_files():
             intra_node_wired = True
     if not intra_node_wired:
         print("Error: Cycle detector intra-node restriction is not wired in Runtime.")
+        return False
+
+    if not check_architecture_boundaries():
         return False
 
     if not check_stdlib_manifest():

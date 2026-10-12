@@ -22,6 +22,8 @@
 
 ---
 
+**New to Nulang?** [Try Core in the browser](https://nulang.org/playground/) (no install) · [Install a checksummed release](https://nulang.org/getting-started/installation/) · [Run the quick start](https://nulang.org/getting-started/quick-start/). Native actors, networking, and durable runtime features require a local binary.
+
 ## What is Nulang?
 
 Nulang is a programming language for concurrent, durable, and distributed
@@ -62,8 +64,7 @@ checksum, then put the extracted executable on your PATH.
 Linux x86_64 example:
 
 ```bash
-sha256sum nulang-linux-x86_64.tar.gz
-cat nulang-linux-x86_64.tar.gz.sha256  # compare the published digest
+sha256sum -c nulang-linux-x86_64.tar.gz.sha256
 tar xzf nulang-linux-x86_64.tar.gz
 install -m 0755 nulang-linux-x86_64 ~/.local/bin/nulang
 ```
@@ -127,7 +128,7 @@ perform IO.print("Hello, " + name + "!")
 - **Hindley-Milner type inference** — full Algorithm W with row-polymorphic records, variant types, and algebraic effect rows.
 - **Actors** — `spawn`, `send`/`!`, `ask`, selective `receive` with `after` timeout, links, monitors, supervision trees, process groups, and actor priority scheduling.
 - **Typed actor protocols** — structural `ActorRef[P]` contracts can restrict public actor APIs to required behaviors. Compiler-derived protocol fingerprints, a trusted schema registry, directional compatibility checks, and pre-mailbox admission are implemented as *Experimental* protocol hardening.
-- **Entities & workflows** — `entity` declarations are durable-first and event-sourced by default. The higher-level `workflow` declaration surface supports steps, timers, signals, and saga compensation, and remains *Experimental* while that API evolves.
+- **Entities & workflows** — `entity` declarations are durable-first and event-sourced by default. The higher-level `workflow` declaration surface supports steps, timers, signals, and saga compensation on the reference bytecode runtime and remains *Experimental*. The canonical portable/cloud WASM backend currently rejects `workflow` declarations fail-closed until it can preserve those durable semantics end to end.
 - **`let` and `var`** — immutable and mutable bindings. Records with `{ field: value }` syntax and `{ base .. field = new_val }` update syntax. Pattern matching with guards, alias patterns, and recursive sub-patterns. `**` exponentiation. Multi-line `"""..."""` strings with `\u{...}` unicode escapes. Pipe operator `|>`.
 - **Error handling** — `catch expr fallback` (prefix or postfix), `fail Error(...)` for structured short-circuit return, `T ! E` return types, `?` unwrap.
 - **FS file I/O** — `perform FS.read(path)`, `perform FS.write(path, content)`, `perform FS.append(path, content)`, `perform FS.exists(path)`.
@@ -149,6 +150,7 @@ perform IO.print("Hello, " + name + "!")
 | Document | Description |
 |----------|-------------|
 | [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md) | Installation, values, effects, actors, pattern matching — with runnable code snippets |
+| [`docs/ADOPTION_PILOT.md`](docs/ADOPTION_PILOT.md) | Independent-developer pilot protocol and measurable adoption gate (#809) |
 | [`docs/TUTORIAL.md`](docs/TUTORIAL.md) | **Tutorial:** Build a Weather CLI step by step — variables, functions, HTTP, JSON, pattern matching, records, file I/O |
 | [`docs/PITFALLS.md`](docs/PITFALLS.md) | Common mistakes: `::` vs `.`, `let` vs `var`, `perform` keyword, `catch`/`fail`, record syntax, and more |
 | [`examples/`](examples/) + [`README`](examples/README.md) | 17 verified, self-contained example programs |
@@ -256,6 +258,7 @@ dependencies.
 - **Questions & discussion:** [GitHub Discussions](https://github.com/nulang-org/nulang/discussions)
 - **Bugs & feature requests:** [Issue tracker](https://github.com/nulang-org/nulang/issues/new/choose)
 - **Contributing:** see [CONTRIBUTING.md](CONTRIBUTING.md) and our [Code of Conduct](CODE_OF_CONDUCT.md)
+- **External developer pilot:** follow [the adoption protocol](docs/ADOPTION_PILOT.md) and report anonymized findings to [issue #809](https://github.com/nulang-org/nulang/issues/809).
 
 ---
 
