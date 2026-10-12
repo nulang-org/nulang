@@ -4,6 +4,10 @@
 - **Shard receive passes reuse an empty message-staging buffer rather than reallocating on every nonempty drain.** The receive loop still snapshots the incoming channel before delivering envelopes, preserving ordering and the existing scheduler-turn batch boundary.
 - **Retained buffer capacity is capped at 256 envelopes.** Exceptionally large bursts are fully processed but do not pin an oversized allocation on a shard. Regression tests cover FIFO delivery, repeated reuse, burst cleanup, and ObjectRef lease release. Exact-base throughput and latency comparison remains diagnostic until CI measurements complete.
 
+### Public CLI release portability — 2026-10-11
+- **Public release archives use the `release-cli` feature profile without a Python shared-library ABI dependency.** The ordinary full/default source build retains opt-in Python interoperability; release packaging checks the resulting Linux and macOS binary for Python dependencies.
+- **Release PRs rehearse the full non-publishing four-platform build matrix before tags are created.** The Linux ARM64 cross build explicitly installs target libc development headers and preflights a target-compiler C header probe, avoiding an observed `ring` compile failure when `--no-install-recommends` omits the ARM64 sysroot. Actual cross-build and clean-host portability remain release gates.
+
 ### Runtime soundness and checked negation — native/AOT backend parity — 2026-10-10
 - **AOT no longer claims raw-Int/Float registers for values that can be nil
   at runtime.** Nightly differential fuzz caught interpreter/AOT divergences
