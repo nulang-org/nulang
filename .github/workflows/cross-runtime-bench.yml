@@ -14,7 +14,7 @@ on:
       runtimes:
         description: Comma-separated runtimes (bytecode/warmed JIT/AOT/Rust/Go/Erlang)
         required: false
-        default: 'nulang,nulang-jit,nulang-aot,rust,go,erlang'
+        default: 'nulang,nulang-aot,rust,go,erlang'
       cpu_mode:
         description: CPU topology for measured runtime processes
         required: false
@@ -72,7 +72,7 @@ jobs:
           RUNS: "${{ inputs.runs || '12' }}"
           WARMUP: "${{ inputs.warmup || '1' }}"
           CPU_MODE: "${{ inputs.cpu_mode || 'single' }}"
-          RUNTIMES: "${{ inputs.runtimes || 'nulang,nulang-jit,nulang-aot,rust,go,erlang' }}"
+          RUNTIMES: "${{ inputs.runtimes || 'nulang,nulang-aot,rust,go,erlang' }}"
         run: |
           python3 scripts/cross_runtime_bench.py \
             --runs "$RUNS" \
@@ -81,9 +81,22 @@ jobs:
             --runtimes "$RUNTIMES" \
             --output cross-runtime-results.json
 
+      - name: Compare Nulang actor bytecode, warmed JIT and AOT
+        env:
+          CPU_MODE: "${{ inputs.cpu_mode || 'single' }}"
+        run: |
+          python3 scripts/cross_runtime_bench.py \
+            --workloads actor_compute \
+            --runs 12 --warmup 1 \
+            --cpu-mode "$CPU_MODE" \
+            --runtimes nulang,nulang-jit,nulang-aot \
+            --output actor-backend-results.json
+
       - name: Upload results
         uses: actions/upload-artifact@v7
         with:
           name: cross-runtime-results-${{ github.sha }}
-          path: cross-runtime-results.json
+          path: |
+            cross-runtime-results.json
+            actor-backend-results.json
           if-no-files-found: error
