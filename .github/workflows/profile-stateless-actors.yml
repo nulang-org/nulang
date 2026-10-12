@@ -1,0 +1,76 @@
+name: Stateless actor profiler contracts
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/profile_stateless_actors.py'
+      - 'tests/test_profile_stateless_actors.py'
+      - 'src/bin/nulang_savina.rs'
+      - '.github/workflows/profile-stateless-actors.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    name: Validate profiler commands and sample integrity
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate profiling contract
+        run: python3 -m unittest discover -s tests -p test_profile_stateless_actors.py -v
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify persistent-actor correctness
+        run: |
+          cargo test --locked --no-default-features --features savina-bench \
+            --bin nulang-savina persistent_ping_pong_processes_every_round -- --nocapture
+      - name: Measure admission versus scheduler phases
+        run: |
+          mkdir -p phase-results
+          for workload in counting fork_join; do
+            cargo run --locked --profile savina --no-default-features \
+              --features savina-bench --bin nulang-savina -- \
+              --benchmark "$workload" --repeat 3 --phase-profile --format jsonl \
+              > "phase-results/$workload.jsonl"
+          done
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          from scripts.profile_stateless_actors import validate_phase_samples
+
+          expected = {"counting": 200000, "fork_join": 100000}
+          summary = {}
+          for workload, messages in expected.items():
+              raw = Path(f"phase-results/{workload}.jsonl").read_text()
+              summary[workload] = validate_phase_samples(raw, workload, 3, messages)
+          Path("phase-results/summary.json").write_text(
+              json.dumps(summary, indent=2, sort_keys=True) + "\n"
+          )
+          for workload, result in summary.items():
+              print(workload, result)
+          PY
+      - name: Retain phase timings
+        uses: actions/upload-artifact@v7
+        with:
+          name: nulang-savina-phase-timings-${{ github.sha }}
+          path: phase-results/
+          if-no-files-found: error
+
+      - name: Verify profiler CLI accepts persistent rounds
+        run: |
+          cargo run --locked --profile savina --no-default-features \
+            --features savina-bench --bin nulang-savina -- \
+            --benchmark ping_pong --repeat 2 --reuse-setup --format jsonl \
+            > persistent-ping-pong.jsonl
+          python3 - <<'PY'
+          import json
+          with open("persistent-ping-pong.jsonl", encoding="utf-8") as source:
+              records = [json.loads(line) for line in source if line.strip()]
+          assert len(records) == 2, len(records)
+          assert [r["iteration"] for r in records] == [1, 2]
+          assert all(r["benchmark"] == "ping_pong" for r in records)
+          assert all(r["messages"] == 40001 and r["elapsed_ns"] > 0 for r in records)
+          PY

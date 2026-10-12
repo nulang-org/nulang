@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Linux stateless actor hot-path profiler — 2026-10-08
+- **The existing Savina actor runner can now be sampled through a reproducible opt-in Linux `perf` workflow.** It builds a symbolized, frame-pointer-enabled bytecode actor binary and retains raw perf data, textual hot-symbol reports, environment metadata, and workload-completion JSONL.
+- **Fail-closed sample parsing and independent CI contract tests verify benchmark identity, repeat count, nonzero work, and contiguous iterations.** Profiler timing is explicitly diagnostic, not an optimized-build regression comparison; exact-parent Nulang A/B remains the performance confirmation path.
+
 
 ### Public CLI release portability — 2026-10-11
 - **Public release archives use the `release-cli` feature profile without a Python shared-library ABI dependency.** The ordinary full/default source build retains opt-in Python interoperability; release packaging checks the resulting Linux and macOS binary for Python dependencies.
