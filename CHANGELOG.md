@@ -1916,6 +1916,8 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### RFC 0020 Behavior Manifest effect inventory — 2026-09-23
+- **Behavior manifests now carry a compiler-derived effect inventory across typed function/actor-behavior rows and executable constant bodies.** Closed typed rows and directly provable HIR effects contribute their known families; open rows or executable calls/runtime helpers whose effect requirements cannot be proven mark `effect_inventory_complete: false` so deployment policy fails closed. Older v0alpha1 manifests deserialize conservatively as incomplete rather than being misread as pure/no-effect programs.
 ### Cloud control-plane placement foundation — 2026-09-24
 - **Nulang Cloud now has an isolated deterministic control-plane planner** (`crates/nulang-cloud-control`) that turns deployment intent plus node/allocation snapshots into a pure `PlacementPlan` without mutating runtimes or provisioning infrastructure.
 - **Placement separates hard feasibility from soft ranking.** Node state, architecture, region/zone, trust tier, required labels/capabilities, resource availability, and per-node replica limits reject candidates before region-locality, failure-domain spread, node spread, and headroom scoring.

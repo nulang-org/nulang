@@ -28,6 +28,16 @@ pub struct BehaviorManifest {
     pub schema: String,
     pub package: BehaviorPackage,
     pub artifact: BehaviorArtifact,
+    /// Compiler-derived union of effect families required by typed function
+    /// and actor-behavior rows. Missing on older v0alpha1 manifests.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effects: Vec<String>,
+    /// True only when every contributing effect row is closed. `None` means
+    /// this predates effect inventory and must be treated as incomplete.
+    /// Keeping the marker optional preserves canonical serialization/digests
+    /// for older v0alpha1 manifests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_inventory_complete: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub actors: Vec<BehaviorActor>,
 }
@@ -120,6 +130,7 @@ impl BehaviorManifest {
         let package_version = package_version.into();
         let actor_defs = actor_defs_by_name(hir);
         let schemas = actor_state_schemas_from_hir(hir);
+        let (effects, effect_inventory_complete) = effect_inventory(hir);
 
         let mut actors = Vec::with_capacity(schemas.len());
         for schema in schemas {
@@ -158,11 +169,20 @@ impl BehaviorManifest {
                 backend: artifact.backend().to_string(),
                 flags: artifact.flags().map(str::to_string).collect(),
             },
+            effects,
+            effect_inventory_complete: Some(effect_inventory_complete),
             actors,
         };
         manifest.normalize();
         manifest.validate()?;
         Ok(manifest)
+    }
+
+    /// Whether this manifest proves that the emitted effect family set is
+    /// complete. Missing legacy metadata and explicit open rows both fail
+    /// closed here.
+    pub fn has_complete_effect_inventory(&self) -> bool {
+        self.effect_inventory_complete == Some(true)
     }
 
     /// Deterministic JSON bytes suitable for a sidecar file and digest input.
@@ -318,6 +338,8 @@ impl BehaviorManifest {
     fn normalize(&mut self) {
         self.artifact.flags.sort();
         self.artifact.flags.dedup();
+        self.effects.sort();
+        self.effects.dedup();
         self.actors
             .sort_by(|left, right| left.name.cmp(&right.name));
         for actor in &mut self.actors {
@@ -372,6 +394,12 @@ impl BehaviorManifest {
                 expected: expected_artifact_id,
                 actual: artifact_id,
             });
+        }
+
+        if self.effects.iter().any(|effect| effect.trim().is_empty()) {
+            return Err(BehaviorManifestError::InvalidEffectInventory(
+                "effect names must not be empty".to_string(),
+            ));
         }
 
         let mut actor_names = BTreeSet::new();
@@ -532,6 +560,191 @@ fn classify_persistence(actor: &hir::ActorDef) -> BehaviorPersistence {
     }
 }
 
+fn effect_inventory(module: &hir::Module) -> (Vec<String>, bool) {
+    fn add_row(
+        row: &crate::types::EffectRow,
+        effects: &mut BTreeSet<String>,
+        complete: &mut bool,
+    ) {
+        let row_effects = match row {
+            crate::types::EffectRow::Closed(effects) => effects,
+            crate::types::EffectRow::Open(effects, _) => {
+                *complete = false;
+                effects
+            }
+        };
+        effects.extend(row_effects.iter().map(ToString::to_string));
+    }
+
+    fn add_effect(effect: crate::types::Effect, effects: &mut BTreeSet<String>) {
+        effects.insert(effect.to_string());
+    }
+
+    fn collect_body(
+        body: &hir::Body,
+        effects: &mut BTreeSet<String>,
+        complete: &mut bool,
+        handled: &BTreeSet<crate::types::Effect>,
+    ) {
+        for stmt in &body.stmts {
+            match stmt {
+                hir::Stmt::Let { value, .. } | hir::Stmt::Assign { value, .. } => {
+                    collect_rvalue(value, effects, complete, handled);
+                }
+                hir::Stmt::Emit { .. } => add_effect(crate::types::Effect::Event, effects),
+                hir::Stmt::StateSet { .. } | hir::Stmt::ParallelMarker { .. } => {}
+            }
+        }
+    }
+
+    fn collect_rvalue(
+        value: &hir::RValue,
+        effects: &mut BTreeSet<String>,
+        complete: &mut bool,
+        handled: &BTreeSet<crate::types::Effect>,
+    ) {
+        use crate::types::{Effect, Type};
+
+        match value {
+            hir::RValue::Call { func, .. } => match func.ty() {
+                Type::Function { effect, .. } => add_row(&effect, effects, complete),
+                _ => *complete = false,
+            },
+            hir::RValue::Closure { body, ty, .. }
+            | hir::RValue::RecClosure { body, ty, .. } => {
+                if let Type::Function { effect, .. } = ty {
+                    add_row(effect, effects, complete);
+                } else {
+                    *complete = false;
+                    collect_body(body, effects, complete, handled);
+                }
+            }
+            hir::RValue::Binary(op, ..) => {
+                if *op == crate::ast::BinOp::Range {
+                    add_effect(Effect::Array, effects);
+                }
+            }
+            hir::RValue::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_body(then_body, effects, complete, handled);
+                if let Some(body) = else_body {
+                    collect_body(body, effects, complete, handled);
+                }
+            }
+            hir::RValue::Match { arms, .. } => {
+                for (_, guard, body) in arms {
+                    if let Some(guard) = guard {
+                        collect_body(guard, effects, complete, handled);
+                    }
+                    collect_body(body, effects, complete, handled);
+                }
+            }
+            hir::RValue::For { body, .. } => collect_body(body, effects, complete, handled),
+            hir::RValue::While { cond, body, .. } => {
+                collect_body(cond, effects, complete, handled);
+                collect_body(body, effects, complete, handled);
+            }
+            hir::RValue::Block(body) => collect_body(body, effects, complete, handled),
+            hir::RValue::Spawn { .. } => add_effect(Effect::Spawn, effects),
+            hir::RValue::Send { .. } => add_effect(Effect::Send, effects),
+            hir::RValue::Ask { .. } => {
+                add_effect(Effect::Send, effects);
+                add_effect(Effect::Receive, effects);
+            }
+            hir::RValue::Perform { effect, .. } => {
+                let effect = crate::effect_checker::parse_effect_name(effect);
+                if !handled.contains(&effect) {
+                    add_effect(effect, effects);
+                }
+            }
+            hir::RValue::Handle {
+                body, handlers, ..
+            } => {
+                let mut inner_handled = handled.clone();
+                for handler in handlers {
+                    inner_handled.insert(crate::effect_checker::parse_effect_name(
+                        &handler.effect_name,
+                    ));
+                }
+                collect_body(body, effects, complete, &inner_handled);
+                for handler in handlers {
+                    collect_body(&handler.body, effects, complete, handled);
+                }
+            }
+            hir::RValue::Receive { arms, after, .. } => {
+                add_effect(Effect::Receive, effects);
+                for (_, _, guard, body) in arms {
+                    if let Some(guard) = guard {
+                        collect_body(guard, effects, complete, handled);
+                    }
+                    collect_body(body, effects, complete, handled);
+                }
+                if let Some((timeout, body)) = after {
+                    collect_body(timeout, effects, complete, handled);
+                    collect_body(body, effects, complete, handled);
+                }
+            }
+            hir::RValue::Migrate { .. } => add_effect(Effect::Migrate, effects),
+            hir::RValue::FFICall { .. } => add_effect(Effect::FFI, effects),
+
+            hir::RValue::PipelineNew { .. }
+            | hir::RValue::PipelineStage { .. }
+            | hir::RValue::PipelineRun { .. }
+            | hir::RValue::SupervisorNew { .. }
+            | hir::RValue::SupervisorWorker { .. }
+            | hir::RValue::SupervisorRun { .. }
+            | hir::RValue::DebateNew { .. }
+            | hir::RValue::DebateParticipant { .. }
+            | hir::RValue::DebateRun { .. } => *complete = false,
+
+            hir::RValue::Use(_)
+            | hir::RValue::Panic(_)
+            | hir::RValue::Literal(_, _)
+            | hir::RValue::Unary(_, _, _)
+            | hir::RValue::Tuple(_, _)
+            | hir::RValue::Record(_, _)
+            | hir::RValue::RecordUpdate { .. }
+            | hir::RValue::Array(_, _)
+            | hir::RValue::FieldAccess { .. }
+            | hir::RValue::Index { .. }
+            | hir::RValue::SelfRef(_)
+            | hir::RValue::Resume { .. }
+            | hir::RValue::CapCheck { .. } => {}
+        }
+    }
+
+    fn collect(
+        decls: &[hir::Decl],
+        effects: &mut BTreeSet<String>,
+        complete: &mut bool,
+    ) {
+        let handled = BTreeSet::new();
+        for decl in decls {
+            match decl {
+                hir::Decl::Function(function) => add_row(&function.effect, effects, complete),
+                hir::Decl::Actor(actor) => {
+                    for behavior in &actor.behaviors {
+                        add_row(&behavior.effect, effects, complete);
+                    }
+                }
+                hir::Decl::Constant { body, .. } => {
+                    collect_body(body, effects, complete, &handled);
+                }
+                hir::Decl::Module { decls, .. } => collect(decls, effects, complete),
+                _ => {}
+            }
+        }
+    }
+
+    let mut effects = BTreeSet::new();
+    let mut complete = true;
+    collect(&module.decls, &mut effects, &mut complete);
+    (effects.into_iter().collect(), complete)
+}
+
 fn actor_defs_by_name(module: &hir::Module) -> BTreeMap<String, &hir::ActorDef> {
     fn collect<'a>(
         decls: &'a [hir::Decl],
@@ -573,6 +786,7 @@ pub enum BehaviorManifestError {
     UnsupportedSchema(String),
     UnsupportedArtifactKind(String),
     InvalidPackage(String),
+    InvalidEffectInventory(String),
     InvalidDigest {
         field: &'static str,
         message: String,
@@ -612,6 +826,9 @@ impl fmt::Display for BehaviorManifestError {
                 "unsupported behavior manifest artifact kind '{kind}'; expected {BEHAVIOR_ARTIFACT_KIND_NBC_V1}"
             ),
             Self::InvalidPackage(message) => write!(f, "invalid behavior manifest package: {message}"),
+            Self::InvalidEffectInventory(message) => {
+                write!(f, "invalid behavior manifest effect inventory: {message}")
+            }
             Self::InvalidDigest { field, message } => {
                 write!(f, "invalid {field} in behavior manifest: {message}")
             }
@@ -751,8 +968,8 @@ mod tests {
     use super::*;
     use crate::ast::{Expr, Literal, MigrationDecl, StateModel};
     use crate::content_identity::SemanticId;
-    use crate::hir::{ActorDef, Module, Operand};
-    use crate::types::{PrimitiveType, Span, Type};
+    use crate::hir::{ActorDef, BehaviorDef, FunctionDef, Module, Operand};
+    use crate::types::{Capability, Effect, EffectRow, PrimitiveType, Region, Span, Type};
 
     fn artifact() -> ArtifactIdentityManifest {
         ArtifactIdentityManifest::new(
@@ -846,6 +1063,8 @@ mod tests {
                 backend: "bytecode".to_string(),
                 flags: Vec::new(),
             },
+            effects: Vec::new(),
+            effect_inventory_complete: None,
             actors: vec![actor],
         }
     }
@@ -891,6 +1110,177 @@ mod tests {
         assert_eq!(actor.migrations[0].from, 1);
         assert_eq!(actor.migrations[0].to, 2);
         assert!(actor.migrations[0].state);
+    }
+
+    #[test]
+    fn typed_hir_emits_sorted_effect_union_and_completeness() {
+        let mut module = typed_hir(1);
+        module.decls.push(hir::Decl::Function(FunctionDef {
+            name: "fetch".to_string(),
+            type_params: Vec::new(),
+            params: Vec::new(),
+            dict_params: Vec::new(),
+            ret: Type::unit(),
+            effect: EffectRow::Closed(vec![Effect::Net, Effect::IO]),
+            cap: Capability::Val,
+            body: hir::Body::default(),
+            public: true,
+            placement: None,
+            span: Span::default(),
+        }));
+
+        let hir::Decl::Actor(actor) = &mut module.decls[0] else {
+            panic!("expected actor")
+        };
+        actor.behaviors.push(BehaviorDef {
+            name: "ask".to_string(),
+            params: Vec::new(),
+            ret: Type::unit(),
+            effect: EffectRow::Closed(vec![Effect::Inference, Effect::IO]),
+            cap: Capability::Ref,
+            body: hir::Body::default(),
+            compensate: None,
+            parallel_branches: None,
+            span: Span::default(),
+        });
+
+        let manifest = BehaviorManifest::from_typed_hir(
+            "demo",
+            "0.1.0",
+            &artifact(),
+            b"compiled-nbc",
+            &module,
+        )
+        .unwrap();
+
+        assert_eq!(manifest.effects, vec!["IO", "Inference", "Net"]);
+        assert!(manifest.has_complete_effect_inventory());
+    }
+
+    #[test]
+    fn open_effect_row_marks_manifest_inventory_incomplete() {
+        let mut module = typed_hir(1);
+        module.decls.push(hir::Decl::Function(FunctionDef {
+            name: "generic".to_string(),
+            type_params: Vec::new(),
+            params: Vec::new(),
+            dict_params: Vec::new(),
+            ret: Type::unit(),
+            effect: EffectRow::Open(vec![Effect::FS], Region(7)),
+            cap: Capability::Val,
+            body: hir::Body::default(),
+            public: true,
+            placement: None,
+            span: Span::default(),
+        }));
+
+        let manifest = BehaviorManifest::from_typed_hir(
+            "demo",
+            "0.1.0",
+            &artifact(),
+            b"compiled-nbc",
+            &module,
+        )
+        .unwrap();
+
+        assert_eq!(manifest.effects, vec!["FS"]);
+        assert_eq!(manifest.effect_inventory_complete, Some(false));
+        assert!(!manifest.has_complete_effect_inventory());
+    }
+
+    #[test]
+    fn constant_direct_perform_is_included_in_effect_inventory() {
+        let mut module = typed_hir(1);
+        let mut body = hir::Body::new();
+        body.push(hir::Stmt::Let {
+            name: "result".to_string(),
+            ty: Type::unit(),
+            value: hir::RValue::Perform {
+                effect: "IO".to_string(),
+                op: "print".to_string(),
+                args: Vec::new(),
+                ty: Type::unit(),
+            },
+            span: Span::default(),
+        });
+        module.decls.push(hir::Decl::Constant {
+            name: "side_effect".to_string(),
+            body,
+            span: Span::default(),
+        });
+
+        let manifest = BehaviorManifest::from_typed_hir(
+            "demo",
+            "0.1.0",
+            &artifact(),
+            b"compiled-nbc",
+            &module,
+        )
+        .unwrap();
+
+        assert!(manifest.effects.contains(&"IO".to_string()));
+        assert!(manifest.has_complete_effect_inventory());
+    }
+
+    #[test]
+    fn constant_call_without_proven_effect_row_marks_inventory_incomplete() {
+        let mut module = typed_hir(1);
+        let mut body = hir::Body::new();
+        body.push(hir::Stmt::Let {
+            name: "result".to_string(),
+            ty: Type::unit(),
+            value: hir::RValue::Call {
+                func: Operand::Var("dynamic".to_string(), Type::unit()),
+                args: Vec::new(),
+                ty: Type::unit(),
+            },
+            span: Span::default(),
+        });
+        module.decls.push(hir::Decl::Constant {
+            name: "dynamic_call".to_string(),
+            body,
+            span: Span::default(),
+        });
+
+        let manifest = BehaviorManifest::from_typed_hir(
+            "demo",
+            "0.1.0",
+            &artifact(),
+            b"compiled-nbc",
+            &module,
+        )
+        .unwrap();
+
+        assert_eq!(manifest.effect_inventory_complete, Some(false));
+        assert!(!manifest.has_complete_effect_inventory());
+    }
+
+    #[test]
+    fn legacy_manifest_without_effect_inventory_is_incomplete_not_pure() {
+        let valid = base_manifest(actor(1, b"schema-v1"));
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&valid.to_json().unwrap()).unwrap();
+        value.as_object_mut().unwrap().remove("effects");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("effect_inventory_complete");
+
+        let legacy_bytes = serde_json::to_vec(&value).unwrap();
+        let parsed = BehaviorManifest::from_json(&legacy_bytes).unwrap();
+        assert!(parsed.effects.is_empty());
+        assert_eq!(parsed.effect_inventory_complete, None);
+        assert!(!parsed.has_complete_effect_inventory());
+        assert_eq!(
+            parsed.to_json().unwrap(),
+            valid.to_json().unwrap(),
+            "adding optional effect metadata must not change canonical serialization of legacy v0alpha1 manifests"
+        );
+        assert_eq!(
+            parsed.digest().unwrap(),
+            valid.digest().unwrap(),
+            "legacy manifest digest must remain stable"
+        );
     }
 
     #[test]
