@@ -218,14 +218,18 @@ A language surface should not become permanently Frozen merely because it has ex
 
 ## Frozen-core review
 
-The current repository describes the language as alpha and pre-external-user while also carrying a `1.0.0-frozen` compatibility contract. That tension should be reviewed explicitly rather than resolved ad hoc through implementation patches.
+RFC 0021 (accepted 2026-09-21) resolves the previous tension between alpha
+status and the historical `1.0.0-frozen` label.
 
-Until a dedicated RFC decides otherwise:
+- Nulang Core remains the portability/self-hosting kernel but is Stable, not
+  permanently Frozen, until the external-adoption gate is met.
+- Published v1 artifact/wire/ABI encodings remain archival obligations and are
+  never silently reinterpreted.
+- Semantic corrections still require an RFC, explicit version transition,
+  diagnostics, and migration guidance.
+- Permanent freezing requires independently authored applications, durability
+  and migration evidence, tooling evidence, a compatibility inventory, and a
+  dedicated freeze RFC.
 
-- do not casually break Frozen Core;
-- do not expand Frozen Core;
-- document mismatches truthfully;
-- prefer warnings/strict modes when a correctness improvement conflicts with an existing frozen validity rule;
-- collect concrete evidence for any future compatibility-policy revision.
-
-The goal is to preserve user trust without letting premature compatibility promises force silent semantic defects.
+The goal remains preserving user trust without allowing premature
+representation or semantic freezes to force silent defects.

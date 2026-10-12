@@ -37,6 +37,15 @@ Each effect groups related operations accessed via `perform Effect.operation(...
 | [Otp](/stdlib/otp/) | `create_supervisor`, `supervise_child`, `set_template`, `start_child`, `terminate_child`, `child_count` | OTP supervision trees |
 | [Crdt](/stdlib/crdt/) | `increment`, `decrement`, `add`, `remove`, `set`, `read` | Replicated CRDT state |
 
+## Nulang-authored Modules
+
+The built-in effects below are runtime/compiler primitives. Nulang also ships
+higher-level modules written in Nulang itself. Their canonical names, sources,
+stability tiers, and official package mirrors are generated from the canonical
+`spec/stdlib/v0alpha1.json` manifest.
+
+See [Standard Library Modules](/stdlib/modules/) for the generated index.
+
 ## Implementation Sites
 
 Built-in operations are implemented in one of two places:
@@ -47,19 +56,31 @@ Built-in operations are implemented in one of two places:
 ## Using Built-in Effects
 
 ```nulang
-// IO effects work everywhere
-perform IO.print("Hello, World!")
-perform IO.println("With a newline")
-let input = perform IO.read()
+// Actor-only effects belong inside actor behaviors.
+actor Service {
+    behavior connect(peer) {
+        perform Actor.register("my_service")
+        perform Actor.link(peer)
+    }
+}
 
-// Actor effects require the runtime
-perform Actor.register("my_service")
-perform Actor.link(some_actor)
+actor Peer {
+    behavior ping() { unit }
+}
 
-// OTP effects for supervision
-let sup = perform Otp.create_supervisor("my_sup", 0)
+fn main() {
+    perform IO.print("Hello, World!")
+    perform IO.println("With a newline")
+    let service = spawn Service {}
+    let peer = spawn Peer {}
+    service ! connect(peer)
+
+    // OTP supervision is provided by the runtime host.
+    let sup = perform Otp.create_supervisor("my_sup", 0)
+    0
+}
 ```
 
 ## Adding New Built-in Effects
 
-New built-in operations are registered in the `StdLib` registry in `src/stdlib.rs` in the Nulang repository; see the contributor documentation for the full walkthrough. The per-effect reference pages under this section are auto-generated from that registry.
+New built-in operations are registered in the `StdLib` registry in `src/stdlib.rs`. Nulang-authored module metadata belongs in `spec/stdlib/v0alpha1.json`; run `python3 scripts/generate_stdlib.py` after changing it. CI rejects stale generated module metadata and package mirrors. Per-effect reference pages remain auto-generated from the executable `StdLib` registry.

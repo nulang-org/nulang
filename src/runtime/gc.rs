@@ -222,6 +222,15 @@ impl OrcaGc {
         }
     }
 
+    /// Reset this GC engine for a new actor, clearing all queues and stats.
+    pub fn reset(&mut self, actor_id: u64) {
+        self.actor_id = actor_id;
+        self.deferred_decrements.clear();
+        self.foreign_ref_queue.clear();
+        self.held_foreign_refs.clear();
+        self.stats.reset();
+    }
+
     /// Allocate a new object on the actor's heap.
     ///
     /// The returned pointer points to the **payload** (user data).  An

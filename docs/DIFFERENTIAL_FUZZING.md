@@ -1,8 +1,9 @@
-# Differential Fuzzing: VM ↔ JIT ↔ AOT
+# Differential Fuzzing: VM ↔ JIT ↔ AOT ↔ WASM
 
 Cross-backend semantic fuzzing for Nulang. Every generated program is
-executed by up to three backends and the observable outcomes must agree
-exactly; any divergence is a backend correctness bug.
+executed by the semantic-reference VM plus each enabled backend that accepts
+the program, and observable outcomes must agree exactly; any divergence is a
+backend correctness bug.
 
 ## Backends compared
 
@@ -16,9 +17,13 @@ exactly; any divergence is a backend correctness bug.
 3. **AOT native** — `AotModule::compile(&mir).run()`, when the program is
    within AOT's supported subset (effects/actors/FFI are rejected at
    compile time with `Unsupported`, which is a skip, not a divergence).
-
-(The WASM backend also participates when built with `--features
-wasm-backend`, via the oracle in `src/fuzz.rs`.)
+4. **WASM** — enabled with `--features wasm-backend`. Only explicit
+   restricted-profile/unsupported-feature compiler diagnostics are counted as
+   unsupported; unexpected compiler failures are divergences.
+   Once WASM bytes are emitted, however, validation, instantiation, or the
+   absence of the required `nulang_init` export is a hard differential
+   failure rather than a skip. Successfully executed WASM values/errors must
+   agree with the bytecode reference.
 
 ## Oracle
 
@@ -38,6 +43,12 @@ wasm-backend`, via the oracle in `src/fuzz.rs`.)
 - AOT runs compare against the cold key for self-contained tags only
   (AOT has its own constant pool; string pool indices are not comparable
   across independent compilations).
+- WASM runs use the same self-contained comparison rule. Only explicit
+  restricted-profile/unsupported-feature compile diagnostics are skips;
+  unexpected compiler failures and all post-emission runtime rejection are
+  divergences. The WASM-enabled test lane also requires positive WASM
+  participation so a regression cannot silently turn every generated program
+  into an unsupported case.
 
 ## Program generator (`src/difffuzz.rs`)
 
@@ -87,22 +98,36 @@ scripts/difffuzz.sh --seeds 1 --seed-base 0x0000000000001234
 
 # Release build (faster per program, slower to build):
 scripts/difffuzz.sh --release --seeds 50000
+
+# Explicit batch size (default: 800 seeds per subprocess):
+scripts/difffuzz.sh --seeds 10000 --batch-size 400
 ```
 
 Note: the driver loads one JIT/AOT native module per program and resident
 memory grows ~linearly with programs executed (~4 MB/program observed).
 Under a small cgroup memory limit (4 GiB) a single process is OOM-killed
-after roughly 900-1000 programs, so long campaigns must be *sharded*:
-invoke the binary repeatedly with advancing `--seed-base` (e.g. 800 seeds
-per shard). Crashers and stats accumulate across shards.
+after roughly 900-1000 programs. **The `scripts/difffuzz.sh` launcher now
+builds once and runs at most 800 seeds per subprocess by default**, releasing
+per-process native allocations before advancing the deterministic seed range.
+Use `--batch-size` to lower the limit for smaller CI workers. Each batch
+preserves the crasher directory, stops on the first nonzero exit, and prints
+its starting seed so a failed range can be reproduced directly. A `--time`
+limit is shared across the whole launcher campaign (after compilation), not
+reset for each batch. The standalone `nula_difffuzz` binary remains an
+unsharded low-level driver; run it in bounded seed batches for long campaigns.
+Crashers accumulate across batches, while each batch prints its own statistics.
 
 Environment: `CARGO_TARGET_DIR` (default `/tmp/ct-bfuzz`),
 `NULANG_STDLIB` (default `/mnt/agents/nulang/src/stdlib`).
 
-CI smoke test (50 fixed seeds, all backends agree):
+CI smoke tests:
 
 ```bash
+# Reference VM + JIT/AOT coverage where enabled by this profile
 cargo test --no-default-features difffuzz
+
+# Adds the restricted WASM backend and requires nonzero WASM participation
+cargo test --features wasm-backend difffuzz
 ```
 
 Also see the pre-existing mutation-based fuzzer: `cargo test -- fuzz`
