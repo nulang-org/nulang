@@ -10,13 +10,20 @@ already implemented by Nulang's `src/benchmarks.rs` harness:
 | thread_ring | 10 actors, H=20,000 token hops | 20,000 |
 | fork_join | 8 workers, 50,000 tasks | 100,000 |
 
-The companion implementations use only each platform's standard message
-primitive:
+The default comparison uses each platform's standard message primitive:
 
 - **Nulang** — real `Runtime` + bytecode actors from the standalone `nulang-savina` runner
 - **Rust** — `std::sync::mpsc` channels + native threads
 - **Go** — channels + goroutines
 - **Erlang/BEAM** — native processes + mailboxes
+
+One **opt-in real actor-framework** fixture is also available:
+
+- **Erlang/OTP** (`erlang_otp`) — `gen_server` actors, `gen_server:cast`
+  envelopes, handler dispatch and actor-owned state. It deliberately reuses
+  the existing Erlang installation; no additional dependencies are required.
+  Unlike the lower-level `erlang` baseline, this includes OTP server dispatch
+  overhead in every workload message.
 
 Run all installed runtimes on the same host:
 
@@ -25,6 +32,26 @@ python3 scripts/cross_runtime_bench.py --runs 5 --warmup 1 \
   --cpu-mode single \
   --output /tmp/nulang-cross-runtime.json
 ```
+
+To compare raw Erlang mailbox processes with real OTP `gen_server` actors
+alongside Nulang (or include the other default runtimes):
+
+```bash
+python3 scripts/cross_runtime_bench.py \
+  --runtimes nulang,erlang,erlang_otp \
+  --runs 5 --warmup 1 --cpu-mode single \
+  --output /tmp/nulang-otp-actors.json
+```
+
+Each measured runtime process has a default 120-second wall-clock timeout
+(`--timeout-seconds` overrides it). A deadlocked fixture fails the run
+instead of leaving CI hung without a measurement.
+
+The runner **fails closed** when a fixture emits a missing or duplicate
+workload, an incorrect logical-message count, or a non-positive duration.
+Benchmark source files and their exact message-count definitions must be
+updated together; silent partial or semantically mismatched results must not
+enter the published report.
 
 The runner compiles each external fixture once, performs warm-up runs, then
 records exact nanosecond timings from each runtime and reports the median for
@@ -53,8 +80,10 @@ another environment where the selected affinity is recorded and enforced.
 ## Interpretation constraints
 
 These numbers are **baselines, not a universal language or framework
-ranking**. The implementations intentionally use standard runtime primitives,
-not third-party actor frameworks, and their schedulers differ materially.
+ranking**. The default implementations use standard runtime primitives. Optional
+`erlang_otp` is an OTP actor-framework implementation, but its messages
+are not equivalent to actor-framework supervision or persistence tests. The
+schedulers and handler dispatch paths differ materially.
 
 In particular:
 
@@ -74,6 +103,9 @@ In particular:
   and repeat important results on controlled hardware before publishing them.
 - Do not turn one workload into a blanket "X is faster than Y" claim.
 
-For actor-framework comparisons (for example Pony, Ractor/Actix/Kameo,
-Proto.Actor, or Pekko/Akka), add separate pinned fixtures instead of silently
-changing these standard-runtime baselines.
+For additional actor-framework comparisons (Pony, Actix/Kameo,
+Proto.Actor, or Pekko/Akka), add separate pinned fixtures and matching test
+runs instead of silently changing the default standard-runtime baselines.
+An existing [Pony/CAF opt-in PR](https://github.com/nulang-org/nulang/pull/894)
+is being tracked separately; its fixtures are not part of this PR or
+published results.

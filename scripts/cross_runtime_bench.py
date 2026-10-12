@@ -24,6 +24,28 @@ ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "benchmarks" / "cross_runtime"
 BUILD = ROOT / "target" / "cross-runtime"
 BENCHMARKS = ("counting", "ping_pong", "thread_ring", "fork_join")
+EXPECTED_MESSAGES = {
+    "counting": 200_000,
+    "ping_pong": 40_001,
+    "thread_ring": 20_000,
+    "fork_join": 100_000,
+}
+DEFAULT_RUNTIMES = ("nulang", "rust", "go", "erlang")
+OPTIONAL_RUNTIMES = ("erlang_otp",)
+ALL_RUNTIMES = frozenset(DEFAULT_RUNTIMES + OPTIONAL_RUNTIMES)
+
+
+def validate_runtimes(selected: list[str]) -> list[str]:
+    """Reject duplicates and unsupported runtimes before building fixtures."""
+    if not selected:
+        raise ValueError("at least one runtime must be selected")
+    if len(selected) != len(set(selected)):
+        raise ValueError("duplicate runtimes are not allowed")
+    unknown = sorted(set(selected) - ALL_RUNTIMES)
+    if unknown:
+        raise ValueError(f"unknown runtimes: {', '.join(unknown)}")
+    return selected
+
 RECORD_RE = re.compile(
     r"\[cross-bench\]\s+runtime=(?P<runtime>[a-z0-9_-]+)\s+"
     r"benchmark=(?P<benchmark>[a-z0-9_-]+)\s+"
@@ -36,6 +58,7 @@ def command_output(
     *,
     cwd: Path = ROOT,
     cpu_affinity: set[int] | None = None,
+    timeout_seconds: int | None = None,
 ) -> str:
     """Run one command, optionally constraining the child to specific CPUs."""
 
@@ -60,6 +83,7 @@ def command_output(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         preexec_fn=preexec_fn,
+        timeout=timeout_seconds,
     )
     return proc.stdout
 
@@ -80,10 +104,18 @@ def parse_records(output: str, expected_runtime: str) -> dict[str, dict[str, int
         name = match.group("benchmark")
         if name not in BENCHMARKS:
             continue
-        records[name] = {
-            "messages": int(match.group("messages")),
-            "elapsed_ns": int(match.group("elapsed_ns")),
-        }
+        if name in records:
+            raise RuntimeError(f"{runtime}/{name}: duplicate benchmark record")
+        messages = int(match.group("messages"))
+        elapsed_ns = int(match.group("elapsed_ns"))
+        if messages != EXPECTED_MESSAGES[name]:
+            raise RuntimeError(
+                f"{runtime}/{name}: message count {messages} does not match "
+                f"expected {EXPECTED_MESSAGES[name]}"
+            )
+        if elapsed_ns <= 0:
+            raise RuntimeError(f"{runtime}/{name}: elapsed_ns must be positive")
+        records[name] = {"messages": messages, "elapsed_ns": elapsed_ns}
 
     missing = [name for name in BENCHMARKS if name not in records]
     if missing:
@@ -185,6 +217,19 @@ def build_commands(selected: list[str]) -> dict[str, list[str]]:
             "stop",
         ]
 
+    if "erlang_otp" in selected:
+        erlc = shutil.which("erlc")
+        erl = shutil.which("erl")
+        if erlc is None or erl is None:
+            raise RuntimeError("erl and erlc are required for the Erlang OTP actor benchmark")
+        command_output(
+            [erlc, "-o", str(BUILD), str(FIXTURES / "cross_runtime_otp.erl")]
+        )
+        commands["erlang_otp"] = [
+            erl, "-noshell", "-pa", str(BUILD), "-s", "cross_runtime_otp",
+            "main", "-s", "init", "stop",
+        ]
+
     return commands
 
 
@@ -267,6 +312,8 @@ def summarize(
             if len(message_counts) != 1:
                 raise RuntimeError(f"{runtime}/{name}: message count changed across samples")
             messages = message_counts.pop()
+            if messages <= 0 or any(ns <= 0 for ns in elapsed):
+                raise RuntimeError(f"{runtime}/{name}: elapsed_ns and messages must be positive")
             median_ns = statistics.median(elapsed)
             summary[runtime][name] = {
                 "samples": len(elapsed),
@@ -282,13 +329,13 @@ def summarize(
 
 def print_table(summary: dict[str, dict[str, dict[str, float | int]]]) -> None:
     print()
-    print("runtime   benchmark      median msg/s   median ns/msg")
-    print("--------  -------------  -------------  -------------")
+    print("runtime       benchmark      median msg/s   median ns/msg")
+    print("------------  -------------  -------------  -------------")
     for runtime in sorted(summary):
         for name in BENCHMARKS:
             row = summary[runtime][name]
             print(
-                f"{runtime:<8}  {name:<13}  "
+                f"{runtime:<12}  {name:<13}  "
                 f"{row['median_messages_per_second']:>13,.0f}  "
                 f"{row['median_ns_per_message']:>13,.1f}"
             )
@@ -301,7 +348,7 @@ def main() -> int:
     parser.add_argument(
         "--runtimes",
         default="nulang,rust,go,erlang",
-        help="comma-separated subset of nulang,rust,go,erlang",
+        help="comma-separated subset of nulang,rust,go,erlang,erlang_otp",
     )
     parser.add_argument(
         "--cpu-mode",
@@ -313,16 +360,24 @@ def main() -> int:
             "the host scheduler unconstrained and is diagnostic only"
         ),
     )
+    parser.add_argument(
+        "--timeout-seconds", type=int, default=120,
+        help="maximum wall-clock seconds per measured fixture process (default: 120)",
+    )
     parser.add_argument("--output", type=Path, help="write full JSON report here")
     args = parser.parse_args()
+
+    if args.timeout_seconds < 1:
+        parser.error("--timeout-seconds must be >= 1")
 
     if args.runs < 1 or args.warmup < 0:
         parser.error("--runs must be >= 1 and --warmup must be >= 0")
 
     selected = [item.strip() for item in args.runtimes.split(",") if item.strip()]
-    unknown = sorted(set(selected) - {"nulang", "rust", "go", "erlang"})
-    if unknown:
-        parser.error(f"unknown runtimes: {', '.join(unknown)}")
+    try:
+        validate_runtimes(selected)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     cpu_affinity = measurement_affinity(args.cpu_mode)
     if cpu_affinity is not None:
@@ -352,10 +407,17 @@ def main() -> int:
         index = round_idx - args.warmup + 1 if measured else round_idx + 1
         for runtime in selected:
             print(f"[{phase} {index}] {runtime}", flush=True)
-            output = command_output(
-                commands[runtime],
-                cpu_affinity=cpu_affinity,
-            )
+            try:
+                output = command_output(
+                    commands[runtime],
+                    cpu_affinity=cpu_affinity,
+                    timeout_seconds=args.timeout_seconds,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError(
+                    f"{runtime}: fixture timed out after {args.timeout_seconds}s "
+                    f"during {phase} {index}"
+                ) from exc
             records = parse_records(output, runtime)
             if measured:
                 for name, row in records.items():
@@ -366,7 +428,7 @@ def main() -> int:
 
     report = {
         "schema": 2,
-        "methodology": "standard-runtime Savina-style messaging baselines",
+        "methodology": "Savina-style standard-runtime and opt-in actor-framework message passing",
         "warmup_runs": args.warmup,
         "measured_runs": args.runs,
         "environment": environment_metadata(args.cpu_mode, cpu_affinity),

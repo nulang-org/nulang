@@ -36,7 +36,7 @@ concurrency:
 
 jobs:
   compare:
-    name: Nulang vs Rust / Go / Erlang baselines
+    name: Nulang vs Rust / Go / BEAM and OTP actors
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -58,6 +58,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y erlang-base erlang-dev
 
+      - name: Verify cross-runtime benchmark contracts
+        run: python3 -m unittest discover -s scripts/tests -p 'test_cross_runtime_bench.py'
+
       - name: Run cross-runtime baselines
         env:
           RUNS: "${{ inputs.runs || '3' }}"
@@ -68,6 +71,7 @@ jobs:
             --runs "$RUNS" \
             --warmup "$WARMUP" \
             --cpu-mode "$CPU_MODE" \
+            --runtimes nulang,rust,go,erlang,erlang_otp \
             --output cross-runtime-results.json
 
       - name: Upload results
