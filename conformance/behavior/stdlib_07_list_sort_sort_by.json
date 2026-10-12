@@ -1,1 +1,1 @@
-{"exit_code":0,"stdout":"sort_len=5\nsort0=1\nsort1=1\nsort2=3\nsort4=5\nsort_dup=3\nsort_empty=0\nsort_by0=4\nsort_by2=1\nmin_by=2\nmax_by=9\nmin_by_abs=-2\nmax_by_abs=-10","stderr":""}
+{"exit_code":0,"stdout":"sort_len=5\nsort0=1\nsort1=1\nsort2=3\nsort4=5\nsort_dup=3\nsort_empty=0\nsort_by0=4\nsort_by2=1\nmin_by=2\nmax_by=9\nmin_by_abs=-2\nmax_by_abs=-10\nmin_by_empty=None\nmax_by_empty=None","stderr":""}
