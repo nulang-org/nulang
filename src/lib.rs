@@ -34,7 +34,9 @@ pub mod content_identity;
 pub mod core_vm;
 #[cfg(feature = "native-codegen")]
 pub mod cranelift_utils;
+pub mod crdt_peer_sync;
 pub mod dap;
+pub mod database;
 pub mod diagnostic;
 #[cfg(feature = "native-codegen")]
 pub mod difffuzz;
@@ -42,7 +44,9 @@ pub mod docgen;
 pub mod dst;
 pub mod durable_effect;
 pub mod durable_effect_persistence;
+pub mod durable_effect_runtime;
 pub mod effect_checker;
+pub mod execution_site_map;
 pub mod ffi;
 pub mod fmt;
 pub mod format;
