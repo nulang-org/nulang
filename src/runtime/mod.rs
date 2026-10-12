@@ -2428,6 +2428,8 @@ impl Runtime {
         // receiving side derives its own child. When no message is being
         // handled, the outgoing message starts a fresh trace on its own.
         let out_trace = self.current_trace.as_ref().map(|t| t.to_traceparent());
+        let sender = self.current_actor.unwrap_or(0);
+        let target_is_local = self.actors.contains_key(&target_id);
         // Cross-node routing by bare actor-ref value (RFC-0007 gap): a
         // spawn@node placeholder or reply-by-ref id whose hosting node we
         // know routes over the wire instead of the local mailbox. The
@@ -2437,7 +2439,7 @@ impl Runtime {
         // sends (a colliding remote ref is unreachable by bare value, an
         // inherent limit of the 48-bit actor-ref payload; explicit
         // `ActorAddress::remote` still works).
-        if !self.actors.contains_key(&target_id) {
+        if !target_is_local {
             if let Some(node) = self.remote_refs.get(&target_id).copied() {
                 // The behavior name must cross the wire (the receiver
                 // resolves it against ITS behavior table). Recover it from
@@ -2514,7 +2516,7 @@ impl Runtime {
 
         // If the target is a known grain identity but is not currently
         // resident, hydrate it and retry local delivery once.
-        if !self.actors.contains_key(&target_id) {
+        if !target_is_local {
             if let Some(grain_id) = self.grain_actor_ids.get(&target_id).cloned() {
                 if let Err(e) = self.resolve_or_hydrate_grain(grain_id) {
                     warn!(
@@ -2525,7 +2527,7 @@ impl Runtime {
                         &Message {
                             behavior_id,
                             payload: MessagePayload::from_slice(args),
-                            sender: self.current_actor.unwrap_or(0),
+                            sender,
                             priority: MessagePriority::System,
                             trace_id: out_trace.clone(),
                         },
@@ -2540,7 +2542,7 @@ impl Runtime {
                         &Message {
                             behavior_id,
                             payload: MessagePayload::from_slice(args),
-                            sender: self.current_actor.unwrap_or(0),
+                            sender,
                             priority: MessagePriority::System,
                             trace_id: out_trace.clone(),
                         },
@@ -2564,10 +2566,90 @@ impl Runtime {
         args: &[Value],
         out_trace: Option<String>,
     ) -> MessageAdmission {
+        let sender = self.current_actor.unwrap_or(0);
+
+        // Primitive/local messages cannot create object-store holds or ORCA
+        // cross-actor edges. Keep that overwhelmingly common path in one
+        // target-actor lookup: mailbox admission, readiness transition, and
+        // receive-wait inspection all use the same mutable borrow.
+        let needs_ref_tracking = args
+            .iter()
+            .any(|arg| arg.as_object_id().is_some() || arg.as_ptr().is_some());
+        if !needs_ref_tracking {
+            let msg = Message {
+                behavior_id,
+                payload: MessagePayload::from_slice(args),
+                sender,
+                priority: MessagePriority::Normal,
+                trace_id: out_trace.clone(),
+            };
+
+            let mut ready_priority = None;
+            let mut wake_for_receive = false;
+            let admission = match self.actors.get_mut(&target_id) {
+                Some(actor) => {
+                    if actor.mailbox.push_local(msg).is_err() {
+                        MessageAdmission::Backpressured
+                    } else {
+                        actor.flight_recorder.record(sender, behavior_id, args);
+                        actor.idle_ms = 0;
+                        wake_for_receive = actor.suspended_execution.is_some()
+                            && actor
+                                .receive_wait
+                                .map(|wait| !wait.timed_out)
+                                .unwrap_or(false);
+                        if actor.run_state == ActorRunState::Idle {
+                            actor.run_state = ActorRunState::Queued;
+                            ready_priority = Some(actor.priority);
+                        }
+                        MessageAdmission::Accepted
+                    }
+                }
+                None => MessageAdmission::Rejected,
+            };
+
+            if admission != MessageAdmission::Accepted {
+                let reason = if admission == MessageAdmission::Backpressured {
+                    "mailbox full"
+                } else {
+                    "target actor not found"
+                };
+                self.route_to_dlq(
+                    &Message {
+                        behavior_id,
+                        payload: MessagePayload::from_slice(args),
+                        sender,
+                        priority: MessagePriority::System,
+                        trace_id: out_trace,
+                    },
+                    reason,
+                );
+                return admission;
+            }
+
+            // Publication follows the run-state transition immediately after
+            // releasing the actor borrow. send_message_by_id has already
+            // established that this target belongs to the current shard.
+            if let Some(priority) = ready_priority {
+                self.scheduler.enqueue_with_priority(target_id, priority);
+            }
+
+            if wake_for_receive {
+                if self.vm_execution_depth > 0 {
+                    if !self.pending_receive_wakes.contains(&target_id) {
+                        self.pending_receive_wakes.push(target_id);
+                    }
+                } else {
+                    self.resume_suspended_receive_wait(target_id);
+                }
+            }
+            return MessageAdmission::Accepted;
+        }
+
         let msg = Message {
             behavior_id,
             payload: MessagePayload::from_slice(args),
-            sender: self.current_actor.unwrap_or(0),
+            sender,
             priority: MessagePriority::Normal,
             trace_id: out_trace.clone(),
         };
@@ -2576,9 +2658,7 @@ impl Runtime {
                 // Record only messages that were actually admitted. The
                 // runtime-default recorder is disabled unless explicitly
                 // enabled, making this branch effectively free in production.
-                actor
-                    .flight_recorder
-                    .record(self.current_actor.unwrap_or(0), behavior_id, args);
+                actor.flight_recorder.record(sender, behavior_id, args);
                 // Activity resets the dehydration idle timer.
                 actor.idle_ms = 0;
                 MessageAdmission::Accepted
@@ -2588,7 +2668,7 @@ impl Runtime {
                     &Message {
                         behavior_id,
                         payload: MessagePayload::from_slice(args),
-                        sender: self.current_actor.unwrap_or(0),
+                        sender,
                         priority: MessagePriority::System,
                         trace_id: out_trace.clone(),
                     },
@@ -2601,7 +2681,7 @@ impl Runtime {
                 &Message {
                     behavior_id,
                     payload: MessagePayload::from_slice(args),
-                    sender: self.current_actor.unwrap_or(0),
+                    sender,
                     priority: MessagePriority::System,
                     trace_id: out_trace.clone(),
                 },

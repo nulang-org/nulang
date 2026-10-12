@@ -189,6 +189,45 @@ fn burst_send_has_single_ready_queue_entry() {
 }
 
 #[test]
+fn fabric_scalar_admission_preserves_single_ready_token_and_drain() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("inc", |actor, _args| {
+            let next = actor
+                .get_state_field("count")
+                .and_then(|value| value.as_int())
+                .unwrap_or(0)
+                + 1;
+            actor.set_state_field("count", Value::int(next));
+        });
+
+    // Clear the spawn-time ready token so the admissions below own the
+    // complete Idle -> Queued transition being characterized.
+    rt.run_scheduler();
+
+    assert_eq!(
+        rt.fabric_admit_local(actor_id, 0, &[Value::int(1)]),
+        MessageAdmission::Accepted
+    );
+    assert_eq!(
+        rt.fabric_admit_local(actor_id, 0, &[Value::int(2)]),
+        MessageAdmission::Accepted
+    );
+    assert_eq!(rt.actors[&actor_id].mailbox.len(), 2);
+    assert_eq!(rt.actors[&actor_id].run_state, ActorRunState::Queued);
+
+    rt.run_scheduler();
+
+    let actor = &rt.actors[&actor_id];
+    assert_eq!(actor.get_state_field("count"), Some(Value::int(2)));
+    assert!(actor.mailbox.is_empty());
+    assert_eq!(actor.run_state, ActorRunState::Idle);
+}
+
+#[test]
 fn adaptive_actor_turn_drains_burst_without_duplicate_wakeups() {
     let mut rt = Runtime::new();
     let actor_id = rt.spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
