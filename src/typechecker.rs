@@ -3488,6 +3488,8 @@ impl TypeChecker {
                             let fresh = Type::Var(TypeVar::fresh());
                             new_ctx = self.bind_pattern(&new_ctx, pat, &fresh)?;
                         } else {
+                            let mut valid_fields: Vec<_> = field_map.keys().cloned().collect();
+                            valid_fields.sort();
                             return Err(NuError::TypeError {
                                 msg: format!(
                                     "Unknown record field `{field_name}` in match pattern"
@@ -3495,7 +3497,7 @@ impl TypeChecker {
                                 span: Span::default(),
                                 expected_type: Some(format!(
                                     "record fields: {}",
-                                    field_map.keys().cloned().collect::<Vec<_>>().join(", ")
+                                    valid_fields.join(", ")
                                 )),
                                 found_type: Some(field_name.clone()),
                                 similar_names: None,
