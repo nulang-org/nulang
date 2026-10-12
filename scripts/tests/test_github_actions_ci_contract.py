@@ -48,6 +48,12 @@ class GitHubActionsCIContractTests(unittest.TestCase):
             "the retired Woodpecker pipeline's whitespace check must stay enforced",
         )
 
+    def test_known_flaky_cluster_tests_have_scoped_retries(self):
+        policy = (ROOT / ".config" / "nextest.toml").read_text(encoding="utf-8")
+
+        self.assertIn("cluster_split_brain", policy)
+        self.assertIn("retries = 2", policy)
+
     def test_contract_is_enforced_by_the_implementation_gate(self):
         gate = (ROOT / "scripts" / "verify_implementation.py").read_text(encoding="utf-8")
 

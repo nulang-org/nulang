@@ -1,0 +1,19 @@
+# Nulang nextest policy.
+#
+# The multi-node cluster tests (`test_three_node_cluster_split_brain_detects_and_heals`,
+# `test_five_node_cluster_split_brain_detects_and_heals`) drive real runtime
+# pumps against wall-clock deadlines (15s). Under full-suite concurrency on
+# shared CI runners a scheduling hiccup can miss that deadline even though the
+# code is correct — observed on `main` itself (a docs-only merge reddened the
+# wasm-backend job) and across unrelated PRs.
+#
+# Retry only that family, in a fresh process, so a transient scheduling delay
+# does not redden a required check. A deterministic failure still fails every
+# attempt (nextest reports per-run retry counts and exits non-zero when a test
+# fails after all retries).
+[profile.default]
+retries = 0
+
+[[profile.default.overrides]]
+filter = 'test(/cluster_split_brain/)'
+retries = 2
