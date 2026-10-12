@@ -233,6 +233,8 @@ version + migration.*
 
 ## Stable tier
 
+### Compiler-latency benchmark baseline — 2026-09-22
+- **Criterion now measures Nulang compilation itself separately from execution** (`benches/compiler_bench.rs`): frontend-to-MIR and source-to-bytecode at 20/100/500 generated functions, plus source-to-Cranelift-AOT at bounded sizes. These results are the evidence base for compile-time optimization and prevent runtime benchmarks from being misused as compiler-latency claims.
 ### Zero-copy non-reentrant JIT register entry — 2026-09-24
 - **Cranelift regions that cannot re-enter the VM now execute directly against the active frame's 256-register array**, eliminating the previous 2 KiB snapshot before native entry and 2 KiB copy-back afterward. `Value` is explicitly `repr(transparent)` over `u64` so the native register ABI has a documented layout guarantee.
 - **Compiled-region metadata now records whether native execution may grow or replace the VM frame stack.** Regions containing helper-backed direct calls retain the detached register snapshot because re-entrant interpreter calls may reallocate `VM::frames`; typed, SIMD, and scalar non-call regions use the direct-frame path.
