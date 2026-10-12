@@ -1535,6 +1535,27 @@ fn test_header_size_is_56() {
     assert_eq!(ActorHeap::HEADER_SIZE, 56);
 }
 
+/// Invalid allocator requests must not wrap the padded payload or total
+/// allocation size. Such requests must not reserve heap storage.
+#[test]
+fn test_allocation_size_overflow_fails_without_modifying_heap() {
+    let mut heap = ActorHeap::new(4096);
+    let huge_sizes = [
+        usize::MAX,
+        usize::MAX - (ALIGN - 1),
+        usize::MAX - ActorHeap::HEADER_SIZE + 1,
+    ];
+    for payload_size in huge_sizes {
+        assert!(
+            heap.alloc(payload_size, TypeTag::Raw).is_none(),
+            "overflow-sized allocation must be rejected"
+        );
+        assert_eq!(heap.live_count(), 0);
+        assert_eq!(heap.used(), 0);
+        assert_eq!(heap.free_list_count(), 0);
+    }
+}
+
 #[test]
 fn test_alloc_zero_payload() {
     let mut heap = ActorHeap::new(64 * 1024);
