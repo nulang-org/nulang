@@ -1,5 +1,10 @@
 # Nulang Changelog
 
+### HTTP client transport preflight — 2026-10-12
+- **The experimental `http-client` package now provides opt-in `validate_transport` and `send_request_checked` helpers.** Unsupported methods, request headers, and GET request bodies are rejected before the legacy `Http.get/post` effect runs, avoiding silent method fallback or option loss on the checked path.
+- **Existing `send_request` behavior remains unchanged for compatibility.** The checked wrapper returns a generic error for a legacy `nil` response; it does not manufacture HTTP status, response headers, or precise timeout/transport errors. A versioned typed transport remains future work.
+
+
 ### Public CLI release portability — 2026-10-11
 - **Public release archives use the `release-cli` feature profile without a Python shared-library ABI dependency.** The ordinary full/default source build retains opt-in Python interoperability; release packaging checks the resulting Linux and macOS binary for Python dependencies.
 - **Release PRs rehearse the full non-publishing four-platform build matrix before tags are created.** The Linux ARM64 cross build explicitly installs target libc development headers and preflights a target-compiler C header probe, avoiding an observed `ring` compile failure when `--no-install-recommends` omits the ARM64 sysroot. Actual cross-build and clean-host portability remain release gates.
