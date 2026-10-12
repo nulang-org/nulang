@@ -59,6 +59,33 @@ def median_absolute_deviation(samples: list[float], center: float) -> float:
     return statistics.median(deviations)
 
 
+def regression_manifest(
+    regressions: list[tuple[str, float, float, float, float]]
+) -> dict:
+    """Return the machine-readable payload consumed by paired confirmation."""
+    return {
+        "schema": 1,
+        "regressions": [
+            {
+                "benchmark": name,
+                "historical_median_ns": baseline,
+                "current_ns": current_ns,
+                "historical_delta": delta,
+                "threshold": threshold,
+            }
+            for name, baseline, current_ns, delta, threshold in regressions
+        ],
+    }
+
+
+def write_regression_manifest(
+    path: Path,
+    regressions: list[tuple[str, float, float, float, float]],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(regression_manifest(regressions), indent=2, sort_keys=True) + "\n")
+
+
 def git_commit_times() -> dict[str, int]:
     """Return commit timestamps keyed by full SHA for the checked-out history.
 
@@ -136,11 +163,18 @@ def main() -> int:
         help="floor on the regression threshold as a fraction of the median, so a benchmark "
         "with unusually low historical spread isn't flagged for a trivial delta (default: 0.20)",
     )
+    parser.add_argument(
+        "--regressions-out",
+        type=Path,
+        help="optional JSON manifest of benchmarks that exceeded the historical gate",
+    )
     args = parser.parse_args()
 
     latest = load_results(args.latest)
     if not latest:
         print("No benchmarks in the latest result file; nothing to check.")
+        if args.regressions_out:
+            write_regression_manifest(args.regressions_out, [])
         return 0
 
     latest_resolved = args.latest.resolve()
@@ -174,6 +208,8 @@ def main() -> int:
             f"(need >= {args.min_samples}); skipping regression gate -- not enough "
             "history to compare against yet."
         )
+        if args.regressions_out:
+            write_regression_manifest(args.regressions_out, [])
         return 0
 
     # benchmark -> list of historical mean_ns values, most recent window only.
@@ -203,6 +239,9 @@ def main() -> int:
         print(f"Skipped {len(skipped)} benchmark(s) with < {args.min_samples} historical samples:")
         for name, n in skipped:
             print(f"  - {name} ({n} prior sample(s))")
+
+    if args.regressions_out:
+        write_regression_manifest(args.regressions_out, regressions)
 
     if not regressions:
         print(

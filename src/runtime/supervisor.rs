@@ -345,6 +345,7 @@ impl Supervisor {
                 }
             }
             new_actor.sequence = snap.sequence;
+            new_actor.activation_epoch = snap.activation_epoch;
             new_actor.waiting_signal = snap.waiting_signal.clone();
         } else {
             for (name, value) in &template.state_data {
@@ -364,7 +365,7 @@ impl Supervisor {
         new_actor.state = ActorState::Running;
         new_actor.parent = Some(self.id);
         if let Some(module) = &template.bytecode_module {
-            new_actor.bytecode_module = Some(module.clone());
+            new_actor.bytecode_module = Some(Box::new(module.clone()));
             runtime.register_recovery_module(
                 new_id,
                 module.clone(),
