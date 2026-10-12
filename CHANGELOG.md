@@ -4,6 +4,10 @@
 - **Distributed node loops wake on inbound packets instead of always sleeping for 10 ms.** TCP transports wait on their inbound channel and stage the wakeup packet for the following receive pass, preserving FIFO delivery and exactly-once consumption at the runtime boundary.
 - **Maintenance remains bounded to 10 ms.** Timers, asynchronous transport failures, and custom transports without a notification mechanism retain their existing periodic maintenance opportunities. TCP idle wakeup behavior is covered by focused regression tests; end-to-end network latency improvement is not yet independently quantified.
 
+### Public CLI release portability — 2026-10-11
+- **Public release archives use the `release-cli` feature profile without a Python shared-library ABI dependency.** The ordinary full/default source build retains opt-in Python interoperability; release packaging checks the resulting Linux and macOS binary for Python dependencies.
+- **Release PRs rehearse the full non-publishing four-platform build matrix before tags are created.** The Linux ARM64 cross build explicitly installs target libc development headers and preflights a target-compiler C header probe, avoiding an observed `ring` compile failure when `--no-install-recommends` omits the ARM64 sysroot. Actual cross-build and clean-host portability remain release gates.
+
 ### Runtime soundness and checked negation — native/AOT backend parity — 2026-10-10
 - **AOT no longer claims raw-Int/Float registers for values that can be nil
   at runtime.** Nightly differential fuzz caught interpreter/AOT divergences
