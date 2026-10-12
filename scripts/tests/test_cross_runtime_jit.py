@@ -79,6 +79,17 @@ class JitExecutionContract(unittest.TestCase):
                 f"{workload}: native warmup must stay outside the measured interval",
             )
 
+    def test_compute_actor_warmup_and_semantic_assertions_are_outside_timing(self):
+        source = (ROOT / "src/bin/nulang_savina.rs").read_text()
+        body = source[source.index("fn bench_actor_compute("):]
+        self.assertLess(
+            body.index('warm_and_verify_jit(&rt, "actor_compute")'),
+            body.index("let start = Instant::now();"),
+        )
+        self.assertIn("set_state_field(\"total\", Value::int(0))", body)
+        self.assertIn("assert_eq!(\n        actual,\n        Some(per_message * N)", body)
+        self.assertIn('benchmark: "actor_compute"', body)
+
     def test_warmed_jit_workflow_is_explicit(self):
         workflow = (ROOT / ".github/workflows/cross-runtime-bench.yml").read_text()
         self.assertIn("nulang-jit", workflow)
