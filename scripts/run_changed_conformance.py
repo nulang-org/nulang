@@ -39,6 +39,13 @@ def run_fixture(root, binary, relative):
         expected = json.loads(expectation.read_text(encoding="utf-8"))
     except (ValueError, OSError) as error:
         return False, f"bad expectation: {error}"
+    if not isinstance(expected, dict):
+        return False, "invalid expectation: JSON root must be an object"
+    exp_code = expected.get("exit_code", 0)
+    exp_stdout = expected.get("stdout", "")
+    exp_stderr = expected.get("stderr", "")
+    if type(exp_code) is not int or not isinstance(exp_stdout, str) or not isinstance(exp_stderr, str):
+        return False, "invalid expectation: exit_code must be an integer; stdout and stderr must be strings"
 
     try:
         proc = subprocess.run(
@@ -50,9 +57,6 @@ def run_fixture(root, binary, relative):
 
     actual_stdout = proc.stdout.strip()
     actual_stderr = proc.stderr.strip()
-    exp_stdout = expected.get("stdout", "")
-    exp_stderr = expected.get("stderr", "")
-    exp_code = expected.get("exit_code", 0)
     if proc.returncode != exp_code or actual_stdout != exp_stdout or (
         exp_stderr and exp_stderr not in actual_stderr
     ):
