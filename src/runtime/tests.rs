@@ -7923,6 +7923,39 @@ fn test_cross_shard_drain_discards_oversized_staging_capacity_after_burst() {
 }
 
 #[test]
+fn test_cross_shard_reused_staging_releases_rejected_object_leases() {
+    let mut shards = Runtime::new_sharded(2);
+    let mut target = shards[1].spawn_actor(Box::new(|| vec![]));
+    while target % 2 != 1 {
+        target = shards[1].spawn_actor(Box::new(|| vec![]));
+    }
+    declare_test_behavior(&mut shards[1], target, "known");
+
+    for batch in 0..3 {
+        let object_id = shards[0]
+            .object_store
+            .put(vec![batch as u8, 42].into_boxed_slice());
+        shards[0].send_message(target, "unknown", &[Value::object(object_id)]);
+        shards[0].object_store.drop_ref(object_id);
+        assert!(
+            shards[0].object_store.get(object_id).is_some(),
+            "queued message must retain its temporary object lease"
+        );
+
+        shards[1].drain_cross_shard_messages();
+
+        assert!(
+            shards[1].cross_shard_pending.is_empty(),
+            "staging buffer must not retain rejected envelopes"
+        );
+        assert!(
+            shards[0].object_store.get(object_id).is_none(),
+            "rejected delivery must release temporary object leases"
+        );
+    }
+}
+
+#[test]
 fn test_object_ref_cross_shard_reuses_node_shared_storage() {
     let mut shards = Runtime::new_sharded(2);
 
