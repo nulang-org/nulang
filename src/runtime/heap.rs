@@ -233,7 +233,8 @@ impl OrcaHeader {
     /// requested `payload_size` length.
     #[inline]
     pub fn padded_payload_size(&self) -> usize {
-        self.total_size() - std::mem::size_of::<Self>()
+        self.total_size()
+            .saturating_sub(std::mem::size_of::<Self>())
     }
 
     /// Create a *logically* initialised header on the caller's stack.
@@ -1669,6 +1670,15 @@ fn test_compact_small_object_reuse_preserves_adjacent_payload() {
         assert_eq!((*ActorHeap::header_of(second)).ref_count, 1);
     }
     assert_eq!(heap.live_count(), 2);
+}
+
+/// Existing array and tuple helpers used saturating size subtraction.
+/// Keep that fail-closed behavior for malformed or incomplete headers.
+#[cfg(not(feature = "compact-orca-header"))]
+#[test]
+fn test_header_payload_extent_saturates_for_invalid_total_size() {
+    let invalid = OrcaHeader::new(0, TypeTag::Raw, 0, 0);
+    assert_eq!(invalid.padded_payload_size(), 0);
 }
 
 #[cfg(not(feature = "compact-orca-header"))]
