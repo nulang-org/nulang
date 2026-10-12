@@ -24,6 +24,7 @@ const BENCHMARKS: &[&str] = &[
     "ping_pong",
     "thread_ring",
     "fork_join",
+    "actor_compute",
     "skynet",
 ];
 
@@ -103,7 +104,7 @@ fn main() -> ExitCode {
             {
                 continue;
             }
-            if config.cross_runtime_only && name == "skynet" {
+            if config.cross_runtime_only && (name == "skynet" || name == "actor_compute") {
                 continue;
             }
             if config.backend == Backend::Jit && name == "skynet" {
@@ -119,6 +120,7 @@ fn main() -> ExitCode {
                 "ping_pong" => bench_ping_pong(config.backend),
                 "thread_ring" => bench_thread_ring(config.backend),
                 "fork_join" => bench_fork_join(config.backend),
+                "actor_compute" => bench_actor_compute(config.backend),
                 "skynet" => bench_skynet(config.backend),
                 _ => unreachable!("benchmark list and dispatcher must stay in sync"),
             };
@@ -685,6 +687,71 @@ spawn Skynet {}
     Measurement {
         benchmark: "skynet",
         messages: EXPECTED as u64 - 1,
+        elapsed,
+    }
+}
+
+/// Compute-heavy actor backend comparison (not a Savina message benchmark).
+/// All three execution backends compile the same source and validate state.
+fn bench_actor_compute(backend: Backend) -> Measurement {
+    const N: i64 = 128;
+    const ITERATIONS: i64 = 4_096;
+    let source = r#"
+        actor Compute {
+            state total = 0
+            behavior work() {
+                var i = 0;
+                var sum = 0;
+                while i < 4096 {
+                    sum = sum + i * 3 - i / 7;
+                    i = i + 1
+                };
+                self.total = self.total + sum
+            }
+        }
+        spawn Compute {}
+    "#;
+
+    let rt = Rc::new(RefCell::new(Runtime::new()));
+    let actor_id = compile_run_with_runtime(source, Rc::clone(&rt), backend)
+        .as_actor_id()
+        .expect("compute benchmark must spawn an actor");
+
+    if backend == Backend::Jit {
+        // A real arithmetic loop tiers up, unlike short Savina handlers.
+        // Exclude warm-up/compilation from timing and require actor-VM proof.
+        rt.borrow_mut().send_message(actor_id, "work", &[]);
+        rt.borrow_mut().run_scheduler();
+        warm_and_verify_jit(&rt, "actor_compute");
+        rt.borrow_mut()
+            .actors
+            .get_mut(&actor_id)
+            .expect("warmed compute actor exists")
+            .set_state_field("total", Value::int(0));
+    }
+
+    let start = Instant::now();
+    for _ in 0..N {
+        rt.borrow_mut().send_message(actor_id, "work", &[]);
+    }
+    rt.borrow_mut().run_scheduler();
+    let elapsed = start.elapsed();
+
+    let per_message: i64 = (0..ITERATIONS).map(|i| i * 3 - i / 7).sum();
+    let actual = rt
+        .borrow()
+        .actors
+        .get(&actor_id)
+        .and_then(|actor| actor.get_state_field("total"))
+        .and_then(|value| value.as_int());
+    assert_eq!(
+        actual,
+        Some(per_message * N),
+        "each backend must execute every actor arithmetic operation"
+    );
+    Measurement {
+        benchmark: "actor_compute",
+        messages: N as u64,
         elapsed,
     }
 }
