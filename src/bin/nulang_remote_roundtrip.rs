@@ -50,8 +50,8 @@ fn main() -> ExitCode {
         let start_sequence = config.warmup + 1;
         let started = Instant::now();
         for offset in 0..config.roundtrips {
-            let sequence = i64::try_from(start_sequence + offset)
-                .expect("benchmark sequence must fit in i64");
+            let sequence =
+                i64::try_from(start_sequence + offset).expect("benchmark sequence must fit in i64");
             fixture.roundtrip(sequence);
         }
         let elapsed = started.elapsed();
@@ -72,7 +72,8 @@ fn parse_args() -> Result<Option<Config>, String> {
         match arg.as_str() {
             "--roundtrips" => {
                 roundtrips = parse_positive_u64(
-                    args.next().ok_or_else(|| "--roundtrips requires N".to_string())?,
+                    args.next()
+                        .ok_or_else(|| "--roundtrips requires N".to_string())?,
                     "roundtrips",
                 )?;
             }
@@ -84,7 +85,9 @@ fn parse_args() -> Result<Option<Config>, String> {
                     .map_err(|_| "--warmup must be a non-negative integer".to_string())?;
             }
             "--repeat" => {
-                let raw = args.next().ok_or_else(|| "--repeat requires N".to_string())?;
+                let raw = args
+                    .next()
+                    .ok_or_else(|| "--repeat requires N".to_string())?;
                 repeat = raw
                     .parse::<u32>()
                     .map_err(|_| "--repeat must be a positive integer".to_string())?;
@@ -135,8 +138,8 @@ fn print_usage() {
 }
 
 fn emit(iteration: u32, roundtrips: u64, elapsed: Duration, format: OutputFormat) {
-    let elapsed_ns = u64::try_from(elapsed.as_nanos())
-        .expect("benchmark duration must fit in u64 nanoseconds");
+    let elapsed_ns =
+        u64::try_from(elapsed.as_nanos()).expect("benchmark duration must fit in u64 nanoseconds");
     let ns_per_roundtrip = elapsed_ns as f64 / roundtrips as f64;
     match format {
         OutputFormat::Human => println!(
@@ -199,9 +202,7 @@ fn make_peer_healthy(runtime: &mut Runtime, peer: NodeId, addr: SocketAddr) {
 }
 
 fn spawn_probe(runtime: &mut Runtime) -> u64 {
-    let actor_id = runtime.spawn_actor(Box::new(|| {
-        vec![("seen".to_string(), Value::int(0))]
-    }));
+    let actor_id = runtime.spawn_actor(Box::new(|| vec![("seen".to_string(), Value::int(0))]));
     runtime
         .actors
         .get_mut(&actor_id)

@@ -15,13 +15,13 @@ use nulang::runtime::{
 use nulang::vm::Value;
 
 #[cfg(feature = "tcp")]
+use nulang::runtime::{Actor, ActorAddress, Runtime, TlsConfig};
+#[cfg(feature = "tcp")]
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[cfg(feature = "tcp")]
 use std::thread;
 #[cfg(feature = "tcp")]
 use std::time::{Duration, Instant};
-#[cfg(feature = "tcp")]
-use nulang::runtime::{Actor, ActorAddress, Runtime, TlsConfig};
 
 fn bench_crdt_delta_compute(c: &mut Criterion) {
     c.bench_function("dist/crdt_delta_compute", |b| {
@@ -176,9 +176,7 @@ fn mark_roundtrip_peer_healthy(runtime: &mut Runtime, peer: NodeId, addr: Socket
 
 #[cfg(feature = "tcp")]
 fn spawn_roundtrip_probe(runtime: &mut Runtime) -> u64 {
-    let actor_id = runtime.spawn_actor(Box::new(|| {
-        vec![("seen".to_string(), Value::int(0))]
-    }));
+    let actor_id = runtime.spawn_actor(Box::new(|| vec![("seen".to_string(), Value::int(0))]));
     runtime
         .actors
         .get_mut(&actor_id)
@@ -274,7 +272,8 @@ impl LoopbackRoundTrip {
     fn measure(&mut self, iterations: u64) -> Duration {
         let started = Instant::now();
         for iteration in 0..iterations {
-            let sequence = i64::try_from(iteration + 1).expect("criterion iteration count fits i64");
+            let sequence =
+                i64::try_from(iteration + 1).expect("criterion iteration count fits i64");
             self.roundtrip(sequence);
         }
         started.elapsed()
