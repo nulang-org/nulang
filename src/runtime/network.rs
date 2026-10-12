@@ -36,7 +36,7 @@ use std::io::{Read, Write};
 use std::net::SocketAddr;
 #[cfg(feature = "tcp")]
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(feature = "tcp")]
 use std::sync::Mutex;
 use std::sync::{mpsc, Arc};
@@ -1890,11 +1890,20 @@ fn lock_ignore_poison<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 // TcpConnection
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "tcp")]
+static NEXT_CONNECTION_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(feature = "tcp")]
+fn next_connection_generation() -> u64 {
+    NEXT_CONNECTION_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
 /// A single TCP connection to a remote node.
 #[cfg(feature = "tcp")]
 pub(crate) struct TcpConnection {
     #[allow(dead_code)]
     pub(crate) node_id: NodeId,
+    pub(crate) generation: u64,
     pub(crate) addr: SocketAddr,
     pub(crate) stream: TransportStream,
     pub(crate) last_activity: Instant,
@@ -1930,6 +1939,8 @@ pub struct IncomingPacket {
 pub struct OutgoingPacket {
     pub to_node: NodeId,
     pub to_addr: SocketAddr,
+    /// Exact sequence number encoded into the NUL0 frame.
+    pub seq: u64,
     pub packet: Packet,
 }
 
@@ -1945,10 +1956,66 @@ pub struct OutgoingPacket {
 ///   spawns a per-connection reader thread;
 /// * a **sender** thread that dequeues [`OutgoingPacket`]s and writes
 ///   them to the appropriate TCP stream (connecting first if necessary).
+/// Outcome of a tracked transport send.
+///
+/// `Unsupported` is reserved for transports that cannot expose NUL0 sequence
+/// identity and permits an explicit compatibility fallback to `send`.
+/// `Rejected` means the transport understood tracked sending but refused the
+/// packet before assigning a sequence; callers must not reinterpret rejection
+/// as an untracked successful send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackedSendOutcome {
+    Sent(u64),
+    Unsupported,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportSendFailureReason {
+    Connect,
+    Write,
+    SenderShutdown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportSendFailure {
+    pub to_node: NodeId,
+    pub packet_seq: u64,
+    pub sender_actor: Option<u64>,
+    pub reason: TransportSendFailureReason,
+}
+
+#[cfg(feature = "tcp")]
+fn packet_sender_actor(packet: &Packet) -> Option<u64> {
+    match packet {
+        Packet::ActorMessage { sender_actor, .. } if *sender_actor != 0 => Some(*sender_actor),
+        _ => None,
+    }
+}
+
 pub trait NetworkTransport: Send {
     fn connect(&mut self, node_id: NodeId, addr: std::net::SocketAddr) -> std::io::Result<()>;
     fn send(&mut self, to_node: NodeId, to_addr: std::net::SocketAddr, packet: Packet);
+    /// Send a packet while exposing the exact NUL0 sequence when supported.
+    ///
+    /// Custom transports remain source-compatible through the default
+    /// `Unsupported` result. A transport that rejects a packet before assigning
+    /// a sequence must return `Rejected`, not `Unsupported`.
+    fn send_tracked(
+        &mut self,
+        _to_node: NodeId,
+        _to_addr: std::net::SocketAddr,
+        _packet: Packet,
+    ) -> TrackedSendOutcome {
+        TrackedSendOutcome::Unsupported
+    }
     fn receive(&self) -> Vec<IncomingPacket>;
+    /// Drain asynchronous transport failures reported after a packet sequence
+    /// was reserved. Transports without asynchronous failure reporting return
+    /// an empty set.
+    fn drain_send_failures(&mut self) -> Vec<TransportSendFailure> {
+        Vec::new()
+    }
     fn node_id(&self) -> NodeId;
     fn listen_addr(&self) -> std::net::SocketAddr;
     fn disconnect(&mut self, node_id: NodeId);
@@ -1981,8 +2048,19 @@ impl NetworkTransport for Box<dyn NetworkTransport> {
     fn send(&mut self, to_node: NodeId, to_addr: std::net::SocketAddr, packet: Packet) {
         (**self).send(to_node, to_addr, packet)
     }
+    fn send_tracked(
+        &mut self,
+        to_node: NodeId,
+        to_addr: std::net::SocketAddr,
+        packet: Packet,
+    ) -> TrackedSendOutcome {
+        (**self).send_tracked(to_node, to_addr, packet)
+    }
     fn receive(&self) -> Vec<IncomingPacket> {
         (**self).receive()
+    }
+    fn drain_send_failures(&mut self) -> Vec<TransportSendFailure> {
+        (**self).drain_send_failures()
     }
     fn node_id(&self) -> NodeId {
         (**self).node_id()
@@ -2025,6 +2103,13 @@ pub struct TcpTransport {
     incoming_tx: mpsc::SyncSender<IncomingPacket>,
     /// Channel endpoint used to enqueue packets for transmission.
     outgoing_tx: mpsc::SyncSender<OutgoingPacket>,
+    /// Transport-local failure queue. The sender thread reports connect/write
+    /// outcomes here so the runtime can surface them to the originating actor.
+    send_failure_tx: mpsc::Sender<TransportSendFailure>,
+    send_failure_rx: mpsc::Receiver<TransportSendFailure>,
+    /// Next NUL0 sequence reserved synchronously by `send` so callers can
+    /// correlate the existing transport ACK with the logical operation.
+    next_seq: u64,
     /// Background thread handles.
     threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
     /// Flag used to ask background threads to shut down.
@@ -2064,6 +2149,7 @@ impl TcpTransport {
         // Bounded channels.
         let (incoming_tx, incoming_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let (outgoing_tx, outgoing_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let (send_failure_tx, send_failure_rx) = mpsc::channel();
 
         let connections: Arc<Mutex<HashMap<NodeId, TcpConnection>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -2095,11 +2181,12 @@ impl TcpTransport {
             let conns = Arc::clone(&connections);
             let local_id = node_id;
             let in_tx = incoming_tx.clone();
+            let failure_tx = send_failure_tx.clone();
             let tls = tls_config.clone();
             let handle = thread::Builder::new()
                 .name("nulang-net-sender".into())
                 .spawn(move || {
-                    sender_thread(outgoing_rx, conns, flag, local_id, in_tx, tls);
+                    sender_thread(outgoing_rx, conns, flag, local_id, in_tx, failure_tx, tls);
                 })?;
             handles.push(handle);
         }
@@ -2111,6 +2198,9 @@ impl TcpTransport {
             incoming_rx,
             incoming_tx,
             outgoing_tx,
+            send_failure_tx,
+            send_failure_rx,
+            next_seq: 1,
             threads: Arc::new(Mutex::new(handles)),
             shutdown_flag,
             tls_config,
@@ -2175,8 +2265,10 @@ impl TcpTransport {
             ));
         }
 
+        let generation = next_connection_generation();
         let conn = TcpConnection {
             node_id,
+            generation,
             addr,
             stream,
             last_activity: Instant::now(),
@@ -2198,7 +2290,9 @@ impl TcpTransport {
         let flag = Arc::clone(&self.shutdown_flag);
         let _ = thread::Builder::new()
             .name(format!("nulang-net-reader-out-{}", addr.port()))
-            .spawn(move || connection_read_loop(read_stream, node_id, in_tx, conns, flag));
+            .spawn(move || {
+                connection_read_loop(read_stream, node_id, generation, in_tx, conns, flag)
+            });
         Ok(())
     }
 
@@ -2216,37 +2310,65 @@ impl TcpTransport {
     /// a silent drop. A packet is dropped only if the sender thread has
     /// already shut down (channel disconnected); that case is logged.
     pub fn send(&mut self, to_node: NodeId, to_addr: SocketAddr, packet: Packet) {
-        // Reject payloads that cannot cross the wire losslessly. A heap
-        // pointer is process-local and nil has no exact wire form; a string
-        // id is only meaningful paired with the packet's string table.
-        // Drop the packet loudly instead of silently mangling it.
+        let _ = self.send_tracked(to_node, to_addr, packet);
+    }
+
+    /// Send a packet while exposing the exact sequence used by NUL0 so an
+    /// existing transport ACK can be correlated with higher-level state.
+    pub fn send_tracked(
+        &mut self,
+        to_node: NodeId,
+        to_addr: SocketAddr,
+        packet: Packet,
+    ) -> TrackedSendOutcome {
         if !packet_payload_wire_safe(&packet) {
             warn!(
                 "nulang-net: dropping packet to node {:?} (addr {}): payload value cannot cross the wire (heap pointer, nil, or string without content)",
                 to_node, to_addr
             );
-            return;
+            return TrackedSendOutcome::Rejected;
         }
-        // Simulated partition: silently drop the packet exactly like a
-        // firewall between the two nodes would. The peer sees the link
-        // go quiet and the failure detector handles it from there.
+
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        if self.next_seq == 0 {
+            self.next_seq = 1;
+        }
+
+        // A simulated partition models an in-flight drop: the sequence was
+        // assigned, but the receiver will never acknowledge it.
         if self.partition.contains(&to_node) {
-            return;
+            return TrackedSendOutcome::Sent(seq);
         }
         let outgoing = OutgoingPacket {
             to_node,
             to_addr,
+            seq,
             packet,
         };
-        // Blocks on a full channel (backpressure). An error means the sender
-        // thread has shut down and the packet cannot be delivered — log it
-        // rather than dropping silently.
-        if self.outgoing_tx.send(outgoing).is_err() {
+        if let Err(error) = self.outgoing_tx.send(outgoing) {
+            let outgoing = error.0;
             warn!(
                 "nulang-net: dropping packet to node {:?} (addr {}): sender thread shut down",
                 to_node, to_addr
             );
+            let _ = self.send_failure_tx.send(TransportSendFailure {
+                to_node,
+                packet_seq: seq,
+                sender_actor: packet_sender_actor(&outgoing.packet),
+                reason: TransportSendFailureReason::SenderShutdown,
+            });
         }
+        TrackedSendOutcome::Sent(seq)
+    }
+
+    /// Drain asynchronous send failures reported by the background sender.
+    pub fn drain_send_failures(&mut self) -> Vec<TransportSendFailure> {
+        let mut failures = Vec::new();
+        while let Ok(failure) = self.send_failure_rx.try_recv() {
+            failures.push(failure);
+        }
+        failures
     }
 
     /// Receive incoming packets (non-blocking).
@@ -2440,12 +2562,14 @@ fn connection_reader(
     // giving the sender thread windows to interleave writes.
     let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
 
+    let generation = next_connection_generation();
     {
         let mut conns = lock_ignore_poison(&connections);
         conns.insert(
             peer_id,
             TcpConnection {
                 node_id: peer_id,
+                generation,
                 addr,
                 stream: stream.try_clone().expect("try_clone should succeed"),
                 last_activity: Instant::now(),
@@ -2453,7 +2577,14 @@ fn connection_reader(
         );
     }
 
-    connection_read_loop(stream, peer_id, incoming_tx, connections, shutdown_flag);
+    connection_read_loop(
+        stream,
+        peer_id,
+        generation,
+        incoming_tx,
+        connections,
+        shutdown_flag,
+    );
 }
 
 /// Read framed packets from `stream` until disconnect or shutdown, then
@@ -2466,11 +2597,12 @@ fn connection_reader(
 fn connection_read_loop(
     mut stream: TransportStream,
     peer_id: NodeId,
+    generation: u64,
     incoming_tx: mpsc::SyncSender<IncomingPacket>,
     connections: Arc<Mutex<HashMap<NodeId, TcpConnection>>>,
     shutdown_flag: Arc<AtomicBool>,
 ) {
-    loop {
+    'read_loop: loop {
         if shutdown_flag.load(Ordering::Relaxed) {
             break;
         }
@@ -2486,11 +2618,11 @@ fn connection_read_loop(
                     std::thread::sleep(Duration::from_millis(1));
                     continue;
                 }
-                Err(_) => return, // Disconnect or timeout.
+                Err(_) => break 'read_loop, // Disconnect or timeout.
             }
         };
         if len == 0 || len > MAX_PACKET_LEN {
-            return; // Protocol error or DoS.
+            break 'read_loop; // Protocol error or DoS.
         }
 
         // Read payload.
@@ -2502,7 +2634,7 @@ fn connection_read_loop(
                     std::thread::sleep(Duration::from_millis(1));
                     continue;
                 }
-                Err(_) => return,
+                Err(_) => break 'read_loop,
             }
         }
 
@@ -2527,7 +2659,12 @@ fn connection_read_loop(
     }
     {
         let mut conns = lock_ignore_poison(&connections);
-        conns.remove(&peer_id);
+        if conns
+            .get(&peer_id)
+            .is_some_and(|conn| conn.generation == generation)
+        {
+            conns.remove(&peer_id);
+        }
     }
     let _ = stream.shutdown();
 }
@@ -2543,11 +2680,9 @@ fn sender_thread(
     shutdown_flag: Arc<AtomicBool>,
     local_node_id: NodeId,
     incoming_tx: mpsc::SyncSender<IncomingPacket>,
+    send_failure_tx: mpsc::Sender<TransportSendFailure>,
     tls_config: TlsConfig,
 ) {
-    // We keep a local sequence counter so we can embed it into the bytes.
-    let mut next_seq: u64 = 1;
-
     loop {
         if shutdown_flag.load(Ordering::Relaxed) && outgoing_rx.try_recv().is_err() {
             break;
@@ -2583,13 +2718,19 @@ fn sender_thread(
                     "[nulang-net] Failed to connect to {:?} at {}: {}",
                     outgoing.to_node, outgoing.to_addr, e
                 );
+                let _ = send_failure_tx.send(TransportSendFailure {
+                    to_node: outgoing.to_node,
+                    packet_seq: outgoing.seq,
+                    sender_actor: packet_sender_actor(&outgoing.packet),
+                    reason: TransportSendFailureReason::Connect,
+                });
+                continue;
             }
         }
 
-        // Send the packet.
-        let seq = next_seq;
-        next_seq = next_seq.wrapping_add(1);
-        let bytes = outgoing.packet.to_bytes(seq);
+        // The caller reserved the sequence synchronously so ACKs can be
+        // correlated with the logical operation that produced this packet.
+        let bytes = outgoing.packet.to_bytes(outgoing.seq);
 
         let result = {
             let mut conns = lock_ignore_poison(&connections);
@@ -2608,6 +2749,12 @@ fn sender_thread(
                 "[nulang-net] Send to {:?} failed: {}; removing connection",
                 outgoing.to_node, e
             );
+            let _ = send_failure_tx.send(TransportSendFailure {
+                to_node: outgoing.to_node,
+                packet_seq: outgoing.seq,
+                sender_actor: packet_sender_actor(&outgoing.packet),
+                reason: TransportSendFailureReason::Write,
+            });
             let mut conns = lock_ignore_poison(&connections);
             if let Some(conn) = conns.remove(&outgoing.to_node) {
                 let _ = conn.stream.shutdown();
@@ -2668,12 +2815,14 @@ fn connect_in_sender(
     }
 
     let read_stream = stream.try_clone()?;
+    let generation = next_connection_generation();
     {
         let mut conns = lock_ignore_poison(connections);
         conns.insert(
             node_id,
             TcpConnection {
                 node_id,
+                generation,
                 addr,
                 stream,
                 last_activity: Instant::now(),
@@ -2685,7 +2834,7 @@ fn connect_in_sender(
     let flag = Arc::clone(shutdown_flag);
     let _ = thread::Builder::new()
         .name(format!("nulang-net-reader-out-{}", addr.port()))
-        .spawn(move || connection_read_loop(read_stream, node_id, in_tx, conns, flag));
+        .spawn(move || connection_read_loop(read_stream, node_id, generation, in_tx, conns, flag));
     Ok(())
 }
 
@@ -3335,7 +3484,134 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // 9b. Non-scalar payloads are rejected at send time
+    // 9b. Reader EOF retires the cached connection
+    // ------------------------------------------------------------------
+    #[test]
+    #[cfg(feature = "tcp")]
+    fn test_connection_read_loop_removes_disconnected_peer() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(listen_addr).unwrap();
+        let (server, peer_addr) = listener.accept().unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+
+        let peer_id = NodeId(0xCAFE);
+        let reader = TransportStream::Raw(server);
+        let writer = reader.try_clone().unwrap();
+        let connections = Arc::new(Mutex::new(HashMap::new()));
+        let generation = next_connection_generation();
+        lock_ignore_poison(&connections).insert(
+            peer_id,
+            TcpConnection {
+                node_id: peer_id,
+                generation,
+                addr: peer_addr,
+                stream: writer,
+                last_activity: Instant::now(),
+            },
+        );
+
+        let (incoming_tx, _incoming_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let reader_connections = Arc::clone(&connections);
+        let reader_shutdown = Arc::clone(&shutdown_flag);
+        let handle = thread::spawn(move || {
+            connection_read_loop(
+                reader,
+                peer_id,
+                generation,
+                incoming_tx,
+                reader_connections,
+                reader_shutdown,
+            );
+        });
+
+        // EOF is the normal disconnect path. The reader must retire the
+        // cached writer so the next outbound packet reconnects instead of
+        // consuming itself on a known-dead socket.
+        drop(client);
+        handle.join().unwrap();
+
+        assert!(
+            !lock_ignore_poison(&connections).contains_key(&peer_id),
+            "reader EOF must remove the disconnected peer from the connection pool"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "tcp")]
+    fn test_stale_reader_does_not_remove_replacement_connection() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let old_client = TcpStream::connect(listen_addr).unwrap();
+        let (old_server, old_peer_addr) = listener.accept().unwrap();
+        old_server
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+
+        let peer_id = NodeId(0xBEEF);
+        let old_reader = TransportStream::Raw(old_server);
+        let old_writer = old_reader.try_clone().unwrap();
+        let old_generation = next_connection_generation();
+        let connections = Arc::new(Mutex::new(HashMap::new()));
+        lock_ignore_poison(&connections).insert(
+            peer_id,
+            TcpConnection {
+                node_id: peer_id,
+                generation: old_generation,
+                addr: old_peer_addr,
+                stream: old_writer,
+                last_activity: Instant::now(),
+            },
+        );
+
+        let (incoming_tx, _incoming_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let reader_connections = Arc::clone(&connections);
+        let reader_shutdown = Arc::clone(&shutdown_flag);
+        let handle = thread::spawn(move || {
+            connection_read_loop(
+                old_reader,
+                peer_id,
+                old_generation,
+                incoming_tx,
+                reader_connections,
+                reader_shutdown,
+            );
+        });
+
+        let new_client = TcpStream::connect(listen_addr).unwrap();
+        let (new_server, new_peer_addr) = listener.accept().unwrap();
+        let new_generation = next_connection_generation();
+        lock_ignore_poison(&connections).insert(
+            peer_id,
+            TcpConnection {
+                node_id: peer_id,
+                generation: new_generation,
+                addr: new_peer_addr,
+                stream: TransportStream::Raw(new_server),
+                last_activity: Instant::now(),
+            },
+        );
+
+        drop(old_client);
+        handle.join().unwrap();
+
+        assert_eq!(
+            lock_ignore_poison(&connections)
+                .get(&peer_id)
+                .map(|conn| conn.generation),
+            Some(new_generation),
+            "an old reader must not evict a replacement connection"
+        );
+
+        drop(new_client);
+    }
+
+    // ------------------------------------------------------------------
+    // 9c. Non-scalar payloads are rejected at send time
     // ------------------------------------------------------------------
     #[test]
     #[cfg(feature = "tcp")]
@@ -3804,10 +4080,21 @@ impl NetworkTransport for TcpTransport {
         self.connect(node_id, addr)
     }
     fn send(&mut self, to_node: NodeId, to_addr: std::net::SocketAddr, packet: Packet) {
-        self.send(to_node, to_addr, packet)
+        TcpTransport::send(self, to_node, to_addr, packet)
+    }
+    fn send_tracked(
+        &mut self,
+        to_node: NodeId,
+        to_addr: std::net::SocketAddr,
+        packet: Packet,
+    ) -> TrackedSendOutcome {
+        TcpTransport::send_tracked(self, to_node, to_addr, packet)
     }
     fn receive(&self) -> Vec<IncomingPacket> {
         self.receive()
+    }
+    fn drain_send_failures(&mut self) -> Vec<TransportSendFailure> {
+        self.drain_send_failures()
     }
     fn node_id(&self) -> NodeId {
         self.node_id()
@@ -3841,6 +4128,7 @@ pub struct DeterministicNetworkTransport {
     /// Channel for receiving packets.
     incoming_rx: mpsc::Receiver<IncomingPacket>,
     incoming_tx: mpsc::SyncSender<IncomingPacket>,
+    next_seq: Arc<AtomicU64>,
     /// Shared bus for connecting to other nodes: node_id -> (incoming_tx, outgoing_tx)
     shared_bus: Arc<
         parking_lot::Mutex<
@@ -3872,6 +4160,7 @@ impl Clone for DeterministicNetworkTransport {
             listen_addr: self.listen_addr,
             incoming_rx: mpsc::sync_channel(CHANNEL_CAPACITY).1,
             incoming_tx: self.incoming_tx.clone(),
+            next_seq: self.next_seq.clone(),
             shared_bus: self.shared_bus.clone(),
             shutdown_flag: self.shutdown_flag.clone(),
             partition: HashSet::new(),
@@ -3912,6 +4201,7 @@ impl DeterministicNetworkTransport {
             listen_addr: addr,
             incoming_rx,
             incoming_tx,
+            next_seq: Arc::new(AtomicU64::new(1)),
             shared_bus,
             shutdown_flag,
             partition: HashSet::new(),
@@ -3943,27 +4233,34 @@ impl NetworkTransport for DeterministicNetworkTransport {
         Ok(())
     }
 
-    fn send(&mut self, to_node: NodeId, _to_addr: SocketAddr, packet: Packet) {
-        // Simulated partition: silently drop (see set_partition).
+    fn send(&mut self, to_node: NodeId, to_addr: SocketAddr, packet: Packet) {
+        let _ = self.send_tracked(to_node, to_addr, packet);
+    }
+
+    fn send_tracked(
+        &mut self,
+        to_node: NodeId,
+        _to_addr: SocketAddr,
+        packet: Packet,
+    ) -> TrackedSendOutcome {
+        let mut seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        if seq == 0 {
+            seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        }
+
         if self.partition.contains(&to_node) {
-            return;
+            return TrackedSendOutcome::Sent(seq);
         }
         if let Some(sender) = self.get_incoming_sender(to_node) {
             let incoming = IncomingPacket {
                 from_node: self.node_id,
-                seq: 0,
+                seq,
                 packet,
             };
             if self.reorder {
-                // Bounded adjacent reorder: hold the first packet of each
-                // pair; when the second arrives, deliver the NEW one first
-                // and then the held one — the receiver sees P2 before P1.
-                // Deterministic (per-pair state, no RNG); nothing is lost
-                // or duplicated, only delayed one slot. `flush_held`
-                // delivers the odd tail at the end of the sender's turn.
-                if let Some(held) = self.held.remove(&to_node) {
+                if let Some(previous) = self.held.remove(&to_node) {
                     let _ = sender.try_send(incoming);
-                    let _ = sender.try_send(held);
+                    let _ = sender.try_send(previous);
                 } else {
                     self.held.insert(to_node, incoming);
                 }
@@ -3971,6 +4268,7 @@ impl NetworkTransport for DeterministicNetworkTransport {
                 let _ = sender.try_send(incoming);
             }
         }
+        TrackedSendOutcome::Sent(seq)
     }
 
     fn flush_held(&mut self) {

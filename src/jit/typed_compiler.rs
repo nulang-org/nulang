@@ -1596,7 +1596,6 @@ pub fn is_opcode_supported_typed(op: OpCode) -> bool {
             | OpCode::IMul
             | OpCode::IDiv
             | OpCode::IMod
-            | OpCode::INeg
             | OpCode::IInc
             | OpCode::IDec
             | OpCode::Xor
@@ -2954,6 +2953,15 @@ pub fn compile_bytecode_region_typed(
             // -- Return --
             OpCode::Ret | OpCode::RetVal => {
                 flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
+                // Returns embedded in a wider loop CFG remain interpreter-owned:
+                // publish the exact bytecode PC and leave native code so VM
+                // frame-pop / return-value semantics are unchanged.
+                emit_yield_pc(
+                    &mut builder,
+                    helpers["nulang_jit_set_branch_exit_pc"],
+                    start_offset,
+                    pc,
+                );
                 builder.ins().jump(return_block, &[]);
             }
 
