@@ -1528,6 +1528,45 @@ fn test_alignment() {
     }
 }
 
+// The experimental compact representation must preserve both the exact
+// requested payload length and the padded extent used by the allocator.
+#[cfg(feature = "compact-orca-header")]
+#[test]
+fn test_compact_header_has_48_byte_abi_and_16_byte_small_slot() {
+    assert_eq!(ActorHeap::HEADER_SIZE, 48);
+
+    let mut heap = ActorHeap::new(4096);
+    heap.set_actor_id(17);
+    let a = heap.alloc(16, TypeTag::Raw).unwrap();
+    let b = heap.alloc(16, TypeTag::Raw).unwrap();
+    unsafe {
+        let first = &*ActorHeap::header_of(a);
+        let second = &*ActorHeap::header_of(b);
+        assert_eq!(first.actor_id, 17);
+        assert_eq!(first.payload_size, 16);
+        assert_eq!(first.total_size(), 64);
+        assert_eq!(second.total_size(), 64);
+        assert_eq!(first.size_class, SizeClass::Small);
+    }
+    assert_eq!(heap.used(), 128, "two 16-byte values must occupy two 64-byte slots");
+}
+
+/// Zero-length and unaligned payloads must preserve the same logical length
+/// and padded allocation extent under the compact representation.
+#[cfg(feature = "compact-orca-header")]
+#[test]
+fn test_compact_header_preserves_exact_payload_lengths() {
+    let mut heap = ActorHeap::new(4096);
+    for (requested, aligned) in [(0usize, 0usize), (1, 8), (9, 16), (17, 24)] {
+        let ptr = heap.alloc(requested, TypeTag::Raw).unwrap();
+        unsafe {
+            let header = &*ActorHeap::header_of(ptr);
+            assert_eq!(header.payload_size, requested);
+            assert_eq!(header.total_size(), ActorHeap::HEADER_SIZE + aligned);
+        }
+    }
+}
+
 #[test]
 fn test_header_size_is_56() {
     // The whole design assumes HEADER_SIZE == 56. If this ever changes,
