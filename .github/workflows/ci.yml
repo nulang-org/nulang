@@ -87,19 +87,30 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
 
       - name: Build
         run: cargo build --locked --all-targets
 
       - name: Test
-        run: |
-          # The five-node split-brain cluster test is known to be timing-
-          # sensitive on GitHub Actions shared runners. Retry the whole suite
-          # once on failure so a single flaky run does not block merges.
-          cargo test --locked || (echo "Retrying test suite after flaky failure..." && cargo test --locked)
+        # nextest isolates individual tests in their own processes and schedules
+        # test binaries concurrently, reducing wall-clock time without changing
+        # the default-feature test selection.
+        run: cargo nextest run --locked
+
+      - name: Test doctests
+        # nextest intentionally does not execute rustdoc tests.
+        run: cargo test --locked --doc
+
+      - name: Test benchmark harness scripts
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 
       - name: Install cargo-llvm-cov
         if: env.CODECOV_TOKEN != ''
@@ -127,7 +138,7 @@ jobs:
   release:
     name: Release Build
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v7
 
@@ -136,15 +147,33 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Build (release)
-        run: cargo build --locked --release
+      - name: Build (public CLI release profile)
+        run: cargo build --locked --release --no-default-features --features release-cli --bin nulang
 
-      - name: Test (release)
-        run: cargo test --locked --release
+      - name: Test (same profile as public release artifacts)
+        run: cargo test --locked --release --no-default-features --features release-cli
+
+      - name: Verify Linux CLI has no Python ABI linkage
+        run: bash scripts/check_release_linux.sh /tmp/cargo-target/release/nulang
+
+      - name: Stage tested release binary
+        run: |
+          mkdir -p ci-artifacts
+          cp /tmp/cargo-target/release/nulang ci-artifacts/nulang
+
+      - name: Upload tested release binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: nulang-release-${{ github.sha }}
+          path: ci-artifacts/nulang
+          if-no-files-found: error
+          retention-days: 1
 
 
   # -----------------------------------------------------------------------
@@ -155,26 +184,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: release
-    env:
-      # The repo sets `target-dir = "/tmp/cargo-target"` in `.cargo/config.toml`,
-      # but the smoke-test steps below reference `./target/release/nulang`.
-      # Override the target directory locally so the binary lands where the
-      # scripts expect it.
-      CARGO_TARGET_DIR: ./target
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y python3-dev
+      - name: Download tested release binary
+        uses: actions/download-artifact@v8
+        with:
+          name: nulang-release-${{ github.sha }}
+          path: target/release
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build nulang (release)
-        run: cargo build --locked --release --bin nulang
+      - name: Make release binary executable
+        run: chmod +x ./target/release/nulang
 
       - name: Smoke test (eval)
         run: ./target/release/nulang --eval 'perform IO.print("hello")'
@@ -184,6 +204,9 @@ jobs:
 
       - name: Run nula test
         run: cd test-pkg && ../target/release/nulang nula test
+
+      - name: Test documentation example discovery
+        run: bash scripts/test_verify_doc_examples.sh
 
       - name: Verify documentation examples
         run: NULANG_BIN=./target/release/nulang bash scripts/verify_doc_examples.sh
@@ -199,6 +222,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -235,6 +260,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -261,6 +288,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: '1.95.0'
           components: rustfmt, clippy
 
       - name: Cache cargo
@@ -291,6 +319,11 @@ jobs:
         run: |
           cargo install cargo-audit --locked
           cargo audit
+
+      # Named batteries-included compatibility profile. Run it with
+      # defaults disabled so CI proves the aggregate is self-contained.
+      - name: Check explicit full profile
+        run: cargo check --locked --all-targets --no-default-features --features full
 
       # All-features compilation check.
       - name: Check all features
@@ -370,15 +403,19 @@ jobs:
           # Full history lets the regression checker order those samples by
           # Git commit time instead of unreliable filesystem mtimes.
           fetch-depth: 0
-
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y python3-dev
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+
+      - name: Verify benchmark timing contracts
+        run: python3 -m unittest scripts/tests/test_benchmark_timing_contract.py
 
       - name: Run benchmarks
         run: cargo bench --locked --bench bench_main
@@ -425,25 +462,26 @@ jobs:
         run: |
           python3 scripts/check_bench_regression.py \
             --latest "benchmarks/${{ github.sha }}.json" \
-            --history-dir benchmarks
+            --history-dir benchmarks \
+            --regressions-out "benchmarks/regressions-${{ github.sha }}.json"
 
-      # Shared GitHub runners occasionally produce an isolated wall-clock
-      # outlier even after the MAD-based noise filter. Confirm a detected
-      # regression with one independent Criterion measurement in the same job.
-      # The collector overwrites this commit's JSON, so history records the
-      # confirmation sample rather than the noisy first pass.
-      - name: Confirm detected regressions
+      # A historical alert is only blocking if the candidate reproduces it
+      # against the exact first parent on the same host and logical CPU. This
+      # distinguishes code regressions from persistent shared-runner drift.
+      - name: Confirm detected regressions with paired parent A/B
         id: regression_confirmation
         if: steps.regression_check.outcome == 'failure'
-        continue-on-error: true
         run: |
-          echo "First benchmark sample exceeded its historical threshold; re-measuring once."
-          cargo bench --locked --bench bench_main
-          python3 scripts/collect_bench_results.py \
-            --out "benchmarks/${{ github.sha }}.json"
-          python3 scripts/check_bench_regression.py \
-            --latest "benchmarks/${{ github.sha }}.json" \
-            --history-dir benchmarks
+          set +e
+          python3 scripts/confirm_bench_regression.py \
+            --base-ref HEAD^ \
+            --manifest "benchmarks/regressions-${{ github.sha }}.json" \
+            --runs 8 \
+            --output "benchmarks/paired-confirmation-${{ github.sha }}.json"
+          status=$?
+          set -e
+          echo "exit_code=${status}" >> "$GITHUB_OUTPUT"
+          exit 0
 
       - name: Upload results as build artifact
         uses: actions/upload-artifact@v7
@@ -452,6 +490,8 @@ jobs:
           path: |
             benchmarks/${{ github.sha }}.json
             benchmarks/savina-${{ github.sha }}.jsonl
+            benchmarks/regressions-${{ github.sha }}.json
+            benchmarks/paired-confirmation-${{ github.sha }}.json
           retention-days: 90
 
       - name: Persist benchmark history
@@ -460,12 +500,23 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add benchmarks/*.json
+          # Stage every canonical Criterion snapshot restored from history plus
+          # the current result. Diagnostic regression/A/B JSON uses non-SHA
+          # filenames and is intentionally excluded.
+          find benchmarks -maxdepth 1 -type f -regextype posix-extended \
+            -regex 'benchmarks/[0-9a-f]{40}\.json' -print0 | \
+            xargs -0 --no-run-if-empty git add --
           git diff --staged --quiet || git commit -m "bench: record results for ${{ github.sha }} [skip ci]"
           git push --force-with-lease origin "HEAD:refs/heads/${BENCH_HISTORY_BRANCH}"
 
-      # Preserve the confirmed sample before failing. A one-off first-pass
-      # outlier no longer blocks main; a reproduced regression still does.
+      # The rolling history alert alone is informational; only a regression
+      # reproduced against the exact parent on the same host blocks the job.
+      - name: Fail the job if paired confirmation failed operationally
+        if: steps.regression_check.outcome == 'failure' && steps.regression_confirmation.outputs.exit_code != '0' && steps.regression_confirmation.outputs.exit_code != '1'
+        run: |
+          echo "Paired benchmark confirmation failed operationally (exit ${{ steps.regression_confirmation.outputs.exit_code }})."
+          exit 1
+
       - name: Fail the job if a regression was confirmed
-        if: steps.regression_check.outcome == 'failure' && steps.regression_confirmation.outcome == 'failure'
+        if: steps.regression_check.outcome == 'failure' && steps.regression_confirmation.outputs.exit_code == '1'
         run: exit 1
