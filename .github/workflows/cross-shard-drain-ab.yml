@@ -1,0 +1,61 @@
+name: Cross-shard receive-pass exact-base A/B
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/cross-shard-drain-ab.yml'
+      - 'examples/cross_shard_drain.rs'
+      - 'scripts/cross_shard_drain_ab.py'
+      - 'scripts/tests/test_cross_shard_drain_ab.py'
+      - 'src/runtime/**'
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Exact base ref or SHA for matched-workload comparison
+        required: true
+      runs:
+        description: Even number of paired rounds
+        default: '4'
+        required: false
+
+concurrency:
+  group: cross-shard-drain-ab-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  paired-receive:
+    name: Exact base vs candidate shard receive
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test paired comparison parser and math
+        run: python3 -m unittest scripts/tests/test_cross_shard_drain_ab.py
+
+      - name: Compare exact base and candidate on one CPU
+        env:
+          BASE_REF: "${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || inputs.base_ref }}"
+          RUNS: "${{ github.event_name == 'pull_request' && '4' || inputs.runs }}"
+        run: |
+          python3 scripts/cross_shard_drain_ab.py \
+            --base-ref "$BASE_REF" \
+            --runs "$RUNS" \
+            --warmup 1 \
+            --rounds-per-measurement 2000 \
+            --output cross-shard-drain-ab.json
+
+      - name: Upload diagnostic results
+        uses: actions/upload-artifact@v7
+        with:
+          name: cross-shard-drain-ab-${{ github.sha }}
+          path: cross-shard-drain-ab.json
+          if-no-files-found: error

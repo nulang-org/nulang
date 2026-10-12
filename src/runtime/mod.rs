@@ -599,6 +599,10 @@ pub struct Runtime {
     /// Channel to receive messages for this shard.
     /// `None` when `shard_count == 1`.
     cross_shard_rx: Option<mpsc::Receiver<CrossShardMsg>>,
+    /// Reusable batch staging for cross-shard receive passes. Empty between
+    /// scheduler turns; its retained capacity is capped to avoid pinning
+    /// a large allocation after one exceptional burst.
+    cross_shard_pending: Vec<CrossShardMsg>,
 }
 
 // SAFETY: in sharded mode each Runtime runs on exactly one thread (shard
@@ -724,6 +728,7 @@ impl Runtime {
             shard_count: 1,
             cross_shard_tx: None,
             cross_shard_rx: None,
+            cross_shard_pending: Vec::new(),
         }
     }
 
@@ -1565,21 +1570,23 @@ impl Runtime {
     /// Drain all pending cross-shard messages into local mailboxes. Called
     /// at the top of every scheduler-loop iteration before dequeuing work.
     fn drain_cross_shard_messages(&mut self) {
-        let mut pending: Vec<CrossShardMsg> = Vec::new();
-        {
-            let rx = match self.cross_shard_rx.as_ref() {
-                Some(rx) => rx,
-                None => return,
-            };
-            loop {
-                match rx.try_recv() {
-                    Ok(msg) => pending.push(msg),
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => break,
-                }
+        // Take the reusable buffer out of self before delivery so the
+        // delivery paths can borrow &mut self. Drain the channel completely
+        // *before* delivering, preserving the existing batch boundary:
+        // messages admitted during delivery wait for the next scheduler pass.
+        let rx = match self.cross_shard_rx.as_ref() {
+            Some(rx) => rx,
+            None => return,
+        };
+        let mut pending = std::mem::take(&mut self.cross_shard_pending);
+        loop {
+            match rx.try_recv() {
+                Ok(msg) => pending.push(msg),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => break,
             }
         }
-        for msg in pending {
+        for msg in pending.drain(..) {
             match msg {
                 CrossShardMsg::DeliverMessage {
                     target_id,
@@ -1632,6 +1639,15 @@ impl Runtime {
                 }
             }
         }
+        // Retain capacity, not envelopes (nor their ObjectRef leases).
+        // The channel is bounded, but active producers can replenish it
+        // while we snapshot a burst; avoid pinning an exceptionally large
+        // temporary allocation for the remaining life of this shard.
+        const MAX_RETAINED_BATCH_CAPACITY: usize = 256;
+        if pending.capacity() > MAX_RETAINED_BATCH_CAPACITY {
+            pending = Vec::new();
+        }
+        self.cross_shard_pending = pending;
     }
 
     /// Mark the start of a call into the shared runtime VM. While the

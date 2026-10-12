@@ -7836,6 +7836,126 @@ fn test_object_ref_released_on_actor_exit() {
 }
 
 #[test]
+fn test_cross_shard_drain_reuses_staging_allocation_and_preserves_fifo() {
+    let mut shards = Runtime::new_sharded(2);
+    let mut target = shards[1].spawn_actor(Box::new(|| vec![]));
+    while target % 2 != 1 {
+        target = shards[1].spawn_actor(Box::new(|| vec![]));
+    }
+    declare_test_behavior(&mut shards[1], target, "handle");
+
+    let mut allocation = std::ptr::null();
+    let mut capacity = 0;
+    for batch in 0..3 {
+        for index in 0..4 {
+            shards[0].send_message_by_id(
+                target,
+                0,
+                &[Value::int((batch * 4 + index) as i64)],
+            );
+        }
+
+        shards[1].drain_cross_shard_messages();
+        let pending = &shards[1].cross_shard_pending;
+        assert!(pending.is_empty(), "drain must not retain delivered envelopes");
+        if batch == 0 {
+            capacity = pending.capacity();
+            assert!(capacity >= 4, "first batch should establish staging capacity");
+            allocation = pending.as_ptr();
+        } else {
+            assert_eq!(pending.capacity(), capacity, "later batches should reuse capacity");
+            assert_eq!(pending.as_ptr(), allocation, "later batches should reuse the allocation");
+        }
+
+        for index in 0..4 {
+            let received = shards[1]
+                .actors
+                .get_mut(&target)
+                .unwrap()
+                .mailbox
+                .pop()
+                .expect("cross-shard message should reach mailbox in FIFO order");
+            assert_eq!(
+                received.payload.as_slice(),
+                &[Value::int((batch * 4 + index) as i64)],
+            );
+        }
+        assert!(shards[1].actors.get(&target).unwrap().mailbox.is_empty());
+    }
+
+    // An empty pass must preserve the staging allocation as well.
+    shards[1].drain_cross_shard_messages();
+    assert_eq!(shards[1].cross_shard_pending.capacity(), capacity);
+    assert_eq!(shards[1].cross_shard_pending.as_ptr(), allocation);
+}
+
+#[test]
+fn test_cross_shard_drain_discards_oversized_staging_capacity_after_burst() {
+    let mut shards = Runtime::new_sharded(2);
+    let mut target = shards[1].spawn_actor(Box::new(|| vec![]));
+    while target % 2 != 1 {
+        target = shards[1].spawn_actor(Box::new(|| vec![]));
+    }
+    declare_test_behavior(&mut shards[1], target, "handle");
+
+    // Under a burst larger than the cache budget, process the whole snapshot
+    // exactly once without retaining its large allocation indefinitely.
+    for seq in 0..300 {
+        shards[0].send_message_by_id(target, 0, &[Value::int(seq)]);
+    }
+    shards[1].drain_cross_shard_messages();
+    assert!(shards[1].cross_shard_pending.is_empty());
+    assert!(
+        shards[1].cross_shard_pending.capacity() <= 256,
+        "an unusually large drain must not pin a burst-sized buffer on the shard"
+    );
+    for seq in 0..300 {
+        let received = shards[1]
+            .actors
+            .get_mut(&target)
+            .unwrap()
+            .mailbox
+            .pop()
+            .expect("every message in the burst must be delivered");
+        assert_eq!(received.payload.as_slice(), &[Value::int(seq)]);
+    }
+    assert!(shards[1].actors.get(&target).unwrap().mailbox.is_empty());
+}
+
+#[test]
+fn test_cross_shard_reused_staging_releases_rejected_object_leases() {
+    let mut shards = Runtime::new_sharded(2);
+    let mut target = shards[1].spawn_actor(Box::new(|| vec![]));
+    while target % 2 != 1 {
+        target = shards[1].spawn_actor(Box::new(|| vec![]));
+    }
+    declare_test_behavior(&mut shards[1], target, "known");
+
+    for batch in 0..3 {
+        let object_id = shards[0]
+            .object_store
+            .put(vec![batch as u8, 42].into_boxed_slice());
+        shards[0].send_message(target, "unknown", &[Value::object(object_id)]);
+        shards[0].object_store.drop_ref(object_id);
+        assert!(
+            shards[0].object_store.get(object_id).is_some(),
+            "queued message must retain its temporary object lease"
+        );
+
+        shards[1].drain_cross_shard_messages();
+
+        assert!(
+            shards[1].cross_shard_pending.is_empty(),
+            "staging buffer must not retain rejected envelopes"
+        );
+        assert!(
+            shards[0].object_store.get(object_id).is_none(),
+            "rejected delivery must release temporary object leases"
+        );
+    }
+}
+
+#[test]
 fn test_object_ref_cross_shard_reuses_node_shared_storage() {
     let mut shards = Runtime::new_sharded(2);
 
