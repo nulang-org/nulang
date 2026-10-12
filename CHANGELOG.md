@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### Polymorphic standard-library list combinators — 2026-10-12
+- **Experimental `stdlib::list` no longer restricts `fold`, `append`, `zip`, or `enumerate` to integer arrays.** `fold` accepts independent element and accumulator types; `zip` accepts different element types on either side. Existing integer-array callers retain the same logic. A new conformance fixture covers strings, mixed-type tuples, an empty fold, and left-fold order.
+- **No new language syntax or runtime primitive.** This is a source-level signature relaxation; execution and backend parity must be confirmed by exact-head CI before promotion.
+
 ### Public CLI release portability — 2026-10-11
 - **Public release archives use the `release-cli` feature profile without a Python shared-library ABI dependency.** The ordinary full/default source build retains opt-in Python interoperability; release packaging checks the resulting Linux and macOS binary for Python dependencies.
 - **Release PRs rehearse the full non-publishing four-platform build matrix before tags are created.** The Linux ARM64 cross build explicitly installs target libc development headers and preflights a target-compiler C header probe, avoiding an observed `ring` compile failure when `--no-install-recommends` omits the ARM64 sysroot. Actual cross-build and clean-host portability remain release gates.
