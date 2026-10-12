@@ -1075,6 +1075,7 @@ pub fn process_network_packets(
                 members,
                 directory,
                 fabric,
+                services,
             } => {
                 cluster.merge_membership_from_sender(members, incoming.from_node);
                 if !directory.is_empty() {
@@ -1094,6 +1095,21 @@ pub fn process_network_packets(
                     {
                         warn!(
                             "nulang-fabric: rejecting gossip snapshot from {:?}: {}",
+                            incoming.from_node, error
+                        );
+                    }
+                }
+                if let Some(snapshot) = services {
+                    if snapshot.node_id != incoming.from_node {
+                        warn!(
+                            "nulang-fabric: rejecting service gossip snapshot for {:?} sent by {:?}",
+                            snapshot.node_id, incoming.from_node
+                        );
+                    } else if let Err(error) =
+                        runtime.fabric_replace_remote_service_advertisements(snapshot)
+                    {
+                        warn!(
+                            "nulang-fabric: rejecting service gossip snapshot from {:?}: {}",
                             incoming.from_node, error
                         );
                     }

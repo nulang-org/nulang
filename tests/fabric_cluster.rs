@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use nulang::runtime::{
     Actor, DeterministicNetworkTransport, FabricAdvertisement, FabricAdvertisementSnapshot, NodeId,
-    Packet, Runtime,
+    Packet, Runtime, ServiceAdvertisement, ServiceHealth, ServiceProtocol,
 };
 use nulang::vm::Value;
 
@@ -168,6 +168,7 @@ fn fabric_gossip_reordering_keeps_newest_snapshot_generation() {
             members: vec![],
             directory: vec![],
             fabric: Some(older),
+            services: None,
         },
     );
     transport.send(
@@ -177,6 +178,7 @@ fn fabric_gossip_reordering_keeps_newest_snapshot_generation() {
             members: vec![],
             directory: vec![],
             fabric: Some(newer),
+            services: None,
         },
     );
     transport.flush_held();
@@ -284,4 +286,76 @@ fn fabric_partition_removes_routes_and_heals_via_gossip() {
     b.process_network();
     a.process_network();
     assert_eq!(a.fabric_remote_subscription_count(), 1);
+}
+
+#[test]
+fn fabric_service_directory_converges_automatically_via_gossip() {
+    let bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addr_a: SocketAddr = "127.0.0.1:32401".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:32402".parse().unwrap();
+    let node_a = NodeId::new(&addr_a);
+    let node_b = NodeId::new(&addr_b);
+
+    let mut a = distributed_runtime(addr_a, bus.clone());
+    let mut b = distributed_runtime(addr_b, bus);
+
+    a.distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_b, addr_b);
+    b.distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_a, addr_a);
+
+    let endpoint = |epoch, health| ServiceAdvertisement {
+        node_id: node_b,
+        service: "api".into(),
+        deployment_id: "api-deploy".into(),
+        replica: 0,
+        allocation_epoch: epoch,
+        host: "127.0.0.1".into(),
+        port: 8080,
+        protocol: ServiceProtocol::Http,
+        health,
+    };
+
+    b.fabric_advertise_service(endpoint(3, ServiceHealth::Serving))
+        .unwrap();
+
+    // The ordinary cluster gossip round carries SVC0 automatically.
+    b.advance_time(Duration::from_millis(600));
+    a.advance_time(Duration::from_millis(600));
+    b.process_network();
+    a.process_network();
+
+    let resolved = a.fabric_resolve_service("api").unwrap();
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].node_id, node_b);
+    assert_eq!(resolved[0].allocation_epoch, 3);
+    assert_eq!(a.fabric_remote_service_endpoint_count(), 1);
+
+    // Health changes use the same complete-snapshot convergence path.
+    b.fabric_advertise_service(endpoint(3, ServiceHealth::Unhealthy))
+        .unwrap();
+    b.advance_time(Duration::from_millis(600));
+    a.advance_time(Duration::from_millis(600));
+    b.process_network();
+    a.process_network();
+    assert!(a.fabric_resolve_service("api").unwrap().is_empty());
+    assert_eq!(a.fabric_remote_service_endpoint_count(), 1);
+
+    // A new allocation epoch can become routable; the old epoch cannot
+    // reappear because the receiver retains its per-replica epoch watermark.
+    b.fabric_advertise_service(endpoint(4, ServiceHealth::Serving))
+        .unwrap();
+    b.advance_time(Duration::from_millis(600));
+    a.advance_time(Duration::from_millis(600));
+    b.process_network();
+    a.process_network();
+    let resolved = a.fabric_resolve_service("api").unwrap();
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].allocation_epoch, 4);
 }

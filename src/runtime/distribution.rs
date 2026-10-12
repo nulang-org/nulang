@@ -336,6 +336,9 @@ pub(crate) fn process_network(rt: &mut Runtime) {
                 // extension for this round instead of advertising a partial
                 // replacement that would delete live remote routes.
                 let fabric = rt.fabric_advertisements(GOSSIP_PAYLOAD_MAX_ENTRIES).ok();
+                let services = rt
+                    .fabric_service_advertisements(GOSSIP_PAYLOAD_MAX_ENTRIES)
+                    .ok();
                 if let (Some(transport), Some(cluster)) =
                     (&mut rt.distributed.transport, &rt.distributed.cluster)
                 {
@@ -345,11 +348,16 @@ pub(crate) fn process_network(rt: &mut Runtime) {
                     } else {
                         Vec::new()
                     };
-                    if !members.is_empty() || !directory.is_empty() || fabric.is_some() {
+                    if !members.is_empty()
+                        || !directory.is_empty()
+                        || fabric.is_some()
+                        || services.is_some()
+                    {
                         let packet = Packet::Gossip {
                             members,
                             directory,
                             fabric,
+                            services,
                         };
                         for (to, addr) in targets {
                             transport.send(NodeId(to.0), addr, packet.clone());

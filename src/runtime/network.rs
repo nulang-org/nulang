@@ -52,6 +52,9 @@ use std::time::{Duration, Instant};
 use super::cluster::{DurableDirectoryEntry, NodeGossip, NodeStatus};
 use super::crdt_manager::{CrdtDeltaOp, CrdtOp};
 use super::distributed_context::{FabricAdvertisement, FabricAdvertisementSnapshot};
+use super::service_directory::{
+    ServiceAdvertisement, ServiceAdvertisementSnapshot, ServiceHealth, ServiceProtocol,
+};
 use super::supervision::RemoteLink;
 use super::MessagePriority;
 use super::NodeId;
@@ -650,6 +653,10 @@ pub enum Packet {
         /// gossip sender. Encoded as an optional additive tail; `None`
         /// preserves the pre-Fabric gossip bytes exactly.
         fabric: Option<FabricAdvertisementSnapshot>,
+        /// Complete Fabric service-directory snapshot owned by the gossip
+        /// sender. This is a second self-identifying additive tail so peers
+        /// that predate service discovery safely ignore it.
+        services: Option<ServiceAdvertisementSnapshot>,
     },
 
     /// Request bytecode for a behavior identified by its BLAKE3 content hash.
@@ -1002,6 +1009,7 @@ impl Packet {
                 members,
                 directory,
                 fabric,
+                services,
             } => {
                 buf.extend_from_slice(&(members.len() as u32).to_be_bytes());
                 for m in members {
@@ -1039,6 +1047,28 @@ impl Packet {
                             }
                             None => buf.push(0),
                         }
+                    }
+                }
+
+                // Service-directory metadata is independently optional. A
+                // sender may omit FAB0 because its subscription snapshot
+                // exceeded the bound while still sending a complete service
+                // snapshot, so SVC0 must be self-identifying on its own.
+                if let Some(snapshot) = services {
+                    buf.extend_from_slice(b"SVC0");
+                    buf.extend_from_slice(&snapshot.node_id.0.to_be_bytes());
+                    buf.extend_from_slice(&snapshot.generation.to_be_bytes());
+                    buf.extend_from_slice(&(snapshot.services.len() as u32).to_be_bytes());
+                    for service in &snapshot.services {
+                        buf.extend_from_slice(&service.node_id.0.to_be_bytes());
+                        write_string(buf, &service.service);
+                        write_string(buf, &service.deployment_id);
+                        buf.extend_from_slice(&service.replica.to_be_bytes());
+                        buf.extend_from_slice(&service.allocation_epoch.to_be_bytes());
+                        write_string(buf, &service.host);
+                        buf.extend_from_slice(&service.port.to_be_bytes());
+                        buf.push(service_protocol_to_u8(service.protocol));
+                        buf.push(service_health_to_u8(service.health));
                     }
                 }
             }
@@ -1455,10 +1485,67 @@ impl Packet {
             });
         }
 
+        // Service snapshots are a separate additive tail. They may follow
+        // FAB0 or appear directly when the subscription snapshot was omitted.
+        let mut services = None;
+        if offset + 4 <= payload.len() && &payload[offset..offset + 4] == b"SVC0" {
+            offset += 4;
+            let node_id = NodeId(read_u64(payload, offset)?);
+            offset += 8;
+            let generation = read_u64(payload, offset)?;
+            offset += 8;
+            let scount = read_u32(payload, offset)? as usize;
+            offset += 4;
+            if scount > 4096 {
+                return None;
+            }
+
+            let mut advertisements = Vec::with_capacity(scount.min(256));
+            for _ in 0..scount {
+                let entry_node_id = NodeId(read_u64(payload, offset)?);
+                offset += 8;
+                let (service, service_len) = read_string(payload, offset)?;
+                offset = offset.checked_add(service_len)?;
+                let (deployment_id, deployment_len) = read_string(payload, offset)?;
+                offset = offset.checked_add(deployment_len)?;
+                let replica = read_u32(payload, offset)?;
+                offset += 4;
+                let allocation_epoch = read_u64(payload, offset)?;
+                offset += 8;
+                let (host, host_len) = read_string(payload, offset)?;
+                offset = offset.checked_add(host_len)?;
+                let port = u16::from_be_bytes(payload.get(offset..offset + 2)?.try_into().ok()?);
+                offset += 2;
+                let protocol = service_protocol_from_u8(*payload.get(offset)?)?;
+                offset += 1;
+                let health = service_health_from_u8(*payload.get(offset)?)?;
+                offset += 1;
+
+                advertisements.push(ServiceAdvertisement {
+                    node_id: entry_node_id,
+                    service,
+                    deployment_id,
+                    replica,
+                    allocation_epoch,
+                    host,
+                    port,
+                    protocol,
+                    health,
+                });
+            }
+
+            services = Some(ServiceAdvertisementSnapshot {
+                node_id,
+                generation,
+                services: advertisements,
+            });
+        }
+
         Some(Packet::Gossip {
             members,
             directory,
             fabric,
+            services,
         })
     }
 
@@ -1850,6 +1937,42 @@ fn status_from_u8(b: u8) -> Option<NodeStatus> {
         2 => Some(NodeStatus::Suspicious),
         3 => Some(NodeStatus::Failed),
         4 => Some(NodeStatus::Leaving),
+        _ => None,
+    }
+}
+
+fn service_protocol_to_u8(protocol: ServiceProtocol) -> u8 {
+    match protocol {
+        ServiceProtocol::Nul0 => 0,
+        ServiceProtocol::Http => 1,
+        ServiceProtocol::Grpc => 2,
+        ServiceProtocol::Tcp => 3,
+    }
+}
+
+fn service_protocol_from_u8(value: u8) -> Option<ServiceProtocol> {
+    match value {
+        0 => Some(ServiceProtocol::Nul0),
+        1 => Some(ServiceProtocol::Http),
+        2 => Some(ServiceProtocol::Grpc),
+        3 => Some(ServiceProtocol::Tcp),
+        _ => None,
+    }
+}
+
+fn service_health_to_u8(health: ServiceHealth) -> u8 {
+    match health {
+        ServiceHealth::Serving => 0,
+        ServiceHealth::Draining => 1,
+        ServiceHealth::Unhealthy => 2,
+    }
+}
+
+fn service_health_from_u8(value: u8) -> Option<ServiceHealth> {
+    match value {
+        0 => Some(ServiceHealth::Serving),
+        1 => Some(ServiceHealth::Draining),
+        2 => Some(ServiceHealth::Unhealthy),
         _ => None,
     }
 }
@@ -2965,6 +3088,7 @@ mod tests {
                 },
             ],
             fabric: None,
+            services: None,
         };
 
         let bytes = packet.to_bytes(99);
@@ -2979,6 +3103,7 @@ mod tests {
         let packet = Packet::Gossip {
             members: vec![],
             directory: vec![],
+            services: None,
             fabric: Some(FabricAdvertisementSnapshot {
                 node_id: NodeId(0xABCD),
                 generation: 7,
@@ -3003,6 +3128,72 @@ mod tests {
     }
 
     #[test]
+    fn test_packet_gossip_service_snapshot_roundtrip_without_fabric_tail() {
+        let packet = Packet::Gossip {
+            members: vec![],
+            directory: vec![],
+            fabric: None,
+            services: Some(ServiceAdvertisementSnapshot {
+                node_id: NodeId(0xBEEF),
+                generation: 9,
+                services: vec![ServiceAdvertisement {
+                    node_id: NodeId(0xBEEF),
+                    service: "api".into(),
+                    deployment_id: "api-deploy".into(),
+                    replica: 2,
+                    allocation_epoch: 17,
+                    host: "10.0.0.7".into(),
+                    port: 8443,
+                    protocol: ServiceProtocol::Grpc,
+                    health: ServiceHealth::Draining,
+                }],
+            }),
+        };
+
+        let bytes = packet.to_bytes(102);
+        let (seq, decoded) =
+            Packet::from_bytes(&bytes).expect("service gossip deserialization failed");
+        assert_eq!(seq, 102);
+        assert_eq!(decoded, packet);
+
+        let truncated = &bytes[..bytes.len() - 1];
+        assert!(Packet::from_bytes(truncated).is_none());
+    }
+
+    #[test]
+    fn test_packet_gossip_combines_fabric_and_service_tails() {
+        let packet = Packet::Gossip {
+            members: vec![],
+            directory: vec![],
+            fabric: Some(FabricAdvertisementSnapshot {
+                node_id: NodeId(0xABCD),
+                generation: 11,
+                subscriptions: vec![],
+            }),
+            services: Some(ServiceAdvertisementSnapshot {
+                node_id: NodeId(0xABCD),
+                generation: 11,
+                services: vec![ServiceAdvertisement {
+                    node_id: NodeId(0xABCD),
+                    service: "metrics".into(),
+                    deployment_id: "api-deploy".into(),
+                    replica: 0,
+                    allocation_epoch: 3,
+                    host: "127.0.0.1".into(),
+                    port: 9090,
+                    protocol: ServiceProtocol::Http,
+                    health: ServiceHealth::Serving,
+                }],
+            }),
+        };
+
+        let bytes = packet.to_bytes(103);
+        let (_, decoded) =
+            Packet::from_bytes(&bytes).expect("combined Fabric gossip deserialization failed");
+        assert_eq!(decoded, packet);
+    }
+
+    #[test]
     fn test_packet_gossip_rejects_truncated_payload() {
         // A header followed by a truncated entry must not panic and must
         // fail cleanly.
@@ -3015,6 +3206,7 @@ mod tests {
             }],
             directory: vec![],
             fabric: None,
+            services: None,
         };
         let bytes = packet.to_bytes(1);
         // Keep the header + count, chop the entry in half.
