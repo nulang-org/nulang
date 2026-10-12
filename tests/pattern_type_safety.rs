@@ -227,3 +227,46 @@ fn variant_pattern_on_non_variant_scrutinee_is_rejected() {
         .expect_err("variant patterns require variant scrutinees");
     assert_type_error(err, "Variant pattern requires a variant scrutinee");
 }
+
+#[test]
+fn unknown_record_field_diagnostic_lists_fields_alphabetically() {
+    // Error text must not depend on hash-map iteration order or field declaration order.
+    let mut ctx = TypeContext::new();
+    ctx.bind(
+        "value",
+        Type::Record(vec![
+            ("theta".to_string(), Type::int()),
+            ("gamma".to_string(), Type::int()),
+            ("zeta".to_string(), Type::int()),
+            ("alpha".to_string(), Type::int()),
+            ("epsilon".to_string(), Type::int()),
+            ("beta".to_string(), Type::int()),
+        ]),
+        Capability::Ref,
+        false,
+    );
+
+    let expr = Expr::Match {
+        scrutinee: Box::new(var("value")),
+        arms: vec![(
+            Pattern::Record(vec![("missing".to_string(), Pattern::Wild)]),
+            None,
+            int_lit(0),
+        )],
+        span: sp(),
+    };
+
+    let err = TypeChecker::new()
+        .infer_expr(&ctx, &expr)
+        .expect_err("unknown record field must be rejected");
+    match err {
+        NuError::TypeError {
+            expected_type: Some(expected),
+            ..
+        } => assert_eq!(
+            expected,
+            "record fields: alpha, beta, epsilon, gamma, theta, zeta"
+        ),
+        other => panic!("expected TypeError with record field suggestions, got {other:?}"),
+    }
+}
