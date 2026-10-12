@@ -2,6 +2,9 @@
 ### Static rejection of impossible typed match patterns — 2026-09-29
 - **Pattern matching now rejects contradictions that are already provable from the scrutinee type.** Unknown variant constructors, variant payload-shape mismatches, tuple arity/type mismatches, and invalid closed-record fields fail during type checking instead of compiling as dead arms that can only fail to match at runtime.
 - **Inference remains conservative for unresolved shapes and open record rows.** This change does not make non-exhaustive matches fatal and does not replace the separate finite-domain coverage diagnostics work.
+### Public CLI release portability — 2026-10-11
+- **Public release archives use the `release-cli` feature profile without a Python shared-library ABI dependency.** The ordinary full/default source build retains opt-in Python interoperability; release packaging checks the resulting Linux and macOS binary for Python dependencies.
+- **Release PRs rehearse the full non-publishing four-platform build matrix before tags are created.** The Linux ARM64 cross build explicitly installs target libc development headers and preflights a target-compiler C header probe, avoiding an observed `ring` compile failure when `--no-install-recommends` omits the ARM64 sysroot. Actual cross-build and clean-host portability remain release gates.
 ### Runtime soundness and checked negation — native/AOT backend parity — 2026-10-10
 - **AOT no longer claims raw-Int/Float registers for values that can be nil
   at runtime.** Nightly differential fuzz caught interpreter/AOT divergences
