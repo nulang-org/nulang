@@ -41,6 +41,12 @@ def criterion_means(criterion_dir: Path) -> dict[str, float]:
         values[name] = float(estimate)
     if not values:
         raise RuntimeError(f"No Criterion estimates found in {criterion_dir}")
+    missing = [
+        prefix for prefix in FILTERS
+        if not any(name.startswith(prefix + "/") for name in values)
+    ]
+    if missing:
+        raise RuntimeError(f"Missing Criterion groups in {criterion_dir}: {missing}")
     return values
 
 
