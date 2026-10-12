@@ -1265,7 +1265,7 @@ impl TypeChecker {
                             },
                             None => variant_ty.clone(),
                         };
-                        let gen_ty = self.do_generalize(&ctx, &ctor_ty);
+                        let gen_ty = self.do_generalize_constructor(&ctx, &ctor_ty);
                         ctx.bind(ctor_name.clone(), gen_ty, Capability::Ref, false);
                     }
                 }
@@ -1636,6 +1636,7 @@ impl TypeChecker {
                 state_fields,
                 behaviors,
                 events,
+                version,
                 migrations,
                 span,
                 ..
@@ -1645,6 +1646,7 @@ impl TypeChecker {
                 state_fields,
                 behaviors,
                 events,
+                *version,
                 migrations,
                 *span,
             ),
@@ -1918,8 +1920,12 @@ impl TypeChecker {
             // Block: sequence of expressions
             Expr::Block { exprs, span } => self.infer_block(ctx, exprs, *span),
 
-            // Par: independence annotation, sequential block semantics.
-            Expr::Par { exprs, span } => self.infer_block(ctx, exprs, *span),
+            // Par: validate independence now, even though execution remains
+            // sequential until RFC 0024's scoped-concurrency backend lands.
+            Expr::Par { exprs, span } => {
+                crate::parallel_analysis::validate_parallel_branches(exprs, *span)?;
+                self.infer_block(ctx, exprs, *span)
+            }
 
             // Spawn actor
             Expr::Spawn {
@@ -3551,7 +3557,15 @@ impl TypeChecker {
         Type::Record(fields)
     }
 
-    fn infer_actor_ref_call(
+    fn is_unspecified_actor_protocol_type(ty: &Type) -> bool {
+        matches!(
+            ty,
+            Type::Nominal { name, .. }
+                if name == crate::types::UNSPECIFIED_ACTOR_PROTOCOL_TYPE_NAME
+        )
+    }
+
+    fn infer_actor_protocol_call(
         &mut self,
         ctx: &TypeContext,
         mut subst: Substitution,
@@ -3559,6 +3573,7 @@ impl TypeChecker {
         behavior: &str,
         args: &[Expr],
         span: Span,
+        allow_unspecified: bool,
     ) -> NuResult<(Substitution, Type)> {
         let (param, ret) = protocol_call_signature(protocol, behavior, span)?;
         let expected_args = protocol_param_types(param);
@@ -3581,6 +3596,11 @@ impl TypeChecker {
             let ctx_sub = apply_subst_to_ctx(ctx, &subst);
             let (s_arg, arg_ty) = self.infer_expr(&ctx_sub, arg)?;
             subst = compose_subst(&s_arg, &subst);
+
+            if allow_unspecified && Self::is_unspecified_actor_protocol_type(expected) {
+                continue;
+            }
+
             let s_match = mgu(
                 &apply_subst(&arg_ty, &subst),
                 &apply_subst(expected, &subst),
@@ -3589,7 +3609,24 @@ impl TypeChecker {
             subst = compose_subst(&s_match, &subst);
         }
 
-        Ok((subst.clone(), apply_subst(ret, &subst)))
+        let ret = if allow_unspecified && Self::is_unspecified_actor_protocol_type(ret) {
+            Type::Var(TypeVar::fresh())
+        } else {
+            apply_subst(ret, &subst)
+        };
+        Ok((subst, ret))
+    }
+
+    fn infer_actor_ref_call(
+        &mut self,
+        ctx: &TypeContext,
+        subst: Substitution,
+        protocol: &Type,
+        behavior: &str,
+        args: &[Expr],
+        span: Span,
+    ) -> NuResult<(Substitution, Type)> {
+        self.infer_actor_protocol_call(ctx, subst, protocol, behavior, args, span, false)
     }
 
     fn infer_actor_decl(
@@ -3599,9 +3636,70 @@ impl TypeChecker {
         state_fields: &[(String, crate::ast::StateModel, Type, Expr)],
         behaviors: &[Behavior],
         events: &[crate::ast::EventDecl],
+        version: u32,
         migrations: &[crate::ast::MigrationDecl],
-        _span: Span,
+        span: Span,
     ) -> NuResult<(Substitution, Type)> {
+        // RFC 0008: durable schema evolution must be explicit and contiguous.
+        // Reject malformed migration graphs before any body is typechecked so
+        // every later compiler/runtime stage can rely on a canonical 1->N chain.
+        if version == 0 {
+            return Err(NuError::type_error(
+                format!(
+                    "entity '{}' schema version must be a positive integer",
+                    name
+                ),
+                span,
+            ));
+        }
+
+        let mut migration_from_versions = HashSet::new();
+        for migration in migrations {
+            let expected_to = migration.from_version.checked_add(1);
+            if migration.from_version == 0 || expected_to != Some(migration.to_version) {
+                return Err(NuError::type_error(
+                    format!(
+                        "entity '{}' migration must advance exactly one schema version; found {} -> {}",
+                        name, migration.from_version, migration.to_version
+                    ),
+                    migration.span,
+                ));
+            }
+            if migration.to_version > version {
+                return Err(NuError::type_error(
+                    format!(
+                        "entity '{}' migration {} -> {} targets schema version beyond current version {}",
+                        name, migration.from_version, migration.to_version, version
+                    ),
+                    migration.span,
+                ));
+            }
+            if !migration_from_versions.insert(migration.from_version) {
+                return Err(NuError::type_error(
+                    format!(
+                        "entity '{}' declares more than one migration from schema version {}",
+                        name, migration.from_version
+                    ),
+                    migration.span,
+                ));
+            }
+        }
+
+        for from_version in 1..version {
+            if !migration_from_versions.contains(&from_version) {
+                return Err(NuError::type_error(
+                    format!(
+                        "entity '{}' is missing migration {} -> {} required for schema version {}",
+                        name,
+                        from_version,
+                        from_version + 1,
+                        version
+                    ),
+                    span,
+                ));
+            }
+        }
+
         // The actor's own name must be in scope inside its behaviors so an
         // actor can `spawn`/`send`/`ask` its own type (recursive actor graphs,
         // e.g. skynet). A placeholder `Type::Actor` suffices: spawn/send/ask
@@ -3736,9 +3834,21 @@ impl TypeChecker {
             return Ok((subst, Type::unit()));
         }
 
-        // Ordinary concrete/dynamic actor behavior remains Phase-1 compatible:
-        // the actor_protocol pre-pass validates statically known actors while
-        // opaque dynamic actors are accepted as actor-typed values.
+        if let Type::Actor {
+            behavior: protocol, ..
+        } = &resolved_actor
+        {
+            if matches!(protocol.as_ref(), Type::Record(_)) {
+                let behavior = behavior.rsplit('.').next().unwrap_or(behavior);
+                let (subst, _) =
+                    self.infer_actor_protocol_call(ctx, s1, protocol, behavior, args, span, true)?;
+                return Ok((subst, Type::unit()));
+            }
+        }
+
+        // Ordinary opaque/dynamic actor behavior remains Phase-1 compatible:
+        // actor values without a concrete behavior record retain the permissive
+        // fallback until a protocol becomes statically available.
         let fresh_actor = Type::Actor {
             state: Box::new(Type::Var(TypeVar::fresh())),
             behavior: Box::new(Type::Var(TypeVar::fresh())),
@@ -3767,6 +3877,17 @@ impl TypeChecker {
 
         if let Some(protocol) = resolved_actor.actor_ref_protocol() {
             return self.infer_actor_ref_call(ctx, s1, protocol, behavior, args, span);
+        }
+
+        if let Type::Actor {
+            behavior: protocol, ..
+        } = &resolved_actor
+        {
+            if matches!(protocol.as_ref(), Type::Record(_)) {
+                let behavior = behavior.rsplit('.').next().unwrap_or(behavior);
+                return self
+                    .infer_actor_protocol_call(ctx, s1, protocol, behavior, args, span, true);
+            }
         }
 
         let fresh_actor = Type::Actor {
@@ -3926,6 +4047,24 @@ impl TypeChecker {
     /// same cell be used at incompatible types (e.g.
     /// `let r = &[] in { r = [1]; (*r)[0] == "s" }`).
     fn do_generalize(&self, ctx: &TypeContext, ty: &Type) -> Type {
+        self.do_generalize_impl(ctx, ty, true)
+    }
+
+    /// Variant constructors describe how to build values; binding the
+    /// constructor itself does not allocate the mutable storage mentioned by
+    /// another variant alternative. Applying the mutable-storage restriction
+    /// here would make nullary constructors of recursive ADTs monomorphic
+    /// merely because a sibling constructor carries an array.
+    fn do_generalize_constructor(&self, ctx: &TypeContext, ty: &Type) -> Type {
+        self.do_generalize_impl(ctx, ty, false)
+    }
+
+    fn do_generalize_impl(
+        &self,
+        ctx: &TypeContext,
+        ty: &Type,
+        apply_value_restriction: bool,
+    ) -> Type {
         // Replace any Skolem constants with fresh type variables so they
         // become the function's polymorphic type parameters. Skolems are
         // rigid during body checking; after the body succeeds, they become
@@ -3941,7 +4080,11 @@ impl TypeChecker {
 
         let ty_fv: FxHashSet<TypeVar> = body.free_vars().into_iter().collect();
         let ctx_fv = self.get_ctx_free_vars(ctx);
-        let ref_fv: FxHashSet<TypeVar> = body.ref_free_vars().into_iter().collect();
+        let ref_fv: FxHashSet<TypeVar> = if apply_value_restriction {
+            body.ref_free_vars().into_iter().collect()
+        } else {
+            FxHashSet::default()
+        };
         let mut gen_vars: Vec<TypeVar> = ty_fv
             .difference(&ctx_fv)
             .copied()
@@ -5848,5 +5991,224 @@ mod tests {
         let expr = bin(BinOp::Range, int_lit(0), string_lit("hello"));
         let result = tc.infer_expr(&TypeContext::new(), &expr);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn migration_chain_accepts_contiguous_steps_to_current_version() {
+        let mut tc = TypeChecker::new();
+        let ctx = TypeContext::new();
+        let migrations = vec![
+            MigrationDecl {
+                from_version: 1,
+                to_version: 2,
+                state_body: None,
+                event_migrations: vec![],
+                span: sp(),
+            },
+            MigrationDecl {
+                from_version: 2,
+                to_version: 3,
+                state_body: None,
+                event_migrations: vec![],
+                span: sp(),
+            },
+        ];
+
+        assert!(tc
+            .infer_actor_decl(&ctx, "Account", &[], &[], &[], 3, &migrations, sp())
+            .is_ok());
+    }
+
+    #[test]
+    fn migration_chain_rejects_gaps_and_non_adjacent_steps() {
+        let mut tc = TypeChecker::new();
+        let ctx = TypeContext::new();
+        let gap = vec![MigrationDecl {
+            from_version: 1,
+            to_version: 2,
+            state_body: None,
+            event_migrations: vec![],
+            span: sp(),
+        }];
+        let err = tc
+            .infer_actor_decl(&ctx, "Account", &[], &[], &[], 3, &gap, sp())
+            .unwrap_err();
+        assert!(err.to_string().contains("missing migration 2 -> 3"));
+
+        let skipped = vec![MigrationDecl {
+            from_version: 1,
+            to_version: 3,
+            state_body: None,
+            event_migrations: vec![],
+            span: sp(),
+        }];
+        let err = tc
+            .infer_actor_decl(&ctx, "Account", &[], &[], &[], 3, &skipped, sp())
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("migration must advance exactly one schema version"));
+    }
+
+    #[test]
+    fn migration_chain_rejects_downgrades_duplicates_and_future_targets() {
+        let mut tc = TypeChecker::new();
+        let ctx = TypeContext::new();
+
+        let downgrade = vec![MigrationDecl {
+            from_version: 2,
+            to_version: 1,
+            state_body: None,
+            event_migrations: vec![],
+            span: sp(),
+        }];
+        assert!(tc
+            .infer_actor_decl(&ctx, "Account", &[], &[], &[], 2, &downgrade, sp())
+            .unwrap_err()
+            .to_string()
+            .contains("migration must advance exactly one schema version"));
+
+        let duplicates = vec![
+            MigrationDecl {
+                from_version: 1,
+                to_version: 2,
+                state_body: None,
+                event_migrations: vec![],
+                span: sp(),
+            },
+            MigrationDecl {
+                from_version: 1,
+                to_version: 2,
+                state_body: None,
+                event_migrations: vec![],
+                span: sp(),
+            },
+        ];
+        assert!(tc
+            .infer_actor_decl(&ctx, "Account", &[], &[], &[], 2, &duplicates, sp())
+            .unwrap_err()
+            .to_string()
+            .contains("more than one migration from schema version 1"));
+
+        let future = vec![MigrationDecl {
+            from_version: 1,
+            to_version: 2,
+            state_body: None,
+            event_migrations: vec![],
+            span: sp(),
+        }];
+        assert!(tc
+            .infer_actor_decl(&ctx, "Account", &[], &[], &[], 1, &future, sp())
+            .unwrap_err()
+            .to_string()
+            .contains("targets schema version beyond current version 1"));
+    }
+    #[test]
+    fn concrete_actor_protocol_is_enforced_without_ast_prepass() {
+        let protocol = Type::Record(vec![(
+            "ping".to_string(),
+            Type::Function {
+                param: Box::new(Type::Tuple(vec![Type::int()])),
+                ret: Box::new(Type::string()),
+                effect: EffectRow::empty(),
+                cap: Capability::Ref,
+            },
+        )]);
+        let actor_ty = Type::Actor {
+            state: Box::new(Type::Var(TypeVar::fresh())),
+            behavior: Box::new(protocol),
+        };
+        let ctx = ctx_with("target", actor_ty);
+        let mut tc = TypeChecker::new();
+
+        let bad_send = Expr::Send {
+            actor: Box::new(var("target")),
+            behavior: "ping".to_string(),
+            args: vec![string_lit("bad")],
+            remote: false,
+            span: sp(),
+        };
+        assert!(tc.infer_expr(&ctx, &bad_send).is_err());
+
+        let ask = Expr::Ask {
+            actor: Box::new(var("target")),
+            behavior: "ping".to_string(),
+            args: vec![int_lit(1)],
+            remote: false,
+            timeout_ms: None,
+            span: sp(),
+        };
+        let (subst, ty) = tc.infer_expr(&ctx, &ask).expect("typed ask");
+        assert_eq!(apply_subst(&ty, &subst), Type::string());
+
+        let missing = Expr::Send {
+            actor: Box::new(var("target")),
+            behavior: "missing".to_string(),
+            args: vec![],
+            remote: false,
+            span: sp(),
+        };
+        assert!(tc.infer_expr(&ctx, &missing).is_err());
+    }
+
+    #[test]
+    fn concrete_actor_protocol_keeps_unspecified_local_types_permissive() {
+        let unspecified = || Type::Nominal {
+            name: crate::types::UNSPECIFIED_ACTOR_PROTOCOL_TYPE_NAME.to_string(),
+            underlying: Box::new(Type::unit()),
+        };
+        let protocol = Type::Record(vec![(
+            "ping".to_string(),
+            Type::Function {
+                param: Box::new(Type::Tuple(vec![unspecified()])),
+                ret: Box::new(unspecified()),
+                effect: EffectRow::empty(),
+                cap: Capability::Ref,
+            },
+        )]);
+        let actor_ty = Type::Actor {
+            state: Box::new(Type::Var(TypeVar::fresh())),
+            behavior: Box::new(protocol),
+        };
+        let ctx = ctx_with("target", actor_ty);
+        let mut tc = TypeChecker::new();
+
+        let send = Expr::Send {
+            actor: Box::new(var("target")),
+            behavior: "ping".to_string(),
+            args: vec![string_lit("still inferred")],
+            remote: false,
+            span: sp(),
+        };
+        assert!(tc.infer_expr(&ctx, &send).is_ok());
+
+        let ask = Expr::Ask {
+            actor: Box::new(var("target")),
+            behavior: "ping".to_string(),
+            args: vec![int_lit(1)],
+            remote: false,
+            timeout_ms: None,
+            span: sp(),
+        };
+        let (_, ret) = tc.infer_expr(&ctx, &ask).expect("unannotated local ask");
+        assert!(matches!(ret, Type::Var(_)));
+    }
+
+    #[test]
+    fn opaque_actor_protocol_remains_permissive() {
+        let actor_ty = Type::Actor {
+            state: Box::new(Type::Var(TypeVar::fresh())),
+            behavior: Box::new(Type::Var(TypeVar::fresh())),
+        };
+        let ctx = ctx_with("target", actor_ty);
+        let mut tc = TypeChecker::new();
+        let send = Expr::Send {
+            actor: Box::new(var("target")),
+            behavior: "dynamic_behavior".to_string(),
+            args: vec![string_lit("anything")],
+            remote: false,
+            span: sp(),
+        };
+        assert!(tc.infer_expr(&ctx, &send).is_ok());
     }
 }
