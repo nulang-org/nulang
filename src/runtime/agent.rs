@@ -349,7 +349,7 @@ pub(crate) fn actor_state_string(rt: &Runtime, actor_id: u64, field: &str) -> Op
         let module_idx = actor.bytecode_module_idx?;
         return Some(vm.value_to_string(module_idx, value));
     }
-    vm_value_to_string(&value, actor.bytecode_module.as_ref())
+    vm_value_to_string(&value, actor.bytecode_module.as_deref())
 }
 
 // ---------------------------------------------------------------------------

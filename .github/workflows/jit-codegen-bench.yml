@@ -1,0 +1,60 @@
+name: JIT codegen benchmarks
+
+on:
+  workflow_dispatch:
+    inputs:
+      repeat:
+        description: Measured repetitions per workload
+        required: false
+        default: '5'
+  pull_request:
+    paths:
+      - '.github/workflows/jit-codegen-bench.yml'
+      - 'src/backends/mod.rs'
+      - 'src/jit/**'
+      - 'src/vm.rs'
+      - 'src/bin/nulang_jit_bench.rs'
+      - 'benchmarks/JIT_CODEGEN.md'
+      - 'Cargo.toml'
+
+concurrency:
+  group: jit-codegen-bench-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate JIT compile telemetry
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run telemetry regression
+        run: |
+          cargo test --locked --release \
+            --no-default-features \
+            --features native-codegen \
+            test_tier2_replaces_baseline_with_typed_code
+
+      - name: Run JIT telemetry workloads
+        env:
+          REPEAT: "${{ github.event_name == 'pull_request' && '1' || inputs.repeat || '5' }}"
+        run: |
+          cargo run --locked --release \
+            --no-default-features \
+            --features native-codegen \
+            --bin nulang-jit-bench -- \
+            --format jsonl --repeat "$REPEAT" | tee jit-codegen-results.jsonl
+
+      - name: Upload JIT telemetry
+        uses: actions/upload-artifact@v7
+        with:
+          name: jit-codegen-results-${{ github.sha }}
+          path: jit-codegen-results.jsonl
+          if-no-files-found: error
