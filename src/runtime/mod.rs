@@ -5449,7 +5449,22 @@ impl Runtime {
                 // Compensation failed: do not record it as completed.
                 continue;
             }
-            let _ = self.append_saga_compensated(actor_id, &step_name);
+            if let Err(error) = self.append_saga_compensated(actor_id, &step_name) {
+                // A compensating effect may already have run. Do not mark it
+                // complete in memory or dispatch more work without a durable
+                // receipt: recovery must reconcile a possible duplicate effect.
+                tracing::error!(
+                    actor_id,
+                    step_name = %step_name,
+                    %error,
+                    "nulang-workflow: compensation receipt not durable; quarantining actor"
+                );
+                self.actors.remove(&actor_id);
+                self.pending_receive_wakes
+                    .retain(|queued| *queued != actor_id);
+                self.current_actor = None;
+                return;
+            }
             if let Some(actor) = self.actors.get_mut(&actor_id) {
                 if !actor.compensated_steps.contains(&step_name) {
                     actor.compensated_steps.push(step_name);

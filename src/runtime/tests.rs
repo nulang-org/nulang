@@ -9041,3 +9041,94 @@ fn confirmed_node_removal_forgets_crdt_receiver_knowledge() {
         "a peer that rejoins after confirmed removal must receive full state"
     );
 }
+
+/// Reject only durable saga receipts so the test can distinguish a completed
+/// compensation body from acknowledgement in the persistence layer.
+struct RejectSagaReceiptStore {
+    inner: MemoryStore,
+}
+
+impl PersistenceStore for RejectSagaReceiptStore {
+    fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> std::io::Result<()> {
+        self.inner.save_snapshot(snapshot)
+    }
+    fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+        self.inner.load_snapshot(actor_id)
+    }
+    fn append_journal(&mut self, actor_id: u64, entry: JournalEntry) -> std::io::Result<()> {
+        self.inner.append_journal(actor_id, entry)
+    }
+    fn read_journal(&self, actor_id: u64) -> Vec<JournalEntry> {
+        self.inner.read_journal(actor_id)
+    }
+    fn append_workflow_event(
+        &mut self,
+        actor_id: u64,
+        event: WorkflowEvent,
+    ) -> std::io::Result<()> {
+        if matches!(event, WorkflowEvent::SagaCompensated { .. }) {
+            return Err(std::io::Error::other("injected saga receipt rejection"));
+        }
+        self.inner.append_workflow_event(actor_id, event)
+    }
+    fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
+        self.inner.read_workflow_events(actor_id)
+    }
+    fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> std::io::Result<()> {
+        self.inner.append_event(actor_id, entry)
+    }
+    fn read_events(&self, actor_id: u64) -> Vec<EventEntry> {
+        self.inner.read_events(actor_id)
+    }
+    fn latest_sequence(&self, actor_id: u64) -> u64 {
+        self.inner.latest_sequence(actor_id)
+    }
+    fn clear(&mut self, actor_id: u64) -> std::io::Result<()> {
+        self.inner.clear(actor_id)
+    }
+}
+
+#[test]
+fn saga_receipt_rejection_quarantines_actor_before_marking_compensated() {
+    let mut rt = Runtime::new();
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "receipt_rejected",
+            Box::new(|| vec![("step_index".to_string(), Value::int(1))]),
+            HashMap::from([("step_index".to_string(), StateModel::Durable)]),
+        )
+        .unwrap();
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("prepare", noop_test_behavior);
+    let safe_snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    let mut backing = MemoryStore::new();
+    backing.save_snapshot(safe_snapshot.clone()).unwrap();
+    rt.persistence = Box::new(RejectSagaReceiptStore { inner: backing });
+
+    // With no compensation bytecode installed the handler is a no-op that
+    // returns success; the receipt write is the only injected failure.
+    rt.run_saga_compensation(actor_id, 0);
+
+    assert!(
+        !rt.actors.contains_key(&actor_id),
+        "a failed durable receipt must quarantine an otherwise runnable actor"
+    );
+    assert!(
+        !rt.persistence
+            .read_workflow_events(actor_id)
+            .iter()
+            .any(|event| { matches!(event, WorkflowEvent::SagaCompensated { .. }) }),
+        "failed receipt cannot masquerade as persisted compensation"
+    );
+    assert_eq!(
+        rt.persistence.load_snapshot(actor_id).unwrap().sequence,
+        safe_snapshot.sequence,
+        "receipt rejection must preserve the last safe durable checkpoint"
+    );
+    assert!(
+        !rt.pending_receive_wakes.contains(&actor_id),
+        "a quarantined actor must not be requeued by a pending receive wake"
+    );
+}
