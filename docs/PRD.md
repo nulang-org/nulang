@@ -633,7 +633,7 @@ This appendix restates the five-layer architecture that the repositioned Nulang 
 
 ## 33.2 Nulang Runtime
 
-- Bytecode VM with register frames and NaN-tagged values.
+- Bytecode VM with register frames and canonical 64-bit tagged-word values.
 - JIT tiering via Cranelift.
 - Actor scheduler, per-actor heap, ORCA GC, cycle detector.
 - Persistence backends (memory, JSON, SQLite, future libsql/Turso).

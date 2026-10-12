@@ -39,12 +39,24 @@ impl Default for ActorBackend {
         ActorBackend::Native
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum ActorPriority {
     High,
     #[default]
     Normal,
     Low,
+}
+
+impl ActorPriority {
+    /// Strictly-higher priority levels, in High → Normal → Low order.
+    /// `prior()` is empty for High.
+    pub fn prior(self) -> &'static [ActorPriority] {
+        match self {
+            ActorPriority::High => &[],
+            ActorPriority::Normal => &[ActorPriority::High],
+            ActorPriority::Low => &[ActorPriority::High, ActorPriority::Normal],
+        }
+    }
 }
 
 /// Scheduler ownership state for an actor.
@@ -265,7 +277,7 @@ pub struct Actor {
     /// Names of steps already compensated (used during recovery replay).
     pub compensated_steps: Vec<String>,
     /// Bytecode module used by this actor's bytecode behaviors.
-    pub bytecode_module: Option<crate::bytecode::CodeModule>,
+    pub bytecode_module: Option<Box<crate::bytecode::CodeModule>>,
     /// Index of the loaded bytecode module in the runtime VM.
     pub bytecode_module_idx: Option<usize>,
     pub parent: Option<u64>, // Supervisor
@@ -281,6 +293,24 @@ pub struct Actor {
     turn_reductions: u32,     // Messages handled in the current scheduling turn
     pub max_reductions: u32,  // Max reductions per turn before yield (preemption)
     pub sequence: u64,        // Last persisted sequence number
+    /// Monotonic fencing epoch for durable ownership of this logical actor.
+    ///
+    /// This is the canonical live source of truth used by snapshots,
+    /// failover directory announcements, and atomic durable transitions.
+    pub activation_epoch: u64,
+    /// Accepted workflow command currently executing on this actor.
+    ///
+    /// Set after the command is durably journaled and cleared when the direct
+    /// turn ends. If execution suspends, the identity is copied into
+    /// `SuspendedExecution` so later resumes close the same activation.
+    pub current_workflow_activation: Option<WorkflowActivationId>,
+    /// Activation whose intermediate custom-event ordinal is currently tracked.
+    ///
+    /// This is execution-local replay state, not durable state. A later replay
+    /// slice will restore/consume it from committed event history.
+    pub workflow_replay_activation: Option<WorkflowActivationId>,
+    /// Next deterministic custom-event ordinal within `workflow_replay_activation`.
+    pub workflow_replay_event_ordinal: u32,
     /// Sentinel heap object used by the cycle detector to represent this
     /// actor as a holder of foreign references.
     cycle_sentinel: Option<*mut OrcaHeader>,
@@ -376,6 +406,8 @@ pub struct ReceiveWaitState {
 pub struct SuspendedExecution {
     pub vm_state: crate::vm::SuspendedVmState,
     pub behavior_idx: usize,
+    /// Stable identity of the accepted workflow command being resumed.
+    pub activation: Option<WorkflowActivationId>,
     pub step_name: String,
 }
 
@@ -427,6 +459,10 @@ impl Actor {
             turn_reductions: 0,
             max_reductions: 1000,
             sequence: 0,
+            activation_epoch: crate::runtime::persistence::INITIAL_ACTIVATION_EPOCH,
+            current_workflow_activation: None,
+            workflow_replay_activation: None,
+            workflow_replay_event_ordinal: 0,
             cycle_sentinel: None,
             suspended_execution: None,
             waiting_signal: None,
@@ -453,6 +489,76 @@ impl Actor {
             held_objects: HashSet::new(),
             held_object_store: None,
         }
+    }
+
+    /// Reset this actor instance for reuse (pooling).
+    pub fn reset(&mut self, id: u64, name: impl Into<String>, mailbox_cap: usize) {
+        self.id = id;
+        self.name = name.into();
+        self.state = ActorState::Created;
+        self.mailbox.reset(mailbox_cap);
+        self.heap.reset();
+        self.heap.set_actor_id(id);
+        self.orca_gc.reset(id);
+        self.iso_arena.reset();
+        self.state_data.clear();
+        self.state_models.clear();
+        self.event_log.clear();
+        self.event_sourced_sequences.clear();
+        self.event_sourced_compaction_interval = 100;
+        self.persistent = false;
+        self.is_workflow = false;
+        self.behavior_table.clear();
+        #[cfg(feature = "native-codegen")]
+        self.aot_targets.clear();
+        self.bytecode_offsets.clear();
+        self.compensation_offsets.clear();
+        self.compensated_steps.clear();
+        self.bytecode_module = None;
+        self.bytecode_module_idx = None;
+        self.parent = None;
+        self.children.clear();
+        self.monitors.clear();
+        self.links.clear();
+        self.trap_exits = false;
+        self.priority = ActorPriority::Normal;
+        self.run_state = ActorRunState::Idle;
+        self.jit_safepoint_counter = crate::backends::JIT_SAFEPOINT_BUDGET;
+        self.jit_yield_pending = false;
+        self.reduction_count = 0;
+        self.turn_reductions = 0;
+        self.max_reductions = 1000;
+        self.sequence = 0;
+        self.activation_epoch = crate::runtime::persistence::INITIAL_ACTIVATION_EPOCH;
+        self.current_workflow_activation = None;
+        self.workflow_replay_activation = None;
+        self.workflow_replay_event_ordinal = 0;
+        self.cycle_sentinel = None;
+        self.suspended_execution = None;
+        self.waiting_signal = None;
+        self.received_signals.clear();
+        self.query_handlers.clear();
+        self.is_agent = false;
+        self.capabilities.clear();
+        self.backend = ActorBackend::default();
+        #[cfg(feature = "ai-runtime")]
+        {
+            self.llm_inflight = false;
+            self.llm_pending_prompt = None;
+            self.llm_completed = None;
+        }
+        self.dirty_fields.clear();
+        self.receive_wait = None;
+        self.timer_sleep_fired = false;
+        self.retry_config = None;
+        // flight_recorder is left as-is, just clear entries
+        self.flight_recorder = FlightRecorder::runtime_default(1000);
+        self.fallback_config.clear();
+        self.hibernation_state = None;
+        self.idle_ms = 0;
+        self.pinned = false;
+        self.held_objects.clear();
+        self.held_object_store = None;
     }
 
     /// Hibernate this actor: serialize its state and VM continuation,
@@ -634,6 +740,55 @@ impl Actor {
     pub fn increment_reductions(&mut self, count: u32) {
         self.reduction_count += count;
         self.turn_reductions += count;
+    }
+
+    /// Convert one actor-owned runtime value into its durable representation.
+    ///
+    /// Constant-pool strings resolve through the actor module. Heap-backed
+    /// strings are accepted only when the pointer exactly matches a live
+    /// allocation tagged `TypeTag::String`; arbitrary pointers fail closed
+    /// through `from_value_resolved` instead of being interpreted as C strings.
+    pub(crate) fn persist_value(&self, value: &Value) -> PersistedValue {
+        if let Some(ptr) = value.as_ptr() {
+            if ptr.is_null() {
+                return PersistedValue::Nil;
+            }
+
+            let mut resolved = None;
+            self.heap.iter_live_objects(|header, payload, _| {
+                if resolved.is_some() || payload != ptr {
+                    return;
+                }
+
+                // SAFETY: iter_live_objects yields headers for live allocations
+                // in this actor heap. Equality with ptr proves exact allocation
+                // provenance before metadata or payload bytes are inspected.
+                let header = unsafe { &*header };
+                if header.type_tag != TypeTag::String || header.payload_size == 0 {
+                    return;
+                }
+
+                // SAFETY: payload_size is the requested size of this live
+                // allocation, so the slice stays within the object. Runtime
+                // strings are UTF-8 bytes followed by a trailing NUL.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(payload as *const u8, header.payload_size)
+                };
+                let Some(nul) = bytes.iter().position(|byte| *byte == 0) else {
+                    return;
+                };
+                let Ok(text) = std::str::from_utf8(&bytes[..nul]) else {
+                    return;
+                };
+                resolved = Some(PersistedValue::String(text.to_owned()));
+            });
+
+            return resolved.unwrap_or_else(|| {
+                PersistedValue::from_value_resolved(value, self.bytecode_module.as_deref())
+            });
+        }
+
+        PersistedValue::from_value_resolved(value, self.bytecode_module.as_deref())
     }
 
     /// Allocate a null-terminated string on the actor heap and return a pointer
