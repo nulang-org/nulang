@@ -93,6 +93,8 @@ class JitExecutionContract(unittest.TestCase):
             body.index("let start = Instant::now();"),
         )
         self.assertIn("set_state_field(\"total\", Value::int(0))", body)
+        self.assertIn("let compiled_before =", body)
+        self.assertIn("benchmark_jit_compiled_count() > compiled_before", body)
         self.assertIn("assert_eq!(\n        actual,\n        Some(per_message * N)", body)
         self.assertIn('benchmark: "actor_compute"', body)
 
