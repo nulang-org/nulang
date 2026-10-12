@@ -62,7 +62,7 @@ class CrossRuntimeRunnerIntegrationTests(unittest.TestCase):
     def test_phases_preserved_in_samples_and_summary(self):
         from cross_runtime_bench import parse_records, summarize
 
-        output = '\\n'.join([
+        output = '\n'.join([
             '[cross-bench] runtime=nulang benchmark=counting messages=200000 elapsed_ns=100',
             '[cross-bench] runtime=nulang benchmark=ping_pong messages=40001 elapsed_ns=200',
             '[cross-bench] runtime=nulang benchmark=thread_ring messages=20000 elapsed_ns=300',
@@ -80,7 +80,7 @@ class CrossRuntimeRunnerIntegrationTests(unittest.TestCase):
     def test_runner_rejects_incorrect_phase_sum(self):
         from cross_runtime_bench import parse_records
 
-        output = '\\n'.join([
+        output = '\n'.join([
             '[cross-bench] runtime=nulang benchmark=counting messages=200000 elapsed_ns=100',
             '[cross-bench] runtime=nulang benchmark=ping_pong messages=40001 elapsed_ns=200',
             '[cross-bench] runtime=nulang benchmark=thread_ring messages=20000 elapsed_ns=300',
