@@ -41,6 +41,10 @@ pub mod effect_checker;
 pub mod prelude_source;
 #[path = "../../../src/parser.rs"]
 pub mod parser;
+#[path = "../../../src/parallel_analysis.rs"]
+pub mod parallel_analysis;
+#[path = "../../../src/parallel_marker.rs"]
+pub mod parallel_marker;
 #[path = "../../../src/stdlib.rs"]
 pub mod stdlib;
 #[path = "../../../src/typechecker.rs"]
@@ -59,6 +63,10 @@ pub mod bytecode;
 pub mod format;
 #[path = "../../../src/mir.rs"]
 pub mod mir;
+#[path = "../../../src/content_identity.rs"]
+pub mod content_identity;
+#[path = "../../../src/semantic_identity.rs"]
+pub mod semantic_identity;
 #[path = "../../../src/mir_inline.rs"]
 pub mod mir_inline;
 #[path = "../../../src/mir_lower.rs"]

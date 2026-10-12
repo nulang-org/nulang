@@ -2255,9 +2255,15 @@ so *every* field silently reverted to the `Local` default the moment
 an actor recovered once -- a second crash would have dropped `durable`
 fields from the snapshot entirely, and `event_sourced` fields would
 have stopped accumulating altogether (the "+1 per emit" bump above
-iterates `state_models` to find which fields to bump). Fixed by
-restoring `state_models` from the recovery module's `actor_metadata`
-in the same place `bytecode_module`/`bytecode_offsets` are restored.
+iterates `state_models` to find which fields to bump). Recovery now
+restores declared models from the recovery module's `actor_metadata`
+and also reconstructs missing runtime-created models from existing
+durable records without changing the snapshot format: snapshot state
+implies Durable unless its CRDT field/id/type metadata identifies a
+specific CRDT model, while event-journal field names imply EventSourced.
+This preserves persistence semantics across repeated recovery even when
+the actor was created through the runtime API rather than a source-level
+actor declaration.
 
 ## 9.7 Deterministic Replay
 
@@ -2309,14 +2315,12 @@ entry. `read` materializes the value back into `state_data`, so `self.field`
 reads stay consistent. `.nula`-level conformance coverage lives in
 `conformance/behavior/crdt_*.nula`.
 
-**Recovery limitation:** `recover_actor` restores the materialized
-`state_data` value and the `CrdtManager` entries from `crdt_snapshot`, but
-does not rebuild `CrdtManager.field_map` (the `(actor_id, field_name) →
-CrdtId` link is not persisted). On a recovered actor, `self.field` still
-reads the materialized value, but `perform Crdt.*` is a silent nil no-op
-until the field is re-registered. Pinned by
-`test_crdt_field_survives_recovery` (a post-recovery `Crdt.increment`
-leaves `state_data["count"]` unchanged).
+**Recovery status (fixed):** snapshots persist both CRDT replica state and
+the per-actor field-to-`CrdtId` mapping. `recover_actor` restores the CRDT
+entries, rebuilds `CrdtManager.field_map` and `field_reverse`, then
+idempotently re-registers declared CRDT fields after actor metadata is restored.
+As a result, `perform Crdt.*` continues to target the same recovered replica
+instead of degrading to a silent nil no-op after restart.
 ---
 
 # Chapter 10: Workflows
