@@ -62,6 +62,37 @@ class GitHubActionsCIContractTests(unittest.TestCase):
         self.assertIn("cluster_split_brain", policy)
         self.assertIn("retries = 2", policy)
 
+    def test_pull_request_workflows_cancel_superseded_runs(self):
+        workflow_dir = ROOT / ".github" / "workflows"
+
+        for path in sorted(workflow_dir.glob("*.yml")):
+            source = path.read_text(encoding="utf-8")
+            header = source.split("\njobs:", 1)[0]
+            if "pull_request" not in header:
+                continue
+            with self.subTest(workflow=path.name):
+                self.assertIn(
+                    "concurrency:",
+                    header,
+                    f"{path.name} runs on pull_request without superseded-run cancellation",
+                )
+                self.assertIn(
+                    "cancel-in-progress:",
+                    header,
+                    f"{path.name} must declare cancel-in-progress",
+                )
+
+    def test_release_workflow_never_cancels_a_publish(self):
+        release = (ROOT / ".github" / "workflows" / "release.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            "cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
+            release,
+            "release.yml must cancel only pull-request runs, never a tag publish",
+        )
+
     def test_contract_is_enforced_by_the_implementation_gate(self):
         gate = (ROOT / "scripts" / "verify_implementation.py").read_text(encoding="utf-8")
 

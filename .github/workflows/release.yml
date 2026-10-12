@@ -14,6 +14,13 @@ on:
       - 'scripts/check_release_linux.sh'
       - 'scripts/tests/test_release_cli_profile.py'
 
+# Superseded pull-request runs are cancelled to save runners, but a
+# tag-triggered release is never cancelled: cancel-in-progress is scoped to
+# pull_request events so a publish can't be interrupted mid-flight.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   # The repo's .cargo/config.toml sets target-dir=/tmp/cargo-target for
