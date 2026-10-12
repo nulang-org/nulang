@@ -2,6 +2,9 @@
 ### NLAP task-attempt lease fencing contract — 2026-09-28
 - **NLAP now distinguishes logical tasks from concrete worker attempts.** `TaskAttempt` carries retry lineage, worker identity, lifecycle state, and a monotonic lease epoch so retries and reassignments do not reuse one ambiguous task execution identity.
 - **`TaskLease` provides the runtime-neutral fencing proof for one authoritative attempt.** Swarm events carry attempt and lease identity explicitly, allowing Nulang Cloud to reject stale workers and bind durable side effects to the exact attempt that owns the task.
+### Public CLI release portability — 2026-10-11
+- **Public release archives use the `release-cli` feature profile without a Python shared-library ABI dependency.** The ordinary full/default source build retains opt-in Python interoperability; release packaging checks the resulting Linux and macOS binary for Python dependencies.
+- **Release PRs rehearse the full non-publishing four-platform build matrix before tags are created.** The Linux ARM64 cross build explicitly installs target libc development headers and preflights a target-compiler C header probe, avoiding an observed `ring` compile failure when `--no-install-recommends` omits the ARM64 sysroot. Actual cross-build and clean-host portability remain release gates.
 ### Runtime soundness and checked negation — native/AOT backend parity — 2026-10-10
 - **AOT no longer claims raw-Int/Float registers for values that can be nil
   at runtime.** Nightly differential fuzz caught interpreter/AOT divergences
