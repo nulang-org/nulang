@@ -10,22 +10,26 @@ from bench_orca_header_profiles import criterion_means, summarize  # noqa: E402
 
 
 class OrcaHeaderBenchmarkReporterTests(unittest.TestCase):
-    def test_reads_criterion_mean_from_group_parameter(self):
+    def test_reads_all_criterion_means_from_group_and_parameter(self):
         with tempfile.TemporaryDirectory() as folder:
             criterion = Path(folder)
-            file = criterion / "gc" / "actor_heap_small_alloc" / "payload_16" / "new" / "estimates.json"
-            file.parent.mkdir(parents=True)
-            file.write_text(json.dumps({"mean": {"point_estimate": 123.5}}), encoding="utf-8")
-            second = criterion / "gc" / "orca_local_alloc_drop" / "payload_16" / "new" / "estimates.json"
-            second.parent.mkdir(parents=True)
-            second.write_text(json.dumps({"mean": {"point_estimate": 200.0}}), encoding="utf-8")
-            self.assertEqual(
-                criterion_means(criterion),
-                {
-                    "gc/actor_heap_small_alloc/payload_16": 123.5,
-                    "gc/orca_local_alloc_drop/payload_16": 200.0,
-                },
-            )
+            expected = {}
+            for group, estimate in (
+                ("actor_heap_small_alloc", 123.5),
+                ("orca_local_alloc_drop", 200.0),
+            ):
+                for payload_size in (8, 16, 32, 64, 128):
+                    file = (
+                        criterion / "gc" / group / f"payload_{payload_size}"
+                        / "new" / "estimates.json"
+                    )
+                    file.parent.mkdir(parents=True, exist_ok=True)
+                    file.write_text(
+                        json.dumps({"mean": {"point_estimate": estimate}}),
+                        encoding="utf-8",
+                    )
+                    expected[f"gc/{group}/payload_{payload_size}"] = estimate
+            self.assertEqual(criterion_means(criterion), expected)
 
     def test_fails_if_one_benchmark_group_did_not_run(self):
         with tempfile.TemporaryDirectory() as folder:
