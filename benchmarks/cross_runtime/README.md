@@ -77,3 +77,19 @@ In particular:
 For actor-framework comparisons (for example Pony, Ractor/Actix/Kameo,
 Proto.Actor, or Pekko/Akka), add separate pinned fixtures instead of silently
 changing these standard-runtime baselines.
+
+## Nulang enqueue/drain phase attribution
+
+For `counting` and `fork_join`, the Nulang fixture now emits two timing
+components from the **same clock interval**: `enqueue_ns` measures the
+producer's initial message burst; `drain_ns` measures the subsequent actor
+scheduler run. Their sum must equal the original `elapsed_ns`. The Python
+harness fails closed if records are missing, duplicated, malformed, or
+inconsistent, and persists these fields in `samples` plus their medians in
+`summary`. The other workloads do not have a producer burst to split.
+
+These are **Nulang-only diagnostic components**, not fair comparisons of
+phase-specific throughput between runtimes. Go, Erlang, and Rust can consume
+concurrently with production, whereas the Nulang fixture still enqueues and
+then drains. Total elapsed time and the four original workload contracts remain
+unchanged. This instrumentation does not establish a performance improvement.
