@@ -23,6 +23,10 @@ from statistics import mean
 from typing import Any
 
 FILTERS = ("gc/actor_heap_small_alloc", "gc/orca_local_alloc_drop")
+PAYLOAD_SIZES = (8, 16, 32, 64, 128)
+EXPECTED_BENCHMARKS = {
+    f"{group}/payload_{size}" for group in FILTERS for size in PAYLOAD_SIZES
+}
 PROFILES = ("default", "compact", "compact", "default")
 
 
@@ -47,12 +51,24 @@ def criterion_means(criterion_dir: Path) -> dict[str, float]:
     ]
     if missing:
         raise RuntimeError(f"Missing Criterion groups in {criterion_dir}: {missing}")
+    absent = sorted(EXPECTED_BENCHMARKS - values.keys())
+    extra = sorted(values.keys() - EXPECTED_BENCHMARKS)
+    if absent or extra:
+        raise RuntimeError(
+            f"Missing Criterion benchmarks in {criterion_dir}: {absent}; "
+            f"unexpected benchmarks: {extra}"
+        )
     return values
 
 
 def summarize(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Compute per-benchmark means and signed latency changes, no speedup claims."""
     by_name: dict[str, dict[str, list[float]]] = {}
+    if samples:
+        expected = set(samples[0]["means_ns"])
+        for sample in samples[1:]:
+            if set(sample["means_ns"]) != expected:
+                raise ValueError("Mismatched benchmark IDs across paired profile runs")
     for sample in samples:
         profile = sample["profile"]
         for name, latency in sample["means_ns"].items():
