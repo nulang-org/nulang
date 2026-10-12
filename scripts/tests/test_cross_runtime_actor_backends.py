@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from cross_runtime_bench import COMPUTE_BENCHMARKS, parse_records
+from cross_runtime_bench import COMPUTE_BENCHMARKS, paired_backend_speedups, parse_records
 
 
 class ActorComputeBackendTests(unittest.TestCase):
@@ -50,6 +50,37 @@ class ActorComputeBackendTests(unittest.TestCase):
         record = "[cross-bench] runtime=nulang-aot benchmark=counting messages=200000 elapsed_ns=100"
         with self.assertRaisesRegex(RuntimeError, "did not emit"):
             parse_records(record, "nulang-aot", COMPUTE_BENCHMARKS)
+
+    def test_paired_speedups_align_same_round_samples(self):
+        samples = {
+            "nulang": {"actor_compute": [
+                {"messages": 128, "elapsed_ns": 300},
+                {"messages": 128, "elapsed_ns": 600},
+                {"messages": 128, "elapsed_ns": 900},
+            ]},
+            "nulang-jit": {"actor_compute": [
+                {"messages": 128, "elapsed_ns": 100},
+                {"messages": 128, "elapsed_ns": 300},
+                {"messages": 128, "elapsed_ns": 300},
+            ]},
+            "nulang-aot": {"actor_compute": [
+                {"messages": 128, "elapsed_ns": 150},
+                {"messages": 128, "elapsed_ns": 300},
+                {"messages": 128, "elapsed_ns": 450},
+            ]},
+        }
+        result = paired_backend_speedups(samples)
+        self.assertEqual(result["nulang-jit"]["median_speedup_vs_bytecode"], 3.0)
+        self.assertEqual(result["nulang-aot"]["median_speedup_vs_bytecode"], 2.0)
+        self.assertEqual(result["nulang-jit"]["paired_rounds"], 3)
+
+    def test_paired_speedups_reject_mismatched_sample_counts(self):
+        samples = {
+            "nulang": {"actor_compute": [{"messages": 128, "elapsed_ns": 200}]},
+            "nulang-aot": {"actor_compute": []},
+        }
+        with self.assertRaisesRegex(RuntimeError, "paired sample count"):
+            paired_backend_speedups(samples)
 
 
 if __name__ == "__main__":
