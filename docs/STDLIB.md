@@ -290,6 +290,19 @@ let r = remove(c, 1)             // [2]
 
 Map operations over arrays of `{key, value}` records. Keys and values are inferred from use. Key lookup is O(n), and `get` returns `Option[value]` so absence is explicit.
 
+**Two different map representations exist:** this `stdlib::map` module implements
+**value-style operations** over ordinary arrays; the unqualified built-in
+`perform Map.*` **effect** operates on a mutable open-addressed hash map.
+The effect uses map-first argument order (`Map.insert(m, k, v)`) and returns
+`nil` for absent lookups. In contrast this module uses key-first
+`insert(k, v, m)` and `get(k, m) -> Option[V]`. These types are **not
+interchangeable**, and converting this module to a mutable map would break
+its snapshot/value semantics. See [issue #1575](https://github.com/nulang-org/nulang/issues/1575)
+for the longer-term typed API convergence plan. Avoid relying on the array
+implementation's performance for large maps: building or merging many entries
+is O(n²) in the worst case.
+
+
 > **Caveat**: `map` and `set` both export `empty`, `size`, `remove`, and
 > `is_empty`. Importing both in the same file causes name collisions — import
 > one at a time, or use distinct names via aliasing at the call site.
@@ -305,6 +318,10 @@ Map operations over arrays of `{key, value}` records. Keys and values are inferr
 | `is_empty` | `fn is_empty(m)` | True when the map is empty. |
 | `keys` | `fn keys(m)` | Return an array of all keys. |
 | `values` | `fn values(m)` | Return an array of all values. |
+| `from_pairs` | `fn from_pairs(entries)` | Build a value map from key/value tuples; last duplicate wins, first key position is preserved. |
+| `to_pairs` | `fn to_pairs(m)` | Export the map as key/value tuples in insertion order. |
+| `merge` | `fn merge(left, right)` | Nonmutating merge; the right-hand map wins on duplicate keys. |
+| `get_or` | `fn get_or(k, m, fallback)` | Return a value or a fallback when the key is absent. |
 
 ### Usage
 
