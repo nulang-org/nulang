@@ -1,5 +1,14 @@
 # Nulang Changelog
 
+### Experimental Web mutation provenance and method safety — 2026-10-12
+- **Experimental Web routes now reject state-changing requests without a matching Origin or trusted Referer.** Unknown HTTP methods return HTTP 405 instead of silently falling back to GET; unsafe routes are denied before handler execution. Trusted reverse proxies must explicitly configure `NULANG_WEB_PUBLIC_ORIGIN`, and non-browser API clients must provide same-origin provenance.
+- **This is a request-provenance gate, not authentication.** User/tenant authorization, session-bound CSRF tokens, and independent low-level HTTP handler security remain separate application responsibilities.
+
+
+### Public CLI release portability — 2026-10-11
+- **Public release archives use the `release-cli` feature profile without a Python shared-library ABI dependency.** The ordinary full/default source build retains opt-in Python interoperability; release packaging checks the resulting Linux and macOS binary for Python dependencies.
+- **Release PRs rehearse the full non-publishing four-platform build matrix before tags are created.** The Linux ARM64 cross build explicitly installs target libc development headers and preflights a target-compiler C header probe, avoiding an observed `ring` compile failure when `--no-install-recommends` omits the ARM64 sysroot. Actual cross-build and clean-host portability remain release gates.
+
 ### Runtime soundness and checked negation — native/AOT backend parity — 2026-10-10
 - **AOT no longer claims raw-Int/Float registers for values that can be nil
   at runtime.** Nightly differential fuzz caught interpreter/AOT divergences
