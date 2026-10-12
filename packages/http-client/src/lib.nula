@@ -151,13 +151,22 @@ pub fn validate_transport(req) {
 pub fn send_request_checked(req) {
     match validate_transport(req) {
         Error(message) => Error(message),
-        Ok(_) => {
-            let response = send_request(req);
-            if response == nil then {
-                Error("Http.get/post failed (status and cause unavailable)")
-            } else {
-                Ok(response)
-            }
-        },
+        Ok(_) => normalize_legacy_response(send_request(req)),
+    }
+}
+
+/// Normalize legacy Http effect output without inventing status metadata.
+/// The standalone VM built without `ureq` returns a *successful String*
+/// containing this fixed diagnostic. Reject it as an error along with nil.
+/// A real server whose body exactly matches that diagnostic is conservatively
+/// treated as a failure; only a versioned typed host transport can avoid
+/// this collision while retaining legacy effect compatibility.
+pub fn normalize_legacy_response(response) {
+    if response == nil then {
+        Error("Http.get/post failed (status and cause unavailable)")
+    } else if response == "HTTP client disabled (feature 'ureq' not enabled)" then {
+        Error("HTTP client unavailable (ureq feature disabled)")
+    } else {
+        Ok(response)
     }
 }
