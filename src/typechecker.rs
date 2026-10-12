@@ -1076,6 +1076,12 @@ pub struct TypeChecker {
     pub collect_errors: bool,
     /// Errors collected when `collect_errors` is set (empty otherwise).
     pub collected_errors: Vec<crate::types::NuError>,
+    /// Non-fatal semantic diagnostics collected during type inference.
+    ///
+    /// Coverage warnings are based on fully inferred scrutinee types and are
+    /// kept separate from parser deprecations so all frontends can consume
+    /// the same semantic result.
+    pub warnings: Vec<NuWarning>,
 }
 
 /// Pre-computed class and instance tables extracted from an AST module.
@@ -1157,7 +1163,13 @@ impl TypeChecker {
             rigid_vars: FxHashSet::default(),
             collect_errors: false,
             collected_errors: Vec::new(),
+            warnings: Vec::new(),
         }
+    }
+
+    /// Consume semantic warnings produced by the most recent module check.
+    pub fn take_warnings(&mut self) -> Vec<NuWarning> {
+        std::mem::take(&mut self.warnings)
     }
 
     /// Type-check an entire module, returning the type of the last declaration.
@@ -1170,6 +1182,9 @@ impl TypeChecker {
 
     /// Type-check an entire module, returning the type of the last declaration.
     pub fn check_module(&mut self, module: &AstModule) -> NuResult<Type> {
+        // Warnings describe one module check. Reusing a TypeChecker must not
+        // duplicate diagnostics from an earlier module.
+        self.warnings.clear();
         // Enrich statically known actor sends/asks with protocol constraints
         // before ordinary Algorithm-W inference. Dynamic actor references
         // remain permissive for compatibility; explicit ActorRef<P> values
@@ -3399,6 +3414,21 @@ impl TypeChecker {
             )?;
             final_subst = compose_subst(&s, &final_subst);
         }
+
+        // Coverage is diagnostic-only in the current compatibility model:
+        // preserve the runtime fallback, but warn when a finite domain is
+        // provably incomplete or contains unreachable arms.
+        let coverage_ty = apply_subst(&scrut_ty, &final_subst);
+        let coverage_arms: Vec<(Pattern, bool)> = arms
+            .iter()
+            .map(|(pattern, guard, _)| (pattern.clone(), guard.is_some()))
+            .collect();
+        self.warnings
+            .extend(crate::pattern_coverage::warnings_for_match(
+                &coverage_ty,
+                &coverage_arms,
+                span,
+            ));
 
         Ok((final_subst.clone(), apply_subst(&first_arm, &final_subst)))
     }

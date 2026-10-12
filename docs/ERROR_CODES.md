@@ -102,11 +102,19 @@ by `render_warning`/`format_warning` (src/diagnostic.rs) with a
 | Range   | Category                                  |
 |---------|-------------------------------------------|
 | `W01xx` | Deprecations                              |
+| `W02xx` | Static pattern analysis                   |
 
 | Code    | Meaning                                   | Replacement (RFC)        |
 |---------|-------------------------------------------|--------------------------|
 | `W0101` | Deprecated `catch` expression (all forms) | `match` on `Ok`/`Error`, `?` under `T ! E` (RFC 0015) |
 | `W0102` | Deprecated `fail` expression              | `return Error(...)` under `T ! E` (RFC 0015) |
+| `W0201` | Provably non-exhaustive finite-domain `match` | Add arms for the reported missing constructor/value witnesses |
+| `W0202` | Provably redundant/unreachable finite-domain match arm | Remove, move, or refine the reported arm(s) |
+
+Finite-domain coverage diagnostics remain warnings by default to preserve the
+current source-compatibility contract. `--deny-warnings` provides opt-in
+strict rejection while the runtime non-exhaustive-match fallback remains
+authoritative for unsupported or infinite domains.
 
 See `docs/MIGRATION_RFC_0015.md` for the `catch`/`fail` migration guide.
 
