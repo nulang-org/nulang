@@ -8981,3 +8981,54 @@ mod vm_tests {
         }
     }
 }
+
+
+#[cfg(test)]
+mod map_tombstone_orca_regressions {
+    use super::*;
+
+    #[test]
+    fn removed_heap_value_is_not_released_twice_when_map_is_freed() {
+        let mut vm = StandaloneVmCallbacks::new();
+        let map = hashmap_op(&mut vm, &[], "new", &[]).expect("map allocation");
+        let value_ptr = vm.alloc(16, HeapTypeTag::Raw).expect("value allocation");
+        // SAFETY: the pointer was just allocated in this VM's owned heap.
+        let value = unsafe { Value::ptr(value_ptr) };
+
+        let map = hashmap_op(&mut vm, &[], "insert", &[map, Value::int(7), value])
+            .expect("insert");
+        assert_eq!(vm.heap.live_count(), 2, "map and value must be live");
+
+        let map = hashmap_op(&mut vm, &[], "remove", &[map, Value::int(7)])
+            .expect("remove");
+        assert_eq!(vm.heap.live_count(), 2, "the caller still owns the value");
+        let map_ptr = map.as_ptr().expect("map pointer");
+
+        let mut tombstones = 0;
+        for idx in 0..map_capacity(map_ptr) {
+            // SAFETY: the map allocation has 2 + cap * 3 initialized Value slots.
+            let base = unsafe { (map_ptr as *const Value).add(map_entry_slot(idx)) };
+            if unsafe { *base }.as_int() == Some(MAP_TOMB) {
+                tombstones += 1;
+                assert!(
+                    unsafe { *base.add(1) }.as_ptr().is_none(),
+                    "a deleted map entry must not retain a key pointer"
+                );
+                assert!(
+                    unsafe { *base.add(2) }.as_ptr().is_none(),
+                    "a deleted map entry must not retain a value pointer"
+                );
+            }
+        }
+        assert_eq!(tombstones, 1, "removed entry must become a tombstone");
+
+        vm.drop_ref(map_ptr);
+        assert_eq!(
+            vm.heap.live_count(),
+            1,
+            "freeing the map must not release the caller-owned value again"
+        );
+        vm.drop_ref(value_ptr);
+        assert_eq!(vm.heap.live_count(), 0, "all references now released");
+    }
+}
