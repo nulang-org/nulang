@@ -365,7 +365,7 @@ impl Supervisor {
         new_actor.state = ActorState::Running;
         new_actor.parent = Some(self.id);
         if let Some(module) = &template.bytecode_module {
-            new_actor.bytecode_module = Some(module.clone());
+            new_actor.bytecode_module = Some(Box::new(module.clone()));
             runtime.register_recovery_module(
                 new_id,
                 module.clone(),

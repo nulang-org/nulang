@@ -56,17 +56,29 @@ Built-in operations are implemented in one of two places:
 ## Using Built-in Effects
 
 ```nulang
-// IO effects work everywhere
-perform IO.print("Hello, World!")
-perform IO.println("With a newline")
-let input = perform IO.read()
+// Actor-only effects belong inside actor behaviors.
+actor Service {
+    behavior connect(peer) {
+        perform Actor.register("my_service")
+        perform Actor.link(peer)
+    }
+}
 
-// Actor effects require the runtime
-perform Actor.register("my_service")
-perform Actor.link(some_actor)
+actor Peer {
+    behavior ping() { unit }
+}
 
-// OTP effects for supervision
-let sup = perform Otp.create_supervisor("my_sup", 0)
+fn main() {
+    perform IO.print("Hello, World!")
+    perform IO.println("With a newline")
+    let service = spawn Service {}
+    let peer = spawn Peer {}
+    service ! connect(peer)
+
+    // OTP supervision is provided by the runtime host.
+    let sup = perform Otp.create_supervisor("my_sup", 0)
+    0
+}
 ```
 
 ## Adding New Built-in Effects
