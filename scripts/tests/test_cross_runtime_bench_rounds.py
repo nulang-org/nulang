@@ -26,11 +26,17 @@ class CrossRuntimeExecutionOrderTests(unittest.TestCase):
         def fake_command_output(command, **_kwargs):
             runtime = command[0]
             observed.append(runtime)
-            return "\n".join(
+            output = "\n".join(
                 f"[cross-bench] runtime={runtime} benchmark={benchmark} "
                 "messages=200 elapsed_ns=10000"
                 for benchmark in cross_runtime_bench.BENCHMARKS
             )
+            if runtime == "nulang":
+                output += (
+                    "\n[cross-phase] runtime=nulang benchmark=counting enqueue_ns=4000 drain_ns=6000"
+                    "\n[cross-phase] runtime=nulang benchmark=fork_join enqueue_ns=2500 drain_ns=7500"
+                )
+            return output
 
         with tempfile.TemporaryDirectory() as directory:
             report_path = Path(directory) / "comparison.json"
@@ -62,6 +68,12 @@ class CrossRuntimeExecutionOrderTests(unittest.TestCase):
 
             report = json.loads(report_path.read_text())
             self.assertEqual(report["measured_execution_orders"], rounds)
+            self.assertEqual(
+                report["summary"]["nulang"]["counting"]["median_enqueue_ns"], 4000
+            )
+            self.assertEqual(
+                report["summary"]["nulang"]["fork_join"]["median_drain_ns"], 7500
+            )
             for runtime in runtimes:
                 self.assertEqual(
                     report["summary"][runtime]["counting"]["samples"], 8

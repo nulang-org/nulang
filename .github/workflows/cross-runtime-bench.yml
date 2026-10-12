@@ -26,6 +26,7 @@ on:
       - 'benchmarks/README.md'
       - 'scripts/cross_runtime_bench.py'
       - 'scripts/cross_runtime_order.py'
+      - 'scripts/cross_runtime_phases.py'
       - 'scripts/tests/test_cross_runtime*.py'
       - 'src/benchmarks.rs'
       - 'src/bin/nulang_savina.rs'

@@ -20,6 +20,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from cross_runtime_phases import parse_nulang_phases
+
 from cross_runtime_order import counterbalanced_runtime_order
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -93,6 +95,12 @@ def parse_records(output: str, expected_runtime: str) -> dict[str, dict[str, int
         raise RuntimeError(
             f"{expected_runtime} did not emit records for: {', '.join(missing)}"
         )
+    if expected_runtime == "nulang":
+        phases = parse_nulang_phases(
+            output, {name: row["elapsed_ns"] for name, row in records.items()}
+        )
+        for name, phase in phases.items():
+            records[name].update(phase)
     return records
 
 
@@ -270,7 +278,7 @@ def summarize(
                 raise RuntimeError(f"{runtime}/{name}: message count changed across samples")
             messages = message_counts.pop()
             median_ns = statistics.median(elapsed)
-            summary[runtime][name] = {
+            result = {
                 "samples": len(elapsed),
                 "messages": messages,
                 "median_elapsed_ns": int(median_ns),
@@ -279,6 +287,16 @@ def summarize(
                 "median_ns_per_message": median_ns / messages,
                 "median_messages_per_second": messages * 1_000_000_000 / median_ns,
             }
+            if runtime == "nulang" and name in ("counting", "fork_join"):
+                if any("enqueue_ns" not in row or "drain_ns" not in row for row in rows):
+                    raise RuntimeError(f"{runtime}/{name}: incomplete phase timing")
+                result["median_enqueue_ns"] = int(
+                    statistics.median(row["enqueue_ns"] for row in rows)
+                )
+                result["median_drain_ns"] = int(
+                    statistics.median(row["drain_ns"] for row in rows)
+                )
+            summary[runtime][name] = result
     return summary
 
 
