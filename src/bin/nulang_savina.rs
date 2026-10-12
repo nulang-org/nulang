@@ -719,12 +719,23 @@ fn bench_actor_compute(backend: Backend) -> Measurement {
 
     // Give bytecode, JIT and AOT the same untimed actor activation,
     // amortizing cold actor state independently of native tier-up.
+    #[cfg(feature = "native-codegen")]
+    let compiled_before = if backend == Backend::Jit {
+        rt.borrow().benchmark_jit_compiled_count()
+    } else {
+        0
+    };
     rt.borrow_mut().send_message(actor_id, "work", &[]);
     rt.borrow_mut().run_scheduler();
     if backend == Backend::Jit {
-        // The loop should tier up inside the scheduler-owned actor VM.
-        // Missing native compilation is an invalid JIT comparison.
+        // A nonzero total is not enough: the new region must have been
+        // compiled by this actor's untimed work, not earlier initialization.
         warm_and_verify_jit(&rt, "actor_compute");
+        #[cfg(feature = "native-codegen")]
+        assert!(
+            rt.borrow().benchmark_jit_compiled_count() > compiled_before,
+            "bench: compute actor warmup did not compile a new native JIT region"
+        );
     }
     rt.borrow_mut()
         .actors
