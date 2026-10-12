@@ -24,10 +24,11 @@
 //! on `Drop`, so duplicate drops are harmless no-ops.
 
 use crate::bytecode::{
-    CodeModule, Constant, DebugFunctionInfo, ForeignFunctionDef, HandlerBinding, HandlerTable,
-    Instruction, OpCode,
+    CodeModule, Constant, DebugFunctionInfo, EffectSiteMetadata, ForeignFunctionDef,
+    HandlerBinding, HandlerTable, Instruction, OpCode,
 };
 use crate::mir;
+use crate::semantic_identity::{effect_sites_for_mir, EffectSiteOwnerKind, MirEffectSite};
 use crate::types::{NuError, NuResult, PrimitiveType, Span, Type};
 use rustc_hash::FxHashMap;
 use std::collections::HashSet;
@@ -97,6 +98,9 @@ pub struct MirCodegen {
     /// Cycles through SPILL_TEMP (12), SPILL_TEMP2 (13), SPILL_TEMP3 (14)
     /// so that consecutive spilled reads don't clobber each other.
     spill_read_cycle: u8,
+    /// Module-absolute PC base for the function currently being compiled in
+    /// the isolated temporary instruction vector.
+    current_function_base: usize,
 }
 
 impl MirCodegen {
@@ -110,6 +114,7 @@ impl MirCodegen {
             float_locals: Vec::new(),
             spill_map: FxHashMap::default(),
             spill_read_cycle: 0,
+            current_function_base: 0,
         }
     }
 
@@ -265,6 +270,11 @@ impl MirCodegen {
     }
 
     pub fn compile_module(&mut self, mir: &mut mir::Module) -> NuResult<&CodeModule> {
+        // Capture compiler-owned semantic effect sites before optimization.
+        // Optimizations may rewrite locals/control flow but must preserve the
+        // observable order and identity of effect operations.
+        let semantic_effect_sites = effect_sites_for_mir(mir);
+
         // MIR optimization pass: constant folding, identity simplification,
         // jump threading, and dead-store elimination. Runs on every
         // function and behavior before codegen.
@@ -320,7 +330,14 @@ impl MirCodegen {
         let mut main_idx = None;
         let mut user_main_idx = None;
         for (idx, func) in mir.functions.iter().enumerate() {
-            let offset = self.compile_function(func)?;
+            let sites: Vec<_> = semantic_effect_sites
+                .iter()
+                .filter(|site| {
+                    site.owner_kind == EffectSiteOwnerKind::Function && site.owner_name == func.name
+                })
+                .cloned()
+                .collect();
+            let offset = self.compile_function(func, &sites)?;
             self.module.function_table[idx] = offset;
             self.module.function_local_counts[idx] = LOCAL_BASE as usize + func.locals.len();
             if func.name == "__main" {
@@ -342,7 +359,14 @@ impl MirCodegen {
         // behaviors compile in this order, so this loop must not be
         // reordered or interleaved with function compilation.
         for func in &mir.behaviors {
-            let offset = self.compile_function(func)?;
+            let sites: Vec<_> = semantic_effect_sites
+                .iter()
+                .filter(|site| {
+                    site.owner_kind == EffectSiteOwnerKind::Behavior && site.owner_name == func.name
+                })
+                .cloned()
+                .collect();
+            let offset = self.compile_function(func, &sites)?;
             let end = self.module.instructions.len();
 
             // Compute BLAKE3 content hash from the compiled bytecode slice +
@@ -474,12 +498,17 @@ impl MirCodegen {
         Ok(&self.module)
     }
 
-    fn compile_function(&mut self, func: &mir::Function) -> NuResult<usize> {
+    fn compile_function(
+        &mut self,
+        func: &mir::Function,
+        effect_sites: &[MirEffectSite],
+    ) -> NuResult<usize> {
         // Isolate this function's bytecode so block offsets are relative to
         // the function start while still allowing forward jump resolution.
         let mut saved_instructions = Vec::new();
         std::mem::swap(&mut saved_instructions, &mut self.module.instructions);
         let function_start = saved_instructions.len();
+        self.current_function_base = function_start;
         // Build the spill map: locals whose id exceeds the register file
         // get a slot in the frame's spill vector.  Inline spilling via
         // local_reg / local_dst / spill_write_done emits SpillLoad/SpillStore
@@ -568,6 +597,7 @@ impl MirCodegen {
         }
         // Function-relative pcs of each source statement's first instruction.
         let mut func_lines: Vec<(usize, u32)> = Vec::new();
+        let mut effect_site_cursor = 0usize;
 
         for (bi, block) in func.blocks.iter().enumerate() {
             block_offsets.insert(block.id, self.module.instructions.len());
@@ -603,7 +633,26 @@ impl MirCodegen {
                 if let Some(&line) = line_map.get(&(block.id.0, si)) {
                     func_lines.push((self.module.instructions.len(), line));
                 }
-                self.compile_stmt(stmt, func, &mut handle_patches)?;
+                let effect_site = match stmt {
+                    mir::Stmt::Assign {
+                        op: mir::RValue::Perform { .. } | mir::RValue::PerformAsync { .. },
+                        ..
+                    } => {
+                        let site = effect_sites.get(effect_site_cursor).ok_or_else(|| {
+                            compile_err(
+                                format!(
+                                    "internal: effect-site metadata exhausted in '{}'",
+                                    func.name
+                                ),
+                                Span::default(),
+                            )
+                        })?;
+                        effect_site_cursor += 1;
+                        Some(site)
+                    }
+                    _ => None,
+                };
+                self.compile_stmt(stmt, func, &mut handle_patches, effect_site)?;
                 if let Some(src) = drop_plan.ownership_transfer.get(&(bi, si)) {
                     self.clear_local_after_transfer(*src);
                 }
@@ -618,6 +667,17 @@ impl MirCodegen {
                 }
             }
             self.compile_terminator(&block.terminator, &func.name, &block_offsets, &mut patches)?;
+        }
+
+        if effect_site_cursor != effect_sites.len() {
+            return Err(compile_err(
+                format!(
+                    "internal: {} semantic effect-site records were not emitted in '{}'",
+                    effect_sites.len() - effect_site_cursor,
+                    func.name
+                ),
+                Span::default(),
+            ));
         }
 
         // (SpillLoad/SpillStore are emitted inline during codegen via
@@ -718,11 +778,12 @@ impl MirCodegen {
         stmt: &mir::Stmt,
         func: &mir::Function,
         handle_patches: &mut Vec<(usize, usize)>,
+        effect_site: Option<&MirEffectSite>,
     ) -> NuResult<()> {
         match stmt {
             mir::Stmt::Assign { dst, op } => {
                 let _spill_dst = self.local_dst(*dst);
-                self.compile_rvalue(_spill_dst, op)?;
+                self.compile_rvalue_with_site(_spill_dst, op, effect_site)?;
                 self.spill_write_done(*dst);
             }
             mir::Stmt::StoreFieldNamed { obj, field, src } => {
@@ -780,6 +841,35 @@ impl MirCodegen {
         Ok(())
     }
 
+    fn record_effect_site(
+        &mut self,
+        relative_pc: usize,
+        site: Option<&MirEffectSite>,
+        effect_operation: &str,
+    ) -> NuResult<()> {
+        let site = site.ok_or_else(|| {
+            compile_err(
+                format!("internal: missing semantic effect-site metadata for {effect_operation}"),
+                Span::default(),
+            )
+        })?;
+        if site.effect_operation != effect_operation {
+            return Err(compile_err(
+                format!(
+                    "internal: effect-site operation mismatch: semantic '{}' vs emitted '{}'",
+                    site.effect_operation, effect_operation
+                ),
+                Span::default(),
+            ));
+        }
+        self.module.effect_sites.push(EffectSiteMetadata {
+            pc: self.current_function_base + relative_pc,
+            id: *site.id.as_bytes(),
+            effect_operation: site.effect_operation.clone(),
+        });
+        Ok(())
+    }
+
     /// Move argument locals into the staging registers r0..rN.
     fn stage_args(&mut self, args: &[mir::LocalId]) -> NuResult<()> {
         if args.len() > MAX_STAGED_ARGS {
@@ -802,6 +892,15 @@ impl MirCodegen {
     }
 
     fn compile_rvalue(&mut self, dst: u8, rv: &mir::RValue) -> NuResult<()> {
+        self.compile_rvalue_with_site(dst, rv, None)
+    }
+
+    fn compile_rvalue_with_site(
+        &mut self,
+        dst: u8,
+        rv: &mir::RValue,
+        effect_site: Option<&MirEffectSite>,
+    ) -> NuResult<()> {
         match rv {
             mir::RValue::Const(c) => {
                 self.load_constant(dst, c);
@@ -1000,6 +1099,9 @@ impl MirCodegen {
                 resolved_handler,
             } => {
                 self.stage_args(args)?;
+                let effect_operation = format!("{effect}.{op}");
+                let effect_pc = self.current_offset();
+                self.record_effect_site(effect_pc, effect_site, &effect_operation)?;
                 if let Some(href) = resolved_handler {
                     // Statically-resolved handler — emit PerformDirect with
                     // table and binding indices, skipping the string lookup.
@@ -1010,9 +1112,7 @@ impl MirCodegen {
                         dst,
                     ));
                 } else {
-                    let eff_idx = self
-                        .module
-                        .add_constant(Constant::String(format!("{}.{}", effect, op)));
+                    let eff_idx = self.module.add_constant(Constant::String(effect_operation));
                     self.emit(Instruction::new3(
                         OpCode::Perform,
                         ((eff_idx >> 8) & 0xFF) as u8,
@@ -1027,6 +1127,8 @@ impl MirCodegen {
                 resolved_handler: _,
             } => {
                 self.stage_args(args)?;
+                let effect_pc = self.current_offset();
+                self.record_effect_site(effect_pc, effect_site, effect_op)?;
                 let eff_idx = self
                     .module
                     .add_constant(Constant::String(effect_op.clone()));
@@ -1463,7 +1565,7 @@ fn binary_opcode(op: &crate::ast::BinOp, is_float: bool) -> NuResult<OpCode> {
 /// call results, array/record loads — are not tracked, and operations on
 /// them keep the legacy integer opcodes. That is a limitation, not a
 /// regression: pre-fix behavior for those cases was the same.
-fn float_locals(func: &mir::Function) -> Vec<bool> {
+pub(crate) fn float_locals(func: &mir::Function) -> Vec<bool> {
     let mut is_float = vec![false; func.locals.len()];
     for local in &func.locals {
         if local.ty == Type::Primitive(PrimitiveType::Float) {
@@ -2718,6 +2820,96 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
     }
     plan
 }
+// ---------------------------------------------------------------------------
+// Consuming actor-send ownership analysis
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+#[derive(Default)]
+struct ConsumingSendPlan {
+    args_by_stmt: FxHashMap<(usize, usize), Vec<mir::LocalId>>,
+}
+
+/// Identify local-send arguments whose sole ownership token can be handed off
+/// later without changing runtime behavior in this analysis-only phase.
+#[allow(dead_code)]
+fn plan_consuming_send_args(func: &mir::Function) -> ConsumingSendPlan {
+    let nlocals = func.locals.len();
+    if nlocals == 0 {
+        return ConsumingSendPlan::default();
+    }
+
+    let ptr_ty: Vec<bool> = func
+        .locals
+        .iter()
+        .map(|l| may_hold_heap_ptr(&l.ty))
+        .collect();
+    let mut excluded = vec![false; nlocals];
+    for id in func.params.iter().chain(&func.captures) {
+        excluded[id.0 as usize] = true;
+    }
+    for table in &func.handler_tables {
+        for binding in &table.bindings {
+            for id in &binding.params {
+                excluded[id.0 as usize] = true;
+            }
+        }
+    }
+
+    let mut def_count = vec![0usize; nlocals];
+    let mut use_count = vec![0usize; nlocals];
+    let mut owning_def = vec![false; nlocals];
+    for block in &func.blocks {
+        for stmt in &block.stmts {
+            for (u, _) in stmt_uses(stmt) {
+                use_count[u] += 1;
+            }
+            if let mir::Stmt::Assign { dst, op } = stmt {
+                let d = dst.0 as usize;
+                def_count[d] += 1;
+                let self_read = rvalue_uses(op).iter().any(|(u, _)| *u == d);
+                owning_def[d] = def_count[d] == 1 && rvalue_is_owning(op) && !self_read;
+            }
+        }
+        for (u, _) in terminator_uses(&block.terminator) {
+            use_count[u] += 1;
+        }
+    }
+
+    let mut plan = ConsumingSendPlan::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (si, stmt) in block.stmts.iter().enumerate() {
+            let mir::Stmt::Assign {
+                op:
+                    mir::RValue::Send {
+                        args,
+                        remote: false,
+                        ..
+                    },
+                ..
+            } = stmt
+            else {
+                continue;
+            };
+            let owned: Vec<_> = args
+                .iter()
+                .copied()
+                .filter(|arg| {
+                    let a = arg.0 as usize;
+                    ptr_ty[a]
+                        && !excluded[a]
+                        && def_count[a] == 1
+                        && use_count[a] == 1
+                        && owning_def[a]
+                })
+                .collect();
+            if !owned.is_empty() {
+                plan.args_by_stmt.insert((bi, si), owned);
+            }
+        }
+    }
+    plan
+}
 
 // ===========================================================================
 // Tests
@@ -3740,6 +3932,72 @@ mod optimize_tests {
             Some(0),
             "clearing the moved-from source must not invalidate the destination"
         );
+    }
+
+    #[test]
+    fn test_consuming_send_plan_marks_unique_fresh_local_payload() {
+        let arr_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("send_unique", None);
+        let target = b.add_param("target", Type::unit());
+        let payload = b.add_temp(arr_ty);
+        let sent = b.add_temp(Type::unit());
+        b.assign(payload, mir::RValue::ArrayLit(vec![]));
+        b.assign(
+            sent,
+            mir::RValue::Send {
+                actor: target,
+                behavior_idx: 0,
+                args: vec![payload],
+                remote: false,
+            },
+        );
+        b.terminate(mir::Terminator::Return(None));
+        let plan = plan_consuming_send_args(&b.build());
+        assert_eq!(plan.args_by_stmt.get(&(0, 1)), Some(&vec![payload]));
+    }
+
+    #[test]
+    fn test_consuming_send_plan_rejects_payload_with_competing_use() {
+        let arr_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("send_shared", None);
+        let target = b.add_param("target", Type::unit());
+        let payload = b.add_temp(arr_ty);
+        let len = b.add_temp(Type::int());
+        let sent = b.add_temp(Type::unit());
+        b.assign(payload, mir::RValue::ArrayLit(vec![]));
+        b.assign(len, mir::RValue::ArrayLen(payload));
+        b.assign(
+            sent,
+            mir::RValue::Send {
+                actor: target,
+                behavior_idx: 0,
+                args: vec![payload],
+                remote: false,
+            },
+        );
+        b.terminate(mir::Terminator::Return(None));
+        assert!(plan_consuming_send_args(&b.build()).args_by_stmt.is_empty());
+    }
+
+    #[test]
+    fn test_consuming_send_plan_rejects_remote_send() {
+        let arr_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("send_remote", None);
+        let target = b.add_param("target", Type::unit());
+        let payload = b.add_temp(arr_ty);
+        let sent = b.add_temp(Type::unit());
+        b.assign(payload, mir::RValue::ArrayLit(vec![]));
+        b.assign(
+            sent,
+            mir::RValue::Send {
+                actor: target,
+                behavior_idx: 0,
+                args: vec![payload],
+                remote: true,
+            },
+        );
+        b.terminate(mir::Terminator::Return(None));
+        assert!(plan_consuming_send_args(&b.build()).args_by_stmt.is_empty());
     }
 
     #[test]
