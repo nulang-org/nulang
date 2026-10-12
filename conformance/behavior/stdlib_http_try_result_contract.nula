@@ -1,0 +1,18 @@
+// Typed HTTP wrappers must report broad failures without claiming timeout/status detail.
+// Invalid absolute URLs fail before network I/O, so this is hermetic.
+import stdlib::http
+
+fn main() {
+    match try_get("::not-a-url::") {
+        Ok(_) => perform IO.print("get=ok"),
+        Error(GetFailed(_)) => perform IO.print("get=error"),
+        Error(_) => perform IO.print("get=wrong_error"),
+    }
+    match try_post("::not-a-url::", "{}") {
+        Ok(_) => perform IO.print("post=ok"),
+        Error(PostFailed(_)) => perform IO.print("post=error"),
+        Error(_) => perform IO.print("post=wrong_error"),
+    }
+    let legacy = get("::not-a-url::")
+    perform IO.print("legacy_nil=" + (if legacy == nil then "yes" else "no"))
+}
