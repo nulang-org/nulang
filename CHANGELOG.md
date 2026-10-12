@@ -5,6 +5,9 @@
 - **Cross-runtime reporting rejects invalid benchmark records before summarizing them.** Duplicate workloads, non-positive timing, inconsistent workload message counts, and duplicate selected runtimes fail closed; eleven Python contract tests are run by the comparison workflow.
 - **Measured fixture processes now have a bounded wall-clock timeout.** A deadlocked runtime fails the cross-runtime run rather than consuming an entire CI job.
 - **CI includes the OTP fixture in cross-runtime artifacts but does not imply an actor-framework speed claim.** Every comparative number still requires a successful same-host run and explicit interpretation of shared-runner noise and unmatched scheduling semantics.
+### Public CLI release portability — 2026-10-11
+- **Public release archives use the `release-cli` feature profile without a Python shared-library ABI dependency.** The ordinary full/default source build retains opt-in Python interoperability; release packaging checks the resulting Linux and macOS binary for Python dependencies.
+- **Release PRs rehearse the full non-publishing four-platform build matrix before tags are created.** The Linux ARM64 cross build explicitly installs target libc development headers and preflights a target-compiler C header probe, avoiding an observed `ring` compile failure when `--no-install-recommends` omits the ARM64 sysroot. Actual cross-build and clean-host portability remain release gates.
 
 ### Runtime soundness and checked negation — native/AOT backend parity — 2026-10-10
 - **AOT no longer claims raw-Int/Float registers for values that can be nil
