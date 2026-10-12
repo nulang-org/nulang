@@ -371,9 +371,11 @@ fn stmt_uses_local(stmt: &Stmt, local: LocalId) -> bool {
         Stmt::Assign { dst, op } => *dst == local || rvalue_uses_local(op, local),
         Stmt::StoreFieldNamed { obj, src, .. } => *obj == local || *src == local,
         Stmt::ArrayStore { arr, idx, src } => *arr == local || *idx == local || *src == local,
-        Stmt::EnterHandle { .. } | Stmt::PopHandler | Stmt::StateSet { .. } | Stmt::Emit { .. } => {
-            false
-        }
+        Stmt::EnterHandle { .. }
+        | Stmt::PopHandler
+        | Stmt::StateSet { .. }
+        | Stmt::Emit { .. }
+        | Stmt::ParallelMarker { .. } => false,
     }
 }
 
@@ -798,6 +800,7 @@ fn remap_stmt(stmt: &Stmt, remap: &FxHashMap<LocalId, LocalId>) -> Stmt {
             field: field.clone(),
             src: remap_local(*src, remap),
         },
+        Stmt::ParallelMarker { marker } => Stmt::ParallelMarker { marker: *marker },
     }
 }
 

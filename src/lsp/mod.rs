@@ -90,6 +90,10 @@ struct DocumentState {
 struct DiagnosticResult {
     diagnostics: Vec<Diagnostic>,
     type_map: HashMap<usize, String>,
+    /// AST produced by the same frontend pass as diagnostics. Keeping it here
+    /// avoids lexing/parsing the document a second time just to populate
+    /// `DocumentState`.
+    ast: Option<crate::ast::AstModule>,
     inferred_decl_types: FxHashMap<String, crate::types::Type>,
     function_rows: FxHashMap<String, crate::types::EffectRow>,
 }
@@ -160,11 +164,6 @@ impl NulangLanguageServer {
 
             let result = Self::compute_diagnostics(&source);
 
-            let ast = Lexer::new(&source)
-                .lex()
-                .ok()
-                .and_then(|tokens| Parser::new(tokens).parse_module().ok());
-
             {
                 let mut docs = documents.lock().unwrap();
                 if let Some(doc) = docs.get_mut(&uri_clone) {
@@ -175,7 +174,7 @@ impl NulangLanguageServer {
                     doc.diagnostics = result.diagnostics.clone();
                     doc.diagnostics_pending = false;
                     doc.type_map = Some(result.type_map);
-                    doc.ast = ast;
+                    doc.ast = result.ast;
                     doc.inferred_decl_types = Some(result.inferred_decl_types);
                     doc.function_rows = Some(result.function_rows);
                 }
@@ -303,10 +302,6 @@ impl LanguageServer for NulangLanguageServer {
         // For document open, compute diagnostics synchronously so the user
         // sees errors immediately; typing changes are debounced instead.
         let result = Self::compute_diagnostics(&source);
-        let ast = Lexer::new(&source)
-            .lex()
-            .ok()
-            .and_then(|tokens| Parser::new(tokens).parse_module().ok());
 
         {
             let mut docs = self.documents.lock().unwrap();
@@ -316,7 +311,7 @@ impl LanguageServer for NulangLanguageServer {
                     version,
                     source: source.clone(),
                     type_map: Some(result.type_map),
-                    ast,
+                    ast: result.ast,
                     diagnostics: result.diagnostics.clone(),
                     diagnostics_pending: false,
                     inferred_decl_types: Some(result.inferred_decl_types),
@@ -1820,6 +1815,7 @@ impl NulangLanguageServer {
                 return DiagnosticResult {
                     diagnostics,
                     type_map: HashMap::new(),
+                    ast: None,
                     inferred_decl_types: FxHashMap::default(),
                     function_rows: FxHashMap::default(),
                 };
@@ -1834,6 +1830,7 @@ impl NulangLanguageServer {
                 return DiagnosticResult {
                     diagnostics,
                     type_map: HashMap::new(),
+                    ast: None,
                     inferred_decl_types: FxHashMap::default(),
                     function_rows: FxHashMap::default(),
                 };
@@ -1917,6 +1914,7 @@ impl NulangLanguageServer {
         DiagnosticResult {
             diagnostics,
             type_map,
+            ast: Some(ast),
             inferred_decl_types,
             function_rows,
         }
@@ -3927,6 +3925,27 @@ mod lsp_tests {
         let engine = InlayHintEngine::new("fun foo) bar(");
         let hints = engine.generate_inlay_hints(None, None, None);
         assert!(hints.is_empty());
+    }
+
+    #[test]
+    fn test_diagnostics_frontend_returns_parsed_ast() {
+        let source = "fn main() -> Int { 42 }";
+        let result = NulangLanguageServer::compute_diagnostics(source);
+
+        assert!(
+            result.ast.is_some(),
+            "successful diagnostics must retain the parsed AST for DocumentState"
+        );
+    }
+
+    #[test]
+    fn test_diagnostics_frontend_has_no_ast_after_parse_failure() {
+        let result = NulangLanguageServer::compute_diagnostics("fn broken(");
+        assert!(
+            result.ast.is_none(),
+            "a failed parse must not publish stale or synthetic AST state"
+        );
+        assert!(!result.diagnostics.is_empty());
     }
 
     /// Regression: the LSP effect check is interprocedural, matching the CLI

@@ -1,0 +1,105 @@
+{
+  "schema": "nulang.stdlib/v0alpha1",
+  "modules": [
+    {
+      "name": "core",
+      "import": "stdlib::core",
+      "source": "src/stdlib/core.nula",
+      "stability": "experimental",
+      "description": "General-purpose core combinators. Prelude-owned Option and Result types are available without importing this module."
+    },
+    {
+      "name": "math",
+      "import": "stdlib::math",
+      "source": "src/stdlib/math.nula",
+      "stability": "experimental",
+      "description": "Numeric helpers including abs, min, max, clamp, pow, factorial, gcd, and sqrt."
+    },
+    {
+      "name": "list",
+      "import": "stdlib::list",
+      "source": "src/stdlib/list.nula",
+      "stability": "experimental",
+      "description": "Functional array/list combinators including map, filter, fold, append, reverse, and sort."
+    },
+    {
+      "name": "string",
+      "import": "stdlib::string",
+      "source": "src/stdlib/string.nula",
+      "stability": "experimental",
+      "description": "String helpers including trim, split, join, replace, case conversion, and search."
+    },
+    {
+      "name": "map",
+      "import": "stdlib::map",
+      "source": "src/stdlib/map.nula",
+      "stability": "experimental",
+      "description": "Persistent map helpers implemented in Nulang over array-backed key/value records."
+    },
+    {
+      "name": "set",
+      "import": "stdlib::set",
+      "source": "src/stdlib/set.nula",
+      "stability": "experimental",
+      "description": "Persistent set helpers implemented in Nulang over arrays."
+    },
+    {
+      "name": "result",
+      "import": "stdlib::result",
+      "source": "src/stdlib/result.nula",
+      "stability": "experimental",
+      "description": "Operations on the prelude-owned Result type."
+    },
+    {
+      "name": "option",
+      "import": "stdlib::option",
+      "source": "src/stdlib/option.nula",
+      "stability": "experimental",
+      "description": "Operations on the prelude-owned Option type."
+    },
+    {
+      "name": "datetime",
+      "import": "stdlib::datetime",
+      "source": "src/stdlib/datetime.nula",
+      "stability": "experimental",
+      "description": "DateTime record helpers and validation."
+    },
+    {
+      "name": "http",
+      "import": "stdlib::http",
+      "source": "src/stdlib/http.nula",
+      "stability": "experimental",
+      "description": "Higher-level HTTP client wrappers over the built-in Http effect."
+    },
+    {
+      "name": "fs",
+      "import": "stdlib::fs",
+      "source": "src/stdlib/fs.nula",
+      "stability": "experimental",
+      "description": "Higher-level filesystem wrappers over the built-in FS effect."
+    },
+    {
+      "name": "json",
+      "import": "stdlib::json",
+      "source": "src/stdlib/json.nula",
+      "stability": "experimental",
+      "description": "JSON parsing, serialization, and field accessors.",
+      "package_mirror": {
+        "package": "json",
+        "path": "packages/json/src/lib.nula",
+        "replacement_preamble": [
+          "// Package: `json` (official seed package, registry tier: Experimental).",
+          "// Standalone port of `src/stdlib/json.nula` — generated from the stdlib source.",
+          "// Consume with: `import lib` (or via `nula add json`)."
+        ]
+      }
+    },
+    {
+      "name": "test",
+      "import": "stdlib::test",
+      "source": "src/stdlib/test.nula",
+      "stability": "experimental",
+      "description": "Testing assertions and helpers over the built-in Test effect."
+    }
+  ]
+}
