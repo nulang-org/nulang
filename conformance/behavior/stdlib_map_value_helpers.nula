@@ -1,0 +1,48 @@
+// Contract for the value-style array-backed stdlib::map helpers.
+// These tests must not accidentally assume the separate mutable Map effect.
+import stdlib::map
+
+fn show(opt: Option[String]) -> String {
+    match opt {
+        Some(x) => x,
+        None => "None",
+    }
+}
+
+fn main() {
+    let original = insert("a", "old", empty())
+    let changed = insert("a", "new", original)
+    perform IO.print(show(get("a", original)))
+    perform IO.print(show(get("a", changed)))
+
+    // The second occurrence of a key wins, while the first insertion
+    // determines iteration order.
+    let built = from_pairs([("x", "first"), ("y", "second"), ("x", "last")])
+    perform IO.print(show(get("x", built)))
+    perform IO.print(perform Int.to_string(size(built)))
+
+    let pairs = to_pairs(built)
+    perform IO.print(perform Int.to_string(perform Array.length(pairs)))
+    perform IO.print(pairs[0].0)
+    perform IO.print(pairs[0].1)
+    perform IO.print(pairs[1].0)
+    perform IO.print(pairs[1].1)
+
+    // Merge must preserve both inputs, and right side wins for collisions.
+    let left = from_pairs([("a", "left"), ("b", "left-b")])
+    let right = from_pairs([("a", "right"), ("c", "right-c")])
+    let combined = merge(left, right)
+    perform IO.print(show(get("a", left)))
+    perform IO.print(show(get("a", right)))
+    perform IO.print(show(get("a", combined)))
+    perform IO.print(show(get("b", combined)))
+    perform IO.print(show(get("c", combined)))
+    perform IO.print(perform Int.to_string(size(combined)))
+
+    perform IO.print(get_or("a", combined, "fallback"))
+    perform IO.print(get_or("unknown", combined, "fallback"))
+
+    let after_removal = remove("a", combined)
+    perform IO.print(show(get("a", after_removal)))
+    perform IO.print(show(get("a", combined)))
+}
