@@ -1,5 +1,10 @@
 # Nulang Changelog
 
+### Fail-closed resumed workflow failures — 2026-10-11
+- Signal, timer-sleep, timed-receive, and LLM continuations now persist `StepFailed` with a fallible checkpoint before actor requeue or saga compensation when a resumed compiled workflow throws.
+- Rejecting the terminal event or checkpoint quarantines the speculative actor; regression tests cover each resume adapter and the shared failure helper, including orphan `StepFailed` recovery.
+- This remains legacy two-write fail-closed behavior, not an atomic activation transition or a guarantee of exactly-once external effects.
+
 ### Fail-closed legacy workflow completion and recovery — 2026-10-10
 - Consolidate the suspended signal, timer, receive, and LLM resume terminal-persistence guards; failed terminal event or checkpoint persistence quarantines the live workflow actor before further dispatch.
 - Cover immediate legacy step terminal/checkpoint sequencing and fail closed when recovery encounters orphan terminal workflow history beyond the last safe snapshot.

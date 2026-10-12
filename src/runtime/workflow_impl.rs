@@ -393,6 +393,52 @@ pub(crate) fn finish_resumed_workflow_step(
     true
 }
 
+/// Close a failed, previously suspended compiled workflow step.
+///
+/// Compiled workflow event append and checkpoint are separate legacy writes.
+/// Never let a failure trigger compensation or enqueue the speculative actor
+/// unless both persistence writes succeed. Partial terminal history must be
+/// quarantined until the RFC 0022 activation replay contract can reconcile it.
+pub(crate) fn finish_resumed_workflow_failure(
+    rt: &mut Runtime,
+    actor_id: u64,
+    activation: Option<WorkflowActivationId>,
+    step_name: String,
+    error: String,
+) -> bool {
+    let Some(actor) = rt.actors.get_mut(&actor_id) else {
+        return false;
+    };
+    actor.waiting_signal = None;
+
+    let sequence = next_sequence(rt, actor_id);
+    let result = rt
+        .persistence
+        .append_workflow_event(
+            actor_id,
+            WorkflowEvent::StepFailed {
+                sequence,
+                activation,
+                step_name,
+                error,
+            },
+        )
+        .and_then(|_| try_checkpoint_actor(rt, actor_id));
+
+    if let Err(error) = result {
+        tracing::error!(
+            actor_id,
+            %error,
+            "nulang-workflow: resumed failure persistence rejected; quarantining actor"
+        );
+        rt.actors.remove(&actor_id);
+        rt.pending_receive_wakes
+            .retain(|queued| *queued != actor_id);
+        return false;
+    }
+    true
+}
+
 /// Snapshot the durable and CRDT state of a persistent actor.
 ///
 /// This wrapper intentionally preserves the legacy best-effort API for call

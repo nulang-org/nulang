@@ -1713,6 +1713,7 @@ impl Runtime {
         }
 
         let mut completed_workflow_step = false;
+        let mut failed_workflow_step = None;
         match result {
             Ok(_) => {
                 completed_workflow_step = self.actor_is_workflow(actor_id);
@@ -1755,10 +1756,9 @@ impl Runtime {
                     self.maybe_schedule_receive_wait(actor_id, receive_timeout);
                 }
             }
-            Err(_) => {
-                // Step failed after resumption: run saga compensations.
+            Err(error) => {
                 if self.actor_is_workflow(actor_id) {
-                    self.run_saga_compensation(actor_id, behavior_idx);
+                    failed_workflow_step = Some(error.to_string());
                 }
             }
         }
@@ -1768,13 +1768,27 @@ impl Runtime {
         // bytecode whose own begin/end must stay inside this window. Runs
         // on every path so wakes of other actors are not lost.
         // Commit outside the shared VM borrow, before draining deferred wakes.
-        let committed = !completed_workflow_step
-            || workflow::finish_resumed_workflow_step(
+        let committed = if let Some(error) = failed_workflow_step {
+            let committed = workflow::finish_resumed_workflow_failure(
                 self,
                 actor_id,
                 suspended.activation,
                 step_name,
+                error,
             );
+            if committed {
+                self.run_saga_compensation(actor_id, behavior_idx);
+            }
+            committed
+        } else {
+            !completed_workflow_step
+                || workflow::finish_resumed_workflow_step(
+                    self,
+                    actor_id,
+                    suspended.activation,
+                    step_name,
+                )
+        };
         self.vm_exec_end();
         if !committed {
             return;
@@ -4892,6 +4906,7 @@ impl Runtime {
         }
         self.restore_suspended_workflow_activation(actor_id, suspended.activation);
         let mut completed_workflow_step = false;
+        let mut failed_workflow_step = None;
         let self_ptr: *mut Runtime = self;
         unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -4928,8 +4943,10 @@ impl Runtime {
                     }
                 }
                 Err(e) => {
-                    // VM error during resume - log and clean up.
                     tracing::warn!("Timer.sleep resume error for actor {}: {:?}", actor_id, e);
+                    if (*self_ptr).actor_is_workflow(actor_id) {
+                        failed_workflow_step = Some(e.to_string());
+                    }
                     if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
                         actor.suspended_execution = None;
                     }
@@ -4938,13 +4955,27 @@ impl Runtime {
         }
         // Do not let the deferred-wake drain dispatch this actor until the
         // terminal event and checkpoint have both succeeded.
-        let committed = !completed_workflow_step
-            || workflow::finish_resumed_workflow_step(
+        let committed = if let Some(error) = failed_workflow_step {
+            let committed = workflow::finish_resumed_workflow_failure(
                 self,
                 actor_id,
                 suspended.activation,
                 suspended.step_name.clone(),
+                error,
             );
+            if committed {
+                self.run_saga_compensation(actor_id, suspended.behavior_idx);
+            }
+            committed
+        } else {
+            !completed_workflow_step
+                || workflow::finish_resumed_workflow_step(
+                    self,
+                    actor_id,
+                    suspended.activation,
+                    suspended.step_name.clone(),
+                )
+        };
         self.vm_exec_end();
         if !committed {
             return;
@@ -4977,6 +5008,7 @@ impl Runtime {
 
         self.restore_suspended_workflow_activation(actor_id, suspended.activation);
         let mut completed_workflow_step = false;
+        let mut failed_workflow_step = None;
         let self_ptr: *mut Runtime = self;
         unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -5048,9 +5080,12 @@ impl Runtime {
                         }
                     }
                 }
-                // Other errors: the wait is over; the send-path result is
-                // discarded anyway, matching step_actor semantics.
-                Err(_) => (*self_ptr).clear_receive_wait(actor_id),
+                Err(error) => {
+                    (*self_ptr).clear_receive_wait(actor_id);
+                    if (*self_ptr).actor_is_workflow(actor_id) {
+                        failed_workflow_step = Some(error.to_string());
+                    }
+                }
             }
             // End the VM-execution window only after any suspend-state
             // re-capture above: draining deferred wakes runs other actors
@@ -5060,13 +5095,27 @@ impl Runtime {
         }
         // The VM borrow has ended; durable failure must quarantine the actor
         // before vm_exec_end can process queued receive wakes.
-        let committed = !completed_workflow_step
-            || workflow::finish_resumed_workflow_step(
+        let committed = if let Some(error) = failed_workflow_step {
+            let committed = workflow::finish_resumed_workflow_failure(
                 self,
                 actor_id,
                 suspended.activation,
                 suspended.step_name.clone(),
+                error,
             );
+            if committed {
+                self.run_saga_compensation(actor_id, suspended.behavior_idx);
+            }
+            committed
+        } else {
+            !completed_workflow_step
+                || workflow::finish_resumed_workflow_step(
+                    self,
+                    actor_id,
+                    suspended.activation,
+                    suspended.step_name.clone(),
+                )
+        };
         self.vm_exec_end();
         if !committed {
             return;

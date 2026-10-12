@@ -8740,6 +8740,86 @@ fn workflow_recovery_rejects_failed_terminal_event_beyond_safe_snapshot() {
 }
 
 #[test]
+fn resumed_workflow_failed_step_records_terminal_and_snapshot() {
+    let mut rt = Runtime::new();
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "resumed_failed_recorded",
+            Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+            HashMap::from([("step_index".to_string(), StateModel::Durable)]),
+        )
+        .unwrap();
+    rt.actors.get_mut(&actor_id).unwrap().waiting_signal = Some("go".to_string());
+
+    assert!(workflow::finish_resumed_workflow_failure(
+        &mut rt,
+        actor_id,
+        None,
+        "wait".to_string(),
+        "injected VM failure".to_string(),
+    ));
+    assert!(matches!(
+        rt.persistence.read_workflow_events(actor_id).last(),
+        Some(WorkflowEvent::StepFailed {
+            step_name, error, ..
+        }) if step_name == "wait" && error == "injected VM failure"
+    ));
+    let committed = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(
+        committed.state.get("step_index"),
+        Some(&PersistedValue::Int(0))
+    );
+    assert_eq!(committed.waiting_signal, None);
+    assert!(rt.actors.contains_key(&actor_id));
+}
+
+#[test]
+fn resumed_workflow_failed_step_checkpoint_rejection_quarantines_actor() {
+    let mut rt = Runtime::new();
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "resumed_failed_checkpoint_rejected",
+            Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+            HashMap::from([("step_index".to_string(), StateModel::Durable)]),
+        )
+        .unwrap();
+    let safe = rt.persistence.load_snapshot(actor_id).unwrap();
+    let mut backing = MemoryStore::new();
+    backing.save_snapshot(safe).unwrap();
+    rt.persistence = Box::new(RejectWorkflowCheckpointStore { inner: backing });
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .set_state_field("step_index", Value::int(4));
+
+    assert!(!workflow::finish_resumed_workflow_failure(
+        &mut rt,
+        actor_id,
+        None,
+        "wait".to_string(),
+        "injected VM failure".to_string(),
+    ));
+    assert!(!rt.actors.contains_key(&actor_id));
+    assert!(matches!(
+        rt.persistence.read_workflow_events(actor_id).last(),
+        Some(WorkflowEvent::StepFailed { step_name, .. }) if step_name == "wait"
+    ));
+    assert_eq!(
+        rt.persistence
+            .load_snapshot(actor_id)
+            .unwrap()
+            .state
+            .get("step_index"),
+        Some(&PersistedValue::Int(0)),
+        "failed checkpoint must not expose speculative resumed-state mutation"
+    );
+    assert!(
+        rt.recover_actor(actor_id).is_none(),
+        "orphan StepFailed event cannot reconstruct partially mutated actor"
+    );
+}
+
+#[test]
 fn workflow_command_is_not_executed_when_durable_admission_fails() {
     let mut rt = Runtime::new();
     let actor_id = rt

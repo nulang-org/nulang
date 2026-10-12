@@ -444,6 +444,7 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
 
     rt.restore_suspended_workflow_activation(actor_id, suspended.activation);
     let mut completed_workflow_step = false;
+    let mut failed_workflow_step = None;
     let self_ptr: *mut Runtime = rt;
     unsafe {
         let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -484,9 +485,11 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
                     (*self_ptr).maybe_schedule_receive_wait(actor_id, receive_timeout);
                 }
             }
-            // Other errors: the send-path result is discarded anyway,
-            // matching step_actor semantics.
-            Err(_) => {}
+            Err(error) => {
+                if (*self_ptr).actor_is_workflow(actor_id) {
+                    failed_workflow_step = Some(error.to_string());
+                }
+            }
         }
         // End the VM-execution window only after any suspend-state
         // re-capture above: draining deferred wakes runs other actors
@@ -496,13 +499,27 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
     }
     // Never keep a completed suspended workflow live if terminal persistence
     // fails. Finish the VM borrow before invoking the fallible store path.
-    let committed = !completed_workflow_step
-        || super::workflow::finish_resumed_workflow_step(
+    let committed = if let Some(error) = failed_workflow_step {
+        let committed = super::workflow::finish_resumed_workflow_failure(
             rt,
             actor_id,
             suspended.activation,
             suspended.step_name.clone(),
+            error,
         );
+        if committed {
+            rt.run_saga_compensation(actor_id, suspended.behavior_idx);
+        }
+        committed
+    } else {
+        !completed_workflow_step
+            || super::workflow::finish_resumed_workflow_step(
+                rt,
+                actor_id,
+                suspended.activation,
+                suspended.step_name.clone(),
+            )
+    };
     rt.vm_exec_end();
     if !committed {
         return;
