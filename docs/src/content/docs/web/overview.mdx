@@ -239,6 +239,10 @@ curl -X POST -d 'msg=live' http://127.0.0.1:8080/sign   # in another → SSE cli
 
 The `examples/chat-web` package shows the full pattern: an SSE `<script>` in the page, a POST handler that stores and broadcasts, and a `redirect` back. Treat this layer as minimal — one broadcast op, one SSE transport, in-process delivery.
 
+**Development-server limits:** Realtime SSE is bounded per process to 128 rooms, eight subscribers per room, eight queued events per subscriber, at most 64 replay events and 64 KiB of replay per room, and 8 KiB per message. Excess subscribers receive an HTTP 503, invalid room names receive HTTP 400, and overloaded consumers are disconnected and must reconnect. Idle, unsubscribed rooms are evicted when the room limit is reached. SSE streams send a comment heartbeat roughly every 15 seconds to detect disconnected peers. Event history is not durable and replay does not yet support resumable event IDs.
+
+**Security boundary:** The built-in `/__nulang/sse/<room>` endpoint does **not** authenticate subscribers or authorize room membership. Use it only for public demo data. Private tenant/user events require a separately enforced authenticated, authorized subscription boundary; a room name must never be treated as a secret or as proof of permission.
+
 ## Deployment
 
 Two paths, depending on what your app does:
