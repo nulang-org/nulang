@@ -9042,6 +9042,50 @@ mod map_tombstone_orca_regressions {
     }
 
     #[test]
+    fn removing_heap_key_and_value_preserves_external_owners_and_allows_reinsert() {
+        let mut vm = StandaloneVmCallbacks::new();
+        let map = hashmap_op(&mut vm, &[], "new", &[]).expect("map");
+        let key_ptr = vm.alloc(8, HeapTypeTag::Raw).expect("key allocation");
+        let value_ptr = vm.alloc(8, HeapTypeTag::Raw).expect("value allocation");
+        // SAFETY: both pointers originate from this VM's heap.
+        let key = unsafe { Value::ptr(key_ptr) };
+        let value = unsafe { Value::ptr(value_ptr) };
+
+        let map = hashmap_op(&mut vm, &[], "insert", &[map, key, value])
+            .expect("insert");
+        assert_eq!(vm.heap.live_count(), 3);
+
+        let map = hashmap_op(&mut vm, &[], "remove", &[map, key])
+            .expect("remove");
+        assert_eq!(
+            hashmap_op(&mut vm, &[], "size", &[map]).and_then(|v| v.as_int()),
+            Some(0),
+            "removal must remove the entry"
+        );
+
+        // This insertion may reuse the tombstone. Map traversal must not
+        // resurrect a stale key/value pointer or duplicate a reference.
+        let map = hashmap_op(&mut vm, &[], "insert", &[map, key, value])
+            .expect("reinsert");
+        let observed = hashmap_op(&mut vm, &[], "get", &[map, key]).expect("get");
+        assert_eq!(observed.as_ptr(), Some(value_ptr));
+        assert_eq!(
+            hashmap_op(&mut vm, &[], "size", &[map]).and_then(|v| v.as_int()),
+            Some(1)
+        );
+
+        vm.drop_ref(map.as_ptr().expect("map pointer"));
+        assert_eq!(
+            vm.heap.live_count(),
+            2,
+            "map release must preserve both caller-owned heap objects"
+        );
+        vm.drop_ref(key_ptr);
+        vm.drop_ref(value_ptr);
+        assert_eq!(vm.heap.live_count(), 0);
+    }
+
+    #[test]
     fn overwriting_with_borrowed_current_value_must_retain_before_release() {
         let mut vm = StandaloneVmCallbacks::new();
         let map = hashmap_op(&mut vm, &[], "new", &[]).expect("map");
