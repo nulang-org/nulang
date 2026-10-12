@@ -1,5 +1,6 @@
 # Nulang Changelog
-
+### RFC 0026 proposed — structured concurrency semantics — 2026-09-29
+- **RFC 0026 defines the target contract for source-level `par` as scoped structured concurrency.** It specifies source-ordered results, lexical child lifetime, deterministic failure selection and sibling cancellation, ownership-aware capture classes, conservative effect scheduling, and preservation of actor-heap thread confinement. The proposal is Experimental and does not itself enable parallel execution.
 ### Public CLI release portability — 2026-10-11
 - **Public release archives use the `release-cli` feature profile without a Python shared-library ABI dependency.** The ordinary full/default source build retains opt-in Python interoperability; release packaging checks the resulting Linux and macOS binary for Python dependencies.
 - **Release PRs rehearse the full non-publishing four-platform build matrix before tags are created.** The Linux ARM64 cross build explicitly installs target libc development headers and preflights a target-compiler C header probe, avoiding an observed `ring` compile failure when `--no-install-recommends` omits the ARM64 sysroot. Actual cross-build and clean-host portability remain release gates.
