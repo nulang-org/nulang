@@ -43,7 +43,7 @@ class CrashHarnessTests(unittest.TestCase):
     def test_runner_rejects_fake_nulang_that_loses_committed_state(self):
         with tempfile.TemporaryDirectory() as temp:
             fake = Path(temp) / "broken-nulang"
-            fake.write_text("#!/usr/bin/env python3\n"
+            fake.write_text(f"#!{sys.executable}\n"
                             "import os\n"
                             "import sys\n"
                             "if os.environ['DEMO_PHASE']=='prepare':\n"
