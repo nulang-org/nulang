@@ -18,3 +18,20 @@ pub fn get(url: String) -> String ! {Http} {
 pub fn post(url: String, body: String) -> String ! {Http} {
     perform Http.post(url, body)
 }
+
+/// Broad transport failure surfaced by the new try_* wrappers.
+/// The raw Http effect currently returns nil on transport/status failure;
+/// it cannot honestly distinguish a timeout from a connection failure.
+pub type HttpRequestError = GetFailed(String) | PostFailed(String)
+
+/// GET with explicit failure handling, without changing legacy get(url).
+pub fn try_get(url: String) -> Result[String, HttpRequestError] ! {Http} {
+    let value = perform Http.get(url);
+    if value == nil then Error(GetFailed(url)) else Ok(value)
+}
+
+/// POST with explicit failure handling, without changing legacy post(url, body).
+pub fn try_post(url: String, body: String) -> Result[String, HttpRequestError] ! {Http} {
+    let value = perform Http.post(url, body);
+    if value == nil then Error(PostFailed(url)) else Ok(value)
+}
