@@ -5,6 +5,9 @@
 - **The manifest separates its JSON schema version from the frozen runtime `VALUE_LAYOUT_VERSION`.** Consumers can detect a representation change independently from an additive manifest-schema evolution.
 - **64-bit masks, tags, and canonical NaN bits are encoded as fixed-width hexadecimal strings.** This preserves exact bit patterns for JSON consumers such as JavaScript that cannot represent arbitrary `u64` integers exactly.
 - **The first ABI slice covers the full Core value layout, including `TAG_OBJECT`, and indexes existing versioned runtime contracts.** Authority, WIT world metadata, and typed-program semantic-schema export remain follow-up work under #1046.
+### Public CLI release portability — 2026-10-11
+- **Public release archives use the `release-cli` feature profile without a Python shared-library ABI dependency.** The ordinary full/default source build retains opt-in Python interoperability; release packaging checks the resulting Linux and macOS binary for Python dependencies.
+- **Release PRs rehearse the full non-publishing four-platform build matrix before tags are created.** The Linux ARM64 cross build explicitly installs target libc development headers and preflights a target-compiler C header probe, avoiding an observed `ring` compile failure when `--no-install-recommends` omits the ARM64 sysroot. Actual cross-build and clean-host portability remain release gates.
 ### Runtime soundness and checked negation — native/AOT backend parity — 2026-10-10
 - **AOT no longer claims raw-Int/Float registers for values that can be nil
   at runtime.** Nightly differential fuzz caught interpreter/AOT divergences
