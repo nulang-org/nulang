@@ -62,5 +62,36 @@ fn main() {
   assert(r4.body == "{}", "body replaced")
   assert(request_url(r4) == "https://api.example.com/items", "post url")
 
+  // Transport preflight: the current Http.get/post effects support only GET
+  // and POST bodies, not arbitrary methods or custom headers. Reject rather
+  // than silently dropping options supplied through the request builder.
+  match validate_transport(r1) {
+    Ok(_) => assert(true, "plain GET transport supported"),
+    Error(_) => fail_with("plain GET should be supported"),
+  }
+  match validate_transport(r4) {
+    Ok(_) => assert(true, "plain POST transport supported"),
+    Error(_) => fail_with("plain POST should be supported"),
+  }
+  match validate_transport(r3) {
+    Error(msg) => assert(msg == "custom request headers are not supported by Http.get/post", "headers must be rejected"),
+    Ok(_) => fail_with("headers cannot be silently ignored"),
+  }
+  let unsupported = { r1 .. method = "DELETE" };
+  match validate_transport(unsupported) {
+    Error(msg) => assert(msg == "unsupported HTTP method: DELETE", "method must be rejected"),
+    Ok(_) => fail_with("DELETE cannot fall back to GET"),
+  }
+  match validate_transport(with_body("ignored", r1)) {
+    Error(msg) => assert(msg == "GET request body is not supported", "GET body must be rejected"),
+    Ok(_) => fail_with("GET body cannot be silently ignored"),
+  }
+
+  // This case must fail before any outbound HTTP request is attempted.
+  match send_request_checked(r3) {
+    Error(msg) => assert(msg == "custom request headers are not supported by Http.get/post", "checked send fails closed"),
+    Ok(_) => fail_with("checked send should reject unsupported headers"),
+  }
+
   perform IO.print("http-client builder tests passed")
 }
