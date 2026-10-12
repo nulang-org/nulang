@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### A/B benchmark failure diagnostics — 2026-09-24
+- **The same-host actor A/B runner now emits captured Cargo/compiler output before propagating a failed build**, replacing opaque exit-101 tracebacks with the actual feature-combination error while leaving benchmark commands, affinity, samples, and thresholds unchanged.
+
 ### Runtime test feature-gating cleanup — 2026-09-23
 - **The runtime test-only `Arc` import is gated behind the `tcp` feature that uses it**, keeping default builds warning-clean after the actor benchmark repair landed separately in #889.
 
