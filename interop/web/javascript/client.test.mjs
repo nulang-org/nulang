@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { NulangWebClient, ApiError } from './client.mjs';
+import { createServer } from 'node:http';
 
 const contract = { openapi:'3.1.0', paths: {
   '/v1/items/{item}': { get: { operationId:'read_item', parameters:[
@@ -59,4 +60,49 @@ test('redirects are blocked for authenticated requests', async () => {
   }});
   await assert.rejects(()=>client.call('read_item',{path:{item:'x'},headers:{'x-tenant-id':'acme'}}),e=>e instanceof ApiError && e.status===302);
   assert.equal(request.redirect,'manual');
+});
+
+test('real Node Fetch loopback preserves path, repeated query, bearer and trace context', async () => {
+  const server = createServer((request, response) => {
+    response.writeHead(200, {'Content-Type': 'application/json'});
+    response.end(JSON.stringify({
+      method: request.method,
+      url: request.url,
+      tenant: request.headers['x-tenant-id'],
+      authorization: request.headers.authorization,
+      traceparent: request.headers.traceparent,
+    }));
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address !== 'string');
+    const client = new NulangWebClient({
+      baseUrl: `http://127.0.0.1:${address.port}/api`,
+      contract,
+      token: 'test-token',
+      timeoutMs: 3000,
+    });
+    const traceparent = '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01';
+    const response = await client.call('read_item', {
+      path: {item: 'a/b'},
+      query: {tag: ['A B', 'é']},
+      headers: {'x-tenant-id': 'acme'},
+      traceparent,
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+      method: 'GET',
+      url: '/api/v1/items/a%2Fb?tag=A+B&tag=%C3%A9',
+      tenant: 'acme',
+      authorization: 'Bearer test-token',
+      traceparent,
+    });
+  } finally {
+    await new Promise((resolve, reject) =>
+      server.close(error => error ? reject(error) : resolve()));
+  }
 });
