@@ -1734,27 +1734,15 @@ fn cmd_test(filter: Option<&str>, verbose: bool, json: bool) -> NuResult<()> {
     struct TestCase {
         display: String,
         file_to_run: PathBuf,
-        is_temp: bool,
+        selected_test: Option<String>,
     }
 
     let mut tests: Vec<TestCase> = Vec::new();
-    // Private per-run directory: concurrent packages must never overwrite
-    // each other's generated entry points.
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let temp_dir = std::env::temp_dir().join(format!("nula_test_{}_{}", std::process::id(), nonce));
-    std::fs::create_dir_all(&temp_dir).map_err(|e| NuError::PackageError {
-        msg: format!("cannot create test directory {}: {}", temp_dir.display(), e),
-        span: Span::default(),
-    })?;
-
     for file in &test_files {
-        let content = match std::fs::read_to_string(file) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
+        let content = std::fs::read_to_string(file).map_err(|e| NuError::PackageError {
+            msg: format!("cannot read test file {}: {}", file.display(), e),
+            span: Span::default(),
+        })?;
         let test_fns = discover_test_functions(&content);
         let relative = file
             .strip_prefix(&tests_dir.parent().unwrap_or(&tests_dir))
@@ -1765,31 +1753,18 @@ fn cmd_test(filter: Option<&str>, verbose: bool, json: bool) -> NuResult<()> {
             tests.push(TestCase {
                 display: relative.display().to_string(),
                 file_to_run: file.clone(),
-                is_temp: false,
+                selected_test: None,
             });
         } else {
             if verbose {
                 println!("--- {} ---", relative.display());
                 println!("  discovered: {}", test_fns.join(", "));
             }
-            // Strip fn main() for per-function wrappers
-            let stripped = strip_main_function(&content);
             for fn_name in &test_fns {
-                let wrapper = format!(
-                    "{}{}\nfn main() {{ {}() }}\n",
-                    stripped,
-                    if stripped.ends_with('\n') { "" } else { "\n" },
-                    fn_name
-                );
-                let temp_path = temp_dir.join(format!("test_{}_{}.nula", tests.len(), fn_name));
-                std::fs::write(&temp_path, &wrapper).map_err(|e| NuError::PackageError {
-                    msg: format!("cannot write generated test {}: {}", temp_path.display(), e),
-                    span: Span::default(),
-                })?;
                 tests.push(TestCase {
                     display: fn_name.clone(),
-                    file_to_run: temp_path,
-                    is_temp: true,
+                    file_to_run: file.clone(),
+                    selected_test: Some(fn_name.clone()),
                 });
             }
         }
@@ -1806,9 +1781,9 @@ fn cmd_test(filter: Option<&str>, verbose: bool, json: bool) -> NuResult<()> {
         // In --json mode the child's stdout is captured (discarded) so the
         // JSON report is the only thing on our stdout.
         let outcome = if json {
-            run_test_file_captured(&file_str)
+            run_test_file_captured(&file_str, test.selected_test.as_deref())
         } else {
-            run_test_file(&file_str)
+            run_test_file(&file_str, test.selected_test.as_deref())
         };
         let duration_ms = started.elapsed().as_millis() as u64;
         match outcome {
@@ -1848,14 +1823,6 @@ fn cmd_test(filter: Option<&str>, verbose: bool, json: bool) -> NuResult<()> {
             }
         }
     }
-
-    // Clean up temp files
-    for test in &tests {
-        if test.is_temp {
-            let _ = std::fs::remove_file(&test.file_to_run);
-        }
-    }
-    let _ = std::fs::remove_dir(&temp_dir);
 
     if json {
         let diagnostics = json_results
@@ -1935,73 +1902,34 @@ fn discover_test_functions(source: &str) -> Vec<String> {
         .collect()
 }
 
-/// Strip an ordinary block-bodied `fn main() { ... }` before adding a test
-/// entry point. Token spans ensure braces inside strings are not treated as
-/// syntax. For unsupported signatures, retain source and let compilation
-/// fail rather than making an unsafe textual cut.
-fn strip_main_function(source: &str) -> String {
-    use crate::lexer::TokenKind;
-    let tokens = match crate::lexer::Lexer::new(source).lex() {
-        Ok(tokens) => tokens,
-        Err(_) => return source.to_owned(),
-    };
-    let significant: Vec<_> = tokens
-        .iter()
-        .filter(|t| {
-            !matches!(
-                &t.kind,
-                TokenKind::Newline | TokenKind::DocComment(_) | TokenKind::Eof
-            )
-        })
-        .collect();
-    for (i, tokens) in significant.windows(5).enumerate() {
-        if !matches!(&tokens[0].kind, TokenKind::Fn)
-            || !matches!(&tokens[1].kind, TokenKind::Ident(name) if name == "main")
-            || !matches!(&tokens[2].kind, TokenKind::LParen)
-            || !matches!(&tokens[3].kind, TokenKind::RParen)
-            || !matches!(&tokens[4].kind, TokenKind::LBrace)
-        {
-            continue;
-        }
-        let start = tokens[0].span.start as usize;
-        let mut depth = 0_usize;
-        for token in &significant[i + 4..] {
-            match &token.kind {
-                TokenKind::LBrace => depth += 1,
-                TokenKind::RBrace => {
-                    depth -= 1;
-                    if depth == 0 {
-                        let end = token.span.end as usize;
-                        if source.is_char_boundary(start) && source.is_char_boundary(end) {
-                            return format!("{}{}", &source[..start], &source[end..]);
-                        }
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    source.to_owned()
-}
-
 /// Run a test file via `nulang`, capturing stderr so error messages appear
 /// after the test name (avoiding interleaved output).
 /// Returns `Ok(())` on success, `Err(stderr_string)` on failure.
 /// Like [`run_test_file`], but captures (discards) the child's stdout so the
 /// parent's stdout stays clean for `--json` output.
-fn run_test_file_captured(file_path: &str) -> Result<(), String> {
-    run_test_file_impl(file_path, false)
+fn run_test_file_captured(file_path: &str, selected_test: Option<&str>) -> Result<(), String> {
+    run_test_file_impl(file_path, selected_test, false)
 }
 
-fn run_test_file(file_path: &str) -> Result<(), String> {
-    run_test_file_impl(file_path, true)
+fn run_test_file(file_path: &str, selected_test: Option<&str>) -> Result<(), String> {
+    run_test_file_impl(file_path, selected_test, true)
 }
 
-fn run_test_file_impl(file_path: &str, inherit_stdout: bool) -> Result<(), String> {
+fn append_test_selector_args(cmd: &mut Command, file_path: &str, selected_test: Option<&str>) {
+    cmd.arg(file_path);
+    if let Some(name) = selected_test {
+        cmd.arg("--test-function").arg(name);
+    }
+}
+
+fn run_test_file_impl(
+    file_path: &str,
+    selected_test: Option<&str>,
+    inherit_stdout: bool,
+) -> Result<(), String> {
     let exe = locate_nulang_exe().map_err(|e| format!("cannot locate nulang: {}", e))?;
     let mut cmd = Command::new(&exe);
-    cmd.arg(file_path);
+    append_test_selector_args(&mut cmd, file_path, selected_test);
     cmd.args(capability_args());
     if inherit_stdout {
         cmd.stdout(std::process::Stdio::inherit());
@@ -3194,10 +3122,14 @@ app "counter" {
     }
 
     #[test]
-    fn test_strip_main_ignores_braces_inside_string_literals() {
-        let source = "fn main() {\n  let s = \"}\"\n  perform IO.print(s)\n}\nfn test_ok() { 1 }\n";
-        assert_eq!(strip_main_function(source).trim(), "fn test_ok() { 1 }");
+    fn test_named_test_dispatch_uses_original_file_with_selector() {
+        let mut cmd = Command::new("nulang");
+        append_test_selector_args(&mut cmd, "tests/test_math.nula", Some("test_add"));
+        let args: Vec<_> = cmd.get_args().map(|s| s.to_string_lossy().into_owned()).collect();
+        assert_eq!(
+            args,
+            vec!["tests/test_math.nula", "--test-function", "test_add"]
+        );
     }
-
 
 }

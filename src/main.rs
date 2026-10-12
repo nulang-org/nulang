@@ -285,6 +285,15 @@ fn main() {
                     std::process::exit(1);
                 }
             }
+            "--test-function" => {
+                if i + 1 < args.len() {
+                    opts.test_function = Some(args[i + 1].clone());
+                    i += 1;
+                } else {
+                    eprintln!("Error: --test-function requires a function name");
+                    std::process::exit(1);
+                }
+            }
             "-c" | "--check" => {
                 if i + 1 < args.len() {
                     opts.check_file = Some(args[i + 1].clone());
@@ -886,6 +895,28 @@ fn main() {
             }
         };
 
+        // Execute a named test from its original source file. Construct the
+        // entry point at the AST level; never strip or generate source files.
+        if let Some(test_function) = opts.test_function.as_deref() {
+            if let Err(e) = run_source_selected_test(
+                &source,
+                Some(path),
+                opts.verbose,
+                &opts.backend,
+                None,
+                None,
+                &opts.target,
+                &opts.with_capabilities,
+                opts.store_path.as_deref(),
+                opts.deny_warnings,
+                Some(test_function),
+            ) {
+                print_error(&e, use_color);
+                std::process::exit(exit_code(&e));
+            }
+            return;
+        }
+
         // `--emit-signals`: analyze the module and write the signal graph JSON.
         if let Some(out) = opts.emit_signals.as_ref() {
             match run_frontend(
@@ -1023,6 +1054,8 @@ struct Options {
     repl: bool,
     eval_code: Option<String>,
     check_file: Option<String>,
+    /// Private test-runner entry-point selector (does not modify source).
+    test_function: Option<String>,
     lsp: bool,
     dap: bool,
     doc: bool,
@@ -1086,6 +1119,7 @@ impl Default for Options {
             repl: false,
             eval_code: None,
             check_file: None,
+            test_function: None,
             lsp: false,
             dap: false,
             doc: false,
@@ -1603,6 +1637,74 @@ fn run_bench<F: FnMut() -> NuResult<()>>(mut run: F, n: usize) -> NuResult<()> {
     Ok(())
 }
 
+/// Select a zero-argument test function by modifying a parsed AST, not its
+/// source text. Any original entry point is replaced only after validation,
+/// and the resulting program retains its original source map and imports.
+fn select_test_entry(ast: &mut nulang::ast::AstModule, name: &str) -> NuResult<()> {
+    use nulang::ast::{Decl, Expr};
+
+    let invalid = || NuError::PackageError {
+        msg: format!("invalid test function '{name}': expected a unique top-level fn test_*()"),
+        span: Span::default(),
+    };
+    if !name.starts_with("test_")
+        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(invalid());
+    }
+
+    let found: Vec<_> = ast
+        .decls
+        .iter()
+        .filter_map(|decl| match decl {
+            Decl::Function {
+                name: candidate,
+                params,
+                type_params,
+                using_params,
+                ..
+            } if candidate == name => Some((params, type_params, using_params)),
+            _ => None,
+        })
+        .collect();
+    let [(params, type_params, using_params)] = found.as_slice() else {
+        return Err(invalid());
+    };
+    if !params.is_empty() || !type_params.is_empty() || !using_params.is_empty() {
+        return Err(NuError::PackageError {
+            msg: format!("test function '{name}' must have no parameters or type parameters"),
+            span: Span::default(),
+        });
+    }
+
+    // Only discard the old entrypoint after locating an unambiguous test.
+    ast.decls
+        .retain(|decl| !matches!(decl, Decl::Function { name, .. } if name == "main"));
+    ast.decls.push(Decl::Function {
+        name: "main".to_string(),
+        type_params: Vec::new(),
+        type_param_constraints: Vec::new(),
+        params: Vec::new(),
+        default_values: Vec::new(),
+        using_params: Vec::new(),
+        ret_type: None,
+        error_type: None,
+        effect: None,
+        cap: None,
+        requires: Vec::new(),
+        ensures: Vec::new(),
+        body: Expr::App {
+            func: Box::new(Expr::Var(name.to_string(), Span::default())),
+            args: Vec::new(),
+            span: Span::default(),
+        },
+        annotations: Vec::new(),
+        public: false,
+        span: Span::default(),
+    });
+    Ok(())
+}
+
 /// Shared frontend: lex -> parse -> typecheck -> effect check -> capability
 /// analysis. Returns the parsed module ready for compilation.
 ///
@@ -1614,6 +1716,24 @@ fn run_frontend(
     verbose: bool,
     with_capabilities: &[String],
     deny_warnings: bool,
+) -> NuResult<(nulang::ast::AstModule, nulang::typechecker::TypeChecker)> {
+    run_frontend_selected_test(
+        source,
+        file_path,
+        verbose,
+        with_capabilities,
+        deny_warnings,
+        None,
+    )
+}
+
+fn run_frontend_selected_test(
+    source: &str,
+    file_path: Option<&str>,
+    verbose: bool,
+    with_capabilities: &[String],
+    deny_warnings: bool,
+    selected_test: Option<&str>,
 ) -> NuResult<(nulang::ast::AstModule, nulang::typechecker::TypeChecker)> {
     let ps = nulang::prelude_source::PRELUDE_SOURCE;
     let mut pl = Lexer::new(ps);
@@ -1651,6 +1771,12 @@ fn run_frontend(
         .into_iter()
         .filter(|d| matches!(d, nulang::ast::Decl::VariantType { .. }))
         .collect();
+
+    // Replace only the AST entrypoint for per-function tests, preserving
+    // exact original file locations for all real functions and diagnostics.
+    if let Some(name) = selected_test {
+        select_test_entry(&mut ast, name)?;
+    }
 
     // 2b. Resolve imports — load and merge declarations from imported files.
     let mut stack = std::collections::HashSet::new();
@@ -1800,8 +1926,43 @@ fn run_source(
     store_path: Option<&str>,
     deny_warnings: bool,
 ) -> NuResult<()> {
-    let (ast, type_checker) =
-        run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
+    run_source_selected_test(
+        source,
+        file_path,
+        verbose,
+        backend,
+        out_file,
+        metrics_port,
+        target,
+        with_capabilities,
+        store_path,
+        deny_warnings,
+        None,
+    )
+}
+
+#[cfg_attr(not(feature = "wasm-backend"), allow(unused_variables))]
+fn run_source_selected_test(
+    source: &str,
+    file_path: Option<&str>,
+    verbose: bool,
+    backend: &str,
+    out_file: Option<&str>,
+    metrics_port: Option<u16>,
+    target: &str,
+    with_capabilities: &[String],
+    store_path: Option<&str>,
+    deny_warnings: bool,
+    selected_test: Option<&str>,
+) -> NuResult<()> {
+    let (ast, type_checker) = run_frontend_selected_test(
+        source,
+        file_path,
+        verbose,
+        with_capabilities,
+        deny_warnings,
+        selected_test,
+    )?;
     match backend {
         #[cfg(feature = "wasm-backend")]
         "wasm" => {
@@ -2807,6 +2968,63 @@ fn levenshtein_distance(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_selected_entrypoint_replaces_main_in_ast_without_source_rewrite() {
+        let source = "fn main() { 999 }\nfn test_pass() { 42 }\n";
+        let tokens = Lexer::new(source).lex().expect("tokens");
+        let mut ast = Parser::new(tokens).parse_module().expect("ast");
+        select_test_entry(&mut ast, "test_pass").expect("select test");
+        let main_functions: Vec<_> = ast
+            .decls
+            .iter()
+            .filter(|decl| matches!(decl, nulang::ast::Decl::Function { name, .. } if name == "main"))
+            .collect();
+        assert_eq!(main_functions.len(), 1, "exactly one entry point");
+        let nulang::ast::Decl::Function { body, .. } = main_functions[0] else {
+            panic!("expected function declaration");
+        };
+        assert!(matches!(
+            body,
+            nulang::ast::Expr::App { func, args, .. }
+                if args.is_empty() && matches!(func.as_ref(), nulang::ast::Expr::Var(name, _) if name == "test_pass")
+        ));
+        assert!(source.contains("999"), "test selection must not edit source");
+    }
+
+    #[test]
+    fn test_selected_entrypoint_rejects_unknown_and_parameterized_tests() {
+        let source = "fn test_with_arg(x: Int) { x }\n";
+        let tokens = Lexer::new(source).lex().expect("tokens");
+        let original = Parser::new(tokens).parse_module().expect("ast");
+        let mut ast = original.clone();
+        assert!(select_test_entry(&mut ast, "test_missing").is_err());
+        assert_eq!(ast, original, "failed selection must not modify the AST");
+        assert!(select_test_entry(&mut ast, "test_with_arg").is_err());
+        assert_eq!(ast, original, "invalid test signature must leave AST intact");
+    }
+
+    #[test]
+    fn test_named_entrypoint_runs_original_module_without_invoking_old_main() {
+        let source = r#"
+            fn main() { perform Test.assert_eq(1, 2) }
+            fn test_pass() { perform Test.assert_eq(1, 1) }
+        "#;
+        let result = run_source_selected_test(
+            source,
+            Some("tests/test_ast_entrypoint.nula"),
+            false,
+            "bytecode",
+            None,
+            None,
+            "native",
+            &[],
+            None,
+            false,
+            Some("test_pass"),
+        );
+        assert!(result.is_ok(), "selected test should pass: {result:?}");
+    }
 
     /// An actor program run through the CLI path must create real actors
     /// and deliver sent messages: with the bare standalone VM the stub

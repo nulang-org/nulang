@@ -137,9 +137,10 @@ is testable from the start.
 
 - **Per-function style** — if a file defines functions whose names start
   with `test_`, each one is discovered and run as a separate test case.
-  The runner removes a simple block-bodied `fn main()` when present and
-  wraps each test function in its own temporary `main`, so the functions
-  must take no arguments:
+  The runner executes each discovered zero-argument function from the original
+  source file. It selects that function as the entrypoint in the compiler AST,
+  without stripping `main`, rewriting the test source, or generating wrapper
+  files:
 
   ```nulang
   // tests/test_strings.nula — two test cases: test_greet_world, test_greet_empty.
@@ -160,10 +161,10 @@ is testable from the start.
 
 :::note
 Test discovery uses parsed top-level function declarations, so text in
-comments and string literals does not register as a test. Generated entry
-points use separate temporary directories per test-run invocation. Unsupported
-`main` signatures are not rewritten; a generated duplicate `main` is reported
-as a compilation failure rather than silently editing unexpected source.
+comments and string literals does not register as a test. Each named test
+executes using the original file path and source map, even when a `main`
+function exists. Zero-argument functions are supported; parameterized or
+ambiguous test functions fail explicitly without changing the file.
 :::
 
 ### Flags
