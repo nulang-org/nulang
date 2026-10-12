@@ -4,6 +4,11 @@
 //! HTTP/stdio transport layer is responsible for validating transport-specific
 //! headers and carrying per-request metadata.
 
+pub mod dev_plane;
+pub mod forge;
+pub mod forge_tools;
+pub mod gitea;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
