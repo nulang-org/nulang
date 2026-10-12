@@ -109,6 +109,11 @@ jobs:
         # nextest intentionally does not execute rustdoc tests.
         run: cargo test --locked --doc
 
+      - name: Source effect-row conformance
+        # Compile/run the actual Nulang source fixtures: Rust unit tests
+        # alone cannot prove parser, checker, and CLI behavior agree.
+        run: python3 conformance/run.py effrow_
+
       - name: Test benchmark harness scripts
         run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 

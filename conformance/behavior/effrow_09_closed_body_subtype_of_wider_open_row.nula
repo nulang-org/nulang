@@ -1,4 +1,6 @@
+// The closed {IO} body satisfies its wider open declaration.
+// Do not call f at the top level: its unresolved tail cannot be discharged
+// without a compatible caller effect row or an explicit row substitution.
 fn f() -> Unit ! {IO, FS, | row} {
     perform IO.print("subset")
 }
-f()

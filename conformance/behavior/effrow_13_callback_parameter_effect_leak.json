@@ -1,0 +1,1 @@
+{"exit_code":5,"stdout":"","stderr":"disallowed effect(s): IO","proves":"Calling an IO-typed callback inside an explicitly pure function is statically rejected."}
