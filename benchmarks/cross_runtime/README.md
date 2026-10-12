@@ -95,3 +95,33 @@ In particular:
 For actor-framework comparisons (for example Pony, Ractor/Actix/Kameo,
 Proto.Actor, or Pekko/Akka), add separate pinned fixtures instead of silently
 changing these standard-runtime baselines.
+
+## Compute-heavy actor backend comparison (Nulang only)
+
+The standard four Savina-style message handlers may be too short to trigger
+native JIT compilation. The matched Rust, Go and Erlang comparison therefore
+uses Nulang bytecode and AOT by default. It never labels uncompiled actor
+handlers as a successful warmed-JIT measurement.
+
+A second, explicitly **Nulang-only** `actor_compute` workload uses the
+identical source for bytecode, warmed JIT and native AOT. Each of 128 actor
+messages executes a 4,096-iteration integer loop and updates actor state.
+The JIT path first executes one untimed warmup message, requires nonzero
+compiled-region telemetry from the scheduler-owned actor VM, and resets
+state. The AOT mode requires full actor behavior target coverage. Every
+backend checks the exact resulting integer state after the measured messages.
+Time includes enqueue and scheduler drain but excludes parsing, compilation
+and JIT warmup.
+
+```bash
+python3 scripts/cross_runtime_bench.py --workloads actor_compute \
+  --runtimes nulang,nulang-jit,nulang-aot \
+  --runs 12 --warmup 1 --cpu-mode single \
+  --output actor-backend-results.json
+```
+
+This is a **compute-bearing actor backend diagnostic**, not a fair
+cross-language or pure message-throughput result. The JIT proof establishes
+that at least one actor-VM region compiled, not the percentage of timed
+instructions actually executed as native code. Do not publish results before
+the exact-head Rust tests and CI benchmark execution complete.
