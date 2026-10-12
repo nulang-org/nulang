@@ -1,1 +1,1 @@
-{"exit_code":0,"stdout":"write=ok\nread=hello\nappend=ok\nread2=hello!\nmissing=error\nlegacy=hello!","stderr":""}
+{"exit_code":0,"stdout":"write=ok\nread=hello\nappend=ok\nread2=hello!\nmissing=error\nlegacy=hello!\nwrite_empty=ok\nread_empty_len=0\nwrite_fail=error\nappend_fail=error","stderr":""}
