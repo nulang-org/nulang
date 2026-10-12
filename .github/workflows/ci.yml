@@ -99,6 +99,12 @@ jobs:
       - name: Build
         run: cargo build --locked --all-targets
 
+      # cargo nextest covers Rust unit/integration tests, but does not execute
+      # .nula behavior fixtures in conformance/behavior. Use the already-built
+      # debug binary (conformance/run.py resolves Cargo's custom target-dir).
+      - name: Nulang language behavior conformance
+        run: python3 conformance/run.py
+
       - name: Test
         # nextest isolates individual tests in their own processes and schedules
         # test binaries concurrently, reducing wall-clock time without changing
@@ -204,6 +210,21 @@ jobs:
 
       - name: Run nula test
         run: cd test-pkg && ../target/release/nulang nula test
+
+      # The scaffold smoke test does not cover existing stdlib extension
+      # packages. Run their own checked-in language-level tests with the
+      # tested release binary, without rebuilding the compiler.
+      - name: Test official stdlib extension packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          export NULANG_STDLIB="$GITHUB_WORKSPACE/src/stdlib"
+          NULANG="$GITHUB_WORKSPACE/target/release/nulang"
+          for package in datetime-ext result-ext http-client; do
+            echo "::group::packages/$package"
+            (cd "packages/$package" && "$NULANG" nula test)
+            echo "::endgroup::"
+          done
 
       - name: Test documentation example discovery
         run: bash scripts/test_verify_doc_examples.sh
