@@ -51,7 +51,30 @@ cargo bench --bench bench_main -- gc/actor_heap_small_alloc
 cargo bench --bench bench_main -- gc/orca_local_alloc_drop
 ```
 
-The benchmarks are in the independent baseline proposal, PR #1549.
+The benchmark baselines were validated and merged in PR #1549. This
+experimental branch carries the same harness, so its benchmark source is
+identical under the default and `compact-orca-header` feature profiles.
+
+Run the paired same-commit study on a dedicated, otherwise-idle runner:
+
+```sh
+python3 -m unittest discover -s scripts/tests -p 'test_bench_orca_header_profiles.py'
+python3 scripts/bench_orca_header_profiles.py --cycles 2 \\
+  --out target/orca-header-profile-study
+```
+
+The runner uses an ABBA order for each cycle (default, compact, compact,
+default), isolates Cargo target and Criterion result directories per feature
+profile, and writes per-trial records plus a JSON summary containing the
+checked-out commit, host details, and signed latency changes. A negative
+latency change means the compact configuration was faster on that sample; it
+is not proof of a significant improvement. The runner refuses dirty
+worktrees unless explicitly overridden, and fails if either benchmark group
+does not produce estimates. It **does not measure RSS or application-level
+tail latency**; those must be collected separately using representative
+actor workloads.
+
+Original benchmark baseline: PR #1549.
 Run paired exact-base/candidate benchmarks on the same host, for both feature
 profiles, with repeated warmups and confidence intervals. Capture peak RSS,
 allocations and reclaimed bytes, throughput, and p95/p99 latency. Include
