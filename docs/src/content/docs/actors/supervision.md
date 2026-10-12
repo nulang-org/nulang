@@ -27,7 +27,16 @@ The second argument is the strategy:
 Place an existing actor under supervision:
 
 ```nulang
-perform Otp.supervise_child(sup_id, worker_actor, 0)
+actor Worker {
+    behavior work() { unit }
+}
+
+fn main() {
+    let sup_id = perform Otp.create_supervisor("my_sup", 0)
+    let worker_actor = spawn Worker {}
+    perform Otp.supervise_child(sup_id, worker_actor, 0)
+    0
+}
 ```
 
 Child restart policies:
@@ -59,17 +68,26 @@ let child2 = perform Otp.start_child(sup)
 Actors can be linked or monitored without full supervision:
 
 ```nulang
-// Link: abnormal exits propagate to the linked peer
-perform Actor.link(target)
+actor Watcher {
+    behavior manage(target) {
+        // Linking and monitoring are invoked from the owning actor.
+        perform Actor.link(target)
+        perform Actor.unlink(target)
+        perform Actor.monitor(target)
+        perform Actor.demonitor(target)
+    }
+}
 
-// Unlink: remove the link
-perform Actor.unlink(target)
+actor Worker {
+    behavior work() { unit }
+}
 
-// Monitor: receive a DOWN message when target exits
-perform Actor.monitor(target)
-
-// Demonitor: stop monitoring
-perform Actor.demonitor(target)
+fn main() {
+    let watcher = spawn Watcher {}
+    let target = spawn Worker {}
+    watcher ! manage(target)
+    0
+}
 ```
 
 ## Exit Trapping
@@ -115,7 +133,7 @@ actor PoolWorker {
 
     behavior process(task: String) {
         // Simulate work — may fail
-        if task == "crash" {
+        if task == "crash" then {
             perform Actor.exit(1)
         }
         perform IO.print("Worker " + perform Int.to_string(self.id) + " processed: " + task)
