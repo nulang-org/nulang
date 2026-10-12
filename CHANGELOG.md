@@ -233,6 +233,8 @@ version + migration.*
 
 ## Stable tier
 
+### Compiler-owned host replay recovery — 2026-09-21
+- **Host replay classes now lower fail-closed into durable recovery policy** (Experimental, `src/host_effect_abi.rs`, `src/durable_effect.rs`). Pure effects are not forced into the durable external-effect journal; idempotent effects map to at-least-once retry; idempotency-key effects map to stable deduplicated retry; backend-owned journal-result effects delegate recovery to the backend; and externally non-replayable effects are rejected from automatic durable recovery instead of being silently promoted to a retryable guarantee.
 ### Zero-copy non-reentrant JIT register entry — 2026-09-24
 - **Cranelift regions that cannot re-enter the VM now execute directly against the active frame's 256-register array**, eliminating the previous 2 KiB snapshot before native entry and 2 KiB copy-back afterward. `Value` is explicitly `repr(transparent)` over `u64` so the native register ABI has a documented layout guarantee.
 - **Compiled-region metadata now records whether native execution may grow or replace the VM frame stack.** Regions containing helper-backed direct calls retain the detached register snapshot because re-entrant interpreter calls may reallocate `VM::frames`; typed, SIMD, and scalar non-call regions use the direct-frame path.
