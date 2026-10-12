@@ -233,6 +233,8 @@ version + migration.*
 
 ## Stable tier
 
+### Compiler-latency benchmark baseline — 2026-09-24
+- **Criterion now measures Nulang compilation separately from execution** (`benches/compiler_bench.rs`): frontend-to-MIR and source-to-bytecode at 20/100/500 generated functions, plus bounded source-to-Cranelift-AOT cases. This restores the evidence base needed before accepting further compiler/JIT complexity.
 ### Zero-copy non-reentrant JIT register entry — 2026-09-24
 - **Cranelift regions that cannot re-enter the VM now execute directly against the active frame's 256-register array**, eliminating the previous 2 KiB snapshot before native entry and 2 KiB copy-back afterward. `Value` is explicitly `repr(transparent)` over `u64` so the native register ABI has a documented layout guarantee.
 - **Compiled-region metadata now records whether native execution may grow or replace the VM frame stack.** Regions containing helper-backed direct calls retain the detached register snapshot because re-entrant interpreter calls may reallocate `VM::frames`; typed, SIMD, and scalar non-call regions use the direct-frame path.
@@ -248,7 +250,6 @@ version + migration.*
 - **Tier-2 promotion now replaces the installed machine-code entry instead of returning the already-cached lower-tier function.** Compiled regions carry an explicit `Baseline` / `Typed` / `Simd` tier plus a `Fast` / `Optimized` codegen policy, and promotion uses fresh Cranelift symbols while preserving the same cache slot.
 - **First-tier native code now uses a low-latency Cranelift module with `opt_level=none` and `regalloc_algorithm=single_pass`; hot replacement uses a separate `opt_level=speed` + backtracking-register-allocation module.** Baseline code can retain folded direct calls while being recompiled at the optimized level; typed code preserves type-directed guard stripping across promotion and can subsequently promote to SIMD when the loop analyzer accepts it.
 - **Each installed compiled region records compiler wall time in nanoseconds.** Regression coverage pins pointer replacement, optimization-level transition, SIMD promotion, per-session counters, and stable compiled-region cardinality across replacement.
-
 
 ### CI playground dependency and formatting repair — 2026-09-24
 - **Browser-playground compilation now includes the shared content-identity module and its pure-Rust `hex` dependency** (`crates/nulang-playground`), matching `semantic_identity.rs`'s current dependency graph. Runtime worker-pool files were also normalized to the repository's rustfmt output so the format gate reflects semantics rather than stale layout.
