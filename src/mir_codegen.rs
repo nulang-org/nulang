@@ -1464,9 +1464,13 @@ fn float_locals(func: &mir::Function) -> Vec<bool> {
 // ===========================================================================
 //
 // A lightweight, conservative MIR→MIR optimizer that runs on every function
-// and behavior before bytecode emission. Four transforms in one fixpoint
-// loop (capped at MAX_OPT_ITERATIONS rounds):
+// and behavior before bytecode emission. Scalar replacement runs once first,
+// followed by four transforms in a fixpoint loop (capped at
+// MAX_OPT_ITERATIONS rounds):
 //
+//   0. scalar replacement   — projection-only compiler-generated immutable
+//                             tuple/record aggregates are replaced by their
+//                             constituent locals, eliminating allocation;
 //   1. constant folding     — arithmetic/comparison on Const operands
 //                             (int, float, bool, string concat) and Unary;
 //   2. identity folding     — x+0, x*1, x|0, x&&true, x*0, ... collapses;
@@ -1498,6 +1502,7 @@ const MAX_OPT_ITERATIONS: usize = 10;
 /// Optimize one MIR function in place. `_module_consts` reserves space for
 /// module-level constant pooling; unused by the current transforms.
 fn optimize_function(func: &mut mir::Function, _module_consts: &mut Vec<mir::RValue>) {
+    crate::mir_scalar_replace::scalar_replace_function(func);
     for _ in 0..MAX_OPT_ITERATIONS {
         let const_locals = collect_const_locals(func);
         let is_float = float_locals(func);
@@ -2689,12 +2694,16 @@ mod tests {
         // honest error rather than silently aliasing onto an existing id.
         //
         // Each field name lives in its own top-level function's own tiny
-        // record literal, not a single 257-field record — a single record
-        // (or a chain of 257 `let`s) hits MIR's unrelated per-function local
-        // count cap first, which would mask the field_id check this test is
-        // actually targeting.
+        // record, not a single 257-field record — a single record (or a chain
+        // of 257 `let`s) hits MIR's unrelated per-function local count cap
+        // first, which would mask the field_id check this test is targeting.
+        //
+        // Keep the record in an ordinary named local so SROA deliberately
+        // preserves it for debugger visibility. Anonymous projection-only
+        // records are allowed to disappear completely and therefore should
+        // not consume a bytecode field id.
         let fns: Vec<String> = (0..257)
-            .map(|i| format!("fn g{i}() -> Int {{ {{ f{i}: {i} }}.f{i} }}"))
+            .map(|i| format!("fn g{i}() -> Int {{ let record = {{ f{i}: {i} }} in record.f{i} }}"))
             .collect();
         let source = format!("{}\ng0()", fns.join("\n"));
         let result = compile_mir_source(&source);
@@ -3267,6 +3276,32 @@ mod optimize_tests {
 
     fn has_opcode(module: &CodeModule, op: OpCode) -> bool {
         module.instructions.iter().any(|i| i.opcode == op)
+    }
+
+    #[test]
+    fn test_scalar_replace_compiler_generated_record_removes_recmk() {
+        let source = "fn main() { let __r = { x: 20, y: 22 }; __r.x + __r.y }";
+        let value = run_source(source).unwrap();
+        assert_eq!(value.as_int(), Some(42));
+
+        let module = compile_source(source).unwrap();
+        assert!(
+            !has_opcode(&module, OpCode::RecMk),
+            "projection-only compiler-generated record should not allocate"
+        );
+    }
+
+    #[test]
+    fn test_scalar_replace_preserves_named_record_for_debugger() {
+        let source = "fn main() { let point = { x: 20, y: 22 }; point.x + point.y }";
+        let value = run_source(source).unwrap();
+        assert_eq!(value.as_int(), Some(42));
+
+        let module = compile_source(source).unwrap();
+        assert!(
+            has_opcode(&module, OpCode::RecMk),
+            "ordinary named source local remains materialized for debugger visibility"
+        );
     }
 
     #[test]
