@@ -44,17 +44,21 @@ jobs:
           key: fuzz-shard-${{ matrix.shard }}
 
       - name: Run differential fuzz shard
+        id: fuzz
+        shell: bash
         env:
           NULANG_FUZZ_ITERATIONS: "100000"
           NULANG_FUZZ_SHARD_ID: ${{ matrix.shard }}
-        run: cargo test --lib --features wasm-backend fuzz_differential_extended -- --ignored --nocapture
+        run: |
+          set -o pipefail
+          cargo test --locked --lib --features wasm-backend fuzz_differential_extended -- --ignored --nocapture 2>&1 \
+            | tee "${RUNNER_TEMP}/fuzz-divergence-shard-${NULANG_FUZZ_SHARD_ID}.log"
 
       - name: Upload divergence log on failure
-        if: failure()
+        if: ${{ failure() && steps.fuzz.outcome == 'failure' }}
         uses: actions/upload-artifact@v7
         with:
           name: fuzz-divergence-shard-${{ matrix.shard }}
-          path: |
-            /tmp/*.log
-          if-no-files-found: ignore
+          path: ${{ runner.temp }}/fuzz-divergence-shard-${{ matrix.shard }}.log
+          if-no-files-found: error
           retention-days: 30
