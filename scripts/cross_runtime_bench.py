@@ -112,6 +112,9 @@ def parse_records(
         proofs = JIT_PROOF_RE.findall(output)
         if len(proofs) != 1 or int(proofs[0]) <= 0:
             raise RuntimeError("actor_compute: missing or invalid scheduler actor-VM native JIT proof")
+        # Preserve independently auditable compilation evidence in the JSON
+        # artifact, rather than relying only on transient Actions logs.
+        records["actor_compute"]["jit_actor_vm_compiled_regions"] = int(proofs[0])
     return records
 
 
@@ -398,6 +401,10 @@ def main() -> int:
         parser.error("--runs must be >= 1 and --warmup must be >= 0")
 
     selected = [item.strip() for item in args.runtimes.split(",") if item.strip()]
+    if not selected:
+        parser.error("at least one runtime must be selected")
+    if len(selected) != len(set(selected)):
+        parser.error("duplicate runtimes are not allowed")
     unknown = sorted(set(selected) - {"nulang", "nulang-jit", "nulang-aot", "rust", "go", "erlang"})
     if unknown:
         parser.error(f"unknown runtimes: {', '.join(unknown)}")
@@ -413,6 +420,8 @@ def main() -> int:
         runtime not in {"nulang", "nulang-jit", "nulang-aot"} for runtime in selected
     ):
         parser.error("actor_compute is Nulang-only; no cross-language comparison is valid")
+    if args.workloads == "actor_compute" and "nulang" not in selected:
+        parser.error("actor_compute requires the nulang bytecode reference backend")
 
     cpu_affinity = measurement_affinity(args.cpu_mode)
     if cpu_affinity is not None:
