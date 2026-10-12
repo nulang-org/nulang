@@ -16,10 +16,25 @@ class OrcaHeaderBenchmarkReporterTests(unittest.TestCase):
             file = criterion / "gc" / "actor_heap_small_alloc" / "payload_16" / "new" / "estimates.json"
             file.parent.mkdir(parents=True)
             file.write_text(json.dumps({"mean": {"point_estimate": 123.5}}), encoding="utf-8")
+            second = criterion / "gc" / "orca_local_alloc_drop" / "payload_16" / "new" / "estimates.json"
+            second.parent.mkdir(parents=True)
+            second.write_text(json.dumps({"mean": {"point_estimate": 200.0}}), encoding="utf-8")
             self.assertEqual(
                 criterion_means(criterion),
-                {"gc/actor_heap_small_alloc/payload_16": 123.5},
+                {
+                    "gc/actor_heap_small_alloc/payload_16": 123.5,
+                    "gc/orca_local_alloc_drop/payload_16": 200.0,
+                },
             )
+
+    def test_fails_if_one_benchmark_group_did_not_run(self):
+        with tempfile.TemporaryDirectory() as folder:
+            criterion = Path(folder)
+            file = criterion / "gc" / "actor_heap_small_alloc" / "payload_16" / "new" / "estimates.json"
+            file.parent.mkdir(parents=True)
+            file.write_text(json.dumps({"mean": {"point_estimate": 123.5}}), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "Missing Criterion groups"):
+                criterion_means(criterion)
 
     def test_summarizes_balanced_abba_without_inventing_significance(self):
         samples = [
