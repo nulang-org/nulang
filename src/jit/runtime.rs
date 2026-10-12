@@ -6,6 +6,8 @@ use crate::value_layout::{
 };
 use crate::vm::Value;
 use std::cell::{Cell, UnsafeCell};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 // is_float_raw is now imported from crate::value_layout (integer bitmask, no FPU).
 
 /// Coerce a raw Nulang value to its string representation: the string content
@@ -331,6 +333,39 @@ pub extern "C" fn nulang_fmul(a: u64, b: u64) -> u64 {
     Value::float(f64::from_bits(a) * f64::from_bits(b)).as_raw()
 }
 
+/// Float arithmetic that coerces a non-float (nil) operand to 0.0, matching
+/// the interpreter's `F*` opcode handlers (`as_float().unwrap_or(0.0)`).
+/// Used by the AOT backend for operations the bytecode compiler statically
+/// types as Float even when a value (e.g. a division-by-zero nil) is not a
+/// float at runtime.
+fn fval(raw: u64) -> f64 {
+    if is_float_raw(raw) {
+        f64::from_bits(raw)
+    } else {
+        0.0
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn nulang_fadd_nil0(a: u64, b: u64) -> u64 {
+    Value::float(fval(a) + fval(b)).as_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn nulang_fsub_nil0(a: u64, b: u64) -> u64 {
+    Value::float(fval(a) - fval(b)).as_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn nulang_fmul_nil0(a: u64, b: u64) -> u64 {
+    Value::float(fval(a) * fval(b)).as_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn nulang_ineg_nil0(a: u64) -> u64 {
+    Value::float(-fval(a)).as_raw()
+}
+
 #[no_mangle]
 pub extern "C" fn nulang_fdiv(a: u64, b: u64) -> u64 {
     let bv = f64::from_bits(b);
@@ -338,6 +373,15 @@ pub extern "C" fn nulang_fdiv(a: u64, b: u64) -> u64 {
         return Value::nil().as_raw();
     }
     Value::float(f64::from_bits(a) / bv).as_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn nulang_fmod(a: u64, b: u64) -> u64 {
+    let bv = f64::from_bits(b);
+    if bv == 0.0 {
+        return Value::nil().as_raw();
+    }
+    Value::float(f64::from_bits(a) % bv).as_raw()
 }
 
 #[no_mangle]
@@ -444,9 +488,22 @@ thread_local! {
 
 /// Record a runtime error for retrieval by the AOT driver (no-op semantics
 /// for the tiered JIT, which never inspects this slot).
+///
+/// First-write-wins: compiled code cannot unwind, so a helper records the
+/// error and yields its nil/replacement value, and later statements keep
+/// executing and may record *their* own errors. The interpreter aborts at
+/// the FIRST arithmetic/type error, so to stay in lockstep the AOT driver
+/// must surface that first error, not the last one recorded by downstream
+/// statements that ran on the error-replacement value. E.g. `--(1 + 2,)`:
+/// the inner neg fails on the tuple pointer ("got ptr"), yields nil, and the
+/// OUTER neg on nil would otherwise overwrite the slot with "got nil".
 pub fn aot_set_pending_error(msg: String) {
+    // First-write-wins: the interpreter aborts at the FIRST error and never
+    // runs later statements, so that first error is the observable one.
     AOT_PENDING_ERROR.with(|e| {
-        *e.borrow_mut() = Some(msg);
+        if e.borrow().is_none() {
+            *e.borrow_mut() = Some(msg);
+        }
     });
 }
 
@@ -616,6 +673,67 @@ thread_local! {
     static JIT_MODULE_IDX: Cell<usize> = const { Cell::new(NO_JIT_MODULE) };
 }
 
+#[derive(Clone, Copy)]
+struct JitLeafCallEntry {
+    func_idx: usize,
+    ptr: *const u8,
+    return_reg: u8,
+    required_args: usize,
+}
+
+thread_local! {
+    static JIT_LEAF_CALLS: std::cell::RefCell<Vec<JitLeafCallEntry>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static JIT_LEAF_CONSTANTS: Cell<*const u64> = const { Cell::new(std::ptr::null()) };
+}
+
+#[cfg(test)]
+static JIT_LEAF_TABLE_INSTALLS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_jit_leaf_table_installs_for_test() {
+    JIT_LEAF_TABLE_INSTALLS.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn jit_leaf_table_installs_for_test() -> usize {
+    JIT_LEAF_TABLE_INSTALLS.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_jit_leaf_calls(calls: &[(usize, *const u8, u8, usize)], constants: *const u64) {
+    #[cfg(test)]
+    JIT_LEAF_TABLE_INSTALLS.fetch_add(1, Ordering::Relaxed);
+    JIT_LEAF_CALLS.with(|slot| {
+        let mut entries = slot.borrow_mut();
+        entries.clear();
+        entries.extend(
+            calls.iter().map(
+                |&(func_idx, ptr, return_reg, required_args)| JitLeafCallEntry {
+                    func_idx,
+                    ptr,
+                    return_reg,
+                    required_args,
+                },
+            ),
+        );
+    });
+    JIT_LEAF_CONSTANTS.with(|slot| slot.set(constants));
+}
+
+pub(crate) fn clear_jit_leaf_calls() {
+    JIT_LEAF_CALLS.with(|slot| slot.borrow_mut().clear());
+    JIT_LEAF_CONSTANTS.with(|slot| slot.set(std::ptr::null()));
+}
+
+fn jit_leaf_call(func_idx: usize) -> Option<JitLeafCallEntry> {
+    JIT_LEAF_CALLS.with(|slot| {
+        slot.borrow()
+            .iter()
+            .copied()
+            .find(|entry| entry.func_idx == func_idx)
+    })
+}
+
 pub unsafe fn set_jit_vm(vm: *mut crate::vm::VM, module_idx: usize) {
     JIT_VM.with(|cell| cell.set(vm));
     JIT_MODULE_IDX.with(|cell| cell.set(module_idx));
@@ -693,6 +811,8 @@ struct JitThreadState {
     yield_pc: u64,
     branch_exit_pc: u64,
     pending_error: Option<String>,
+    leaf_calls: Vec<JitLeafCallEntry>,
+    leaf_constants: *const u64,
 }
 
 fn save_jit_thread_state() -> JitThreadState {
@@ -707,6 +827,8 @@ fn save_jit_thread_state() -> JitThreadState {
         JIT_BRANCH_EXIT_PC.with(|c| c.get()),
     );
     let pending_error = AOT_PENDING_ERROR.with(|e| e.borrow().clone());
+    let leaf_calls = JIT_LEAF_CALLS.with(|slot| slot.borrow().clone());
+    let leaf_constants = JIT_LEAF_CONSTANTS.with(|slot| slot.get());
     JitThreadState {
         vm,
         module_idx,
@@ -715,6 +837,8 @@ fn save_jit_thread_state() -> JitThreadState {
         yield_pc,
         branch_exit_pc,
         pending_error,
+        leaf_calls,
+        leaf_constants,
     }
 }
 
@@ -728,6 +852,8 @@ fn restore_jit_thread_state(s: JitThreadState) {
     JIT_YIELD_PC.with(|c| c.set(s.yield_pc));
     JIT_BRANCH_EXIT_PC.with(|c| c.set(s.branch_exit_pc));
     AOT_PENDING_ERROR.with(|e| *e.borrow_mut() = s.pending_error);
+    JIT_LEAF_CALLS.with(|slot| *slot.borrow_mut() = s.leaf_calls);
+    JIT_LEAF_CONSTANTS.with(|slot| slot.set(s.leaf_constants));
 }
 
 /// Run a provably-non-suspending callee (function-table index `func_idx`) to
@@ -746,7 +872,7 @@ fn restore_jit_thread_state(s: JitThreadState) {
 /// The callee is `!may_suspend` by construction (the compiler gates emission
 /// on that analysis), so it never suspends mid-run.
 #[no_mangle]
-pub extern "C" fn nulang_jit_direct_call(
+pub unsafe extern "C" fn nulang_jit_direct_call(
     regs: *mut u64,
     func_idx: i64,
     argc: i64,
@@ -757,9 +883,59 @@ pub extern "C" fn nulang_jit_direct_call(
         set_jit_pending_vm_error("JIT direct call with no active VM".to_string());
         return 1;
     }
+    let func_idx = func_idx as usize;
+    let argc = argc.max(0) as usize;
+    let dst = dst.max(0) as usize;
+
+    if dst < 256 {
+        if let Some(leaf) = jit_leaf_call(func_idx) {
+            if argc >= leaf.required_args {
+                let mut callee_regs = std::mem::MaybeUninit::<[u64; 256]>::uninit();
+                let callee_ptr = callee_regs.as_mut_ptr() as *mut u64;
+                let copied = argc.min(256);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(regs, callee_ptr, copied);
+                }
+
+                // A nested leaf call is part of the enclosing native region's
+                // reduction. Do not consume a second safepoint budget or leak
+                // branch/yield markers from the callee back into the caller.
+                let saved_safepoint = JIT_SAFEPOINT_PTR.with(|slot| {
+                    let old = slot.get();
+                    slot.set(std::ptr::null_mut());
+                    old
+                });
+                let saved_yield = JIT_YIELD_PC.with(|slot| slot.replace(u64::MAX));
+                let saved_branch = JIT_BRANCH_EXIT_PC.with(|slot| slot.replace(u64::MAX));
+                let saved_aot_error = AOT_PENDING_ERROR.with(|slot| slot.borrow_mut().take());
+
+                let constants = JIT_LEAF_CONSTANTS.with(|slot| slot.get());
+                let func: extern "C" fn(*mut u64, *const u64) =
+                    unsafe { std::mem::transmute(leaf.ptr) };
+                func(callee_ptr, constants);
+
+                let leaf_error = AOT_PENDING_ERROR.with(|slot| slot.borrow_mut().take());
+                AOT_PENDING_ERROR.with(|slot| *slot.borrow_mut() = saved_aot_error);
+                JIT_SAFEPOINT_PTR.with(|slot| slot.set(saved_safepoint));
+                JIT_YIELD_PC.with(|slot| slot.set(saved_yield));
+                JIT_BRANCH_EXIT_PC.with(|slot| slot.set(saved_branch));
+
+                if let Some(msg) = leaf_error {
+                    set_jit_pending_vm_error(msg);
+                    return 1;
+                }
+
+                unsafe {
+                    *regs.add(dst) = *callee_ptr.add(leaf.return_reg as usize);
+                }
+                return 0;
+            }
+        }
+    }
+
     let vm = unsafe { &mut *vm_ptr };
     let saved = save_jit_thread_state();
-    let status = vm.jit_direct_call(regs, func_idx as usize, argc as usize, dst as usize);
+    let status = vm.jit_direct_call(regs, func_idx, argc, dst);
     restore_jit_thread_state(saved);
     status
 }

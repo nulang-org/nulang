@@ -1,14 +1,91 @@
 //! Stable ABI between the actor runtime and native Nulang behavior entry points.
 //!
 //! Internal Nulang functions are free to use optimized, type-specialized
-//! signatures. Only the actor/runtime boundary uses this fixed C ABI. Keeping
-//! that boundary stable lets the runtime add suspension/yield semantics without
-//! forcing every native call through a boxed actor-context signature.
+//! signatures. Only runtime boundaries use the fixed boxed ABI. Keeping that
+//! boundary stable lets native code progressively unbox typed values without
+//! coupling the actor scheduler, effect runtime, durability layer, or FFI to
+//! one backend's internal representation.
+
+use crate::types::{PrimitiveType, Type};
 
 /// Current native actor ABI version.
 ///
 /// Generated wrappers validate this before reading the rest of the context.
 pub const NATIVE_ACTOR_ABI_VERSION: u32 = 1;
+
+/// Native representation selected for a typed value inside compiled code.
+///
+/// This is deliberately separate from `vm::Value`: the VM/runtime ABI remains
+/// NaN-tagged while native backends may keep proven primitive values unboxed.
+/// Backends must preserve Nulang semantics (for example Int48 normalization)
+/// even when the physical representation is a raw machine integer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NativeValueRepr {
+    /// NaN-tagged `vm::Value`; required whenever static representation is not
+    /// known or a value crosses a boxed runtime boundary.
+    Tagged,
+    /// Raw machine integer representation for statically known Nulang `Int`.
+    I64,
+    /// Raw IEEE-754 binary64 representation for statically known `Float`.
+    F64,
+    /// Raw backend boolean representation for statically known `Bool`.
+    Bool,
+}
+
+impl NativeValueRepr {
+    /// Conservative representation for a source/MIR type.
+    ///
+    /// Only scalar primitives with an unambiguous native representation are
+    /// unboxed here. Heap values, type variables, actor addresses, unit-like
+    /// values, and composite types remain tagged until a dedicated lowering
+    /// contract exists for them.
+    pub fn for_type(ty: &Type) -> Self {
+        match ty {
+            Type::Primitive(PrimitiveType::Int) => Self::I64,
+            Type::Primitive(PrimitiveType::Float) => Self::F64,
+            Type::Primitive(PrimitiveType::Bool) => Self::Bool,
+            _ => Self::Tagged,
+        }
+    }
+
+    pub const fn is_boxed(self) -> bool {
+        matches!(self, Self::Tagged)
+    }
+
+    pub const fn is_raw_scalar(self) -> bool {
+        !self.is_boxed()
+    }
+}
+
+/// ABI boundary crossed by a compiled Nulang value.
+///
+/// `Internal` is the only boundary allowed to preserve an unboxed scalar.
+/// Runtime-facing boundaries intentionally force `Tagged` today. This keeps
+/// native specialization an optimization rather than a semantic requirement
+/// and prevents raw values from leaking into code that expects `vm::Value`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NativeBoundary {
+    Internal,
+    ActorRuntime,
+    EffectRuntime,
+    DurableRuntime,
+    Ffi,
+}
+
+impl NativeBoundary {
+    pub fn representation_for(self, ty: &Type) -> NativeValueRepr {
+        match self {
+            Self::Internal => NativeValueRepr::for_type(ty),
+            Self::ActorRuntime | Self::EffectRuntime | Self::DurableRuntime | Self::Ffi => {
+                NativeValueRepr::Tagged
+            }
+        }
+    }
+
+    pub const fn requires_boxed_values(self) -> bool {
+        !matches!(self, Self::Internal)
+    }
+}
 
 /// Result status returned by a native actor entry wrapper.
 ///
@@ -106,5 +183,70 @@ mod tests {
             assert_eq!(NativeActorStatus::from_raw(status as u32), Some(status));
         }
         assert_eq!(NativeActorStatus::from_raw(u32::MAX), None);
+    }
+
+    #[test]
+    fn typed_internal_values_have_explicit_native_representations() {
+        assert_eq!(
+            NativeValueRepr::for_type(&Type::int()),
+            NativeValueRepr::I64
+        );
+        assert_eq!(
+            NativeValueRepr::for_type(&Type::float()),
+            NativeValueRepr::F64
+        );
+        assert_eq!(
+            NativeValueRepr::for_type(&Type::bool()),
+            NativeValueRepr::Bool
+        );
+        assert_eq!(
+            NativeValueRepr::for_type(&Type::string()),
+            NativeValueRepr::Tagged
+        );
+    }
+
+    #[test]
+    fn runtime_boundaries_force_boxed_values() {
+        for boundary in [
+            NativeBoundary::ActorRuntime,
+            NativeBoundary::EffectRuntime,
+            NativeBoundary::DurableRuntime,
+            NativeBoundary::Ffi,
+        ] {
+            assert!(boundary.requires_boxed_values());
+            assert_eq!(
+                boundary.representation_for(&Type::int()),
+                NativeValueRepr::Tagged
+            );
+            assert_eq!(
+                boundary.representation_for(&Type::float()),
+                NativeValueRepr::Tagged
+            );
+        }
+    }
+
+    #[test]
+    fn internal_boundary_preserves_typed_native_representation() {
+        assert!(!NativeBoundary::Internal.requires_boxed_values());
+        assert_eq!(
+            NativeBoundary::Internal.representation_for(&Type::int()),
+            NativeValueRepr::I64
+        );
+        assert_eq!(
+            NativeBoundary::Internal.representation_for(&Type::float()),
+            NativeValueRepr::F64
+        );
+        assert_eq!(
+            NativeBoundary::Internal.representation_for(&Type::bool()),
+            NativeValueRepr::Bool
+        );
+    }
+
+    #[test]
+    fn composite_and_heap_types_remain_tagged_by_default() {
+        let record = Type::record(vec![("x".to_string(), Type::int())]);
+        assert!(NativeValueRepr::for_type(&record).is_boxed());
+        assert!(NativeValueRepr::for_type(&Type::string()).is_boxed());
+        assert!(NativeValueRepr::for_type(&Type::int()).is_raw_scalar());
     }
 }
