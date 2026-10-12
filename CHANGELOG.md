@@ -233,6 +233,10 @@ version + migration.*
 
 ## Stable tier
 
+### WASM component authority unification — 2026-09-23
+- **Wasmtime component host imports now use the typed runtime authority model** (Experimental, `src/wasm_component_runtime.rs`). The backend-specific `Capabilities { allow_log, allow_clock, allow_random }` policy is removed; `ComponentRuntime::new` is deny-by-default and `new_with_authority` accepts the same `AuthorityManifest` used by the actor runtime.
+- **WIT host operations require exact grants at both link and dispatch time.** `IO::Log`, `Time::Now`, and `Random::U64` use typed `AuthorityGrant::Other` entries; sibling grants do not authorize each other, and unauthorized imports are omitted from the linker so component instantiation fails closed.
+- This is a current-`main` replay of the security slice from #552 and introduces no second WASM-specific policy model.
 ### Zero-copy non-reentrant JIT register entry — 2026-09-24
 - **Cranelift regions that cannot re-enter the VM now execute directly against the active frame's 256-register array**, eliminating the previous 2 KiB snapshot before native entry and 2 KiB copy-back afterward. `Value` is explicitly `repr(transparent)` over `u64` so the native register ABI has a documented layout guarantee.
 - **Compiled-region metadata now records whether native execution may grow or replace the VM frame stack.** Regions containing helper-backed direct calls retain the detached register snapshot because re-entrant interpreter calls may reallocate `VM::frames`; typed, SIMD, and scalar non-call regions use the direct-frame path.
