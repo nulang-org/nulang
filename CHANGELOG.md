@@ -233,6 +233,8 @@ version + migration.*
 
 ## Stable tier
 
+### Explicit state consistency/durability semantics — 2026-09-21
+- **State models now expose orthogonal semantic axes** (`src/ast.rs`, `src/runtime/persistence.rs`). The existing `local`/`durable`/`event_sourced`/`crdt` language surface is unchanged, but each model now derives a storage-neutral durability contract (`Ephemeral`, `Checkpointed`, or `EventLog`) and a consistency contract (`Local`, `ActorOwned`, or `Convergent`). `ActorOwned` models explicitly require single-writer fencing when ownership moves; CRDT models are explicitly multi-writer/convergent. This is an additive semantic API intended for runtime policy and Behavior Manifest admission, not a new claim of generic linearizable shared state.
 ### Zero-copy non-reentrant JIT register entry — 2026-09-24
 - **Cranelift regions that cannot re-enter the VM now execute directly against the active frame's 256-register array**, eliminating the previous 2 KiB snapshot before native entry and 2 KiB copy-back afterward. `Value` is explicitly `repr(transparent)` over `u64` so the native register ABI has a documented layout guarantee.
 - **Compiled-region metadata now records whether native execution may grow or replace the VM frame stack.** Regions containing helper-backed direct calls retain the detached register snapshot because re-entrant interpreter calls may reallocate `VM::frames`; typed, SIMD, and scalar non-call regions use the direct-frame path.

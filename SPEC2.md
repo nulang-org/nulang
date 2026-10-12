@@ -391,6 +391,24 @@ Every state variable in an actor has an associated *state model* that determines
 | `event_sourced` | Event journal | Event stream | Full event replay | Audit trails, temporal queries |
 | `crdt` | Delta log | Concrete-type selector + merge-on-sync landed; `Crdt.*` effect module and operation-set enforcement open (see §9.10) | CRDT merge (on sync) | Shared distributed state |
 
+The runtime derives two orthogonal contracts from this surface model:
+
+| Model | Consistency contract | Durability contract |
+|-------|----------------------|---------------------|
+| `local` | `Local` | `Ephemeral` |
+| `durable` | `ActorOwned` | `Checkpointed` |
+| `event_sourced` | `ActorOwned` | `EventLog` |
+| `crdt` | `Convergent` | `Checkpointed` |
+
+`ActorOwned` means that only one activation may authoritatively mutate the
+field at a time; distributed runtimes must fence stale owners before ownership
+moves. It does **not** claim a general linearizable shared-memory or
+linearizable key-value abstraction. `Convergent` state deliberately permits
+multiple writers under the selected CRDT merge semantics. Keeping consistency
+separate from durability prevents a durable field from being mistaken for a
+replicated/linearizable field and gives deployment systems a machine-readable
+basis for placement and recovery policy.
+
 The state model is declared alongside the variable:
 
 ```nulang
