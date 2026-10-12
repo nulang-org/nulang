@@ -402,6 +402,12 @@ def main() -> int:
     if unknown:
         parser.error(f"unknown runtimes: {', '.join(unknown)}")
 
+    if args.workloads == "savina" and "nulang-jit" in selected:
+        parser.error(
+            "warmed JIT is not verified for short Savina actor behaviors; "
+            "use --workloads actor_compute for a native-JIT-backed actor probe"
+        )
+
     benchmarks = COMPUTE_BENCHMARKS if args.workloads == "actor_compute" else BENCHMARKS
     if args.workloads == "actor_compute" and any(
         runtime not in {"nulang", "nulang-jit", "nulang-aot"} for runtime in selected
