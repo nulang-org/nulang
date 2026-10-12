@@ -18,6 +18,7 @@ use crate::runtime::persistence::{
 };
 use crate::semantic_identity::EffectSiteId;
 use crate::runtime::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks, Runtime, StateModel};
+use crate::semantic_identity::EffectSiteId;
 use crate::vm::{Frame, Value, VM};
 
 // ---------------------------------------------------------------------------

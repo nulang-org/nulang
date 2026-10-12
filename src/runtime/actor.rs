@@ -349,6 +349,12 @@ pub struct Actor {
     /// suspended behavior re-executes its `LlmAsk` instruction.
     #[cfg(feature = "ai-runtime")]
     pub llm_completed: Option<Result<nulang_ai::LlmResponse, nulang_ai::LlmError>>,
+    /// Durable effect operation backing the current workflow LLM request.
+    #[cfg(feature = "ai-runtime")]
+    pub llm_durable_effect_id: Option<crate::durable_effect::DurableEffectId>,
+    /// Canonical serialized LLM request bound to `llm_durable_effect_id`.
+    #[cfg(feature = "ai-runtime")]
+    pub llm_durable_request: Option<Vec<u8>>,
     /// State of an in-flight timed selective receive (`receive ... after
     /// ms =>`), from the first suspension until the wait resolves (match,
     /// timeout, or the behavior ends). `None` when no receive-wait is live.
@@ -476,6 +482,10 @@ impl Actor {
             dirty_fields: HashSet::new(),
             #[cfg(feature = "ai-runtime")]
             llm_completed: None,
+            #[cfg(feature = "ai-runtime")]
+            llm_durable_effect_id: None,
+            #[cfg(feature = "ai-runtime")]
+            llm_durable_request: None,
             receive_wait: None,
             timer_sleep_fired: false,
             retry_config: None,

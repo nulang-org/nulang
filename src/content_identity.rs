@@ -67,6 +67,11 @@ impl SourceId {
 }
 
 impl SemanticId {
+    /// Reconstruct a semantic identity already validated and stored in a compiler artifact.
+    pub(crate) const fn from_digest(digest: [u8; 32]) -> Self {
+        Self(digest)
+    }
+
     /// Hash canonical typed/lowered semantic bytes plus referenced semantic IDs.
     ///
     /// Reference ordering and duplicate declarations are normalized so package
