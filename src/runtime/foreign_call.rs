@@ -203,12 +203,9 @@ mod tests {
     #[test]
     fn call_request_owns_module_function_and_arguments() {
         let values = [Value::int(3), Value::string(2)];
-        let request = ForeignCallRequest::from_vm_args(
-            "math",
-            "combine",
-            &values,
-            |id| (id == 2).then(|| "payload".to_string()),
-        )
+        let request = ForeignCallRequest::from_vm_args("math", "combine", &values, |id| {
+            (id == 2).then(|| "payload".to_string())
+        })
         .unwrap();
 
         assert_eq!(request.module, "math");
