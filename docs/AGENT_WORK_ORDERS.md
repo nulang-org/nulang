@@ -85,3 +85,19 @@ Use commands actually available on the host; `just fast-check` requires `cargo-n
 Compiler changes need a semantics regression test and applicable bytecode/JIT/WASM parity checks. Runtime changes need actor isolation, supervision, durability/recovery, backpressure, and network tests as applicable. Performance changes require paired baseline/candidate data with equal compiler flags, feature flags, machine, workload, warm-up and repeated runs; report variability and correctness together. Mark claimed speedups unverified when measurements are absent.
 
 Keep public-language changes within the Frozen/Stable/Experimental policy and core admission rule. Require a human maintainer to approve language-surface changes, unsafe memory/FFI logic, format changes, or durability guarantees; automated reviews supplement rather than replace maintainer approval.
+
+## Machine-readable local evidence
+Generate a read-only Git scope summary and execute exactly the checks you name (commands run **without a shell**):
+
+```bash
+python3 scripts/agent_evidence.py \
+  --base <FULL_BASE_SHA> \
+  --check 'focused=cargo test --locked test_name' \
+  --check 'fast=just fast-check' \
+  --output .git/agent-evidence.json
+
+python3 -m unittest discover -s scripts/tests -p 'test_agent_evidence.py'
+```
+
+The base must be an existing full 40-character commit SHA. Only explicit `--check` commands run, and the collector limits them to 20 named checks with a per-check timeout. The emitted JSON records base/head SHAs, changed paths, clean/dirty state, command fingerprints, exit codes, and duration. It intentionally discards command output and does **not** claim CI, independent review, or benchmarks have passed. Use an ignored/local output path such as `.git/agent-evidence.json` and inspect the artifact before attaching it to a PR. Follow `just check` and the GitHub Actions matrix as the authoritative pre-merge gates.
+
