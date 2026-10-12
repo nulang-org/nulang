@@ -1418,7 +1418,7 @@ mod tests {
     }
 
     #[test]
-    fn static_serving_stays_inside_its_root_including_symlinks() {
+    fn test_static_serving_stays_inside_its_root_including_symlinks() {
         use std::time::{SystemTime, UNIX_EPOCH};
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1460,7 +1460,7 @@ mod tests {
     }
 
     #[test]
-    fn realtime_room_replay_and_slow_subscribers_are_bounded() {
+    fn test_realtime_room_replay_and_slow_subscribers_are_bounded() {
         let mut registry = RealtimeRegistry::default();
         let (_id, _history, slow) = registry.subscribe("unit:bounded").unwrap();
         for n in 0..(MAX_REALTIME_HISTORY_MESSAGES + MAX_REALTIME_SUBSCRIBER_BACKLOG + 4) {
@@ -1490,7 +1490,7 @@ mod tests {
     }
 
     #[test]
-    fn realtime_history_is_bounded_by_bytes_as_well_as_event_count() {
+    fn test_realtime_history_is_bounded_by_bytes_as_well_as_event_count() {
         let mut registry = RealtimeRegistry::default();
         for n in 0..32 {
             registry
@@ -1506,14 +1506,14 @@ mod tests {
     }
 
     #[test]
-    fn sse_heartbeat_is_a_comment_and_not_an_application_message() {
+    fn test_sse_heartbeat_is_a_comment_and_not_an_application_message() {
         let mut wire = Vec::new();
         WebDevServer::write_sse_keepalive(&mut wire).unwrap();
         assert_eq!(wire.as_slice(), b": keep-alive\n\n");
     }
 
     #[test]
-    fn realtime_registry_preserves_active_rooms_at_capacity() {
+    fn test_realtime_registry_preserves_active_rooms_at_capacity() {
         let mut registry = RealtimeRegistry::default();
         let mut active = Vec::new();
         for n in 0..MAX_REALTIME_ROOMS {
@@ -1529,7 +1529,7 @@ mod tests {
     }
 
     #[test]
-    fn realtime_registry_bounds_rooms_and_subscribers() {
+    fn test_realtime_registry_bounds_rooms_and_subscribers() {
         let mut registry = RealtimeRegistry::default();
         for n in 0..MAX_REALTIME_ROOMS {
             registry.broadcast(&format!("unit:{n}"), "initial").unwrap();
