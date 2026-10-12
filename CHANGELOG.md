@@ -1,5 +1,10 @@
 # Nulang Changelog
 
+### Value-style map helpers and representation guidance — 2026-10-12
+- **`stdlib::map` gains `from_pairs`, `to_pairs`, `merge`, and `get_or` without replacing its array-based value semantics.** A new conformance fixture covers repeated keys, right-biased merging, original-value preservation, insertion order, and missing-key fallback.
+- **Reference docs distinguish value-style maps from the separately implemented mutable `Map.*` effect.** The latter has map-first argument order, mutable open-addressed storage, and `nil` for absence; broader type/ownership/API reconciliation remains tracked separately.
+
+
 ### Public CLI release portability — 2026-10-11
 - **Public release archives use the `release-cli` feature profile without a Python shared-library ABI dependency.** The ordinary full/default source build retains opt-in Python interoperability; release packaging checks the resulting Linux and macOS binary for Python dependencies.
 - **Release PRs rehearse the full non-publishing four-platform build matrix before tags are created.** The Linux ARM64 cross build explicitly installs target libc development headers and preflights a target-compiler C header probe, avoiding an observed `ring` compile failure when `--no-install-recommends` omits the ARM64 sysroot. Actual cross-build and clean-host portability remain release gates.
