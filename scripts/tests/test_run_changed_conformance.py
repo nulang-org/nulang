@@ -111,6 +111,25 @@ class ChangedConformanceTests(unittest.TestCase):
         self.assertIn("SKIP", result.stdout)
         self.assertIn("0 passed, 0 failed, 1 skipped", result.stdout)
 
+    def test_snapshot_must_be_json_object(self):
+        p = self.fixture()
+        p.with_suffix(".json").write_text("null", encoding="utf-8")
+        result = self.run_runner(p)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid expectation", result.stdout)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_snapshot_fields_have_valid_types(self):
+        p = self.fixture()
+        p.with_suffix(".json").write_text(
+            json.dumps({"exit_code": "0", "stdout": "expected", "stderr": ["oops"]}),
+            encoding="utf-8",
+        )
+        result = self.run_runner(p)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid expectation", result.stdout)
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_rejects_paths_outside_conformance_directory(self):
         p = self.root / "outside.nula"
         p.write_text("ok")
