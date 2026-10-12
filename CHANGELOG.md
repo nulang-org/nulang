@@ -1,5 +1,10 @@
 # Nulang Changelog
 
+### Fail-closed legacy workflow completion and recovery — 2026-10-10
+- Consolidate the suspended signal, timer, receive, and LLM resume terminal-persistence guards; failed terminal event or checkpoint persistence quarantines the live workflow actor before further dispatch.
+- Cover immediate legacy step terminal/checkpoint sequencing and fail closed when recovery encounters orphan terminal workflow history beyond the last safe snapshot.
+- This is a safety fence for the legacy two-write path, **not** RFC 0022 atomic activation replay or an exactly-once guarantee. The durable transition/recovery contract remains a separate milestone.
+
 ### Runtime soundness and checked negation — native/AOT backend parity — 2026-10-10
 - **AOT no longer claims raw-Int/Float registers for values that can be nil
   at runtime.** Nightly differential fuzz caught interpreter/AOT divergences
