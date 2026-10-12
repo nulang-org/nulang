@@ -1,5 +1,10 @@
 # Nulang Changelog
 
+### Runtime map ownership and ORCA slot safety — 2026-10-12
+- **Removing an entry from the native mutable `Map.*` table now clears its key/value slots before releasing their local references.** ORCA treats map payloads as uniform `Value` slots, so leaving stale pointers in tombstones could release an already-removed object a second time when the map itself was reclaimed.
+- **Replacing an entry retains incoming references before releasing the old ones.** A `Map.get` result can alias an existing map-owned value; dropping the old slot first could reclaim that value before the new slot retained it. Focused standalone-VM/ORCA regression tests exercise both ownership boundaries.
+
+
 ### Public CLI release portability — 2026-10-11
 - **Public release archives use the `release-cli` feature profile without a Python shared-library ABI dependency.** The ordinary full/default source build retains opt-in Python interoperability; release packaging checks the resulting Linux and macOS binary for Python dependencies.
 - **Release PRs rehearse the full non-publishing four-platform build matrix before tags are created.** The Linux ARM64 cross build explicitly installs target libc development headers and preflights a target-compiler C header probe, avoiding an observed `ring` compile failure when `--no-install-recommends` omits the ARM64 sysroot. Actual cross-build and clean-host portability remain release gates.
