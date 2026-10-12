@@ -233,6 +233,8 @@ version + migration.*
 
 ## Stable tier
 
+### Consuming actor-send ownership analysis — 2026-09-23
+- **The MIR backend now identifies provably consumable local-send payloads without changing runtime semantics** (`src/mir_codegen.rs`). A payload is marked only when it is a fresh/non-aliasing owning value with one definition and one total use, and that sole use is a same-node MIR `Send` argument. Multi-use and remote-send payloads remain ordinary copies. This establishes the compiler proof surface for a later ORCA local-reference-to-foreign-hold handoff.
 ### Zero-copy non-reentrant JIT register entry — 2026-09-24
 - **Cranelift regions that cannot re-enter the VM now execute directly against the active frame's 256-register array**, eliminating the previous 2 KiB snapshot before native entry and 2 KiB copy-back afterward. `Value` is explicitly `repr(transparent)` over `u64` so the native register ABI has a documented layout guarantee.
 - **Compiled-region metadata now records whether native execution may grow or replace the VM frame stack.** Regions containing helper-backed direct calls retain the detached register snapshot because re-entrant interpreter calls may reallocate `VM::frames`; typed, SIMD, and scalar non-call regions use the direct-frame path.
