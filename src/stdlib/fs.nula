@@ -29,3 +29,27 @@ pub fn append(path: String, content: String) -> Unit ! {FS} {
 pub fn exists(path: String) -> Bool ! {FS} {
     perform FS.exists(path)
 }
+
+/// Errors surfaced by the additive Result-returning filesystem wrappers.
+/// The host effect currently erases errno and permission details; these
+/// variants deliberately report only the failed operation and its path.
+pub type FsError = ReadFailed(String) | WriteFailed(String) | AppendFailed(String)
+
+/// Read a file, returning Error(ReadFailed(path)) when the raw effect fails.
+/// The original read(path) API remains available and unchanged.
+pub fn try_read(path: String) -> Result[String, FsError] ! {FS} {
+    let value = perform FS.read(path);
+    if value == nil then Error(ReadFailed(path)) else Ok(value)
+}
+
+/// Write a file, preserving the legacy unit-returning write(path, content).
+pub fn try_write(path: String, content: String) -> Result[Unit, FsError] ! {FS} {
+    let value = perform FS.write(path, content);
+    if value == nil then Error(WriteFailed(path)) else Ok(unit)
+}
+
+/// Append to a file, preserving the legacy append(path, content) API.
+pub fn try_append(path: String, content: String) -> Result[Unit, FsError] ! {FS} {
+    let value = perform FS.append(path, content);
+    if value == nil then Error(AppendFailed(path)) else Ok(unit)
+}
