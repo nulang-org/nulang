@@ -9,7 +9,7 @@
 // a non-ASCII character produces all of its UTF-8 bytes, not its code point.
 
 /// Errors from strict octet and hexadecimal operations.
-pub type ByteError = OddHexLength | InvalidHexDigit(Int) | InvalidByte(Int)
+pub type ByteError = OddHexLength | InvalidHexDigit(Int) | InvalidByte(Int) | InvalidUtf8(Int)
 
 /// Copy the UTF-8 bytes of a string into an octet array.
 /// Strings are valid UTF-8. This does not perform any character conversion.
@@ -69,4 +69,76 @@ pub fn decode_hex(text: String) -> Result[[Int], ByteError] {
         i = i + 2
     };
     Ok(out)
+}
+
+/// Validate a raw octet array as UTF-8 and count Unicode scalar values.
+///
+/// Returns Ok(number_of_scalars) for valid UTF-8 (including NUL bytes).
+/// InvalidByte(value) identifies a value outside 0..255.
+/// InvalidUtf8(offset) identifies the offending byte index, or the leading
+/// index for a truncated multibyte sequence. Rejects overlong encodings,
+/// encoded surrogates, code points above U+10FFFF and stray continuation bytes.
+///
+/// This operates on [Int] to avoid silently interpreting a byte array as a
+/// host String. In particular it never constructs a string containing NUL.
+pub fn utf8_rune_count(bytes: [Int]) -> Result[Int, ByteError] {
+    let n = perform Array.length(bytes);
+    var i = 0;
+    var count = 0;
+    while i < n {
+        let first = bytes[i];
+        if first < 0 || first > 255 then {
+            return Error(InvalidByte(first))
+        } else {};
+
+        if first <= 127 then {
+            i = i + 1
+        } else {
+            // C0/C1 would be overlong; F5..FF exceed the Unicode maximum.
+            let width =
+                if first >= 194 && first <= 223 then 2
+                else if first >= 224 && first <= 239 then 3
+                else if first >= 240 && first <= 244 then 4
+                else 0;
+
+            if width == 0 then {
+                return Error(InvalidUtf8(i))
+            } else {};
+            if i + width > n then {
+                return Error(InvalidUtf8(i))
+            } else {};
+
+            var offset = 1;
+            while offset < width {
+                let b = bytes[i + offset];
+                if b < 0 || b > 255 then {
+                    return Error(InvalidByte(b))
+                } else {};
+                if b < 128 || b > 191 then {
+                    return Error(InvalidUtf8(i + offset))
+                } else {};
+
+                // Constrain the first continuation byte to reject non-canonical
+                // sequences without constructing an intermediate code point.
+                if offset == 1 then {
+                    if first == 224 && b < 160 then {
+                        return Error(InvalidUtf8(i + offset))
+                    } else {};
+                    if first == 237 && b > 159 then {
+                        return Error(InvalidUtf8(i + offset))
+                    } else {};
+                    if first == 240 && b < 144 then {
+                        return Error(InvalidUtf8(i + offset))
+                    } else {};
+                    if first == 244 && b > 143 then {
+                        return Error(InvalidUtf8(i + offset))
+                    } else {}
+                } else {};
+                offset = offset + 1
+            };
+            i = i + width
+        };
+        count = count + 1
+    };
+    Ok(count)
 }

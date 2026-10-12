@@ -1,0 +1,36 @@
+// Go unicode/utf8-inspired validation of opaque octet arrays.
+// All validated UTF-8 sequences count as one Unicode scalar value, including U+0000.
+import stdlib::bytes
+
+fn status(r: Result[Int, ByteError]) -> String {
+    match r {
+        Ok(count) => "ok:" + perform Int.to_string(count),
+        Error(err) => match err {
+            InvalidUtf8(at) => "utf8:" + perform Int.to_string(at),
+            InvalidByte(value) => "byte:" + perform Int.to_string(value),
+            _ => "unexpected",
+        },
+    }
+}
+
+fn main() {
+    perform IO.print("empty=" + status(utf8_rune_count([])))
+    perform IO.print("ascii=" + status(utf8_rune_count([65, 66, 67])))
+    perform IO.print("utf8=" + status(utf8_rune_count(from_utf8("hé💡"))))
+    perform IO.print("nul=" + status(utf8_rune_count([0, 65, 0])))
+    perform IO.print("boundaries=" + status(utf8_rune_count([127, 194, 128, 224, 160, 128, 240, 144, 128, 128])))
+    perform IO.print("max=" + status(utf8_rune_count([244, 143, 191, 191])))
+    perform IO.print("truncated=" + status(utf8_rune_count([226, 130])))
+    perform IO.print("bad_cont=" + status(utf8_rune_count([226, 40, 161])))
+    perform IO.print("overlong2=" + status(utf8_rune_count([192, 128])))
+    perform IO.print("overlong3=" + status(utf8_rune_count([224, 128, 128])))
+    perform IO.print("overlong4=" + status(utf8_rune_count([240, 128, 128, 128])))
+    perform IO.print("surrogate=" + status(utf8_rune_count([237, 160, 128])))
+    perform IO.print("too_large=" + status(utf8_rune_count([244, 144, 128, 128])))
+    perform IO.print("stray=" + status(utf8_rune_count([128])))
+    perform IO.print("too_high_lead=" + status(utf8_rune_count([245, 128, 128, 128])))
+    perform IO.print("offset=" + status(utf8_rune_count([65, 226, 40, 161])))
+    perform IO.print("invalid_second=" + status(utf8_rune_count([65, 226, 300, 128])))
+    perform IO.print("negative=" + status(utf8_rune_count([-1])))
+    perform IO.print("large=" + status(utf8_rune_count([256])))
+}

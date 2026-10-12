@@ -1,0 +1,1 @@
+{"exit_code":0,"stdout":"empty=ok:0\nascii=ok:3\nutf8=ok:3\nnul=ok:3\nboundaries=ok:4\nmax=ok:1\ntruncated=utf8:0\nbad_cont=utf8:1\noverlong2=utf8:0\noverlong3=utf8:1\noverlong4=utf8:1\nsurrogate=utf8:1\ntoo_large=utf8:1\nstray=utf8:0\ntoo_high_lead=utf8:0\noffset=utf8:2\ninvalid_second=byte:300\nnegative=byte:-1\nlarge=byte:256","stderr":""}

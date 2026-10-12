@@ -195,9 +195,14 @@ buffer. Avoid interpreting arbitrary byte sequences as UTF-8 without validation.
 | `from_utf8` | `String -> [Int]` | Copy the raw UTF-8 octets of a string. |
 | `encode_hex` | `[Int] -> Result[String, ByteError]` | Lowercase hex; reject out-of-range octets. |
 | `decode_hex` | `String -> Result[[Int], ByteError]` | Decode both hex cases; reject odd length and invalid digits. |
+| `utf8_rune_count` | `[Int] -> Result[Int, ByteError]` | Validate UTF-8 and return Unicode scalar count, including NUL. |
 
-Errors are `OddHexLength`, `InvalidHexDigit(byte_offset)`, and
-`InvalidByte(value)`. No partial success is returned on invalid input.
+Errors are `OddHexLength`, `InvalidHexDigit(byte_offset)`,
+`InvalidByte(value)` (out-of-range octet), and `InvalidUtf8(byte_offset)`.
+The UTF-8 validator rejects overlong sequences, Unicode surrogates and code
+points above U+10FFFF; truncated sequences report their lead-byte offset.
+It operates on raw octets without constructing host strings, so it also accepts
+valid UTF-8 containing U+0000. No partial success is returned on invalid input.
 
 Octet extraction and hex decoding preallocate fixed-size integer arrays;
 encoding uses a growable string builder. This avoids copy-on-append for these
