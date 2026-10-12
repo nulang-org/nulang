@@ -6,7 +6,14 @@ on:
       - 'tests/remote_rtt_stage_profile.rs'
       - 'tests/remote_rtt_stage_profile_contract.rs'
       - '.github/workflows/remote-rtt-stage-profile-pr.yml'
-      - 'src/runtime/**'
+      # Narrowed from 'src/runtime/**': this job builds the workspace in
+      # release mode and runs a timing test (30 min timeout), so triggering on
+      # every runtime change flooded the shared runner queue. The remote-RTT
+      # stage budget is governed by the transport, cluster, and distributed
+      # staging paths below.
+      - 'src/runtime/network.rs'
+      - 'src/runtime/cluster.rs'
+      - 'src/runtime/distributed.rs'
 
 # A newer push to the same PR supersedes the previous run.
 concurrency:
