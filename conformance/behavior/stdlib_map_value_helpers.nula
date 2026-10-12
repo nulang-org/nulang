@@ -17,11 +17,11 @@ fn main() {
 
     // The second occurrence of a key wins, while the first insertion
     // determines iteration order.
-    let from = from_pairs([("x", "first"), ("y", "second"), ("x", "last")])
-    perform IO.print(show(get("x", from)))
-    perform IO.print(perform Int.to_string(size(from)))
+    let built = from_pairs([("x", "first"), ("y", "second"), ("x", "last")])
+    perform IO.print(show(get("x", built)))
+    perform IO.print(perform Int.to_string(size(built)))
 
-    let pairs = to_pairs(from)
+    let pairs = to_pairs(built)
     perform IO.print(perform Int.to_string(perform Array.length(pairs)))
     perform IO.print(pairs[0].0)
     perform IO.print(pairs[0].1)
