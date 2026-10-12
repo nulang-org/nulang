@@ -157,12 +157,17 @@ pub enum TypeTag {
 ///   11    | type_tag       (TypeTag     u8)
 ///   12    | _pad           ([u8; 4]) — aligns actor_id to 8 bytes
 ///   16    | actor_id       (u64)
-///   24    | size           (usize — total bytes, header + aligned payload)
+///   24    | size           (usize — default ABI only)
 ///   32    | payload_size   (usize — requested payload bytes)
 ///   40    | live_next      (*mut OrcaHeader)
 ///   48    | live_prev      (*mut OrcaHeader)
 ///  -------+---------------
-///   56    | TOTAL
+///   56    | TOTAL (default ABI)
+///
+/// With `compact-orca-header`, `size` is absent. The payload length moves to
+/// offset 24; `live_next` and `live_prev` move to offsets 32 and 40,
+/// respectively, for a 48-byte header. `total_size()` reconstructs the
+/// physical allocation extent from the exact requested payload length.
 /// ```
 ///
 /// # Thread safety
@@ -195,6 +200,9 @@ pub struct OrcaHeader {
     /// ID of the actor that owns this object.
     pub actor_id: u64,
     /// Total bytes allocated for this object (header + aligned payload).
+    /// Kept in the default ABI; the experimental compact ABI recomputes it
+    /// from the exact payload length to save one word per object.
+    #[cfg(not(feature = "compact-orca-header"))]
     pub size: usize,
     /// Requested payload size in bytes (as passed to `alloc`).
     pub payload_size: usize,
@@ -206,6 +214,28 @@ pub struct OrcaHeader {
 }
 
 impl OrcaHeader {
+    /// Physical allocation extent, including the header and payload padding.
+    /// The compact ABI derives the total from `payload_size`, whereas the
+    /// default ABI retains the original stored `size` field.
+    #[inline]
+    pub fn total_size(&self) -> usize {
+        #[cfg(feature = "compact-orca-header")]
+        {
+            std::mem::size_of::<Self>() + align_up(self.payload_size)
+        }
+        #[cfg(not(feature = "compact-orca-header"))]
+        {
+            self.size
+        }
+    }
+
+    /// Aligned payload extent. Do not use for strings requiring the exact
+    /// requested `payload_size` length.
+    #[inline]
+    pub fn padded_payload_size(&self) -> usize {
+        self.total_size() - std::mem::size_of::<Self>()
+    }
+
     /// Create a *logically* initialised header on the caller's stack.
     ///
     /// # Safety
@@ -227,6 +257,7 @@ impl OrcaHeader {
             type_tag,
             _pad: [0; 4],
             actor_id,
+            #[cfg(not(feature = "compact-orca-header"))]
             size: total_size,
             payload_size,
             live_next: std::ptr::null_mut(),
@@ -639,7 +670,7 @@ impl ActorHeap {
             unsafe {
                 // Payload starts one header stride past the header.
                 let payload_ptr = current.add(1) as *mut u8;
-                let payload_size = (*current).size - Self::HEADER_SIZE;
+                let payload_size = (*current).padded_payload_size();
                 callback(current, payload_ptr, payload_size);
                 current = (*current).live_next;
             }
@@ -821,7 +852,7 @@ impl ActorHeap {
             // header one stride back holds the block's original total size.
             let next = *(cursor as *mut *mut u8);
             let header = Self::header_of(cursor);
-            if (*header).size == total_size {
+            if (*header).total_size() == total_size {
                 if prev.is_null() {
                     self.free_lists[huge_idx] = next;
                 } else {
@@ -848,7 +879,7 @@ impl ActorHeap {
             // used for the matching `Layout`.
             unsafe {
                 let header_ptr = Self::header_of(payload_ptr);
-                let layout = std::alloc::Layout::from_size_align((*header_ptr).size, ALIGN)
+                let layout = std::alloc::Layout::from_size_align((*header_ptr).total_size(), ALIGN)
                     .expect("invalid LOS layout");
                 std::alloc::dealloc(header_ptr as *mut u8, layout);
             }
@@ -1218,8 +1249,8 @@ fn test_header_integrity() {
         assert_eq!(h.actor_id, 99);
         assert_eq!(h.type_tag, TypeTag::Closure);
         assert_eq!(h.gc_color, GcColor::White);
-        // Total size = HEADER_SIZE + align_up(42) = 48 + 48 = 96
-        assert_eq!(h.size, ActorHeap::HEADER_SIZE + 48);
+        // Total size = HEADER_SIZE + align_up(42) = HEADER_SIZE + 48
+        assert_eq!(h.total_size(), ActorHeap::HEADER_SIZE + 48);
     }
 }
 
@@ -1475,7 +1506,7 @@ fn test_large_allocation() {
     unsafe {
         let h = &*ActorHeap::header_of(p);
         assert_eq!(h.size_class, SizeClass::Huge);
-        assert_eq!(h.size, ActorHeap::HEADER_SIZE + 512);
+        assert_eq!(h.total_size(), ActorHeap::HEADER_SIZE + 512);
         assert_eq!(h.type_tag, TypeTag::Array);
     }
 
@@ -1567,10 +1598,10 @@ fn test_compact_header_preserves_exact_payload_lengths() {
     }
 }
 
+#[cfg(not(feature = "compact-orca-header"))]
 #[test]
 fn test_header_size_is_56() {
-    // The whole design assumes HEADER_SIZE == 56. If this ever changes,
-    // classify_total_size and the memory layout comments must be updated.
+    // The default ABI is fixed at 56 bytes; an opt-in compact ABI is tested separately.
     assert_eq!(ActorHeap::HEADER_SIZE, 56);
 }
 
@@ -1582,7 +1613,7 @@ fn test_alloc_zero_payload() {
     let p = heap.alloc(0, TypeTag::Raw).unwrap();
     unsafe {
         let h = &*ActorHeap::header_of(p);
-        assert_eq!(h.size, ActorHeap::HEADER_SIZE);
+        assert_eq!(h.total_size(), ActorHeap::HEADER_SIZE);
         assert_eq!(h.ref_count, 1);
     }
 }
@@ -1838,7 +1869,7 @@ fn test_free_then_larger_alloc_same_class_preserves_neighbor() {
         (
             h.ref_count,
             h.foreign_count,
-            h.size,
+            h.total_size(),
             h.size_class,
             h.type_tag,
         )
@@ -1861,7 +1892,7 @@ fn test_free_then_larger_alloc_same_class_preserves_neighbor() {
         let h = &*ActorHeap::header_of(b);
         assert_eq!(h.ref_count, b_ref, "neighbour ref_count corrupted");
         assert_eq!(h.foreign_count, b_foreign);
-        assert_eq!(h.size, b_size);
+        assert_eq!(h.total_size(), b_size);
         assert_eq!(h.size_class, b_class);
         assert_eq!(h.type_tag, b_tag);
     }
@@ -1883,7 +1914,7 @@ fn test_zero_payload_free_preserves_neighbor() {
         assert_eq!(h.size_class, SizeClass::Small);
         // The header records the exact requested total (header only): the
         // VM derives element counts from it, so an empty array stays len 0.
-        assert_eq!(h.size, ActorHeap::HEADER_SIZE);
+        assert_eq!(h.total_size(), ActorHeap::HEADER_SIZE);
     }
 
     // Free e1 (stores a null next-pointer), then e2 (stores e1's non-null
@@ -1902,7 +1933,7 @@ fn test_zero_payload_free_preserves_neighbor() {
         assert_eq!(h.foreign_count, 0);
         assert_eq!(h.size_class, SizeClass::Small);
         assert_eq!(h.type_tag, TypeTag::Array);
-        assert_eq!(h.size, ActorHeap::HEADER_SIZE);
+        assert_eq!(h.total_size(), ActorHeap::HEADER_SIZE);
     }
     assert_eq!(heap.live_count(), 1);
     assert_eq!(heap.free_list_count(), 2);
