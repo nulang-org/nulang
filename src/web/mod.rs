@@ -12,6 +12,7 @@ pub mod modules;
 pub mod openapi;
 pub mod package_contracts;
 pub mod reactivity;
+pub mod redirect;
 pub mod request_bindings;
 pub mod route_check;
 pub mod runtime_bindings;

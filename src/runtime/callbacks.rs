@@ -457,7 +457,10 @@ pub(crate) fn perform_web_builtin(
         Some("redirect") => {
             let url = resolve(constants, *regs.first()?);
             match render_web_redirect(&url) {
-                Some(out) => Some(callbacks.alloc_string(&out)),
+                Some(out) => {
+                    crate::runtime::http_server::note_web_redirect(&url, &out);
+                    Some(callbacks.alloc_string(&out))
+                }
                 None => Some(crate::vm::Value::nil()),
             }
         }
