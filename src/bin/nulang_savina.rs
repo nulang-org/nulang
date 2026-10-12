@@ -732,10 +732,18 @@ fn bench_actor_compute(backend: Backend) -> Measurement {
         // compiled by this actor's untimed work, not earlier initialization.
         warm_and_verify_jit(&rt, "actor_compute");
         #[cfg(feature = "native-codegen")]
-        assert!(
-            rt.borrow().benchmark_jit_compiled_count() > compiled_before,
-            "bench: compute actor warmup did not compile a new native JIT region"
-        );
+        {
+            assert!(
+                rt.borrow().benchmark_jit_compiled_count() > compiled_before,
+                "bench: compute actor warmup did not compile a new native JIT region"
+            );
+            // Retain warmup-specific compilation evidence in both CI logs
+            // and the benchmark JSON (via the Python harness).
+            eprintln!(
+                "[jit-proof] workload=actor_compute actor_vm_new_compiled_regions={}",
+                rt.borrow().benchmark_jit_compiled_count() - compiled_before
+            );
+        }
     }
     rt.borrow_mut()
         .actors
