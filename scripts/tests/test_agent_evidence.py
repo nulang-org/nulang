@@ -56,6 +56,14 @@ class EvidenceTests(unittest.TestCase):
         self.assertTrue(out['dirty'])
         self.assertFalse(out['ready_for_review'])
 
+    def test_check_that_moves_head_cannot_claim_stale_commit(self):
+        out = agent_evidence.collect(self.cwd, self.base, [
+            ('mutation', ['git', 'commit', '--allow-empty', '-qm', 'rogue'])
+        ])
+        self.assertNotEqual(out['head_sha'], git(self.cwd, 'rev-parse', 'HEAD'))
+        self.assertFalse(out['ready_for_review'])
+        self.assertEqual(out['head_integrity'], 'changed-during-checks')
+
     def test_invalid_base_rejected_without_running_checks(self):
         with self.assertRaisesRegex(ValueError, 'base SHA'):
             agent_evidence.collect(self.cwd, 'main', [('bad', ['python3', '-c', 'exit(3)'])])
