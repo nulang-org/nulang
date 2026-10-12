@@ -802,19 +802,23 @@ pub(crate) fn hashmap_op(
                     unsafe {
                         let oldk = *((base as *const Value).add(1));
                         let oldv = *((base as *const Value).add(2));
+                        // The incoming values can alias the existing slots
+                        // (for example after Map.get). Retain them before
+                        // dropping the old slot references, or a borrowed
+                        // value could be freed before being retained again.
+                        if let Some(p) = k.as_ptr() {
+                            callbacks.retain_ref(p);
+                        }
+                        if let Some(p) = v.as_ptr() {
+                            callbacks.retain_ref(p);
+                        }
+                        *((base as *mut Value).add(1)) = k;
+                        *((base as *mut Value).add(2)) = v;
                         if let Some(p) = oldk.as_ptr() {
                             callbacks.drop_ref(p);
                         }
                         if let Some(p) = oldv.as_ptr() {
                             callbacks.drop_ref(p);
-                        }
-                        *((base as *mut Value).add(1)) = k;
-                        if let Some(p) = k.as_ptr() {
-                            callbacks.retain_ref(p);
-                        }
-                        *((base as *mut Value).add(2)) = v;
-                        if let Some(p) = v.as_ptr() {
-                            callbacks.retain_ref(p);
                         }
                     }
                     return Some(unsafe {
@@ -922,13 +926,19 @@ pub(crate) fn hashmap_op(
                     unsafe {
                         let oldk = *((base as *const Value).add(1));
                         let oldv = *((base as *const Value).add(2));
+                        // GC scans every Value slot in a Map, even tombstones.
+                        // Clear the key/value slots before releasing the
+                        // counted references, or map reclamation will drop
+                        // these pointers a second time.
+                        *(base as *mut Value) = Value::int(MAP_TOMB);
+                        *((base as *mut Value).add(1)) = Value::nil();
+                        *((base as *mut Value).add(2)) = Value::nil();
                         if let Some(p) = oldk.as_ptr() {
                             callbacks.drop_ref(p);
                         }
                         if let Some(p) = oldv.as_ptr() {
                             callbacks.drop_ref(p);
                         }
-                        *(base as *mut Value) = Value::int(MAP_TOMB);
                     }
                     map_set_used(m, used.saturating_sub(1));
                     return Some(unsafe {
@@ -8979,5 +8989,124 @@ mod vm_tests {
             // slots[1] is a TAG_STRING — verify it's a valid string value
             assert!(slots[1].is_string(), "array[1] should be a string");
         }
+    }
+}
+
+#[cfg(test)]
+mod map_tombstone_orca_regressions {
+    use super::*;
+
+    #[test]
+    fn removed_heap_value_is_not_released_twice_when_map_is_freed() {
+        let mut vm = StandaloneVmCallbacks::new();
+        let map = hashmap_op(&mut vm, &[], "new", &[]).expect("map allocation");
+        let value_ptr = vm.alloc(16, HeapTypeTag::Raw).expect("value allocation");
+        // SAFETY: the pointer was just allocated in this VM's owned heap.
+        let value = unsafe { Value::ptr(value_ptr) };
+
+        let map = hashmap_op(&mut vm, &[], "insert", &[map, Value::int(7), value])
+            .expect("insert");
+        assert_eq!(vm.heap.live_count(), 2, "map and value must be live");
+
+        let map = hashmap_op(&mut vm, &[], "remove", &[map, Value::int(7)])
+            .expect("remove");
+        assert_eq!(vm.heap.live_count(), 2, "the caller still owns the value");
+        let map_ptr = map.as_ptr().expect("map pointer");
+
+        let mut tombstones = 0;
+        for idx in 0..map_capacity(map_ptr) {
+            // SAFETY: the map allocation has 2 + cap * 3 initialized Value slots.
+            let base = unsafe { (map_ptr as *const Value).add(map_entry_slot(idx)) };
+            if unsafe { *base }.as_int() == Some(MAP_TOMB) {
+                tombstones += 1;
+                assert!(
+                    unsafe { *base.add(1) }.as_ptr().is_none(),
+                    "a deleted map entry must not retain a key pointer"
+                );
+                assert!(
+                    unsafe { *base.add(2) }.as_ptr().is_none(),
+                    "a deleted map entry must not retain a value pointer"
+                );
+            }
+        }
+        assert_eq!(tombstones, 1, "removed entry must become a tombstone");
+
+        vm.drop_ref(map_ptr);
+        assert_eq!(
+            vm.heap.live_count(),
+            1,
+            "freeing the map must not release the caller-owned value again"
+        );
+        vm.drop_ref(value_ptr);
+        assert_eq!(vm.heap.live_count(), 0, "all references now released");
+    }
+
+    #[test]
+    fn removing_heap_key_and_value_preserves_external_owners_and_allows_reinsert() {
+        let mut vm = StandaloneVmCallbacks::new();
+        let map = hashmap_op(&mut vm, &[], "new", &[]).expect("map");
+        let key_ptr = vm.alloc(8, HeapTypeTag::Raw).expect("key allocation");
+        let value_ptr = vm.alloc(8, HeapTypeTag::Raw).expect("value allocation");
+        // SAFETY: both pointers originate from this VM's heap.
+        let key = unsafe { Value::ptr(key_ptr) };
+        let value = unsafe { Value::ptr(value_ptr) };
+
+        let map = hashmap_op(&mut vm, &[], "insert", &[map, key, value])
+            .expect("insert");
+        assert_eq!(vm.heap.live_count(), 3);
+
+        let map = hashmap_op(&mut vm, &[], "remove", &[map, key])
+            .expect("remove");
+        assert_eq!(
+            hashmap_op(&mut vm, &[], "size", &[map]).and_then(|v| v.as_int()),
+            Some(0),
+            "removal must remove the entry"
+        );
+
+        // This insertion may reuse the tombstone. Map traversal must not
+        // resurrect a stale key/value pointer or duplicate a reference.
+        let map = hashmap_op(&mut vm, &[], "insert", &[map, key, value])
+            .expect("reinsert");
+        let observed = hashmap_op(&mut vm, &[], "get", &[map, key]).expect("get");
+        assert_eq!(observed.as_ptr(), Some(value_ptr));
+        assert_eq!(
+            hashmap_op(&mut vm, &[], "size", &[map]).and_then(|v| v.as_int()),
+            Some(1)
+        );
+
+        vm.drop_ref(map.as_ptr().expect("map pointer"));
+        assert_eq!(
+            vm.heap.live_count(),
+            2,
+            "map release must preserve both caller-owned heap objects"
+        );
+        vm.drop_ref(key_ptr);
+        vm.drop_ref(value_ptr);
+        assert_eq!(vm.heap.live_count(), 0);
+    }
+
+    #[test]
+    fn overwriting_with_borrowed_current_value_must_retain_before_release() {
+        let mut vm = StandaloneVmCallbacks::new();
+        let map = hashmap_op(&mut vm, &[], "new", &[]).expect("map");
+        let value_ptr = vm.alloc(16, HeapTypeTag::Raw).expect("value");
+        // SAFETY: pointer was just allocated in the same VM heap.
+        let owned_value = unsafe { Value::ptr(value_ptr) };
+        let map = hashmap_op(&mut vm, &[], "insert", &[map, Value::int(9), owned_value])
+            .expect("insert");
+
+        // Only the map now owns a counted reference. Map.get yields the
+        // existing pointer; re-inserting it must not free it first.
+        vm.drop_ref(value_ptr);
+        let borrowed = hashmap_op(&mut vm, &[], "get", &[map, Value::int(9)])
+            .expect("get");
+        assert_eq!(borrowed.as_ptr(), Some(value_ptr));
+        let map = hashmap_op(&mut vm, &[], "insert", &[map, Value::int(9), borrowed])
+            .expect("overwrite");
+        assert_eq!(vm.heap.live_count(), 2, "overwrite must preserve map-owned value");
+
+        // Map destruction should now be the only release of its value.
+        vm.drop_ref(map.as_ptr().expect("map pointer"));
+        assert_eq!(vm.heap.live_count(), 0);
     }
 }
