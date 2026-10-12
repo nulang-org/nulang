@@ -3,21 +3,21 @@
 </p>
 <h1 align="center">Nulang</h1>
 <p align="center">
-  A typed language for concurrent, durable, and distributed software with algebraic effects, reference capabilities, actors, and durable execution.
+  Build concurrent and durable applications with typed actors, explicit effects, and a language designed for distributed systems.
 </p>
 <p align="center">
-  <a href="https://nulang.org">Website</a> •
+  <a href="https://nulang.org">Docs</a> •
   <a href="https://nulang.org/playground/">Playground</a> •
-  <a href="https://nulang.cloud">Nulang Cloud</a> •
+  <a href="https://github.com/nulang-org/nulang/releases">Releases</a> •
   <a href="https://github.com/nulang-org/nulang/issues">Issues</a> •
   <a href="ROADMAP.md">Roadmap</a> •
   <a href="CONTRIBUTING.md">Contribute</a> •
-  <a href="https://github.com/nulang-org/nulang">GitHub</a>
+  <a href="https://nulang.cloud">Nulang Cloud</a>
 </p>
 <p align="center">
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-2021%20Edition-orange.svg" alt="Rust 2021"></a>
   <a href="https://github.com/nulang-org/nulang/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License Apache 2.0"></a>
-  <a href="https://github.com/nulang-org/nulang/actions"><img src="https://github.com/nulang-org/nulang/workflows/CI/badge.svg" alt="CI"></a>
+  <a href="https://github.com/nulang-org/nulang/actions"><img src="https://github.com/nulang-org/nulang/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://codecov.io/github/nulang-org/nulang"><img src="https://codecov.io/github/nulang-org/nulang/graph/badge.svg" alt="Coverage"></a>
 <a href="https://github.com/nulang-org/nulang/actions/workflows/docs-sync.yml"><img src="https://github.com/nulang-org/nulang/actions/workflows/docs-sync.yml/badge.svg" alt="Docs Sync"></a>
   <a href="https://deepwiki.com/nulang-org/nulang"><img src="https://img.shields.io/badge/DeepWiki-docs-blue.svg" alt="DeepWiki"></a>
@@ -25,28 +25,69 @@
 
 ---
 
-**New to Nulang?** [Try Core in the browser](https://nulang.org/playground/) (no install) · [Install a checksummed release](https://nulang.org/getting-started/installation/) · [Run the quick start](https://nulang.org/getting-started/quick-start/). Native actors, networking, and durable runtime features require a local binary.
+**Nulang is alpha software.** Use it to explore typed concurrency, actors, effects,
+and durable execution—not as a drop-in production replacement for Erlang,
+Temporal, Redis, or a database. The bytecode VM is the semantic reference;
+distributed operation, native AOT, and full WASM/runtime parity remain
+experimental. See [implementation status](docs/IMPLEMENTATION_STATUS.md).
 
-## What is Nulang?
+**Start here:** [Try Core in the browser](https://nulang.org/playground/)
+(no install) · [Install a release](https://nulang.org/getting-started/installation/) ·
+[Read the quick start](https://nulang.org/getting-started/quick-start/) ·
+[Explore runnable examples](examples/README.md).
+The playground does **not** support native actors, networking, FFI, or JIT.
 
-Nulang is a programming language for concurrent, durable, and distributed
-software. Its semantic core combines a Hindley-Milner type system, reference
-capabilities (`iso`/`trn`/`ref`/`val`/`box`/`tag`/`lineariso`), and
-row-polymorphic algebraic effects. Erlang-style fault-tolerant actors are the
-first-class abstraction for independently addressable isolated state; ordinary
-local computation remains ordinary computation rather than being modeled as an
-actor. The compiler pipeline (AST → HIR → MIR)
-uses the register-based bytecode VM as the semantic reference implementation.
-Hot regions can tier into a Cranelift JIT; WASM is the canonical portable/cloud
-execution target; and native AOT remains a secondary backend until full semantic
-parity is demonstrated. An experimental WasmFX backend explores stack-switching
-for suspending effects. The runtime supports sharded multi-threaded execution: each `Runtime` shard has
-one owning cooperative scheduler thread, and `NULANG_SHARDS>1` runs shards in
-parallel with bounded cross-shard channels. The scheduler implementation retains
-Chase-Lev work-stealing APIs for multi-worker callers, but the live per-shard
-`run_scheduler()` path currently uses one worker slot. Supervision trees, ORCA
-garbage collection, durable persistence, and experimental location-transparent
-distribution are integrated into that model.
+## Why Nulang?
+
+Nulang brings together mechanisms that often live in separate tools:
+
+- **State isolation and concurrency:** actors communicate by message passing
+  rather than sharing mutable state; links and supervision provide fault-handling
+  building blocks.
+- **Explicit side effects:** algebraic effects make effectful operations visible
+  and handleable, alongside Hindley-Milner type inference and reference
+  capabilities.
+- **Durable execution experiments:** entities, workflows, journals, timers,
+  and recovery exist in the native runtime, but end-to-end reliability and
+  production guarantees are still being validated.
+
+Nulang is most relevant if you are prototyping actor-based services,
+fault-tolerant application logic, or durable workflow models. For a production
+distributed system today, evaluate the [current limitations](docs/IMPLEMENTATION_STATUS.md)
+and reproduce failure/recovery behavior for your workload before adopting it.
+
+## See Nulang in action
+
+This is the existing [Hello World example](examples/01_hello.nula):
+
+```nulang
+perform IO.print("Hello, Nulang!")
+
+let name = "World"
+perform IO.print("Hello, " + name + "!")
+```
+
+To see message-passing actors, run
+[`examples/08_actors.nula`](examples/08_actors.nula) using a native binary.
+For effects, see [`examples/07_effects.nula`](examples/07_effects.nula).
+The [example index](examples/README.md) documents the example catalog and
+its runnable commands. Some examples are experimental and need native runtime
+features; consult each example’s notes and current CI before relying on it.
+
+## How it works
+
+Nulang combines a Hindley-Milner type system, row-polymorphic algebraic
+effects, and reference capabilities (`iso`/`trn`/`ref`/`val`/`box`/`tag`/`lineariso`).
+Actors provide independently addressable isolated state; local computation
+does not need to become an actor.
+
+The compiler lowers source through AST, HIR, and MIR to a register-based
+bytecode VM. Cranelift JIT compilation can optimize hot regions; native AOT
+and WASM are additional, less complete backends. The native runtime supports
+cooperative actor scheduling, optional multiple shards, supervision, and
+ORCA memory management. Experimental distribution and durability build on
+that runtime. See [architecture](ARCHITECTURE.md) and
+[implementation status](docs/IMPLEMENTATION_STATUS.md) for verified boundaries.
 
 ---
 
@@ -60,16 +101,27 @@ Tagged releases publish checksummed archives from the release CI matrix:
 - **macOS (Apple Silicon / aarch64)**: `nulang-macos-aarch64.tar.gz`
 - **Windows (x86_64)**: `nulang-windows-x86_64.tar.gz`
 
-Download the latest archive and its matching `.sha256` file from
+Choose an available tagged artifact and its matching `.sha256` file from
 [GitHub Releases](https://github.com/nulang-org/nulang/releases), verify the
-checksum, then put the extracted executable on your PATH.
+checksum, then put the extracted executable on your `PATH`. Tagged releases
+may lag behind the current `main` branch.
+
+**Python interoperability:** The current `release-cli` build profile for
+public archives intentionally omits Python runtime linkage. Such binaries
+may recognize `Python.*` effects but cannot execute Python interop. For
+Python-enabled source builds, use
+`cargo build --locked --release --no-default-features --features full`
+with compatible Python development/runtime libraries. The feature set of
+older tagged archives may differ; inspect the chosen release's notes.
 
 Linux x86_64 example:
 
 ```bash
 sha256sum -c nulang-linux-x86_64.tar.gz.sha256
 tar xzf nulang-linux-x86_64.tar.gz
+mkdir -p ~/.local/bin
 install -m 0755 nulang-linux-x86_64 ~/.local/bin/nulang
+# Ensure ~/.local/bin is on your PATH, then run: nulang --help
 ```
 
 Windows x86_64 archives contain the release executable under its
@@ -80,7 +132,7 @@ it in a directory on PATH.
 ```bash
 git clone https://github.com/nulang-org/nulang.git
 cd nulang
-cargo build --release
+cargo build --locked --release
 ```
 
 Source builds use Rust 1.95.0, pinned by `rust-toolchain.toml`. The tagged
@@ -89,53 +141,30 @@ Windows x86_64; other platform/architecture combinations are not release-tested.
 
 ## Quick Start
 
-A pre-built release binary needs no Rust toolchain. To build from source, use
-Rust 1.95.0:
+**Without installing:** open the [browser playground](https://nulang.org/playground/)
+to try the Core subset.
+
+**With a tagged release on your `PATH`:**
 
 ```bash
-git clone https://github.com/nulang-org/nulang.git
-cd nulang
-cargo build --release
+nulang --eval 'perform IO.print("Hello, Nulang!")'
+nulang --repl
 ```
+
+**From a source checkout:** Cargo is configured to place build artifacts
+outside the checkout (see [`.cargo/config.toml`](.cargo/config.toml)).
+Use `cargo run` so these commands work regardless of the configured target
+directory:
 
 ```bash
-nulang hello.nula              # compile + run
-nulang --check hello.nula      # type-check only
-nulang --eval '40 + 2'         # evaluate inline code
-nulang --repl                  # interactive REPL
+cargo run --locked --release -- examples/01_hello.nula
+cargo run --locked --release -- --check examples/01_hello.nula
+cargo run --locked --release -- examples/08_actors.nula
 ```
 
-A Nulang program:
-
-```nulang
-perform IO.print("Hello, Nulang!")
-
-let name = "World"
-perform IO.print("Hello, " + name + "!")
-```
-
-> Run `nulang examples/01_hello.nula`. See [`examples/`](examples/) for
-> 17 verified programs covering actors, effects, pattern matching, records,
-> loops, arrays, HTTP, JSON, and more.
->
-> No install? Try the hosted [browser playground](https://nulang.org/playground/).
-> It runs the compiler frontend + CoreVM locally in WebAssembly. Actors,
-> networking, FFI, and JIT execution still require the native runtime.
-
----
-
-## Contribute to Nulang
-
-Nulang welcomes focused fixes, tests, runnable examples, documentation, and
-tooling improvements. Start with the [contributor guide](CONTRIBUTING.md), see
-the [roadmap](ROADMAP.md) for priorities, browse
-[starter issues](https://github.com/nulang-org/nulang/issues?q=is%3Aissue+is%3Aopen+label%3Agood-first-issue) or
-[all open issues](https://github.com/nulang-org/nulang/issues), or
-[ask in Discussions](https://github.com/nulang-org/nulang/discussions)
-before taking on a broad design change. The
-[issue forms](https://github.com/nulang-org/nulang/issues/new/choose) help
-maintainers reproduce and triage proposals; no Rust expertise is required for
-documentation and example contributions.
+For a new project, run `nulang nula new my-app` using the installed CLI.
+Follow the [step-by-step quick start](https://nulang.org/getting-started/quick-start/)
+or browse the [examples](examples/README.md).
 
 ---
 
@@ -173,7 +202,7 @@ documentation and example contributions.
 | [`docs/ADOPTION_PILOT.md`](docs/ADOPTION_PILOT.md) | Independent-developer pilot protocol and measurable adoption gate (#809) |
 | [`docs/TUTORIAL.md`](docs/TUTORIAL.md) | **Tutorial:** Build a Weather CLI step by step — variables, functions, HTTP, JSON, pattern matching, records, file I/O |
 | [`docs/PITFALLS.md`](docs/PITFALLS.md) | Common mistakes: `::` vs `.`, `let` vs `var`, `perform` keyword, `catch`/`fail`, record syntax, and more |
-| [`examples/`](examples/) + [`README`](examples/README.md) | 17 verified, self-contained example programs |
+| [`examples/`](examples/) + [`README`](examples/README.md) | Example catalog, runnable commands, and per-example caveats |
 | [`SPEC2.md`](SPEC2.md) | Language specification: syntax, semantics, type system, runtime, format stability contract |
 | [`CHANGELOG.md`](CHANGELOG.md) | Changelog organized by stability tier (Frozen / Stable / Experimental) |
 | [`GOVERNANCE.md`](GOVERNANCE.md) | Stability tiers, RFC process, and language versioning |
@@ -270,21 +299,35 @@ docker build -t nulang .
 docker run --rm nulang --eval 'perform IO.print("Hello from Docker!")'
 ```
 
-The image is ~50 MB and contains only the `nulang` binary and its runtime
-dependencies.
+The final image contains the `nulang` executable and required runtime
+dependencies; its size depends on the build and base image.
 
-## Community
+## Contributing and project direction
 
-- **Questions & discussion:** [GitHub Discussions](https://github.com/nulang-org/nulang/discussions)
-- **Bugs & feature requests:** [Issue tracker](https://github.com/nulang-org/nulang/issues/new/choose)
-- **Contributing:** see [CONTRIBUTING.md](CONTRIBUTING.md) and our [Code of Conduct](CODE_OF_CONDUCT.md)
-- **External developer pilot:** follow [the adoption protocol](docs/ADOPTION_PILOT.md) and report anonymized findings to [issue #809](https://github.com/nulang-org/nulang/issues/809).
+Nulang welcomes code, tests, documentation, tooling, and reproducible bug
+reports. Review the [current roadmap](ROADMAP.md) to choose work that advances
+existing stability and developer-experience priorities. To start:
 
----
+1. Browse [open issues](https://github.com/nulang-org/nulang/issues) or
+   [look for beginner-friendly issues](https://github.com/nulang-org/nulang/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22).
+2. Read the [contributor guide](CONTRIBUTING.md) for build, test, PR, and
+   language-change requirements. Documentation and example improvements do not
+   require Rust expertise.
+3. For semantic changes, consult [governance](GOVERNANCE.md) and
+   [RFC proposals](RFC/). Prefer an issue or discussion before changing
+   Stable/Frozen contracts.
 
-## Docs & Wiki
+For up-to-date priorities, compare [open issues](https://github.com/nulang-org/nulang/issues)
+and [proposed RFCs](RFC/) with the [implementation status](docs/IMPLEMENTATION_STATUS.md).
+There is no claim here that a proposed feature is already shipped.
 
-The [nulang.org](https://nulang.org) documentation site is regenerated automatically on every push to `main` via the [Docs Sync workflow](.github/workflows/docs-sync.yml). When source files, examples, or docs content change, the workflow rebuilds generated docs and the browser playground, verifies the Astro site, and proposes the generated files through the `automation/docs-sync` pull request rather than pushing directly to protected `main`.
+**Questions:** [GitHub Discussions](https://github.com/nulang-org/nulang/discussions) ·
+**Report a bug or request a feature:** [New issue](https://github.com/nulang-org/nulang/issues/new/choose) ·
+**Community rules:** [Code of Conduct](CODE_OF_CONDUCT.md).
+
+Independent developers interested in testing adoption can follow the
+[pilot protocol](docs/ADOPTION_PILOT.md) and report anonymized findings to
+[issue #809](https://github.com/nulang-org/nulang/issues/809).
 
 ---
 
