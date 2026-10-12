@@ -1579,7 +1579,11 @@ fn test_compact_header_has_48_byte_abi_and_16_byte_small_slot() {
         assert_eq!(second.total_size(), 64);
         assert_eq!(first.size_class, SizeClass::Small);
     }
-    assert_eq!(heap.used(), 128, "two 16-byte values must occupy two 64-byte slots");
+    assert_eq!(
+        heap.used(),
+        128,
+        "two 16-byte values must occupy two 64-byte slots"
+    );
 }
 
 /// Zero-length and unaligned payloads must preserve the same logical length
