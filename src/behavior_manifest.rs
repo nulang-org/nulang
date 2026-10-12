@@ -21,6 +21,7 @@ use std::str::FromStr;
 
 pub const BEHAVIOR_MANIFEST_SCHEMA: &str = "nulang.behavior/v0alpha1";
 pub const BEHAVIOR_ARTIFACT_KIND_NBC_V1: &str = "nulang-bytecode-v1";
+pub const BEHAVIOR_ARTIFACT_KIND_WASM_MODULE: &str = "wasm-module";
 const BEHAVIOR_MANIFEST_DIGEST_DOMAIN: &[u8] = b"nulang.behavior-manifest.v0alpha1\0";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,12 +60,45 @@ pub struct BehaviorArtifact {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BehaviorActor {
     pub name: String,
+    #[serde(default)]
+    pub kind: BehaviorOwnerKind,
     pub persistence: BehaviorPersistence,
     pub schema_version: u32,
     pub state_schema_semantic_id: String,
     pub migration_identity: MigrationIdentityCoverage,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub migrations: Vec<BehaviorMigrationStep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<BehaviorWorkflow>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BehaviorOwnerKind {
+    Actor,
+    Workflow,
+    Agent,
+    Organization,
+}
+
+impl Default for BehaviorOwnerKind {
+    fn default() -> Self {
+        Self::Actor
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BehaviorWorkflow {
+    pub steps: Vec<BehaviorWorkflowStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BehaviorWorkflowStep {
+    pub name: String,
+    #[serde(default)]
+    pub compensation: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parallel_branches: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,11 +165,13 @@ impl BehaviorManifest {
 
             actors.push(BehaviorActor {
                 name: schema.actor_name.clone(),
+                kind: classify_owner_kind(actor),
                 persistence: classify_persistence(actor),
                 schema_version: schema.version,
                 state_schema_semantic_id: state_schema_semantic_id(&schema).to_string(),
                 migration_identity: MigrationIdentityCoverage::TopologyOnly,
                 migrations: migration_steps(&schema),
+                workflow: workflow_metadata(actor),
             });
         }
 
@@ -147,7 +183,7 @@ impl BehaviorManifest {
                 language_version: LANGUAGE_VERSION_STR.to_string(),
             },
             artifact: BehaviorArtifact {
-                kind: BEHAVIOR_ARTIFACT_KIND_NBC_V1.to_string(),
+                kind: behavior_artifact_kind(artifact)?.to_string(),
                 digest: artifact_digest(artifact_bytes),
                 source_id: artifact.source_id().map(|id| id.to_string()),
                 semantic_id: artifact.semantic_id().to_string(),
@@ -345,7 +381,9 @@ impl BehaviorManifest {
                 "package version must not be empty".to_string(),
             ));
         }
-        if self.artifact.kind != BEHAVIOR_ARTIFACT_KIND_NBC_V1 {
+        if self.artifact.kind != BEHAVIOR_ARTIFACT_KIND_NBC_V1
+            && self.artifact.kind != BEHAVIOR_ARTIFACT_KIND_WASM_MODULE
+        {
             return Err(BehaviorManifestError::UnsupportedArtifactKind(
                 self.artifact.kind.clone(),
             ));
@@ -435,6 +473,18 @@ impl BehaviorManifest {
     }
 }
 
+fn behavior_artifact_kind(
+    artifact: &ArtifactIdentityManifest,
+) -> Result<&'static str, BehaviorManifestError> {
+    match artifact.backend() {
+        "bytecode" => Ok(BEHAVIOR_ARTIFACT_KIND_NBC_V1),
+        "wasm" | "wasmfx" => Ok(BEHAVIOR_ARTIFACT_KIND_WASM_MODULE),
+        other => Err(BehaviorManifestError::UnsupportedArtifactBackend(
+            other.to_string(),
+        )),
+    }
+}
+
 fn parse_identity<T>(field: &'static str, value: &str) -> Result<T, BehaviorManifestError>
 where
     T: FromStr,
@@ -507,6 +557,36 @@ fn migration_steps(schema: &ActorStateSchema) -> Vec<BehaviorMigrationStep> {
     steps
 }
 
+fn classify_owner_kind(actor: &hir::ActorDef) -> BehaviorOwnerKind {
+    if actor.is_workflow {
+        BehaviorOwnerKind::Workflow
+    } else if actor.is_agent {
+        BehaviorOwnerKind::Agent
+    } else if actor.is_organization {
+        BehaviorOwnerKind::Organization
+    } else {
+        BehaviorOwnerKind::Actor
+    }
+}
+
+fn workflow_metadata(actor: &hir::ActorDef) -> Option<BehaviorWorkflow> {
+    if !actor.is_workflow {
+        return None;
+    }
+
+    Some(BehaviorWorkflow {
+        steps: actor
+            .behaviors
+            .iter()
+            .map(|behavior| BehaviorWorkflowStep {
+                name: behavior.name.clone(),
+                compensation: behavior.compensate.is_some(),
+                parallel_branches: behavior.parallel_branches.clone().unwrap_or_default(),
+            })
+            .collect(),
+    })
+}
+
 fn classify_persistence(actor: &hir::ActorDef) -> BehaviorPersistence {
     let mut durable = false;
     let mut event_sourced = false;
@@ -572,6 +652,7 @@ pub enum BehaviorManifestError {
     Json(String),
     UnsupportedSchema(String),
     UnsupportedArtifactKind(String),
+    UnsupportedArtifactBackend(String),
     InvalidPackage(String),
     InvalidDigest {
         field: &'static str,
@@ -609,7 +690,11 @@ impl fmt::Display for BehaviorManifestError {
             ),
             Self::UnsupportedArtifactKind(kind) => write!(
                 f,
-                "unsupported behavior manifest artifact kind '{kind}'; expected {BEHAVIOR_ARTIFACT_KIND_NBC_V1}"
+                "unsupported behavior manifest artifact kind '{kind}'; expected {BEHAVIOR_ARTIFACT_KIND_NBC_V1} or {BEHAVIOR_ARTIFACT_KIND_WASM_MODULE}"
+            ),
+            Self::UnsupportedArtifactBackend(backend) => write!(
+                f,
+                "unsupported behavior manifest artifact backend '{backend}'"
             ),
             Self::InvalidPackage(message) => write!(f, "invalid behavior manifest package: {message}"),
             Self::InvalidDigest { field, message } => {
@@ -766,6 +851,18 @@ mod tests {
         )
     }
 
+    fn wasm_artifact() -> ArtifactIdentityManifest {
+        ArtifactIdentityManifest::new(
+            Some(SourceId::from_bytes(b"actor Counter {}")),
+            SemanticId::from_canonical_bytes(b"program", []),
+            "nulang-rust-0.1.0",
+            "wasm32",
+            "nulang-host-effects-v0alpha1",
+            "wasm",
+            ["opt=0"],
+        )
+    }
+
     fn typed_hir(version: u32) -> Module {
         let migrations = if version > 1 {
             vec![MigrationDecl {
@@ -853,6 +950,7 @@ mod tests {
     fn actor(version: u32, schema_seed: &[u8]) -> BehaviorActor {
         BehaviorActor {
             name: "payments::Account".to_string(),
+            kind: BehaviorOwnerKind::Actor,
             persistence: BehaviorPersistence::Durable,
             schema_version: version,
             state_schema_semantic_id: schema_id(schema_seed),
@@ -869,7 +967,103 @@ mod tests {
                     })
                     .collect()
             },
+            workflow: None,
         }
+    }
+
+    #[test]
+    fn typed_hir_binds_wasm_artifact_kind_to_exact_bytes() {
+        let manifest = BehaviorManifest::from_typed_hir(
+            "demo",
+            "0.1.0",
+            &wasm_artifact(),
+            b"canonical-wasm-bytes",
+            &typed_hir(1),
+        )
+        .unwrap();
+
+        assert_eq!(manifest.artifact.kind, BEHAVIOR_ARTIFACT_KIND_WASM_MODULE);
+        manifest
+            .verify_artifact_bytes(b"canonical-wasm-bytes")
+            .unwrap();
+    }
+
+    #[test]
+    fn typed_hir_emits_ordered_workflow_step_metadata() {
+        let mut module = typed_hir(1);
+        let hir::Decl::Actor(actor) = &mut module.decls[0] else {
+            panic!("expected actor");
+        };
+        actor.name = "ApprovalFlow".into();
+        actor.is_workflow = true;
+        actor.behaviors = vec![
+            crate::hir::BehaviorDef {
+                name: "reserve".into(),
+                params: Vec::new(),
+                ret: Type::unit(),
+                effect: crate::types::EffectRow::empty(),
+                cap: crate::types::Capability::Ref,
+                body: crate::hir::Body::default(),
+                compensate: Some(crate::hir::Body::default()),
+                parallel_branches: None,
+                span: Span::default(),
+            },
+            crate::hir::BehaviorDef {
+                name: "parallel_0".into(),
+                params: Vec::new(),
+                ret: Type::unit(),
+                effect: crate::types::EffectRow::empty(),
+                cap: crate::types::Capability::Ref,
+                body: crate::hir::Body::default(),
+                compensate: None,
+                parallel_branches: Some(vec!["email".into(), "sms".into()]),
+                span: Span::default(),
+            },
+        ];
+
+        let manifest = BehaviorManifest::from_typed_hir(
+            "demo",
+            "0.1.0",
+            &artifact(),
+            b"compiled-nbc",
+            &module,
+        )
+        .unwrap();
+
+        let owner = &manifest.actors[0];
+        assert_eq!(owner.kind, BehaviorOwnerKind::Workflow);
+        assert_eq!(
+            owner.workflow,
+            Some(BehaviorWorkflow {
+                steps: vec![
+                    BehaviorWorkflowStep {
+                        name: "reserve".into(),
+                        compensation: true,
+                        parallel_branches: Vec::new(),
+                    },
+                    BehaviorWorkflowStep {
+                        name: "parallel_0".into(),
+                        compensation: false,
+                        parallel_branches: vec!["email".into(), "sms".into()],
+                    },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn non_workflow_actor_omits_workflow_metadata() {
+        let manifest = BehaviorManifest::from_typed_hir(
+            "demo",
+            "0.1.0",
+            &artifact(),
+            b"compiled-nbc",
+            &typed_hir(1),
+        )
+        .unwrap();
+
+        assert_eq!(manifest.actors[0].kind, BehaviorOwnerKind::Actor);
+        assert_eq!(manifest.actors[0].workflow, None);
     }
 
     #[test]
