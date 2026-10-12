@@ -1361,6 +1361,7 @@ fn stress_persistence_journal_replay_ordering() {
                 actor_id,
                 JournalEntry {
                     sequence: seq,
+                    activation_id: None,
                     behavior_id: (seq % 3) as u16,
                     payload: vec![PersistedValue::from_value(&Value::int(seq as i64))],
                 },

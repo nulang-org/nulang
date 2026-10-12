@@ -125,6 +125,7 @@ fn bench_memory_journal_read(c: &mut Criterion) {
                 1,
                 JournalEntry {
                     sequence: sequence as u64,
+                    activation_id: None,
                     behavior_id: 0,
                     payload: vec![PersistedValue::Int(sequence as i64)],
                 },

@@ -1526,6 +1526,7 @@ pub(crate) mod tests {
                     7,
                     JournalEntry {
                         sequence: s,
+                        activation_id: None,
                         behavior_id: 0,
                         payload: vec![],
                     },

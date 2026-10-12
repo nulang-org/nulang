@@ -210,6 +210,7 @@ mod tests {
                     7,
                     JournalEntry {
                         sequence: seq,
+                        activation_id: None,
                         behavior_id: 0,
                         payload: vec![PersistedValue::Int(1)],
                     },
