@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
 
 # A newer push to the same PR/branch supersedes the previous run. Without
 # this, every push queues a full ~6h run set (including Release Build) and
@@ -20,6 +21,7 @@ jobs:
   # Documentation site + zero-install browser playground
   # -----------------------------------------------------------------------
   docs-site:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     name: Docs site & browser playground
     runs-on: ubuntu-latest
     steps:
@@ -74,6 +76,7 @@ jobs:
   # Primary build & test (default features)
   # -----------------------------------------------------------------------
   test:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     name: Build & Test
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -136,6 +139,7 @@ jobs:
   # Release build — catches optimization-only errors
   # -----------------------------------------------------------------------
   release:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     name: Release Build
     runs-on: ubuntu-latest
     timeout-minutes: 75
@@ -189,6 +193,7 @@ jobs:
   # Nula package-manager smoke test — scaffold a package and run `nula test`
   # -----------------------------------------------------------------------
   nula-test:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     name: Nula Package Test
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -223,6 +228,7 @@ jobs:
   # No-default-features build — proves zero PyO3/SQLite/LSP dependencies
   # -----------------------------------------------------------------------
   minimal-build:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     name: Build without optional features
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -267,6 +273,7 @@ jobs:
   # WASM backend
   # -----------------------------------------------------------------------
   wasm-backend:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     name: Build & Test (wasm-backend feature)
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -303,6 +310,7 @@ jobs:
   # Lint — format, clippy, audit, docs, all-features check
   # -----------------------------------------------------------------------
   lint:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     name: Format, Clippy & Audit
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -374,6 +382,7 @@ jobs:
   # Lean formalization — verifies the formal specs compile
   # -----------------------------------------------------------------------
   lean:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     name: Lean Formalization
     runs-on: ubuntu-latest
     timeout-minutes: 20

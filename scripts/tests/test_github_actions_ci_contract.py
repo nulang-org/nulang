@@ -93,6 +93,33 @@ class GitHubActionsCIContractTests(unittest.TestCase):
             "release.yml must cancel only pull-request runs, never a tag publish",
         )
 
+    def test_draft_runs_do_not_consume_ci_and_never_wedge_a_pr(self):
+        import re
+
+        workflow_dir = ROOT / ".github" / "workflows"
+
+        for path in sorted(workflow_dir.glob("*.yml")):
+            source = path.read_text(encoding="utf-8")
+            header = source.split("\njobs:", 1)[0]
+            if "pull_request" not in header:
+                continue
+            if "github.event.pull_request.draft == false" not in source:
+                continue
+            with self.subTest(workflow=path.name):
+                self.assertIn(
+                    "ready_for_review",
+                    header,
+                    f"{path.name} skips draft runs but would not re-run when the PR is marked ready",
+                )
+                # Multi-trigger workflows must scope the guard to pull_request
+                # events, otherwise push/schedule runs are skipped too.
+                if re.search(r"^  (push|schedule|workflow_dispatch):", header, re.M):
+                    self.assertIn(
+                        "github.event_name != 'pull_request' ||",
+                        source,
+                        f"{path.name} also runs on non-PR events, so its draft guard must be event-scoped",
+                    )
+
     def test_contract_is_enforced_by_the_implementation_gate(self):
         gate = (ROOT / "scripts" / "verify_implementation.py").read_text(encoding="utf-8")
 

@@ -6,6 +6,7 @@ on:
   push:
     tags: ['v*']
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - '.github/workflows/release.yml'
       - 'Cargo.toml'
@@ -30,6 +31,7 @@ env:
 
 jobs:
   preflight:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     name: Release preflight
     runs-on: ubuntu-latest
     permissions:
@@ -73,6 +75,7 @@ jobs:
           PY
 
   release:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     name: Build (${{ matrix.target }})
     needs: preflight
     runs-on: ${{ matrix.os }}
