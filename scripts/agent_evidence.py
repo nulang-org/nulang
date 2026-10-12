@@ -61,6 +61,9 @@ def collect(cwd, base, checks, timeout=600):
             'exit_code': exit_code,
             'duration_ms': int((time.monotonic() - started) * 1000),
         })
+    final_head = git(cwd, 'rev-parse', 'HEAD')
+    dirty = dirty or bool(git(cwd, 'status', '--porcelain', '--untracked-files=all'))
+    head_integrity = 'unchanged' if final_head == head else 'changed-during-checks'
     return {
         'schema_version': 1,
         'source': 'nulang-local-checks',
@@ -68,8 +71,9 @@ def collect(cwd, base, checks, timeout=600):
         'head_sha': head,
         'changed_files': sorted(changed),
         'dirty': dirty,
+        'head_integrity': head_integrity,
         'checks': results,
-        'ready_for_review': bool(results) and not dirty and all(r['status'] == 'passed' for r in results),
+        'ready_for_review': bool(results) and not dirty and head_integrity == 'unchanged' and all(r['status'] == 'passed' for r in results),
         'independent_review': {'status': 'unknown'},
         'ci': {'status': 'unknown'},
         'benchmark': {'status': 'not-measured'},
