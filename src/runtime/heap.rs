@@ -1630,6 +1630,47 @@ fn test_compact_header_los_exact_size_reuse_and_reset() {
     assert_eq!(heap.live_count(), 0);
 }
 
+/// The JIT reads object metadata at compile-time field offsets. Preserve
+/// those offsets even when the compact layout evolves.
+#[cfg(feature = "compact-orca-header")]
+#[test]
+fn test_compact_header_field_offsets_for_jit() {
+    assert_eq!(std::mem::offset_of!(OrcaHeader, ref_count), 0);
+    assert_eq!(std::mem::offset_of!(OrcaHeader, foreign_count), 4);
+    assert_eq!(std::mem::offset_of!(OrcaHeader, sticky), 8);
+    assert_eq!(std::mem::offset_of!(OrcaHeader, size_class), 9);
+    assert_eq!(std::mem::offset_of!(OrcaHeader, gc_color), 10);
+    assert_eq!(std::mem::offset_of!(OrcaHeader, type_tag), 11);
+    assert_eq!(std::mem::offset_of!(OrcaHeader, actor_id), 16);
+    assert_eq!(std::mem::offset_of!(OrcaHeader, payload_size), 24);
+    assert_eq!(std::mem::offset_of!(OrcaHeader, live_next), 32);
+    assert_eq!(std::mem::offset_of!(OrcaHeader, live_prev), 40);
+}
+
+/// Allocation from the compact 64-byte size class must not overwrite an
+/// adjacent live object's payload, even when a freed slot gets reused.
+#[cfg(feature = "compact-orca-header")]
+#[test]
+fn test_compact_small_object_reuse_preserves_adjacent_payload() {
+    let mut heap = ActorHeap::new(4096);
+    let first = heap.alloc(16, TypeTag::Raw).unwrap();
+    let second = heap.alloc(16, TypeTag::Raw).unwrap();
+    unsafe {
+        std::ptr::write_bytes(second, 0xA5, 16);
+        heap.free(first);
+    }
+
+    let reused = heap.alloc(16, TypeTag::Raw).unwrap();
+    assert_eq!(reused, first, "freed small slot should be reused");
+    unsafe {
+        std::ptr::write_bytes(reused, 0x5A, 16);
+        let bytes = std::slice::from_raw_parts(second, 16);
+        assert_eq!(bytes, &[0xA5; 16]);
+        assert_eq!((*ActorHeap::header_of(second)).ref_count, 1);
+    }
+    assert_eq!(heap.live_count(), 2);
+}
+
 #[cfg(not(feature = "compact-orca-header"))]
 #[test]
 fn test_header_size_is_56() {
