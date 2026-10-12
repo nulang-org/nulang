@@ -22,6 +22,12 @@ pub fn lower_module(
     ast: &ast::AstModule,
     inferred_decl_types: &FxHashMap<String, Type>,
 ) -> hir::Module {
+    // Preserve statically-known nominal actor identity before HIR erases the
+    // protocol environment. The pass is idempotent because the canonical
+    // compiler pipeline already runs it during type checking.
+    let annotated_ast = crate::actor_protocol::annotate_module(ast).ok();
+    let ast = annotated_ast.as_ref().unwrap_or(ast);
+
     let mut module = hir::Module::new(&ast.name);
     let tools = collect_tool_schemas(&ast.decls);
 
