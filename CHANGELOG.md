@@ -1,5 +1,10 @@
 # Nulang Changelog
 
+### Standard-library end-to-end CI gates — 2026-10-12
+- **The default-feature Build & Test job now executes the repository's Nulang language-behavior conformance suite.** Rust unit and integration tests do not execute `conformance/behavior/*.nula` fixtures; the new step exercises their expected process exit codes and output at the PR's exact head.
+- **The existing Nula Package Test job now executes the checked-in `datetime-ext`, `result-ext`, and `http-client` package tests.** These use the already-tested release binary and an explicit stdlib import path, rather than relying on a package-scaffolding smoke test to cover existing package logic.
+
+
 ### Public CLI release portability — 2026-10-11
 - **Public release archives use the `release-cli` feature profile without a Python shared-library ABI dependency.** The ordinary full/default source build retains opt-in Python interoperability; release packaging checks the resulting Linux and macOS binary for Python dependencies.
 - **Release PRs rehearse the full non-publishing four-platform build matrix before tags are created.** The Linux ARM64 cross build explicitly installs target libc development headers and preflights a target-compiler C header probe, avoiding an observed `ring` compile failure when `--no-install-recommends` omits the ARM64 sysroot. Actual cross-build and clean-host portability remain release gates.
