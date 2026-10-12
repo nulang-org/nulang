@@ -52,9 +52,9 @@ fn bench_jit_hot_loop(c: &mut Criterion) {
     // plus the one-time JIT compile cost plus the remaining JIT-compiled
     // iterations, all in a single run() call.
     c.bench_function("jit/hot_loop_first_run", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || fresh_vm(&module),
-            |mut vm| black_box(vm.run().unwrap()),
+            |vm| black_box(vm.run().unwrap()),
             BatchSize::SmallInput,
         )
     });
@@ -66,37 +66,36 @@ fn bench_jit_hot_loop(c: &mut Criterion) {
     // second run() with zero compile overhead, isolating steady-state
     // JIT-compiled throughput from the one-time tier-up cost above.
     c.bench_function("jit/hot_loop_warm", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || {
                 let mut vm = fresh_vm(&module);
                 let _ = vm.run();
                 vm
             },
-            |mut vm| black_box(vm.run().unwrap()),
+            |vm| black_box(vm.run().unwrap()),
             BatchSize::SmallInput,
         )
     });
 }
 
-/// A hot loop that calls a function each iteration. `Call`/`TailCall` are not
-/// in the JIT compilable opcode set, so `find_compilable_region` fragments at
-/// the call: the loop's arithmetic around the call is JIT-compiled, but the
-/// call itself (frame push + dispatch) is interpreted every iteration. This
-/// quantifies the real-world JIT gap for call-heavy loops — the largest
-/// remaining coverage hole — against the pure-interpreter `interp/function_call`
-/// baseline and the no-call `jit/hot_loop_warm` ceiling.
+/// A hot loop that calls a function each iteration. Direct, non-suspending,
+/// non-recursive calls can stay inside a compiled region, but the current
+/// scalar JIT lowers them through `nulang_jit_direct_call`, which re-enters
+/// the VM to execute the callee on the interpreter frame stack. This benchmark
+/// therefore measures the remaining native-call boundary cost against the
+/// pure-interpreter baseline and the no-call `jit/hot_loop_warm` ceiling.
 fn bench_jit_function_call_loop(c: &mut Criterion) {
     let source = "fn add(x: Int, y: Int) -> Int { x + y }; var sum = 0; var i = 0; while i < 100000 { sum = add(sum, i); i = i + 1; }; sum";
     let module = compile(source);
 
     c.bench_function("jit/function_call_loop", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || {
                 let mut vm = fresh_vm(&module);
                 let _ = vm.run();
                 vm
             },
-            |mut vm| black_box(vm.run().unwrap()),
+            |vm| black_box(vm.run().unwrap()),
             BatchSize::SmallInput,
         )
     });
@@ -104,13 +103,13 @@ fn bench_jit_function_call_loop(c: &mut Criterion) {
     // JIT-disabled interp baseline for the IDENTICAL source, so the bench
     // directly shows whether the JIT helps or hurts call-heavy loops.
     c.bench_function("jit/function_call_loop_interp", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || {
                 let mut vm = nulang::vm::VM::new_without_jit();
                 vm.load_module(module.clone());
                 vm
             },
-            |mut vm| black_box(vm.run().unwrap()),
+            |vm| black_box(vm.run().unwrap()),
             BatchSize::SmallInput,
         )
     });
@@ -128,7 +127,11 @@ fn bench_jit_function_call_loop(c: &mut Criterion) {
 fn bench_jit_tiering_profitability(c: &mut Criterion) {
     let mut group = c.benchmark_group("jit/tiering_profitability");
 
-    for trips in [250usize, 500, 1_000, 2_000, 10_000, 100_000] {
+    // Dense points around the current first-run crossover keep threshold
+    // decisions evidence-based instead of extrapolating between 2k and 10k.
+    for trips in [
+        250usize, 500, 1_000, 2_000, 3_000, 4_000, 5_000, 7_500, 10_000, 100_000,
+    ] {
         let source = format!(
             "var sum = 0; var i = 0; while i < {trips} {{ sum = sum + i * 3 - i / 7; i = i + 1; }}; sum"
         );
@@ -138,22 +141,22 @@ fn bench_jit_tiering_profitability(c: &mut Criterion) {
             BenchmarkId::new("jit_first_run", trips),
             &module,
             |b, module| {
-                b.iter_batched(
+                b.iter_batched_ref(
                     || fresh_vm(module),
-                    |mut vm| black_box(vm.run().unwrap()),
+                    |vm| black_box(vm.run().unwrap()),
                     BatchSize::SmallInput,
                 )
             },
         );
 
         group.bench_with_input(BenchmarkId::new("interp", trips), &module, |b, module| {
-            b.iter_batched(
+            b.iter_batched_ref(
                 || {
                     let mut vm = VM::new_without_jit();
                     vm.load_module(module.clone());
                     vm
                 },
-                |mut vm| black_box(vm.run().unwrap()),
+                |vm| black_box(vm.run().unwrap()),
                 BatchSize::SmallInput,
             )
         });
