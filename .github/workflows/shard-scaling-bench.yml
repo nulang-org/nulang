@@ -1,6 +1,8 @@
 name: Shard scaling benchmarks
 
 on:
+  schedule:
+    - cron: '15 4 * * *'
   workflow_dispatch:
     inputs:
       messages:
@@ -11,13 +13,6 @@ on:
         description: Measured repetitions
         required: false
         default: '5'
-  pull_request:
-    paths:
-      - '.github/workflows/shard-scaling-bench.yml'
-      - 'src/bin/nulang_shard_bench.rs'
-      - 'src/runtime/**'
-      - 'Cargo.toml'
-
 concurrency:
   group: shard-scaling-bench-${{ github.ref }}
   cancel-in-progress: true

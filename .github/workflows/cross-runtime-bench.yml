@@ -1,6 +1,8 @@
 name: Cross-runtime actor benchmarks
 
 on:
+  schedule:
+    - cron: '30 3 * * *'
   workflow_dispatch:
     inputs:
       runs:
@@ -19,17 +21,6 @@ on:
         options:
           - single
           - host
-  pull_request:
-    paths:
-      - '.github/workflows/cross-runtime-bench.yml'
-      - 'benchmarks/cross_runtime/**'
-      - 'benchmarks/README.md'
-      - 'scripts/cross_runtime_bench.py'
-      - 'src/benchmarks.rs'
-      - 'src/bin/nulang_savina.rs'
-      - 'benchmarks/SAVINA.md'
-      - 'Cargo.toml'
-
 concurrency:
   group: cross-runtime-bench-${{ github.ref }}
   cancel-in-progress: true

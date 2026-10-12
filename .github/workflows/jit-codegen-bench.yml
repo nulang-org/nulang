@@ -1,22 +1,14 @@
 name: JIT codegen benchmarks
 
 on:
+  schedule:
+    - cron: '0 4 * * *'
   workflow_dispatch:
     inputs:
       repeat:
         description: Measured repetitions per workload
         required: false
         default: '5'
-  pull_request:
-    paths:
-      - '.github/workflows/jit-codegen-bench.yml'
-      - 'src/backends/mod.rs'
-      - 'src/jit/**'
-      - 'src/vm.rs'
-      - 'src/bin/nulang_jit_bench.rs'
-      - 'benchmarks/JIT_CODEGEN.md'
-      - 'Cargo.toml'
-
 concurrency:
   group: jit-codegen-bench-${{ github.ref }}
   cancel-in-progress: true
