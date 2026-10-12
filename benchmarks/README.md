@@ -170,6 +170,8 @@ Examples:
   cycle-edge registration, and ready publication), excluding handler execution
   and pending-op draining.
 - `gc/orca_receiver_hold/{repeated,distinct}/256` runs 256 real pointer messages through receive, ORCA GC-op draining and receiver hold registration. The repeated case shares one object; the distinct case uses 256 objects. These are end-to-end admission/dispatch/reclamation-bookkeeping costs, not a standalone hash table benchmark. Compare both workloads in same-host paired runs before claiming a win.
+- `gc/actor_heap_small_alloc/payload_{8,16,32,64,128}` measures 512 fresh allocations on an actor heap; setup creates the heap outside the timed section, and the timed path includes bump/size-class growth and the live-object list. It does not include reclamation, scanning, or OS-level RSS measurement.
+- `gc/orca_local_alloc_drop/payload_{8,16,32,64,128}` measures 512 alloc/free pairs through ORCA on one actor heap with no foreign references, including immediate reclaim and free-list reuse. Do not compare its absolute latency directly to the fresh-allocation benchmark as if both performed the same work.
 - `dist/crdt_delta_compute` and `dist/gossip_membership_merge_4` are local
   algorithmic microbenchmarks, not network synchronization/convergence.
 - `dist/nul0_actor_message_{encode,decode}/*` measures wire codec work only,
