@@ -86,6 +86,31 @@ class ChangedConformanceTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("1 passed, 0 failed", result.stdout)
 
+    def test_deleted_snapshot_is_blocking(self):
+        p = self.fixture()
+        snapshot = p.with_suffix(".json")
+        snapshot.unlink()
+        result = self.run_runner(snapshot)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing expectation", result.stdout)
+
+    def test_deleted_source_with_retained_snapshot_is_blocking(self):
+        p = self.fixture()
+        p.unlink()
+        result = self.run_runner(p)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing fixture", result.stdout)
+
+    def test_deleted_fixture_and_snapshot_pair_is_skipped(self):
+        p = self.fixture()
+        snapshot = p.with_suffix(".json")
+        p.unlink()
+        snapshot.unlink()
+        result = self.run_runner(p, snapshot)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("SKIP", result.stdout)
+        self.assertIn("0 passed, 0 failed, 1 skipped", result.stdout)
+
     def test_rejects_paths_outside_conformance_directory(self):
         p = self.root / "outside.nula"
         p.write_text("ok")
