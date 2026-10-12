@@ -233,6 +233,9 @@ version + migration.*
 
 ## Stable tier
 
+### Formal effect-handler safety foundation — 2026-09-22
+- **Lean effect handlers now require typed handler bodies** (`spec/formal/effects.lean`). The formal `tHandle` rule no longer permits an arbitrary untyped handler expression: body and handler effect rows must be discharged by the installed handler or preserved in the outward residual row.
+- **Vacuous effect-safety placeholders were replaced with checked dispatch lemmas.** `effect_safety` and `effect_safety_static` now conclude concrete handled-dispatch properties; entering a handler scope is proved to establish dispatch safety. The stronger whole-language progress/preservation theorem remains explicitly open until latent function effect rows are represented in the formal function type.
 ### Zero-copy non-reentrant JIT register entry — 2026-09-24
 - **Cranelift regions that cannot re-enter the VM now execute directly against the active frame's 256-register array**, eliminating the previous 2 KiB snapshot before native entry and 2 KiB copy-back afterward. `Value` is explicitly `repr(transparent)` over `u64` so the native register ABI has a documented layout guarantee.
 - **Compiled-region metadata now records whether native execution may grow or replace the VM frame stack.** Regions containing helper-backed direct calls retain the detached register snapshot because re-entrant interpreter calls may reallocate `VM::frames`; typed, SIMD, and scalar non-call regions use the direct-frame path.

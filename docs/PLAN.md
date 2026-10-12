@@ -74,7 +74,7 @@ among Phases 1-4's broader production-readiness work.
 | CI matrix | build/test/release/wasm/minimal/lint/lean/package-smoke |
 | Direct deps | 72 |
 | Transitive deps | 472 (verified `Cargo.lock` `grep -c '^name = '`, 2026-08-14; was 504 before a 2026-08-02 libsql feature trim dropped the unused tonic/axum gRPC stack, then 468, already stale before that) |
-| Formal proofs (Lean 4) | Core type soundness **proved** (`progress`/`preservation`/`type_soundness` machine-checked 2026-08-14); capability lattice proved (5/6 theorems — `linear_at_most_once` remains `sorry`, needs split-context refinement); effects are vacuous `True` stubs, not proofs |
+| Formal proofs (Lean 4) | Core type soundness **proved** (`progress`/`preservation`/`type_soundness` machine-checked 2026-08-14); capability lattice proved (5/6 theorems — `linear_at_most_once` remains `sorry`, needs split-context refinement); local handler-stack effect dispatch safety proved and handler bodies typed; whole-language effect progress/preservation remains open pending latent function-effect formalization |
 | Conformance suite | 300 behavior cases + grammar cases |
 | Bootstrap self-hosting | Stage 13; not yet self-compiling |
 | Benchmarks | `benches/` uses criterion (7 files, 404 lines); no CI regression tracking |
@@ -947,9 +947,11 @@ runtime withstands adversarial operational review. Both hold up as
    - `capabilities.lean`: `cap_sendable` (only `val`/`tag` cross actor
      boundaries) — proved; `linear_iso_at_most_once` — open, needs the
      split-context `HasTypeCap` refinement.
-   - `effects.lean`: `effect_safety` (closed row `{}` cannot perform an
-     unhandled effect) — still a `True` stub, not proved; progress+
-     preservation for handler dispatch — open.
+   - `effects.lean`: local handler-stack dispatch safety is proved and
+     `tHandle` now requires a typed handler body whose effects are either
+     discharged or preserved outward. Whole-language progress/preservation is
+     still open because the simplified formal `Ty.fn` does not yet carry the
+     compiler's latent function effect row.
    - `combined.lean`: type + capability + effect judgment soundness —
      open.
    - CI gate on `lake build` blocks any PR that touches
