@@ -436,8 +436,11 @@ impl ActorHeap {
     /// Returns `None` only if the global allocator fails (OS OOM); an
     /// exhausted bump block triggers growth instead of failure.
     pub fn alloc(&mut self, payload_size: usize, type_tag: TypeTag) -> Option<*mut u8> {
-        let aligned_payload = align_up(payload_size);
-        let total_size = Self::HEADER_SIZE + aligned_payload;
+        // Reject sizes that cannot be represented after alignment and
+        // prepending the header. Wrapping here would let a huge logical
+        // payload alias a tiny physical allocation.
+        let aligned_payload = payload_size.checked_add(ALIGN - 1)? & !(ALIGN - 1);
+        let total_size = Self::HEADER_SIZE.checked_add(aligned_payload)?;
         // `block_size` is the uniform physical size reserved for the class
         // (the exact total for Huge/LOS blocks).  The header still records
         // the exact `total_size`, because the VM derives array / record /
