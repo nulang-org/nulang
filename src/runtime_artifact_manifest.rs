@@ -198,6 +198,7 @@ impl RuntimeArtifactManifest {
 
         module.semantic_id = Some(self.semantic_id);
         module.artifact_id = Some(self.artifact_id);
+        module.artifact_identity_manifest = Some(self.artifact_identity());
         module.actor_semantic_ids = definition_ids;
         Ok(())
     }
@@ -488,6 +489,13 @@ mod tests {
         assert_eq!(restored.semantic_id, module.semantic_id);
         assert_eq!(restored.artifact_id, module.artifact_id);
         assert_eq!(restored.actor_semantic_ids, module.actor_semantic_ids);
+        assert_eq!(
+            restored
+                .artifact_identity_manifest
+                .as_ref()
+                .map(|manifest| manifest.artifact_id()),
+            module.artifact_id
+        );
     }
 
     #[test]

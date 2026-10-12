@@ -1555,6 +1555,13 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### Provenance-preserving migration and shadow respawn — 2026-09-21
+- **Identified durable actors now keep their definition SemanticId and exact ArtifactId across node migration.** NUL0 v1 `MigrateActor` packets carry an additive, backward-compatible provenance tail containing a BLAKE3 digest of the exact NBC bytes plus the versioned runtime artifact manifest. Historical readers ignore the tail; current readers verify it before restoring identified state.
+- **Shadow replication preserves the same provenance.** `ShadowReplicate` stores the byte-verified manifest alongside NBC + snapshot state, and node-loss respawn reuses the provenance-verifying migration receiver instead of downgrading the replica to a legacy/unidentified snapshot.
+- **Migration refuses provenance downgrade.** An identified actor or snapshot without a verifiable artifact manifest is rejected rather than having identity fields erased. Legacy snapshots and legacy packets remain supported and explicitly unverified.
+- **Snapshot restoration is definition-scoped.** Migration and snapshot hydration select one actor metadata entry when definition identity is known, preventing unrelated workflows/agents/default fields/state models in the same module from leaking into the restored actor.
+- **CodeModule retains the full artifact identity manifest as an in-memory sidecar.** Frozen NBC v1 remains unchanged; runtime manifests restore that sidecar after verified transport or artifact-store hydration so subsequent migrations can preserve the chain of provenance.
+
 ### Compiler-owned identified bytecode emission — 2026-09-21
 - **Standard typed bytecode compilation now derives exact executable identity in the compiler pipeline.** One `IdentifiedBytecodeArtifact` owns the compiled `CodeModule`, `ArtifactIdentityManifest`, and `RuntimeArtifactManifest`, preventing callers from pairing bytecode with manifests derived from a different semantic/codegen configuration.
 - **Portable NBC ArtifactId inputs are centralized.** Compiler version, target, ABI, backend, and bytecode-format codegen flags now come from one compiler contract, and ordinary typed source execution receives the same ArtifactId semantics as explicit artifact emission.

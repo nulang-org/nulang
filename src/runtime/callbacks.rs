@@ -2322,7 +2322,7 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
             // Extract all needed data from the actor in a tight scope so the
             // immutable borrow on rt.actors is released before reap_living_actor
             // takes a mutable borrow on rt.
-            let (snapshot_json, nbc_bytes) = {
+            let (snapshot_json, nbc_bytes, artifact_provenance) = {
                 let actor = match rt.actors.get(&actor_id) {
                     Some(a) => a,
                     None => {
@@ -2393,16 +2393,15 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
                         return;
                     }
                 };
-                // NBC v1 does not carry the compiler semantic-identity
-                // sidecar. Until migration transports a verifiable artifact
-                // manifest, cross-node migration remains explicitly legacy /
-                // unverified rather than copying an identity string that the
-                // receiver cannot prove belongs to the transported bytecode.
+                // Preserve the actor's verified provenance. If either
+                // identity is present, the transport below must also carry a
+                // byte-verified runtime artifact manifest; otherwise migration
+                // refuses instead of silently downgrading provenance.
                 let snapshot = crate::runtime::persistence::ActorSnapshot {
                     actor_id,
                     sequence: actor.sequence,
-                    semantic_id: None,
-                    artifact_id: None,
+                    semantic_id: actor.definition_semantic_id.map(|id| id.to_string()),
+                    artifact_id: actor.execution_artifact_id.map(|id| id.to_string()),
                     state,
                     waiting_signal: actor.waiting_signal.clone(),
                     crdt_snapshot,
@@ -2448,7 +2447,53 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
                     }
                 };
 
-                (snapshot_json, nbc)
+                let artifact_provenance = match module.artifact_identity_manifest.as_ref() {
+                    Some(identity) => {
+                        let runtime_manifest =
+                            match crate::runtime_artifact_manifest::RuntimeArtifactManifest::from_module(
+                                &module,
+                                identity,
+                            ) {
+                                Ok(manifest) => manifest,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        actor_id,
+                                        %error,
+                                        "nulang-migrate: cannot derive runtime artifact provenance"
+                                    );
+                                    return;
+                                }
+                            };
+                        let runtime_manifest_json = match runtime_manifest.to_json() {
+                            Ok(json) => json,
+                            Err(error) => {
+                                tracing::warn!(
+                                    actor_id,
+                                    %error,
+                                    "nulang-migrate: cannot serialize runtime artifact provenance"
+                                );
+                                return;
+                            }
+                        };
+                        Some(super::network::RuntimeArtifactProvenance {
+                            nbc_blake3: *blake3::hash(&nbc).as_bytes(),
+                            runtime_manifest_json,
+                        })
+                    }
+                    None => None,
+                };
+
+                let snapshot_is_identified =
+                    snapshot.semantic_id.is_some() || snapshot.artifact_id.is_some();
+                if snapshot_is_identified && artifact_provenance.is_none() {
+                    tracing::warn!(
+                        actor_id,
+                        "nulang-migrate: refusing to downgrade identified actor without verifiable artifact provenance"
+                    );
+                    return;
+                }
+
+                (snapshot_json, nbc, artifact_provenance)
             }; // <- actor borrow released here
 
             // Send the migration packet.
@@ -2463,6 +2508,7 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
                 actor_id,
                 nbc_bytes,
                 snapshot_json,
+                artifact_provenance,
             };
 
             if let (Some(transport), Some(addr)) = (&mut rt.distributed.transport, target_addr) {
