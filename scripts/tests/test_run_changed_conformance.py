@@ -74,6 +74,18 @@ class ChangedConformanceTests(unittest.TestCase):
         p.with_suffix(".json").write_text(json.dumps({"exit_code": 0, "stdout": "", "stderr": ""}))
         self.assertNotEqual(self.run_runner(p).returncode, 0)
 
+    def test_snapshot_only_change_runs_source_once(self):
+        p = self.fixture()
+        result = self.run_runner(p.with_suffix(".json"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("1 passed", result.stdout)
+
+    def test_source_and_snapshot_change_deduplicates(self):
+        p = self.fixture()
+        result = self.run_runner(p, p.with_suffix(".json"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("1 passed, 0 failed", result.stdout)
+
     def test_rejects_paths_outside_conformance_directory(self):
         p = self.root / "outside.nula"
         p.write_text("ok")
