@@ -156,17 +156,20 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
 
-      - name: Build (release)
-        run: cargo build --locked --release
+      - name: Build (public CLI release profile)
+        run: cargo build --locked --release --no-default-features --features release-cli --bin nulang
 
       # nextest isolates tests in their own processes and applies the retry
       # policy in .config/nextest.toml (load-flaky multi-node cluster tests).
-      - name: Test (release)
-        run: cargo nextest run --release --locked
+      - name: Test (same profile as public release artifacts)
+        run: cargo nextest run --locked --release --no-default-features --features release-cli
 
       # nextest intentionally does not execute rustdoc tests.
-      - name: Test doctests (release)
-        run: cargo test --release --locked --doc
+      - name: Test doctests (same profile as public release artifacts)
+        run: cargo test --locked --release --no-default-features --features release-cli --doc
+
+      - name: Verify Linux CLI has no Python ABI linkage
+        run: bash scripts/check_release_linux.sh /tmp/cargo-target/release/nulang
 
       - name: Stage tested release binary
         run: |

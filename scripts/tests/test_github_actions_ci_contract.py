@@ -40,7 +40,10 @@ class GitHubActionsCIContractTests(unittest.TestCase):
         self.assertIn("cargo nextest run --locked", source)
         self.assertIn("cargo nextest run --locked --features wasm-backend", source)
         self.assertIn("cargo nextest run --locked --no-default-features", source)
-        self.assertIn("cargo nextest run --release --locked", source)
+        self.assertIn(
+            "cargo nextest run --locked --release --no-default-features --features release-cli",
+            source,
+        )
         self.assertIn("cargo clippy --locked --all-targets", source)
         self.assertIn("--doc", source)
 
