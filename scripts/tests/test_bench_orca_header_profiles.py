@@ -36,6 +36,32 @@ class OrcaHeaderBenchmarkReporterTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Missing Criterion groups"):
                 criterion_means(criterion)
 
+    def test_rejects_missing_payload_variant_even_when_both_groups_exist(self):
+        with tempfile.TemporaryDirectory() as folder:
+            criterion = Path(folder)
+            for group in ("actor_heap_small_alloc", "orca_local_alloc_drop"):
+                file = criterion / "gc" / group / "payload_16" / "new" / "estimates.json"
+                file.parent.mkdir(parents=True)
+                file.write_text(
+                    json.dumps({"mean": {"point_estimate": 123.5}}),
+                    encoding="utf-8",
+                )
+            with self.assertRaisesRegex(RuntimeError, "Missing Criterion benchmarks"):
+                criterion_means(criterion)
+
+    def test_rejects_missing_profile_workload_in_summary(self):
+        samples = [
+            {"profile": "default", "means_ns": {
+                "gc/actor_heap_small_alloc/payload_16": 100,
+                "gc/orca_local_alloc_drop/payload_16": 150,
+            }},
+            {"profile": "compact", "means_ns": {
+                "gc/actor_heap_small_alloc/payload_16": 90,
+            }},
+        ]
+        with self.assertRaisesRegex(ValueError, "Mismatched benchmark IDs"):
+            summarize(samples)
+
     def test_summarizes_balanced_abba_without_inventing_significance(self):
         samples = [
             {"profile": "default", "means_ns": {"gc/actor_heap_small_alloc/payload_16": 100}},
