@@ -3712,6 +3712,16 @@ impl Runtime {
             // retired, never freed.
             let header = unsafe { crate::runtime::heap::ActorHeap::header_of(ptr) };
             let owner_id = unsafe { (*header).actor_id };
+            // One actor-lifetime hold is sufficient for repeated deliveries
+            // of the same object. Per-send in-flight credits still drain
+            // independently through process_gc_ops.
+            if !self
+                .actors
+                .get_mut(&receiver_id)
+                .is_some_and(|receiver| receiver.orca_gc.record_held_ref(owner_id, header))
+            {
+                continue;
+            }
             if let Some(owner) = self.actors.get_mut(&owner_id) {
                 // SAFETY: `ptr` points to a live object owned by `owner_id`.
                 unsafe { owner.orca_gc.inc_foreign_hold(&owner.heap, ptr) };
@@ -3720,9 +3730,6 @@ impl Runtime {
                 // the in-flight send bump), so bump the header directly.
                 // SAFETY: as above; single scheduler thread.
                 unsafe { (*header).foreign_count += 1 };
-            }
-            if let Some(receiver) = self.actors.get_mut(&receiver_id) {
-                receiver.orca_gc.record_held_ref(owner_id, header);
             }
         }
     }
