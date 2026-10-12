@@ -59,8 +59,7 @@ Run the paired same-commit study on a dedicated, otherwise-idle runner:
 
 ```sh
 python3 -m unittest discover -s scripts/tests -p 'test_bench_orca_header_profiles.py'
-python3 scripts/bench_orca_header_profiles.py --cycles 2 \\
-  --out target/orca-header-profile-study
+python3 scripts/bench_orca_header_profiles.py --cycles 2 --out target/orca-header-profile-study
 ```
 
 The runner uses an ABBA order for each cycle (default, compact, compact,
