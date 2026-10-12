@@ -26,9 +26,13 @@ def run_fixture(root, binary, relative):
     fixture = (root / relative).resolve()
     if fixture.suffix != ".nula" or not fixture.is_relative_to(fixture_root):
         return False, f"outside conformance/behavior: {relative}"
-    if not fixture.is_file():
-        return False, f"missing fixture: {relative}"
     expectation = fixture.with_suffix(".json")
+    if not fixture.is_file():
+        if not expectation.is_file():
+            # A PR may intentionally remove an obsolete fixture and its
+            # expectation together; neither can produce useful test output.
+            return None, "deleted source and expectation"
+        return False, f"missing fixture: {relative}"
     if not expectation.is_file():
         return False, f"missing expectation: {expectation.relative_to(root)}"
     try:
@@ -81,16 +85,19 @@ def main(argv=None):
     if not binary.is_file():
         print(f"Nulang binary missing: {binary}")
         return 1
-    passed = failed = 0
+    passed = failed = skipped = 0
     for relative in paths:
         ok, detail = run_fixture(root, binary, relative)
-        if ok:
+        if ok is None:
+            print(f"SKIP: {relative}: {detail}")
+            skipped += 1
+        elif ok:
             print(f"PASS: {relative}")
             passed += 1
         else:
             print(f"FAIL: {relative}: {detail}")
             failed += 1
-    print(f"{passed} passed, {failed} failed")
+    print(f"{passed} passed, {failed} failed, {skipped} skipped")
     return 1 if failed else 0
 
 
