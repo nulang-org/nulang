@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### Reusable cross-shard receive staging — 2026-10-12
+- **Shard receive passes reuse an empty message-staging buffer rather than reallocating on every nonempty drain.** The receive loop still snapshots the incoming channel before delivering envelopes, preserving ordering and the existing scheduler-turn batch boundary.
+- **Retained buffer capacity is capped at 256 envelopes.** Exceptionally large bursts are fully processed but do not pin an oversized allocation on a shard. Regression tests cover FIFO delivery, repeated reuse, burst cleanup, and ObjectRef lease release. Exact-base throughput and latency comparison remains diagnostic until CI measurements complete.
+
 ### Runtime soundness and checked negation — native/AOT backend parity — 2026-10-10
 - **AOT no longer claims raw-Int/Float registers for values that can be nil
   at runtime.** Nightly differential fuzz caught interpreter/AOT divergences
