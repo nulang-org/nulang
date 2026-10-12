@@ -82,6 +82,12 @@ class JitExecutionContract(unittest.TestCase):
     def test_compute_actor_warmup_and_semantic_assertions_are_outside_timing(self):
         source = (ROOT / "src/bin/nulang_savina.rs").read_text()
         body = source[source.index("fn bench_actor_compute("):]
+        # Warm up all three backends equally before timing. Only JIT requires
+        # proof that its one-message loop compiled native code.
+        self.assertLess(
+            body.index('rt.borrow_mut().send_message(actor_id, "work", &[]);'),
+            body.index("if backend == Backend::Jit {"),
+        )
         self.assertLess(
             body.index('warm_and_verify_jit(&rt, "actor_compute")'),
             body.index("let start = Instant::now();"),
