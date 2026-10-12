@@ -44,6 +44,8 @@ struct Measurement {
     benchmark: &'static str,
     messages: u64,
     elapsed: Duration,
+    // Burst enqueue and scheduler drain for counting/fork-join only.
+    phases: Option<(Duration, Duration)>,
 }
 
 impl Measurement {
@@ -179,6 +181,14 @@ fn emit(measurement: &Measurement, iteration: u32, format: OutputFormat) {
                 measurement.messages,
                 measurement.elapsed.as_nanos()
             );
+            if let Some((enqueue, drain)) = measurement.phases {
+                println!(
+                    "[cross-phase] runtime=nulang benchmark={} enqueue_ns={} drain_ns={}",
+                    measurement.benchmark,
+                    enqueue.as_nanos(),
+                    drain.as_nanos()
+                );
+            }
         }
         OutputFormat::Jsonl => {
             let elapsed_ns = u64::try_from(measurement.elapsed.as_nanos())
@@ -193,6 +203,8 @@ fn emit(measurement: &Measurement, iteration: u32, format: OutputFormat) {
                     "iteration": iteration,
                     "messages": measurement.messages,
                     "elapsed_ns": elapsed_ns,
+                    "enqueue_ns": measurement.phases.map(|(enqueue, _)| enqueue.as_nanos()),
+                    "drain_ns": measurement.phases.map(|(_, drain)| drain.as_nanos()),
                     "messages_per_second": measurement.messages_per_second(),
                     "ns_per_message": measurement.ns_per_message(),
                 })
@@ -238,8 +250,14 @@ fn bench_counting() -> Measurement {
     for _ in 0..N {
         rt.borrow_mut().send_message(actor_id, "inc", &[]);
     }
+    let drain_start = Instant::now();
     rt.borrow_mut().run_scheduler();
-    let elapsed = start.elapsed();
+    let finished = Instant::now();
+    let elapsed = finished.duration_since(start);
+    let phases = Some((
+        drain_start.duration_since(start),
+        finished.duration_since(drain_start),
+    ));
 
     let count = rt
         .borrow()
@@ -253,6 +271,7 @@ fn bench_counting() -> Measurement {
         benchmark: "counting",
         messages: N as u64,
         elapsed,
+        phases,
     }
 }
 
@@ -321,6 +340,7 @@ fn bench_ping_pong() -> Measurement {
         benchmark: "ping_pong",
         messages: 2 * N as u64 + 1,
         elapsed,
+        phases: None,
     }
 }
 
@@ -386,6 +406,7 @@ let s = spawn Sink {} in
         benchmark: "thread_ring",
         messages: HOPS as u64,
         elapsed,
+        phases: None,
     }
 }
 
@@ -440,8 +461,14 @@ let s = spawn Sink {} in
         rt.borrow_mut()
             .send_message(worker, "task", &[Value::int(i)]);
     }
+    let drain_start = Instant::now();
     rt.borrow_mut().run_scheduler();
-    let elapsed = start.elapsed();
+    let finished = Instant::now();
+    let elapsed = finished.duration_since(start);
+    let phases = Some((
+        drain_start.duration_since(start),
+        finished.duration_since(drain_start),
+    ));
 
     let count = rt
         .borrow()
@@ -455,6 +482,7 @@ let s = spawn Sink {} in
         benchmark: "fork_join",
         messages: 2 * TASKS as u64,
         elapsed,
+        phases,
     }
 }
 
@@ -518,5 +546,6 @@ spawn Skynet {}
         benchmark: "skynet",
         messages: EXPECTED as u64 - 1,
         elapsed,
+        phases: None,
     }
 }
