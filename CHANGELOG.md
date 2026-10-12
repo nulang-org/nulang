@@ -1,5 +1,10 @@
 # Nulang Changelog
+### Scalar local-send fast path — 2026-09-29
+- **Primitive local actor sends now combine mailbox admission, ready-state transition, priority capture, and receive-wait inspection under one target-actor lookup.** Payloads containing object handles or actor-heap pointers continue through the existing object-store/ORCA reference-tracking path unchanged.
+- **Local residency is cached across the remote-ref and grain-hydration routing checks,** removing a redundant actor-table lookup from the common local path while preserving migrated, cross-shard, grain, trace, backpressure, and DLQ behavior.
 
+### Local-send layer probes — 2026-09-29
+- **The same-host Nulang A/B harness now decomposes one-value local sends into mailbox-only, actor-lookup + mailbox, actor-lookup + mailbox + ready-state publication, and full `send_message_by_id` measurements.** This makes the next actor-runtime optimization target measurable before changing routing, scheduling, GC, or receive-wake semantics.
 ### Public CLI release portability — 2026-10-11
 - **Public release archives use the `release-cli` feature profile without a Python shared-library ABI dependency.** The ordinary full/default source build retains opt-in Python interoperability; release packaging checks the resulting Linux and macOS binary for Python dependencies.
 - **Release PRs rehearse the full non-publishing four-platform build matrix before tags are created.** The Linux ARM64 cross build explicitly installs target libc development headers and preflights a target-compiler C header probe, avoiding an observed `ring` compile failure when `--no-install-recommends` omits the ARM64 sysroot. Actual cross-build and clean-host portability remain release gates.

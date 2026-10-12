@@ -120,6 +120,115 @@ fn bench_ab_mailbox_push_inline_1() {
     report_ab("mailbox_push_inline_1", N as u64, elapsed);
 }
 
+/// Decompose the primitive local-send hot path into additive layers.
+///
+/// These probes use the same one-value inline payload and long-lived runtime
+/// shape as the full enqueue sweep. They deliberately stop at successive
+/// boundaries so a same-host A/B run can locate overhead before production
+/// code is changed:
+///
+/// - actor lookup + message construction + mailbox admission;
+/// - the same work plus ready-state publication;
+/// - `enqueue_payload_1` below remains the full `send_message_by_id` control.
+///
+/// The readiness probe models a burst to one actor: the first operation queues
+/// the actor and later operations exercise the already-queued fast rejection,
+/// matching the common flood/enqueue shape.
+#[test]
+fn bench_ab_local_send_layer_decomposition() {
+    const N: usize = 100_000;
+    let payload = [Value::int(1)];
+
+    let mut lookup_rt = Runtime::new();
+    let lookup_actor = lookup_rt.spawn_actor(Box::new(Vec::new));
+    lookup_rt
+        .actors
+        .get_mut(&lookup_actor)
+        .expect("spawned actor")
+        .register_behavior("handle", ab_noop_handler);
+    lookup_rt.run_scheduler();
+
+    let start = Instant::now();
+    for _ in 0..N {
+        let actor = lookup_rt
+            .actors
+            .get_mut(&lookup_actor)
+            .expect("benchmark actor stays resident");
+        actor
+            .mailbox
+            .push_local(Message {
+                behavior_id: 0,
+                payload: MessagePayload::from_slice(&payload),
+                sender: 0,
+                priority: MessagePriority::Normal,
+                trace_id: None,
+            })
+            .expect("unbounded benchmark mailbox must admit message");
+    }
+    let lookup_elapsed = start.elapsed();
+    assert_eq!(
+        lookup_rt
+            .actors
+            .get(&lookup_actor)
+            .expect("actor still live")
+            .mailbox
+            .len(),
+        N
+    );
+    report_ab(
+        "local_send_lookup_mailbox_inline_1",
+        N as u64,
+        lookup_elapsed,
+    );
+    lookup_rt.run_scheduler();
+
+    let mut ready_rt = Runtime::new();
+    let ready_actor = ready_rt.spawn_actor(Box::new(Vec::new));
+    ready_rt
+        .actors
+        .get_mut(&ready_actor)
+        .expect("spawned actor")
+        .register_behavior("handle", ab_noop_handler);
+    ready_rt.run_scheduler();
+
+    let start = Instant::now();
+    for _ in 0..N {
+        {
+            let actor = ready_rt
+                .actors
+                .get_mut(&ready_actor)
+                .expect("benchmark actor stays resident");
+            actor
+                .mailbox
+                .push_local(Message {
+                    behavior_id: 0,
+                    payload: MessagePayload::from_slice(&payload),
+                    sender: 0,
+                    priority: MessagePriority::Normal,
+                    trace_id: None,
+                })
+                .expect("unbounded benchmark mailbox must admit message");
+        }
+        ready_rt.enqueue_actor(ready_actor);
+    }
+    let ready_elapsed = start.elapsed();
+    assert_eq!(
+        ready_rt
+            .actors
+            .get(&ready_actor)
+            .expect("actor still live")
+            .mailbox
+            .len(),
+        N
+    );
+    report_ab(
+        "local_send_lookup_mailbox_ready_inline_1",
+        N as u64,
+        ready_elapsed,
+    );
+    ready_rt.run_scheduler();
+}
+
 /// Local enqueue hot-path sweep around the inline-payload boundary.
 ///
 /// 0/1/4 values are the common small-message cases; 5 crosses the proposed
