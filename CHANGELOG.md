@@ -1,4 +1,43 @@
 # Nulang Changelog
+
+### Public CLI release portability — 2026-10-11
+- **Public release archives use the `release-cli` feature profile without a Python shared-library ABI dependency.** The ordinary full/default source build retains opt-in Python interoperability; release packaging checks the resulting Linux and macOS binary for Python dependencies.
+- **Release PRs rehearse the full non-publishing four-platform build matrix before tags are created.** The Linux ARM64 cross build explicitly installs target libc development headers and preflights a target-compiler C header probe, avoiding an observed `ring` compile failure when `--no-install-recommends` omits the ARM64 sysroot. Actual cross-build and clean-host portability remain release gates.
+
+### Runtime soundness and checked negation — native/AOT backend parity — 2026-10-10
+- **AOT no longer claims raw-Int/Float registers for values that can be nil
+  at runtime.** Nightly differential fuzz caught interpreter/AOT divergences
+  on `-(1 % 0)`, `-3 ** -2`, and `-fn(x, y) { x + y }`: statically-Int
+  locals produced by div/mod/pow-by-zero, nil-returning calls, closures, and
+  function references were marked `KnownType::Int`, so the AOT emitted raw
+  `sext48/ineg/tag` instead of the checking `nulang_ineg` helper — nil's zero
+  payload came back as int 0. MIR type metadata is now conservative for such
+  locals (mirroring the JIT's `infer_reg_types`), with `Load` copies
+  propagated, so AOT routes them through the interpreter-parity helpers.
+- **Unary negation is unconditionally checked across every native backend.**
+  CoreVM, AOT, JIT, and SIMD no longer emit raw signed negation: boxed neg
+  always routes through the checked runtime helper (raising interpreter-parity
+  nil/type errors), integer `INeg` is held out of JIT/SIMD compilation, and
+  negating `INT48_MIN` returns an overflow error rather than silently
+  wrapping. Focused CoreVM, AOT, and JIT regression tests added; no change to
+  source type inference or WASM source semantics.
+
+### Actor scheduler LIFO handoff and lifecycle pooling — 2026-10-10
+- **Performance:** Optimized actor scheduler LIFO handoff with strict
+  priority gating, and added actor lifecycle pooling.
+
+### Seeded cluster simulation peer ordering — 2026-10-07
+- **Cluster simulations with an injected deterministic RNG now canonicalize peer order for gossip targets, bounded gossip payloads, active-view repair, and heartbeat action emission.** This removes four sources of randomized Rust `HashMap` ordering while preserving the existing unseeded production path. Regression tests compare independently constructed cluster states under identical RNG seeds.
+
+### Receiver-acknowledged CRDT delta synchronization — 2026-10-07
+- **Per-peer CRDT frontiers now advance only after a matching NUL0 acknowledgement arrives from the intended receiver.** Dropped or unacknowledged batches remain retransmittable from that peer's last proven frontier instead of disappearing behind sender-side optimistic state.
+- **Peer recovery invalidates stale receiver knowledge.** A `Failed → Healthy` transition through heartbeat or authoritative gossip forgets prior CRDT frontier/correlation state so a restarted process receives fresh state.
+- **Tracked sends distinguish unsupported transports from explicit rejection.** Compatibility transports retain the legacy untracked fallback, while tracked-capable rejection cannot be reinterpreted as success and wrong-peer ACKs cannot advance another peer's frontier.
+
+### Poll-rate-independent cluster gossip — 2026-10-06
+- **Cluster gossip now runs on an explicit 100 ms cadence instead of every `Runtime::process_network()` poll.** This prevents hot remote-actor polling loops from amplifying membership traffic into bounded transport queue backpressure while preserving the deterministic cluster-maintenance cadence.
+- **A virtual-clock regression and stacked remote RTT probe pin the boundary.** Immediate repeated ticks suppress gossip, emission resumes at 100 ms, and the Healthy-membership loopback probe completes 2,000 roundtrips without the prior transport stall.
+
 ### Standalone SQLite feature dependency closure — 2026-10-02
 - **The standalone `sqlite` feature now enables Tokio directly because `LibsqlStore` owns a Tokio runtime.** Minimal `--no-default-features --features sqlite` builds no longer rely on unrelated default-profile features to supply that direct dependency.
 
@@ -95,6 +134,12 @@
 - **Same-host A/B reports now compare base and candidate samples from the same measurement round before taking the median**, rather than relying only on a ratio of two independent medians. The existing alternating execution order is preserved, so pairing better cancels monotonic host-load and thermal drift.
 - **Performance reports now include a deterministic bootstrap 95% interval for median paired speedup** alongside paired throughput and latency deltas. The historical ratio-of-medians output remains for compatibility, while JSON report schema 2 records the paired result explicitly.
 - **Focused Python regressions pin sample alignment and operation-count invariants**, preventing a benchmark from silently producing a paired comparison across mismatched runs.
+
+
+### Universal UI protocol integration for Web actions — 2026-09-26
+- **Web reactivity now lowers into the renderer-neutral `nulang-ui/1` document/patch protocol.** Action placement uses the shared protocol type, unresolved placement fails closed to the server, static output avoids framework JavaScript, and signal updates use indexed bindings rather than repeated DOM scans.
+- **Server actions now carry validated `nulang-ui-msg/1` envelopes alongside the temporary legacy form field.** Malformed envelopes, client-placement requests, and envelope/legacy action identity mismatches fail closed before route dispatch.
+- **Direct runtime dispatch is compiler-gated.** Top-level zero-argument server actions can be resolved and invoked by compiler bytecode metadata; parameterized handlers explicitly require a future compiler-owned action binding plan instead of inferring argument types from form data.
 
 
 ### Same-host A/B Cargo target isolation — 2026-09-25
