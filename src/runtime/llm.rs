@@ -135,7 +135,6 @@ use super::{
     BytecodeRuntimeCallbacks, Runtime,
 };
 use crate::primitives::ActorRole;
-use crate::runtime::persistence::WorkflowEvent;
 use crate::vm::Value;
 
 /// Drain completed background LLM calls and resume any actors waiting for
@@ -444,6 +443,7 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
     }
 
     rt.restore_suspended_workflow_activation(actor_id, suspended.activation);
+    let mut terminal_commit_failed = false;
     let self_ptr: *mut Runtime = rt;
     unsafe {
         let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -473,16 +473,19 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
                             actor.set_state_field("step_index", Value::int(n + 1));
                         }
                     }
-                    let seq = (*self_ptr).next_sequence(actor_id);
-                    let _ = (*self_ptr).persistence.append_workflow_event(
+                    if let Err(error) = super::workflow::persist_step_completed(
+                        &mut *self_ptr,
                         actor_id,
-                        WorkflowEvent::StepCompleted {
-                            sequence: seq,
-                            activation: suspended.activation,
-                            step_name: suspended.step_name,
-                        },
-                    );
-                    (*self_ptr).checkpoint_actor(actor_id);
+                        suspended.activation,
+                        suspended.step_name,
+                    ) {
+                        tracing::error!(
+                            actor_id,
+                            %error,
+                            "nulang-workflow: LLM-resume terminal commit failed"
+                        );
+                        terminal_commit_failed = true;
+                    }
                 }
             }
             Err(crate::types::NuError::Suspended(_)) => {
@@ -517,7 +520,17 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
         // on the shared VM, which would clobber the frames an
         // un-captured suspend still needs. Runs on every path, so
         // wakes of other actors are not lost when THIS one suspends.
+        // Hide speculative state before deferred wakes. Reconstruct only
+        // after leaving the VM execution window: legacy recovery may replay
+        // bytecode on the shared VM.
+        if terminal_commit_failed {
+            (*self_ptr).actors.remove(&actor_id);
+        }
         (*self_ptr).vm_exec_end();
+    }
+    if terminal_commit_failed {
+        rt.recover_workflow_after_failed_terminal(actor_id);
+        return;
     }
     // The suspension resolved (completed or failed): if messages queued
     // up while the behavior was suspended, schedule the actor to drain
