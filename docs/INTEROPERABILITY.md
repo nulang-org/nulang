@@ -96,10 +96,22 @@ tsc --noEmit --strict --module nodenext --moduleResolution nodenext \
   --target ES2022 --lib ES2022,DOM interop/web/javascript/typecheck.mts
 ```
 
+With a local native CLI built with TCP support, also run:
+
+```sh
+cargo build --locked --no-default-features --features tcp --bin nulang
+python3 scripts/smoke_web_client_interop.py --nulang-bin ./target/debug/nulang
+```
+
 The Python and JavaScript suites both exercise a real local HTTP server.
 JavaScript also uses injected Fetch implementations to cover error and redirect
-edge cases. These are SDK-side tests, **not** cross-language tests against a
-running Nulang Web server yet.
+edge cases. The additional native smoke launches Nulang's real `Http.serve`
+implementation on an ephemeral localhost port and uses both language clients
+to request its response. **This proves a minimal HTTP wire round-trip, not
+compiler-generated OpenAPI route/export conformance:** the native server has
+one generic handler and the smoke uses a deliberately hand-authored contract.
+Typed response schemas, route/query binding, and trace-context extraction by
+the Nulang server still require separate executable integration tests.
 
 ## Remaining interoperability priorities
 
