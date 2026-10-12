@@ -1,0 +1,29 @@
+// New try_* wrappers report Result, while existing FS wrappers stay source-compatible.
+import stdlib::fs
+
+fn main() {
+    let path = "/tmp/nulang_try_io_results_20261012.txt";
+    match try_write(path, "hello") {
+        Ok(_) => perform IO.print("write=ok"),
+        Error(_) => perform IO.print("write=error"),
+    }
+    match try_read(path) {
+        Ok(value) => perform IO.print("read=" + value),
+        Error(_) => perform IO.print("read=error"),
+    }
+    match try_append(path, "!") {
+        Ok(_) => perform IO.print("append=ok"),
+        Error(_) => perform IO.print("append=error"),
+    }
+    match try_read(path) {
+        Ok(value) => perform IO.print("read2=" + value),
+        Error(_) => perform IO.print("read2=error"),
+    }
+    match try_read("/tmp/nulang_try_io_results_missing_directory_20261012/file") {
+        Ok(_) => perform IO.print("missing=ok"),
+        Error(ReadFailed(_)) => perform IO.print("missing=error"),
+        Error(_) => perform IO.print("missing=wrong_error"),
+    }
+    let legacy = read(path);
+    perform IO.print("legacy=" + legacy)
+}
