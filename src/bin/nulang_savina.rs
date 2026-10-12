@@ -717,18 +717,20 @@ fn bench_actor_compute(backend: Backend) -> Measurement {
         .as_actor_id()
         .expect("compute benchmark must spawn an actor");
 
+    // Give bytecode, JIT and AOT the same untimed actor activation,
+    // amortizing cold actor state independently of native tier-up.
+    rt.borrow_mut().send_message(actor_id, "work", &[]);
+    rt.borrow_mut().run_scheduler();
     if backend == Backend::Jit {
-        // A real arithmetic loop tiers up, unlike short Savina handlers.
-        // Exclude warm-up/compilation from timing and require actor-VM proof.
-        rt.borrow_mut().send_message(actor_id, "work", &[]);
-        rt.borrow_mut().run_scheduler();
+        // The loop should tier up inside the scheduler-owned actor VM.
+        // Missing native compilation is an invalid JIT comparison.
         warm_and_verify_jit(&rt, "actor_compute");
-        rt.borrow_mut()
-            .actors
-            .get_mut(&actor_id)
-            .expect("warmed compute actor exists")
-            .set_state_field("total", Value::int(0));
     }
+    rt.borrow_mut()
+        .actors
+        .get_mut(&actor_id)
+        .expect("warmed compute actor exists")
+        .set_state_field("total", Value::int(0));
 
     let start = Instant::now();
     for _ in 0..N {
