@@ -227,3 +227,46 @@ fn relative_web_redirect_preserves_legacy_html_fallback() {
     assert!(response_body(&response).contains("http-equiv=\"refresh\""));
     assert!(response_body(&response).contains("url=receipt"));
 }
+
+#[test]
+fn same_origin_post_redirects_and_foreign_post_is_rejected_without_location() {
+    let (module, function_index) = compile_handler(
+        "fn submit() { perform Web.redirect(\"/receipt\") }",
+        "submit",
+    );
+    let server = WebDevServer::bind(
+        0,
+        None,
+        None,
+        vec![WebRoute {
+            method: HttpMethod::Post,
+            path: "/submit".to_string(),
+            handler_module: module,
+            handler_func_idx: function_index,
+        }],
+    )
+    .expect("bind combined origin-and-redirect WebDevServer");
+
+    let host = format!("localhost:{}", server.port);
+    let permitted = format!(
+        "POST /submit HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    let response = send_raw_request(server.port, &permitted);
+    assert!(response.starts_with("HTTP/1.1 303 See Other\r\n"), "{response}");
+    assert!(response.contains("\r\nLocation: /receipt\r\n"), "{response}");
+    assert_eq!(response_body(&response), "");
+
+    let foreign = format!(
+        "POST /submit HTTP/1.1\r\nHost: {host}\r\nOrigin: https://attacker.example\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    let denied = send_raw_request(server.port, &foreign);
+    assert!(denied.starts_with("HTTP/1.1 403 Forbidden\r\n"), "{denied}");
+    assert!(!denied.contains("\r\nLocation:"), "{denied}");
+
+    let missing = format!(
+        "POST /submit HTTP/1.1\r\nHost: {host}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    let denied = send_raw_request(server.port, &missing);
+    assert!(denied.starts_with("HTTP/1.1 403 Forbidden\r\n"), "{denied}");
+    assert!(!denied.contains("\r\nLocation:"), "{denied}");
+}

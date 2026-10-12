@@ -206,7 +206,7 @@ nulang nula dev            # serves on the [web] port (or: nula dev --port 8080)
 
 ```bash
 curl http://127.0.0.1:8080/hello/david      # <h1>Hello, david!</h1>
-curl -X POST -d 'msg=hi' http://127.0.0.1:8080/sign
+curl -X POST -H 'Origin: http://127.0.0.1:8080' -d 'msg=hi' http://127.0.0.1:8080/sign
 curl http://127.0.0.1:8080/last             # "Last message: hi"
 ```
 
@@ -236,10 +236,24 @@ Subscribers connect to the built-in Server-Sent Events endpoint `/<room-prefix>/
 
 ```bash
 curl -N http://127.0.0.1:8080/__nulang/sse/signs   # in one terminal
-curl -X POST -d 'msg=live' http://127.0.0.1:8080/sign   # in another → SSE client receives it
+curl -X POST -H 'Origin: http://127.0.0.1:8080' -d 'msg=live' http://127.0.0.1:8080/sign   # in another → SSE client receives it
 ```
 
 The `examples/chat-web` package shows the full pattern: an SSE `<script>` in the page, a POST handler that stores and broadcasts, and a `redirect` back. Treat this layer as minimal — one broadcast op, one SSE transport, in-process delivery.
+
+**Development-server limits:** Realtime SSE is bounded per process to 128 rooms, eight subscribers per room, eight queued events per subscriber, at most 64 replay events and 64 KiB of replay per room, and 8 KiB per message. Excess subscribers receive an HTTP 503, invalid room names receive HTTP 400, and overloaded consumers are disconnected and must reconnect. Idle, unsubscribed rooms are evicted when the room limit is reached. SSE streams send a comment heartbeat roughly every 15 seconds to detect disconnected peers. Event history is not durable and replay does not yet support resumable event IDs.
+
+**Security boundary:** The built-in `/__nulang/sse/<room>` endpoint does **not** authenticate subscribers or authorize room membership. Use it only for public demo data. Private tenant/user events require a separately enforced authenticated, authorized subscription boundary; a room name must never be treated as a secret or as proof of permission.
+
+## Mutation request origin checks
+
+The experimental `Web` routed dev server rejects unsafe methods (`POST`, `PUT`, `PATCH`, `DELETE`) before executing route handlers unless the request carries a trusted browser origin. `Origin` must exactly match the service's public origin; if absent, `Referer` must identify that exact origin. `Sec-Fetch-Site: cross-site` and `same-site` are denied even if another header appears to match. Missing provenance and ambiguous/duplicate provenance headers return HTTP 403. Unknown methods return HTTP 405 rather than being treated as GET.
+
+For direct development over HTTP, the request `Host` must match the actual listener IP and port, or `localhost` for a loopback listener. For HTTPS termination at a **trusted reverse proxy**, explicitly set `NULANG_WEB_PUBLIC_ORIGIN=https://app.example.com`, where the hostname matches the external `Host` forwarded to Nulang. Proxy forwarding headers such as `X-Forwarded-Host` and `X-Forwarded-Proto` are not accepted as trust evidence. Incorrect configuration fails closed for mutations.
+
+Browsers automatically send a matching `Origin` for same-origin form submissions and fetch calls. Automated clients must set the `Origin` header explicitly, as shown in the POST examples above. Older clients that send neither `Origin` nor `Referer` must be updated. This gate covers the `Web` route server, **not** the separate low-level `Http.serve` API.
+
+This is a CSRF origin/provenance control, **not authentication or permission checking**. Application handlers must still authorize every mutation, validate inputs, and protect sessions appropriately. The built-in SSE endpoint is also not authenticated; do not use it for private tenant or user data. A full session-bound CSRF token integration is deferred until the session/response contract is defined.
 
 ## Deployment
 

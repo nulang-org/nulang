@@ -3,6 +3,7 @@ pub mod adapters;
 pub mod bindings;
 pub mod budget;
 pub mod contracts;
+pub mod csrf;
 pub mod dispatch;
 pub mod handler_call;
 pub mod http_problem;
