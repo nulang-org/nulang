@@ -67,10 +67,14 @@ custom headers, and GET request bodies. `send_request_checked(req)` runs that
 validation before network I/O and returns `Result[String, String]`: on success
 only the response body is available.
 
-**This is not a full typed HTTP transport.** The existing VM effect returns
-`nil` for transport failure, timeout, and non-2xx HTTP responses, so
-`send_request_checked` maps all such failures to one generic error. It does
-not expose status codes, response headers, redirect details, or cancellation.
+**This is not a full typed HTTP transport.** The legacy VM effect returns
+`nil` for transport failures, timeouts, and non-2xx HTTP responses. When
+compiled without `ureq`, the standalone VM instead returns the literal
+`HTTP client disabled (feature 'ureq' not enabled)` as a String. The checked
+API rejects both cases through `normalize_legacy_response`, but a real HTTP
+body identical to that diagnostic will also be conservatively rejected.
+The wrapper cannot expose status codes, response headers, redirect details,
+or cancellation. This ambiguity requires a versioned typed host transport.
 The planned typed request/response transport is tracked in
 [issue #1576](https://github.com/nulang-org/nulang/issues/1576).
 
