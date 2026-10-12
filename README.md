@@ -132,8 +132,13 @@ it in a directory on PATH.
 ```bash
 git clone https://github.com/nulang-org/nulang.git
 cd nulang
-cargo build --locked --release
+cargo build --locked --release --no-default-features --features release-cli
 ```
+
+This matches the current Python-free public CLI feature set and avoids requiring
+Python runtime linkage for ordinary Nulang development. Contributors testing
+Python interoperability or the full default feature set should use the
+`--no-default-features --features full` build described above.
 
 Source builds use Rust 1.95.0, pinned by `rust-toolchain.toml`. The tagged
 release matrix currently validates Linux x86_64/aarch64, macOS aarch64, and
@@ -157,9 +162,9 @@ Use `cargo run` so these commands work regardless of the configured target
 directory:
 
 ```bash
-cargo run --locked --release -- examples/01_hello.nula
-cargo run --locked --release -- --check examples/01_hello.nula
-cargo run --locked --release -- examples/08_actors.nula
+cargo run --locked --release --no-default-features --features release-cli -- examples/01_hello.nula
+cargo run --locked --release --no-default-features --features release-cli -- --check examples/01_hello.nula
+cargo run --locked --release --no-default-features --features release-cli -- examples/08_actors.nula
 ```
 
 For a new project, run `nulang nula new my-app` using the installed CLI.
