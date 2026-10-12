@@ -4628,13 +4628,23 @@ impl Runtime {
     /// Re-arm a timer from the durable journal without appending a new event.
     /// Used during recovery to restore timers that have not yet fired.
     pub(crate) fn rearm_timer(&mut self, actor_id: u64, name: &str, duration_ms: u64) {
+        self.rearm_timer_with_id(actor_id, name, duration_ms, None);
+    }
+
+    pub(crate) fn rearm_timer_with_id(
+        &mut self,
+        actor_id: u64,
+        name: &str,
+        duration_ms: u64,
+        timer_id: Option<WorkflowTimerId>,
+    ) {
         let behavior_id = self.behavior_id_for(actor_id, "__timer_fired").unwrap_or(0);
         self.timer_wheel.send_after_with_context(
             std::time::Duration::from_millis(duration_ms),
             actor_id,
             behavior_id,
             vec![],
-            name.to_string(),
+            workflow::encode_workflow_timer_context(name, timer_id),
         );
     }
 
@@ -4991,10 +5001,17 @@ impl Runtime {
                     context,
                 } => {
                     if self.actor_is_workflow(target_actor) {
-                        if let Err(error) = self.append_timer_fired(target_actor, &context) {
+                        let (timer_name, timer_id) =
+                            workflow::decode_workflow_timer_context(&context);
+                        if let Err(error) = workflow::append_timer_fired_identified(
+                            self,
+                            target_actor,
+                            &timer_name,
+                            timer_id,
+                        ) {
                             tracing::error!(
                                 actor_id = target_actor,
-                                timer = %context,
+                                timer = %timer_name,
                                 %error,
                                 "nulang-workflow: refusing to deliver timer after durable TimerFired commit failed"
                             );
@@ -5738,40 +5755,21 @@ impl Runtime {
                 .filter(|e| e.sequence() > snapshot.sequence)
                 .cloned()
                 .collect();
-            let mut fired_timer_names: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            for event in &events_to_replay {
-                if let WorkflowEvent::TimerFired { name, .. } = event {
-                    fired_timer_names.insert(name.clone());
-                }
-            }
             for event in &events_to_replay {
                 if let Some(actor) = self.actors.get_mut(&actor_id) {
                     Self::apply_workflow_event(actor, event);
                     actor.sequence = event.sequence();
                 }
             }
-            // Re-arm timers that were set before the snapshot/replay but have
-            // not yet fired. Timers are reconstructed from the full durable
-            // journal, not just events after the snapshot, because snapshots do
-            // not capture pending timers.
+            // Re-arm timers from the full durable journal because snapshots do
+            // not capture live timer-wheel state. New records pair set/fired by
+            // durable timer instance identity; legacy records retain name-based
+            // pairing for backwards compatibility.
             let all_timer_events = self.persistence.read_timer_events(actor_id);
-            let mut fired_timer_names: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            for event in &all_timer_events {
-                if let WorkflowEvent::TimerFired { name, .. } = event {
-                    fired_timer_names.insert(name.clone());
-                }
-            }
-            for event in &all_timer_events {
-                if let WorkflowEvent::TimerSet {
-                    name, duration_ms, ..
-                } = event
-                {
-                    if !fired_timer_names.contains(name) {
-                        self.rearm_timer(actor_id, name, *duration_ms);
-                    }
-                }
+            for (timer_id, name, duration_ms) in
+                workflow::pending_workflow_timers(&all_timer_events)
+            {
+                self.rearm_timer_with_id(actor_id, &name, duration_ms, timer_id);
             }
             // If the workflow was in the middle of a step waiting on a signal,
             // re-trigger that step so it can resume from replayed events. We

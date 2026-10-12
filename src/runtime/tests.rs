@@ -4506,6 +4506,172 @@ fn test_workflow_llm_completion_persistence_failure_does_not_resume_with_synthet
 }
 
 #[test]
+fn test_replay_identified_timer_set_is_consumed_without_advancing_safe_snapshot() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor("TimerReplay", Box::new(Vec::new), HashMap::new());
+    let activation = WorkflowActivationId::new(actor_id, 120);
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .current_workflow_activation = Some(activation);
+
+    let safe_snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    rt.schedule_workflow_timer(actor_id, "payment_timeout", 5_000)
+        .unwrap();
+
+    let events = rt.persistence.read_workflow_events(actor_id);
+    let timer_id = events
+        .iter()
+        .find_map(|event| match event {
+            WorkflowEvent::TimerSet {
+                timer_id: Some(timer_id),
+                name,
+                duration_ms,
+                ..
+            } if name == "payment_timeout" && *duration_ms == 5_000 => Some(*timer_id),
+            _ => None,
+        })
+        .expect("active workflow timer must carry deterministic replay identity");
+    assert_eq!(timer_id, WorkflowTimerId::new(activation, 0));
+    assert_eq!(
+        rt.persistence.load_snapshot(actor_id).unwrap().sequence,
+        safe_snapshot.sequence,
+        "nonterminal TimerSet must keep the last completed snapshot as the recovery boundary"
+    );
+
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.workflow_timer_activation = Some(activation);
+        actor.workflow_timer_ordinal = 0;
+    }
+    rt.schedule_workflow_timer(actor_id, "payment_timeout", 5_000)
+        .unwrap();
+
+    let matching = rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event,
+                WorkflowEvent::TimerSet {
+                    timer_id: Some(id),
+                    ..
+                } if *id == timer_id
+            )
+        })
+        .count();
+    assert_eq!(
+        matching, 1,
+        "replay must consume the committed TimerSet rather than append it again"
+    );
+    assert_eq!(
+        rt.actors.get(&actor_id).unwrap().workflow_timer_ordinal,
+        1,
+        "consuming the committed timer must advance the activation-local timer cursor"
+    );
+}
+
+#[test]
+fn test_pending_timer_recovery_pairs_reused_names_by_timer_identity() {
+    let actor_id = 77;
+    let first_activation = WorkflowActivationId::new(actor_id, 10);
+    let second_activation = WorkflowActivationId::new(actor_id, 20);
+    let first = WorkflowTimerId::new(first_activation, 0);
+    let second = WorkflowTimerId::new(second_activation, 0);
+    let events = vec![
+        WorkflowEvent::TimerSet {
+            sequence: 11,
+            timer_id: Some(first),
+            name: "retry".to_string(),
+            duration_ms: 100,
+        },
+        WorkflowEvent::TimerFired {
+            sequence: 12,
+            timer_id: Some(first),
+            name: "retry".to_string(),
+        },
+        WorkflowEvent::TimerSet {
+            sequence: 21,
+            timer_id: Some(second),
+            name: "retry".to_string(),
+            duration_ms: 200,
+        },
+    ];
+
+    let pending = workflow::pending_workflow_timers(&events);
+    assert_eq!(
+        pending,
+        vec![(Some(second), "retry".to_string(), 200)],
+        "a fired timer name from an older activation must not suppress a newer timer instance"
+    );
+}
+
+#[cfg(feature = "ai-runtime")]
+#[test]
+fn test_workflow_llm_completion_persistence_failure_does_not_resume_with_synthetic_error() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "nulang-llm-completion-fail-{}-{nonce}",
+        std::process::id()
+    ));
+
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(JsonFileStore::new(&path).unwrap());
+    let actor_id = rt.spawn_workflow_actor("LlmFailClosed", Box::new(Vec::new), HashMap::new());
+    let activation = WorkflowActivationId::new(actor_id, 115);
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .current_workflow_activation = Some(activation);
+    let site = crate::semantic_identity::effect_site_id(
+        "llm-fail-closed-test",
+        crate::semantic_identity::EffectSiteOwnerKind::Behavior,
+        "LlmFailClosed.run",
+        "Inference.ask",
+        0,
+    );
+    let mut request = nulang_ai::LlmRequest::default();
+    request.model = "test-model".to_string();
+    request.messages.push(nulang_ai::LlmMessage {
+        role: "user".to_string(),
+        content: "hello".to_string(),
+    });
+    assert!(matches!(
+        llm::prepare_workflow_llm_effect(&mut rt, actor_id, site, "Inference.ask", &request)
+            .unwrap(),
+        llm::WorkflowLlmDurabilityDecision::Dispatch
+    ));
+
+    std::fs::remove_dir_all(&path).unwrap();
+    std::fs::write(&path, b"not a directory").unwrap();
+
+    let response = nulang_ai::LlmResponse {
+        content: Some("provider-result".to_string()),
+        tool_calls: Vec::new(),
+        model: "test-model".to_string(),
+        finish_reason: "stop".to_string(),
+        usage: Default::default(),
+    };
+    llm::store_llm_completion(&mut rt, actor_id, Ok(response));
+
+    let actor = rt.actors.get(&actor_id).unwrap();
+    assert!(
+        actor.llm_completed.is_none(),
+        "user bytecode must not observe a synthetic LLM error when Completed persistence failed"
+    );
+    assert!(
+        actor.llm_durable_effect_id.is_some(),
+        "Prepared identity must remain available for recovery/retry"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn test_recovery_replays_unfinished_atomic_native_workflow_activation() {
     let mut rt = Runtime::new();
     let mut models = HashMap::new();

@@ -261,6 +261,26 @@ impl WorkflowReplayEventId {
     }
 }
 
+/// Stable identity of one durable timer instance inside an accepted workflow activation.
+///
+/// Timer names are user-facing labels and may be reused. Recovery therefore pairs
+/// TimerSet/TimerFired with this activation-local instance identity instead of
+/// treating a historical fired name as proof that every later timer of that name fired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct WorkflowTimerId {
+    pub activation: WorkflowActivationId,
+    pub ordinal: u32,
+}
+
+impl WorkflowTimerId {
+    pub const fn new(activation: WorkflowActivationId, ordinal: u32) -> Self {
+        Self {
+            activation,
+            ordinal,
+        }
+    }
+}
+
 /// A workflow event records a durable, replayable step in a workflow actor.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "tag", content = "value")]
@@ -284,11 +304,18 @@ pub enum WorkflowEvent {
     /// A timer was set for a workflow.
     TimerSet {
         sequence: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timer_id: Option<WorkflowTimerId>,
         name: String,
         duration_ms: u64,
     },
     /// A previously set timer fired.
-    TimerFired { sequence: u64, name: String },
+    TimerFired {
+        sequence: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timer_id: Option<WorkflowTimerId>,
+        name: String,
+    },
     /// An external signal was delivered to the workflow.
     SignalReceived {
         sequence: u64,
@@ -696,6 +723,7 @@ pub trait PersistenceStore: Send + Sync {
             actor_id,
             WorkflowEvent::TimerSet {
                 sequence,
+                timer_id: None,
                 name,
                 duration_ms,
             },
@@ -704,7 +732,14 @@ pub trait PersistenceStore: Send + Sync {
 
     /// Append a `TimerFired` workflow event.
     fn append_timer_fired(&mut self, actor_id: u64, sequence: u64, name: String) -> io::Result<()> {
-        self.append_workflow_event(actor_id, WorkflowEvent::TimerFired { sequence, name })
+        self.append_workflow_event(
+            actor_id,
+            WorkflowEvent::TimerFired {
+                sequence,
+                timer_id: None,
+                name,
+            },
+        )
     }
 
     /// Append a `SignalReceived` workflow event.

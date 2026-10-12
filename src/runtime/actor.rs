@@ -307,6 +307,10 @@ pub struct Actor {
     pub workflow_effect_activation: Option<WorkflowActivationId>,
     /// Next dynamic occurrence index for each compiler-owned semantic effect site.
     pub workflow_effect_occurrences: HashMap<[u8; 32], u32>,
+    /// Activation whose deterministic workflow timer ordinal is currently tracked.
+    pub workflow_timer_activation: Option<WorkflowActivationId>,
+    /// Next timer instance ordinal within `workflow_timer_activation`.
+    pub workflow_timer_ordinal: u32,
     /// Sentinel heap object used by the cycle detector to represent this
     /// actor as a holder of foreign references.
     cycle_sentinel: Option<*mut OrcaHeader>,
@@ -467,6 +471,8 @@ impl Actor {
             workflow_replay_event_ordinal: 0,
             workflow_effect_activation: None,
             workflow_effect_occurrences: HashMap::new(),
+            workflow_timer_activation: None,
+            workflow_timer_ordinal: 0,
             cycle_sentinel: None,
             suspended_execution: None,
             waiting_signal: None,
