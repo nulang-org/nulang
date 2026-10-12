@@ -12,30 +12,27 @@ inlay hints, formatting, and more — powered by the built-in language server
 
 ### Marketplace
 
-Search for **"Nulang"** in the Extensions view *(coming soon — pending
-marketplace publication)*.
+The repository has a [publishing workflow](https://github.com/nulang-org/nulang/blob/main/.github/workflows/vscode-extension.yml) for the VS Code Marketplace and Open VSX, but this page does not assert that publication succeeded. Search for **"Nulang"** in your editor's extension marketplace; if no verified listing is available, use the `.vsix` instructions below.
 
-### From source (.vsix)
+### Install a local .vsix
 
 The extension lives in the repo at `editors/vscode/`:
 
 ```bash
 git clone https://github.com/nulang-org/nulang.git
 cd nulang/editors/vscode
-npm install
+npm ci
 npx @vscode/vsce package
 code --install-extension nulang-0.2.0.vsix
 ```
 
-### Manual install
+### Development setup
 
-```bash
-cp -r editors/vscode ~/.vscode/extensions/nulang/
-```
+The [extension source](https://github.com/nulang-org/nulang/tree/main/editors/vscode) contains integration tests. If you are developing the extension, build it and install the resulting `.vsix` rather than copying uncompiled source files into the VS Code extensions folder.
 
 ### Requirements
 
-The `nulang` binary must be on your `PATH`, or point `NULANG_PATH` at it, or
+Install a [prebuilt release binary](/getting-started/installation/) for your platform first. The `nulang` binary must be on your `PATH`, or point `NULANG_PATH` at it, or
 set the `nulang.path` setting explicitly (setting > `NULANG_PATH` > `PATH`).
 Useful commands (Command Palette → "Nulang: ..."): Compile, Run, Type Check,
 and Restart Language Server.
