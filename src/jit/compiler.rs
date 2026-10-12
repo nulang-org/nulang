@@ -920,17 +920,27 @@ pub(crate) fn emit_arr_load(
         .icmp_imm(IntCC::Equal, type_tag, TypeTag::Array as i64);
     builder.ins().brif(is_array, bounds_blk, &[], nil_blk, &[]);
 
-    // Bounds check: len = (header.size - header_size) / 8. The unsigned
-    // compare also rejects negative indices (huge when viewed unsigned),
-    // and the int-tag select mirrors `as_int().unwrap_or(0)`.
+    // Bounds check: count of Value slots, with a negative index rejected by
+    // the unsigned comparison below. Arrays store an exact 8-byte-multiple
+    // payload length, so the compact header can load payload_size directly.
     builder.switch_to_block(bounds_blk);
-    let size = builder.ins().load(
+    #[cfg(not(feature = "compact-orca-header"))]
+    let payload = {
+        let size = builder.ins().load(
+            types::I64,
+            MemFlags::new(),
+            header,
+            std::mem::offset_of!(OrcaHeader, size) as i32,
+        );
+        builder.ins().isub(size, header_size)
+    };
+    #[cfg(feature = "compact-orca-header")]
+    let payload = builder.ins().load(
         types::I64,
         MemFlags::new(),
         header,
-        std::mem::offset_of!(OrcaHeader, size) as i32,
+        std::mem::offset_of!(OrcaHeader, payload_size) as i32,
     );
-    let payload = builder.ins().isub(size, header_size);
     let len = builder.ins().ushr_imm(payload, 3);
     let shifted = builder.ins().ishl_imm(idx_val, 16);
     let idx_sext = builder.ins().sshr_imm(shifted, 16);
