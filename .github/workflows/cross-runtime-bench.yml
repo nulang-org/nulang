@@ -58,6 +58,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y erlang-base erlang-dev
 
+      - name: Validate phase parser contract
+        run: python3 -m unittest discover -s scripts/tests -p 'test_cross_runtime_phases.py'
+
       - name: Run cross-runtime baselines
         env:
           RUNS: "${{ inputs.runs || '3' }}"
