@@ -81,6 +81,10 @@ jobs:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          # PR refs checkout a synthetic merge commit; the first parent is
+          # the base tree used to select changed behavior fixtures.
+          fetch-depth: 2
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y python3-dev
@@ -111,6 +115,14 @@ jobs:
 
       - name: Test benchmark harness scripts
         run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+
+      - name: Conformance for changed Nulang behavior fixtures
+        # cargo build --all-targets already produced this exact-head binary.
+        # Include both source and snapshot changes; never silently skip a
+        # changed .nula file without a matching .json expectation.
+        run: |
+          git diff --name-only --diff-filter=ACMRT HEAD^1 HEAD -- 'conformance/behavior/*.nula' 'conformance/behavior/*.json' > /tmp/nulang-changed-behavior.txt
+          python3 scripts/run_changed_conformance.py --file-list /tmp/nulang-changed-behavior.txt
 
       - name: Install cargo-llvm-cov
         if: env.CODECOV_TOKEN != ''
