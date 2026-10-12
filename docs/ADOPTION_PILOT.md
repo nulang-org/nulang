@@ -3,7 +3,8 @@
 **Status:** Proposed pilot protocol (not evidence of completed recruitment or adoption).  
 **Tracker:** [Issue #809](https://github.com/nulang-org/nulang/issues/809)  
 **Scope:** Nulang alpha, reference bytecode runtime. This is a developer experience evaluation, **not** a production reliability certification.  
-**Recording template:** [Per-participant evidence worksheet](ADOPTION_PILOT_REPORT_TEMPLATE.md) (blank; no participants have been enrolled by this document).
+**Recording template:** [Per-participant evidence worksheet](ADOPTION_PILOT_REPORT_TEMPLATE.md) (blank; no participants have been enrolled by this document).  
+**Recruitment brief:** [Independent participant invitation](ADOPTION_PILOT_RECRUITMENT.md) (publish only once source install and CI are validated).
 
 ## Goal and gate
 
