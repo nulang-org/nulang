@@ -3604,11 +3604,14 @@ mod tests {
     }
 
     #[test]
-    fn test_par_block_runs_as_sequential_block() {
-        // `par { .. }` is an independence annotation: sequential block
-        // semantics (last expression wins).
-        let value = run_mir_source("par { 1 + 2; 3 * 4 }").unwrap();
-        assert_eq!(value.as_int(), Some(12));
+    fn test_par_block_returns_source_ordered_results_while_executing_sequentially() {
+        // Execution is still sequential, but every branch contributes to the
+        // source-ordered result tuple.
+        let value = run_mir_source(
+            "let result = par { 1 + 2; 3 * 4 } in match result { | (a, b) => a * 100 + b }",
+        )
+        .unwrap();
+        assert_eq!(value.as_int(), Some(312));
     }
 }
 

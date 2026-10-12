@@ -1,5 +1,7 @@
 # Nulang Changelog
-
+### Structured `par` source-ordered results — 2026-09-29
+- **Experimental `par { ... }` now returns every branch result in source order instead of inheriting block-style last-expression semantics.** Non-empty regions infer and lower to tuples, one branch remains a one-element tuple, and an empty region remains `Unit`. Execution is still sequential.
+- **Unary tuple patterns now preserve their trailing-comma marker.** `(x,)` parses and formats as a one-element tuple pattern rather than collapsing to grouped `x`, keeping one-branch `par` results destructurable and source-round-trippable.
 ### Public CLI release portability — 2026-10-11
 - **Public release archives use the `release-cli` feature profile without a Python shared-library ABI dependency.** The ordinary full/default source build retains opt-in Python interoperability; release packaging checks the resulting Linux and macOS binary for Python dependencies.
 - **Release PRs rehearse the full non-publishing four-platform build matrix before tags are created.** The Linux ARM64 cross build explicitly installs target libc development headers and preflights a target-compiler C header probe, avoiding an observed `ring` compile failure when `--no-install-recommends` omits the ARM64 sysroot. Actual cross-build and clean-host portability remain release gates.
