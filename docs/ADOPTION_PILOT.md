@@ -2,13 +2,18 @@
 
 **Status:** Proposed pilot protocol (not evidence of completed recruitment or adoption).  
 **Tracker:** [Issue #809](https://github.com/nulang-org/nulang/issues/809)  
-**Scope:** Nulang alpha, reference bytecode runtime. This is a developer experience evaluation, **not** a production reliability certification.
+**Scope:** Nulang alpha, reference bytecode runtime. This is a developer experience evaluation, **not** a production reliability certification.  
+**Recording template:** [Per-participant evidence worksheet](ADOPTION_PILOT_REPORT_TEMPLATE.md) (blank; no participants have been enrolled by this document).
 
 ## Goal and gate
 
 Recruit **three developers who do not maintain the Nulang compiler** and have not been coached through the implementation. Each person should build or materially extend one useful Nulang application, then independently revisit it for a change or bug fix.
 
 The pilot passes the adoption gate only when **three independent developers finish non-trivial applications**, or when **one production-like reference application** demonstrates a reproducible material advantage over an equivalent conventional stack. Merely starting an example or starring the repository does not satisfy the gate.
+The separate [semantic stabilization contract](SEMANTIC_STABILIZATION_CONTRACT.md)
+calls for at least **five** non-maintainer applications before broad
+Stable/Frozen surface expansion. That later language-maturity gate is
+**not** automatically met when this initial three-person adoption pilot passes.
 
 ## Paths a participant can choose
 
@@ -18,12 +23,53 @@ The pilot passes the adoption gate only when **three independent developers fini
 
 Ask each participant to narrate where instructions are confusing. **Do not repair their environment for them until they have recorded the blocker.**
 
-## Task A: first useful program
+## Pilot setup and fixed tasks
 
-- Begin with the existing `examples/16_realworld.nula` or `examples/17_actor_fetcher.nula`, but modify it for a genuine use case (new input, error handling, data transformation, or output).
-- Run the result locally, add at least one meaningful test or repeatable verification command, and commit the source to an independently maintained repository.
-- Record the steps, compiler/runtime version, elapsed setup time, operating system, blockers, and code changes.
-- Return at least one day later to extend or repair the project without maintainer intervention.
+Before inviting anyone, record the exact current install instructions,
+available release assets, example filenames, and their Git commit SHA.
+If the native binary or a required hosted resource is not accessible,
+report that as an onboarding blocker; do not silently switch participants to
+a different installation procedure.
+
+Give participants this task briefing without private coaching or pre-written
+solutions. Keep initial assistance to clarification; when the participant is
+blocked, record the original problem and elapsed time **before** giving help.
+For comparable observations, select one of these two initial tracks and record
+the choice in the [worksheet](ADOPTION_PILOT_REPORT_TEMPLATE.md):
+
+- **Track A — useful CLI:** begin with
+  [`examples/16_realworld.nula`](../examples/16_realworld.nula)
+  or the **sequential** HTTP/JSON reporter
+  [`examples/17_actor_fetcher.nula`](../examples/17_actor_fetcher.nula).
+  Modify input handling, error behavior, data transformation, or output for
+  a genuine use case. This track uses native HTTP/FS effects and may require
+  external network access. The latter filename is historical; it does **not**
+  demonstrate actors because its source documents a current actor/HTTP
+  interaction limitation.
+- **Track B — isolated actor state:** begin with the native
+  [`examples/08_actors.nula`](../examples/08_actors.nula) and add a
+  user-visible business invariant, for example a rejection case when a
+  counter would exceed a self-chosen bound. Use actor message handling rather
+  than global mutable state. This is an in-memory, single-process task; do
+  **not** infer persistence or cross-node guarantees.
+
+For either track:
+
+1. Follow public onboarding material with no private maintainer instructions.
+   Record time and any errors from first open through first successful run.
+2. Make one independently authored useful change beyond renaming a constant.
+   Record the exact source and one repeatable verification command or test.
+3. Put the work in a participant-maintained repository **if the participant
+   agrees to share one**; otherwise retain an anonymized verification record.
+4. Return **at least 24 hours later** to change or fix the program again
+   without maintainer intervention. Record whether the return visit happens,
+   not just whether it was invited.
+5. Ask whether the developer would choose Nulang again for that workload,
+   and capture the reason in their words.
+
+A browser-playground session is useful for discovery, but **cannot** complete
+the native-actor or HTTP/FS tracks by itself. Record discovery and native
+activation as distinct milestones; do not conflate them.
 
 ## Task B: durable recovery demonstration (requires validated runtime behavior)
 
@@ -39,20 +85,23 @@ Do **not** assert crash consistency, exactly-once side effects, or distributed d
 
 ## Measurement worksheet
 
-For each participant, capture:
+Use a **separate copy** of the
+[evidence worksheet](ADOPTION_PILOT_REPORT_TEMPLATE.md) for every consenting
+participant. It records the environment and exact version, unassisted and
+assisted milestones, initial and ≥24-hour follow-up outcomes, exact commands,
+reproduction evidence, friction severity, and optional recovery comparisons.
 
-| Field | What to record |
-| --- | --- |
-| Participant | Anonymous pilot ID and prior language experience |
-| Runtime | Nulang release SHA/tag, CLI version, OS, CPU architecture |
-| Start | How they discovered Nulang and which entry path they chose |
-| Activation | Minutes to first successful program and first self-authored change |
-| Completion | Task attempted, repository URL (if consented), and whether independent |
-| Friction | Exact confusing instruction, error message, or missing capability |
-| Repeat usage | Did they return and modify the program after >=1 day? |
-| Outcome | Would they use Nulang for this use case again? Why or why not? |
+Use explicit `not measured` instead of zero when data is missing. Never
+equate downloads, pageviews, GitHub stars, or generated repositories with
+independent adoption. Obtain consent before recording or publishing anything
+and remove identifiers, credentials, and private data. If consent is
+withdrawn, exclude that participant's per-person report from publication.
 
-Use explicit `not measured` instead of zero when data is missing. Do not equate downloads, pageviews, GitHub stars, or generated repositories with independent adoption. Obtain consent before publishing user feedback, recording sessions, or linking participant repositories.
+For aggregate findings, preserve the entire funnel: invited, consented,
+attempted, completed independently, completed with help, blocked, declined,
+and withdrawn. Avoid reporting a median from an unspecified or selectively
+sampled denominator. `Issue #809` is the public tracker; do not post raw
+interviews or private transcripts there.
 
 ## Decision rules
 
@@ -62,4 +111,8 @@ Use explicit `not measured` instead of zero when data is missing. Do not equate 
 - **Task B demonstrates correctness or reliability gaps:** prioritize the relevant runtime correctness gate; do not use the broken example in marketing.
 - **Three complete independent applications or one independently reproducible compelling use case:** update issue #809 with exact evidence, then decide what broader adoption and performance work is justified.
 
-Pilot results belong in issue #809, linked to exact example/runtime versions and without identifying participant information unless explicitly authorized.
+Pilot results belong in [issue #809](https://github.com/nulang-org/nulang/issues/809),
+linked to exact example/runtime versions and without identifying participant
+information unless explicitly authorized. Only report the gate as passed
+after independently reproducible evidence is available; a drafted plan, an
+internal demo, or a code-generated sample alone is not external adoption.
