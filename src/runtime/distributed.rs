@@ -1481,8 +1481,14 @@ pub fn process_network_packets(
                 actor_id,
                 nbc_bytes,
                 snapshot_json,
+                artifact_provenance,
             } => {
-                let _ = runtime.receive_migrated_actor(actor_id, nbc_bytes, snapshot_json);
+                let _ = runtime.receive_migrated_actor_with_provenance(
+                    actor_id,
+                    nbc_bytes,
+                    snapshot_json,
+                    artifact_provenance,
+                );
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
             Packet::NodeGoodbye { node_id, durable } => {
@@ -1517,10 +1523,17 @@ pub fn process_network_packets(
                 nbc_bytes,
                 snapshot_json,
                 epoch,
+                artifact_provenance,
             } => {
                 // RFC 0014 §3: store the replica, do NOT instantiate it.
                 // The shadow re-spawns from it only on confirmed removal.
-                runtime.store_shadow_replica(actor_id, nbc_bytes, snapshot_json, epoch);
+                runtime.store_shadow_replica(
+                    actor_id,
+                    nbc_bytes,
+                    snapshot_json,
+                    epoch,
+                    artifact_provenance,
+                );
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
             Packet::ActorMessage {
