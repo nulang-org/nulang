@@ -96,9 +96,10 @@ tsc --noEmit --strict --module nodenext --moduleResolution nodenext \
   --target ES2022 --lib ES2022,DOM interop/web/javascript/typecheck.mts
 ```
 
-The Python test suite exercises an actual local HTTP server. JavaScript
-uses an injected Fetch implementation. These are SDK-side tests, **not**
-cross-language tests against a running Nulang Web server yet.
+The Python and JavaScript suites both exercise a real local HTTP server.
+JavaScript also uses injected Fetch implementations to cover error and redirect
+edge cases. These are SDK-side tests, **not** cross-language tests against a
+running Nulang Web server yet.
 
 ## Remaining interoperability priorities
 
