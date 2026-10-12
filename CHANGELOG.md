@@ -233,6 +233,8 @@ version + migration.*
 
 ## Stable tier
 
+### MIR aggregate escape-analysis substrate — 2026-09-24
+- **A conservative, analysis-only MIR pass now classifies aggregate allocation escape behavior** (`src/mir_escape.rs`) across returns, calls, closures, effects, FFI, actor boundaries, state/events, aliases, mutation, and nested aggregates. It also exposes the narrower immutable tuple/record projection-only candidate set needed for later scalar replacement. This slice changes no generated code or runtime semantics.
 ### Zero-copy non-reentrant JIT register entry — 2026-09-24
 - **Cranelift regions that cannot re-enter the VM now execute directly against the active frame's 256-register array**, eliminating the previous 2 KiB snapshot before native entry and 2 KiB copy-back afterward. `Value` is explicitly `repr(transparent)` over `u64` so the native register ABI has a documented layout guarantee.
 - **Compiled-region metadata now records whether native execution may grow or replace the VM frame stack.** Regions containing helper-backed direct calls retain the detached register snapshot because re-entrant interpreter calls may reallocate `VM::frames`; typed, SIMD, and scalar non-call regions use the direct-frame path.
