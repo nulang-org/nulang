@@ -117,6 +117,36 @@ def check_architecture_boundaries():
     return True
 
 
+def check_ci_contract():
+    """Fail when the GitHub Actions CI contract drifts.
+
+    Nulang's CI is GitHub Actions only. This runs the contract tests that
+    assert the primary workflow keeps its per-ref concurrency, full Rust
+    matrix, and whitespace step, and that the retired Woodpecker/Buildkite
+    configurations stay deleted.
+    """
+    print("Checking GitHub Actions CI admission contract...")
+    res = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "unittest",
+            "scripts/tests/test_github_actions_ci_contract.py",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if res.returncode != 0:
+        print("Error: GitHub Actions CI contract validation failed.")
+        if res.stdout:
+            print(res.stdout)
+        if res.stderr:
+            print(res.stderr)
+        return False
+    print(res.stderr.strip())
+    return True
+
+
 def verify_files():
     # 1. (compiler.rs has been removed; MIR pipeline is now exclusive.)
     # 2. Check vm.rs for Frame caller and leaked SConcat
@@ -301,7 +331,7 @@ def run_tests():
 
 if __name__ == "__main__":
     args = parse_args()
-    ok = verify_files() and check_warnings()
+    ok = verify_files() and check_warnings() and check_ci_contract()
     if ok and not args.skip_tests:
         ok = run_tests()
     sys.exit(0 if ok else 1)

@@ -39,6 +39,24 @@ class GitHubActionsCIContractTests(unittest.TestCase):
         self.assertIn("cargo test --locked --no-default-features", source)
         self.assertIn("cargo clippy --locked --all-targets", source)
 
+    def test_whitespace_parity_step_is_retained(self):
+        source = CI_WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "git diff --check",
+            source,
+            "the retired Woodpecker pipeline's whitespace check must stay enforced",
+        )
+
+    def test_contract_is_enforced_by_the_implementation_gate(self):
+        gate = (ROOT / "scripts" / "verify_implementation.py").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "test_github_actions_ci_contract",
+            gate,
+            "the CI contract test must run from scripts/verify_implementation.py",
+        )
+
     def test_retired_external_ci_configs_are_not_restored(self):
         for retired_path in (
             ".woodpecker/rust.yml",

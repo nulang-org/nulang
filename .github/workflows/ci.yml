@@ -295,6 +295,12 @@ jobs:
       - name: Format check
         run: cargo fmt --check
 
+      # Whitespace hygiene — parity with the retired Woodpecker pipeline's
+      # trailing `git diff --check`, which caught steps that dirty tracked
+      # files (the check is a no-op on a clean checkout).
+      - name: Whitespace check
+        run: git diff --check
+
       # Clippy with default features — correctness lints are blocking.
       - name: Clippy (default features)
         run: cargo clippy --locked --all-targets -- -D clippy::correctness
