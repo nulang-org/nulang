@@ -55,6 +55,9 @@ native-codegen = [
     "dep:cranelift-codegen",
     "dep:target-lexicon",
 ]
+# Experimental, opt-in 48-byte per-object header. Never enable by default
+# without same-host memory/latency benchmarks and JIT/AOT/FFI validation.
+compact-orca-header = []
 # Marker profile for embedded mobile runtimes. Intentionally empty: the
 # bytecode interpreter and pre-registered host callbacks need no JIT.
 mobile-runtime = []
