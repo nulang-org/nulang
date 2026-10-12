@@ -1170,7 +1170,7 @@ pub unsafe extern "C" fn nulang_obj_get(obj: u64, idx: u64) -> u64 {
         return Value::nil().as_raw();
     }
     let header = &*ActorHeap::header_of(obj_ptr);
-    let payload_size = header.size.saturating_sub(ActorHeap::HEADER_SIZE);
+    let payload_size = header.padded_payload_size();
     let len = payload_size / std::mem::size_of::<Value>();
     // idx may be a raw slot index (records/tuples, unboxed arrays) or a tagged
     // Int (boxed arrays) — mask off any tag bits to get the slot position.
@@ -1191,7 +1191,7 @@ pub unsafe extern "C" fn nulang_obj_set(obj: u64, idx: u64, val: u64) {
     }
     let val = unsafe { Value::from_raw(val) };
     let header = &*ActorHeap::header_of(obj_ptr);
-    let payload_size = header.size.saturating_sub(ActorHeap::HEADER_SIZE);
+    let payload_size = header.padded_payload_size();
     let len = payload_size / std::mem::size_of::<Value>();
     // idx may be a raw slot index (records/tuples, unboxed arrays) or a tagged
     // Int (boxed arrays) — mask off any tag bits to get the slot position.
@@ -1218,7 +1218,7 @@ pub unsafe extern "C" fn nulang_obj_len(obj: u64) -> u64 {
         return Value::int(0).as_raw();
     }
     let header = &*ActorHeap::header_of(obj_ptr);
-    let payload_size = header.size.saturating_sub(ActorHeap::HEADER_SIZE);
+    let payload_size = header.padded_payload_size();
     let len = payload_size / std::mem::size_of::<Value>();
     Value::int(len as i64).as_raw()
 }
@@ -1235,7 +1235,7 @@ pub unsafe extern "C" fn nulang_rec_copy(obj: u64) -> u64 {
     if header.type_tag != HeapTypeTag::Record {
         return Value::nil().as_raw();
     }
-    let payload_size = header.size.saturating_sub(ActorHeap::HEADER_SIZE);
+    let payload_size = header.padded_payload_size();
     let slot_count = payload_size / std::mem::size_of::<Value>();
     if let Some(dst_ptr) = alloc_obj(payload_size, HeapTypeTag::Record) {
         let src_slots = std::slice::from_raw_parts(src_ptr as *const Value, slot_count);
@@ -1330,7 +1330,7 @@ unsafe fn heap_string_payload(ptr: *mut u8) -> Option<String> {
     if header.type_tag != HeapTypeTag::String {
         return None;
     }
-    let payload_size = header.size.saturating_sub(ActorHeap::HEADER_SIZE);
+    let payload_size = header.padded_payload_size();
     // SAFETY: `ptr..ptr+payload_size` is inside this live allocation.
     let bytes = std::slice::from_raw_parts(ptr, payload_size);
     // Find the NUL terminator within the allocation; fall back to the full
@@ -1429,7 +1429,7 @@ pub unsafe extern "C" fn nulang_arr_len(regs: *mut u64, arr_reg: u32, dst_reg: u
     let len = if !arr_ptr.is_null() {
         let header = &*ActorHeap::header_of(arr_ptr);
         if header.type_tag == HeapTypeTag::Array {
-            header.size.saturating_sub(ActorHeap::HEADER_SIZE) / std::mem::size_of::<Value>()
+            header.padded_payload_size() / std::mem::size_of::<Value>()
         } else {
             0
         }
@@ -1448,7 +1448,7 @@ pub unsafe extern "C" fn nulang_field_load(regs: *mut u64, obj_reg: u32, idx: u3
     let val = if !obj_ptr.is_null() {
         let header = &*ActorHeap::header_of(obj_ptr);
         if header.type_tag == HeapTypeTag::Tuple {
-            let payload_size = header.size.saturating_sub(ActorHeap::HEADER_SIZE);
+            let payload_size = header.padded_payload_size();
             let len = payload_size / std::mem::size_of::<Value>();
             if (idx as usize) < len {
                 *((obj_ptr as *const Value).add(idx as usize))
