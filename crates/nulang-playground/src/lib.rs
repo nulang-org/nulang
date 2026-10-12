@@ -41,6 +41,8 @@ pub mod effect_checker;
 pub mod prelude_source;
 #[path = "../../../src/parser.rs"]
 pub mod parser;
+#[path = "../../../src/pattern_coverage.rs"]
+pub mod pattern_coverage;
 #[path = "../../../src/parallel_analysis.rs"]
 pub mod parallel_analysis;
 #[path = "../../../src/parallel_marker.rs"]

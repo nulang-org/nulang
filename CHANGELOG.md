@@ -136,6 +136,10 @@
 - **Focused Python regressions pin sample alignment and operation-count invariants**, preventing a benchmark from silently producing a paired comparison across mismatched runs.
 
 
+### Finite-domain pattern coverage diagnostics — 2026-09-26
+- **The typechecker now emits semantic coverage warnings for finite top-level matches.** `W0201` reports missing witnesses and `W0202` reports provably redundant arms for declared variants and `Bool`; guarded arms never count as exhaustive.
+- **Default runtime compatibility is preserved.** Coverage findings are warnings unless `--deny-warnings` is enabled, and unsupported pattern domains continue to use the runtime non-exhaustive fallback.
+- **CLI, LSP, tests, and public safety documentation now share the same boundary.** The docs no longer claim universal compile-time match or effect-handler exhaustiveness.
 ### Universal UI protocol integration for Web actions — 2026-09-26
 - **Web reactivity now lowers into the renderer-neutral `nulang-ui/1` document/patch protocol.** Action placement uses the shared protocol type, unresolved placement fails closed to the server, static output avoids framework JavaScript, and signal updates use indexed bindings rather than repeated DOM scans.
 - **Server actions now carry validated `nulang-ui-msg/1` envelopes alongside the temporary legacy form field.** Malformed envelopes, client-placement requests, and envelope/legacy action identity mismatches fail closed before route dispatch.

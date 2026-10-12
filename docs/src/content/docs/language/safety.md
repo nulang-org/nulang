@@ -30,7 +30,7 @@ Nulang's capability system (inspired by Pony) prevents data races and use-after-
 
 - **Hindley-Milner inference** (Algorithm W): full type inference with polymorphism. The compiler infers types globally — you write annotations only for public APIs.
 - **No `any` / `dynamic`**: every expression has a known type. There are no implicit coercions or runtime type checks.
-- **Exhaustive match**: `match` expressions must cover all variants. Missing arms are compile-time errors — no runtime `MatchError`.
+- **Pattern coverage diagnostics**: for statically finite top-level variant and `Bool` matches, the compiler emits `W0201` when it can prove a case is missing and `W0202` for provably redundant arms. These are warnings by default (`--deny-warnings` makes them fatal); patterns outside the conservative analyzer still retain the runtime non-exhaustive-match fallback.
 - **No null**: `nil` is an explicit tagged value with its own type (`Nil`). You cannot dereference nil — the type system tracks where `nil` may flow.
 - **Row polymorphism**: records are structurally typed. A function accepting `{ x: Int, y: Int }` works with any record containing those fields (and any others) — no type-level casting needed.
 
@@ -49,15 +49,15 @@ fn greet() -> Unit ! {IO} {
 ```
 
 - **Row polymorphism**: `!{IO | e}` means "IO plus whatever other effects the caller has." Effects compose without monad transformers.
-- **Handler exhaustiveness**: unhandled effects are compile-time errors. If a function performs `State.get`, the caller must either handle `State` or propagate it in its own effect row.
+- **Effect-row checking**: performed effects are inferred and checked against function effect rows at compile time. Handler availability is still resolved dynamically; performing an effect with no enclosing/runtime handler raises a runtime `EffectError`. Static handler-exhaustiveness checking is not implemented yet.
 - **Side-effect documentation**: the effect row IS the documentation. You can see every side effect a function may have by reading its type signature.
 
 ## Actor Isolation
 
 Actors share no memory. All communication is via message passing — there is no shared mutable state between actors.
 
-- **Mailbox isolation**: each actor has a private FIFO mailbox. Messages are always delivered, never dropped.
-- **Per-actor GC**: ORCA garbage collection operates per-actor. One actor's GC cycle never pauses another actor — no global stop-the-world.
+- **Mailbox isolation**: each actor has private mailbox lanes. Configured normal/bulk capacity applies explicit backpressure on admission rather than silently dropping messages; system messages bypass that capacity.
+- **Actor-local GC scope**: ORCA tracks actor-owned heaps rather than using one process-wide tracing heap. The current live runtime still has one cooperative scheduler thread per shard, so GC work on a shard can delay other actors scheduled on that same shard.
 - **Supervision isolation**: supervision trees restart failed actors in isolation. A crashing actor's memory is released; other actors continue running.
 
 ## Fault Tolerance
