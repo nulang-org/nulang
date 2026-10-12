@@ -1681,6 +1681,46 @@ fn test_header_payload_extent_saturates_for_invalid_total_size() {
     assert_eq!(invalid.padded_payload_size(), 0);
 }
 
+/// Measure actual bump-space consumption, not only the expected struct
+/// size. Keep the same fixture in both feature profiles for an apples-to-apples
+/// allocator footprint check. Each sample stays live, so the free list cannot
+/// conceal differences between size classes.
+#[test]
+fn test_orca_header_mixed_small_object_slot_footprint() {
+    const PER_SIZE: usize = 128;
+    let mut heap = ActorHeap::new(1024 * 1024);
+    let mut live = Vec::with_capacity(PER_SIZE * 5);
+
+    for payload_size in [8usize, 16, 32, 64, 128] {
+        for _ in 0..PER_SIZE {
+            live.push(heap.alloc(payload_size, TypeTag::Raw).unwrap());
+        }
+    }
+    assert_eq!(heap.live_count(), PER_SIZE * 5);
+
+    let slot_sizes = if cfg!(feature = "compact-orca-header") {
+        [64usize, 64, 128, 128, 256]
+    } else {
+        [64usize, 128, 128, 128, 256]
+    };
+    let expected_bytes: usize = slot_sizes.iter().sum::<usize>() * PER_SIZE;
+    assert_eq!(
+        heap.used(),
+        expected_bytes,
+        "allocator must reserve the expected physical size-class slots"
+    );
+
+    // Reclamation must preserve live-list and free-list accounting under both
+    // layouts, without a stale pointer from one size class to another.
+    for ptr in live {
+        unsafe {
+            heap.free(ptr);
+        }
+    }
+    assert_eq!(heap.live_count(), 0);
+    assert_eq!(heap.free_list_count(), PER_SIZE * 5);
+}
+
 #[cfg(not(feature = "compact-orca-header"))]
 #[test]
 fn test_header_size_is_56() {
