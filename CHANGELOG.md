@@ -2,7 +2,7 @@
 
 ### HTTP client transport preflight — 2026-10-12
 - **The experimental `http-client` package now provides opt-in `validate_transport` and `send_request_checked` helpers.** Unsupported methods, request headers, and GET request bodies are rejected before the legacy `Http.get/post` effect runs, avoiding silent method fallback or option loss on the checked path.
-- **Existing `send_request` behavior remains unchanged for compatibility.** The checked wrapper returns a generic error for a legacy `nil` response; it does not manufacture HTTP status, response headers, or precise timeout/transport errors. A versioned typed transport remains future work.
+- **Existing `send_request` behavior remains unchanged for compatibility.** The checked wrapper returns an error for a legacy `nil` response and for the standalone VM's exact feature-disabled diagnostic string; the latter can conservatively reject an identical real response body. It does not manufacture HTTP status, response headers, or precise timeout/transport errors. A versioned typed transport remains future work.
 
 
 ### Public CLI release portability — 2026-10-11
