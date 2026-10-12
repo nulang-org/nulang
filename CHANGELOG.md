@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### Gregorian datetime validation — 2026-10-12
+- **`stdlib::datetime.is_valid` now rejects impossible dates while preserving the existing constructor.** Gregorian month-day bounds and century leap-year rules are verified by a 15-case executable conformance fixture and matching `datetime-ext` assertions. No change to timestamp conversion or time-zone semantics.
+
+
 ### Public CLI release portability — 2026-10-11
 - **Public release archives use the `release-cli` feature profile without a Python shared-library ABI dependency.** The ordinary full/default source build retains opt-in Python interoperability; release packaging checks the resulting Linux and macOS binary for Python dependencies.
 - **Release PRs rehearse the full non-publishing four-platform build matrix before tags are created.** The Linux ARM64 cross build explicitly installs target libc development headers and preflights a target-compiler C header probe, avoiding an observed `ring` compile failure when `--no-install-recommends` omits the ARM64 sysroot. Actual cross-build and clean-host portability remain release gates.
