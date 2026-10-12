@@ -4,9 +4,10 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from bench_orca_header_profiles import criterion_means, summarize  # noqa: E402
+from bench_orca_header_profiles import assert_checkout_matches, criterion_means, summarize  # noqa: E402
 
 
 class OrcaHeaderBenchmarkReporterTests(unittest.TestCase):
@@ -79,6 +80,21 @@ class OrcaHeaderBenchmarkReporterTests(unittest.TestCase):
         self.assertAlmostEqual(row["latency_change_pct"], -19.0476190476)
         self.assertEqual(row["default_samples"], 2)
         self.assertEqual(row["compact_samples"], 2)
+
+    def test_checkout_guard_rejects_head_changes_between_trials(self):
+        with patch("bench_orca_header_profiles.git", return_value="different-head"):
+            with self.assertRaisesRegex(RuntimeError, "HEAD moved"):
+                assert_checkout_matches("original-head", allow_dirty=False)
+
+    def test_checkout_guard_rejects_dirty_worktree(self):
+        with patch("bench_orca_header_profiles.git", side_effect=["expected", " M src/runtime/heap.rs"]):
+            with self.assertRaisesRegex(RuntimeError, "dirty worktree"):
+                assert_checkout_matches("expected", allow_dirty=False)
+
+    def test_checkout_guard_allows_explicitly_recorded_dirty_override(self):
+        with patch("bench_orca_header_profiles.git", return_value="expected") as spy:
+            assert_checkout_matches("expected", allow_dirty=True)
+            spy.assert_called_once_with("rev-parse", "HEAD")
 
     def test_rejects_missing_comparison_profile(self):
         with self.assertRaisesRegex(ValueError, "Missing one profile"):
