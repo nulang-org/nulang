@@ -60,10 +60,12 @@ claims. Performance work requires matched-runner measurements.
    reproducible problem and a clear acceptance test. Start with
    [curated good-first issues](https://github.com/nulang-org/nulang/issues?q=is%3Aissue+is%3Aopen+label%3Agood-first-issue) or
    [all open issues](https://github.com/nulang-org/nulang/issues).
-   Two starter documentation tasks were filed on 2026-10-12:
+   Two scoped documentation tasks were filed on 2026-10-12:
    [string-literal wording #1562](https://github.com/nulang-org/nulang/issues/1562)
    and [source-build quick start #1563](https://github.com/nulang-org/nulang/issues/1563).
-   Check the issue state before claiming either task.
+   The quick-start fix is already proposed in this README/onboarding PR,
+   so **#1563 is not available for a new contributor to claim**. Check each
+   issue's current state and assignments before starting work.
 2. If no suitable issue exists, [open a discussion](https://github.com/nulang-org/nulang/discussions)
    with the problem and your proposed scope, or file an
    [issue](https://github.com/nulang-org/nulang/issues/new/choose).
