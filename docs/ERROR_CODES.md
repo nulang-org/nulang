@@ -102,11 +102,20 @@ by `render_warning`/`format_warning` (src/diagnostic.rs) with a
 | Range   | Category                                  |
 |---------|-------------------------------------------|
 | `W01xx` | Deprecations                              |
+| `W02xx` | Static pattern analysis                   |
 
-| Code    | Meaning                                   | Replacement (RFC)        |
-|---------|-------------------------------------------|--------------------------|
+| Code    | Meaning                                   | Replacement / action |
+|---------|-------------------------------------------|----------------------|
 | `W0101` | Deprecated `catch` expression (all forms) | `match` on `Ok`/`Error`, `?` under `T ! E` (RFC 0015) |
-| `W0102` | Deprecated `fail` expression              | `return Error(...)` under `T ! E` (RFC 0015) |
+| `W0102` | Deprecated `fail` expression              | `return Error(...)` under a `T ! E` signature (RFC 0015) |
+| `W0201` | Provably non-exhaustive finite-domain `match` | Add arms for the reported missing constructor/value witnesses |
+| `W0202` | Provably redundant/unreachable finite-domain match arm | Remove, move, or refine the reported arm(s) |
+
+`W0201` remains warning-by-default in Nulang 1.x so existing match validity
+and the runtime non-exhaustive fallback are preserved. `--deny-warnings`
+provides opt-in strict enforcement. The compiler currently proves coverage for
+closed variants and booleans; unsupported or infinite domains remain runtime
+checked.
 
 See `docs/MIGRATION_RFC_0015.md` for the `catch`/`fail` migration guide.
 

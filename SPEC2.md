@@ -1692,6 +1692,8 @@ match tree {
 
 Pattern guards (`| pat if cond => ...`) are implemented — the guard is a boolean expression evaluated with the pattern's bindings in scope after the pattern matches, and an arm whose guard fails falls through to the next arm (a guarded last arm whose guard fails raises the non-exhaustive-match error) — while list-cons patterns are planned for a future version. Nested variant, tuple, and record patterns all match structurally: sub-patterns are tested recursively against the payload, element, or field value, so `Some(Some(x))` rejects both `Some(None)` and `None`, and the `Node((l, v, r))` form above binds `l`, `v`, and `r`. One caveat remains: tuple patterns do not check arity — a pattern tests only the positions it names, so `(a, b)` also matches a longer tuple (extra elements are ignored) and a position beyond the scrutinee's length binds nil.
 
+For finite domains the typechecker performs a conservative coverage pass after ordinary type inference. Matches over closed variants and `Bool` emit `W0201` when missing constructors/values are provable and `W0202` when an arm is provably unreachable. Guarded arms do not count as total coverage, and structured payload patterns are not used as exhaustiveness proofs unless their totality is known. These are warnings by default in Nulang 1.x (`--deny-warnings` makes them fatal); unsupported or infinite domains, and any case the checker cannot prove, retain the runtime non-exhaustive-match fallback.
+
 ## 6.8 Lambda Expressions
 
 Lambda expressions create anonymous functions with the `fn` keyword. An optional `->` may separate the parameter list from the body:

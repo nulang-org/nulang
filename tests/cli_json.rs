@@ -109,6 +109,38 @@ fn check_json_parse_error_reports_e01xx() {
 }
 
 #[test]
+fn check_json_success_preserves_semantic_warnings() {
+    let dir = temp_dir("warning");
+    let src = write_temp(
+        &dir,
+        "warning.nula",
+        "fn choose(flag: Bool) -> Int {\n    match flag {\n        | true => 1\n    }\n}\n",
+    );
+
+    let (code, stdout, _stderr) = run_check_json(&src);
+    assert_eq!(code, 0, "warnings must not fail default compilation: {stdout:?}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout must parse as JSON: {e}\n{stdout:?}"));
+
+    assert_eq!(v["schema_version"], 1);
+    assert_eq!(v["command"], "check");
+    assert_eq!(v["ok"], true);
+    let diags = v["diagnostics"].as_array().expect("diagnostics array");
+    assert_eq!(diags.len(), 1, "expected one finite-domain warning: {diags:?}");
+    assert_eq!(diags[0]["code"], "W0201");
+    assert_eq!(diags[0]["severity"], "warning");
+    assert!(
+        diags[0]["message"]
+            .as_str()
+            .expect("warning message")
+            .contains("false")
+    );
+    assert!(diags[0]["span"].is_object(), "warning should preserve its span");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn check_json_passing_source_is_ok_with_empty_diagnostics() {
     let dir = temp_dir("pass");
     let src = write_temp(

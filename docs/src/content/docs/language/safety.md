@@ -49,7 +49,7 @@ fn greet() -> Unit ! {IO} {
 ```
 
 - **Row polymorphism**: `!{IO | e}` means "IO plus whatever other effects the caller has." Effects compose without monad transformers.
-- **Handler exhaustiveness**: unhandled effects are compile-time errors. If a function performs `State.get`, the caller must either handle `State` or propagate it in its own effect row.
+- **Effect-row checking**: performed effects are tracked in function effect rows, so callers must type-check against the effects a function may perform. Whether an enclosing runtime handler exists is still resolved dynamically; an actually unhandled effect raises `EffectError`.
 - **Side-effect documentation**: the effect row IS the documentation. You can see every side effect a function may have by reading its type signature.
 
 ## Actor Isolation
@@ -96,7 +96,7 @@ Nulang inherits BEAM/OTP fault-tolerance patterns:
 |---|---|---|
 | **Type safety** | Static types catch bugs at compile time | Dynamic types — errors surface at runtime |
 | **Effect documentation** | Effect rows in type signatures | No effect tracking — any function can do I/O |
-| **Pattern matching** | Exhaustive (compile-time check) | Non-exhaustive by default |
+| **Pattern matching** | Conservative finite-domain warnings (`W0201`/`W0202`); runtime fallback when unproven | Non-exhaustive by default |
 | **Fault tolerance** | Same OTP supervision primitives | Same OTP supervision primitives |
 
 ### vs C/C++

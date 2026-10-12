@@ -34,7 +34,7 @@
 
 use serde::Serialize;
 
-use crate::types::{current_source_text, source_map_file, NuError, Span};
+use crate::types::{current_source_text, source_map_file, NuError, NuWarning, Span};
 
 /// Current JSON diagnostics schema version.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -141,6 +141,23 @@ fn diagnostic_from_single(err: &NuError) -> JsonDiagnostic {
         notes: crate::diagnostic::diagnostic_notes(err),
         suggestion: err.suggestion().map(|msg| JsonSuggestion {
             message: msg.to_string(),
+            replacement: None,
+        }),
+    }
+}
+
+
+/// Convert a non-fatal compiler warning into the same machine-readable schema
+/// used for errors. Stable warning codes and source spans are preserved.
+pub fn diagnostic_from_warning(warning: &NuWarning) -> JsonDiagnostic {
+    JsonDiagnostic {
+        code: Some(warning.code.to_string()),
+        severity: "warning".to_string(),
+        message: warning.msg.clone(),
+        span: json_span(warning.span),
+        notes: Vec::new(),
+        suggestion: warning.help.as_ref().map(|help| JsonSuggestion {
+            message: help.clone(),
             replacement: None,
         }),
     }
