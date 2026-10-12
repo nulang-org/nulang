@@ -321,6 +321,36 @@ def summarize(
     return summary
 
 
+def paired_backend_speedups(
+    samples: dict[str, dict[str, list[dict[str, int]]]]
+) -> dict[str, dict[str, float | int]]:
+    """Compute same-round native/bytecode ratios; never divide independent medians."""
+    if "nulang" not in samples:
+        return {}
+    baseline = samples["nulang"]["actor_compute"]
+    ratios: dict[str, dict[str, float | int]] = {}
+    for runtime in ("nulang-jit", "nulang-aot"):
+        if runtime not in samples:
+            continue
+        candidate = samples[runtime]["actor_compute"]
+        if len(candidate) != len(baseline) or not baseline:
+            raise RuntimeError(f"{runtime}: paired sample count mismatch")
+        paired = []
+        for base, contender in zip(baseline, candidate):
+            if base["messages"] != contender["messages"]:
+                raise RuntimeError(f"{runtime}: paired work count mismatch")
+            if base["elapsed_ns"] <= 0 or contender["elapsed_ns"] <= 0:
+                raise RuntimeError(f"{runtime}: nonpositive paired duration")
+            paired.append(base["elapsed_ns"] / contender["elapsed_ns"])
+        ratios[runtime] = {
+            "paired_rounds": len(paired),
+            "median_speedup_vs_bytecode": statistics.median(paired),
+            "min_paired_speedup": min(paired),
+            "max_paired_speedup": max(paired),
+        }
+    return ratios
+
+
 def print_table(
     summary: dict[str, dict[str, dict[str, float | int]]],
     benchmarks: tuple[str, ...] = BENCHMARKS,
@@ -425,6 +455,17 @@ def main() -> int:
 
     summary = summarize(samples)
     print_table(summary, benchmarks)
+    paired_speedups = (
+        paired_backend_speedups(samples)
+        if args.workloads == "actor_compute"
+        else {}
+    )
+    for runtime, stats in paired_speedups.items():
+        print(
+            f"[backend-paired] {runtime} vs bytecode "
+            f"median_speedup={stats['median_speedup_vs_bytecode']:.3f}x "
+            f"paired_rounds={stats['paired_rounds']}"
+        )
 
     report = {
         "schema": 2,
@@ -440,6 +481,7 @@ def main() -> int:
         "environment": environment_metadata(args.cpu_mode, cpu_affinity),
         "samples": samples,
         "summary": summary,
+        "backend_paired_speedups": paired_speedups,
     }
 
     if args.output:
