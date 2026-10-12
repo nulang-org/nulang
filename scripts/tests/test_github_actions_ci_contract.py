@@ -36,6 +36,7 @@ class GitHubActionsCIContractTests(unittest.TestCase):
         source = CI_WORKFLOW.read_text(encoding="utf-8")
 
         self.assertIn("cargo nextest run --locked", source)
+        self.assertIn("cargo nextest run --locked --features wasm-backend", source)
         self.assertIn("cargo test --locked --no-default-features", source)
         self.assertIn("cargo clippy --locked --all-targets", source)
 

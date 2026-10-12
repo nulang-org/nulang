@@ -263,11 +263,20 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
       - name: Build
         run: cargo build --locked --all-targets --features wasm-backend
 
+      # nextest isolates tests in their own processes and applies the retry
+      # policy in .config/nextest.toml (load-flaky multi-node cluster tests).
       - name: Test
-        run: cargo test --locked --features wasm-backend
+        run: cargo nextest run --locked --features wasm-backend
+
+      # nextest intentionally does not execute rustdoc tests.
+      - name: Test doctests
+        run: cargo test --locked --features wasm-backend --doc
 
   # -----------------------------------------------------------------------
   # Lint — format, clippy, audit, docs, all-features check
