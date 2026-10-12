@@ -19,6 +19,15 @@ Both surfaces are **Experimental** tier (see `spec/grammar.ebnf` §4): they work
 
 ### Requirements
 
+:::caution[Public release binaries omit Python interop]
+The downloadable `release-cli` archives intentionally exclude the
+`python` feature to avoid a version-specific shared `libpython` dependency.
+A `Python.*` effect may parse/type-check but will not execute in those builds.
+To use Python interop, build from source with
+`cargo build --locked --release --no-default-features --features full`
+and install the required Python development/runtime libraries.
+:::
+
 - The `python` cargo feature, which is **on by default** (`Cargo.toml`). Build with `--no-default-features` to exclude it.
 - A Python 3 runtime on the host. Nulang links against `libpython` (PyO3 0.29, abi3 limited API) and initializes the interpreter on first use via `auto-initialize`. On Fedora-style systems, `build.rs` creates the `libpythonX.Y.so` symlink PyO3's linker expects.
 - The `os` resource capability at compile time — pass `--with os` — because performing the `Python` effect is gated like `Process` and `System` (`effect_resource_category` in `src/effect_checker.rs`).
