@@ -76,7 +76,7 @@ boundary, supporting independent testability, replaceability, and evolution.
 +==========================================================================+
 |                       LAYER 1: LANGUAGE                                   |
 |  Lexer | Parser | HM Type Checker | Effect & Capability Analysis | HIR   |
-|  MIR | Register-Bytecode Compiler | NaN-Boxed VM | Cranelift JIT Tier    |
+|  MIR | Register-Bytecode Compiler | Tagged-Word VM | Cranelift JIT Tier |
 +==========================================================================+
 ```
 

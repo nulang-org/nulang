@@ -336,7 +336,11 @@ pub fn python_object_id_to_owned_foreign(
         if let Ok(value) = obj.cast::<PyInt>() {
             let value = value.extract::<i64>().unwrap_or_else(|_| {
                 let text = value.str().map(|s| s.to_string()).unwrap_or_default();
-                if text.starts_with('-') { i64::MIN } else { i64::MAX }
+                if text.starts_with('-') {
+                    i64::MIN
+                } else {
+                    i64::MAX
+                }
             });
             return Ok(OwnedForeignValue::Int(value));
         }

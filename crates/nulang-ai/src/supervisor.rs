@@ -1,14 +1,13 @@
 //! Supervisor pattern for multi-agent orchestration.
 //!
-//! A [`SupervisorTeam`] coordinates a set of worker agents.  The supervisor
-//! receives a task, delegates it through the workers in order, and returns the
-//! final accumulated result.  Each worker is prompted with the previous worker's
-//! output (or the original task for the first worker) so the team behaves like
-//! a sequential refinement chain.
+//! A [`SupervisorTeam`] coordinates a set of worker agents. The legacy
+//! [`SupervisorTeam::run`] path delegates through workers in order and returns
+//! the final accumulated result. Explicit [`SupervisorTeam::delegate`] and
+//! [`SupervisorTeam::handoff`] operations expose two different ownership
+//! semantics without forcing a specific distributed runtime implementation.
 //!
-//! Implementors of [`SupervisorRuntime`] provide the actor `ask` behavior.
-//! Test code can use a mock implementation to avoid spinning up a real actor
-//! system.
+//! Implementors of [`SupervisorRuntime`] provide the actor behavior. Test code
+//! can use a mock implementation to avoid spinning up a real actor system.
 
 // ---------------------------------------------------------------------------
 // Runtime abstraction
@@ -16,11 +15,24 @@
 
 /// Minimal runtime capability required to execute a supervisor team.
 ///
-/// Test code can provide a mock implementation to avoid spinning up a real
-/// actor system.
+/// `delegate_agent` means the supervisor retains ownership and expects a result
+/// back. `handoff_agent` means the target worker becomes the logical owner of
+/// subsequent execution. The default implementations preserve backward
+/// compatibility by routing both operations through `ask_agent`; runtimes that
+/// track ownership or sessions can override them independently.
 pub trait SupervisorRuntime {
     /// Send `prompt` to `agent_id` and return the textual response.
     fn ask_agent(&mut self, agent_id: u64, prompt: &str) -> Result<String, String>;
+
+    /// Execute bounded specialist work while the caller retains ownership.
+    fn delegate_agent(&mut self, agent_id: u64, prompt: &str) -> Result<String, String> {
+        self.ask_agent(agent_id, prompt)
+    }
+
+    /// Transfer logical ownership of the active work to another agent.
+    fn handoff_agent(&mut self, agent_id: u64, context: &str) -> Result<String, String> {
+        self.ask_agent(agent_id, context)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -77,10 +89,52 @@ impl SupervisorTeam {
         self
     }
 
+    fn worker_named(&self, name: &str) -> Result<&Worker, String> {
+        self.workers
+            .iter()
+            .find(|worker| worker.name == name)
+            .ok_or_else(|| format!("Worker {} not found", name))
+    }
+
+    /// Delegate bounded work to a named specialist and return its result to the
+    /// current owner.
+    pub fn delegate<R: SupervisorRuntime>(
+        &self,
+        runtime: &mut R,
+        worker_name: &str,
+        task: &str,
+    ) -> Result<String, String> {
+        let worker = self.worker_named(worker_name)?;
+        let prompt = format!(
+            "You are {}. {}\n\nDelegated task: {}\n\nReturn a bounded result to the supervisor; do not assume ownership of unrelated work.",
+            worker.name, worker.description, task
+        );
+        runtime.delegate_agent(worker.agent_id, &prompt)
+    }
+
+    /// Hand logical ownership of the active work to a named worker.
+    ///
+    /// The concrete runtime decides how ownership is represented (session,
+    /// actor, thread, or remote agent). The default runtime behavior remains a
+    /// synchronous request/response for compatibility.
+    pub fn handoff<R: SupervisorRuntime>(
+        &self,
+        runtime: &mut R,
+        worker_name: &str,
+        context: &str,
+    ) -> Result<String, String> {
+        let worker = self.worker_named(worker_name)?;
+        let prompt = format!(
+            "You are {}. {}\n\nOwnership has been handed to you. Continue from this context:\n{}",
+            worker.name, worker.description, context
+        );
+        runtime.handoff_agent(worker.agent_id, &prompt)
+    }
+
     /// Run the team on `task`, returning the final worker's output.
     ///
     /// Each worker receives a prompt that includes its description and the
-    /// current accumulated state.  Returns an error if the team has no workers
+    /// current accumulated state. Returns an error if the team has no workers
     /// or if any worker call fails.
     pub fn run<R: SupervisorRuntime>(&self, runtime: &mut R, task: &str) -> Result<String, String> {
         if self.workers.is_empty() {
@@ -186,5 +240,18 @@ mod tests {
             team.run(&mut rt, "start"),
             Err("No response configured for agent 2".to_string())
         );
+    }
+
+    #[test]
+    fn test_delegate_and_handoff_default_to_ask_agent() {
+        let team = SupervisorTeam::new().worker("worker", 1, "Does work");
+        let mut rt = MockRuntime::new(HashMap::from([(1, "result".to_string())]));
+
+        assert_eq!(team.delegate(&mut rt, "worker", "task").unwrap(), "result");
+        assert_eq!(
+            team.handoff(&mut rt, "worker", "context").unwrap(),
+            "result"
+        );
+        assert_eq!(rt.calls.into_inner().len(), 2);
     }
 }

@@ -132,7 +132,10 @@ impl<R: Send + 'static> BlockingExecutor<R> {
     where
         F: FnOnce() -> R + Send + 'static,
     {
-        let tx = self.request_tx.as_ref().ok_or(BlockingSubmitError::Closed)?;
+        let tx = self
+            .request_tx
+            .as_ref()
+            .ok_or(BlockingSubmitError::Closed)?;
         let id = self.next_id;
         if id == 0 {
             return Err(BlockingSubmitError::IdExhausted);
@@ -202,9 +205,7 @@ mod tests {
         loop {
             match executor.try_recv() {
                 Ok(completion) => return completion,
-                Err(TryRecvError::Empty) if Instant::now() < deadline => {
-                    std::thread::yield_now()
-                }
+                Err(TryRecvError::Empty) if Instant::now() < deadline => std::thread::yield_now(),
                 Err(error) => panic!("completion did not arrive: {error:?}"),
             }
         }

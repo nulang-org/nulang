@@ -1,0 +1,32 @@
+[
+  {
+    "label": "Nulang: setup worktree",
+    "command": "mise",
+    "args": ["run", "setup"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "hooks": ["create_worktree"],
+    "reveal": "no_focus",
+    "hide": "on_success"
+  },
+  {
+    "label": "Nulang: check",
+    "command": "mise",
+    "args": ["run", "check"],
+    "use_new_terminal": true,
+    "allow_concurrent_runs": false
+  },
+  {
+    "label": "Nulang: test",
+    "command": "mise",
+    "args": ["run", "test"],
+    "use_new_terminal": true,
+    "allow_concurrent_runs": false
+  },
+  {
+    "label": "Nulang: full CI",
+    "command": "mise",
+    "args": ["run", "check-full"],
+    "use_new_terminal": true,
+    "allow_concurrent_runs": false
+  }
+]

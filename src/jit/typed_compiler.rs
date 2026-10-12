@@ -1596,7 +1596,6 @@ pub fn is_opcode_supported_typed(op: OpCode) -> bool {
             | OpCode::IMul
             | OpCode::IDiv
             | OpCode::IMod
-            | OpCode::INeg
             | OpCode::IInc
             | OpCode::IDec
             | OpCode::Xor
@@ -2954,6 +2953,15 @@ pub fn compile_bytecode_region_typed(
             // -- Return --
             OpCode::Ret | OpCode::RetVal => {
                 flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
+                // Returns embedded in a wider loop CFG remain interpreter-owned:
+                // publish the exact bytecode PC and leave native code so VM
+                // frame-pop / return-value semantics are unchanged.
+                emit_yield_pc(
+                    &mut builder,
+                    helpers["nulang_jit_set_branch_exit_pc"],
+                    start_offset,
+                    pc,
+                );
                 builder.ins().jump(return_block, &[]);
             }
 
@@ -3085,9 +3093,9 @@ mod typed_tests {
         meta.set_type(1, KnownType::Int);
 
         let ptr = compile_bytecode_region_typed(
-            &mut jit.module,
-            &mut jit.builder_context,
-            &mut jit.ctx,
+            &mut jit.codegen.optimized_module,
+            &mut jit.codegen.optimized_builder_context,
+            &mut jit.codegen.optimized_ctx,
             "test_typed_iadd",
             0,
             2,
@@ -3115,9 +3123,9 @@ mod typed_tests {
 
         // No type metadata — forces runtime fallback for all ops
         let ptr = compile_bytecode_region_typed(
-            &mut jit.module,
-            &mut jit.builder_context,
-            &mut jit.ctx,
+            &mut jit.codegen.optimized_module,
+            &mut jit.codegen.optimized_builder_context,
+            &mut jit.codegen.optimized_ctx,
             "test_untyped_fallback",
             0,
             4,
@@ -3150,9 +3158,9 @@ mod typed_tests {
         meta.set_type(1, KnownType::Int);
 
         let ptr = compile_bytecode_region_typed(
-            &mut jit.module,
-            &mut jit.builder_context,
-            &mut jit.ctx,
+            &mut jit.codegen.optimized_module,
+            &mut jit.codegen.optimized_builder_context,
+            &mut jit.codegen.optimized_ctx,
             "test_typed_idiv_imod",
             0,
             3,
@@ -3196,9 +3204,9 @@ mod typed_tests {
         }
 
         let ptr = compile_bytecode_region_typed(
-            &mut jit.module,
-            &mut jit.builder_context,
-            &mut jit.ctx,
+            &mut jit.codegen.optimized_module,
+            &mut jit.codegen.optimized_builder_context,
+            &mut jit.codegen.optimized_ctx,
             "test_typed_bitwise",
             0,
             instructions.len(),
@@ -3245,9 +3253,9 @@ mod typed_tests {
         meta.set_type(1, KnownType::Float);
 
         let ptr = compile_bytecode_region_typed(
-            &mut jit.module,
-            &mut jit.builder_context,
-            &mut jit.ctx,
+            &mut jit.codegen.optimized_module,
+            &mut jit.codegen.optimized_builder_context,
+            &mut jit.codegen.optimized_ctx,
             "test_typed_float",
             0,
             5,
@@ -3284,9 +3292,9 @@ mod typed_tests {
         meta.set_type(1, KnownType::Float);
 
         let ptr = compile_bytecode_region_typed(
-            &mut jit.module,
-            &mut jit.builder_context,
-            &mut jit.ctx,
+            &mut jit.codegen.optimized_module,
+            &mut jit.codegen.optimized_builder_context,
+            &mut jit.codegen.optimized_ctx,
             "test_typed_fdiv_nil",
             0,
             2,
@@ -3323,9 +3331,9 @@ mod typed_tests {
 
         // No type metadata: forces the runtime-helper fallback branch.
         let ptr = compile_bytecode_region_typed(
-            &mut jit.module,
-            &mut jit.builder_context,
-            &mut jit.ctx,
+            &mut jit.codegen.optimized_module,
+            &mut jit.codegen.optimized_builder_context,
+            &mut jit.codegen.optimized_ctx,
             "test_untyped_fdiv_nil",
             0,
             2,
@@ -3374,9 +3382,9 @@ mod typed_tests {
         meta.set_type(1, KnownType::Int);
 
         let ptr = compile_bytecode_region_typed(
-            &mut jit.module,
-            &mut jit.builder_context,
-            &mut jit.ctx,
+            &mut jit.codegen.optimized_module,
+            &mut jit.codegen.optimized_builder_context,
+            &mut jit.codegen.optimized_ctx,
             "test_typed_icmp",
             0,
             6,
@@ -3403,9 +3411,9 @@ mod typed_tests {
         meta2.set_type(1, KnownType::Float);
 
         let ptr2 = compile_bytecode_region_typed(
-            &mut jit2.module,
-            &mut jit2.builder_context,
-            &mut jit2.ctx,
+            &mut jit2.codegen.optimized_module,
+            &mut jit2.codegen.optimized_builder_context,
+            &mut jit2.codegen.optimized_ctx,
             "test_typed_fcmp",
             0,
             4,
@@ -3439,9 +3447,9 @@ mod typed_tests {
         meta.set_type(1, KnownType::Float);
 
         let ptr = compile_bytecode_region_typed(
-            &mut jit.module,
-            &mut jit.builder_context,
-            &mut jit.ctx,
+            &mut jit.codegen.optimized_module,
+            &mut jit.codegen.optimized_builder_context,
+            &mut jit.codegen.optimized_ctx,
             "test_native_float_cache_chain",
             0,
             instructions.len(),
@@ -3478,9 +3486,9 @@ mod typed_tests {
         meta.set_type(1, KnownType::Float);
 
         let ptr = compile_bytecode_region_typed(
-            &mut jit.module,
-            &mut jit.builder_context,
-            &mut jit.ctx,
+            &mut jit.codegen.optimized_module,
+            &mut jit.codegen.optimized_builder_context,
+            &mut jit.codegen.optimized_ctx,
             "test_native_float_cache_fneg",
             0,
             instructions.len(),
@@ -3518,9 +3526,9 @@ mod typed_tests {
         }
 
         let ptr = compile_bytecode_region_typed(
-            &mut jit.module,
-            &mut jit.builder_context,
-            &mut jit.ctx,
+            &mut jit.codegen.optimized_module,
+            &mut jit.codegen.optimized_builder_context,
+            &mut jit.codegen.optimized_ctx,
             "test_native_float_cache_helper_boundary",
             0,
             instructions.len(),
@@ -3557,9 +3565,9 @@ mod typed_tests {
         meta.set_type(2, KnownType::Float);
 
         let ptr = compile_bytecode_region_typed(
-            &mut jit.module,
-            &mut jit.builder_context,
-            &mut jit.ctx,
+            &mut jit.codegen.optimized_module,
+            &mut jit.codegen.optimized_builder_context,
+            &mut jit.codegen.optimized_ctx,
             "test_native_numeric_cache_conversions",
             0,
             instructions.len(),
@@ -3594,9 +3602,9 @@ mod typed_tests {
         meta.set_type(1, KnownType::Float);
 
         let ptr = compile_bytecode_region_typed(
-            &mut jit.module,
-            &mut jit.builder_context,
-            &mut jit.ctx,
+            &mut jit.codegen.optimized_module,
+            &mut jit.codegen.optimized_builder_context,
+            &mut jit.codegen.optimized_ctx,
             "test_native_float_cache_nan",
             0,
             instructions.len(),
@@ -3641,9 +3649,9 @@ mod typed_tests {
         // R1 is deliberately left unknown
 
         let ptr = compile_bytecode_region_typed(
-            &mut jit.module,
-            &mut jit.builder_context,
-            &mut jit.ctx,
+            &mut jit.codegen.optimized_module,
+            &mut jit.codegen.optimized_builder_context,
+            &mut jit.codegen.optimized_ctx,
             "test_mixed",
             0,
             3,
@@ -3685,9 +3693,9 @@ mod typed_tests {
                                           // R2 holds the comparison result; we mark it as Bool after ICmpLt
 
         let ptr = compile_bytecode_region_typed(
-            &mut jit.module,
-            &mut jit.builder_context,
-            &mut jit.ctx,
+            &mut jit.codegen.optimized_module,
+            &mut jit.codegen.optimized_builder_context,
+            &mut jit.codegen.optimized_ctx,
             "test_typed_loop",
             0,
             7,
@@ -3721,9 +3729,9 @@ mod typed_tests {
         meta.set_type(1, KnownType::Int);
 
         let ptr = compile_bytecode_region_typed(
-            &mut jit.module,
-            &mut jit.builder_context,
-            &mut jit.ctx,
+            &mut jit.codegen.optimized_module,
+            &mut jit.codegen.optimized_builder_context,
+            &mut jit.codegen.optimized_ctx,
             "test_native_int_cache_wrap",
             0,
             instructions.len(),
@@ -3765,9 +3773,9 @@ mod typed_tests {
         meta.set_type(1, KnownType::Int);
 
         let ptr = compile_bytecode_region_typed(
-            &mut jit.module,
-            &mut jit.builder_context,
-            &mut jit.ctx,
+            &mut jit.codegen.optimized_module,
+            &mut jit.codegen.optimized_builder_context,
+            &mut jit.codegen.optimized_ctx,
             "test_native_int_cache_helper_boundary",
             0,
             instructions.len(),
@@ -3807,9 +3815,9 @@ mod typed_tests {
         meta.set_type(4, KnownType::Bool);
 
         let ptr = compile_bytecode_region_typed(
-            &mut jit.module,
-            &mut jit.builder_context,
-            &mut jit.ctx,
+            &mut jit.codegen.optimized_module,
+            &mut jit.codegen.optimized_builder_context,
+            &mut jit.codegen.optimized_ctx,
             "test_native_int_cache_cfg_join",
             0,
             instructions.len(),
@@ -3906,9 +3914,9 @@ mod typed_tests {
         meta.set_type(6, KnownType::Int);
 
         let ptr = compile_bytecode_region_typed(
-            &mut jit.module,
-            &mut jit.builder_context,
-            &mut jit.ctx,
+            &mut jit.codegen.optimized_module,
+            &mut jit.codegen.optimized_builder_context,
+            &mut jit.codegen.optimized_ctx,
             "test_loop_ssa_int",
             0,
             instructions.len(),
@@ -3947,9 +3955,9 @@ mod typed_tests {
         }
 
         let ptr = compile_bytecode_region_typed(
-            &mut jit.module,
-            &mut jit.builder_context,
-            &mut jit.ctx,
+            &mut jit.codegen.optimized_module,
+            &mut jit.codegen.optimized_builder_context,
+            &mut jit.codegen.optimized_ctx,
             "test_loop_ssa_float",
             0,
             instructions.len(),
@@ -4000,9 +4008,9 @@ mod typed_tests {
         // r8 stays Unknown at loop entry.
 
         let ptr = compile_bytecode_region_typed(
-            &mut jit.module,
-            &mut jit.builder_context,
-            &mut jit.ctx,
+            &mut jit.codegen.optimized_module,
+            &mut jit.codegen.optimized_builder_context,
+            &mut jit.codegen.optimized_ctx,
             "test_loop_ssa_noncarried_temp",
             0,
             instructions.len(),
@@ -4139,9 +4147,9 @@ mod typed_tests {
         meta.set_type(4, KnownType::Bool);
 
         let ptr = compile_bytecode_region_typed(
-            &mut jit.module,
-            &mut jit.builder_context,
-            &mut jit.ctx,
+            &mut jit.codegen.optimized_module,
+            &mut jit.codegen.optimized_builder_context,
+            &mut jit.codegen.optimized_ctx,
             "test_cfg_ssa_int_if_else",
             0,
             instructions.len(),
@@ -4194,9 +4202,9 @@ mod typed_tests {
         meta.set_type(4, KnownType::Bool);
 
         let ptr = compile_bytecode_region_typed(
-            &mut jit.module,
-            &mut jit.builder_context,
-            &mut jit.ctx,
+            &mut jit.codegen.optimized_module,
+            &mut jit.codegen.optimized_builder_context,
+            &mut jit.codegen.optimized_ctx,
             "test_cfg_ssa_float_if",
             0,
             instructions.len(),
@@ -4288,9 +4296,9 @@ mod typed_tests {
         assert_eq!(cfg_plan.join_pc, 5);
 
         let ptr = compile_bytecode_region_typed(
-            &mut jit.module,
-            &mut jit.builder_context,
-            &mut jit.ctx,
+            &mut jit.codegen.optimized_module,
+            &mut jit.codegen.optimized_builder_context,
+            &mut jit.codegen.optimized_ctx,
             "test_branchy_loop_cfg_and_backedge_ssa",
             0,
             instructions.len(),
@@ -4335,9 +4343,9 @@ mod typed_tests {
         meta.set_type(1, KnownType::Int);
 
         let ptr = compile_bytecode_region_typed(
-            &mut jit.module,
-            &mut jit.builder_context,
-            &mut jit.ctx,
+            &mut jit.codegen.optimized_module,
+            &mut jit.codegen.optimized_builder_context,
+            &mut jit.codegen.optimized_ctx,
             "test_sext48",
             0,
             2,
@@ -4363,9 +4371,9 @@ mod typed_tests {
         meta2.set_type(1, KnownType::Int);
 
         let ptr2 = compile_bytecode_region_typed(
-            &mut jit2.module,
-            &mut jit2.builder_context,
-            &mut jit2.ctx,
+            &mut jit2.codegen.optimized_module,
+            &mut jit2.codegen.optimized_builder_context,
+            &mut jit2.codegen.optimized_ctx,
             "test_sext48_negative",
             0,
             3,
