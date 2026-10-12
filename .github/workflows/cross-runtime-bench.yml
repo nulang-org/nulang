@@ -92,11 +92,18 @@ jobs:
             --runtimes nulang,nulang-jit,nulang-aot \
             --output actor-backend-results.json
 
-      - name: Upload results
+      - name: Upload cross-runtime messaging results
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: cross-runtime-results-${{ github.sha }}
-          path: |
-            cross-runtime-results.json
-            actor-backend-results.json
-          if-no-files-found: error
+          path: cross-runtime-results.json
+          if-no-files-found: warn
+
+      - name: Upload native actor backend results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: actor-backend-results-${{ github.sha }}
+          path: actor-backend-results.json
+          if-no-files-found: warn
