@@ -57,5 +57,40 @@ class CrossRuntimePhaseTests(unittest.TestCase):
         self.assertEqual(result['counting']['enqueue_ns'], 0)
 
 
+
+class CrossRuntimeRunnerIntegrationTests(unittest.TestCase):
+    def test_phases_preserved_in_samples_and_summary(self):
+        from cross_runtime_bench import parse_records, summarize
+
+        output = '\\n'.join([
+            '[cross-bench] runtime=nulang benchmark=counting messages=200000 elapsed_ns=100',
+            '[cross-bench] runtime=nulang benchmark=ping_pong messages=40001 elapsed_ns=200',
+            '[cross-bench] runtime=nulang benchmark=thread_ring messages=20000 elapsed_ns=300',
+            '[cross-bench] runtime=nulang benchmark=fork_join messages=100000 elapsed_ns=600',
+            '[cross-phase] runtime=nulang benchmark=counting enqueue_ns=20 drain_ns=80',
+            '[cross-phase] runtime=nulang benchmark=fork_join enqueue_ns=250 drain_ns=350',
+        ])
+        records = parse_records(output, 'nulang')
+        self.assertEqual(records['counting']['enqueue_ns'], 20)
+        self.assertEqual(records['fork_join']['drain_ns'], 350)
+        summary = summarize({'nulang': {name: [row] for name, row in records.items()}})
+        self.assertEqual(summary['nulang']['counting']['median_enqueue_ns'], 20)
+        self.assertEqual(summary['nulang']['fork_join']['median_drain_ns'], 350)
+
+    def test_runner_rejects_incorrect_phase_sum(self):
+        from cross_runtime_bench import parse_records
+
+        output = '\\n'.join([
+            '[cross-bench] runtime=nulang benchmark=counting messages=200000 elapsed_ns=100',
+            '[cross-bench] runtime=nulang benchmark=ping_pong messages=40001 elapsed_ns=200',
+            '[cross-bench] runtime=nulang benchmark=thread_ring messages=20000 elapsed_ns=300',
+            '[cross-bench] runtime=nulang benchmark=fork_join messages=100000 elapsed_ns=600',
+            '[cross-phase] runtime=nulang benchmark=counting enqueue_ns=20 drain_ns=79',
+            '[cross-phase] runtime=nulang benchmark=fork_join enqueue_ns=250 drain_ns=350',
+        ])
+        with self.assertRaisesRegex(ValueError, 'does not equal'):
+            parse_records(output, 'nulang')
+
+
 if __name__ == '__main__':
     unittest.main()
