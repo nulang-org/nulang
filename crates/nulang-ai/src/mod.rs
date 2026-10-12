@@ -8,6 +8,7 @@
 
 pub mod client;
 pub mod debate;
+pub mod eval;
 pub mod memory;
 pub mod mock;
 pub mod pipeline;
@@ -22,6 +23,7 @@ pub mod usage;
 
 pub use client::{complete_sync, LlmClient};
 pub use debate::{Debate, DebateRuntime, Participant, Stance};
+pub use eval::{provider_contract_violations, run_evals, EvalCase, EvalExpectation, EvalResult};
 pub use memory::{EpisodicMemory, Turn};
 pub use mock::MockLlmClient;
 pub use pipeline::{Pipeline, PipelineRuntime, PipelineStage};
