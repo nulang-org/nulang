@@ -576,8 +576,16 @@ fn host_neg(_caller: Caller<'_, HostState>, a: i64) -> Result<i64, Error> {
     } else {
         // Match the interpreter's INeg (and the JIT helper `nulang_ineg`):
         // ints negate with a 48-bit overflow check at INT48_MIN; anything
-        // else is a type error. A guest pointer remains valid guest-local
-        // state, but it cannot be reconstructed as a host pointer Value.
+        // else is a type error. A guest TAG_PTR is a linear-memory offset,
+        // not a process-local host pointer, so format that type error from
+        // the raw guest bits instead of reconstructing a host `Value`.
+        if value_layout::is_ptr_raw(a) {
+            let repr = format!("#Value({a:x})");
+            return Err(Error::msg(format!(
+                "type error: arithmetic `neg` requires numeric operands, got {repr} and {repr}"
+            )));
+        }
+
         let v = guest_non_pointer_value(a).map_err(Error::msg)?;
         match v.as_int() {
             Some(x) if x != crate::value_layout::INT48_MIN => Ok(value_layout::tag_int(-x) as i64),

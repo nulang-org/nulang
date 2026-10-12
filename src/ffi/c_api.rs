@@ -67,6 +67,16 @@ impl NulangRuntime {
         handle
     }
 
+    /// Resolve an externally visible C module handle to the unique compiled
+    /// module it references. Public handles intentionally have fresh identity
+    /// even when compilation reuses a cached module, so they must never be
+    /// used directly as indices into `modules`.
+    fn module_index_for_handle(&self, module_handle: usize) -> Option<usize> {
+        let module_index = *self.module_handles.get(module_handle)?;
+        self.modules.get(module_index)?;
+        Some(module_index)
+    }
+
     fn compile(&mut self, source: &str) -> Option<usize> {
         self.clear_error();
 
@@ -97,7 +107,7 @@ impl NulangRuntime {
 
     fn run(&mut self, module_handle: usize) -> Option<Value> {
         self.clear_error();
-        let module_index = *self.module_handles.get(module_handle)?;
+        let module_index = self.module_index_for_handle(module_handle)?;
         let module = self.modules.get(module_index)?.clone();
         let mut vm = VM::new();
         vm.load_module(module);
@@ -117,7 +127,8 @@ impl NulangRuntime {
         args: &[NulangValue],
     ) -> Option<Value> {
         self.clear_error();
-        let module = self.modules.get(module_handle)?.clone();
+        let module_index = self.module_index_for_handle(module_handle)?;
+        let module = self.modules.get(module_index)?.clone();
         let offset = module.function_offset_by_name(name)?;
         let mut vm = VM::new();
         vm.load_module(module);
@@ -141,7 +152,8 @@ impl NulangRuntime {
     }
 
     fn add_module_string(&mut self, module_handle: usize, s: &str) -> Option<Value> {
-        let module = self.modules.get_mut(module_handle)?;
+        let module_index = self.module_index_for_handle(module_handle)?;
+        let module = self.modules.get_mut(module_index)?;
         let idx = module.add_string_constant(s);
         Some(Value::string(idx as u32))
     }
@@ -155,10 +167,13 @@ impl NulangRuntime {
             return value;
         }
         if let Some(bytes) = vm.string_bytes(value) {
-            if let Some(module) = self.modules.get_mut(module_handle) {
-                let id =
-                    module.add_string_constant(String::from_utf8_lossy(&bytes).into_owned()) as u32;
-                return Value::string(id);
+            if let Some(module_index) = self.module_index_for_handle(module_handle) {
+                if let Some(module) = self.modules.get_mut(module_index) {
+                    let id = module
+                        .add_string_constant(String::from_utf8_lossy(&bytes).into_owned())
+                        as u32;
+                    return Value::string(id);
+                }
             }
         }
         value
@@ -710,6 +725,32 @@ mod tests {
     }
 
     #[test]
+    fn test_cached_compile_handle_supports_module_operations() {
+        let rt = nulang_runtime_new();
+        assert!(!rt.is_null());
+
+        let source =
+            CString::new("fn len(s: String) -> Int { perform String.length(s) } len(\"\")")
+                .unwrap();
+        let first = unsafe { nulang_compile(rt, source.as_ptr()) };
+        let cached = unsafe { nulang_compile(rt, source.as_ptr()) };
+        assert!(first >= 0 && cached >= 0);
+        assert_ne!(first, cached);
+
+        let text = CString::new("cached").unwrap();
+        let arg = unsafe { nulang_module_string(rt, cached, text.as_ptr()) };
+        assert!(!nulang_value_is_nil(arg));
+
+        let args = [arg];
+        let name = CString::new("len").unwrap();
+        let result =
+            unsafe { nulang_call_function(rt, cached, name.as_ptr(), args.as_ptr(), args.len()) };
+        assert_eq!(nulang_value_int(result), 6);
+
+        unsafe { nulang_runtime_free(rt) };
+    }
+
+    #[test]
     fn test_different_source_creates_distinct_compile_cache_entries() {
         let rt = nulang_runtime_new();
         let first_source = CString::new("1 + 1").unwrap();
@@ -844,6 +885,41 @@ mod tests {
         assert_eq!(nulang_value_int(result), 42);
 
         // SAFETY: rt is valid.
+        unsafe { nulang_runtime_free(rt) };
+    }
+
+    #[test]
+    fn test_c_api_call_function_uses_bytecode_offset_for_non_first_function() {
+        let rt = nulang_runtime_new();
+        let source =
+            CString::new("fn first() -> Int { 7 } fn second() -> Int { 42 } first()").unwrap();
+
+        let handle = unsafe { nulang_compile(rt, source.as_ptr()) };
+        assert!(handle >= 0, "compile failed");
+
+        // Prove this fixture would fail if the function-table index were
+        // accidentally passed to VM::call_function as a bytecode PC.
+        let runtime = unsafe { &*rt };
+        let module_index = runtime.module_handles[handle as usize];
+        let module = &runtime.modules[module_index];
+        let offset = module
+            .function_offset_by_name("second")
+            .expect("second function offset");
+        let table_index = module
+            .function_table
+            .iter()
+            .position(|&candidate| candidate == offset)
+            .expect("second function table entry");
+        assert_ne!(
+            offset, table_index,
+            "regression fixture requires bytecode offset != function-table index"
+        );
+
+        let name = CString::new("second").unwrap();
+        let result =
+            unsafe { nulang_call_function(rt, handle, name.as_ptr(), std::ptr::null(), 0) };
+        assert_eq!(nulang_value_int(result), 42);
+
         unsafe { nulang_runtime_free(rt) };
     }
 

@@ -6,6 +6,12 @@ on:
     # Only check PRs that introduce user-visible changes.
     # Draft PRs are exempt until marked ready.
 
+# A newer commit on the same PR/head makes the older validation result stale.
+# Keep event types separate so scheduled/default-branch runs do not cancel PR runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -55,7 +61,7 @@ jobs:
       - name: Verify CHANGELOG.md was modified
         if: steps.check.outputs.needed == 'true'
         run: |
-          git fetch origin "${{ github.base_ref }}" --depth=1
+          git fetch origin "${{ github.base_ref }}"
           if git diff --name-only "origin/${{ github.base_ref }}...HEAD" | grep -q "^CHANGELOG.md$"; then
             echo "✓ CHANGELOG.md updated"
             exit 0

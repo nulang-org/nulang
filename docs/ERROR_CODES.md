@@ -45,7 +45,7 @@ suspension is not an error, and each child of `Multiple` has its own code.
 | `E0302` | Unhandled effect (no handler installed)   | `EffectError`/runtime |
 | `E0300`* | Spawn-time capability denied (message prefix `capability denied:`, names the missing `Net::TcpOut("host:port")` token; see SPEC2 §5.9) | `EffectError`/runtime |
 | `E0400` | Capability error (generic)                | `CapError`         |
-| `E0401` | Sendability violation (non-`val` cross-actor send) | `CapError` |
+| `E0401` | Sendability / actor-isolation violation | `CapError` |
 | `E0402` | Linear value used after consume           | `CapError`         |
 | `E0501` | Runtime error (generic)                   | `RuntimeError`     |
 | `E0502` | VM error (generic)                        | `VMError`          |

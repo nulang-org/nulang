@@ -1,0 +1,6 @@
+# Standard Buildkite discovery entrypoint. `ci.yml` is the canonical pipeline.
+steps:
+  - label: ":pipeline: Upload Nulang CI"
+    command: "buildkite-agent pipeline upload ci.yml"
+    agents:
+      queue: "nulang-cloud"
