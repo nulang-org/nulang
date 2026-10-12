@@ -35,10 +35,14 @@ class GitHubActionsCIContractTests(unittest.TestCase):
     def test_rust_build_matrix_remains_in_primary_ci(self):
         source = CI_WORKFLOW.read_text(encoding="utf-8")
 
+        # Every Rust test job runs under nextest so the retry policy in
+        # .config/nextest.toml applies uniformly; doctests stay on cargo test.
         self.assertIn("cargo nextest run --locked", source)
         self.assertIn("cargo nextest run --locked --features wasm-backend", source)
-        self.assertIn("cargo test --locked --no-default-features", source)
+        self.assertIn("cargo nextest run --locked --no-default-features", source)
+        self.assertIn("cargo nextest run --release --locked", source)
         self.assertIn("cargo clippy --locked --all-targets", source)
+        self.assertIn("--doc", source)
 
     def test_whitespace_parity_step_is_retained(self):
         source = CI_WORKFLOW.read_text(encoding="utf-8")

@@ -153,11 +153,20 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
       - name: Build (release)
         run: cargo build --locked --release
 
+      # nextest isolates tests in their own processes and applies the retry
+      # policy in .config/nextest.toml (load-flaky multi-node cluster tests).
       - name: Test (release)
-        run: cargo test --locked --release
+        run: cargo nextest run --release --locked
+
+      # nextest intentionally does not execute rustdoc tests.
+      - name: Test doctests (release)
+        run: cargo test --release --locked --doc
 
       - name: Stage tested release binary
         run: |
@@ -225,13 +234,22 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
       # No python3-dev installed here on purpose: this job proves the
       # no-default-features build has zero PyO3/SQLite/LSP dependencies.
       - name: Build
         run: cargo build --locked --all-targets --no-default-features
 
+      # nextest isolates tests in their own processes and applies the retry
+      # policy in .config/nextest.toml (load-flaky multi-node cluster tests).
       - name: Test
-        run: cargo test --locked --no-default-features
+        run: cargo nextest run --locked --no-default-features
+
+      # nextest intentionally does not execute rustdoc tests.
+      - name: Test doctests (no default features)
+        run: cargo test --locked --no-default-features --doc
 
       - name: Check zero warnings
         run: cargo check --locked --tests --no-default-features
