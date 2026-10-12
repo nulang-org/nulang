@@ -315,7 +315,7 @@ pub(crate) fn perform_web_builtin(
             unsafe {
                 let header = &*ActorHeap::header_of(ptr);
                 if header.type_tag == HeapTypeTag::Array || header.type_tag == HeapTypeTag::Tuple {
-                    let payload_size = header.size.saturating_sub(ActorHeap::HEADER_SIZE);
+                    let payload_size = header.padded_payload_size();
                     let len = payload_size / std::mem::size_of::<crate::vm::Value>();
                     if len > 0 {
                         return std::slice::from_raw_parts(ptr as *const crate::vm::Value, len)
@@ -677,9 +677,7 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
         unsafe {
             let header = &*crate::runtime::heap::ActorHeap::header_of(ptr);
             if header.type_tag == crate::runtime::heap::TypeTag::Array {
-                let payload_size = header
-                    .size
-                    .saturating_sub(crate::runtime::heap::ActorHeap::HEADER_SIZE);
+                let payload_size = header.padded_payload_size();
                 Some(payload_size / std::mem::size_of::<crate::vm::Value>())
             } else {
                 None
@@ -1495,9 +1493,7 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
             let _actor = (*self.runtime).actors.get(&self.actor_id)?;
             let header = &*crate::runtime::heap::ActorHeap::header_of(ptr);
             if header.type_tag == crate::runtime::heap::TypeTag::Array {
-                let payload_size = header
-                    .size
-                    .saturating_sub(crate::runtime::heap::ActorHeap::HEADER_SIZE);
+                let payload_size = header.padded_payload_size();
                 Some(payload_size / std::mem::size_of::<crate::vm::Value>())
             } else {
                 None
