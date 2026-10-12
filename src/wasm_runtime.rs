@@ -500,13 +500,19 @@ fn host_arith_fi(a: u64, b: u64, fop: fn(f64, f64) -> f64, iop: fn(i64, i64) -> 
     }
 }
 
-fn host_add(_caller: Caller<'_, HostState>, a: i64, b: i64) -> Result<i64, Error> {
-    Ok(host_arith_fi(
-        a as u64,
-        b as u64,
-        |x, y| x + y,
-        |x, y| x + y,
-    ))
+fn host_add(caller: Caller<'_, HostState>, a: i64, b: i64) -> Result<i64, Error> {
+    let raw_a = a as u64;
+    let raw_b = b as u64;
+    // Unlike other numeric operators, IAdd concatenates if either operand
+    // is a string. MIR ArrayLoad results have unknown static types, so an
+    // indexed string reaches arith_add rather than the typed str_concat call.
+    // Preserve the interpreter's dynamic string-to-text coercion here.
+    if (raw_a & value_layout::TAG_MASK) == value_layout::TAG_STRING
+        || (raw_b & value_layout::TAG_MASK) == value_layout::TAG_STRING
+    {
+        return host_str_concat(caller, a, b);
+    }
+    Ok(host_arith_fi(raw_a, raw_b, |x, y| x + y, |x, y| x + y))
 }
 fn host_sub(_caller: Caller<'_, HostState>, a: i64, b: i64) -> Result<i64, Error> {
     Ok(host_arith_fi(
@@ -1143,6 +1149,33 @@ mod tests {
         let engine = Engine::new(&config).unwrap();
         let result = Module::new(&engine, &[] as &[u8]);
         assert!(result.is_err(), "empty bytes should fail to parse");
+    }
+
+    #[test]
+    fn test_host_add_concatenates_dynamic_string_and_integer_in_both_orders() {
+        // A string read from an array is lowered as dynamic Binary(Add),
+        // not the statically known StrConcat rvalue. Match interpreter IAdd.
+        let tagged_string = (value_layout::TAG_STRING | 8) as i64;
+        let tagged_two = value_layout::tag_int(2) as i64;
+        for (lhs, rhs, expected) in [
+            (tagged_string, tagged_two, "x2"),
+            (tagged_two, tagged_string, "2x"),
+        ] {
+            let wat = format!(
+                r#"(module
+                    (import "env" "memory" (memory 1))
+                    (import "env" "arith_add" (func $add (param i64 i64) (result i64)))
+                    (data (i32.const 8) "x\00")
+                    (func (export "nulang_init") (result i64)
+                        i64.const {lhs}
+                        i64.const {rhs}
+                        call $add)
+                )"#
+            );
+            let mut runtime = WasmRuntime::new(wat.as_bytes(), None).unwrap();
+            let result = runtime.run().unwrap();
+            assert_eq!(runtime.string_value(&result).as_deref(), Some(expected));
+        }
     }
 
     #[test]

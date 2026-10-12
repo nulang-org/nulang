@@ -6,6 +6,18 @@ use crate::bytecode::*;
 extern "C" fn noop_jit_region(_regs: *mut u64, _constants: *const u64) {}
 
 #[test]
+fn checked_integer_negation_must_not_enter_native_jit_without_exception_exit() {
+    // INeg can throw for non-numbers and INT48_MIN. A JIT region without
+    // an exceptional exit must leave that instruction to the interpreter.
+    // The typed emitter still contains a raw INeg arm, so check *both*
+    // admission gates, not just the scalar compiler's supported-opcode list.
+    assert!(!crate::jit::compiler::is_opcode_compilable(OpCode::INeg));
+    assert!(!crate::jit::typed_compiler::is_opcode_supported_typed(
+        OpCode::INeg
+    ));
+}
+
+#[test]
 fn call_free_compiled_execution_skips_leaf_table_install() {
     let mut jit = make_jit();
     jit.store_compiled(0, 0, noop_jit_region as *const u8, 1);
