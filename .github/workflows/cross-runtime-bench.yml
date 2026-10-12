@@ -25,6 +25,9 @@ on:
       - 'benchmarks/cross_runtime/**'
       - 'benchmarks/README.md'
       - 'scripts/cross_runtime_bench.py'
+      - 'scripts/actor_density_cross_runtime.py'
+      - 'tests/test_cross_runtime_bench.py'
+      - 'tests/test_actor_density_cross_runtime.py'
       - 'src/benchmarks.rs'
       - 'src/bin/nulang_savina.rs'
       - 'benchmarks/SAVINA.md'
@@ -36,7 +39,7 @@ concurrency:
 
 jobs:
   compare:
-    name: Nulang vs Rust / Go / Erlang baselines
+    name: Nulang vs Rust / Go / Erlang / Ractor baselines
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -58,6 +61,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y erlang-base erlang-dev
 
+      - name: Validate comparator output contracts
+        run: python3 -m unittest discover -s tests -p test_cross_runtime_bench.py -v
+
+      - name: Validate actor-density probe contracts
+        run: python3 -m unittest discover -s tests -p test_actor_density_cross_runtime.py -v
+
+      - name: Smoke-test Ractor actor density
+        run: |
+          cargo run --locked --release \
+            --manifest-path benchmarks/cross_runtime/ractor_baseline/Cargo.toml \
+            --bin density -- idle 1000 > ractor-density-smoke.txt
+          grep -q '^actor_count=1000$' ractor-density-smoke.txt
+          grep -q '^rss_after_settle_bytes=' ractor-density-smoke.txt
+
       - name: Run cross-runtime baselines
         env:
           RUNS: "${{ inputs.runs || '3' }}"
@@ -74,5 +91,8 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: cross-runtime-results-${{ github.sha }}
-          path: cross-runtime-results.json
+          path: |
+            cross-runtime-results.json
+            ractor-density-smoke.txt
+            benchmarks/cross_runtime/ractor_baseline/Cargo.lock
           if-no-files-found: error

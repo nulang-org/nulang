@@ -1,0 +1,12 @@
+[package]
+name = "nulang-ractor-baseline"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Independent benchmark fixture; deliberately not added to Nulang's workspace.
+[workspace]
+
+[dependencies]
+ractor = "=0.16.5"
+tokio = { version = "1.47", features = ["macros", "rt", "sync"] }
