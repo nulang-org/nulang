@@ -4294,25 +4294,44 @@ impl Runtime {
                         processed = false;
                     }
                     Err(e) => {
-                        self.checkpoint_actor(actor_id);
-                        // A workflow step failed: record the failure (durable
-                        // StepFailed event — SPEC2 §10 known-issue #5: step
-                        // failures were silent, exit 0, no diagnostic), then
-                        // run saga compensations for previously completed
-                        // steps in reverse order.
+                        // A compiled workflow failure must commit its terminal
+                        // event BEFORE checkpointing any speculative VM state
+                        // or running saga compensation. The legacy event and
+                        // snapshot are separate writes: failure of either
+                        // requires quarantining the actor until safe recovery
+                        // can prove the persisted history is consistent.
                         if self.actor_is_workflow(actor_id) {
                             let seq = self.next_sequence(actor_id);
                             let step_name = self.step_name_for(actor_id, behavior_idx);
-                            let _ = self.persistence.append_workflow_event(
-                                actor_id,
-                                WorkflowEvent::StepFailed {
-                                    sequence: seq,
-                                    activation: workflow_activation,
-                                    step_name,
-                                    error: format!("{}", e),
-                                },
-                            );
+                            let terminal_result = self
+                                .persistence
+                                .append_workflow_event(
+                                    actor_id,
+                                    WorkflowEvent::StepFailed {
+                                        sequence: seq,
+                                        activation: workflow_activation,
+                                        step_name,
+                                        error: format!("{}", e),
+                                    },
+                                )
+                                .and_then(|_| workflow::try_checkpoint_actor(self, actor_id));
+                            if let Err(error) = terminal_result {
+                                tracing::error!(
+                                    actor_id,
+                                    %error,
+                                    "nulang-workflow: failed-step terminal persistence rejected; quarantining actor"
+                                );
+                                self.actors.remove(&actor_id);
+                                self.pending_receive_wakes
+                                    .retain(|queued| *queued != actor_id);
+                                self.current_actor = None;
+                                return;
+                            }
+                            // Compensations are observable and must not begin
+                            // until the failure itself is durably recorded.
                             self.run_saga_compensation(actor_id, behavior_idx);
+                        } else {
+                            self.checkpoint_actor(actor_id);
                         }
                         processed = false;
                     }
