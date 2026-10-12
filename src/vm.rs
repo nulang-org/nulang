@@ -802,19 +802,23 @@ pub(crate) fn hashmap_op(
                     unsafe {
                         let oldk = *((base as *const Value).add(1));
                         let oldv = *((base as *const Value).add(2));
+                        // The incoming values can alias the existing slots
+                        // (for example after Map.get). Retain them before
+                        // dropping the old slot references, or a borrowed
+                        // value could be freed before being retained again.
+                        if let Some(p) = k.as_ptr() {
+                            callbacks.retain_ref(p);
+                        }
+                        if let Some(p) = v.as_ptr() {
+                            callbacks.retain_ref(p);
+                        }
+                        *((base as *mut Value).add(1)) = k;
+                        *((base as *mut Value).add(2)) = v;
                         if let Some(p) = oldk.as_ptr() {
                             callbacks.drop_ref(p);
                         }
                         if let Some(p) = oldv.as_ptr() {
                             callbacks.drop_ref(p);
-                        }
-                        *((base as *mut Value).add(1)) = k;
-                        if let Some(p) = k.as_ptr() {
-                            callbacks.retain_ref(p);
-                        }
-                        *((base as *mut Value).add(2)) = v;
-                        if let Some(p) = v.as_ptr() {
-                            callbacks.retain_ref(p);
                         }
                     }
                     return Some(unsafe {
