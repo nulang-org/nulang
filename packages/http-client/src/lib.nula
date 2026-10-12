@@ -125,3 +125,39 @@ pub fn send_request(req) -> String ! {Http, String, Array} {
         perform Http.get(request_url(req))
     }
 }
+
+
+/// Preflight a request against the legacy Http.get/Http.post effect transport.
+/// The builder can describe more than that transport can send: it cannot
+/// currently transmit caller-provided headers or arbitrary HTTP methods.
+/// Return a typed error instead of allowing those fields to be ignored.
+pub fn validate_transport(req) {
+    if req.method != "GET" && req.method != "POST" then {
+        Error("unsupported HTTP method: " + req.method)
+    } else if perform Array.length(req.headers) > 0 then {
+        Error("custom request headers are not supported by Http.get/post")
+    } else if req.method == "GET" && req.body != "" then {
+        Error("GET request body is not supported")
+    } else {
+        Ok(unit)
+    }
+}
+
+/// Opt-in fail-closed send for the existing body-only Http effect.
+/// Rejects unsupported request options before network I/O. Since the legacy
+/// effect collapses transport errors, non-2xx, and timeout to nil, it cannot
+/// yet return a precise status code or HttpError. A future versioned transport
+/// must expose response status, headers, and structured error causes.
+pub fn send_request_checked(req) {
+    match validate_transport(req) {
+        Error(message) => Error(message),
+        Ok(_) => {
+            let response = send_request(req);
+            if response == nil then {
+                Error("Http.get/post failed (status and cause unavailable)")
+            } else {
+                Ok(response)
+            }
+        },
+    }
+}
