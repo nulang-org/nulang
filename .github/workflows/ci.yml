@@ -121,7 +121,7 @@ jobs:
         # Include both source and snapshot changes; never silently skip a
         # changed .nula file without a matching .json expectation.
         run: |
-          git diff --name-only --diff-filter=ACMRT HEAD^1 HEAD -- 'conformance/behavior/*.nula' 'conformance/behavior/*.json' > /tmp/nulang-changed-behavior.txt
+          git diff --name-only --diff-filter=ACMRTD HEAD^1 HEAD -- 'conformance/behavior/*.nula' 'conformance/behavior/*.json' > /tmp/nulang-changed-behavior.txt
           python3 scripts/run_changed_conformance.py --file-list /tmp/nulang-changed-behavior.txt
 
       - name: Install cargo-llvm-cov
