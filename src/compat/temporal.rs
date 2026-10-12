@@ -205,6 +205,7 @@ impl TemporalWorkflowTaskContext {
         validate_non_empty("timer_id", &timer_id)?;
         Ok(WorkflowEvent::TimerSet {
             sequence: self.transition_sequence,
+            replay_id: None,
             name: timer_id,
             duration_ms,
         })
@@ -999,10 +1000,12 @@ mod tests {
         match ctx.timer_started("retry", 1_500).unwrap() {
             WorkflowEvent::TimerSet {
                 sequence,
+                replay_id,
                 name,
                 duration_ms,
             } => {
                 assert_eq!(sequence, 9);
+                assert_eq!(replay_id, None);
                 assert_eq!(name, "retry");
                 assert_eq!(duration_ms, 1_500);
             }
