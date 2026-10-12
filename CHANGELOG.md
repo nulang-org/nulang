@@ -233,6 +233,10 @@ version + migration.*
 
 ## Stable tier
 
+### Effect-boundary observability metadata — 2026-09-23
+- **Effect durability semantics now have canonical low-cardinality observability labels** (`src/primitives.rs`) for runtime-owned, backend-owned, external, at-least-once, effectively-once-with-deduplication, and backend-defined execution.
+- **Trace contexts can create explicit effect spans** (`src/runtime/trace.rs`) carrying actor identity, effect name, boundary, delivery semantics, optional stable operation/idempotency identity, and the existing W3C trace hierarchy.
+- Call sites must provide the guarantee they actually enforce; tracing does not infer or strengthen semantics from an effect name. This is a current-`main` extraction of #350.
 ### Zero-copy non-reentrant JIT register entry — 2026-09-24
 - **Cranelift regions that cannot re-enter the VM now execute directly against the active frame's 256-register array**, eliminating the previous 2 KiB snapshot before native entry and 2 KiB copy-back afterward. `Value` is explicitly `repr(transparent)` over `u64` so the native register ABI has a documented layout guarantee.
 - **Compiled-region metadata now records whether native execution may grow or replace the VM frame stack.** Regions containing helper-backed direct calls retain the detached register snapshot because re-entrant interpreter calls may reallocate `VM::frames`; typed, SIMD, and scalar non-call regions use the direct-frame path.
