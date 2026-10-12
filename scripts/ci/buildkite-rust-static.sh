@@ -23,6 +23,11 @@ cargo check --locked --all-targets
 cargo clippy --locked --all-targets -- -D clippy::correctness
 cargo check --locked --tests
 
+# Prove the named batteries-included compatibility profile independently of
+# the current default alias. This lets release consumers pin `full` before a
+# later change makes the default profile smaller.
+cargo check --locked --all-targets --no-default-features --features full
+
 cargo check --locked --all-targets --all-features
 cargo clippy --locked --all-targets --all-features -- -D clippy::correctness
 

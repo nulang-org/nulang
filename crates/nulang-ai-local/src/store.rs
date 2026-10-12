@@ -245,7 +245,7 @@ impl SqliteStore {
             })?;
 
         let mut stmt = conn.prepare(
-            "SELECT id, goal_id, parent_task_id, manager, description, dependencies, required_capabilities, acceptance_criteria, budget_usd, timeout_secs, status, assigned_agent_id, created_at, updated_at FROM tasks WHERE goal_id = ?1",
+            "SELECT id, goal_id, parent_task_id, manager, description, dependencies, required_capabilities, acceptance_criteria, budget_usd, timeout_secs, status, assigned_agent_id, created_at, updated_at FROM tasks WHERE goal_id = ?1 ORDER BY created_at ASC, id ASC",
         )?;
         let tasks = stmt
             .query_map(params![goal_id.to_string()], |row| {
