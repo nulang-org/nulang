@@ -1602,6 +1602,34 @@ fn test_compact_header_preserves_exact_payload_lengths() {
     }
 }
 
+/// Compact-header LOS reuse must match the original physical allocation
+/// extent exactly; mismatched requests must not reuse each other's blocks.
+#[cfg(feature = "compact-orca-header")]
+#[test]
+fn test_compact_header_los_exact_size_reuse_and_reset() {
+    let mut heap = ActorHeap::new(4096);
+    let original = heap.alloc(301, TypeTag::Raw).unwrap();
+    assert_eq!(
+        unsafe { (*ActorHeap::header_of(original)).total_size() },
+        ActorHeap::HEADER_SIZE + 304
+    );
+    unsafe {
+        heap.free(original);
+    }
+
+    // 309 bytes align to 312, so the original 304-byte allocation
+    // cannot be reused and must retain its own deallocation layout.
+    let different = heap.alloc(309, TypeTag::Raw).unwrap();
+    assert_ne!(different, original);
+    let reused = heap.alloc(301, TypeTag::Raw).unwrap();
+    assert_eq!(reused, original);
+    assert_eq!(heap.live_count(), 2);
+
+    // Release all LOS blocks, including one retrieved from a free list.
+    heap.reset();
+    assert_eq!(heap.live_count(), 0);
+}
+
 #[cfg(not(feature = "compact-orca-header"))]
 #[test]
 fn test_header_size_is_56() {
