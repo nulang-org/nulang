@@ -18,12 +18,14 @@ class ActorComputeBackendTests(unittest.TestCase):
     def test_accepts_warmed_actor_jit_with_compilation_proof(self):
         output = (
             "[jit-warm] workload=actor_compute actor_vm_compiled_regions=1\n"
+            "[jit-proof] workload=actor_compute actor_vm_new_compiled_regions=1\n"
             "[cross-bench] runtime=nulang-jit benchmark=actor_compute "
             "messages=128 elapsed_ns=190000\n"
         )
         self.assertEqual(
             parse_records(output, "nulang-jit", COMPUTE_BENCHMARKS)["actor_compute"],
-            {"messages": 128, "elapsed_ns": 190000, "jit_actor_vm_compiled_regions": 1},
+            {"messages": 128, "elapsed_ns": 190000, "jit_actor_vm_compiled_regions": 1,
+             "jit_actor_vm_new_compiled_regions": 1},
         )
 
     def test_rejects_jit_enabled_without_actual_compilation(self):
@@ -39,6 +41,13 @@ class ActorComputeBackendTests(unittest.TestCase):
         ):
             with self.subTest(proof=proof), self.assertRaisesRegex(RuntimeError, "native JIT proof"):
                 parse_records(proof + record, "nulang-jit", COMPUTE_BENCHMARKS)
+
+    def test_rejects_old_regions_without_new_actor_work_compilation(self):
+        row = "[cross-bench] runtime=nulang-jit benchmark=actor_compute messages=128 elapsed_ns=1"
+        original = "[jit-warm] workload=actor_compute actor_vm_compiled_regions=2\n"
+        for delta in ("", "[jit-proof] workload=actor_compute actor_vm_new_compiled_regions=0\n"):
+            with self.subTest(delta=delta), self.assertRaisesRegex(RuntimeError, "new JIT proof"):
+                parse_records(original + delta + row, "nulang-jit", COMPUTE_BENCHMARKS)
 
     def test_rejects_duplicate_result(self):
         record = "[cross-bench] runtime=nulang-aot benchmark=actor_compute messages=128 elapsed_ns=1"
