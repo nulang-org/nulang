@@ -6,7 +6,7 @@ on:
       runs:
         description: Measured runs per runtime
         required: false
-        default: '12'
+        default: '10'
       warmup:
         description: Warm-up runs per runtime
         required: false
@@ -69,7 +69,7 @@ jobs:
 
       - name: Run cross-runtime baselines
         env:
-          RUNS: "${{ inputs.runs || '12' }}"
+          RUNS: "${{ inputs.runs || '10' }}"
           WARMUP: "${{ inputs.warmup || '1' }}"
           CPU_MODE: "${{ inputs.cpu_mode || 'single' }}"
           RUNTIMES: "${{ inputs.runtimes || 'nulang,nulang-aot,rust,go,erlang' }}"
