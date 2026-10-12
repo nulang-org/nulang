@@ -1,5 +1,10 @@
 # Nulang Changelog
 
+### Additive typed FS/HTTP results — 2026-10-12
+- **Experimental stdlib gains nonbreaking Result-based I/O helpers.** `stdlib::fs.try_read/try_write/try_append` and `stdlib::http.try_get/try_post` return typed `Result` values without changing existing `read/write/append/get/post` call sites or the underlying host effect ABI.
+- **Errors remain honest about missing transport details.** The result wrappers report operation/path/URL only because host effects currently collapse underlying I/O failures to `nil`; no granular OS/HTTP error classification is implied. Deterministic conformance coverage is included.
+
+
 ### Public CLI release portability — 2026-10-11
 - **Public release archives use the `release-cli` feature profile without a Python shared-library ABI dependency.** The ordinary full/default source build retains opt-in Python interoperability; release packaging checks the resulting Linux and macOS binary for Python dependencies.
 - **Release PRs rehearse the full non-publishing four-platform build matrix before tags are created.** The Linux ARM64 cross build explicitly installs target libc development headers and preflights a target-compiler C header probe, avoiding an observed `ring` compile failure when `--no-install-recommends` omits the ARM64 sysroot. Actual cross-build and clean-host portability remain release gates.
