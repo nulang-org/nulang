@@ -665,7 +665,7 @@ mod tests {
             let h = &*ActorHeap::header_of(p);
             assert_eq!(h.type_tag, TypeTag::Array);
             assert_eq!(
-                h.size.saturating_sub(ActorHeap::HEADER_SIZE) / std::mem::size_of::<u64>(),
+                h.padded_payload_size() / std::mem::size_of::<u64>(),
                 3
             );
         }
