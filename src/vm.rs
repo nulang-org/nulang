@@ -3,7 +3,7 @@
 //! ## Architecture
 //!
 //! - **256 general-purpose registers** per activation frame
-//! - **NaN-boxing** for efficient tagged values (int/float/bool/nil/actor_ref)
+//! - **Canonical 64-bit tagged words** for values (16-bit tag + 48-bit payload; raw IEEE-754 bits for floats)
 //! - **Bytecode modules** with constant pools and function tables
 //! - **Algebraic effects** via handler stack (Perform/Resume/Unwind/Handle)
 //!
@@ -20,9 +20,9 @@
 //!
 //! ## Value Representation
 //!
-//! Uses NaN boxing: all non-float values are encoded in the quiet-NaN
-//! payload of an f64. This gives us 51 bits of payload space for
-//! pointers, integers, and type tags.
+//! Uses the canonical i64/u64 tagged-word ABI from `value_layout`: tagged values use
+//! a 16-bit tag and 48-bit payload, while floats retain raw IEEE-754 bits with
+//! NaNs canonicalized to a reserved non-tag pattern.
 
 use std::ffi::{c_char, CStr, CString};
 
@@ -122,6 +122,13 @@ pub enum PerformAsyncResult {
     /// result (interned into the module's constant pool by the VM), `None`
     /// means nil.
     Ready(Option<String>),
+    /// The effect completed with an already-materialized VM value.
+    ///
+    /// This keeps generic asynchronous host effects type-preserving when their
+    /// result is not naturally a string (for example an integer, boolean, or
+    /// opaque foreign-runtime handle). The value is produced on the scheduler
+    /// thread; worker threads must still cross the owned-value boundary first.
+    ReadyValue(Value),
     /// The effect was dispatched to a background worker; the VM suspends the
     /// current behavior and re-executes the `PerformAsync` instruction on resume.
     Pending,
@@ -331,12 +338,11 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
     /// `effect_op` is the fully-qualified effect-and-operation name (e.g.
     /// `"Inference.ask"`). `args` are the staged argument values from
     /// registers r0..rN; `constants` is the performing module's constant
-    /// pool for resolving string-id arguments. Returns `Ready(content)` when
-    /// the effect completed synchronously (the VM interns the content string
-    /// into its module's constant pool), or `Pending` when the call was
-    /// dispatched to a background worker — the VM then suspends the current
-    /// behavior with a `PerformAsync` sentinel and re-executes the
-    /// instruction on resume.
+    /// pool for resolving string-id arguments. Returns `Ready(content)` for
+    /// string/nil results, `ReadyValue(value)` for a scheduler-materialized
+    /// non-string result, or `Pending` when the call was dispatched to a
+    /// background worker — the VM then suspends the current behavior with a
+    /// `PerformAsync` sentinel and re-executes the instruction on resume.
     ///
     /// The default implementation returns `Ready(None)` so the standalone VM
     /// always gets a nil result for any async effect.
@@ -1921,6 +1927,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
 ///
 /// All non-float values are encoded in the quiet-NaN payload of an f64.
 /// The high 16 bits hold the type tag; the low 48 bits hold the payload.
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Value {
     raw: u64,
@@ -2456,12 +2463,10 @@ fn compute_jit_candidate_pcs(module: &CodeModule) -> Vec<bool> {
     for info in &module.debug_functions {
         mark(info.code_offset);
     }
-    // Statement starts are cheap compiler-provided region boundaries and also
-    // cover less-common control-flow constructs whose jump tables are not
-    // decoded here (for example Switch).
-    for &(pc, _) in &module.line_table {
-        mark(pc);
-    }
+    // Debug/source line metadata is intentionally not consulted here. MIR
+    // statements can share a basic block, so treating every line-table entry
+    // as a hotness boundary makes cold straight-line code probe the JIT far
+    // more often without exposing a new compilable control-flow entry.
 
     for (pc, instr) in module.instructions.iter().enumerate() {
         let next = pc + 1;
@@ -2539,7 +2544,9 @@ pub struct VM {
     /// Most interpreted instructions are not useful region entry points.
     /// Skipping the JIT vtable call and counter update at those PCs keeps cold
     /// execution close to the pure-interpreter path while retaining function,
-    /// behavior, statement, branch, and post-boundary entries.
+    /// behavior, branch-target/fallthrough, and post-boundary entries. Debug
+    /// line metadata remains independent so breakpoint/stepping fidelity does
+    /// not add hotness probes.
     #[cfg(feature = "native-codegen")]
     jit_candidate_pcs: Vec<Vec<bool>>,
     /// Runtime error raised by a re-entrant JIT direct call (taken from the
@@ -3063,6 +3070,16 @@ impl VM {
             .as_ref()
             .map(|j| j.compiled_count())
             .unwrap_or(0)
+    }
+
+    /// Compiler-only telemetry for this VM's JIT session.
+    ///
+    /// This excludes interpreter warm-up and generated-code execution time.
+    pub fn jit_compile_stats(&self) -> crate::backends::JitCompileStats {
+        self.jit_session
+            .as_ref()
+            .map(|jit| jit.compile_stats())
+            .unwrap_or_default()
     }
 
     /// Discard all closure capture environments.
@@ -3594,6 +3611,15 @@ impl VM {
             return false;
         }
 
+        // Capture the active module address before native entry. The direct
+        // frame-register path exposes this immutable, disjoint module context
+        // to string-aware helpers instead of exposing the parent VM itself.
+        // Non-reentrant execution cannot grow/reallocate `self.modules`.
+        let module_ptr = self
+            .modules
+            .get(module_idx)
+            .map(|module| module as *const CodeModule);
+
         // Detach the raw-bit constant cache as well. No slice into VM-owned
         // storage may survive a re-entrant &mut VM call.
         let constants = if module_idx < self.jit_constants.len() {
@@ -3602,29 +3628,65 @@ impl VM {
             Vec::new()
         };
 
-        // Snapshot registers into stack-local storage. This deliberately keeps
-        // the current conservative 256-register ABI; register-copy reduction
-        // is a separate optimization and must not be entangled with this
-        // ownership fix.
-        let mut regs: [u64; 256] = [0; 256];
-        for (i, r) in self.frames[frame_idx].regs.iter().enumerate() {
-            regs[i] = r.to_bits();
+        // Regions containing helper-backed direct calls can re-enter the VM
+        // and push interpreter frames. A push may reallocate `VM::frames`, so
+        // those regions must retain the detached 256-register snapshot.
+        //
+        // Regions proven not to re-enter the VM execute directly against the
+        // active frame's register storage. `Value` is repr(transparent) over
+        // u64, making the native ABI layout identical while removing both the
+        // 2 KiB copy-in and 2 KiB copy-back from the common hot-region path.
+        let requires_vm_reentry = jit.compiled_region_requires_vm_reentry(module_idx, pc);
+        let mut detached_regs: [u64; 256] = [0; 256];
+        if requires_vm_reentry {
+            for (i, r) in self.frames[frame_idx].regs.iter().enumerate() {
+                detached_regs[i] = r.to_bits();
+            }
         }
 
-        // No Rust borrow into module/backend/constant-cache storage survives
-        // beyond this point. Helpers receive raw pointers scoped to this
-        // synchronous native call.
+        // Install callback state before borrowing the frame register array.
+        // JIT_VM itself is only installed for the detached path: direct-frame
+        // regions are compiled without helpers that dereference the VM pointer,
+        // which avoids creating an overlapping &VM while native code mutates
+        // the frame register subobject.
         let self_ptr = self as *mut VM;
         unsafe {
             crate::jit::runtime::set_jit_callbacks(
                 self.actor_callbacks.as_mut() as *mut dyn ActorVmCallbacks
             );
-            crate::jit::runtime::set_jit_vm(self_ptr, module_idx);
+            if requires_vm_reentry {
+                crate::jit::runtime::set_jit_vm(self_ptr, module_idx);
+            } else if let Some(module_ptr) = module_ptr {
+                crate::jit::runtime::set_jit_string_module(module_ptr);
+            }
         }
 
-        let action = jit.execute_compiled(module_idx, pc, &mut regs, &constants);
+        let action = if requires_vm_reentry {
+            jit.execute_compiled(module_idx, pc, &mut detached_regs, &constants)
+        } else {
+            // SAFETY:
+            // - Value is repr(transparent) over u64, so [Value; 256] and
+            //   [u64; 256] have identical size/alignment/layout;
+            // - this compiled region is marked non-reentrant, so no helper can
+            //   grow/reallocate VM::frames while this reference is live;
+            // - JIT_VM is intentionally not installed on this path, so native
+            //   helpers cannot create a reference to the parent VM that aliases
+            //   this exclusive register borrow;
+            // - string-aware helpers use a separate immutable CodeModule
+            //   pointer, which is disjoint from `frames` and cannot move on
+            //   this non-reentrant path;
+            // - execution is synchronous and the borrow ends on return.
+            let regs = unsafe {
+                &mut *(&mut self.frames[frame_idx].regs as *mut [Value; 256] as *mut [u64; 256])
+            };
+            jit.execute_compiled(module_idx, pc, regs, &constants)
+        };
 
-        crate::jit::runtime::clear_jit_vm();
+        if requires_vm_reentry {
+            crate::jit::runtime::clear_jit_vm();
+        } else {
+            crate::jit::runtime::clear_jit_string_module();
+        }
         crate::jit::runtime::clear_jit_callbacks();
 
         // Query metadata while the backend is still local, then restore every
@@ -3641,8 +3703,10 @@ impl VM {
         }
 
         if action != TieredAction::Interpret {
-            for (i, bits) in regs.iter().enumerate() {
-                self.frames[frame_idx].regs[i] = unsafe { Value::from_bits(*bits) };
+            if requires_vm_reentry {
+                for (i, bits) in detached_regs.iter().enumerate() {
+                    self.frames[frame_idx].regs[i] = unsafe { Value::from_bits(*bits) };
+                }
             }
 
             // A re-entrant callee raised a runtime error. Surface it before
@@ -4349,6 +4413,9 @@ impl VM {
                     Some(ref content) => self.add_runtime_string(module_idx, content.clone()),
                     None => Value::nil(),
                 };
+                self.frames[frame_idx].regs[dst_reg] = value;
+            }
+            PerformAsyncResult::ReadyValue(value) => {
                 self.frames[frame_idx].regs[dst_reg] = value;
             }
             PerformAsyncResult::Pending => {
@@ -6217,6 +6284,100 @@ mod vm_tests {
     use super::*;
     use crate::bytecode::{BehaviorTableEntry, HandlerBinding, HandlerTable, Instruction};
 
+    #[derive(Debug)]
+    struct ReadyValueCallbacks {
+        heap: ActorHeap,
+        gc: crate::runtime::OrcaGc,
+    }
+
+    impl ReadyValueCallbacks {
+        fn new() -> Self {
+            let mut heap = ActorHeap::new(1024 * 1024);
+            heap.set_actor_id(0);
+            Self {
+                heap,
+                gc: crate::runtime::OrcaGc::new(0),
+            }
+        }
+    }
+
+    impl ActorVmCallbacks for ReadyValueCallbacks {
+        fn alloc(&mut self, size: usize, type_tag: HeapTypeTag) -> Option<*mut u8> {
+            self.heap.alloc(size, type_tag)
+        }
+
+        fn drop_ref(&mut self, ptr: *mut u8) {
+            unsafe {
+                self.gc.drop_local_ref(&mut self.heap, ptr);
+            }
+        }
+
+        fn retain_ref(&mut self, ptr: *mut u8) {
+            unsafe {
+                self.gc.local_ref(&self.heap, ptr);
+            }
+        }
+
+        fn array_len(&self, ptr: *mut u8) -> Option<usize> {
+            unsafe {
+                let header = &*ActorHeap::header_of(ptr);
+                if header.type_tag == HeapTypeTag::Array {
+                    let payload_size = header.size.saturating_sub(ActorHeap::HEADER_SIZE);
+                    Some(payload_size / std::mem::size_of::<Value>())
+                } else {
+                    None
+                }
+            }
+        }
+
+        fn spawn_actor(
+            &mut self,
+            _module: &CodeModule,
+            _spawn_pc: usize,
+            _behavior_idx: usize,
+            _init: Vec<(String, Value)>,
+        ) -> Value {
+            Value::actor_ref(0)
+        }
+
+        fn send_message(&mut self, _target: Value, _behavior_id: u16, _args: &[Value]) {}
+
+        fn perform_async(
+            &mut self,
+            _effect_op: &str,
+            _constants: &[Constant],
+            _args: &[Value],
+        ) -> PerformAsyncResult {
+            PerformAsyncResult::ReadyValue(Value::int(73))
+        }
+    }
+
+    #[test]
+    fn perform_async_ready_value_preserves_non_string_result() {
+        let mut vm = VM::new_without_jit();
+        let mut module = CodeModule::new("perform_async_ready_value");
+        let effect_idx = module.add_string_constant("Test.value");
+        vm.load_module(module);
+        vm.set_actor_callbacks(Box::new(ReadyValueCallbacks::new()));
+
+        let mut frame = Frame::new(None, 0);
+        frame.pc = 1;
+        vm.frames.push(frame);
+        vm.current_frame_idx = Some(0);
+
+        let instr = Instruction::new3(
+            OpCode::PerformAsync,
+            ((effect_idx >> 8) & 0xff) as u8,
+            (effect_idx & 0xff) as u8,
+            7,
+        );
+        vm.step_perform_async(0, 0, instr)
+            .expect("ReadyValue should complete without suspension");
+
+        assert_eq!(vm.frames[0].regs[7].as_int(), Some(73));
+        assert_eq!(vm.frames[0].pc, 1, "ReadyValue must not rewind the PC");
+    }
+
     /// A NULL C string return (nil from cstr_to_value) must pass through
     /// instead of erroring on the missing pointer.
     #[test]
@@ -6924,6 +7085,33 @@ mod vm_tests {
         assert!(candidates[5], "branch target must remain a candidate");
     }
 
+    #[cfg(feature = "native-codegen")]
+    #[test]
+    fn test_jit_candidate_pcs_do_not_use_debug_line_table_as_hotness_boundaries() {
+        let mut module = CodeModule::new("test_jit_debug_lines_not_candidates");
+        module.emit(Instruction::new1(OpCode::Const0, 0)); // 0: entry
+        module.emit(Instruction::new3(OpCode::IAdd, 0, 0, 0)); // 1: ordinary statement
+        module.emit(Instruction::new3(OpCode::IMul, 0, 0, 0)); // 2: ordinary statement
+        module.emit(Instruction::new0(OpCode::Halt)); // 3
+        module.entry_point = Some(0);
+
+        // Debug line metadata is for breakpoints/stepping. It must not make
+        // otherwise-straight-line bytecode pay a JIT hotness probe.
+        module.line_table.push((1, 10));
+        module.line_table.push((2, 11));
+
+        let candidates = compute_jit_candidate_pcs(&module);
+        assert!(candidates[0], "module entry remains a JIT candidate");
+        assert!(
+            !candidates[1],
+            "debug line metadata must not create a JIT candidate"
+        );
+        assert!(
+            !candidates[2],
+            "debug line metadata must not create a JIT candidate"
+        );
+    }
+
     /// Test 16: JIT-compiled hot loop produces the same result as the interpreter.
     #[test]
     fn test_jit_hot_loop_matches_interpreter() {
@@ -6979,6 +7167,83 @@ mod vm_tests {
             "JIT hot loop should match interpreter"
         );
         assert_eq!(hot_result.as_int(), Some(6), "sum 0..4 = 6");
+    }
+
+    /// String-aware scalar JIT helpers must retain constant-pool semantics on
+    /// the zero-copy register path. This loop tiers up after the hot threshold;
+    /// without the disjoint module context, compiled ICmpEq resolves both
+    /// interned strings as missing and the final value becomes false.
+    #[cfg(feature = "native-codegen")]
+    #[test]
+    fn test_jit_direct_frame_string_equality_keeps_module_context() {
+        let mut module = CodeModule::new("jit_string_context");
+        let c_limit = module.add_constant(Constant::Int(2_000));
+        let c_left = module.add_constant(Constant::String("same".to_string()));
+        let c_right = module.add_constant(Constant::String("same".to_string()));
+
+        // r0 = i/result, r1 = limit, r2 = loop condition, r4/r5 = strings,
+        // r6 = equality result, r7 = padding accumulator. Keep the loop body
+        // large enough to be a real JIT candidate so the test exercises the
+        // direct-frame path rather than merely validating interpreter behavior.
+        module.emit(Instruction::new3(
+            OpCode::ConstU,
+            ((c_limit >> 8) & 0xFF) as u8,
+            (c_limit & 0xFF) as u8,
+            1,
+        ));
+        module.emit(Instruction::new1(OpCode::Const0, 0));
+        module.emit(Instruction::new1(OpCode::Const0, 7));
+
+        let loop_start = module.current_offset();
+        module.emit(Instruction::new3(
+            OpCode::ConstU,
+            ((c_left >> 8) & 0xFF) as u8,
+            (c_left & 0xFF) as u8,
+            4,
+        ));
+        module.emit(Instruction::new3(
+            OpCode::ConstU,
+            ((c_right >> 8) & 0xFF) as u8,
+            (c_right & 0xFF) as u8,
+            5,
+        ));
+        module.emit(Instruction::new3(OpCode::ICmpEq, 4, 5, 6));
+        module.emit(Instruction::new1(OpCode::IInc, 7));
+        module.emit(Instruction::new1(OpCode::IInc, 7));
+        module.emit(Instruction::new1(OpCode::IInc, 7));
+        module.emit(Instruction::new1(OpCode::IInc, 0));
+        module.emit(Instruction::new3(OpCode::ICmpLt, 0, 1, 2));
+
+        let jmp_back = module.current_offset();
+        let back = loop_start as i64 - jmp_back as i64;
+        module.emit(Instruction::new3(
+            OpCode::JmpT,
+            2,
+            ((back as i16 >> 8) & 0xFF) as u8,
+            (back as i16 & 0xFF) as u8,
+        ));
+        module.emit(Instruction::new2(OpCode::Move, 6, 0));
+        module.emit(Instruction::new0(OpCode::Halt));
+        module.entry_point = Some(0);
+
+        let mut vm = VM::new();
+        vm.load_module(module);
+        let result = vm.run().expect("run");
+        assert_eq!(
+            result.as_bool(),
+            Some(true),
+            "hot string equality must preserve interned-string resolution"
+        );
+
+        let compiled = vm
+            .jit_session
+            .as_ref()
+            .map(|jit| jit.compiled_count())
+            .unwrap_or(0);
+        assert!(
+            compiled > 0,
+            "string equality loop must tier up for this regression to be meaningful"
+        );
     }
 
     /// Regression test: a hot loop whose body is long enough to JIT and whose
