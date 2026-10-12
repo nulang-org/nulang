@@ -2,6 +2,9 @@
 ### Activation-local composite allocation — 2026-09-27
 - **Proven activation-local arrays, records, and tuples can now use the actor iso arena instead of the ORCA heap.** The VM reuses the existing conservative escape analysis at bytecode allocation sites, keeps escaping values heap-backed, and falls back to the normal heap when an embedder has no arena allocator.
 - **Arena lifetime follows behavior activation lifetime.** Normal completion resets the bump arena in O(1), while suspension and JIT yield preserve arena contents until the activation actually completes.
+### Public CLI release portability — 2026-10-11
+- **Public release archives use the `release-cli` feature profile without a Python shared-library ABI dependency.** The ordinary full/default source build retains opt-in Python interoperability; release packaging checks the resulting Linux and macOS binary for Python dependencies.
+- **Release PRs rehearse the full non-publishing four-platform build matrix before tags are created.** The Linux ARM64 cross build explicitly installs target libc development headers and preflights a target-compiler C header probe, avoiding an observed `ring` compile failure when `--no-install-recommends` omits the ARM64 sysroot. Actual cross-build and clean-host portability remain release gates.
 ### Runtime soundness and checked negation — native/AOT backend parity — 2026-10-10
 - **AOT no longer claims raw-Int/Float registers for values that can be nil
   at runtime.** Nightly differential fuzz caught interpreter/AOT divergences
