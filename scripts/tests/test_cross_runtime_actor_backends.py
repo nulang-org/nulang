@@ -23,7 +23,7 @@ class ActorComputeBackendTests(unittest.TestCase):
         )
         self.assertEqual(
             parse_records(output, "nulang-jit", COMPUTE_BENCHMARKS)["actor_compute"],
-            {"messages": 128, "elapsed_ns": 190000},
+            {"messages": 128, "elapsed_ns": 190000, "jit_actor_vm_compiled_regions": 1},
         )
 
     def test_rejects_jit_enabled_without_actual_compilation(self):
@@ -92,6 +92,57 @@ class ActorComputeBackendTests(unittest.TestCase):
             harness.main()
         self.assertEqual(failure.exception.code, 2)
         self.assertIn("Nulang-only", stderr.getvalue())
+
+    def test_compute_requires_bytecode_reference_before_building(self):
+        stderr = StringIO()
+        with (
+            mock.patch.object(
+                sys, "argv",
+                ["cross_runtime_bench.py", "--workloads", "actor_compute",
+                 "--runtimes", "nulang-jit,nulang-aot"],
+            ),
+            mock.patch.object(harness, "build_commands",
+                              side_effect=AssertionError("must fail before building")),
+            redirect_stderr(stderr),
+            self.assertRaises(SystemExit) as failure,
+        ):
+            harness.main()
+        self.assertEqual(failure.exception.code, 2)
+        self.assertIn("bytecode reference", stderr.getvalue())
+
+    def test_duplicate_runtime_names_cannot_skew_sample_counts(self):
+        stderr = StringIO()
+        with (
+            mock.patch.object(
+                sys, "argv",
+                ["cross_runtime_bench.py", "--workloads", "actor_compute",
+                 "--runtimes", "nulang,nulang,nulang-jit"],
+            ),
+            mock.patch.object(harness, "build_commands",
+                              side_effect=AssertionError("must fail before building")),
+            redirect_stderr(stderr),
+            self.assertRaises(SystemExit) as failure,
+        ):
+            harness.main()
+        self.assertEqual(failure.exception.code, 2)
+        self.assertIn("duplicate runtimes", stderr.getvalue())
+
+    def test_empty_runtime_list_is_rejected(self):
+        stderr = StringIO()
+        with (
+            mock.patch.object(
+                sys, "argv",
+                ["cross_runtime_bench.py", "--workloads", "actor_compute",
+                 "--runtimes", ""],
+            ),
+            mock.patch.object(harness, "build_commands",
+                              side_effect=AssertionError("must fail before building")),
+            redirect_stderr(stderr),
+            self.assertRaises(SystemExit) as failure,
+        ):
+            harness.main()
+        self.assertEqual(failure.exception.code, 2)
+        self.assertIn("at least one runtime", stderr.getvalue())
 
     def test_paired_speedups_align_same_round_samples(self):
         samples = {
