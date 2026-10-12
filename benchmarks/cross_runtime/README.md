@@ -107,9 +107,11 @@ A second, explicitly **Nulang-only** `actor_compute` workload uses the
 identical source for bytecode, warmed JIT and native AOT. Each of 128 actor
 messages executes a 4,096-iteration integer loop and updates actor state.
 All three backends execute one identical untimed actor warmup message and
-reset state before measurement. The JIT variant additionally requires nonzero
-compiled-region telemetry from the scheduler-owned actor VM. The AOT mode
-requires full actor behavior target coverage. Every backend checks the exact
+reset state before measurement. The JIT variant additionally requires a **positive increase** in
+compiled-region telemetry from the scheduler-owned actor VM during that
+workload's untimed warmup; the JSON report records both the total and the
+newly compiled region counts. A nonzero historical total alone is rejected.
+The AOT mode requires full actor behavior target coverage. Every backend checks the exact
 resulting integer state after the measured messages.
 Time includes enqueue and scheduler drain but excludes parsing, compilation
 and JIT warmup.
