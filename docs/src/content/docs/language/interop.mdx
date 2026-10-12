@@ -95,7 +95,12 @@ fn main() {
 ```
 
 :::note
-Current state of this surface, verified with the compiler binary: `perform Python.import(...)` does not parse today — `import` is a reserved keyword and the parser does not exempt it as an effect operation name (error `E0102`). Until that is fixed there is no way to import a module from pure Nulang source, so `Python.call`/`Python.get_attr` compile and dispatch but return `nil` with a `module '<name>' not imported` diagnostic for never-imported modules, and performing `Python.*` from inside a behavior traps the behavior silently. The bridge itself (import, call, attribute access, marshalling) is implemented and unit-tested at the Rust level; driving it end-to-end from source is blocked on the import syntax gap.
+`perform Python.import("math")` is accepted as an effect operation even though
+`import` is also a reserved declaration keyword. Python effects still require
+the actor runtime host, the `python` build feature, and the relevant authority
+grant. Importing a module alone does not resolve the string-marshalling
+limitations above: treat the Python bridge as Experimental, and verify
+the exact functions and value types used by your application.
 :::
 
 ## The C FFI
