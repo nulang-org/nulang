@@ -8992,7 +8992,6 @@ mod vm_tests {
     }
 }
 
-
 #[cfg(test)]
 mod map_tombstone_orca_regressions {
     use super::*;
@@ -9041,6 +9040,7 @@ mod map_tombstone_orca_regressions {
         vm.drop_ref(value_ptr);
         assert_eq!(vm.heap.live_count(), 0, "all references now released");
     }
+
     #[test]
     fn overwriting_with_borrowed_current_value_must_retain_before_release() {
         let mut vm = StandaloneVmCallbacks::new();
@@ -9065,5 +9065,4 @@ mod map_tombstone_orca_regressions {
         vm.drop_ref(map.as_ptr().expect("map pointer"));
         assert_eq!(vm.heap.live_count(), 0);
     }
-
 }
