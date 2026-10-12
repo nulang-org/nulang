@@ -9037,4 +9037,29 @@ mod map_tombstone_orca_regressions {
         vm.drop_ref(value_ptr);
         assert_eq!(vm.heap.live_count(), 0, "all references now released");
     }
+    #[test]
+    fn overwriting_with_borrowed_current_value_must_retain_before_release() {
+        let mut vm = StandaloneVmCallbacks::new();
+        let map = hashmap_op(&mut vm, &[], "new", &[]).expect("map");
+        let value_ptr = vm.alloc(16, HeapTypeTag::Raw).expect("value");
+        // SAFETY: pointer was just allocated in the same VM heap.
+        let owned_value = unsafe { Value::ptr(value_ptr) };
+        let map = hashmap_op(&mut vm, &[], "insert", &[map, Value::int(9), owned_value])
+            .expect("insert");
+
+        // Only the map now owns a counted reference. Map.get yields the
+        // existing pointer; re-inserting it must not free it first.
+        vm.drop_ref(value_ptr);
+        let borrowed = hashmap_op(&mut vm, &[], "get", &[map, Value::int(9)])
+            .expect("get");
+        assert_eq!(borrowed.as_ptr(), Some(value_ptr));
+        let map = hashmap_op(&mut vm, &[], "insert", &[map, Value::int(9), borrowed])
+            .expect("overwrite");
+        assert_eq!(vm.heap.live_count(), 2, "overwrite must preserve map-owned value");
+
+        // Map destruction should now be the only release of its value.
+        vm.drop_ref(map.as_ptr().expect("map pointer"));
+        assert_eq!(vm.heap.live_count(), 0);
+    }
+
 }
