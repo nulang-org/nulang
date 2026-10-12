@@ -2,9 +2,9 @@
 /**
  * generate-docs.js — Auto-generate Nulang standard library documentation.
  *
- * Runs the Nulang compiler to extract built-in effect operation docs from
- * src/stdlib.rs and writes per-effect Markdown pages into the Starlight
- * docs content directory. Also regenerates the full `docs/api.md` reference.
+ * First verifies the canonical stdlib manifest and generated package/module
+ * artifacts, then runs the Nulang compiler to emit built-in effect docs and
+ * the full `docs/api.md` reference.
  *
  * Prerequisites:
  *   - Rust toolchain (cargo)
@@ -35,12 +35,18 @@ function run(cmd, opts = {}) {
 function main() {
   console.log('=== Generating Nulang Standard Library Docs ===\n');
 
-  // Step 1: Generate per-effect stdlib Markdown docs
-  console.log('[1/2] Extracting built-in effect operations from src/stdlib.rs...');
+  // Step 1: Verify generated stdlib metadata/package mirrors before docs are
+  // derived from them. This fails closed on drift instead of silently
+  // publishing stale API documentation.
+  console.log('[1/3] Verifying canonical stdlib manifest...');
+  run('python3 scripts/generate_stdlib.py --check');
+
+  // Step 2: Generate per-effect stdlib Markdown docs.
+  console.log('\n[2/3] Extracting built-in effect operations...');
   run(`cargo run --bin nulang -- --emit-stdlib-docs ${STDLIB_DOCS_DIR}`);
 
-  // Step 2: Regenerate the full API reference (docs/api.md)
-  console.log('\n[2/2] Regenerating full API reference...');
+  // Step 3: Regenerate the full API reference (docs/api.md)
+  console.log('\n[3/3] Regenerating full API reference...');
   run('cargo run --bin nulang -- --doc');
 
   console.log('\n=== Docs generated successfully ===');

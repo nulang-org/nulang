@@ -234,9 +234,9 @@ fn translate_stmt(stmt: &Stmt, func: &mir::Function, pc: u32) -> CirStmt {
                 src: translate_rvalue(op, func, pc),
             },
         },
-        Stmt::EnterHandle { .. } | Stmt::PopHandler => {
-            // User-defined handler frames: dispatch is deferred to a follow-up
-            // (the plan's MVP scope). No observable effect in CIR.
+        Stmt::EnterHandle { .. } | Stmt::PopHandler | Stmt::ParallelMarker { .. } => {
+            // User-defined handler frames and parallel-region markers are
+            // compiler/runtime metadata at the CIR boundary.
             CirStmt::Assign {
                 dst: FRAME_PTR_VAR,
                 src: CirExpr::ConstNil,
