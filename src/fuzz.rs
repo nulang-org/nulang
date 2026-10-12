@@ -1,7 +1,8 @@
 //! Nulang compiler/runtime fuzzer: mutation-based fuzzing of the frontend
 //! (lex -> parse -> typecheck -> HIR -> MIR -> bytecode) plus differential
-//! execution fuzzing across the interpreter, JIT, and (when a mutant
-//! compiles under it) the AOT native backend.
+//! execution fuzzing across the interpreter, JIT, and restricted compiled
+//! backends (AOT native and, with `wasm-backend`, WASM) when they accept
+//! the generated program.
 //!
 //! Generates mutants from a seed corpus of valid programs. Two independent
 //! properties are checked:
@@ -13,7 +14,7 @@
 //!      program, it must agree too (`differential_fuzz_one`). Any
 //!      disagreement is a real bug, not a fuzzer false positive — see
 //!      PLAN.md Phase 1 bullet 1's kill criteria: a divergence touching
-//!      Frozen-tier surface (bytecode/value-layout semantics) is a Sev-1.
+//!      bytecode/value-layout semantics is a Sev-1.
 //!
 //! Uses a built-in xorshift64 RNG, no external fuzzing crate dependency.
 //!
@@ -752,22 +753,30 @@ pub(crate) fn differential_fuzz_one(source: &str) -> Result<DiffOutcome, String>
                 Err(_) => return Err(format!("WASM run panicked on {:?}", source)),
                 Ok(Err(e)) => {
                     let err_str = e.to_string();
+                    // Once the compiler has emitted bytes, validation,
+                    // instantiation, and required-export failures are backend
+                    // correctness failures, not "unsupported program" skips.
+                    // Restricted-profile rejection belongs at compile time in
+                    // validate_default_wasm_semantics().
                     if err_str.contains("failed to compile")
                         || err_str.contains("failed to parse WebAssembly module")
                         || err_str.contains("failed to find function export `nulang_init`")
                     {
-                        false
-                    } else {
-                        let wasm_key: Result<String, String> =
-                            Err(normalize_error(&format!("runtime error: {}", err_str)));
-                        if wasm_key != cold_key {
-                            return Err(format!(
-                                "interpreter/WASM divergence on {:?}: interp={:?} wasm={:?}",
-                                source, cold_key, wasm_key
-                            ));
-                        }
-                        true
+                        return Err(format!(
+                            "WASM emitted bytes but the runtime rejected them on {:?}: {}",
+                            source, err_str
+                        ));
                     }
+
+                    let wasm_key: Result<String, String> =
+                        Err(normalize_error(&format!("runtime error: {}", err_str)));
+                    if wasm_key != cold_key {
+                        return Err(format!(
+                            "interpreter/WASM divergence on {:?}: interp={:?} wasm={:?}",
+                            source, cold_key, wasm_key
+                        ));
+                    }
+                    true
                 }
                 Ok(Ok(wasm_value)) => {
                     if !is_safely_comparable(wasm_value) {
@@ -784,7 +793,19 @@ pub(crate) fn differential_fuzz_one(source: &str) -> Result<DiffOutcome, String>
                     }
                 }
             },
-            Err(_) => false,
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("WASM backend restricted profile")
+                    || err_str.contains("WASM backend does not support")
+                {
+                    false
+                } else {
+                    return Err(format!(
+                        "unexpected WASM compile failure on {:?}: {}",
+                        source, err_str
+                    ));
+                }
+            }
         }
     };
     #[cfg(not(feature = "wasm-backend"))]
@@ -883,6 +904,29 @@ mod tests {
         }
     }
 
+    /// The WASM-enabled CI lane must prove that the restricted backend
+    /// actually participates in the differential oracle. This catches a
+    /// regression where every program is silently classified as unsupported
+    /// and the job stays green without executing WASM at all.
+    #[cfg(feature = "wasm-backend")]
+    #[test]
+    fn differential_wasm_supported_profile_has_coverage() {
+        for source in [
+            "42",
+            "1 + 2",
+            "if true then 1 else 2",
+            "let x = 10; let y = x * 2; y + x",
+        ] {
+            match differential_fuzz_one(source) {
+                Ok(DiffOutcome::Agreed { wasm: true, .. }) => {}
+                other => panic!(
+                    "WASM differential oracle did not execute supported source {:?}: {:?}",
+                    source, other
+                ),
+            }
+        }
+    }
+
     /// Extended differential fuzz (ignored by default — run explicitly or
     /// from a dedicated CI job): 30,000 iterations with a fixed seed by
     /// default. Shardable for a CI matrix via env vars so a scheduled
@@ -953,6 +997,33 @@ mod tests {
                 "Differential fuzzer found {} divergence(s)",
                 divergence_count
             );
+        }
+    }
+
+    /// Differential regression cases: known kernels that must agree across
+    /// all backends. Added from nightly fuzz captures (2026-10-10).
+    #[test]
+    fn differential_known_divergence_regressions() {
+        let mut divergent = Vec::new();
+        for src in [
+            "fn main() { 1.0 / 0.0 }",
+            "fn main() { 0.1 + (1.0 / 0.0) }",
+            "fn main() { -(0.1 + (1.0 / 0.0)) }",
+            "fn main() { -fn(x, y) { x + y } }",
+            "fn main() { let x = 0.1; let y = 0.2; -(x + 1.0 / 0.0) }",
+            "fn main() { let x = 0.1; let y = 0.2; -(x + y) }",
+            "fn main() { --(1 + 2,) }",
+        ] {
+            match differential_fuzz_one(src) {
+                Ok(_) => {}
+                Err(e) => divergent.push((src, e)),
+            }
+        }
+        if !divergent.is_empty() {
+            for (src, e) in &divergent {
+                eprintln!("DIVERGENCE: {} -> {}", src, e);
+            }
+            panic!("known divergence regressions present");
         }
     }
 

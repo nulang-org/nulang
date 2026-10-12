@@ -26,6 +26,7 @@
 //!                            handlers, no actor mailbox — requires wasm-backend)
 //!   --out <file>             Output file (WASM backends / --emit-nbc)
 //!   --emit-nbc               Compile <FILE> to a .nbc artifact; don't run
+//!   --emit-behavior-manifest <file>  Emit RFC 0020 behavior sidecar with durable schema metadata
 //!   <FILE>.nbc               Run a pre-compiled .nbc artifact directly
 //!   --verify <src>           Verify .nbc source hash against <src>
 //!   nula <cmd>               Package manager (new, init, build, build-wasm, test, run, add, remove, publish, deploy, list, clean)
@@ -475,6 +476,33 @@ fn main() {
                 }
             }
             "--emit-nbc" => opts.emit_nbc = true,
+            "--emit-behavior-manifest" => {
+                if i + 1 < args.len() {
+                    opts.emit_behavior_manifest = Some(args[i + 1].clone());
+                    i += 1;
+                } else {
+                    eprintln!("Error: --emit-behavior-manifest requires a file path argument");
+                    std::process::exit(1);
+                }
+            }
+            "--behavior-package-name" => {
+                if i + 1 < args.len() {
+                    opts.behavior_package_name = Some(args[i + 1].clone());
+                    i += 1;
+                } else {
+                    eprintln!("Error: --behavior-package-name requires a package name");
+                    std::process::exit(1);
+                }
+            }
+            "--behavior-package-version" => {
+                if i + 1 < args.len() {
+                    opts.behavior_package_version = Some(args[i + 1].clone());
+                    i += 1;
+                } else {
+                    eprintln!("Error: --behavior-package-version requires a package version");
+                    std::process::exit(1);
+                }
+            }
             "--verify" => {
                 if i + 1 < args.len() {
                     opts.verify_source = Some(args[i + 1].clone());
@@ -510,6 +538,9 @@ fn main() {
                     "--backend",
                     "--out",
                     "--emit-nbc",
+                    "--emit-behavior-manifest",
+                    "--behavior-package-name",
+                    "--behavior-package-version",
                     "--verify",
                     "--bench",
                     "--json",
@@ -543,6 +574,11 @@ fn main() {
             arg => positional.push(arg.to_string()),
         }
         i += 1;
+    }
+
+    if opts.emit_behavior_manifest.is_some() && !opts.emit_nbc {
+        eprintln!("Error: --emit-behavior-manifest currently requires --emit-nbc");
+        std::process::exit(1);
     }
 
     // Resolve color mode once after all args are parsed.
@@ -709,6 +745,9 @@ fn main() {
                 opts.rewrite_signals.as_deref(),
                 &opts.with_capabilities,
                 opts.deny_warnings,
+                opts.emit_behavior_manifest.as_deref(),
+                opts.behavior_package_name.as_deref(),
+                opts.behavior_package_version.as_deref(),
             ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
@@ -828,7 +867,11 @@ fn main() {
         // compiler. This is the durable-distribution path — a `.nbc` minted
         // in 2026 runs on any conforming runtime in 2126.
         if path.ends_with(".nbc") {
-            if let Err(e) = run_nbc_file(path, opts.verify_source.as_deref()) {
+            if let Err(e) = run_nbc_file(
+                path,
+                opts.verify_source.as_deref(),
+                opts.store_path.as_deref(),
+            ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
             }
@@ -886,6 +929,9 @@ fn main() {
                 opts.rewrite_signals.as_deref(),
                 &opts.with_capabilities,
                 opts.deny_warnings,
+                opts.emit_behavior_manifest.as_deref(),
+                opts.behavior_package_name.as_deref(),
+                opts.behavior_package_version.as_deref(),
             ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
@@ -985,6 +1031,13 @@ struct Options {
     out_file: Option<String>,
     /// Compile the input to a `.nbc` artifact and write it, don't run.
     emit_nbc: bool,
+    /// Optional RFC 0020 behavior sidecar output path. Currently emitted for
+    /// the bytecode artifact path so package builds can bind durable schema
+    /// metadata to the same typed program and artifact identity.
+    emit_behavior_manifest: Option<String>,
+    /// Package identity embedded in the behavior sidecar.
+    behavior_package_name: Option<String>,
+    behavior_package_version: Option<String>,
     /// When running a `.nbc` artifact, verify its recorded source hash against
     /// this source file before executing. Refuses on mismatch.
     verify_source: Option<String>,
@@ -1040,6 +1093,9 @@ impl Default for Options {
             backend: "bytecode".to_string(),
             out_file: None,
             emit_nbc: false,
+            emit_behavior_manifest: None,
+            behavior_package_name: None,
+            behavior_package_version: None,
             verify_source: None,
             emit_stdlib_docs: None,
             emit_signals: None,
@@ -1112,6 +1168,7 @@ fn print_help() {
         println!("  --out <file>     Output file for WASM backends (default: out.wasm)");
     }
     println!("  --out <file>     Output path for --emit-nbc (default: <FILE> with .nbc extension)");
+    println!("  --emit-behavior-manifest <file>  Emit RFC 0020 durable-schema behavior sidecar");
     println!("  <FILE>.nbc       Run a pre-compiled .nbc artifact directly (no compiler invoked)");
     println!(
         "  --verify <src>   When running a .nbc artifact, verify its source hash against <src>"
@@ -2387,6 +2444,9 @@ fn compile_source_to_nbc(
     rewrite_signals: Option<&str>,
     with_capabilities: &[String],
     deny_warnings: bool,
+    behavior_manifest_path: Option<&str>,
+    behavior_package_name: Option<&str>,
+    behavior_package_version: Option<&str>,
 ) -> NuResult<()> {
     let (mut ast, type_checker) =
         run_frontend(source, None, false, with_capabilities, deny_warnings)?;
@@ -2407,7 +2467,33 @@ fn compile_source_to_nbc(
             span: Span::default(),
         })?;
     }
-    let m = compile_with_new_pipeline(&ast, "main", &type_checker)?;
+    // Keep typed HIR/MIR alive through artifact emission so the optional
+    // Behavior Manifest is derived from exactly the same semantic inputs as
+    // the executable artifact.
+    let hir = nulang::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
+    let mut mir = nulang::mir_lower::lower_module(&hir)?;
+    let artifact_identity = if behavior_manifest_path.is_some() {
+        Some(
+            nulang::compiler_identity::artifact_identity_for_typed_program(
+                Some(source.as_bytes()),
+                &hir,
+                &mir,
+                [],
+                concat!("nulang-rust-", env!("CARGO_PKG_VERSION")),
+                "nulang-bytecode-v1",
+                "nulang-vm-v1",
+                "bytecode",
+                std::iter::empty::<&str>(),
+            )
+            .map_err(|error| nulang::types::NuError::VMError {
+                msg: format!("failed to derive artifact semantic identity: {error}"),
+                span: Span::default(),
+            })?,
+        )
+    } else {
+        None
+    };
+    let m = nulang::mir_codegen::compile_mir(&mut mir, "main")?;
     let source_hash = blake3::hash(source.as_bytes());
     let bytes =
         m.to_nbc(Some(*source_hash.as_bytes()))
@@ -2419,6 +2505,44 @@ fn compile_source_to_nbc(
         msg: format!("failed to write {out_path}: {e}"),
         span: Span::default(),
     })?;
+
+    if let (Some(manifest_path), Some(artifact_identity)) =
+        (behavior_manifest_path, artifact_identity.as_ref())
+    {
+        let package_name = behavior_package_name.unwrap_or("main");
+        let package_version = behavior_package_version.unwrap_or("0.0.0");
+        let behavior_manifest = nulang::behavior_manifest::BehaviorManifest::from_typed_hir(
+            package_name,
+            package_version,
+            artifact_identity,
+            &bytes,
+            &hir,
+        )
+        .map_err(|error| nulang::types::NuError::VMError {
+            msg: format!("failed to build behavior manifest: {error}"),
+            span: Span::default(),
+        })?;
+        let manifest_bytes =
+            behavior_manifest
+                .to_json()
+                .map_err(|error| nulang::types::NuError::VMError {
+                    msg: format!("failed to serialize behavior manifest: {error}"),
+                    span: Span::default(),
+                })?;
+        std::fs::write(manifest_path, manifest_bytes).map_err(|error| {
+            nulang::types::NuError::VMError {
+                msg: format!("failed to write behavior manifest {manifest_path}: {error}"),
+                span: Span::default(),
+            }
+        })?;
+        println!(
+            "Wrote {manifest_path} ({}, {})",
+            behavior_manifest.schema,
+            behavior_manifest
+                .digest()
+                .unwrap_or_else(|_| "digest-unavailable".to_string())
+        );
+    }
     println!(
         "Wrote {out_path} ({} bytes, .nbc format v{}, language v{})",
         bytes.len(),
@@ -2430,8 +2554,10 @@ fn compile_source_to_nbc(
 
 /// Load and run a `.nbc` artifact directly, optionally verifying its recorded
 /// source hash against a source file. This is the durable-distribution path:
-/// no compiler invocation, no source parse — just `from_nbc` + `VM::run`.
-fn run_nbc_file(path: &str, verify_source: Option<&str>) -> NuResult<()> {
+/// no compiler invocation or source parse. Pure modules run directly in the VM;
+/// actor/workflow modules use `run_with_runtime` so spawn/send/state semantics
+/// match source execution.
+fn run_nbc_file(path: &str, verify_source: Option<&str>, store_path: Option<&str>) -> NuResult<()> {
     let bytes = std::fs::read(path).map_err(|e| nulang::types::NuError::VMError {
         msg: format!("cannot read .nbc file '{path}': {e}"),
         span: Span::default(),
@@ -2471,14 +2597,78 @@ fn run_nbc_file(path: &str, verify_source: Option<&str>) -> NuResult<()> {
         }
     }
 
-    let mut vm = VM::new();
-    vm.load_module(artifact.module);
-    let value = vm.run()?;
-    let result_str = value.to_string_repr();
+    let constants = artifact.module.constants.clone();
+    let (value, _runtime) = run_nbc_module(artifact.module, store_path)?;
+
+    let result_str = if value.is_string() || value.is_ptr() {
+        nulang::vm::resolve_value_string(&constants, value)
+    } else {
+        value.to_string_repr()
+    };
     if !result_str.is_empty() && result_str != "unit" && result_str != "()" {
         println!("{}", result_str);
     }
     Ok(())
+}
+
+/// Execute a deserialized `.nbc` module with the same actor semantics as
+/// source execution.
+///
+/// A bare `VM` installs `StandaloneVmCallbacks`, whose actor operations are
+/// deliberately inert (`spawn` returns actor-ref 0 and `send` is a no-op).
+/// Serialized actor/workflow modules therefore must use the real Runtime bridge
+/// and scheduler, exactly like the bytecode source path in `run_source`.
+fn run_nbc_module(
+    module: nulang::bytecode::CodeModule,
+    store_path: Option<&str>,
+) -> NuResult<(
+    nulang::vm::Value,
+    Option<std::rc::Rc<std::cell::RefCell<nulang::runtime::Runtime>>>,
+)> {
+    let has_actors = !module.actor_metadata.is_empty() || !module.behaviors.is_empty();
+    let has_durable = module.actor_metadata.iter().any(|meta| {
+        meta.persistent
+            || meta.is_workflow
+            || meta.state_models.iter().any(|(_, model)| {
+                matches!(
+                    model,
+                    nulang::ast::StateModel::Durable | nulang::ast::StateModel::EventSourced
+                )
+            })
+    });
+    let store_dir = if has_actors && has_durable {
+        Some(
+            store_path
+                .map(str::to_owned)
+                .or_else(|| std::env::var("NULANG_STORE_PATH").ok())
+                .unwrap_or_else(|| ".nulang/store".to_string()),
+        )
+    } else {
+        None
+    };
+
+    if has_actors {
+        let (value, runtime) = run_with_runtime(module, None, store_dir.as_deref())?;
+
+        let failures = runtime.borrow().workflow_failures();
+        if !failures.is_empty() {
+            let summary = failures
+                .iter()
+                .map(|(step, error)| format!("{step}: {error}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(NuError::RuntimeError {
+                msg: format!("workflow execution failed: {summary}"),
+                span: Span::default(),
+            });
+        }
+
+        Ok((value, Some(runtime)))
+    } else {
+        let mut vm = VM::new();
+        vm.load_module(module);
+        Ok((vm.run()?, None))
+    }
 }
 
 fn type_to_string(ty: &Type) -> String {
@@ -2621,6 +2811,97 @@ mod tests {
     /// An actor program run through the CLI path must create real actors
     /// and deliver sent messages: with the bare standalone VM the stub
     /// spawn/send callbacks would leave the counter at 0.
+    #[test]
+    fn test_nbc_actor_program_schedules_and_delivers() {
+        let source = r#"
+            actor Counter {
+                state count: Int = 0
+                behavior inc() { self.count = self.count + 1 }
+            }
+            let c = spawn Counter {} in {
+                send c inc()
+                send c inc()
+                c
+            }
+        "#;
+
+        let (ast, type_checker) = run_frontend(source, None, false, &[], false)
+            .expect("frontend should accept the actor program");
+        let module = compile_with_new_pipeline(&ast, "test", &type_checker)
+            .expect("actor program should compile");
+        let source_hash = blake3::hash(source.as_bytes());
+        let bytes = module
+            .to_nbc(Some(*source_hash.as_bytes()))
+            .expect("actor module should serialize to nbc");
+        let artifact = nulang::bytecode::CodeModule::from_nbc(&bytes)
+            .expect("serialized actor module should deserialize");
+
+        let (_value, runtime) =
+            run_nbc_module(artifact.module, None).expect("nbc actor program should run");
+        let runtime = runtime.expect("actor nbc must execute with a real Runtime");
+        let rt = runtime.borrow();
+        let actor = rt.actors.values().next().expect("one actor should exist");
+        assert_eq!(
+            actor.get_state_field("count").and_then(|v| v.as_int()),
+            Some(2),
+            "both inc messages must be delivered after nbc round-trip"
+        );
+    }
+
+    #[test]
+    fn test_nbc_persistent_actor_uses_requested_store() {
+        let source = r#"
+            persistent actor BankAccount {
+                state durable balance: Int = 0
+                behavior deposit(amount: Int) { self.balance = self.balance + amount }
+            }
+            let acc = spawn BankAccount {} in {
+                send acc deposit(50)
+                acc
+            }
+        "#;
+
+        let (ast, type_checker) = run_frontend(source, None, false, &[], false)
+            .expect("frontend should accept persistent actor program");
+        let module = compile_with_new_pipeline(&ast, "test", &type_checker)
+            .expect("persistent actor program should compile");
+        let source_hash = blake3::hash(source.as_bytes());
+        let bytes = module
+            .to_nbc(Some(*source_hash.as_bytes()))
+            .expect("persistent actor module should serialize");
+        let artifact = nulang::bytecode::CodeModule::from_nbc(&bytes)
+            .expect("persistent actor artifact should deserialize");
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        let store_dir = std::env::temp_dir().join(format!(
+            "nulang-nbc-persist-{}-{unique}",
+            std::process::id()
+        ));
+        let store_str = store_dir.to_string_lossy().into_owned();
+
+        let (_value, runtime) = run_nbc_module(artifact.module, Some(&store_str))
+            .expect("persistent nbc actor program should run");
+        let runtime = runtime.expect("persistent actor nbc must use Runtime");
+        let rt = runtime.borrow();
+        let (actor_id, actor) = rt.actors.iter().next().expect("one actor should exist");
+        assert_eq!(
+            actor.get_state_field("balance").and_then(|v| v.as_int()),
+            Some(50)
+        );
+        let snapshot = store_dir
+            .join(format!("actor_{actor_id}"))
+            .join("snapshot.json");
+        assert!(
+            snapshot.exists(),
+            "durable nbc actor must checkpoint to the requested store"
+        );
+        drop(rt);
+        let _ = std::fs::remove_dir_all(store_dir);
+    }
+
     #[test]
     fn test_run_source_actor_program_schedules_and_delivers() {
         let source = r#"
