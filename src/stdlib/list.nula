@@ -155,12 +155,34 @@ pub fn drop(n, xs) {
 }
 
 /// Range: array of [0, 1, ..., n-1].
+/// Int elements make zero-initialized preallocation semantically safe.
 pub fn range(n) {
-    var result = [];
+    let len = if n > 0 then n else 0;
+    var result = perform Array.new(len, 0);
     var i = 0;
-    while i < n {
-        result = perform Array.push(result, i);
+    while i < len {
+        result[i] = i;
         i = i + 1
+    };
+    result
+}
+
+/// Concatenate two integer arrays into a new array. Original arrays unchanged.
+/// The final cardinality is known up front, so allocate once and fill in place.
+pub fn append(xs: [Int], ys: [Int]) -> [Int] {
+    let len_x = perform Array.length(xs);
+    let len_y = perform Array.length(ys);
+    let total = len_x + len_y;
+    var result = perform Array.new(total, 0);
+    var i = 0;
+    while i < len_x {
+        result[i] = xs[i];
+        i = i + 1
+    };
+    var j = 0;
+    while j < len_y {
+        result[len_x + j] = ys[j];
+        j = j + 1
     };
     result
 }
@@ -176,14 +198,7 @@ pub fn sort(xs: [Int]) -> [Int] {
         var less = filter(fn(x) { x < pivot }, xs);
         var eq = filter(fn(x) { x == pivot }, xs);
         var greater = filter(fn(x) { x > pivot }, xs);
-        var result = sort(less);
-        for x in eq {
-            result = perform Array.push(result, x)
-        };
-        for x in sort(greater) {
-            result = perform Array.push(result, x)
-        };
-        result
+        append(append(sort(less), eq), sort(greater))
     }
 }
 
@@ -233,23 +248,15 @@ pub fn max_by(cmp, xs) {
     best
 }
 
-/// Concatenate two arrays into a new array.  Original arrays unchanged.
-pub fn append(xs: [Int], ys: [Int]) -> [Int] {
-    var result = xs;
-    for x in ys {
-        result = perform Array.push(result, x)
-    };
-    result
-}
-
-/// Zip two arrays into an array of tuples. Result length = min(len(xs), len(ys)).
+/// Zip two integer arrays into an array of tuples. Result length = min(len(xs), len(ys)).
 pub fn zip(xs: [Int], ys: [Int]) {
-    var result = [];
+    let len_x = perform Array.length(xs);
+    let len_y = perform Array.length(ys);
+    let len = if len_x < len_y then len_x else len_y;
+    var result = perform Array.new(len, (0, 0));
     var i = 0;
-    var len_x = perform Array.length(xs);
-    var len_y = perform Array.length(ys);
-    while i < len_x && i < len_y {
-        result = perform Array.push(result, (xs[i], ys[i]));
+    while i < len {
+        result[i] = (xs[i], ys[i]);
         i = i + 1
     };
     result
@@ -257,21 +264,40 @@ pub fn zip(xs: [Int], ys: [Int]) {
 
 /// Enumerate: returns [(0, xs[0]), (1, xs[1]), ...].
 pub fn enumerate(xs: [Int]) {
-    var result = [];
+    let len = perform Array.length(xs);
+    var result = perform Array.new(len, (0, 0));
     var i = 0;
-    var len = perform Array.length(xs);
     while i < len {
-        result = perform Array.push(result, (i, xs[i]));
+        result[i] = (i, xs[i]);
         i = i + 1
     };
     result
 }
 
 /// Remove duplicates, preserving first-occurrence order.
+/// Use the input length as an upper bound and scan only the initialized prefix
+/// so duplicate detection never observes placeholder slots.
 pub fn uniq(xs: [Int]) -> [Int] {
-    var result = [];
-    for x in xs {
-        if !contains(x, result) then { result = perform Array.push(result, x) } else {}
-    };
-    result
+    let len = perform Array.length(xs);
+    if len == 0 then { [] } else {
+        var result = perform Array.new(len, 0);
+        var count = 0;
+        var i = 0;
+        while i < len {
+            let x = xs[i];
+            var seen = false;
+            var j = 0;
+            while j < count && !seen {
+                if result[j] == x then { seen = true } else {};
+                j = j + 1
+            };
+            if !seen then {
+                result[count] = x;
+                count = count + 1
+            } else {};
+            i = i + 1
+        };
+        if count == len then result
+        else perform Array.slice(result, 0, count)
+    }
 }

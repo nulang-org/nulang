@@ -1,5 +1,5 @@
 //! VM throughput benchmarks: arithmetic, function calls, closures, dispatch,
-//! record/array access, and specialized numeric fast paths.
+//! record/array access, specialized numeric fast paths, and array construction.
 
 use criterion::{black_box, criterion_group, BatchSize, Criterion};
 use nulang::bytecode::CodeModule;
@@ -123,6 +123,32 @@ fn bench_array_indexing(c: &mut Criterion) {
     });
 }
 
+/// Compare repeated copy-on-append construction with one allocation followed
+/// by in-place ArrStore writes. Both produce the same 512-element array.
+fn bench_array_construction(c: &mut Criterion) {
+    let push = compile(
+        "var result = []; var i = 0; while i < 512 { result = perform Array.push(result, i); i = i + 1; }; perform Array.length(result)",
+    );
+    let preallocated = compile(
+        "var result = perform Array.new(512, 0); var i = 0; while i < 512 { result[i] = i; i = i + 1; }; perform Array.length(result)",
+    );
+
+    c.bench_function("vm/array_push_build", |b| {
+        b.iter_batched(
+            || fresh_vm(&push),
+            |mut vm| black_box(vm.run().unwrap()),
+            BatchSize::SmallInput,
+        )
+    });
+    c.bench_function("vm/array_preallocated_build", |b| {
+        b.iter_batched(
+            || fresh_vm(&preallocated),
+            |mut vm| black_box(vm.run().unwrap()),
+            BatchSize::SmallInput,
+        )
+    });
+}
+
 /// Compare the VM's specialized IPow path (binary exponentiation) with the
 /// old std.math.pow strategy: an O(exp) user-level recursive multiply loop.
 /// Keep the base mutable so MIR constant folding cannot erase the operation.
@@ -186,6 +212,7 @@ criterion_group!(
     bench_closure_capture,
     bench_record_access,
     bench_array_indexing,
+    bench_array_construction,
     bench_int_pow_fastpath,
     bench_float_sqrt_fastpath,
 );
