@@ -28,6 +28,7 @@ BUILD = ROOT / "target" / "cross-runtime"
 BENCHMARKS = ("counting", "ping_pong", "thread_ring", "fork_join")
 COMPUTE_BENCHMARKS = ("actor_compute",)
 JIT_PROOF_RE = re.compile(r"\[jit-warm\] workload=actor_compute actor_vm_compiled_regions=(\d+)")
+JIT_NEW_REGION_RE = re.compile(r"\[jit-proof\] workload=actor_compute actor_vm_new_compiled_regions=(\d+)")
 RECORD_RE = re.compile(
     r"\[cross-bench\]\s+runtime=(?P<runtime>[a-z0-9_-]+)\s+"
     r"benchmark=(?P<benchmark>[a-z0-9_-]+)\s+"
@@ -115,6 +116,10 @@ def parse_records(
         # Preserve independently auditable compilation evidence in the JSON
         # artifact, rather than relying only on transient Actions logs.
         records["actor_compute"]["jit_actor_vm_compiled_regions"] = int(proofs[0])
+        new_regions = JIT_NEW_REGION_RE.findall(output)
+        if len(new_regions) != 1 or not 0 < int(new_regions[0]) <= int(proofs[0]):
+            raise RuntimeError("actor_compute: missing or invalid new JIT proof from actor work")
+        records["actor_compute"]["jit_actor_vm_new_compiled_regions"] = int(new_regions[0])
     return records
 
 
