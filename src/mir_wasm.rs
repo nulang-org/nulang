@@ -257,6 +257,13 @@ impl WasmBackend {
     // ── Compile ───────────────────────────────────────────────────
 
     pub fn compile(&mut self, mir: &mir::Module, _module_name: &str) -> NuResult<Vec<u8>> {
+        if mir.actor_metadata.iter().any(|meta| meta.is_workflow) {
+            return Err(crate::types::NuError::VMError {
+                msg: "WASM backend does not yet support durable workflow semantics; use the bytecode/native runtime until workflow journaling, suspension, recovery, and compensation are implemented for WASM".into(),
+                span: crate::types::Span::default(),
+            });
+        }
+
         self.foreign_functions = mir.foreign_functions.clone();
         // Pre-scan: build the module-wide record field name → slot index map
         // (mirrors the AOT backend) so Record literals and LoadFieldNamed agree.
@@ -471,27 +478,25 @@ impl WasmBackend {
             self.compile_function(func, mir.functions.len() + idx);
         }
 
-        if !mir.functions.is_empty() {
-            // Export the actual entry function as `nulang_init`. Lifted closure
-            // functions are appended after `__main`, so `len()-1` can point at
-            // a closure carrying parameters, which the host rejects when it
-            // looks for a `() -> i64` export.
-            if let Some(main_in_module) = mir
-                .functions
-                .iter()
-                .position(|f| f.name == "__main" || f.name == "main")
-            {
-                let main_idx = FUNC_IMPORT_COUNT + main_in_module as u32;
-                self.exports
-                    .export("nulang_init", ExportKind::Func, main_idx);
-            } else {
-                // Library module (no entry expression): export a synthetic
-                // `() -> i64` function returning nil, matching the interpreter
-                // (a program with only function definitions evaluates to nil).
-                // Falling back to the last module function could be a
-                // parameterized one, which the host can't call as `() -> i64`.
-                self.emit_nil_entry();
-            }
+        // Export the actual entry function as `nulang_init`. Lifted closure
+        // functions are appended after `__main`, so `len()-1` can point at
+        // a closure carrying parameters, which the host rejects when it
+        // looks for a `() -> i64` export.
+        if let Some(main_in_module) = mir
+            .functions
+            .iter()
+            .position(|f| f.name == "__main" || f.name == "main")
+        {
+            let main_idx = FUNC_IMPORT_COUNT + main_in_module as u32;
+            self.exports
+                .export("nulang_init", ExportKind::Func, main_idx);
+        } else {
+            // Library and empty modules have no entry expression. Export a
+            // synthetic `() -> i64` function returning nil, matching the
+            // interpreter. This is also required for the empty source program:
+            // emitting a valid module without the host ABI entrypoint makes a
+            // successful compilation unusable by every WASM runtime.
+            self.emit_nil_entry();
         }
 
         // Emit the actor-emulation globals (current actor + mailbox queue)
@@ -538,9 +543,9 @@ impl WasmBackend {
     }
 
     /// Pre-scan interning for a dispatchable effect (`Perform` or the async
-    /// variant): interns the dotted effect path (`"Storage.write"`). The host
-    /// owns the EffectId + request envelope mapping; the compiler emits only
-    /// what it knows (the tag + runtime-marshalled positional args).
+    /// variant). Compiler-owned host operations intern their versioned
+    /// canonical ABI id; custom/unknown effects retain the legacy dotted source
+    /// tag until they have an explicit host ABI declaration.
     fn intern_effect_dispatch(&mut self, effect: &str, op: &str, args: &[LocalId]) -> NuResult<()> {
         let dispatchable = !matches!(
             (effect, op),
@@ -559,7 +564,22 @@ impl WasmBackend {
                 crate::types::Span::default(),
             ));
         }
-        let tag = format!("{effect}.{op}");
+        let tag = match crate::host_effect_abi::lookup_host_operation(effect, op) {
+            Some(operation) => {
+                if args.len() != operation.request.arity as usize {
+                    return Err(crate::types::NuError::type_error(
+                        format!(
+                            "WASM backend: host effect {effect}.{op} expects {} args, got {}",
+                            operation.request.arity,
+                            args.len()
+                        ),
+                        crate::types::Span::default(),
+                    ));
+                }
+                operation.canonical_id()
+            }
+            None => format!("{effect}.{op}"),
+        };
         self.intern_string(&tag);
         Ok(())
     }
@@ -1092,10 +1112,9 @@ impl WasmBackend {
                 }));
                 body.instruction(&Instruction::End);
             }
-            Stmt::Emit { .. } => {
-                // Effect and actor-state statements without a WASM
-                // counterpart stay no-ops until the corresponding runtime
-                // machinery is implemented.
+            Stmt::Emit { .. } | Stmt::ParallelMarker { .. } => {
+                // Effect statements without a WASM counterpart and
+                // structured-concurrency metadata remain runtime no-ops.
                 body.instruction(&Instruction::I64Const(value_layout::TAG_NIL as i64));
                 body.instruction(&Instruction::Drop);
             }
@@ -1113,12 +1132,44 @@ impl WasmBackend {
                 body.instruction(&Instruction::LocalGet(self.mir_local(l, func)));
             }
             RValue::Binary(op, a, b) => {
+                use crate::ast::BinOp;
+
+                let float_arithmetic = self.is_float_local(a, func) || self.is_float_local(b, func);
+                let numeric = matches!(
+                    op,
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Pow
+                );
+
+                // Mirror mir_codegen's type-directed F* opcode selection.
+                // For a statically-float operation, normalize tagged runtime
+                // fallbacks before calling the existing host arithmetic ABI:
+                // FAdd/FSub/FMul/FPow use 0.0; FDiv/FMod use 1.0 for a
+                // non-float denominator. This matters when an earlier FDiv
+                // returns nil but the enclosing expression remains Float.
+                if numeric && float_arithmetic {
+                    self.emit_float_operand(body, a, 0.0, func);
+                    let rhs_fallback = if matches!(op, BinOp::Div | BinOp::Mod) {
+                        1.0
+                    } else {
+                        0.0
+                    };
+                    self.emit_float_operand(body, b, rhs_fallback, func);
+
+                    let import = match op {
+                        BinOp::Add => IMPORT_ARITH_ADD,
+                        BinOp::Sub => IMPORT_ARITH_SUB,
+                        BinOp::Mul => IMPORT_ARITH_MUL,
+                        BinOp::Div => IMPORT_ARITH_DIV,
+                        BinOp::Mod => IMPORT_ARITH_MOD,
+                        BinOp::Pow => IMPORT_POW,
+                        _ => unreachable!(),
+                    };
+                    body.instruction(&Instruction::Call(import));
+                    return;
+                }
+
                 body.instruction(&Instruction::LocalGet(self.mir_local(a, func)));
                 body.instruction(&Instruction::LocalGet(self.mir_local(b, func)));
-                use crate::ast::BinOp;
-                // Numeric ops route through host helpers so float operands
-                // (raw bit patterns the inline integer path would corrupt) get
-                // f64 arithmetic, matching the interpreter. Comparisons too.
                 let import = match op {
                     BinOp::Add => Some(IMPORT_ARITH_ADD),
                     BinOp::Sub => Some(IMPORT_ARITH_SUB),
@@ -2099,6 +2150,60 @@ impl WasmBackend {
         func.name == "__main" || func.name == "main"
     }
 
+    fn is_float_local(&self, id: &mir::LocalId, func: &mir::Function) -> bool {
+        func.locals
+            .get(id.0 as usize)
+            .map(|local| {
+                local.ty == crate::types::Type::Primitive(crate::types::PrimitiveType::Float)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Push a raw f64 bit-pattern for a MIR operand, matching the VM's
+    /// `Value::as_float().unwrap_or(fallback)` semantics without adding a
+    /// new host import. Tagged values occupy NaN payload space; canonical
+    /// float NaN is the one accepted NaN representation.
+    fn emit_float_operand(
+        &self,
+        body: &mut Function,
+        id: &mir::LocalId,
+        fallback: f64,
+        func: &mir::Function,
+    ) {
+        const EXPONENT_MASK: i64 = 0x7FF0_0000_0000_0000u64 as i64;
+        const MANTISSA_MASK: i64 = 0x000F_FFFF_FFFF_FFFFu64 as i64;
+        let local = self.mir_local(id, func);
+
+        // is_float_raw(raw):
+        // exponent != all-ones || mantissa == 0 (infinity) || canonical NaN.
+        body.instruction(&Instruction::LocalGet(local));
+        body.instruction(&Instruction::I64Const(EXPONENT_MASK));
+        body.instruction(&Instruction::I64And);
+        body.instruction(&Instruction::I64Const(EXPONENT_MASK));
+        body.instruction(&Instruction::I64Ne);
+
+        body.instruction(&Instruction::LocalGet(local));
+        body.instruction(&Instruction::I64Const(MANTISSA_MASK));
+        body.instruction(&Instruction::I64And);
+        body.instruction(&Instruction::I64Eqz);
+        body.instruction(&Instruction::I32Or);
+
+        body.instruction(&Instruction::LocalGet(local));
+        body.instruction(&Instruction::I64Const(
+            value_layout::CANONICAL_NAN_BITS as i64,
+        ));
+        body.instruction(&Instruction::I64Eq);
+        body.instruction(&Instruction::I32Or);
+
+        body.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+        body.instruction(&Instruction::LocalGet(local));
+        body.instruction(&Instruction::Else);
+        body.instruction(&Instruction::I64Const(
+            value_layout::float_bits(fallback) as i64
+        ));
+        body.instruction(&Instruction::End);
+    }
+
     fn compile_unary(
         &self,
         body: &mut Function,
@@ -2117,14 +2222,7 @@ impl WasmBackend {
                 // carry Float for comparisons in this pipeline, even though the
                 // runtime comparison result is a tagged Bool; that path is still
                 // FNeg in the VM and must produce -0.0 for the Bool fallback.
-                let is_float = func
-                    .locals
-                    .get(a.0 as usize)
-                    .map(|local| {
-                        local.ty
-                            == crate::types::Type::Primitive(crate::types::PrimitiveType::Float)
-                    })
-                    .unwrap_or(false);
+                let is_float = self.is_float_local(a, func);
                 body.instruction(&Instruction::Call(if is_float {
                     IMPORT_ARITH_FNEG
                 } else {
@@ -2230,14 +2328,18 @@ impl WasmBackend {
             _ => {
                 // Runtime-argument effect dispatch: `perform Effect.op(args)`
                 // → `nulang_dispatch_args(tag_ptr, tag_len, argv_ptr, argc)`.
-                // The guest emits only the dotted effect path plus a positional
-                // array of tagged Nulang values; the host resolves the EffectId
-                // + request envelope and writes the single JSON result to the
-                // ring buffer. Args are marshalled into the module-wide argv
+                // For compiler-owned host operations, `tag` is the versioned
+                // canonical ABI id. Custom/unknown effects retain their legacy
+                // dotted source tag during the migration. Runtime arguments stay
+                // positional; Cloud instantiates the compiler-authored request
+                // schema for canonical ids and writes the projected JSON result
+                // to the ring buffer. Args are marshalled into the module-wide argv
                 // scratch (they are already-computed locals, so no dispatch's
                 // argument evaluation can run between our stores and the call).
                 // The tag is interned in the pre-scan.
-                let tag = format!("{effect}.{op}");
+                let tag = crate::host_effect_abi::lookup_host_operation(effect, op)
+                    .map(|operation| operation.canonical_id())
+                    .unwrap_or_else(|| format!("{effect}.{op}"));
                 let (tag_off, tag_len) = self.interned.get(&tag).copied().unwrap_or((0, 0));
                 let scratch = self.argv_scratch_off;
                 for (i, arg) in args.iter().enumerate() {
@@ -2941,6 +3043,37 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(test, feature = "wasm-backend"))]
+    fn test_empty_source_exports_runnable_nil_entry() {
+        let value = run_source("").expect("empty source should compile and run");
+        assert_eq!(
+            value.as_raw(),
+            crate::vm::Value::nil().as_raw(),
+            "empty source must match the interpreter's nil result"
+        );
+    }
+
+    #[test]
+    fn test_wasm_rejects_workflow_until_durable_semantics_are_supported() {
+        let error = compile_source(
+            r#"
+            workflow Order {
+                step reserve { 1 }
+                step charge { 2 }
+            }
+            "#,
+        )
+        .expect_err("WASM workflows must fail closed without durable semantics");
+
+        assert!(
+            error
+                .to_string()
+                .contains("WASM backend does not yet support durable workflow semantics"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn test_compile_literal_int() {
         let wasm = compile_source("42").expect("compile");
         assert_eq!(&wasm[0..4], b"\0asm");
@@ -3030,6 +3163,20 @@ mod tests {
         let value = runtime.run()?;
         let last = runtime.take_last_dispatch();
         Ok((value, last))
+    }
+
+    #[test]
+    #[cfg(all(test, feature = "wasm-backend"))]
+    fn test_wasm_float_add_after_zero_division_matches_bytecode_fallbacks() {
+        // Regression from the 2026-09-25 differential-fuzz nightly.
+        // Bytecode selects FDiv/FAdd/FNeg from MIR type information:
+        // 1.0 / 0.0 -> nil, FAdd(0.1, nil) treats nil as 0.0, then FNeg -> -0.1.
+        let value = run_source("let x = 0.1; let y = 0.2; -(x + 1.0 / 0.0)").expect("run");
+        let got = value.as_float().expect("result must remain Float");
+        assert!(
+            (got - (-0.1)).abs() < f64::EPSILON,
+            "WASM float arithmetic must preserve bytecode fallback semantics, got {got}"
+        );
     }
 
     #[test]
@@ -3319,15 +3466,15 @@ mod tests {
         );
     }
 
-    // ── Language effect tag mapping (dotted path → host envelope) ──
+    // ── Compiler-owned host effect identity mapping ──
 
     #[test]
     #[cfg(all(test, feature = "wasm-backend"))]
     fn test_wasm_inference_ask_maps_to_pool_builtin() {
-        // `perform Inference.ask("hi there")` emits the dotted effect path
-        // plus a positional argv array; the host resolves the EffectId +
-        // chat envelope and unwraps the handler's `{"content": ...}`
-        // response, so the guest read-back sees the plain reply string.
+        // `perform Inference.ask("hi there")` emits the compiler-owned
+        // canonical host id plus a positional argv array; the host resolves the
+        // chat envelope and unwraps the handler's `{"content": ...}` response,
+        // so the guest read-back sees the plain reply string.
         let wasm = compile_source(r#"perform Inference.ask("hi there")"#).expect("compile");
         let mut rt = crate::wasm_runtime::WasmRuntime::new(&wasm, None).unwrap();
         rt.set_dispatch_result(Some(br#""hello back""#.to_vec()));
@@ -3335,7 +3482,10 @@ mod tests {
         let (tag, payload) = rt
             .take_last_dispatch()
             .expect("dispatch must have been called");
-        assert_eq!(tag, b"Inference.ask", "dotted language effect path");
+        assert_eq!(
+            tag, b"nulang.host-effects/v0alpha1:nulang:inference/inference#chat",
+            "compiler-owned canonical host id"
+        );
         assert_eq!(payload, br#"["hi there"]"#, "positional argv array");
         assert_eq!(
             rt.string_value(&value).as_deref(),
@@ -3347,9 +3497,9 @@ mod tests {
     #[test]
     #[cfg(all(test, feature = "wasm-backend"))]
     fn test_wasm_storage_read_maps_to_pool_builtin() {
-        // `perform Storage.read(key)` emits the dotted path + argv; the host
-        // resolves the string-contract storage EffectId and unwraps the
-        // handler's `{"found":..., "value": "..."}` response to the plain
+        // `perform Storage.read(key)` emits the canonical host id + argv;
+        // the host resolves the string-contract storage EffectId and unwraps
+        // the handler's `{"found":..., "value": "..."}` response to the plain
         // stored string.
         let (value, last) = run_source_with_dispatch(
             r#"perform Storage.read("greeting")"#,
@@ -3357,7 +3507,10 @@ mod tests {
         )
         .expect("run");
         let (tag, payload) = last.expect("dispatch must have been called");
-        assert_eq!(tag, b"Storage.read", "dotted language effect path");
+        assert_eq!(
+            tag, b"nulang.host-effects/v0alpha1:nulang:storage/string#Read",
+            "compiler-owned canonical host id"
+        );
         assert_eq!(payload, br#"["greeting"]"#, "positional argv array");
         assert!(
             value.is_string(),
@@ -3374,7 +3527,10 @@ mod tests {
             run_source_with_dispatch(r#"perform Storage.write("greeting", "hello")"#, None)
                 .expect("run");
         let (tag, payload) = last.expect("dispatch must have been called");
-        assert_eq!(tag, b"Storage.write", "dotted language effect path");
+        assert_eq!(
+            tag, b"nulang.host-effects/v0alpha1:nulang:storage/string#Write",
+            "compiler-owned canonical host id"
+        );
         assert_eq!(payload, br#"["greeting","hello"]"#, "positional argv array");
         assert!(value.is_nil(), "discarded write result must be nil");
     }
@@ -3386,7 +3542,10 @@ mod tests {
             run_source_with_dispatch(r#"perform Queue.pop("orders")"#, Some(br#""m1""#.to_vec()))
                 .expect("run");
         let (tag, payload) = last.expect("dispatch must have been called");
-        assert_eq!(tag, b"Queue.pop", "dotted language effect path");
+        assert_eq!(
+            tag, b"nulang.host-effects/v0alpha1:nulang:queue/string#Receive",
+            "compiler-owned canonical host id"
+        );
         assert_eq!(payload, br#"["orders"]"#, "positional argv array");
         assert!(
             value.is_string(),
@@ -3401,7 +3560,10 @@ mod tests {
             run_source_with_dispatch(r#"perform Queue.push("orders", "hello")"#, None)
                 .expect("run");
         let (tag, payload) = last.expect("dispatch must have been called");
-        assert_eq!(tag, b"Queue.push", "dotted language effect path");
+        assert_eq!(
+            tag, b"nulang.host-effects/v0alpha1:nulang:queue/string#Send",
+            "compiler-owned canonical host id"
+        );
         assert_eq!(payload, br#"["orders","hello"]"#, "positional argv array");
         assert!(value.is_nil(), "discarded send result must be nil");
     }
@@ -3415,7 +3577,10 @@ mod tests {
         )
         .expect("run");
         let (tag, payload) = last.expect("dispatch must have been called");
-        assert_eq!(tag, b"Http.get", "dotted language effect path");
+        assert_eq!(
+            tag, b"nulang.host-effects/v0alpha1:nulang:http/string#GET",
+            "compiler-owned canonical host id"
+        );
         assert_eq!(
             payload, br#"["https://example.com/"]"#,
             "positional argv array"
@@ -3434,7 +3599,10 @@ mod tests {
         let (value, last) =
             run_source_with_dispatch(r#"perform Timer.sleep(1000)"#, None).expect("run");
         let (tag, payload) = last.expect("dispatch must have been called");
-        assert_eq!(tag, b"Timer.sleep", "dotted language effect path");
+        assert_eq!(
+            tag, b"nulang.host-effects/v0alpha1:nulang:timer/timer#sleep",
+            "compiler-owned canonical host id"
+        );
         assert_eq!(payload, br#"[1000]"#, "positional argv array");
         assert!(value.is_nil(), "discarded sleep result must be nil");
     }

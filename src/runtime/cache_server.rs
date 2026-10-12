@@ -235,7 +235,7 @@ impl CacheShardServer {
             ));
         }
 
-        let mut poll = Poll::new()?;
+        let poll = Poll::new()?;
         let mut listener = TcpListener::bind(bind_addr)?;
         poll.registry()
             .register(&mut listener, LISTENER_TOKEN, Interest::READABLE)?;

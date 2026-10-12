@@ -8,17 +8,19 @@ import CopyMarkdown from '../../../components/CopyMarkdown.astro';
 
 <CopyMarkdown />
 
+Install a [checksummed release binary](/getting-started/installation/) for your platform, or use the browser playground below. You do **not** need to build the compiler from source for this tutorial.
+
 :::tip[No install? Try the playground]
-Run `python3 playground/server.py` from a repo checkout (it auto-detects a
-built `nulang` binary) and open http://localhost:8080. A hosted version at
-nulang.org/playground is coming soon.
+Open the [browser playground](/playground/) to compile and run the frozen Core
+subset locally in WebAssembly — no account, server, or install required.
+Actors, networking, FFI, and JIT execution still require the native runtime.
 :::
 
 
 Run a one-liner:
 
 ```bash
-cargo run -- --eval 'perform IO.print("Hello, Nulang!")'
+nulang --eval 'perform IO.print("Hello, Nulang!")'
 ```
 
 ```
@@ -28,8 +30,20 @@ Hello, Nulang!
 Or start the REPL for an interactive session:
 
 ```bash
-cargo run -- --repl
+nulang --repl
 ```
+
+## Your first local project
+
+After installing the compiler, scaffold a project using the bundled `nula` package manager:
+
+```bash
+nulang nula new hello-app
+cd hello-app
+nulang nula run
+```
+
+The command `nulang nula test` runs tests discovered under the project's `tests/` directory. Package management and other non-Core operations require the native runtime, not the limited browser playground.
 
 ## Variables and Functions
 

@@ -288,7 +288,7 @@ fn print_usage() {
     println!("                Scaffold a new package directory");
     println!("                Templates: default, cli, lib, full");
     println!("  init          Scaffold a new package in the current directory");
-    println!("  build         Build the package (type-check + .nbc artifact in .nula/dist/)");
+    println!("  build         Build .nbc + RFC 0020 behavior sidecar in .nula/dist/");
     println!("  build-wasm    Build package to .wasm + .cwasm in .nula/dist/");
     println!("  test [--filter <substr>] [--verbose|-v] [--watch|-w]  Run .nula test files");
     println!("  run           Build and run the package entry point");
@@ -1072,12 +1072,13 @@ fn cmd_build(json: bool) -> NuResult<()> {
         span: Span::default(),
     })?;
     let name = manifest.package.name.clone();
+    let version = manifest.package.version.clone();
 
     let entry = prepare_package()?;
     let entry_str = entry.to_string_lossy().into_owned();
 
     if json {
-        return cmd_build_json(&root, &name, &entry_str);
+        return cmd_build_json(&root, &name, &version, &entry_str);
     }
 
     let dist_dir = root.join(".nula").join("dist");
@@ -1088,6 +1089,8 @@ fn cmd_build(json: bool) -> NuResult<()> {
 
     let nbc_path = dist_dir.join(format!("{}.nbc", name));
     let nbc_path_str = nbc_path.to_string_lossy().into_owned();
+    let behavior_path = dist_dir.join(format!("{}.behavior.json", name));
+    let behavior_path_str = behavior_path.to_string_lossy().into_owned();
 
     eprintln!("Building {}...", name);
     eprintln!("  Type-checking {}...", entry.display());
@@ -1097,7 +1100,18 @@ fn cmd_build(json: bool) -> NuResult<()> {
     eprintln!("  Compiling {} to .nbc...", name);
     nulang_exe(
         &[
-            &["--emit-nbc", "--out", &nbc_path_str, &entry_str],
+            &[
+                "--emit-nbc",
+                "--out",
+                &nbc_path_str,
+                "--emit-behavior-manifest",
+                &behavior_path_str,
+                "--behavior-package-name",
+                &name,
+                "--behavior-package-version",
+                &version,
+                &entry_str,
+            ],
             &cap_refs[..],
         ]
         .concat(),
@@ -1111,7 +1125,7 @@ fn cmd_build(json: bool) -> NuResult<()> {
 /// diagnostics are produced by the child `nulang --check --json` invocation
 /// and forwarded (re-wrapped as `command: "build"`) so consumers see one
 /// schema.
-fn cmd_build_json(root: &Path, name: &str, entry_str: &str) -> NuResult<()> {
+fn cmd_build_json(root: &Path, name: &str, version: &str, entry_str: &str) -> NuResult<()> {
     use crate::json_diagnostics::{diagnostic_from_message, JsonReport, SCHEMA_VERSION};
 
     // Step 1: type-check with JSON diagnostics, capturing the child's stdout.
@@ -1156,8 +1170,21 @@ fn cmd_build_json(root: &Path, name: &str, entry_str: &str) -> NuResult<()> {
     })?;
     let nbc_path = dist_dir.join(format!("{}.nbc", name));
     let nbc_path_str = nbc_path.to_string_lossy().into_owned();
+    let behavior_path = dist_dir.join(format!("{}.behavior.json", name));
+    let behavior_path_str = behavior_path.to_string_lossy().into_owned();
     eprintln!("  Compiling {} to .nbc...", name);
-    let compile = nulang_exe_output(&["--emit-nbc", "--out", &nbc_path_str, entry_str])?;
+    let compile = nulang_exe_output(&[
+        "--emit-nbc",
+        "--out",
+        &nbc_path_str,
+        "--emit-behavior-manifest",
+        &behavior_path_str,
+        "--behavior-package-name",
+        name,
+        "--behavior-package-version",
+        version,
+        entry_str,
+    ])?;
     if !compile.status.success() {
         let stderr = String::from_utf8_lossy(&compile.stderr).trim().to_string();
         let report = JsonReport::new(
@@ -2174,6 +2201,7 @@ fn cmd_deploy(
         span: Span::default(),
     })?;
     let name = manifest.package.name.clone();
+    let version = manifest.package.version.clone();
 
     // Build the web output so dist/ contains the IR and static assets.
     cmd_build_web()?;
@@ -2231,8 +2259,21 @@ fn cmd_deploy(
     let entry_str = entry.to_string_lossy().into_owned();
     let nbc_path = nula_dist.join(format!("{}.nbc", name));
     let nbc_path_str = nbc_path.to_string_lossy().into_owned();
-    eprintln!("Compiling {} to .nbc...", name);
-    nulang_exe(&["--emit-nbc", "--out", &nbc_path_str, &entry_str])?;
+    let behavior_path = nula_dist.join(format!("{}.behavior.json", name));
+    let behavior_path_str = behavior_path.to_string_lossy().into_owned();
+    eprintln!("Compiling {} to .nbc + behavior manifest...", name);
+    nulang_exe(&[
+        "--emit-nbc",
+        "--out",
+        &nbc_path_str,
+        "--emit-behavior-manifest",
+        &behavior_path_str,
+        "--behavior-package-name",
+        &name,
+        "--behavior-package-version",
+        &version,
+        &entry_str,
+    ])?;
 
     // Optionally build .wasm + .cwasm (WASM tier).
     if wasm {
