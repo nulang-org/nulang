@@ -91,6 +91,77 @@ pub fn lower_module(hir: &hir::Module) -> NuResult<mir::Module> {
 
     let mut module = ctx.finish()?;
     crate::mir_inline::inline_local_closures(&mut module);
+    for func in module
+        .functions
+        .iter_mut()
+        .chain(module.behaviors.iter_mut())
+    {
+        // `TypeMetadata` is built optimistically from each local's declared
+        // type, but a local's RUNTIME value is not constrained by that type:
+        // `1 % 0`, `1 / 0`, negative-`**` exponents, out-of-bounds
+        // field/array reads, and nil-returning calls all legally produce nil,
+        // and a function name used as a value is a function-table index, not
+        // an integer. The AOT backend compiles raw register ops
+        // (sext48/tag/negate/compare) on "known" registers, so claiming Int
+        // for such a register corrupts the tag: `-(1 % 0)` returned int 0
+        // (nil's zero payload re-tagged) instead of the interpreter's type
+        // error. Mirror the JIT's `infer_reg_types` (IDiv/IMod results are
+        // Unknown) by under-approximating "known" on the final MIR, and
+        // propagate through `Load` copies (`let x = 1 % 0; -(x)`).
+        let mut nil_legal: Vec<bool> = vec![false; func.locals.len()];
+        let local_base = mir::FunctionBuilder::LOCAL_BASE as usize;
+        let nil_legal_op = |op: &mir::RValue, declared_unit: bool| -> bool {
+            match op {
+                mir::RValue::Binary(
+                    crate::ast::BinOp::Div | crate::ast::BinOp::Mod | crate::ast::BinOp::Pow,
+                    _,
+                    _,
+                ) => true,
+                mir::RValue::LoadFieldPos { .. }
+                | mir::RValue::ArrayLoad { .. }
+                | mir::RValue::Call { .. }
+                | mir::RValue::Closure { .. }
+                | mir::RValue::Migrate { .. } => true,
+                // A top-level function used as a value lowers to its raw
+                // function-table index in a Unit-typed local.
+                mir::RValue::Const(crate::bytecode::Constant::Int(_)) => declared_unit,
+                _ => false,
+            }
+        };
+        loop {
+            let mut changed = false;
+            for block in &func.blocks {
+                for stmt in &block.stmts {
+                    if let mir::Stmt::Assign { dst, op } = stmt {
+                        let li = dst.0 as usize;
+                        if nil_legal[li] {
+                            continue;
+                        }
+                        let declared_unit = func
+                            .locals
+                            .get(li)
+                            .map(|l| l.ty == crate::types::Type::unit())
+                            .unwrap_or(false);
+                        let direct = nil_legal_op(op, declared_unit);
+                        let via_load = matches!(op, mir::RValue::Load(src) if (src.0 as usize) < nil_legal.len() && nil_legal[src.0 as usize]);
+                        if direct || via_load {
+                            nil_legal[li] = true;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        for (li, legal) in nil_legal.iter().enumerate() {
+            if *legal {
+                func.type_metadata
+                    .set_type(local_base + li, crate::type_metadata::KnownType::Unknown);
+            }
+        }
+    }
     Ok(module)
 }
 
@@ -370,21 +441,62 @@ impl ModuleCtx {
             .unwrap_or(self.behaviors.len())
     }
 
-    /// Resolve `send`/`ask actor behavior(...)` to a behavior-table index by
-    /// name. Mirrors the stable compiler's `behavior_table_index`: an exact
-    /// "ActorName.behavior" match first, falling back to any behavior with a
-    /// matching suffix if the receiver expression isn't a bare actor-typed
-    /// variable name (a known ambiguity inherited from the stable compiler,
-    /// not introduced here).
-    fn send_behavior_idx(&self, actor_name_hint: &str, behavior: &str) -> usize {
-        let full_name = format!("{}.{}", actor_name_hint, behavior);
-        if let Some(idx) = self.behavior_names.iter().position(|n| *n == full_name) {
-            return idx;
+    /// Resolve `send`/`ask actor behavior(...)` to a behavior-table index.
+    ///
+    /// Exact qualified identities always win. A unique short-name suffix is
+    /// retained only as a compatibility path for genuinely opaque/dynamic
+    /// actor references; an ambiguous suffix must fail closed instead of
+    /// selecting code owned by a different actor schema.
+    fn send_behavior_idx(&self, actor_name_hint: &str, behavior: &str) -> NuResult<usize> {
+        if let Some(idx) = self.behavior_names.iter().position(|name| name == behavior) {
+            return Ok(idx);
         }
+
+        if !actor_name_hint.is_empty() {
+            let full_name = format!("{}.{}", actor_name_hint, behavior);
+            if let Some(idx) = self
+                .behavior_names
+                .iter()
+                .position(|name| *name == full_name)
+            {
+                return Ok(idx);
+            }
+        }
+
+        let suffix = format!(".{}", behavior);
+        let candidates: Vec<(usize, &str)> = self
+            .behavior_names
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, name)| name.ends_with(&suffix).then_some((idx, name.as_str())))
+            .collect();
+
+        match candidates.as_slice() {
+            [] => Ok(self.behaviors.len()),
+            [(idx, _)] => Ok(*idx),
+            _ => Err(compile_err(
+                format!(
+                    "ambiguous actor behavior '{}'; candidates: {}. \
+                     The receiver's nominal actor identity must be preserved before MIR lowering",
+                    behavior,
+                    candidates
+                        .iter()
+                        .map(|(_, name)| *name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                Span::default(),
+            )),
+        }
+    }
+
+    /// Selective receive still resolves against the current actor's local arm
+    /// names; keep that legacy resolver separate from send/ask nominal identity.
+    fn receive_behavior_idx(&self, behavior: &str) -> usize {
         let suffix = format!(".{}", behavior);
         self.behavior_names
             .iter()
-            .position(|n| n.ends_with(&suffix))
+            .position(|name| name == behavior || name.ends_with(&suffix))
             .unwrap_or(self.behaviors.len())
     }
 
@@ -1468,7 +1580,7 @@ impl<'c> FnLowerer<'c> {
                 ..
             } => {
                 let actor_hint = operand_name_hint(actor);
-                let idx = self.ctx.send_behavior_idx(&actor_hint, behavior);
+                let idx = self.ctx.send_behavior_idx(&actor_hint, behavior)?;
                 let actor_id = self.lower_operand(actor)?;
                 let mut arg_ids = Vec::with_capacity(args.len());
                 for a in args {
@@ -1494,7 +1606,7 @@ impl<'c> FnLowerer<'c> {
                 ..
             } => {
                 let actor_hint = operand_name_hint(actor);
-                let idx = self.ctx.send_behavior_idx(&actor_hint, behavior);
+                let idx = self.ctx.send_behavior_idx(&actor_hint, behavior)?;
                 let actor_id = self.lower_operand(actor)?;
                 let mut arg_ids = Vec::with_capacity(args.len());
                 for a in args {
@@ -1690,7 +1802,7 @@ impl<'c> FnLowerer<'c> {
         }
         let behavior_ids: Vec<u16> = arms
             .iter()
-            .map(|(name, _, _, _)| self.ctx.send_behavior_idx("", name) as u16)
+            .map(|(name, _, _, _)| self.ctx.receive_behavior_idx(name) as u16)
             .collect();
         let max_params = arms.iter().map(|(_, p, _, _)| p.len()).max().unwrap_or(0);
         let timeout = match after {
@@ -2896,6 +3008,48 @@ mod tests {
         let hir_module = hir::Module::new("test");
         let mir_module = lower_module(&hir_module).unwrap();
         assert_eq!(mir_module.name, "test");
+    }
+
+    #[test]
+    fn known_receiver_uses_nominal_behavior_identity_when_short_names_collide() {
+        let module = lower_source(
+            r#"
+            actor First {
+                state n: Int = 0
+                behavior hit() { self.n = self.n + 100 }
+                behavior get() { self.n }
+            }
+            actor Second {
+                state n: Int = 0
+                behavior get() { self.n }
+                behavior hit() { self.n = self.n + 1 }
+            }
+            fn main() {
+                let s = spawn Second {}
+                send s hit()
+                ask s get()
+            }
+            "#,
+        )
+        .expect("known receiver identity should disambiguate colliding behavior names");
+        let main = find_fn(&module, "main");
+
+        let mut send_idx = None;
+        let mut ask_idx = None;
+        for block in &main.blocks {
+            for stmt in &block.stmts {
+                if let mir::Stmt::Assign { op, .. } = stmt {
+                    match op {
+                        mir::RValue::Send { behavior_idx, .. } => send_idx = Some(*behavior_idx),
+                        mir::RValue::Ask { behavior_idx, .. } => ask_idx = Some(*behavior_idx),
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        assert_eq!(send_idx, Some(3), "send must resolve to Second.hit");
+        assert_eq!(ask_idx, Some(2), "ask must resolve to Second.get");
     }
 
     // -----------------------------------------------------------------------
