@@ -233,6 +233,8 @@ version + migration.*
 
 ## Stable tier
 
+### Timer callback behavior-zero correctness — 2026-09-23
+- **`Timer.after` now preserves a valid behavior id 0 and fails closed for unknown callback names** (`src/runtime/callbacks.rs`). The runtime no longer maps failed callback lookup to 0 and then filters 0 out; declared first behaviors are schedulable, while unknown names emit a warning and create no timer. Focused regressions cover both cases.
 ### Zero-copy non-reentrant JIT register entry — 2026-09-24
 - **Cranelift regions that cannot re-enter the VM now execute directly against the active frame's 256-register array**, eliminating the previous 2 KiB snapshot before native entry and 2 KiB copy-back afterward. `Value` is explicitly `repr(transparent)` over `u64` so the native register ABI has a documented layout guarantee.
 - **Compiled-region metadata now records whether native execution may grow or replace the VM frame stack.** Regions containing helper-backed direct calls retain the detached register snapshot because re-entrant interpreter calls may reallocate `VM::frames`; typed, SIMD, and scalar non-call regions use the direct-frame path.
