@@ -120,15 +120,21 @@ def parse_allocation_profile(output: str, allocations: int) -> dict:
     rows = [json.loads(line) for line in output.splitlines() if line.strip()]
     if not rows:
         raise ValueError('no allocation rows')
+    # Keep this fixture contract aligned with examples/actor_allocation_profile.rs.
+    expected_sizes = {8, 16, 32, 64, 128, 256}
     seen = set()
     for row in rows:
         size = row['payload_bytes']
         if size in seen:
             raise ValueError(f'duplicate allocation size {size}')
+        if size not in expected_sizes:
+            raise ValueError(f'unexpected allocation size {size}')
         seen.add(size)
         if (row['allocations'] != allocations or row['payload_total_bytes'] != size * allocations
                 or row['physical_bytes'] < row['payload_total_bytes']):
             raise ValueError('inconsistent allocation accounting')
+    if seen != expected_sizes:
+        raise ValueError(f'missing allocation size buckets: {sorted(expected_sizes - seen)}')
     return {
         'fixture': 'synthetic_equal_count_per_size_not_production_trace',
         'buckets': rows,
