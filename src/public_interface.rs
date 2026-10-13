@@ -513,7 +513,8 @@ fn checked_decls(
         for name in names {
             if !result.iter().any(|decl| matches_name(decl, name)) {
                 return Err(format!(
-                    "public interface: explicitly exported declaration '{}' has no verified signature",
+                    "public interface: explicitly exported declaration \
+                     '{}' has no verified signature",
                     name
                 ));
             }
@@ -838,7 +839,11 @@ mod tests {
             name: "api".to_string(),
             decls: vec![ast_fn("answer", Some(EffectRow::empty()))],
         };
-        let err = interface_for_checked_ast(&source, &rustc_hash::FxHashMap::default()).unwrap_err();
+        let err = interface_for_checked_ast(
+            &source,
+            &rustc_hash::FxHashMap::default(),
+        )
+        .unwrap_err();
         assert!(err.contains("inferred"));
     }
 
