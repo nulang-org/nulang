@@ -108,7 +108,7 @@ pub fn run(args: &[String]) -> NuResult<()> {
                 });
             }
             cmd_build_wasm(args[1..].iter().any(|a| a == "--locked"))
-        },
+        }
         Some("test") => {
             let mut filter: Option<&str> = None;
             let mut verbose = false;
@@ -2684,9 +2684,7 @@ mod tests {
 
     #[test]
     fn locked_mode_rejects_missing_lockfile_for_build_run_and_test() {
-        let dir = std::env::temp_dir().join(format!(
-            "nula_locked_missing_{}", std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("nula_locked_missing_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         scaffold_package(&dir, "locked-app", "default").unwrap();
         let _guard = ChangeDir::new(&dir);
@@ -2703,9 +2701,7 @@ mod tests {
 
     #[test]
     fn locked_mode_preserves_unchanged_lockfile_bytes() {
-        let dir = std::env::temp_dir().join(format!(
-            "nula_locked_unchanged_{}", std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("nula_locked_unchanged_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         scaffold_package(&dir, "locked-app", "default").unwrap();
         let _guard = ChangeDir::new(&dir);
@@ -2720,9 +2716,7 @@ mod tests {
 
     #[test]
     fn locked_mode_rejects_changed_dependency_pin_without_rewriting() {
-        let dir = std::env::temp_dir().join(format!(
-            "nula_locked_pin_drift_{}", std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("nula_locked_pin_drift_{}", std::process::id()));
         let root = dir.join("root");
         let util = dir.join("util");
         let _ = std::fs::remove_dir_all(&dir);
@@ -2755,9 +2749,7 @@ mod tests {
 
     #[test]
     fn locked_mode_detects_changed_path_dependency_source_identity() {
-        let dir = std::env::temp_dir().join(format!(
-            "nula_locked_source_drift_{}", std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("nula_locked_source_drift_{}", std::process::id()));
         let root = dir.join("root");
         let util = dir.join("util");
         let _ = std::fs::remove_dir_all(&dir);
