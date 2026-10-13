@@ -99,3 +99,53 @@ fn exhaustive_bool_match_has_no_coverage_warning() {
 
     assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
 }
+
+
+#[test]
+fn nil_singleton_match_requires_unguarded_coverage() {
+    let warnings = warnings_for(
+        r#"
+        fn choose() -> Int {
+            match nil {
+                | nil if false => 0
+            }
+        }
+        "#,
+    );
+
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].code, "W0201");
+    assert!(warnings[0].msg.contains("nil"));
+}
+
+#[test]
+fn unit_singleton_literal_proves_coverage() {
+    let warnings = warnings_for(
+        r#"
+        fn choose() -> Int {
+            match unit {
+                | unit => 1
+            }
+        }
+        "#,
+    );
+
+    assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+}
+
+#[test]
+fn unit_singleton_redundant_wildcard_emits_w0202() {
+    let warnings = warnings_for(
+        r#"
+        fn choose() -> Int {
+            match unit {
+                | unit => 1
+                | _ => 2
+            }
+        }
+        "#,
+    );
+
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].code, "W0202");
+}
