@@ -128,6 +128,7 @@ def measurement_order(selected: list[str], round_idx: int) -> list[str]:
     offset = round_idx % len(selected)
     return selected[offset:] + selected[:offset]
 
+
 def build_commands(selected: list[str]) -> dict[str, list[str]]:
     BUILD.mkdir(parents=True, exist_ok=True)
     commands: dict[str, list[str]] = {}
