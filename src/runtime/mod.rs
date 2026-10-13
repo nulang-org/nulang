@@ -7267,6 +7267,30 @@ impl Runtime {
             },
         };
 
+        // These are *gauges* over live allocators, not monotonic counters:
+        // heaps reset during actor pooling and actor removal changes the sum.
+        // Include the main/top-level heap, but exclude pooled/retired heaps.
+        let mut allocator = AllocatorMetric::default();
+        for heap in std::iter::once(&self.main_heap)
+            .chain(self.actors.values().map(|actor| &actor.heap))
+        {
+            let snap = heap.allocation_snapshot();
+            allocator.heap_allocations_since_reset = allocator
+                .heap_allocations_since_reset
+                .saturating_add(snap.allocations as u64);
+            allocator.heap_requested_payload_bytes_since_reset = allocator
+                .heap_requested_payload_bytes_since_reset
+                .saturating_add(snap.requested_payload_bytes);
+            allocator.heap_live_objects = allocator
+                .heap_live_objects
+                .saturating_add(snap.live_objects as u64);
+        }
+        for actor in self.actors.values() {
+            allocator.arena_epoch_allocations = allocator
+                .arena_epoch_allocations
+                .saturating_add(actor.iso_arena.allocation_snapshot().epoch_allocations as u64);
+        }
+
         MetricsSnapshot {
             actors_live: self.actor_count() as u64,
             actors_mailboxes: mailboxes,
@@ -7276,6 +7300,7 @@ impl Runtime {
             resolver,
             supervisors,
             crdt,
+            allocator,
         }
     }
 
@@ -7684,6 +7709,22 @@ pub struct MetricsSnapshot {
     pub supervisors: Vec<SupervisorMetric>,
     /// CRDT replication state.
     pub crdt: CrdtMetric,
+    /// Non-monotonic live-allocator gauges. Not whole-process totals.
+    pub allocator: AllocatorMetric,
+}
+
+/// Instantaneous totals from active heaps and activation-local arenas.
+///
+/// The heap gauges sum since-reset observations from the main heap and
+/// currently live actor heaps. The arena gauge sums current-epoch
+/// allocations from live actors only. Actor pools and retired heaps are
+/// excluded. Actor churn or allocator reset can decrease these values.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct AllocatorMetric {
+    pub heap_allocations_since_reset: u64,
+    pub heap_requested_payload_bytes_since_reset: u64,
+    pub heap_live_objects: u64,
+    pub arena_epoch_allocations: u64,
 }
 
 /// Per-actor mailbox depth for the metrics snapshot.
