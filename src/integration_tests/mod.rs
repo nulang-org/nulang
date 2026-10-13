@@ -11701,6 +11701,10 @@ match { a: 2, b: 9 } with {
         let actor = runtime.actors.get(&actor_id).expect("resumed workflow");
         assert!(!actor.jit_yield_pending, "the JIT continuation must finish");
         assert!(actor.suspended_execution.is_none());
+        assert!(
+            actor.current_workflow_activation.is_none(),
+            "terminal JIT completion must consume the workflow activation"
+        );
         assert_eq!(
             actor.get_state_field("step_index").and_then(|v| v.as_int()),
             Some(1),
