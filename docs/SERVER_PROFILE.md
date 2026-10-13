@@ -69,10 +69,11 @@ restarts; the `server` Cargo feature simply makes the separate SQLite
 persistence adapter available in the binary. Do not expose `nula dev` as a
 production-ready public server.
 
-CI's `scripts/test_service_template.py` will scaffold the template, run it
-on a localhost-only ephemeral port, and check both HTTP routes using the
-release CLI. The test is not a substitute for independent production security
-or durability tests.
+CI's `scripts/test_service_template.py` will scaffold the template,
+connect through loopback to an ephemeral dev-server port, and check both HTTP
+routes using **both** the release CLI and the lean `server` feature profile.
+The current development listener may bind all interfaces; run this smoke in
+isolated CI. It is not a production security or durability test.
 
 ## Next integration slice
 
