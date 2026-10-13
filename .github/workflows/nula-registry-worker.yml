@@ -1,0 +1,38 @@
+name: Nula Registry Worker Checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Superseded PR commits must not monopolize the runner queue.
+concurrency:
+  group: nula-registry-worker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  registry-worker:
+    name: Registry Worker Tests & Typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: registry-worker
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: registry-worker/package-lock.json
+
+      - name: Install locked dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Test registry upload, download and signature handling
+        run: npm test
+
+      - name: Type-check the worker and tests
+        run: npx tsc --noEmit
