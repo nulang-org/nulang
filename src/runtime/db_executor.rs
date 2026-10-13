@@ -210,7 +210,7 @@ mod tests {
             if let Some(gate) = self.gate.take() {
                 gate.wait();
             }
-            Ok(vec![r#"[1,\"ok\"]"#.into()])
+            Ok(vec![r#"[1,"ok"]"#.into()])
         }
     }
 
@@ -244,7 +244,7 @@ mod tests {
         let completion = receive(&executor, Instant::now() + Duration::from_secs(2));
         assert_eq!(completion.ticket(), ticket);
         let (_, result) = completion.into_result();
-        assert_eq!(result.unwrap(), vec![r#"[1,\"ok\"]"#.to_string()]);
+        assert_eq!(result.unwrap(), vec![r#"[1,"ok"]"#.to_string()]);
         let calls = calls.lock().unwrap();
         assert_eq!(calls[0].0, "SELECT $1");
         assert_ne!(calls[0].1, caller);
