@@ -120,6 +120,24 @@ class GitHubActionsCIContractTests(unittest.TestCase):
                         f"{path.name} also runs on non-PR events, so its draft guard must be event-scoped",
                     )
 
+    def test_draft_guards_preserve_dependency_failure_skips(self):
+        # A job that declares `needs` is skipped when its dependency fails —
+        # but adding an `if:` replaces that implicit condition, so the guard
+        # must reference the dependency result explicitly.
+        ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "&& needs.release.result == 'success'",
+            ci,
+            "ci.yml nula-test (needs: release) must keep the dependency-success requirement",
+        )
+        self.assertIn(
+            "&& needs.preflight.result == 'success'",
+            release,
+            "release.yml release job (needs: preflight) must keep the dependency-success requirement",
+        )
+
     def test_contract_is_enforced_by_the_implementation_gate(self):
         gate = (ROOT / "scripts" / "verify_implementation.py").read_text(encoding="utf-8")
 
