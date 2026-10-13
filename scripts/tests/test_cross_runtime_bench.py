@@ -70,7 +70,8 @@ class BenchmarkRecordContractTests(unittest.TestCase):
 
     def test_rejects_missing_workload(self):
         output = "\n".join(
-            record("nulang", name, count) for name, count in ROWS.items()
+            record("nulang", name, count)
+            for name, count in ROWS.items()
             if name != "fork_join"
         )
         with self.assertRaisesRegex(RuntimeError, "fork_join"):
