@@ -294,11 +294,8 @@ impl Runtime {
     }
 }
 
-//! Actor-scoped asynchronous SQL integration.
-//!
-//! The tests intentionally precede the implementation. Unlike durable actor
-//! effects, in-flight application SQL is not replay-safe.
-
+// Actor-scoped SQL regression tests. Durable actors cannot replay unreceipted
+// external writes safely, so those calls must fail before worker admission.
 #[cfg(test)]
 mod tests {
     use super::*;
