@@ -4315,29 +4315,14 @@ impl Runtime {
                         // requires quarantining the actor until safe recovery
                         // can prove the persisted history is consistent.
                         if self.actor_is_workflow(actor_id) {
-                            let seq = self.next_sequence(actor_id);
                             let step_name = self.step_name_for(actor_id, behavior_idx);
-                            let terminal_result = self
-                                .persistence
-                                .append_workflow_event(
-                                    actor_id,
-                                    WorkflowEvent::StepFailed {
-                                        sequence: seq,
-                                        activation: workflow_activation,
-                                        step_name,
-                                        error: format!("{}", e),
-                                    },
-                                )
-                                .and_then(|_| workflow::try_checkpoint_actor(self, actor_id));
-                            if let Err(error) = terminal_result {
-                                tracing::error!(
-                                    actor_id,
-                                    %error,
-                                    "nulang-workflow: failed-step terminal persistence rejected; quarantining actor"
-                                );
-                                self.actors.remove(&actor_id);
-                                self.pending_receive_wakes
-                                    .retain(|queued| *queued != actor_id);
+                            if !workflow::finish_resumed_workflow_failure(
+                                self,
+                                actor_id,
+                                workflow_activation,
+                                step_name,
+                                e.to_string(),
+                            ) {
                                 self.current_actor = None;
                                 return;
                             }

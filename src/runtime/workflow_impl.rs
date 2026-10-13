@@ -406,12 +406,47 @@ pub(crate) fn finish_resumed_workflow_failure(
     step_name: String,
     error: String,
 ) -> bool {
-    let Some(actor) = rt.actors.get_mut(&actor_id) else {
+    // The live actor has already executed a failing VM continuation. It may
+    // contain speculative durable-field writes; never use it as the source
+    // of a StepFailed checkpoint, even if both store operations succeed.
+    let previous = rt.persistence.load_snapshot(actor_id);
+    let live_state = build_actor_snapshot_at_sequence(rt, actor_id, next_sequence(rt, actor_id));
+
+    let prepared = previous
+        .zip(live_state.ok().flatten())
+        .and_then(|(mut safe, live)| {
+            if safe.actor_id != actor_id
+                || safe.activation_epoch == 0
+                || live.activation_epoch != safe.activation_epoch
+            {
+                return None;
+            }
+            let speculative = live.state != safe.state
+                || live.crdt_snapshot != safe.crdt_snapshot
+                || live.crdt_field_map != safe.crdt_field_map
+                || live.authority_tokens != safe.authority_tokens
+                || live.schema_name != safe.schema_name;
+            let sequence = next_sequence(rt, actor_id);
+            safe.sequence = sequence;
+            // The failed activation is terminal: do not preserve an old
+            // signal-wait marker in the new durable checkpoint.
+            safe.waiting_signal = None;
+            Some((safe, speculative))
+        });
+
+    let Some((safe, speculative)) = prepared else {
+        tracing::error!(
+            actor_id,
+            "nulang-workflow: no verified safe failed-step snapshot; quarantining actor"
+        );
+        rt.actors.remove(&actor_id);
+        rt.pending_receive_wakes
+            .retain(|queued| *queued != actor_id);
+        rt.current_actor = None;
         return false;
     };
-    actor.waiting_signal = None;
 
-    let sequence = next_sequence(rt, actor_id);
+    let sequence = safe.sequence;
     let result = rt
         .persistence
         .append_workflow_event(
@@ -423,7 +458,7 @@ pub(crate) fn finish_resumed_workflow_failure(
                 error,
             },
         )
-        .and_then(|_| try_checkpoint_actor(rt, actor_id));
+        .and_then(|_| rt.persistence.save_snapshot(safe.clone()));
 
     if let Err(error) = result {
         tracing::error!(
@@ -434,7 +469,30 @@ pub(crate) fn finish_resumed_workflow_failure(
         rt.actors.remove(&actor_id);
         rt.pending_receive_wakes
             .retain(|queued| *queued != actor_id);
+        rt.current_actor = None;
         return false;
+    }
+    rt.maybe_shadow_replicate(actor_id, &safe);
+
+    if speculative {
+        // A durable StepFailed now points at the PRE-failure state. The
+        // resident actor still has speculative VM/local/CRDT state, so do
+        // not dispatch it or run saga compensation until safe rehydration.
+        tracing::warn!(
+            actor_id,
+            "nulang-workflow: failed step mutated durable state; quarantining for safe recovery"
+        );
+        rt.actors.remove(&actor_id);
+        rt.pending_receive_wakes
+            .retain(|queued| *queued != actor_id);
+        rt.current_actor = None;
+        return false;
+    }
+
+    if let Some(actor) = rt.actors.get_mut(&actor_id) {
+        actor.waiting_signal = None;
+        actor.sequence = sequence;
+        actor.dirty_fields.clear();
     }
     true
 }

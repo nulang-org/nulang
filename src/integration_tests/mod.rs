@@ -8579,6 +8579,79 @@ match { a: 2, b: 9 } with {
         assert_eq!(recovered.state.get("answer"), safe.state.get("answer"));
     }
 
+    /// Successful StepFailed append + checkpoint must not commit speculative
+    /// durable mutations. Prior fault-injection tests only covered rejected I/O.
+    #[test]
+    fn test_workflow_immediate_failed_step_successful_store_preserves_safe_state() {
+        let source = r#"
+            workflow FailedStepSafeSnapshot {
+                step prepare {
+                    (self.step_index = self.step_index + 1, self.prepared = 7)
+                }
+                step fail_step {
+                    {
+                        self.step_index = self.step_index + 4
+                        self.answer = "speculative"
+                        perform Fail.now()
+                    }
+                }
+            }
+            let w = spawn FailedStepSafeSnapshot {} in { w }
+        "#;
+        let backing = SharedMemoryStore::new();
+        let (module, _ty) = compile_source(source).unwrap();
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        rt.borrow_mut().persistence = Box::new(backing.clone());
+
+        let value = {
+            let mut vm = VM::new();
+            vm.load_module(module);
+            vm.set_actor_callbacks(Box::new(RuntimeVmCallbacks::new(rt.clone())));
+            vm.run().unwrap()
+        };
+        let actor_id = value.as_actor_id().expect("spawn should return actor ref");
+        rt.borrow_mut().send_message_by_id(actor_id, 0, &[]);
+        rt.borrow_mut().run_scheduler();
+        let safe = backing
+            .load_snapshot(actor_id)
+            .expect("completed prepare snapshot");
+        assert_eq!(
+            safe.state.get("step_index"),
+            Some(&crate::runtime::PersistedValue::Int(1))
+        );
+
+        rt.borrow_mut().send_message_by_id(actor_id, 1, &[]);
+        rt.borrow_mut().run_scheduler();
+        assert!(
+            backing
+                .read_workflow_events(actor_id)
+                .iter()
+                .any(|event| {
+                    matches!(event, WorkflowEvent::StepFailed { step_name, .. } if step_name == "fail_step")
+                }),
+            "StepFailed must be durably recorded even if the runtime quarantines speculative state"
+        );
+        let stored = backing
+            .load_snapshot(actor_id)
+            .expect("failed terminal safe snapshot");
+        assert!(stored.sequence > safe.sequence);
+        assert_eq!(
+            stored.state, safe.state,
+            "a failed VM step must not commit its mutated state"
+        );
+        assert!(
+            !rt.borrow().actors.contains_key(&actor_id),
+            "an actor with speculative failed-step mutations needs replay/rollback before dispatch"
+        );
+        assert!(
+            !backing
+                .read_workflow_events(actor_id)
+                .iter()
+                .any(|event| { matches!(event, WorkflowEvent::SagaCompensated { .. }) }),
+            "do not run saga compensation on speculative in-memory actor state"
+        );
+    }
+
     /// A failed compiled workflow step must not checkpoint mutated state or run
     /// compensations when its terminal StepFailed event is rejected.
     #[test]

@@ -9132,3 +9132,69 @@ fn saga_receipt_rejection_quarantines_actor_before_marking_compensated() {
         "a quarantined actor must not be requeued by a pending receive wake"
     );
 }
+
+#[test]
+fn failed_resumed_workflow_does_not_checkpoint_speculative_durable_state_on_successful_write() {
+    let mut rt = Runtime::new();
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "failed_resumed_state",
+            Box::new(|| {
+                vec![
+                    ("step_index".to_string(), Value::int(1)),
+                    ("answer".to_string(), Value::int(7)),
+                ]
+            }),
+            HashMap::from([
+                ("step_index".to_string(), StateModel::Durable),
+                ("answer".to_string(), StateModel::Durable),
+            ]),
+        )
+        .unwrap();
+    let safe = rt.persistence.load_snapshot(actor_id).unwrap();
+
+    // Simulate a resumed VM continuation that writes durable fields before
+    // throwing. Storage succeeds; this is NOT a failure-injection test.
+    let actor = rt.actors.get_mut(&actor_id).unwrap();
+    actor.set_state_field("step_index", Value::int(9));
+    actor.set_state_field("answer", Value::int(999));
+    actor.waiting_signal = Some("go".to_string());
+
+    assert!(
+        !workflow::finish_resumed_workflow_failure(
+            &mut rt,
+            actor_id,
+            None,
+            "failed_step".to_string(),
+            "injected VM trap".to_string(),
+        ),
+        "the failed activation is not safe to dispatch or compensate"
+    );
+
+    let committed = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert!(matches!(
+        rt.persistence.read_workflow_events(actor_id).last(),
+        Some(WorkflowEvent::StepFailed { step_name, .. }) if step_name == "failed_step"
+    ));
+    assert!(committed.sequence > safe.sequence);
+    assert_eq!(committed.state, safe.state);
+    assert_eq!(committed.waiting_signal, None);
+    assert!(!rt.actors.contains_key(&actor_id));
+
+    // Restart after the successful safe checkpoint: speculative mutations
+    // must remain absent from the reconstructed persistent actor.
+    assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
+    let recovered = rt.actors.get(&actor_id).unwrap();
+    assert_eq!(
+        recovered
+            .get_state_field("step_index")
+            .and_then(|value| value.as_int()),
+        Some(1)
+    );
+    assert_eq!(
+        recovered
+            .get_state_field("answer")
+            .and_then(|value| value.as_int()),
+        Some(7)
+    );
+}
