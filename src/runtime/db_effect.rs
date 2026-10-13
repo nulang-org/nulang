@@ -33,7 +33,7 @@ pub(crate) fn parse_query_args(
     constants: &[Constant],
     args: &[Value],
 ) -> io::Result<OwnedDbQuery> {
-    const MAX_PARAMS: usize = 254;
+    const MAX_PARAMS: usize = 10;
     const MAX_SQL_BYTES: usize = 1_048_576;
     // PerformAsync passes all VM registers. r1 is a compiler-generated
     // argument count; never mistake uncleared registers for SQL parameters.
