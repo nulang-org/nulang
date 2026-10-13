@@ -3716,7 +3716,10 @@ mod tests {
         let err = CapabilityAnalyzer::new().infer_cap(&ctx, &send).unwrap_err();
         match err {
             NuError::CapError { msg, .. } => {
-                assert!(msg.contains("source: this expression evaluates to inferred capability `box`"), "{msg}");
+                assert!(
+                    msg.contains("source: this expression evaluates to inferred capability `box`"),
+                    "{msg}"
+                );
                 assert!(msg.contains("no single binding origin is available"), "{msg}");
                 assert!(!msg.contains("nearest lexical binding"), "{msg}");
             }
