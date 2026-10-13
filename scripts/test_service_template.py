@@ -7,6 +7,7 @@ Requires an already-built Nulang executable and no remote services.
 """
 import os
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -71,7 +72,88 @@ def main() -> int:
                     homepage = response.read().decode("utf-8")
                     assert response.status == 200
                     assert "Nulang Service" in homepage, homepage
-                print("service template smoke: GET /health + GET / OK")
+                # The service template explicitly opts into SQLite state.
+                write_request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/state",
+                    data=b"value=committed-after-restart",
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(write_request, timeout=3) as response:
+                    assert response.status == 200
+                    assert "saved" in response.read().decode("utf-8")
+
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/state", timeout=3
+                ) as response:
+                    assert response.status == 200
+                    assert "committed-after-restart" in response.read().decode("utf-8")
+
+                db_file = package / "data" / "web-state.sqlite"
+                assert db_file.is_file(), "opt-in SQLite backend must create a real database file"
+
+                # Hard-kill the process AFTER a successful HTTP acknowledgement.
+                # Restart from the same database to prove that the web request
+                # path does not silently use the in-memory demo KV backend.
+                server.kill()
+                server.wait(timeout=5)
+                server = subprocess.Popen(
+                    [str(binary), "nula", "dev", "--port", str(port)],
+                    cwd=package,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                )
+
+                deadline = time.monotonic() + 30
+                while time.monotonic() < deadline:
+                    if server.poll() is not None:
+                        raise RuntimeError(f"restarted server exited with {server.returncode}")
+                    try:
+                        with urllib.request.urlopen(
+                            f"http://127.0.0.1:{port}/state", timeout=1
+                        ) as response:
+                            body = response.read().decode("utf-8")
+                            assert response.status == 200
+                            assert "committed-after-restart" in body, (
+                                f"acknowledged web write lost after restart: {body!r}"
+                            )
+                        break
+                    except (OSError, urllib.error.URLError):
+                        time.sleep(0.2)
+                else:
+                    raise RuntimeError("restart did not serve persisted web state")
+
+                # Force a SQL error on the *real* web request path. It must
+                # become HTTP 500, not a successful response backed by memory.
+                with sqlite3.connect(db_file) as db:
+                    db.execute(
+                        "CREATE TRIGGER web_reject_update "
+                        "BEFORE UPDATE ON nulang_web_kv "
+                        "BEGIN SELECT RAISE(ABORT, 'forced web storage failure'); END"
+                    )
+
+                failed_write = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/state",
+                    data=b"value=must-not-commit",
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    method="POST",
+                )
+                try:
+                    urllib.request.urlopen(failed_write, timeout=3)
+                except urllib.error.HTTPError as error:
+                    assert error.code == 500, f"expected fail-closed HTTP 500, got {error.code}"
+                else:
+                    raise AssertionError("SQLite failure was incorrectly acknowledged")
+
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/state", timeout=3
+                ) as response:
+                    body = response.read().decode("utf-8")
+                    assert "committed-after-restart" in body
+                    assert "must-not-commit" not in body
+
+                print("service template smoke: HTTP + SQLite SIGKILL recovery + fail-closed SQL error")
                 return 0
             except Exception:
                 log.flush()

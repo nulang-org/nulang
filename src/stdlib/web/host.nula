@@ -81,22 +81,22 @@ pub fn form_value(name: String) -> String ! {Web, Request} {
     perform Web.form_value(name)
 }
 
-/// Get a value from the ephemeral in-memory web store.
+/// Get a value from the web KV store (ephemeral by default; optional SQLite in routed dev server).
 pub fn kv_get(key: String) -> String ! {Web, Request} {
     perform Web.kv_get(key)
 }
 
-/// Set a value in the ephemeral in-memory web store.
+/// Set a value in the web KV store (ephemeral by default; optional SQLite in routed dev server).
 pub fn kv_set(key: String, value: String) -> Unit ! {Web, Request} {
     perform Web.kv_set(key, value)
 }
 
-/// Delete a value from the ephemeral in-memory web store.
+/// Delete a value from the web KV store (ephemeral by default; optional SQLite in routed dev server).
 pub fn kv_delete(key: String) -> Unit ! {Web, Request} {
     perform Web.kv_delete(key)
 }
 
-/// Return all key/value pairs in the ephemeral in-memory web store.
+/// Return all key/value pairs in the web KV store (ephemeral by default; optional SQLite in routed dev server).
 pub fn kv_all() -> [(String, String)] ! {Web, Request} {
     perform Web.kv_all()
 }

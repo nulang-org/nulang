@@ -50,10 +50,11 @@ compile/runtime profile can opt into those capabilities when needed.
   permission/capability enforcement, TLS termination, secrets, health checks
   and deployment supervision.
 
-## HTTP service template (stacked preview)
+## Opt-in SQLite state for routed web services (stacked preview)
 
-The new `service` package template provides an HTTP homepage and a liveness
-endpoint through the existing routed-web development server:
+The `service` template now demonstrates single-host persistent Web.kv_* state
+using the existing libSQL driver and a dedicated `nulang_web_kv` table.
+This is **not** an actor/workflow persistence backend replacement.
 
 ```bash
 nulang nula new my-service --template service
@@ -61,25 +62,48 @@ cd my-service
 nulang nula dev
 # In a second shell:
 curl --fail http://127.0.0.1:8787/health
+curl -d 'value=hello' http://127.0.0.1:8787/state
+curl --fail http://127.0.0.1:8787/state
 ```
 
-This template is currently **stateless**. The web development server's
-`Web.kv_*` effects are **not** SQLite-backed and do not persist across
-restarts; the `server` Cargo feature simply makes the separate SQLite
-persistence adapter available in the binary. Do not expose `nula dev` as a
-production-ready public server.
+The generated `Nulang.toml` explicitly opts in:
 
-CI's `scripts/test_service_template.py` will scaffold the template,
-connect through loopback to an ephemeral dev-server port, and check both HTTP
-routes using **both** the release CLI and the lean `server` feature profile.
-The current development listener may bind all interfaces; run this smoke in
-isolated CI. It is not a production security or durability test.
+```toml
+[web]
+port = 8787
+kv_backend = "sqlite"
+kv_path = "data/web-state.sqlite"
+```
 
-## Next integration slice
+The existing `web` template and all manifests without `kv_backend`
+continue to use ephemeral in-memory KV. A configured SQLite failure prevents
+the server starting or makes the affected request fail with HTTP 500; it never
+falls back to memory. The response body is intentionally generic, with detailed
+storage errors confined to server logs. SQLite is opt-in and requires the
+`sqlite` Cargo feature, included in `server` and `release-cli`.
 
-Design an explicit **runtime-owned request-to-persistence boundary** with
-structured errors and tenant/capability enforcement before connecting web
-operations to SQLite. The later durable-job dispatcher must reuse the canonical
-atomic durable-transition coordinator and pass crash/restart testing. Do not
-create a second workflow engine or promise exactly-once execution of arbitrary
-external effects.
+The routed *development* listener now binds to `127.0.0.1` by default.
+The sample POST endpoint is unauthenticated and is not a production API.
+
+**Durability scope:** Each individual Web.kv_set or Web.kv_delete completes
+only after SQLite acknowledges it, using WAL and FULL synchronous mode.
+A request containing multiple writes is **not** a database transaction.
+There is no automatic rollback across web effects or atomic handoff to
+actor/workflow transitions. Do not infer exactly-once external effects,
+replication, HA, per-tenant separation, authorization, backups or full
+production hosting support from this sample.
+
+CI's `scripts/test_service_template.py` exercises the generated service
+with the release and lean server CLI profiles, asserting a successful web
+write is still present after process SIGKILL/restart. It also injects a
+SQLite-triggered write error and asserts HTTP 500 with no hidden memory write.
+`tests/web_sqlite_state.rs` verifies adapter persistence and SQL parameters.
+
+## Remaining work
+
+Before production use, define capability-scoped access to persistent web
+state, explicit multi-operation transactions and tenant isolation, robust
+backup/restore, and a hardened deployment server. Durable-job dispatch must
+continue to use Nulang's canonical RFC 0022 transition coordinator after
+the existing workflow recovery P0 issues are resolved. Do not create
+a second workflow engine.

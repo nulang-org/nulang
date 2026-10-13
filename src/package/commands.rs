@@ -480,6 +480,9 @@ fn scaffold_package(dir: &Path, name: &str, template: &str) -> NuResult<()> {
             })?;
         web_manifest
             .push_str("[web]\nport = 8787\nstatic_dir = \"public\"\noutput_dir = \"dist\"\n");
+        if template == "service" {
+            web_manifest.push_str("kv_backend = \"sqlite\"\nkv_path = \"data/web-state.sqlite\"\n");
+        }
         std::fs::write(&manifest_path, web_manifest).map_err(|e| NuError::PackageError {
             msg: format!(
                 "cannot write web section to {}: {}",
@@ -575,6 +578,7 @@ fn template_files(name: &str) -> Vec<(&'static str, &'static str)> {
 
 import stdlib::web::html
 import stdlib::web::types
+import stdlib::web::host
 
 fn home() -> Html {
     document(
@@ -590,9 +594,21 @@ fn health() -> Html {
     text("ok")
 }
 
+fn read_state() -> Html {
+    text(kv_get("message"))
+}
+
+fn write_state() -> Html {
+    let value = form_value("value")
+    kv_set("message", value)
+    text("saved")
+}
+
 app "service" {
     route "GET" "/" -> home
     route "GET" "/health" -> health
+    route "GET" "/state" -> read_state
+    route "POST" "/state" -> write_state
 }
 "#,
             ),
@@ -604,6 +620,8 @@ This template registers two HTTP routes using the built-in Web effect:
 
 - GET / — HTML homepage
 - GET /health — **liveness only** (not a persistence or readiness probe)
+- GET /state — read persisted demo message
+- POST /state — save `value=...` to SQLite (form encoding)
 
 ## Start locally
 
@@ -626,19 +644,26 @@ requires additional deployment and security review.
 
 ## SQLite and durable jobs
 
-This template deliberately has **no stateful endpoints**. It does not
-claim that `Web.kv_get` / `Web.kv_set` survive process restarts: those
-effects currently use an ephemeral in-memory store.
+This template explicitly selects `[web] kv_backend = "sqlite"` with
+`kv_path = "data/web-state.sqlite"`. Its demo `Web.kv_*` effects use a
+SQLite table, and each acknowledged set/delete operation is committed before
+the HTTP response. Try:
 
-The optional server build profile (`--no-default-features --features
-server`) includes libSQL/SQLite for Nulang's existing durable actor
-persistence APIs, but the web request handler is not automatically backed
-by a SQLite database. See docs/SERVER_PROFILE.md in the Nulang repository.
+```sh
+curl -d 'value=hello' http://127.0.0.1:8787/state
+curl http://127.0.0.1:8787/state
+```
 
-Use tested persistence APIs for application data, rather than storing
-important user data in the demo web KV. Durable background jobs and
-transactional web storage require a separate end-to-end integration and
-crash-recovery validation before production use.
+The file survives restarts. Each KV operation commits separately, NOT the
+entire HTTP request. There is no multi-step rollback, actor/workflow atomicity,
+authentication, tenant isolation or production-ready HTTP hosting. Never use
+this demo endpoint on a publicly accessible listener; anyone who can reach it
+can overwrite the single demo key.
+
+The separate `web` template retains its existing ephemeral-memory default.
+The SQLite adapter is feature-gated and requires a Nulang binary built with
+`sqlite` (included in the `server` and public release profiles).
+Durable background jobs require separate crash-recovery validation.
 "#,
             ),
         ],
@@ -1694,11 +1719,14 @@ fn cmd_dev(port_override: Option<u16>) -> NuResult<()> {
         }
         Ok(())
     } else {
-        let server = WebDevServer::bind_runtime(
+        // Explicit opt-in only: invalid or unsafe database locations abort startup.
+        let sqlite_path = resolve_web_sqlite_path(&root, &manifest.web)?;
+        let server = WebDevServer::bind_runtime_with_state(
             port,
             Some(static_dir),
             Some(output_dir.clone()),
             runtime_routes,
+            sqlite_path,
         )
         .map_err(|e| NuError::PackageError {
             msg: format!("cannot bind dev server: {}", e),
@@ -1709,6 +1737,82 @@ fn cmd_dev(port_override: Option<u16>) -> NuResult<()> {
         loop {
             std::thread::park();
         }
+    }
+}
+
+/// Resolve a package-local database path without trusting absolute paths,
+/// parent traversal, or symlinked storage directories. A bad configuration
+/// must never result in a silent fallback to the ephemeral store.
+fn resolve_web_sqlite_path(
+    root: &Path,
+    web: &crate::package::manifest::WebSection,
+) -> NuResult<Option<PathBuf>> {
+    match web.kv_backend.as_str() {
+        "memory" => Ok(None),
+        "sqlite" => {
+            let rel = Path::new(&web.kv_path);
+            if rel.as_os_str().is_empty()
+                || !rel.components().all(|c| matches!(c, std::path::Component::Normal(_)))
+            {
+                return Err(NuError::PackageError {
+                    msg: "web.kv_path must be a non-empty package-relative path without traversal".into(),
+                    span: Span::default(),
+                });
+            }
+            let root = root.canonicalize().map_err(|e| NuError::PackageError {
+                msg: format!("cannot resolve package root: {e}"),
+                span: Span::default(),
+            })?;
+            // Walk one directory at a time to reject symlinked ancestors
+            // before attempting to create a subdirectory through them.
+            let mut parent = root.clone();
+            for component in rel.parent().expect("validated path").components() {
+                parent.push(component.as_os_str());
+                match std::fs::symlink_metadata(&parent) {
+                    Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                        return Err(NuError::PackageError {
+                            msg: "web SQLite storage parent must be a real directory".into(),
+                            span: Span::default(),
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        std::fs::create_dir(&parent).map_err(|e| NuError::PackageError {
+                            msg: format!("cannot create web storage directory: {e}"),
+                            span: Span::default(),
+                        })?;
+                    }
+                    Err(error) => {
+                        return Err(NuError::PackageError {
+                            msg: format!("cannot inspect web storage directory: {error}"),
+                            span: Span::default(),
+                        });
+                    }
+                }
+            }
+            let parent = parent.canonicalize().map_err(|e| NuError::PackageError {
+                msg: format!("cannot resolve web storage directory: {e}"),
+                span: Span::default(),
+            })?;
+            if !parent.starts_with(&root) {
+                return Err(NuError::PackageError {
+                    msg: "web storage directory escapes package root".into(),
+                    span: Span::default(),
+                });
+            }
+            let path = parent.join(rel.file_name().expect("validated file name"));
+            if path.symlink_metadata().is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+                return Err(NuError::PackageError {
+                    msg: "web SQLite file must not be a symlink".into(),
+                    span: Span::default(),
+                });
+            }
+            Ok(Some(path))
+        }
+        other => Err(NuError::PackageError {
+            msg: format!("unsupported web.kv_backend '{other}'; use 'memory' or 'sqlite'"),
+            span: Span::default(),
+        }),
     }
 }
 
@@ -2799,22 +2903,83 @@ mod tests {
             .expect("service template must scaffold");
         let manifest = Manifest::load(&dir).expect("service manifest must parse");
         assert_eq!(manifest.web.port, 8787);
+        assert_eq!(manifest.web.kv_backend, "sqlite");
+        assert_eq!(manifest.web.kv_path, "data/web-state.sqlite");
 
         let source = std::fs::read_to_string(dir.join("src/main.nula"))
             .expect("service must provide an app entry point");
         assert!(source.contains("app \"service\""));
         assert!(source.contains("route \"GET\" \"/\" -> home"));
         assert!(source.contains("route \"GET\" \"/health\" -> health"));
-        assert!(
-            !source.contains("kv_set"),
-            "service template must not imply durable state through ephemeral web KV"
-        );
+        assert!(source.contains("route \"GET\" \"/state\" -> read_state"));
+        assert!(source.contains("route \"POST\" \"/state\" -> write_state"));
+        assert!(source.contains("kv_set(\"message\", value)"));
         let readme = std::fs::read_to_string(dir.join("README.md"))
             .expect("service template needs usage instructions");
         assert!(readme.contains("nula dev"));
         assert!(readme.contains("SQLite"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn web_sqlite_path_rejects_traversal_and_unsupported_backends() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_web_path_validation_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut config = crate::package::manifest::WebSection::default();
+        config.kv_backend = "sqlite".into();
+        for unsafe_path in ["../outside.sqlite", "/tmp/outside.sqlite", "data/../../outside.db"] {
+            config.kv_path = unsafe_path.into();
+            assert!(
+                resolve_web_sqlite_path(&dir, &config).is_err(),
+                "path {unsafe_path} must be rejected"
+            );
+        }
+
+        config.kv_path = "data/web-state.sqlite".into();
+        config.kv_backend = "unknown".into();
+        assert!(resolve_web_sqlite_path(&dir, &config).is_err());
+
+        config.kv_backend = "memory".into();
+        assert_eq!(resolve_web_sqlite_path(&dir, &config).unwrap(), None);
+
+        config.kv_backend = "sqlite".into();
+        let path = resolve_web_sqlite_path(&dir, &config)
+            .expect("safe storage path should resolve")
+            .expect("SQLite must have a concrete path");
+        assert!(path.starts_with(dir.canonicalize().unwrap()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn web_sqlite_path_rejects_symlinked_storage_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "nulang_web_symlink_test_{}",
+            std::process::id()
+        ));
+        let outside = root.with_extension("outside");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, root.join("data")).unwrap();
+
+        let mut web = crate::package::manifest::WebSection::default();
+        web.kv_backend = "sqlite".into();
+        let result = resolve_web_sqlite_path(&root, &web);
+        assert!(result.is_err(), "symlinked parent must fail before opening SQLite");
+        assert!(!outside.join("web-state.sqlite").exists());
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outside);
     }
 
     #[test]

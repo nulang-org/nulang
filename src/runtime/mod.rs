@@ -67,6 +67,8 @@ pub mod crdt_reg;
 mod distribution;
 mod exit;
 mod http_server;
+#[cfg(feature = "sqlite")]
+pub mod web_state;
 #[cfg(feature = "ai-runtime")]
 mod llm;
 mod metrics;
