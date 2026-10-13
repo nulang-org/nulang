@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Real-process smoke for the generated Nulang HTTP service.
 
-Runs only on localhost with a temporary package and an ephemeral port.
-Requires an already-built Nulang executable; does not install packages,
-expose the server on the public internet, or depend on remote services.
+Connects through loopback to a temporary service on an ephemeral port.
+The current dev server may bind all interfaces: run only in isolated CI.
+Requires an already-built Nulang executable and no remote services.
 """
 import os
 import socket
