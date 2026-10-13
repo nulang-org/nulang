@@ -1,3 +1,146 @@
+//! Explicit publisher trust for Nula package registry archives.
+//!
+//! A registry server transports an Ed25519 signature; the client accepts it
+//! ONLY when it verifies against a public key pinned independently by the
+//! consuming project in Nulang.trust.toml. Neither the server nor the package
+//! itself may choose the trusted keys.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use serde::Deserialize;
+
+pub const TRUST_FILE: &str = "Nulang.trust.toml";
+pub const SIGNATURE_HEADER: &str = "X-Nula-Signature";
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrustConfig {
+    registries: BTreeMap<String, TrustedRegistry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrustedRegistry {
+    public_keys: Vec<String>,
+}
+
+/// Return an exact registry URL's explicitly configured publisher keys.
+/// There is no implicit trust-on-first-use and no fallback to server-provided
+/// public keys. A project author must review/pin trusted public keys.
+pub fn trusted_publisher_keys(root: &Path, registry_url: &str) -> Result<Vec<String>, String> {
+    let path = root.join(TRUST_FILE);
+    let source = std::fs::read_to_string(&path).map_err(|err| {
+        format!(
+            "registry publisher trust requires an explicit {}: {}",
+            path.display(), err
+        )
+    })?;
+    let config: TrustConfig = toml::from_str(&source).map_err(|err| {
+        format!("invalid {}: {}", path.display(), err)
+    })?;
+    let url = registry_url.trim_end_matches('/');
+    let keys = config.registries.get(url).ok_or_else(|| {
+        format!("no pinned publisher keys for registry '{}' in {}", url, path.display())
+    })?;
+    if keys.public_keys.is_empty() {
+        return Err(format!("registry '{}' has no trusted publisher keys", url));
+    }
+    for key in &keys.public_keys {
+        parse_verifying_key(key)?;
+    }
+    Ok(keys.public_keys.clone())
+}
+
+fn parse_verifying_key(hex_key: &str) -> Result<VerifyingKey, String> {
+    let data = hex::decode(hex_key).map_err(|_| "publisher public key must be hex".to_string())?;
+    let key: [u8; 32] = data.try_into().map_err(|_| {
+        "publisher public key must be exactly 32 bytes".to_string()
+    })?;
+    VerifyingKey::from_bytes(&key).map_err(|err| format!("invalid Ed25519 publisher key: {}", err))
+}
+
+fn signed_coordinates(registry_url: &str, name: &str, version: &str, archive: &[u8]) -> Vec<u8> {
+    fn field(message: &mut Vec<u8>, value: &[u8]) {
+        message.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        message.extend_from_slice(value);
+    }
+    let mut message = b"nulang-registry-publisher-v1\0".to_vec();
+    field(&mut message, registry_url.trim_end_matches('/').as_bytes());
+    field(&mut message, name.as_bytes());
+    field(&mut message, version.as_bytes());
+    message.extend_from_slice(blake3::hash(archive).as_bytes());
+    message
+}
+
+/// Return the 32-byte raw public key, hex encoded for Nulang.trust.toml.
+pub fn signing_public_key(secret_seed: &[u8; 32]) -> String {
+    let signing_key = SigningKey::from_bytes(secret_seed);
+    hex::encode(signing_key.verifying_key().as_bytes())
+}
+
+/// Publisher-side signature over registry URL + package coordinates + exact
+/// compressed tarball digest. Only the secret seed signs; it is never sent.
+pub fn sign_registry_archive(
+    registry_url: &str,
+    name: &str,
+    version: &str,
+    archive: &[u8],
+    secret_seed: &[u8; 32],
+) -> String {
+    let signer = SigningKey::from_bytes(secret_seed);
+    let message = signed_coordinates(registry_url, name, version, archive);
+    hex::encode(signer.sign(&message).to_bytes())
+}
+
+/// Verify against at least one independently pinned publisher public key.
+/// Valid signatures from other keys are insufficient.
+pub fn verify_publisher_signature(
+    registry_url: &str,
+    name: &str,
+    version: &str,
+    archive: &[u8],
+    hex_signature: &str,
+    trusted_keys: &[String],
+) -> Result<(), String> {
+    if trusted_keys.is_empty() {
+        return Err("registry has no configured trusted publisher keys".to_string());
+    }
+    let signature = hex::decode(hex_signature)
+        .map_err(|_| "registry publisher signature is not hex".to_string())?;
+    let signature = Signature::from_slice(&signature)
+        .map_err(|_| "registry publisher signature must be 64 bytes".to_string())?;
+    let message = signed_coordinates(registry_url, name, version, archive);
+
+    // Reject malformed keys even if another key happens to verify.
+    let keys = trusted_keys
+        .iter()
+        .map(|key| parse_verifying_key(key))
+        .collect::<Result<Vec<_>, _>>()?;
+    if keys.iter().any(|key| key.verify(&message, &signature).is_ok()) {
+        Ok(())
+    } else {
+        Err(format!(
+            "registry package '{}@{}' has no valid signature from a trusted publisher key",
+            name, version
+        ))
+    }
+}
+
+/// Parse the seed from a protected environment variable. Do not echo seed
+/// contents in diagnostics or write them into repository files.
+pub fn signing_seed_from_env() -> Result<[u8; 32], String> {
+    let encoded = std::env::var("NULA_SIGNING_KEY_HEX").map_err(|_| {
+        "publishing requires NULA_SIGNING_KEY_HEX (32-byte Ed25519 signing seed)".to_string()
+    })?;
+    let bytes = hex::decode(encoded.trim())
+        .map_err(|_| "NULA_SIGNING_KEY_HEX must contain exactly 64 hex characters".to_string())?;
+    bytes.try_into().map_err(|_| {
+        "NULA_SIGNING_KEY_HEX must contain exactly 32 bytes".to_string()
+    })
+}
+
 //! Publisher-authorized registry archive verification.
 //!
 //! Trust roots are explicit, project-controlled Ed25519 public keys in
