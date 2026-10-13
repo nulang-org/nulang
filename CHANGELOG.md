@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### Public CLI release portability — 2026-10-11
+- **Public release archives use the `release-cli` feature profile without a Python shared-library ABI dependency.** The ordinary full/default source build retains opt-in Python interoperability; release packaging checks the resulting Linux and macOS binary for Python dependencies.
+- **Release PRs rehearse the full non-publishing four-platform build matrix before tags are created.** The Linux ARM64 cross build explicitly installs target libc development headers and preflights a target-compiler C header probe, avoiding an observed `ring` compile failure when `--no-install-recommends` omits the ARM64 sysroot. Actual cross-build and clean-host portability remain release gates.
+
 ### Runtime soundness and checked negation — native/AOT backend parity — 2026-10-10
 - **AOT no longer claims raw-Int/Float registers for values that can be nil
   at runtime.** Nightly differential fuzz caught interpreter/AOT divergences
@@ -17,6 +21,9 @@
   negating `INT48_MIN` returns an overflow error rather than silently
   wrapping. Focused CoreVM, AOT, and JIT regression tests added; no change to
   source type inference or WASM source semantics.
+
+### Unary-negation backend parity — 2026-09-25
+- **Unary `-` now rejects concrete nonnumeric operands during type checking.** Known booleans, tuples, functions, and other nonnumeric values fail before code generation; unresolved inference variables remain dynamic until Nulang has a principled numeric constraint/typeclass.
 
 ### Actor scheduler LIFO handoff and lifecycle pooling — 2026-10-10
 - **Performance:** Optimized actor scheduler LIFO handoff with strict
@@ -229,6 +236,8 @@ version + migration.*
 
 ## Stable tier
 
+### Preserve observable MIR panic through DCE — 2026-09-24
+- **MIR dead-store elimination now treats `RValue::Panic` as observable/divergent** (`src/mir_codegen.rs`), so an unused panic result cannot cause a reachable contract/precondition failure to be optimized away. A focused optimizer regression pins the behavior.
 ### Zero-copy non-reentrant JIT register entry — 2026-09-24
 - **Cranelift regions that cannot re-enter the VM now execute directly against the active frame's 256-register array**, eliminating the previous 2 KiB snapshot before native entry and 2 KiB copy-back afterward. `Value` is explicitly `repr(transparent)` over `u64` so the native register ABI has a documented layout guarantee.
 - **Compiled-region metadata now records whether native execution may grow or replace the VM frame stack.** Regions containing helper-backed direct calls retain the detached register snapshot because re-entrant interpreter calls may reallocate `VM::frames`; typed, SIMD, and scalar non-call regions use the direct-frame path.
@@ -252,7 +261,6 @@ version + migration.*
 
 ### Complete Python marshal extraction typing — 2026-09-24
 - **Owned Python→Nulang foreign-value conversion now uses explicit PyO3 extraction targets for Int, Float, and String** (`src/python/marshal.rs`), completing the Bool fix from #930. This prevents Rust/CodeQL builds from failing generic `extract` inference one branch at a time without changing conversion semantics.
-
 
 ### Python bool marshal type inference — 2026-09-24
 - **Default-feature builds now make PyO3 boolean extraction explicit with `extract::<bool>()`**, avoiding a compiler inference failure in the Python marshal path without changing conversion semantics.
