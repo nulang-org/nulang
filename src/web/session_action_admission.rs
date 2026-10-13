@@ -421,6 +421,54 @@ mod tests {
     }
 
     #[test]
+    fn capacity_limits_fail_closed_without_evicting_replay_entries() {
+        let registry = SessionActionAdmission::with_limits(AdmissionLimits {
+            max_sessions: 1,
+            max_documents_per_session: 1,
+            max_admissions_per_session: 1,
+        });
+        let owner = identity("session-1", "owner-1");
+        registry.register_document(&owner, document(1)).unwrap();
+
+        let other_session = identity("session-2", "owner-2");
+        assert_eq!(
+            registry.register_document(&other_session, document(1)),
+            Err(AdmissionError::CapacityExceeded)
+        );
+
+        let another_document = UiDocument::new(
+            "unrelated",
+            Revision(1),
+            "root",
+            vec![UiNode::new("root", "interaction_root")],
+        );
+        assert_eq!(
+            registry.register_document(&owner, another_document),
+            Err(AdmissionError::CapacityExceeded)
+        );
+        // Updating an already-registered document does not consume a slot.
+        registry.register_document(&owner, document(2)).unwrap();
+
+        let admitted = request(2, "key-1", "Hello");
+        assert!(matches!(
+            registry.reserve(&owner, &module(), &admitted, &params()),
+            Ok(AdmissionDecision::Accepted(_))
+        ));
+        assert_eq!(
+            registry.reserve(&owner, &module(), &admitted, &params()),
+            Ok(AdmissionDecision::Duplicate)
+        );
+        assert_eq!(
+            registry.reserve(&owner, &module(), &request(2, "key-1", "Changed"), &params()),
+            Err(AdmissionError::ReplayConflict)
+        );
+        assert_eq!(
+            registry.reserve(&owner, &module(), &request(2, "key-2", "Hello"), &params()),
+            Err(AdmissionError::CapacityExceeded)
+        );
+    }
+
+    #[test]
     fn host_verified_identity_must_have_nonempty_parts() {
         assert!(VerifiedUiIdentity::from_verified_host("", "owner").is_none());
         assert!(VerifiedUiIdentity::from_verified_host("session", " ").is_none());
