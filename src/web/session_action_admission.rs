@@ -4,6 +4,189 @@
 //! The registry is an in-memory non-executing primitive, not a persistent effect
 //! receipt store or an authentication provider.
 
+use crate::bytecode::CodeModule;
+use crate::web::action_dispatch::{
+    bind_document_action_payload, BoundUiAction, UiActionDispatchError,
+};
+use crate::web::contracts::HandlerParamContract;
+use nulang_ui_protocol::{
+    ActionId, ActionPlacement, ActionRequest, DocumentId, HostToRuntimeMessage,
+    IdempotencyKey, Revision, UiDocument, WireValue,
+};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Mutex;
+
+/// Opaque to request payloads. Only a host that has already authenticated the
+/// request may construct this value; string validation is NOT authentication.
+/// A future integration must bind these IDs to its trusted session middleware.
+#[derive(Debug, Clone)]
+pub(crate) struct VerifiedUiIdentity {
+    session_id: String,
+    principal_id: String,
+}
+
+impl VerifiedUiIdentity {
+    pub(crate) fn from_verified_host(session_id: &str, principal_id: &str) -> Option<Self> {
+        if session_id.trim().is_empty() || principal_id.trim().is_empty() {
+            return None;
+        }
+        Some(Self {
+            session_id: session_id.to_owned(),
+            principal_id: principal_id.to_owned(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AdmissionError {
+    UnknownSession,
+    UnknownDocument,
+    SessionOwnerMismatch,
+    InvalidDocument(String),
+    NonIncreasingRevision,
+    ReplayConflict,
+    Binding(UiActionDispatchError),
+    InternalStateUnavailable,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum AdmissionDecision {
+    /// Authorization, parameter binding, and reservation passed. The caller
+    /// still must enforce effect authority before scheduling execution.
+    Accepted(BoundUiAction),
+    /// Same session, idempotency key, and semantic invocation already admitted.
+    /// Never execute this duplicate; the existing receipt must be consulted.
+    Duplicate,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct InvocationSignature {
+    document_id: DocumentId,
+    revision: Revision,
+    action_id: ActionId,
+    placement: ActionPlacement,
+    payload: WireValue,
+}
+
+impl From<&ActionRequest> for InvocationSignature {
+    fn from(request: &ActionRequest) -> Self {
+        Self {
+            document_id: request.document_id.clone(),
+            revision: request.revision,
+            action_id: request.action_id.clone(),
+            placement: request.placement,
+            payload: request.payload.clone(),
+        }
+    }
+}
+
+struct SessionState {
+    owner_id: String,
+    documents: BTreeMap<DocumentId, UiDocument>,
+    admitted: BTreeMap<IdempotencyKey, InvocationSignature>,
+}
+
+/// In-memory admission fence only. Reservations are not durable receipts and
+/// do not survive a process crash; this type MUST NOT back externally effectful
+/// actions until persistence/fencing and session lifecycle integration exist.
+///
+/// A mutex keeps check + reserve atomic across concurrently arriving requests.
+#[derive(Default)]
+pub(crate) struct SessionActionAdmission {
+    sessions: Mutex<HashMap<String, SessionState>>,
+}
+
+impl SessionActionAdmission {
+    /// Install a document obtained from the server renderer, not the client.
+    /// A document's revision may only advance for an existing session.
+    pub(crate) fn register_document(
+        &self,
+        identity: &VerifiedUiIdentity,
+        document: UiDocument,
+    ) -> Result<(), AdmissionError> {
+        document
+            .validate()
+            .map_err(|error| AdmissionError::InvalidDocument(error.to_string()))?;
+
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| AdmissionError::InternalStateUnavailable)?;
+
+        if let Some(session) = sessions.get_mut(&identity.session_id) {
+            if session.owner_id != identity.principal_id {
+                return Err(AdmissionError::SessionOwnerMismatch);
+            }
+            if let Some(current) = session.documents.get(&document.document_id) {
+                if document.revision <= current.revision {
+                    return Err(AdmissionError::NonIncreasingRevision);
+                }
+            }
+            session.documents.insert(document.document_id.clone(), document);
+        } else {
+            let mut documents = BTreeMap::new();
+            documents.insert(document.document_id.clone(), document);
+            sessions.insert(
+                identity.session_id.clone(),
+                SessionState {
+                    owner_id: identity.principal_id.clone(),
+                    documents,
+                    admitted: BTreeMap::new(),
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Non-executing reservation. Duplicate keys are scoped to the authenticated
+    /// session and compared by semantic invocation, not by trace/correlation ID.
+    ///
+    /// After returning Accepted, the caller owns execution and must atomically
+    /// commit an external-effect intent/receipt in durable storage if retry
+    /// safety across restarts is required.
+    pub(crate) fn reserve(
+        &self,
+        identity: &VerifiedUiIdentity,
+        module: &CodeModule,
+        message: &HostToRuntimeMessage,
+        compiler_params: &[HandlerParamContract],
+    ) -> Result<AdmissionDecision, AdmissionError> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| AdmissionError::InternalStateUnavailable)?;
+        let session = sessions
+            .get_mut(&identity.session_id)
+            .ok_or(AdmissionError::UnknownSession)?;
+        if session.owner_id != identity.principal_id {
+            return Err(AdmissionError::SessionOwnerMismatch);
+        }
+
+        let HostToRuntimeMessage::InvokeAction { request, .. } = message;
+        // Exact semantic replay is checked before revision validation so a
+        // retry cannot re-execute merely because the document has advanced.
+        // Envelope structure is re-validated in bind_document_action_payload.
+        if let Some(earlier) = session.admitted.get(&request.idempotency_key) {
+            return if *earlier == InvocationSignature::from(request) {
+                Ok(AdmissionDecision::Duplicate)
+            } else {
+                Err(AdmissionError::ReplayConflict)
+            };
+        }
+
+        let document = session
+            .documents
+            .get(&request.document_id)
+            .ok_or(AdmissionError::UnknownDocument)?;
+        let bound = bind_document_action_payload(module, document, message, compiler_params)
+            .map_err(AdmissionError::Binding)?;
+        session
+            .admitted
+            .insert(request.idempotency_key.clone(), InvocationSignature::from(request));
+        Ok(AdmissionDecision::Accepted(bound))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
