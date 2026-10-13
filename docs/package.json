@@ -13,7 +13,7 @@
     "preview": "astro preview",
     "check": "astro check",
     "sync-playground": "node scripts/sync-playground.mjs",
-    "test:homepage": "node --test scripts/tests/homepage-examples.test.mjs"
+    "test:homepage": "node --test scripts/tests/homepage-examples.test.mjs scripts/tests/hero-interactions.test.mjs"
   },
   "dependencies": {
     "@astrojs/sitemap": "^3.7.4",
