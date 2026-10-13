@@ -147,8 +147,8 @@ fn merge_imported_decls(
                 }
                 return Err(NuError::RuntimeError {
                     msg: format!(
-                        "import conflict: '{}' from '{}' is defined in '{}', but the same name \\
-                         already refers to a declaration in '{}'. Rename one declaration or \\
+                        "import conflict: '{}' from '{}' is defined in '{}', but the same name \
+                         already refers to a declaration in '{}'. Rename one declaration or \
                          import only the symbols you need (qualified aliases are not supported).",
                         name,
                         import_path,
@@ -428,7 +428,7 @@ mod tests {
     #[test]
     fn independent_opaque_types_with_same_name_must_conflict() {
         let err = resolve_fixture(
-            "import \"first\"\nimport \"second\"\n",
+            "import first\nimport second\n",
             &[
                 ("first", "opaque type Token = Int\n"),
                 ("second", "opaque type Token = Int\n"),
@@ -442,7 +442,7 @@ mod tests {
     #[test]
     fn imported_type_cannot_silently_shadow_local_type() {
         let err = resolve_fixture(
-            "opaque type Token = Int\nimport \"foreign\"\n",
+            "opaque type Token = Int\nimport foreign\n",
             &[("foreign", "opaque type Token = Int\n")],
         )
         .unwrap_err();
@@ -452,7 +452,7 @@ mod tests {
     #[test]
     fn repeated_import_of_same_type_origin_is_idempotent() {
         let module = resolve_fixture(
-            "import \"shared\"\nimport \"shared\"\n",
+            "import shared\nimport shared\n",
             &[("shared", "opaque type Token = Int\n")],
         )
         .unwrap();
@@ -465,10 +465,10 @@ mod tests {
     #[test]
     fn transitive_reexport_of_same_type_origin_is_idempotent() {
         let module = resolve_fixture(
-            "import \"shared\"\nimport \"wrapper\"\n",
+            "import shared\nimport wrapper\n",
             &[
                 ("shared", "opaque type Token = Int\n"),
-                ("wrapper", "import \"shared\"\n"),
+                ("wrapper", "import shared\n"),
             ],
         )
         .unwrap();
