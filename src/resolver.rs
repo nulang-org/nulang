@@ -550,6 +550,7 @@ mod tests {
         assert_ne!(first, changed, "edited source must not use stale tokens");
         TOKEN_CACHE_HITS.with(|hits| assert_eq!(hits.get(), 1));
 
+        let _ = Lexer::new("unrelated diagnostic source");
         let cached_changed = lex_import_tokens(&path, "fn beta() -> Int { 2 }")
             .expect("lex unchanged edited source");
         assert_eq!(changed, cached_changed);
