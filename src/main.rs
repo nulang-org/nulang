@@ -2864,7 +2864,6 @@ mod tests {
         assert_eq!(parsed["sites"][0]["disposition"], "arena_eligible");
     }
 
-
     /// An actor program run through the CLI path must create real actors
     /// and deliver sent messages: with the bare standalone VM the stub
     /// spawn/send callbacks would leave the counter at 0.
