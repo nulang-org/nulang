@@ -172,12 +172,12 @@ fn bench_orca_local_alloc_drop(c: &mut Criterion) {
                 |(heap, gc)| {
                     for _ in 0..OPERATIONS {
                         let ptr = gc
-                            .alloc_object(heap, payload_bytes, TypeTag::Raw)
+                            .alloc_object(&mut *heap, payload_bytes, TypeTag::Raw)
                             .expect("benchmark ORCA allocation");
                         // SAFETY: this is a live local reference on actor 1
                         // created immediately above; no other references exist.
                         unsafe {
-                            assert!(gc.drop_local_ref(heap, ptr));
+                            assert!(gc.drop_local_ref(&mut *heap, ptr));
                         }
                     }
                     assert_eq!(heap.live_count(), 0);
