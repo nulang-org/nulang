@@ -586,7 +586,6 @@ pub(crate) fn vm_value_to_string_or_default(
         .unwrap_or_default()
 }
 
-/// Look up a tool by name and invoke the corresponding exported function.
 /// Bind model-produced tool arguments in the declared Nulang function ABI order.
 ///
 /// Our compiler emits every tool parameter as required, in source declaration
@@ -650,6 +649,7 @@ fn ordered_tool_arguments(
     Ok(ordered)
 }
 
+/// Look up a tool by name and invoke the corresponding exported function.
 pub(crate) fn invoke_tool_function(
     _rt: &Runtime,
     module: &crate::bytecode::CodeModule,
