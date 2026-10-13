@@ -1,5 +1,10 @@
 # Nulang Changelog
 
+### Publisher-authorized Nula registry downloads — 2026-10-13
+- **Ed25519 signatures on registry packages with explicit project-pinned trust keys.** A publisher signs its exact tarball digest, package name/version, and registry URL; `nula publish` uses `NULA_SIGNING_KEY_HEX`, and `nula publisher-key` prints only the corresponding public key.
+- **Registry signatures are transported, not trusted, by the registry.** The Cloudflare Worker stores signatures in R2 object metadata; the bundled Rust registry stores detached `.sig` sidecars. Clients verify signatures against `Nulang.trust.toml` before extracting online downloads, and compare reused caches to signed archive contents.
+- **Trust limitations:** Signed archive fetches require configured public keys; unsigned legacy artifacts are rejected. The existing offline lockfile/cache-identity mechanism does not independently replay publisher signatures and remains separate follow-up work.
+
 ### Bounded staged registry extraction — 2026-10-13
 - **Registry packages are staged and validated before entering the cache.** Tar extraction rejects traversal, links/special files, duplicate paths, malformed gzip, mismatched package metadata and excessive compressed/decompressed sizes or entry counts; failures leave installed caches untouched.
 - **Registry uploads require a declared body length and enforce a 64 MiB compressed package cap.** The Cloudflare worker returns HTTP 411 for chunked uploads and HTTP 413 for oversized declared packages, independent of billing-quota hooks. No publisher signing or authenticity claim is added.
