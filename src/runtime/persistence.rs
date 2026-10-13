@@ -3746,6 +3746,23 @@ mod postgres_store_tests {
     }
 
     #[test]
+    fn postgres_query_binds_integers_at_the_sql_parameter_width() {
+        let Some(url) = pg_url() else {
+            return;
+        };
+        let store = PostgresStore::new(&url).unwrap();
+        let rows = store.query(
+            "SELECT $1::int2, $2::int4, $3::int8",
+            &[Value::int(7), Value::int(100), Value::int(9_000_000_000)],
+        ).unwrap();
+        assert_eq!(rows, vec!["[7,100,9000000000]".to_owned()]);
+
+        let error = store.query("SELECT $1::int2", &[Value::int(100_000)])
+            .expect_err("out-of-range parameters must not silently truncate");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
     fn postgres_query_reports_unsupported_columns_instead_of_panicking() {
         let Some(url) = pg_url() else {
             return;
