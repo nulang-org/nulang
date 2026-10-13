@@ -2291,11 +2291,23 @@ fn cmd_publish(registry_url: Option<String>, token: Option<String>) -> NuResult<
     let version = &manifest.package.version;
     eprintln!("Publishing {}-{} to {} ...", name, version, registry_url);
 
+    let signing_seed = crate::registry::trust::signing_seed_from_env()
+        .map_err(|error| NuError::PackageError {
+            msg: error,
+            span: Span::default(),
+        })?;
+    let signature = crate::registry::trust::sign_registry_archive(
+        &registry_url,
+        name,
+        version,
+        &tarball,
+        &signing_seed,
+    );
     let client = RegistryClient::new(registry_url, Some(token));
     client
-        .publish(name, version, &tarball)
+        .publish_signed(name, version, &tarball, &signature)
         .map_err(|e| NuError::PackageError {
-            msg: format!("publish failed: {}", e),
+            msg: format!("signed publish failed: {}", e),
             span: Span::default(),
         })?;
 
