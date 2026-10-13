@@ -56,7 +56,7 @@ class WorkflowSecurityTests(unittest.TestCase):
         self.assertEqual(untrusted_run_lines(source), [2])
 
     def test_rejects_base_branch_interpolation(self):
-        source = 'steps:\\n  - run: echo "${{ github.base_ref }}"\\n'
+        source = 'steps:\n  - run: echo "${{ github.base_ref }}"\n'
         self.assertEqual(untrusted_run_lines(source), [2])
 
     def test_env_binding_is_not_shell_source(self):
