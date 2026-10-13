@@ -3835,6 +3835,38 @@ mod lsp_tests {
     }
 
     #[test]
+    fn test_effect_inlay_tooltip_distinguishes_effects_from_authority() {
+        let engine = InlayHintEngine::new("fn main() { 42 }");
+        let hint = engine.annotation_to_inlay(TypeAnnotation {
+            line: 0,
+            character: 0,
+            label: " ! {IO}".to_string(),
+            kind: AnnotationKind::Effect,
+        });
+        let Some(InlayHintTooltip::String(tooltip)) = hint.tooltip else {
+            panic!("expected explanatory effect tooltip");
+        };
+        assert!(tooltip.contains("operations"), "{tooltip}");
+        assert!(tooltip.contains("authority"), "{tooltip}");
+    }
+
+    #[test]
+    fn test_reference_capability_tooltip_explains_aliasing_and_transfer() {
+        let engine = InlayHintEngine::new("fn main() { 42 }");
+        let hint = engine.annotation_to_inlay(TypeAnnotation {
+            line: 0,
+            character: 0,
+            label: " : val".to_string(),
+            kind: AnnotationKind::Capability,
+        });
+        let Some(InlayHintTooltip::String(tooltip)) = hint.tooltip else {
+            panic!("expected explanatory capability tooltip");
+        };
+        assert!(tooltip.contains("aliasing"), "{tooltip}");
+        assert!(tooltip.contains("transfer"), "{tooltip}");
+    }
+
+    #[test]
     fn test_hover_reports_inferred_effects_from_checked_function_rows() {
         let source = "fn greet(s: String) -> String {\n    perform IO.print(s)\n    s\n}";
         let result = NulangLanguageServer::compute_diagnostics(source);
