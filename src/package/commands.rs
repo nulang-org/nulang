@@ -2709,6 +2709,36 @@ mod tests {
     }
 
     #[test]
+    fn test_service_template_scaffolds_dynamic_http_routes() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_service_tmpl_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        scaffold_package(&dir, "service-app", "service")
+            .expect("service template must scaffold");
+        let manifest = Manifest::load(&dir).expect("service manifest must parse");
+        assert_eq!(manifest.web.port, 8787);
+
+        let source = std::fs::read_to_string(dir.join("src/main.nula"))
+            .expect("service must provide an app entry point");
+        assert!(source.contains("app \"service\""));
+        assert!(source.contains("route \"GET\" \"/\" -> home"));
+        assert!(source.contains("route \"GET\" \"/health\" -> health"));
+        assert!(
+            !source.contains("kv_set"),
+            "service template must not imply durable state through ephemeral web KV"
+        );
+        let readme = std::fs::read_to_string(dir.join("README.md"))
+            .expect("service template needs usage instructions");
+        assert!(readme.contains("nula dev"));
+        assert!(readme.contains("SQLite"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_cmd_new_rejects_unknown_template() {
         let dir = std::env::temp_dir().join(format!("nulang_unk_tmpl_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
