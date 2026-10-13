@@ -14,6 +14,7 @@ class BsdDistributionTests(unittest.TestCase):
         self.assertIn("nulang-freebsd-x86_64", workflow)
         self.assertIn("--no-default-features --features release-cli --bin nulang", workflow)
         self.assertIn("examples/01_hello.nula", workflow)
+        self.assertIn("examples/08_actors.nula", workflow)
         self.assertIn("nulang-freebsd-x86_64.tar.gz.sha256", workflow)
         self.assertIn("needs: [release, freebsd]", workflow)
 
@@ -24,6 +25,9 @@ class BsdDistributionTests(unittest.TestCase):
                 self.assertIn(f"vmactions/{os_name}-vm@v1", workflow)
         self.assertIn("--no-default-features --bin nulang", workflow)
         self.assertIn("examples/01_hello.nula", workflow)
+        self.assertIn("examples/08_actors.nula", workflow)
+        self.assertIn("NetBSD/x86_64/10.1/All", workflow)
+        self.assertNotIn("NetBSD/amd64/10.1/All", workflow)
 
     def test_download_choices_match_packaged_release_artifacts(self):
         component = (ROOT / "docs/src/components/PlatformDownloads.astro").read_text(
