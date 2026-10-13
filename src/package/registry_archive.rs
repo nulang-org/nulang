@@ -200,6 +200,100 @@ pub fn extract_registry_archive(
     )))
 }
 
+/// Recompute the canonical extracted tree identity from a signed tar.gz
+/// entirely in memory. No files or directories are created in offline mode.
+/// Bounds and entry restrictions mirror `extract_registry_archive`.
+pub fn registry_tree_id_from_signed_archive(
+    tarball: &[u8],
+    expected_name: &str,
+    expected_version: &str,
+) -> NuResult<crate::content_identity::SourceId> {
+    if tarball.is_empty() || tarball.len() > MAX_REGISTRY_ARCHIVE_BYTES {
+        return Err(package_error("signed registry archive is missing or too large"));
+    }
+
+    // Finish the GZIP stream first, validating CRC before accepting entries.
+    let mut gzip = flate2::read::GzDecoder::new(tarball);
+    let mut raw = Vec::new();
+    gzip.by_ref().take(MAX_DECOMPRESSED_STREAM_BYTES + 1)
+        .read_to_end(&mut raw)
+        .map_err(|e| package_error(format!("invalid signed registry gzip: {}", e)))?;
+    if raw.len() as u64 > MAX_DECOMPRESSED_STREAM_BYTES {
+        return Err(package_error("signed registry archive exceeds decompression limit"));
+    }
+
+    let mut archive = tar::Archive::new(std::io::Cursor::new(raw));
+    let mut seen = BTreeSet::new();
+    let mut files = Vec::new();
+    let mut total = 0u64;
+    let mut entries = 0usize;
+    let mut manifest_data = None;
+
+    for entry in archive.entries().map_err(|e| package_error(format!(
+        "invalid signed registry tar: {}", e
+    )))? {
+        let mut entry = entry.map_err(|e| package_error(format!(
+            "invalid signed registry entry: {}", e
+        )))?;
+        entries += 1;
+        if entries > MAX_ENTRIES {
+            return Err(package_error("signed registry archive has too many entries"));
+        }
+        let relative = entry.path().map_err(|e| package_error(format!(
+            "invalid signed registry path: {}", e
+        )))?.into_owned();
+        let valid = !relative.as_os_str().is_empty()
+            && relative.components().all(|component| match component {
+                Component::Normal(part) => !part.to_string_lossy().contains('\\'),
+                _ => false,
+            });
+        if !valid || !seen.insert(relative.clone()) {
+            return Err(package_error(format!(
+                "signed registry archive has unsafe or duplicate path: {}",
+                relative.display()
+            )));
+        }
+        if entry.header().entry_type().is_dir() {
+            continue;
+        }
+        if !entry.header().entry_type().is_file() {
+            return Err(package_error(format!(
+                "signed registry archive contains link or special entry: {}",
+                relative.display()
+            )));
+        }
+        let size = entry.size();
+        total = total.checked_add(size)
+            .ok_or_else(|| package_error("signed registry archive extracted size overflow"))?;
+        if size > MAX_ENTRY_BYTES || total > MAX_EXTRACTED_BYTES {
+            return Err(package_error("signed registry archive exceeds extracted file limits"));
+        }
+        let name = relative.to_str()
+            .ok_or_else(|| package_error("signed registry path is not valid UTF-8"))?
+            .replace('\\', "/");
+        let mut contents = Vec::with_capacity(size as usize);
+        entry.read_to_end(&mut contents).map_err(|e| package_error(format!(
+            "cannot read signed registry entry '{}': {}", name, e
+        )))?;
+        if contents.len() as u64 != size {
+            return Err(package_error(format!("truncated signed registry entry '{}'", name)));
+        }
+        if name == "Nulang.toml" {
+            manifest_data = Some(contents.clone());
+        }
+        files.push((name, contents));
+    }
+    let manifest_bytes = manifest_data
+        .ok_or_else(|| package_error("signed registry archive has no Nulang.toml"))?;
+    let manifest_text = std::str::from_utf8(&manifest_bytes)
+        .map_err(|_| package_error("signed registry manifest is not UTF-8"))?;
+    let manifest = Manifest::parse(manifest_text)?;
+    if manifest.package.name != expected_name || manifest.package.version != expected_version {
+        return Err(package_error("signed registry archive package metadata differs from lockfile"));
+    }
+    Ok(crate::package::identity::registry_tree_id_from_entries(&files))
+}
+
 // Regression tests for archive validation and staging behavior.
 
 #[cfg(test)]
