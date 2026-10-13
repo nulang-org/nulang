@@ -74,15 +74,22 @@ in draft rather than converting an unreviewed self-authored PR into a merge.
 
 ## Repository ruleset to configure in GitHub
 
-The files in this PR cannot enable server-side branch protection. A repository
-administrator must configure a ruleset targeting `main`:
+The files in this PR cannot enable server-side branch protection. At audit
+time (2026-10-13), repository ruleset [#25012292](https://github.com/nulang-org/nulang/rules/25012292)
+was **active and targeted all branches**. It already required one approval,
+code-owner approval, and approval after the last push, but had **no required
+status checks**, did not dismiss stale approvals, did not require conversations
+resolved, and had broad always-bypass actors. The branch-protection endpoint
+was not accessible through the installed GitHub connection. An administrator
+must edit this existing ruleset (rather than create a conflicting one)
+to protect `main` with these requirements:
 
 1. Require pull requests; block force pushes and branch deletion.
-2. Require at least **one approval by someone other than the PR author**,
-   dismiss stale approvals after changes, and require conversations resolved.
-   When a second trusted maintainer can review `CODEOWNERS` paths, require
-   code-owner review; enabling it with only one owner deadlocks that owner's
-   own PRs.
+2. Keep at least **one independent approval** and last-push approval;
+   dismiss stale approvals after changes and require conversations resolved.
+   The live ruleset already enables code-owner review; **do not introduce**
+   a sole-owner `CODEOWNERS` file. Add code owners only after a second
+   trusted maintainer can review the primary maintainer's PRs.
 3. Require up-to-date passing checks on the merge candidate, including
    `CI / Build & Test`, `CI / Format, Clippy & Audit`,
    `CI / Build & Test (wasm-backend feature)`,
@@ -101,4 +108,4 @@ administrator must configure a ruleset targeting `main`:
    Do not enable a setting that prevents the only maintainer from recovering
    the repository before a second trusted maintainer exists.
 
-Ruleset status has **not** been verified or changed by these files.
+Ruleset settings were **read and verified**, but cannot be changed by this GitHub connector. No ruleset changes were made by this PR.
