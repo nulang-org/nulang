@@ -46,6 +46,39 @@ stability tiers, and official package mirrors are generated from the canonical
 
 See [Standard Library Modules](/stdlib/modules/) for the generated index.
 
+## Single-pass list transforms (Experimental)
+
+`stdlib::list` includes `mapping`, `filtering`, `chain_transforms`,
+`transduce`, and `collect_transduced` for composing transformations without
+materializing arrays between stages. Transforms are lazy: they are applied only
+when `transduce` or `collect_transduced` traverses the source.
+
+```nulang
+import stdlib::list
+
+fn main() {
+    let double_then_even = chain_transforms(
+        mapping(fn(x) { x * 2 }),
+        filtering(fn(x) { x % 4 == 0 })
+    )
+    let total = transduce(
+        [1, 2, 3, 4, 5], double_then_even, 0,
+        fn(acc, x) { acc + x }
+    )
+    perform IO.print(perform Int.to_string(total)) // 12
+}
+```
+
+`chain_transforms(a, b)` processes each element through `a` and then `b`.
+`transduce` keeps only the accumulator, while `collect_transduced` builds
+one final array using the existing `Array.push` effect.
+
+**Performance boundary:** This API eliminates intermediate collection
+materialization by construction, but it does not yet guarantee zero-overhead
+closures, unboxed iterator state, stack allocation, or compile-time evaluation.
+Those require separate MIR specialization and escape-analysis work. The
+existing eager `map` and `filter` functions are unchanged.
+
 ## Implementation Sites
 
 Built-in operations are implemented in one of two places:
