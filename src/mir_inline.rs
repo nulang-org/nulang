@@ -469,11 +469,9 @@ fn stmt_uses_local(stmt: &Stmt, local: LocalId) -> bool {
         Stmt::Assign { dst, op } => *dst == local || rvalue_uses_local(op, local),
         Stmt::StoreFieldNamed { obj, src, .. } => *obj == local || *src == local,
         Stmt::ArrayStore { arr, idx, src } => *arr == local || *idx == local || *src == local,
-        Stmt::EnterHandle { .. }
-        | Stmt::PopHandler
-        | Stmt::StateSet { .. }
-        | Stmt::Emit { .. }
-        | Stmt::ParallelMarker { .. } => false,
+        Stmt::StateSet { src, .. } => *src == local,
+        Stmt::Emit { args, .. } => args.contains(&local),
+        Stmt::EnterHandle { .. } | Stmt::PopHandler | Stmt::ParallelMarker { .. } => false,
     }
 }
 
