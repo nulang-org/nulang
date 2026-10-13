@@ -32,7 +32,6 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_LABELS: ${{ toJson(github.event.pull_request.labels.*.name) }}
         run: |
-
           # Explicit exemption wins over title classification. Without this
           # ordering, feat/fix/perf PRs can never use the documented label.
           if echo "$PR_LABELS" | grep -qi "skip-changelog"; then
