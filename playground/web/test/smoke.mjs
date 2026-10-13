@@ -11,6 +11,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { homepageExamples } from "../../../docs/src/lib/homepage-examples.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const wasmPath = path.join(here, "..", "nulang_playground.wasm");
@@ -76,6 +77,33 @@ check(
   "perform IO.print(undefined_variable_xyz)\n",
   (r) => !r.ok && r.error.length > 0
 );
+
+
+// Homepage demos must run on the real compiler/CoreVM, not merely resemble
+// snippets in the standalone playground. These output assertions detect
+// compiler/runtime regressions before the docs site is published.
+const homepageOutputs = new Map([
+  ["hello", "Hello, Nulang!\nHello, World!\nThe answer is 42\n"],
+  ["recursion", "fib(10) = 55\n5! = 120\n"],
+  ["closures", "add10(32) = 42\nBlock result: 30\n"],
+]);
+for (const example of homepageExamples) {
+  const expected = homepageOutputs.get(example.id);
+  if (expected === undefined) {
+    failures++;
+    console.error("FAIL  unrecognized homepage sample:", example.id);
+    continue;
+  }
+  check(
+    "homepage " + example.id,
+    example.code,
+    (r) => r.ok && r.output === expected
+  );
+}
+if (homepageExamples.length !== homepageOutputs.size) {
+  failures++;
+  console.error("FAIL  homepage example count does not match expected outputs");
+}
 
 // Run twice through the same instance: the result buffer must be reusable.
 const again = run('perform IO.print("again")\n');
