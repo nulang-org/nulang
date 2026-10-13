@@ -9186,11 +9186,15 @@ fn failed_resumed_workflow_does_not_checkpoint_speculative_durable_state_on_succ
     assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
     let recovered = rt.actors.get(&actor_id).unwrap();
     assert_eq!(
-        recovered.get_state_field("step_index").and_then(|value| value.as_int()),
+        recovered
+            .get_state_field("step_index")
+            .and_then(|value| value.as_int()),
         Some(1)
     );
     assert_eq!(
-        recovered.get_state_field("answer").and_then(|value| value.as_int()),
+        recovered
+            .get_state_field("answer")
+            .and_then(|value| value.as_int()),
         Some(7)
     );
 }
