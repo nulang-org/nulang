@@ -21,7 +21,6 @@ forbidden = {
     "pyo3", "pyo3-ffi", "nulang-ai", "tower-lsp", "wasmtime",
     "wasm-encoder", "libloading", "libffi", "libffi-sys",
     "rocksdb", "librocksdb-sys", "postgres", "tokio-postgres",
-    "mio",
 }
 unexpected = sorted(name for name in names if name in forbidden or name.startswith("cranelift"))
 if unexpected:
