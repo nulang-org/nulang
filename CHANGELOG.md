@@ -1,5 +1,13 @@
 # Nulang Changelog
 
+### Single GitHub Actions CI pipeline and cheaper per-PR validation — 2026-10-12
+- **GitHub Actions is now the only CI system.** The Woodpecker pipeline (`.woodpecker/rust.yml`) and the Buildkite entrypoint (`.buildkite/pipeline.yml`, root `ci.yml`, `scripts/ci/buildkite-rust-*.sh`) are retired, removing duplicate validation of every Rust pull request. The GHA admission contract is asserted by `scripts/tests/test_github_actions_ci_contract.py`, run from `scripts/verify_implementation.py`.
+- **Draft pull requests no longer consume CI.** Every pull-request workflow skips its jobs while a PR is a draft (the `ready_for_review` event re-runs them when the PR is marked ready) — drafts cannot merge, so those matrix runs were pure runner cost.
+- **The four-platform release rehearsal is opt-in on pull requests.** Add the `run-release-matrix` label to rehearse the packaging matrix before tagging; tag builds always run the full matrix.
+- **Benchmark workflows run nightly and on demand** instead of on every product-source pull request, and the Remote-RTT stage profile is scoped to the transport/cluster/distributed paths it measures.
+- **Superseded runs are cancelled per ref** in every PR workflow, and the publish job is never cancelled.
+- **Load-flaky cluster tests are retried under nextest** (`.config/nextest.toml`, scoped to the `cluster_split_brain` family) and all four Rust test jobs run under nextest; whitespace parity (`git diff --check`) is restored from the retired pipeline.
+
 ### Public CLI release portability — 2026-10-11
 - **Public release archives use the `release-cli` feature profile without a Python shared-library ABI dependency.** The ordinary full/default source build retains opt-in Python interoperability; release packaging checks the resulting Linux and macOS binary for Python dependencies.
 - **Release PRs rehearse the full non-publishing four-platform build matrix before tags are created.** The Linux ARM64 cross build explicitly installs target libc development headers and preflights a target-compiler C header probe, avoiding an observed `ring` compile failure when `--no-install-recommends` omits the ARM64 sysroot. Actual cross-build and clean-host portability remain release gates.
