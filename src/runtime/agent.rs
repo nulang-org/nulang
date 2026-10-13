@@ -649,6 +649,78 @@ mod tests {
     use crate::runtime::Runtime;
 
     #[test]
+    fn test_tool_arguments_follow_declaration_order_not_json_key_order() {
+        // JSON object keys are commonly sorted; VM registers follow the
+        // source function's declared parameter order instead.
+        let tool = crate::tool_schema::function_to_tool_schema(
+            "transfer",
+            "Transfer tokens",
+            &[
+                (
+                    "recipient".to_string(),
+                    crate::types::Type::Primitive(crate::types::PrimitiveType::String),
+                ),
+                (
+                    "amount".to_string(),
+                    crate::types::Type::Primitive(crate::types::PrimitiveType::Int),
+                ),
+            ],
+            &crate::types::Type::Primitive(crate::types::PrimitiveType::Unit),
+        );
+        let args = serde_json::json!({"amount": 7, "recipient": "alice"});
+        let ordered = ordered_tool_arguments(&tool, args.as_object().unwrap()).unwrap();
+        assert_eq!(ordered, vec![serde_json::json!("alice"), serde_json::json!(7)]);
+    }
+
+    #[test]
+    fn test_tool_arguments_reject_missing_required_field() {
+        let tool = crate::tool_schema::ToolSchema {
+            name: "transfer".to_string(),
+            description: String::new(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"recipient": {"type": "string"}, "amount": {"type": "integer"}},
+                "required": ["recipient", "amount"]
+            }),
+        };
+        let args = serde_json::json!({"recipient": "alice"});
+        let err = ordered_tool_arguments(&tool, args.as_object().unwrap()).unwrap_err();
+        assert!(err.contains("amount"), "{err}");
+    }
+
+    #[test]
+    fn test_tool_arguments_reject_unexpected_field() {
+        let tool = crate::tool_schema::ToolSchema {
+            name: "lookup".to_string(),
+            description: String::new(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"]
+            }),
+        };
+        let args = serde_json::json!({"query": "weather", "unapproved": true});
+        let err = ordered_tool_arguments(&tool, args.as_object().unwrap()).unwrap_err();
+        assert!(err.contains("unapproved"), "{err}");
+    }
+
+    #[test]
+    fn test_tool_arguments_reject_ambiguous_compiler_schema() {
+        let tool = crate::tool_schema::ToolSchema {
+            name: "lookup".to_string(),
+            description: String::new(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}},
+                "required": ["query", "query"]
+            }),
+        };
+        let args = serde_json::json!({"query": "weather", "limit": 5});
+        let err = ordered_tool_arguments(&tool, args.as_object().unwrap()).unwrap_err();
+        assert!(err.contains("duplicate"), "{err}");
+    }
+
+    #[test]
     fn test_set_clear_token_budget() {
         let mut rt = Runtime::new();
         assert!(rt.llm.token_budget.is_none());
