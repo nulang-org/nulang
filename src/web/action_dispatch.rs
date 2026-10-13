@@ -249,6 +249,135 @@ mod tests {
         UiDocument::new("app", Revision(1), "root", vec![root])
     }
 
+    fn typed_param(name: &str, ty: &str) -> crate::web::contracts::HandlerParamContract {
+        crate::web::contracts::HandlerParamContract {
+            name: name.to_owned(),
+            ty: Some(ty.to_owned()),
+            capability: None,
+            request: None,
+        }
+    }
+
+    fn action_payload(fields: &[(&str, WireValue)]) -> HostToRuntimeMessage {
+        let mut message = action_message("save", ActionPlacement::Server);
+        let HostToRuntimeMessage::InvokeAction { request, .. } = &mut message;
+        request.payload = WireValue::Object(
+            fields
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), value.clone()))
+                .collect(),
+        );
+        message
+    }
+
+    #[test]
+    fn document_bound_scalar_payload_binds_by_compiler_parameter_order() {
+        let module = module_with_action("save", vec![0, 1, 2]);
+        let document = trusted_document("save", ActionPlacement::Server);
+        let message = action_payload(&[
+            ("count", WireValue::from("42")),
+            ("active", WireValue::Bool(true)),
+            ("title", WireValue::from("Save me")),
+        ]);
+        let params = [
+            typed_param("title", "String"),
+            typed_param("count", "Int"),
+            typed_param("active", "Bool"),
+        ];
+
+        let bound = bind_document_action_payload(&module, &document, &message, &params)
+            .expect("trusted document and exact compiler arity permit scalar binding");
+        assert_eq!(bound.action_id, "save");
+        assert_eq!(
+            bound.arguments,
+            vec![
+                Constant::String("Save me".into()),
+                Constant::Int(42),
+                Constant::Bool(true),
+            ]
+        );
+    }
+
+    #[test]
+    fn document_bound_scalar_payload_rejects_unknown_missing_and_wrong_types() {
+        let module = module_with_action("save", vec![0, 1]);
+        let document = trusted_document("save", ActionPlacement::Server);
+        let params = [typed_param("title", "String"), typed_param("count", "Int")];
+
+        for message in [
+            action_payload(&[("title", WireValue::from("one"))]),
+            action_payload(&[
+                ("title", WireValue::from("one")),
+                ("count", WireValue::I64(1.into())),
+                ("admin", WireValue::Bool(true)),
+            ]),
+            action_payload(&[
+                ("title", WireValue::from("one")),
+                ("count", WireValue::from("not-an-int")),
+            ]),
+        ] {
+            assert!(matches!(
+                bind_document_action_payload(&module, &document, &message, &params),
+                Err(UiActionDispatchError::InvalidPayload(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn document_bound_scalar_payload_rejects_unproven_compiler_contracts() {
+        let module = module_with_action("save", vec![0, 1]);
+        let document = trusted_document("save", ActionPlacement::Server);
+        let message = action_payload(&[("title", WireValue::from("one"))]);
+
+        assert!(matches!(
+            bind_document_action_payload(
+                &module,
+                &document,
+                &message,
+                &[typed_param("title", "String")]
+            ),
+            Err(UiActionDispatchError::RequiresBindingPlan { .. })
+        ));
+
+        let mut privileged = typed_param("title", "String");
+        privileged.capability = Some("iso".into());
+        assert!(matches!(
+            bind_document_action_payload(
+                &module_with_action("save", vec![0]),
+                &document,
+                &message,
+                &[privileged]
+            ),
+            Err(UiActionDispatchError::InvalidPayload(_))
+        ));
+    }
+
+    #[test]
+    fn document_bound_scalar_payload_rejects_foreign_or_unregistered_actions() {
+        let module = module_with_action("save", vec![0]);
+        let document = trusted_document("save", ActionPlacement::Server);
+        let message = action_payload(&[("title", WireValue::from("one"))]);
+        let params = [typed_param("title", "String")];
+
+        assert!(matches!(
+            bind_document_action_payload(
+                &module,
+                &trusted_document("other", ActionPlacement::Server),
+                &message,
+                &params
+            ),
+            Err(UiActionDispatchError::UnregisteredAction(_))
+        ));
+
+        let mut stale = message.clone();
+        let HostToRuntimeMessage::InvokeAction { request, .. } = &mut stale;
+        request.revision = Revision(999);
+        assert!(matches!(
+            bind_document_action_payload(&module, &document, &stale, &params),
+            Err(UiActionDispatchError::RevisionMismatch { .. })
+        ));
+    }
+
     #[test]
     fn document_bound_action_executes_only_a_registered_server_handler() {
         let module = module_with_action("save", Vec::new());
