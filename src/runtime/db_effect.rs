@@ -349,7 +349,7 @@ mod tests {
         .unwrap();
         assert_eq!(query.params, vec![OwnedDbParam::Int(42)]);
         assert!(parse_query_args(&constants, &[Value::string(0), Value::int(-1)]).is_err());
-        assert!(parse_query_args(&constants, &[Value::string(0), Value::int(255)]).is_err());
+        assert!(parse_query_args(&constants, &[Value::string(0), Value::int(11)]).is_err());
         assert!(parse_query_args(
             &constants,
             &[Value::string(0), Value::int(2), Value::int(42)],
