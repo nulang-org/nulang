@@ -41,6 +41,39 @@ These APIs are read-only snapshots. They do not allocate VM values, run code,
 change pointer ownership, or alter ORCA collection. No new background
 monitoring threads or network listeners are introduced.
 
+## Allocation baseline benchmarks
+
+The existing Criterion harness (`benches/bench_main.rs`) registers
+`benches/gc_bench.rs`. It now also registers two previously defined but
+unreachable allocation benchmark groups:
+
+- `gc/actor_heap_small_alloc`: 512 successful fresh heap allocations per
+  sample, at payload sizes 8, 16, 32, 64, and 128 bytes.
+- `gc/orca_local_alloc_drop`: 512 successful ORCA allocations and
+  immediate last-reference drops per sample, at the same payload sizes.
+
+Use the existing supported harness:
+
+```sh
+cargo bench --locked --bench bench_main -- gc/actor_heap_small_alloc
+cargo bench --locked --bench bench_main -- gc/orca_local_alloc_drop
+cargo bench --locked --bench bench_main -- gc/orca_foreign_ref_send
+python3 -m unittest scripts/tests/test_benchmark_timing_contract.py
+```
+
+All three GC benchmarks use `iter_batched_ref` so setup and owned fixture
+destruction occur **outside** Criterion's measured closure. Allocation, drops,
+and pointer bookkeeping remain measured. The GC benchmark group is exercised
+by the existing `cargo bench --locked --bench bench_main` command used
+by CI on `main`. For a parent/candidate comparison, run the same filter,
+payload and number of samples under controlled CPU conditions; the
+regression checker is informational for a new benchmark until it has enough
+historical samples.
+
+These are **benchmarks prepared for execution**, not published measured
+results. Do not claim that byte counting is negligible before a paired
+parent-vs-candidate run.
+
 ## Validation
 
 ```sh
