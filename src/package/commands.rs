@@ -2683,7 +2683,7 @@ mod tests {
         scaffold_package(&dir, "locked-app", "default").unwrap();
         let _guard = ChangeDir::new(&dir);
 
-        for command in ["build", "run", "test"] {
+        for command in ["build", "run", "test", "build-wasm"] {
             let args = vec![command.to_string(), "--locked".to_string()];
             let error = run(&args).expect_err("locked command must require an existing lockfile");
             assert!(error.to_string().contains("Nulang.lock"), "{error}");
@@ -3269,7 +3269,7 @@ app "counter" {
         .unwrap();
 
         let _guard = ChangeDir::new(&dir);
-        cmd_build_web().expect("web build should succeed");
+        cmd_build_web(false).expect("web build should succeed");
 
         let html =
             std::fs::read_to_string(dir.join("dist/index.html")).expect("index.html should exist");
