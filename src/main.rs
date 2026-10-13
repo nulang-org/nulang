@@ -10,6 +10,7 @@
 //!   nulang agent <init|run|chat|goals|graph>
 //!   nulang nula <new|build|build-wasm|test|run|add|remove|publish|deploy|watch|doc>
 //!   nulang fmt [--check] [<file>]
+//!   nulang explain allocations <file.nbc>
 //!
 //! Options:
 //!   -r, --repl               Start interactive REPL
@@ -128,6 +129,30 @@ fn main() {
         }
         let mut repl = Repl::new();
         repl.run();
+        return;
+    }
+
+    // Read-only compiler diagnostics over a validated bytecode artifact.
+    // This is a static eligibility report, not a runtime allocation trace.
+    if args[1] == "explain" {
+        if args.len() != 4 || args[2] != "allocations" {
+            eprintln!("Usage: nulang explain allocations <file.nbc>");
+            std::process::exit(2);
+        }
+        let bytes = match std::fs::read(&args[3]) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                eprintln!("cannot read allocation artifact '{}': {err}", args[3]);
+                std::process::exit(1);
+            }
+        };
+        match render_allocation_report_nbc(&bytes) {
+            Ok(json) => println!("{json}"),
+            Err(err) => {
+                eprintln!("cannot analyze allocation artifact: {err}");
+                std::process::exit(1);
+            }
+        }
         return;
     }
 
@@ -1019,6 +1044,15 @@ fn main() {
     repl.run();
 }
 
+/// Validate the stable .nbc artifact before performing read-only analysis.
+/// Failed deserialization must not silently fall back to raw opcode guesses.
+fn render_allocation_report_nbc(bytes: &[u8]) -> Result<String, String> {
+    let artifact = nulang::bytecode::CodeModule::from_nbc(bytes)
+        .map_err(|error| error.to_string())?;
+    let report = nulang::allocation_report::analyze_aggregate_allocations(&artifact.module);
+    serde_json::to_string_pretty(&report).map_err(|error| error.to_string())
+}
+
 struct Options {
     repl: bool,
     eval_code: Option<String>,
@@ -1126,6 +1160,7 @@ fn print_help() {
     println!("       nulang --lsp");
     println!("       nulang --dap");
     println!("       nulang fmt [--check] [<file>]");
+    println!("       nulang explain allocations <file.nbc>");
     println!("       nulang node --listen <ADDR> [--seed <ADDR>] [--expected-nodes <N>]");
     println!("       nulang --doc");
     println!();
@@ -2807,6 +2842,27 @@ fn levenshtein_distance(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allocation_report_cli_rejects_malformed_nbc() {
+        assert!(render_allocation_report_nbc(b"not an nbc artifact").is_err());
+    }
+
+    #[test]
+    fn allocation_report_cli_reads_valid_nbc_without_running_it() {
+        use nulang::bytecode::{CodeModule, Instruction, OpCode};
+
+        let mut module = CodeModule::new("report-fixture");
+        module.emit(Instruction::new2(OpCode::ArrAlloc, 0, 1));
+        module.emit(Instruction::new1(OpCode::Drop, 1));
+        module.emit(Instruction::new0(OpCode::Halt));
+        let bytes = module.to_nbc(None).expect("valid nbc");
+        let json = render_allocation_report_nbc(&bytes).expect("valid report");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(parsed["module"], "report-fixture");
+        assert_eq!(parsed["arena_eligible"], 1);
+        assert_eq!(parsed["sites"][0]["disposition"], "arena_eligible");
+    }
 
     /// An actor program run through the CLI path must create real actors
     /// and deliver sent messages: with the bare standalone VM the stub

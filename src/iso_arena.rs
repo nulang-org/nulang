@@ -389,11 +389,16 @@ fn may_ptr_sets(module: &CodeModule) -> Vec<RegSet> {
     let n = instrs.len();
     let mut in_sets: Vec<RegSet> = vec![[0; 4]; n];
     let mut worklist: Vec<usize> = Vec::new();
+    // An empty may-pointer set is a valid reachable state. Track whether
+    // an instruction has been visited independently of whether its set
+    // has acquired any bits, or zero-state prefixes stop forward analysis.
+    let mut reached = vec![false; n];
 
     // Entry points: module entry takes no arguments; every function-table
     // target conservatively receives unknown (pointer-suspect) arguments.
     let entry = module.entry_point.unwrap_or(0);
     if entry < n {
+        reached[entry] = true;
         worklist.push(entry);
     }
     for &off in &module.function_table {
@@ -402,6 +407,7 @@ fn may_ptr_sets(module: &CodeModule) -> Vec<RegSet> {
             for r in 0..=255u8 {
                 regset_insert(&mut in_sets[off], r);
             }
+            reached[off] = true;
             worklist.push(off);
         }
     }
@@ -470,7 +476,10 @@ fn may_ptr_sets(module: &CodeModule) -> Vec<RegSet> {
             continue; // malformed target: no propagation (sites reject anyway)
         };
         for s in succs {
-            let mut changed = false;
+            // Every reachable successor must be processed at least once,
+            // even if no pointer has yet appeared along that path.
+            let mut changed = !reached[s];
+            reached[s] = true;
             for w in 0..4 {
                 let merged = in_sets[s][w] | out[w];
                 if merged != in_sets[s][w] {
@@ -706,6 +715,38 @@ mod tests {
     }
 
     // -- Escape analysis ----------------------------------------------------
+
+    #[test]
+    fn pointer_analysis_crosses_zero_state_prefix_before_nested_allocations() {
+        // Regression: a reachable Nop/Const0 prefix leaves the may-pointer
+        // state empty. We must still visit successors, or an outer container
+        // can be classified arena-safe while a heap-owned child is stored
+        // into it without the ORCA retain barrier.
+        let m = send_module(
+            vec![
+                Instruction::new0(OpCode::Nop),
+                Instruction::new1(OpCode::Const0, 0),
+                arr_alloc(0, 1),
+                arr_alloc(0, 2),
+                Instruction::new3(OpCode::ArrStore, 1, 0, 2),
+                Instruction::new1(OpCode::Drop, 1),
+                Instruction::new1(OpCode::Drop, 2),
+                Instruction::new0(OpCode::Halt),
+            ],
+            0,
+        );
+        let state = may_ptr_sets(&m);
+        assert!(
+            regset_contains(&state[4], 2),
+            "pointer analysis must reach stores after zero-pointer prefixes"
+        );
+        let qualified = qualifying_alloc_sites(&m);
+        assert!(
+            !qualified.contains(&2),
+            "outer container must not use arena when it stores a heap pointer"
+        );
+        assert!(!qualified.contains(&3), "stored child must not qualify");
+    }
 
     #[test]
     fn qualifies_when_dropped_before_halt() {
