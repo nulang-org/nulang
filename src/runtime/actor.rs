@@ -417,7 +417,28 @@ pub struct BehaviorEntry {
     pub handler_fn: fn(&mut Actor, &[Value]),
 }
 
+/// Read-only allocator counters belonging to the actor's current allocators.
+///
+/// The heap scope is since the most recent heap reset; arena totals are
+/// lifetime-of-arena and survive per-activation resets and actor pooling.
+/// These must not be summed as if they shared one lifetime or timestamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct ActorAllocationSnapshot {
+    pub actor_id: u64,
+    pub heap: crate::runtime::heap::HeapAllocationSnapshot,
+    pub arena: crate::iso_arena::ArenaAllocationSnapshot,
+}
+
 impl Actor {
+    /// Observe successful allocator calls without executing the actor.
+    pub fn allocation_snapshot(&self) -> ActorAllocationSnapshot {
+        ActorAllocationSnapshot {
+            actor_id: self.id,
+            heap: self.heap.allocation_snapshot(),
+            arena: self.iso_arena.allocation_snapshot(),
+        }
+    }
+
     pub fn new(id: u64, name: impl Into<String>, mailbox_cap: usize) -> Self {
         Actor {
             id,
