@@ -2956,6 +2956,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn web_sqlite_path_rejects_symlinked_storage_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "nulang_web_symlink_test_{}",
+            std::process::id()
+        ));
+        let outside = root.with_extension("outside");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, root.join("data")).unwrap();
+
+        let mut web = crate::package::manifest::WebSection::default();
+        web.kv_backend = "sqlite".into();
+        let result = resolve_web_sqlite_path(&root, &web);
+        assert!(result.is_err(), "symlinked parent must fail before opening SQLite");
+        assert!(!outside.join("web-state.sqlite").exists());
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
     #[test]
     fn test_cmd_new_rejects_unknown_template() {
         let dir = std::env::temp_dir().join(format!("nulang_unk_tmpl_{}", std::process::id()));
