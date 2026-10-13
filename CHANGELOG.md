@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Embedded source-only WASM compiler API — 2026-10-13
+- **Library embedders can compile a self-contained Nulang module to core WebAssembly in-process** via `nulang::compiler_api::compile_source_to_wasm` when the `wasm-backend` feature is enabled. The API uses the standard frontend, HIR/MIR lowering, effect/capability checks, and default WASM backend without invoking the command-line compiler or writing compiler output files.
+- **Unresolved imports fail closed** instead of reading packages from the guest filesystem. Explicit resource grants require the separate `compile_source_to_wasm_with_grants` entrypoint; the default grants none. This surface is under integration and real Firecracker guest validation in Cloud #230, not yet production-validated.
+
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
