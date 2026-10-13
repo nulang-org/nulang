@@ -3,7 +3,7 @@
 
 use crate::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, McpServer};
 use serde_json::Value;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 
