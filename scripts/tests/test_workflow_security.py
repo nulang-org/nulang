@@ -16,7 +16,7 @@ UNTRUSTED_EXPRESSION = re.compile(
     r"\$\{\{\s*(?:"
     r"github\.event\.(?:pull_request|issue|comment|review|review_comment|"
     r"head_commit|commits|discussion)(?:\.|\[)"
-    r"|github\.head_ref\b)"
+    r"|github\.(?:head_ref|base_ref)\b)"
 )
 
 
@@ -53,6 +53,10 @@ class WorkflowSecurityTests(unittest.TestCase):
 
     def test_rejects_single_line_run_interpolation(self):
         source = 'steps:\n  - run: echo "${{ github.head_ref }}"\n'
+        self.assertEqual(untrusted_run_lines(source), [2])
+
+    def test_rejects_base_branch_interpolation(self):
+        source = 'steps:\\n  - run: echo "${{ github.base_ref }}"\\n'
         self.assertEqual(untrusted_run_lines(source), [2])
 
     def test_env_binding_is_not_shell_source(self):
