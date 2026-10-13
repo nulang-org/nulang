@@ -1584,6 +1584,10 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### Branchy typed JIT loop SSA — 2026-10-13
+- **Native Int/Float SSA across one forward branch diamond and loop backedge** (Experimental, `src/jit/typed_compiler.rs`). The typed JIT composes CFG-join and loop-carried type analysis for an eligible numeric loop with one forward diamond and one backedge. Additional internal control-flow edges and nullable/dynamic values remain on conservative fallback paths.
+- **Focused performance evidence, not a general speedup claim:** A 500,000-iteration compiled-region probe reported median 2.533 ms before versus 0.958–0.975 ms after this optimization.
+
 ### Standard-library Option lookup contracts — 2026-09-21
 - **Collection absence is explicit.** Experimental `stdlib::map.get`, `stdlib::list.index_of`, and `stdlib::list.find` now return `Option` instead of sentinel `-1` values. `max_of`, `min_of`, `min_by`, and `max_by` now return `None` for empty inputs. Conformance fixtures and stdlib tests pin the new contracts. This is source-breaking for Experimental stdlib callers that compared missing results with integer sentinels.
 
