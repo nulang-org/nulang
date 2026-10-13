@@ -7,9 +7,10 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 thread_local! {
-    /// Cache of fully resolved import declarations keyed by canonical file path.
-    /// Cleared at the start of every top-level `resolve_imports` call so that
-    /// repeated compilations in the same process do not reuse stale ASTs.
+    /// Cache of complete, unfiltered resolved declarations, keyed by canonical
+    /// file path. Each import applies its own requested item selection after
+    /// lookup, so a prior selective import cannot hide later declarations.
+    /// Cleared at the start of each top-level resolve to avoid stale ASTs.
     static IMPORT_CACHE: RefCell<BTreeMap<PathBuf, Vec<Decl>>> = const { RefCell::new(BTreeMap::new()) };
 }
 
@@ -53,7 +54,7 @@ pub fn resolve_imports(
         // If the file has already been fully resolved in this compilation,
         // reuse its cached declarations.
         if let Some(cached) = IMPORT_CACHE.with(|c| c.borrow().get(&resolved_canonical).cloned()) {
-            merge_imported_decls(module, cached, import_path, true)?;
+            merge_imported_decls(module, filter_decls(cached, items), import_path, true)?;
             continue;
         }
 
@@ -85,17 +86,19 @@ pub fn resolve_imports(
 
         resolve_imports(&mut imported, &resolved_canonical, stack)?;
 
-        let imported_decls = if items.is_empty() {
-            imported.decls
-        } else {
-            filter_decls(imported.decls, items)
-        };
-
+        // Store the full resolved module. Caching a filtered selection under
+        // a file-only key would make later imports lose requested symbols.
+        let imported_decls = imported.decls;
         IMPORT_CACHE.with(|c| {
             c.borrow_mut()
                 .insert(resolved_canonical, imported_decls.clone())
         });
-        merge_imported_decls(module, imported_decls, import_path, false)?;
+        merge_imported_decls(
+            module,
+            filter_decls(imported_decls, items),
+            import_path,
+            false,
+        )?;
     }
     module.decls.retain(|d| !matches!(d, Decl::Import { .. }));
     stack.remove(&canonical_file);
@@ -374,6 +377,93 @@ mod tests {
         let r = filter_decls(vec![fn_decl("a"), fn_decl("b")], &["a".into()]);
         assert_eq!(r.len(), 1);
         assert_eq!(decl_name(&r[0]), Some("a"));
+    }
+
+    // Selective imports are represented in the AST even though the current
+    // surface parser only constructs unfiltered imports. A file-only cache key
+    // must never retain the first import's selection for later requests.
+    #[test]
+    fn import_cache_does_not_reuse_a_previous_selection() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time is after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "nulang-resolver-selective-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).expect("create isolated fixture directory");
+        std::fs::write(
+            dir.join("dep.nula"),
+            "fn alpha() -> Int { 1 }\nfn beta() -> Int { 2 }\n",
+        )
+        .expect("write fixture source");
+        let mut module = AstModule {
+            name: "selective_import_regression".into(),
+            decls: vec![
+                Decl::Import {
+                    path: "dep".into(),
+                    items: vec!["alpha".into()],
+                    span: sp(),
+                },
+                Decl::Import {
+                    path: "dep".into(),
+                    items: vec!["beta".into()],
+                    span: sp(),
+                },
+            ],
+        };
+        let result = resolve_imports(&mut module, &dir.join("main.nula"), &mut HashSet::new());
+        std::fs::remove_dir_all(&dir).expect("remove fixture directory");
+        result.expect("resolve both selections from the same imported file");
+        let names: HashSet<&str> = module.decls.iter().filter_map(decl_name).collect();
+        assert!(
+            names.contains("alpha"),
+            "first requested function is present"
+        );
+        assert!(
+            names.contains("beta"),
+            "second requested function is present"
+        );
+        assert_eq!(names.len(), 2, "imports must not duplicate declarations");
+    }
+
+    #[test]
+    fn top_level_resolve_imports_discards_stale_declarations() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time is after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "nulang-resolver-freshness-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).expect("create isolated fixture directory");
+        let dep = dir.join("dep.nula");
+        let compile = || {
+            let mut module = AstModule {
+                name: "freshness".into(),
+                decls: vec![Decl::Import {
+                    path: "dep".into(),
+                    items: vec![],
+                    span: sp(),
+                }],
+            };
+            resolve_imports(&mut module, &dir.join("main.nula"), &mut HashSet::new())
+                .expect("resolve top-level import");
+            module
+                .decls
+                .into_iter()
+                .filter_map(|d| decl_name(&d).map(str::to_string))
+                .collect::<Vec<_>>()
+        };
+        std::fs::write(&dep, "fn alpha() -> Int { 1 }").expect("write first revision");
+        let first = compile();
+        std::fs::write(&dep, "fn beta() -> Int { 2 }").expect("write second revision");
+        let second = compile();
+        std::fs::remove_dir_all(&dir).expect("remove fixture directory");
+        assert_eq!(first, vec!["alpha"]);
+        assert_eq!(second, vec!["beta"], "a new build must reread the source");
     }
 
     #[test]
