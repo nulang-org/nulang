@@ -162,6 +162,9 @@ impl SessionActionAdmission {
             return Err(AdmissionError::SessionOwnerMismatch);
         }
 
+        message.validate().map_err(|error| {
+            AdmissionError::Binding(UiActionDispatchError::InvalidEnvelope(error.to_string()))
+        })?;
         let HostToRuntimeMessage::InvokeAction { request, .. } = message;
         // Exact semantic replay is checked before revision validation so a
         // retry cannot re-execute merely because the document has advanced.
