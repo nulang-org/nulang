@@ -395,7 +395,7 @@ mod tests {
         std::fs::create_dir(&dir).expect("create isolated fixture directory");
         std::fs::write(
             dir.join("dep.nula"),
-            "fn alpha() -> Int { 1 }; fn beta() -> Int { 2 }",
+            "fn alpha() -> Int { 1 }\nfn beta() -> Int { 2 }\n",
         )
         .expect("write fixture source");
         let mut module = AstModule {
@@ -421,8 +421,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("remove fixture directory");
         result.expect("resolve both selections from the same imported file");
         let names: HashSet<&str> = module.decls.iter().filter_map(decl_name).collect();
-        assert!(names.contains("alpha"), "first requested function is present");
-        assert!(names.contains("beta"), "second requested function is present");
+        assert!(\n            names.contains("alpha"),\n            "first requested function is present"\n        );
+        assert!(\n            names.contains("beta"),\n            "second requested function is present"\n        );
         assert_eq!(names.len(), 2, "imports must not duplicate declarations");
     }
 
@@ -453,7 +453,7 @@ mod tests {
                 &mut HashSet::new(),
             )
             .expect("resolve top-level import");
-            module.decls.into_iter().filter_map(|d| decl_name(&d).map(str::to_string)).collect::<Vec<_>>()
+            module\n                .decls\n                .into_iter()\n                .filter_map(|d| decl_name(&d).map(str::to_string))\n                .collect::<Vec<_>>()
         };
         std::fs::write(&dep, "fn alpha() -> Int { 1 }").expect("write first revision");
         let first = compile();
