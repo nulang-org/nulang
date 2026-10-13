@@ -1,0 +1,9 @@
+// A closure captures its environment at construction, not by re-reading
+// a subsequently rebound caller local. The optimizer must preserve this.
+fn main() {
+    var value = 4
+    let read_snapshot = fn() { value }
+    value = 9
+    perform IO.print("capture=" + perform Int.to_string(read_snapshot()))
+    perform IO.print("current=" + perform Int.to_string(value))
+}
