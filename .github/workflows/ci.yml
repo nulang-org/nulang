@@ -206,6 +206,13 @@ jobs:
           python3 scripts/verify_cli_persistent_restart.py \
             --binary ./target/release/nulang
 
+      # SIGKILL only after observing an acknowledged durable update; the
+      # same JSON store must restore the actor in a completely new CLI process.
+      - name: Verify persistent actor state after SIGKILL
+        run: |
+          python3 scripts/verify_cli_sigkill_recovery.py \
+            --binary ./target/release/nulang
+
       - name: Scaffold test package
         run: ./target/release/nulang nula new test-pkg
 
