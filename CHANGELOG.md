@@ -1,4 +1,8 @@
 # Nulang Changelog
+### MIR same-block capture-free callee devirtualization — 2026-10-13
+- **Conservative MIR optimization resolves calls through locally created capture-free closures to direct function-table calls.** It considers only definitions earlier in the same basic block and invalidates the candidate on reassignment; captured closures, load aliases, and cross-block definitions remain dynamic.
+- **Compiler unit tests cover direct rewriting, captured-closure preservation, reassignment, and cross-block non-dominance.** A conformance fixture checks capture-free, captured, and zero-argument closure behavior. This is callee devirtualization, not general closure inlining, generic monomorphization, or zero-overhead iterator codegen.
+
 ### Single-pass composable list transforms — 2026-10-13
 - **Experimental list transducers compose mapping and filtering without producing intermediate arrays.** `stdlib::list` now exposes `mapping`, `filtering`, `chain_transforms`, `identity_transform`, `transduce`, and `collect_transduced`; existing eager `map`/`filter` semantics are unchanged.
 - **Behavioral conformance covers composition order, empty input, identity transforms, final collection and source preservation.** These library combinators are a semantic foundation for future MIR specialization; they do not imply zero-overhead closure calls or stack allocation today.

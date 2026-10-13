@@ -1649,15 +1649,53 @@ const MAX_OPT_ITERATIONS: usize = 10;
 /// module-level constant pooling; unused by the current transforms.
 fn optimize_function(func: &mut mir::Function, _module_consts: &mut Vec<mir::RValue>) {
     for _ in 0..MAX_OPT_ITERATIONS {
+        let direct_calls = devirtualize_captureless_calls(func);
         let const_locals = collect_const_locals(func);
         let is_float = float_locals(func);
         let folded = fold_function(func, &const_locals, &is_float);
         let threaded = thread_jumps(func);
         let dce = dead_store_elim(func);
-        if !folded && !threaded && !dce {
+        if !direct_calls && !folded && !threaded && !dce {
             break;
         }
     }
+}
+
+/// Replace calls through locally constructed, capture-free closures with
+/// direct module-function calls. Only definitions earlier in the *same* MIR
+/// basic block are considered: a definition in a predecessor block may not
+/// dominate this call. Any reassignment invalidates the previous candidate.
+///
+/// A closure without captures encodes only a function-table index. Calling
+/// that index directly has the same arguments and no captured environment.
+/// We deliberately do not rewrite closures with captures, arbitrary aliases,
+/// or values produced by calls/loads, even if they might be optimizable.
+fn devirtualize_captureless_calls(func: &mut mir::Function) -> bool {
+    let mut changed = false;
+    for block in &mut func.blocks {
+        let mut local_targets: FxHashMap<mir::LocalId, usize> = FxHashMap::default();
+        for stmt in &mut block.stmts {
+            if let mir::Stmt::Assign { dst, op } = stmt {
+                if let mir::RValue::Call { func, .. } = op {
+                    if let mir::FuncRef::Local(callee) = func {
+                        if let Some(&target) = local_targets.get(callee) {
+                            *func = mir::FuncRef::Index(target);
+                            changed = true;
+                        }
+                    }
+                }
+
+                // Model the assignment after reading the old callee above.
+                local_targets.remove(dst);
+                if let mir::RValue::Closure { func, captures } = op {
+                    if captures.is_empty() {
+                        local_targets.insert(*dst, *func);
+                    }
+                }
+            }
+        }
+    }
+    changed
 }
 
 /// Collect locals that hold a single, never-reassigned constant value.
@@ -2971,6 +3009,158 @@ mod tests {
         )
         .unwrap();
         assert_eq!(value.as_int(), Some(55));
+    }
+
+    #[test]
+    fn test_devirtualize_captureless_same_block_call() {
+        let mut builder = mir::FunctionBuilder::new("captureless", Some(Type::int()));
+        let closure = builder.add_temp(Type::unit());
+        let result = builder.add_temp(Type::int());
+        builder.assign(
+            closure,
+            mir::RValue::Closure {
+                func: 7,
+                captures: vec![],
+            },
+        );
+        builder.assign(
+            result,
+            mir::RValue::Call {
+                func: mir::FuncRef::Local(closure),
+                args: vec![],
+            },
+        );
+        builder.terminate(mir::Terminator::Return(Some(result)));
+
+        let mut function = builder.build();
+        assert!(devirtualize_captureless_calls(&mut function));
+        assert!(matches!(
+            &function.blocks[0].stmts[1],
+            mir::Stmt::Assign {
+                op: mir::RValue::Call {
+                    func: mir::FuncRef::Index(7),
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_devirtualize_does_not_drop_closure_captures() {
+        let mut builder = mir::FunctionBuilder::new("captured", Some(Type::int()));
+        let captured = builder.add_temp(Type::int());
+        let closure = builder.add_temp(Type::unit());
+        let result = builder.add_temp(Type::int());
+        builder.assign(
+            closure,
+            mir::RValue::Closure {
+                func: 7,
+                captures: vec![captured],
+            },
+        );
+        builder.assign(
+            result,
+            mir::RValue::Call {
+                func: mir::FuncRef::Local(closure),
+                args: vec![],
+            },
+        );
+        builder.terminate(mir::Terminator::Return(Some(result)));
+
+        let mut function = builder.build();
+        assert!(!devirtualize_captureless_calls(&mut function));
+        assert!(matches!(
+            &function.blocks[0].stmts[1],
+            mir::Stmt::Assign {
+                op: mir::RValue::Call {
+                    func: mir::FuncRef::Local(_),
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_devirtualize_does_not_assume_cross_block_dominance() {
+        let mut builder = mir::FunctionBuilder::new("separate_blocks", Some(Type::int()));
+        let closure = builder.add_temp(Type::unit());
+        let result = builder.add_temp(Type::int());
+        builder.assign(
+            closure,
+            mir::RValue::Closure {
+                func: 5,
+                captures: vec![],
+            },
+        );
+        let following = builder.create_block();
+        builder.terminate(mir::Terminator::Jump(following));
+        builder.switch_to(following);
+        builder.assign(
+            result,
+            mir::RValue::Call {
+                func: mir::FuncRef::Local(closure),
+                args: vec![],
+            },
+        );
+        builder.terminate(mir::Terminator::Return(Some(result)));
+
+        let mut function = builder.build();
+        assert!(!devirtualize_captureless_calls(&mut function));
+        assert!(matches!(
+            &function.blocks[1].stmts[0],
+            mir::Stmt::Assign {
+                op: mir::RValue::Call {
+                    func: mir::FuncRef::Local(_),
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_devirtualize_respects_callee_reassignment() {
+        let mut builder = mir::FunctionBuilder::new("reassigned", Some(Type::int()));
+        let closure = builder.add_temp(Type::unit());
+        let captured = builder.add_temp(Type::int());
+        let result = builder.add_temp(Type::int());
+        builder.assign(
+            closure,
+            mir::RValue::Closure {
+                func: 3,
+                captures: vec![],
+            },
+        );
+        builder.assign(
+            closure,
+            mir::RValue::Closure {
+                func: 4,
+                captures: vec![captured],
+            },
+        );
+        builder.assign(
+            result,
+            mir::RValue::Call {
+                func: mir::FuncRef::Local(closure),
+                args: vec![],
+            },
+        );
+        builder.terminate(mir::Terminator::Return(Some(result)));
+
+        let mut function = builder.build();
+        assert!(!devirtualize_captureless_calls(&mut function));
+        assert!(matches!(
+            &function.blocks[0].stmts[2],
+            mir::Stmt::Assign {
+                op: mir::RValue::Call {
+                    func: mir::FuncRef::Local(_),
+                    ..
+                },
+                ..
+            }
+        ));
     }
 
     #[test]
