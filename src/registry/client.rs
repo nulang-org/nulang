@@ -11,6 +11,13 @@
 #[cfg(feature = "ureq")]
 use std::io::Read;
 
+/// An archive already authenticated against a project-pinned publisher key.
+/// Retain the detached signature for subsequent offline provenance checks.
+pub struct VerifiedRegistryArchive {
+    pub bytes: Vec<u8>,
+    pub signature: String,
+}
+
 /// Client for a package registry server.
 pub struct RegistryClient {
     registry_url: String,
@@ -92,7 +99,7 @@ impl RegistryClient {
         name: &str,
         version: &str,
         project_root: &std::path::Path,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<VerifiedRegistryArchive, String> {
         #[cfg(feature = "ureq")]
         {
             let keys = crate::registry::trust::trusted_publisher_keys(
@@ -124,7 +131,7 @@ impl RegistryClient {
                 &signature,
                 &keys,
             )?;
-            Ok(bytes)
+            Ok(VerifiedRegistryArchive { bytes, signature })
         }
         #[cfg(not(feature = "ureq"))]
         {
