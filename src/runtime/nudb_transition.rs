@@ -145,10 +145,35 @@ impl NuDbTransitionJournal {
     }
 
     fn load_tail(&self, actor_id: u64) -> io::Result<Option<TailEnvelope>> {
-        self.tablet
+        let tail: Option<TailEnvelope> = self
+            .tablet
             .read_latest(&tail_key(actor_id))
             .map(|bytes| serde_json::from_slice(bytes).map_err(invalid_data))
-            .transpose()
+            .transpose()?;
+
+        match tail.as_ref() {
+            Some(tail) => {
+                if tail.activation_epoch == 0 || tail.sequence == 0 {
+                    return Err(invalid_data("NuDB actor tail has invalid epoch or sequence"));
+                }
+                let stored = self
+                    .load_transition(actor_id, tail.sequence)?
+                    .ok_or_else(|| invalid_data("NuDB actor tail references missing transition"))?;
+                if stored.activation_epoch != tail.activation_epoch
+                    || stored.digest().map_err(invalid_data)? != tail.digest
+                {
+                    return Err(invalid_data("NuDB actor tail and transition disagree"));
+                }
+            }
+            None => {
+                // Every new actor starts at sequence 1. Never reset an actor
+                // whose first transition survived but whose tail disappeared.
+                if self.load_transition(actor_id, 1)?.is_some() {
+                    return Err(invalid_data("NuDB actor history exists without a tail"));
+                }
+            }
+        }
+        Ok(tail)
     }
 
     pub fn load_tail_position(&self, actor_id: u64) -> io::Result<Option<DurableTailPosition>> {
