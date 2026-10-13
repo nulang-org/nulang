@@ -389,11 +389,16 @@ fn may_ptr_sets(module: &CodeModule) -> Vec<RegSet> {
     let n = instrs.len();
     let mut in_sets: Vec<RegSet> = vec![[0; 4]; n];
     let mut worklist: Vec<usize> = Vec::new();
+    // An empty may-pointer set is a valid reachable state. Track whether
+    // an instruction has been visited independently of whether its set
+    // has acquired any bits, or zero-state prefixes stop forward analysis.
+    let mut reached = vec![false; n];
 
     // Entry points: module entry takes no arguments; every function-table
     // target conservatively receives unknown (pointer-suspect) arguments.
     let entry = module.entry_point.unwrap_or(0);
     if entry < n {
+        reached[entry] = true;
         worklist.push(entry);
     }
     for &off in &module.function_table {
@@ -402,6 +407,7 @@ fn may_ptr_sets(module: &CodeModule) -> Vec<RegSet> {
             for r in 0..=255u8 {
                 regset_insert(&mut in_sets[off], r);
             }
+            reached[off] = true;
             worklist.push(off);
         }
     }
@@ -470,7 +476,10 @@ fn may_ptr_sets(module: &CodeModule) -> Vec<RegSet> {
             continue; // malformed target: no propagation (sites reject anyway)
         };
         for s in succs {
-            let mut changed = false;
+            // Every reachable successor must be processed at least once,
+            // even if no pointer has yet appeared along that path.
+            let mut changed = !reached[s];
+            reached[s] = true;
             for w in 0..4 {
                 let merged = in_sets[s][w] | out[w];
                 if merged != in_sets[s][w] {
