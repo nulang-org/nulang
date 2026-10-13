@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Activation-local composite allocation — 2026-09-27
+- **Proven activation-local arrays, records, and tuples can now use the actor iso arena instead of the ORCA heap.** The VM reuses the existing conservative escape analysis at bytecode allocation sites, keeps escaping values heap-backed, and falls back to the normal heap when an embedder has no arena allocator.
+- **Arena lifetime follows behavior activation lifetime.** Normal completion resets the bump arena in O(1), while suspension and JIT yield preserve arena contents until the activation actually completes.
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
