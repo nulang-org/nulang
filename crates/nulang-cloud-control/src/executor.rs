@@ -1,5 +1,5 @@
 use crate::store::{AllocationCommand, AllocationCommandKind, ControlStore, StoreError};
-use std::collections::BTreeSet;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandApplyError {
@@ -60,161 +60,146 @@ pub struct DispatchReport {
     pub records: Vec<DispatchRecord>,
 }
 
-/// Drain the current durable outbox snapshot safely.
+/// Drain the durable outbox with generation-fenced command leases.
 ///
-/// Stops are attempted before Starts. A stale pending Start is treated as
-/// ambiguous: it may have executed before a controller crash, so the dispatcher
-/// sends an idempotent compensating Stop before acknowledging it. A Start that
-/// becomes stale between its pre-check and post-apply check is handled the same
-/// way.
-///
-/// This function is safe to retry after crashes when the sink obeys the
-/// idempotency contract. Until durable command claiming is added, deployments
-/// should run one logical dispatcher per control-store scope; multiple
-/// concurrent dispatchers remain functionally idempotent but do not provide a
-/// global Stop-before-Start ordering guarantee.
+/// Each command is claimed atomically before delivery. A claim carries a
+/// durable generation; if its lease expires and another dispatcher reclaims
+/// the command, the stale dispatcher can no longer acknowledge or release the
+/// newer claim. Pending Stops block Starts for the same logical replica at the
+/// claim boundary, so active-active dispatchers preserve Stop-before-Start
+/// without relying on process-local ordering.
 pub fn dispatch_pending(
     store: &dyn ControlStore,
     sink: &dyn AllocationCommandSink,
 ) -> Result<DispatchReport, StoreError> {
-    let mut commands = store.pending_commands()?;
-    commands.sort_by(|left, right| {
-        command_priority(left.kind)
-            .cmp(&command_priority(right.kind))
-            .then_with(|| left.deployment_id.cmp(&right.deployment_id))
-            .then_with(|| left.replica.cmp(&right.replica))
-            .then_with(|| left.epoch.cmp(&right.epoch))
-            .then_with(|| left.command_id.cmp(&right.command_id))
-    });
+    let dispatcher_id = format!("controller-{}", std::process::id());
+    dispatch_pending_as(store, sink, &dispatcher_id, 30_000)
+}
 
+/// Dispatch using an explicit owner id and lease duration.
+///
+/// This is useful for long-running controller processes that already have a
+/// stable instance identity. The clock is sampled before each claim so a batch
+/// does not progressively shorten later command leases.
+pub fn dispatch_pending_as(
+    store: &dyn ControlStore,
+    sink: &dyn AllocationCommandSink,
+    dispatcher_id: &str,
+    lease_ms: u64,
+) -> Result<DispatchReport, StoreError> {
     let mut report = DispatchReport::default();
-    let mut failed_stops = BTreeSet::new();
-    let mut confirmed_stops = BTreeSet::new();
 
-    for command in commands {
-        let replica_key = (command.deployment_id.clone(), command.replica);
-        let allocation_key = (
-            command.deployment_id.clone(),
-            command.revision,
-            command.replica,
-            command.node_id,
-            command.epoch,
-        );
+    loop {
+        let now_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| {
+                StoreError::Backend(format!("system clock before UNIX epoch: {error}"))
+            })?
+            .as_millis()
+            .try_into()
+            .map_err(|_| StoreError::Backend("system clock millisecond value overflow".into()))?;
+
+        let Some(claim) = store.claim_next_command(dispatcher_id, now_unix_ms, lease_ms)? else {
+            break;
+        };
+        let command = &claim.command;
 
         match command.kind {
-            AllocationCommandKind::Stop => match sink.apply(&command) {
+            AllocationCommandKind::Stop => match sink.apply(command) {
                 Ok(()) => {
-                    store.acknowledge_command(&command.command_id)?;
-                    confirmed_stops.insert(allocation_key);
+                    store.acknowledge_claimed_command(&claim)?;
                     report.records.push(DispatchRecord {
-                        command_id: command.command_id,
+                        command_id: command.command_id.clone(),
                         outcome: DispatchOutcome::Applied,
                     });
                 }
                 Err(error) => {
-                    failed_stops.insert(replica_key);
+                    store.release_command_claim(&claim)?;
                     report.records.push(DispatchRecord {
-                        command_id: command.command_id,
+                        command_id: command.command_id.clone(),
                         outcome: DispatchOutcome::Failed {
                             message: error.message,
                             retryable: error.retryable,
                         },
                     });
+                    break;
                 }
             },
             AllocationCommandKind::Start => {
-                if failed_stops.contains(&replica_key) {
-                    report.records.push(DispatchRecord {
-                        command_id: command.command_id,
-                        outcome: DispatchOutcome::BlockedByStopFailure,
-                    });
-                    continue;
-                }
-
-                if !store.start_command_is_authoritative(&command)? {
-                    if confirmed_stops.contains(&allocation_key) {
-                        store.acknowledge_command(&command.command_id)?;
-                        report.records.push(DispatchRecord {
-                            command_id: command.command_id,
-                            outcome: DispatchOutcome::StaleStartFenced,
-                        });
-                        continue;
-                    }
-
-                    let fence = compensating_stop(&command);
+                if !store.start_command_is_authoritative(command)? {
+                    let fence = compensating_stop(command);
                     match sink.apply(&fence) {
                         Ok(()) => {
-                            store.acknowledge_command(&command.command_id)?;
-                            confirmed_stops.insert(allocation_key);
+                            store.acknowledge_claimed_command(&claim)?;
                             report.records.push(DispatchRecord {
-                                command_id: command.command_id,
+                                command_id: command.command_id.clone(),
                                 outcome: DispatchOutcome::StaleStartFenced,
                             });
                         }
                         Err(error) => {
+                            store.release_command_claim(&claim)?;
                             report.records.push(DispatchRecord {
-                                command_id: command.command_id,
+                                command_id: command.command_id.clone(),
                                 outcome: DispatchOutcome::Failed {
                                     message: error.message,
                                     retryable: error.retryable,
                                 },
                             });
+                            break;
                         }
                     }
                     continue;
                 }
 
-                match sink.apply(&command) {
+                match sink.apply(command) {
                     Ok(()) => {
-                        if store.start_command_is_authoritative(&command)? {
-                            store.acknowledge_command(&command.command_id)?;
+                        if store.start_command_is_authoritative(command)? {
+                            store.acknowledge_claimed_command(&claim)?;
                             report.records.push(DispatchRecord {
-                                command_id: command.command_id,
+                                command_id: command.command_id.clone(),
                                 outcome: DispatchOutcome::Applied,
                             });
                         } else {
-                            let fence = compensating_stop(&command);
+                            let fence = compensating_stop(command);
                             match sink.apply(&fence) {
                                 Ok(()) => {
-                                    store.acknowledge_command(&command.command_id)?;
-                                    confirmed_stops.insert(allocation_key);
+                                    store.acknowledge_claimed_command(&claim)?;
                                     report.records.push(DispatchRecord {
-                                        command_id: command.command_id,
+                                        command_id: command.command_id.clone(),
                                         outcome: DispatchOutcome::StaleStartFenced,
                                     });
                                 }
                                 Err(error) => {
+                                    store.release_command_claim(&claim)?;
                                     report.records.push(DispatchRecord {
-                                        command_id: command.command_id,
+                                        command_id: command.command_id.clone(),
                                         outcome: DispatchOutcome::Failed {
                                             message: error.message,
                                             retryable: error.retryable,
                                         },
                                     });
+                                    break;
                                 }
                             }
                         }
                     }
-                    Err(error) => report.records.push(DispatchRecord {
-                        command_id: command.command_id,
-                        outcome: DispatchOutcome::Failed {
-                            message: error.message,
-                            retryable: error.retryable,
-                        },
-                    }),
+                    Err(error) => {
+                        store.release_command_claim(&claim)?;
+                        report.records.push(DispatchRecord {
+                            command_id: command.command_id.clone(),
+                            outcome: DispatchOutcome::Failed {
+                                message: error.message,
+                                retryable: error.retryable,
+                            },
+                        });
+                        break;
+                    }
                 }
             }
         }
     }
 
     Ok(report)
-}
-
-fn command_priority(kind: AllocationCommandKind) -> u8 {
-    match kind {
-        AllocationCommandKind::Stop => 0,
-        AllocationCommandKind::Start => 1,
-    }
 }
 
 fn compensating_stop(start: &AllocationCommand) -> AllocationCommand {
@@ -359,10 +344,7 @@ mod tests {
                 }
             )
         }));
-        assert!(report
-            .records
-            .iter()
-            .any(|record| { record.outcome == DispatchOutcome::BlockedByStopFailure }));
+        assert_eq!(report.records.len(), 1);
         assert!(sink.applied.lock().unwrap().is_empty());
         assert!(!store.pending_commands().unwrap().is_empty());
     }
