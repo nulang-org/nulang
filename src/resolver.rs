@@ -563,6 +563,30 @@ mod tests {
     }
 
     #[test]
+    fn token_cache_retains_only_bounded_small_sources() {
+        TOKEN_CACHE.with(|cache| cache.borrow_mut().clear());
+        let source = "fn item() -> Int { 1 }";
+        for i in 0..(MAX_TOKEN_CACHE_FILES + 10) {
+            let path = PathBuf::from(format!("bounded-import-{i}.nula"));
+            lex_import_tokens(&path, source).expect("lex fixture");
+        }
+        TOKEN_CACHE.with(|cache| {
+            let cache = cache.borrow();
+            assert!(cache.len() <= MAX_TOKEN_CACHE_FILES);
+            assert!(cache
+                .values()
+                .all(|entry| entry.tokens.len() <= MAX_TOKEN_CACHE_TOKENS));
+        });
+
+        let large_source = " ".repeat(MAX_TOKEN_CACHE_SOURCE_BYTES + 1);
+        let large_path = PathBuf::from("oversize-import.nula");
+        lex_import_tokens(&large_path, &large_source).expect("lex large fixture");
+        TOKEN_CACHE.with(|cache| {
+            assert!(!cache.borrow().contains_key(&large_path));
+        });
+    }
+
+    #[test]
     fn imported_transitive_edit_is_visible_with_parent_tokens_cached() {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
