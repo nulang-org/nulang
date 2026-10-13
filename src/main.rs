@@ -274,6 +274,17 @@ fn main() {
                 | "list" | "clean" | "watch" | "dev" | "doc" | "publish" | "deploy"
         )
     {
+        // Do not silently ignore a filename passed to the package runner.
+        // Standalone files already run directly as `nulang file.nula`.
+        if args[1] == "run"
+            && (args.len() > 3 || (args.len() == 3 && args[2] != "--watch"))
+        {
+            eprintln!(
+                "Error: `nulang run` runs the current package; for a standalone file use `nulang {}`",
+                args[2]
+            );
+            std::process::exit(1);
+        }
         let package_args = if args[1] == "nula" {
             &args[2..]
         } else {
