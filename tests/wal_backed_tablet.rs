@@ -200,7 +200,11 @@ fn writer_ownership_survives_wal_reclamation_and_relative_path_aliases() {
     writer.checkpoint().unwrap();
 
     // Two lexical paths to the same physical WAL must share one writer lock.
-    let alias = path.parent().unwrap().join(".").join(path.file_name().unwrap());
+    let alias = path
+        .parent()
+        .unwrap()
+        .join(".")
+        .join(path.file_name().unwrap());
     assert!(
         WalBackedTablet::open(descriptor(), &alias).is_err(),
         "checkpoint rename and parent aliases must not bypass the writer lock"
