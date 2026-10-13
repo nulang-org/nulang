@@ -457,6 +457,82 @@ mod tests {
     }
 
     #[test]
+    fn import_lexer_cache_hits_unchanged_sources_and_invalidates_edits() {
+        let path = PathBuf::from("lex-cache-regression.nula");
+        TOKEN_CACHE.with(|cache| cache.borrow_mut().clear());
+        TOKEN_CACHE_HITS.with(|hits| hits.set(0));
+
+        let first = lex_import_tokens(&path, "fn alpha() -> Int { 1 }")
+            .expect("lex first version");
+        let again = lex_import_tokens(&path, "fn alpha() -> Int { 1 }")
+            .expect("lex unchanged version");
+        assert_eq!(first, again, "cache must return exactly the original token stream");
+        TOKEN_CACHE_HITS.with(|hits| assert_eq!(hits.get(), 1));
+
+        let changed = lex_import_tokens(&path, "fn beta() -> Int { 2 }")
+            .expect("lex edited version");
+        assert_ne!(first, changed, "edited source must not use stale tokens");
+        TOKEN_CACHE_HITS.with(|hits| assert_eq!(hits.get(), 1));
+
+        let cached_changed = lex_import_tokens(&path, "fn beta() -> Int { 2 }")
+            .expect("lex unchanged edited source");
+        assert_eq!(changed, cached_changed);
+        TOKEN_CACHE_HITS.with(|hits| assert_eq!(hits.get(), 2));
+        assert_eq!(
+            crate::types::current_source_text().as_deref(),
+            Some("fn beta() -> Int { 2 }"),
+            "a cache hit must update the diagnostic source map just like Lexer::new"
+        );
+    }
+
+    #[test]
+    fn imported_transitive_edit_is_visible_with_parent_tokens_cached() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time is after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "nulang-lex-transitive-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).expect("create fixture directory");
+        std::fs::write(dir.join("parent.nula"), "import dep\nfn parent() -> Int { 1 }\n")
+            .expect("write unchanged parent");
+        let dep = dir.join("dep.nula");
+        let compile = || {
+            let mut module = AstModule {
+                name: "transitive".into(),
+                decls: vec![Decl::Import {
+                    path: "parent".into(),
+                    items: vec![],
+                    span: sp(),
+                }],
+            };
+            resolve_imports(&mut module, &dir.join("main.nula"), &mut HashSet::new())
+                .expect("resolve parent and transitive import");
+            module
+                .decls
+                .iter()
+                .filter_map(decl_name)
+                .map(str::to_string)
+                .collect::<HashSet<_>>()
+        };
+        TOKEN_CACHE_HITS.with(|hits| hits.set(0));
+        std::fs::write(&dep, "fn first() -> Int { 1 }\n").expect("write first dependency");
+        let first = compile();
+        std::fs::write(&dep, "fn second() -> Int { 2 }\n").expect("edit dependency");
+        let second = compile();
+        std::fs::remove_dir_all(&dir).expect("remove fixture directory");
+        assert!(first.contains("first"));
+        assert!(!first.contains("second"));
+        assert!(second.contains("second"));
+        assert!(!second.contains("first"));
+        TOKEN_CACHE_HITS.with(|hits| {
+            assert!(hits.get() >= 1, "unchanged parent should reuse lexed tokens")
+        });
+    }
+
+    #[test]
     fn test_resolve_module_path() {
         std::env::set_var("NULANG_MODULE_PATH", "@nulang/auth=/tmp/nulang_auth_mod");
         let base = std::path::Path::new(".");
