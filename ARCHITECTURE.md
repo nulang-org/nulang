@@ -177,7 +177,7 @@ Core surface forms (`src/ast.rs`, `src/parser.rs`):
 
 There is no `switch` and no `case` keyword — `match` arms are introduced by
 `|`. Pattern matching is typed. The compiler performs conservative finite-domain
-coverage analysis for top-level declared variants and `Bool`, emitting `W0201`
+coverage analysis for top-level declared variants, `Bool`, `Nil`, and `Unit`, emitting `W0201`
 for provably missing cases and `W0202` for provably redundant arms. These are
 warnings by default; matches outside that proof domain, and warnings not promoted
 with `--deny-warnings`, retain the runtime non-exhaustive-match fallback.
