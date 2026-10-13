@@ -3044,6 +3044,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn checked_async_sql_lowers_to_perform_async_with_explicit_parameter_count() {
+        let module = lower_source(r#"perform DB.query_checked_async("SELECT $1", 42)"#)
+            .expect("DB.query_checked_async should be lowerable");
+        let main = find_fn(&module, "__main");
+        let mut site = None;
+        for block in &main.blocks {
+            for stmt in &block.stmts {
+                if let mir::Stmt::Assign {
+                    op: mir::RValue::PerformAsync { effect_op, args, .. },
+                    ..
+                } = stmt
+                {
+                    if effect_op == "DB.query_checked_async" {
+                        site = Some(args.clone());
+                    }
+                }
+            }
+        }
+        let args = site.expect("async SQL must use PerformAsync");
+        assert_eq!(args.len(), 3, "SQL + compiler-owned arity + one parameter");
+        let arity_is_one = main.blocks.iter().flat_map(|b| &b.stmts).any(|stmt| {
+            matches!(
+                stmt,
+                mir::Stmt::Assign {
+                    dst,
+                    op: mir::RValue::Const(Constant::Int(1)),
+                } if *dst == args[1]
+            )
+        });
+        assert!(arity_is_one, "the second staged operand must carry exact parameter arity");
+    }
+
+    #[test]
     fn test_lower_empty_module() {
         let hir_module = hir::Module::new("test");
         let mir_module = lower_module(&hir_module).unwrap();
