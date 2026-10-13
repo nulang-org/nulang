@@ -5,7 +5,8 @@ use crate::{ToolHandler, ToolRegistry, ToolSpec};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::time::Duration;
+use tokio::process::Command;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -14,11 +15,21 @@ pub struct LocalToolConfig {
     pub workspace: PathBuf,
     /// Host-selected compiler executable. Never accept this in tool arguments.
     pub compiler: PathBuf,
+    pub timeout: Duration,
 }
 
 impl LocalToolConfig {
     pub fn new(workspace: PathBuf, compiler: PathBuf) -> Self {
-        Self { workspace, compiler }
+        Self {
+            workspace,
+            compiler,
+            timeout: Duration::from_secs(30),
+        }
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 }
 
@@ -36,12 +47,16 @@ impl ToolHandler for CheckTool {
         let source = resolve_source(&self.config.workspace, path)?;
         // --check performs static validation, not VM execution. Arguments and
         // current directory are fixed by the trusted server, not the model.
-        let output = Command::new(&self.config.compiler)
+        let mut command = Command::new(&self.config.compiler);
+        command
             .current_dir(&self.config.workspace)
             .arg("--json")
             .arg("--check")
             .arg(&source)
-            .output()
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(self.config.timeout, command.output())
+            .await
+            .map_err(|_| "Nulang compiler timed out".to_string())?
             .map_err(|err| format!("Unable to invoke Nulang compiler: {err}"))?;
         if output.stdout.len() > 4 * 1024 * 1024 {
             return Err("Compiler diagnostics exceeded 4 MiB output limit".into());
