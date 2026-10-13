@@ -3699,6 +3699,32 @@ mod tests {
     }
 
     #[test]
+    fn test_send_failure_on_composite_value_does_not_invent_binding_provenance() {
+        let ctx = CapContext::new()
+            .with_binding("target", Capability::Val)
+            .with_binding("payload", Capability::Ref);
+        let send = Expr::Send {
+            actor: Box::new(Expr::Var("target".to_string(), s())),
+            behavior: "push".to_string(),
+            args: vec![Expr::Tuple(
+                vec![Expr::Var("payload".to_string(), s())],
+                s(),
+            )],
+            remote: false,
+            span: s(),
+        };
+        let err = CapabilityAnalyzer::new().infer_cap(&ctx, &send).unwrap_err();
+        match err {
+            NuError::CapError { msg, .. } => {
+                assert!(msg.contains("source: this expression evaluates to inferred capability `box`"), "{msg}");
+                assert!(msg.contains("no single binding origin is available"), "{msg}");
+                assert!(!msg.contains("nearest lexical binding"), "{msg}");
+            }
+            other => panic!("expected composite capability rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_cap_remote_send_rejects_iso() {
         let mut analyzer = CapabilityAnalyzer::new();
         let ctx = CapContext::new()
