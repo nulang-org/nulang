@@ -1,4 +1,8 @@
 # Nulang Changelog
+
+### list.find conformance Option contract — 2026-10-13
+- **The list.find behavior fixture now matches its Option[T] API.** Both the matched `Some(2)` payload and unmatched `None` variant are pattern-matched before rendering. Previously it passed the tagged Option directly to `Int.to_string` and expected a legacy `-1` miss sentinel. The underlying `stdlib::list.find` implementation is unchanged; the exact-head Nulang conformance run remains required.
+
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
