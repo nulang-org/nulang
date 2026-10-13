@@ -265,12 +265,12 @@ mod tests {
         while calls.lock().unwrap().is_empty() && Instant::now() < started {
             std::thread::yield_now();
         }
-        executor.try_submit(OwnedDbQuery::new("second", vec![])).unwrap();
-        assert_eq!(
-            executor.try_submit(OwnedDbQuery::new("third", vec![])),
-            Err(BlockingSubmitError::QueueFull)
-        );
+        let second = executor.try_submit(OwnedDbQuery::new("second", vec![]));
+        let third = executor.try_submit(OwnedDbQuery::new("third", vec![]));
+        // Always release the worker before asserting, even on regression.
         gate.wait();
+        assert!(second.is_ok(), "second job must fit in the bounded queue");
+        assert_eq!(third, Err(BlockingSubmitError::QueueFull));
         executor.close();
     }
 
@@ -308,6 +308,29 @@ mod tests {
         let checked = super::super::DbQueryOutcome::from_legacy_rows(result).to_json();
         assert!(checked.contains(r#""code":"unsupported""#));
         assert!(!checked.contains("private details"));
+    }
+
+    #[test]
+    fn worker_panic_is_reported_and_does_not_drop_completion_identity() {
+        struct PanicClient;
+        impl OwnedDbQueryClient for PanicClient {
+            fn execute(&mut self, _: &OwnedDbQuery) -> io::Result<Vec<String>> {
+                panic!("simulated driver panic");
+            }
+        }
+        let mut executor = BoundedDbQueryExecutor::new(vec![Box::new(PanicClient)], 2).unwrap();
+        let ticket = executor.try_submit(OwnedDbQuery::new("first", vec![])).unwrap();
+        let completion = receive(&executor, Instant::now() + Duration::from_secs(2));
+        assert_eq!(completion.ticket(), ticket);
+        let (_, result) = completion.into_result();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Other);
+
+        // The connection mutex is poisoned after the panic: fail explicitly,
+        // do not block the next query or silently resurrect the connection.
+        let next = executor.try_submit(OwnedDbQuery::new("second", vec![])).unwrap();
+        let completion = receive(&executor, Instant::now() + Duration::from_secs(2));
+        assert_eq!(completion.ticket(), next);
+        assert!(completion.into_result().1.is_err());
     }
 
     #[test]
