@@ -246,6 +246,27 @@ jobs:
           echo "$output" | grep -F '"benchmark":"ping_pong"'
 
   # -----------------------------------------------------------------------
+  # Lean, self-hosted server profile: no Python, JIT, LSP or AI provider runtime
+  # -----------------------------------------------------------------------
+  server-profile:
+    name: Lean server & SQLite recovery
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check server build, dependency graph and SQLite recovery
+        run: bash scripts/check_server_profile.sh
+
+  # -----------------------------------------------------------------------
   # WASM backend
   # -----------------------------------------------------------------------
   wasm-backend:
