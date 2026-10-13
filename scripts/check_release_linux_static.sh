@@ -17,11 +17,19 @@ if ! readelf -h "$binary" >/dev/null 2>&1; then
   echo "not an ELF executable: $binary" >&2
   exit 1
 fi
-if readelf -lW "$binary" | grep -Eq '^[[:space:]]*INTERP[[:space:]]'; then
+if ! program_headers="$(readelf -lW "$binary")"; then
+  echo "unable to inspect ELF program headers: $binary" >&2
+  exit 1
+fi
+if grep -Eq '^[[:space:]]*INTERP[[:space:]]' <<<"$program_headers"; then
   echo "binary requires an ELF interpreter (dynamic loader): $binary" >&2
   exit 1
 fi
-if readelf -dW "$binary" | grep -Eq '\((NEEDED|RPATH|RUNPATH)\)'; then
+if ! dynamic_headers="$(readelf -dW "$binary")"; then
+  echo "unable to inspect ELF dynamic section: $binary" >&2
+  exit 1
+fi
+if grep -Eq '\((NEEDED|RPATH|RUNPATH)\)' <<<"$dynamic_headers"; then
   echo "binary declares shared-library or search-path dependencies: $binary" >&2
   exit 1
 fi

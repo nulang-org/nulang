@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import pathlib
 import shutil
 import subprocess
@@ -56,6 +57,31 @@ class MuslReleaseTests(unittest.TestCase):
                 result = subprocess.run(['bash', str(checker), str(candidate)], capture_output=True, text=True)
                 self.assertEqual(result.returncode, expected, (candidate.name, result.stderr))
 
+
+    @unittest.skipUnless(
+        sys.platform.startswith('linux') and shutil.which('gcc') and shutil.which('readelf'),
+        'requires Linux, gcc, and binutils',
+    )
+    def test_checker_fails_closed_when_readelf_inspection_fails(self):
+        """An unreadable program/dynamic header must not count as static."""
+        checker = ROOT / 'scripts/check_release_linux_static.sh'
+        with tempfile.TemporaryDirectory() as d:
+            tmp = pathlib.Path(d)
+            src = tmp / 'hello.c'
+            src.write_text('int main(void) { return 0; }\n')
+            binary = tmp / 'binary'
+            subprocess.run(['gcc', str(src), '-o', str(binary)], check=True)
+            readelf = tmp / 'readelf'
+            real_readelf = shutil.which('readelf')
+            readelf.write_text(
+                '#!/bin/sh\n'
+                'if [ "$1" = "-h" ]; then exec "' + real_readelf + '" "$@"; fi\n'
+                'exit 19\n'
+            )
+            readelf.chmod(0o755)
+            env = {**os.environ, 'PATH': str(tmp) + os.pathsep + os.environ['PATH']}
+            result = subprocess.run(['bash', str(checker), str(binary)], env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
 
 if __name__ == '__main__':
     unittest.main()
