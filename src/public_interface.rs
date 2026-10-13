@@ -316,6 +316,231 @@ pub fn interface_for_hir(module: &hir::Module) -> Result<PublicModuleInterface, 
     })
 }
 
+/// The conservative, inference-aware entry point for real source modules.
+///
+/// The legacy `interface_for_hir` view is suitable for describing an
+/// explicitly constructed HIR model but HIR lowering currently replaces
+/// unspecified parameter/return types with `Unit` and unspecified effect
+/// rows with an empty row. Such values cannot certify a source API.
+///
+/// This API requires an *unflattened defining-module AST*, the corresponding
+/// `TypeChecker::inferred_decl_types` captured after successful typechecking,
+/// and explicit effect annotations for exported functions. Inferred effects
+/// are not yet recorded by that typechecker, so an absent annotation must
+/// fail closed rather than masquerade as a pure function.
+///
+/// It is an experimental source-API description only. The manifest does not
+/// yet cover default-argument bodies, typeclass dictionaries, contextual
+/// using-parameters, or versioned dependency invalidation.
+pub fn interface_for_checked_ast(
+    source: &crate::ast::AstModule,
+    inferred: &rustc_hash::FxHashMap<String, Type>,
+) -> Result<PublicModuleInterface, String> {
+    let mut observed_functions = std::collections::BTreeSet::new();
+    let decls = checked_decls(
+        &source.decls,
+        inferred,
+        None,
+        &mut observed_functions,
+    )?;
+    interface_for_hir(&hir::Module {
+        name: source.name.clone(),
+        decls,
+    })
+}
+
+fn checked_decls(
+    decls: &[crate::ast::Decl],
+    inferred: &rustc_hash::FxHashMap<String, Type>,
+    selected: Option<&[String]>,
+    observed_functions: &mut std::collections::BTreeSet<String>,
+) -> Result<Vec<Decl>, String> {
+    use crate::ast::Decl as AstDecl;
+    let mut result = Vec::new();
+    for decl in decls {
+        match decl {
+            AstDecl::Function {
+                name,
+                type_params,
+                type_param_constraints,
+                params,
+                default_values,
+                using_params,
+                effect,
+                cap,
+                public,
+                span,
+                ..
+            } if allowed(name, *public, selected) => {
+                if effect.is_none() {
+                    return Err(format!(
+                        "public interface: '{}' has no explicit effect row; inferred effect \
+                         information is not yet authoritative",
+                        name
+                    ));
+                }
+                if !type_param_constraints.is_empty()
+                    || !using_params.is_empty()
+                    || default_values.iter().any(Option::is_some)
+                {
+                    return Err(format!(
+                        "public interface: '{}' uses unsupported generic constraints, \
+                         contextual parameters, or default values",
+                        name
+                    ));
+                }
+                if !observed_functions.insert(name.clone()) {
+                    return Err(format!(
+                        "public interface: ambiguous inferred function name '{}'",
+                        name
+                    ));
+                }
+                let inferred_type = inferred.get(name).ok_or_else(|| {
+                    format!("public interface: missing inferred signature for '{}'", name)
+                })?;
+                let Type::Function {
+                    param,
+                    ret,
+                    effect: checked_effect,
+                    cap: checked_cap,
+                } = inferred_type
+                else {
+                    return Err(format!(
+                        "public interface: inferred signature for '{}' is not a function",
+                        name
+                    ));
+                };
+                if effect.as_ref() != Some(checked_effect)
+                    || cap.is_some_and(|declared| declared != *checked_cap)
+                {
+                    return Err(format!(
+                        "public interface: '{}' has inconsistent declared/inferred authority",
+                        name
+                    ));
+                }
+                let parameter_types = match (params.len(), param.as_ref()) {
+                    (0, Type::Tuple(items)) if items.is_empty() => Vec::new(),
+                    (1, ty) => vec![ty.clone()],
+                    (n, Type::Tuple(items)) if n == items.len() => items.clone(),
+                    _ => {
+                        return Err(format!(
+                            "public interface: '{}' inferred parameter shape mismatch",
+                            name
+                        ));
+                    }
+                };
+                let params = params
+                    .iter()
+                    .zip(parameter_types)
+                    .map(|(param, ty)| (param.name.clone(), ty))
+                    .collect();
+                result.push(Decl::Function(hir::FunctionDef {
+                    name: name.clone(),
+                    type_params: type_params.clone(),
+                    params,
+                    dict_params: Vec::new(),
+                    ret: ret.as_ref().clone(),
+                    effect: checked_effect.clone(),
+                    cap: *checked_cap,
+                    body: hir::Body::default(),
+                    public: true,
+                    placement: None,
+                    span: *span,
+                }));
+            }
+            AstDecl::TypeAlias {
+                name, type_params, body, opaque, public, span,
+            } if allowed(name, *public, selected) => {
+                result.push(Decl::TypeAlias {
+                    name: name.clone(),
+                    type_params: type_params.clone(),
+                    body: body.clone(),
+                    opaque: *opaque,
+                    public: true,
+                    span: *span,
+                });
+            }
+            AstDecl::RecordType {
+                name, type_params, fields, public, span, ..
+            } if allowed(name, *public, selected) => {
+                result.push(Decl::RecordType {
+                    name: name.clone(),
+                    type_params: type_params.clone(),
+                    fields: fields.clone(),
+                    public: true,
+                    span: *span,
+                });
+            }
+            AstDecl::VariantType {
+                name, type_params, variants, public, span, ..
+            } if allowed(name, *public, selected) => {
+                result.push(Decl::VariantType {
+                    name: name.clone(),
+                    type_params: type_params.clone(),
+                    variants: variants.clone(),
+                    public: true,
+                    span: *span,
+                });
+            }
+            AstDecl::Module { name, exports, decls, span }
+                if selected.is_none() || allowed(name, false, selected) =>
+            {
+                let children = checked_decls(
+                    decls,
+                    inferred,
+                    Some(exports),
+                    observed_functions,
+                )?;
+                result.push(Decl::Module {
+                    name: name.clone(),
+                    exports: exports.clone(),
+                    decls: children,
+                    span: *span,
+                });
+            }
+            other if selected.is_some_and(|names| {
+                names.iter().any(|name| ast_decl_name(other) == Some(name.as_str()))
+            }) => {
+                return Err(format!(
+                    "public interface: unsupported explicitly exported declaration '{}'",
+                    ast_decl_name(other).unwrap_or("<unnamed>")
+                ));
+            }
+            _ => {}
+        }
+    }
+    if let Some(names) = selected {
+        for name in names {
+            if !result.iter().any(|decl| matches_name(decl, name)) {
+                return Err(format!(
+                    "public interface: explicitly exported declaration '{}' has no verified signature",
+                    name
+                ));
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn ast_decl_name(decl: &crate::ast::Decl) -> Option<&str> {
+    use crate::ast::Decl;
+    match decl {
+        Decl::Function { name, .. }
+        | Decl::Actor { name, .. }
+        | Decl::StateMachine { name, .. }
+        | Decl::TypeAlias { name, .. }
+        | Decl::RecordType { name, .. }
+        | Decl::VariantType { name, .. }
+        | Decl::EffectDecl { name, .. }
+        | Decl::Module { name, .. }
+        | Decl::Agent { name, .. }
+        | Decl::Database { name, .. }
+        | Decl::NamedHandler { name, .. }
+        | Decl::CrdtDecl { name, .. } => Some(name.as_str()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
