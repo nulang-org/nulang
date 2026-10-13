@@ -1,5 +1,12 @@
 # Nulang Changelog
 
+### Workflow JIT safepoint suspension and checked success — 2026-10-13
+- Treat native JIT safepoint yields as cooperative suspensions, not completed workflow steps; preserve behavior/activation identity, and requeue JIT continuations independently of mailbox traffic.
+- On successful JIT continuation, commit the legacy `StepCompleted` event and fallible checkpoint before deferred receive-wake dispatch, without double-advancing ordinary compiled workflow steps. A rejected terminal append/checkpoint quarantines the speculative actor.
+- On JIT-resumed workflow VM errors, commit `StepFailed` against the previous safe snapshot via parent #1542's helper. Quarantine on speculative mutation or rejected writes; run compensation only after a proven safe failure receipt. The legacy success path is still two writes, **not** RFC 0022 atomic replay or exactly-once external effects.
+- Native-codegen regression candidates cover real JIT preemption, single terminal receipt/progress, and terminal-event rejection; executable exact-head verification remains mandatory.
+
+
 ### Fail-closed resumed workflow failures — 2026-10-11
 - Signal, timer-sleep, timed-receive, and LLM continuations now persist `StepFailed` with a fallible checkpoint before actor requeue or saga compensation when a resumed compiled workflow throws.
 - Rejecting the terminal event or checkpoint quarantines the speculative actor; regression tests cover each resume adapter and the shared failure helper, including orphan `StepFailed` recovery.

@@ -1761,6 +1761,8 @@ pub enum VmSuspension {
     ReceiveWait,
     /// `perform <Effect>.<op>(...)` — awaiting an async effect completion.
     PerformAsync,
+    /// Cooperative preemption of a running JIT region; continuation is ready.
+    JitSafepoint,
 }
 
 impl std::fmt::Display for VmSuspension {
@@ -1769,6 +1771,7 @@ impl std::fmt::Display for VmSuspension {
             VmSuspension::SignalWait => write!(f, "SignalWait"),
             VmSuspension::ReceiveWait => write!(f, "ReceiveWait"),
             VmSuspension::PerformAsync => write!(f, "PerformAsync"),
+            VmSuspension::JitSafepoint => write!(f, "JitSafepoint"),
         }
     }
 }
