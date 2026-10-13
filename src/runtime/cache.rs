@@ -15,8 +15,8 @@
 //!   recycled slot;
 //! - Redis Cluster compatible 16,384-slot hashing and hash tags.
 
-use rustc_hash::FxHasher;
-use std::hash::Hasher;
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
 
 pub const REDIS_CLUSTER_SLOTS: u16 = 16_384;
 const INLINE_BYTES: usize = 22;
@@ -28,6 +28,10 @@ const FREE_LIST_COUNT: usize = MAX_ARENA_EXP - MIN_ARENA_EXP + 1;
 const DEFAULT_INDEX_CAPACITY: usize = 64;
 const DEFAULT_WHEEL_BUCKETS: usize = 4_096;
 const DEFAULT_WHEEL_TICK_MS: u64 = 10;
+const DEFAULT_MAX_KEY_BYTES: usize = 64 * 1024;
+const DEFAULT_MAX_VALUE_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_MAX_ENTRIES: usize = 1_000_000;
+const DEFAULT_MAX_ARENA_BYTES: usize = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ArenaSlice {
@@ -95,6 +99,24 @@ impl ByteArena {
     fn reserved_bytes(&self) -> usize {
         self.bytes.len()
     }
+
+    fn additional_reserved_for(&self, lengths: &[usize]) -> usize {
+        let mut claimed_free = [0usize; FREE_LIST_COUNT];
+        let mut growth = 0usize;
+
+        for &len in lengths {
+            if len <= INLINE_BYTES {
+                continue;
+            }
+            let (class, capacity) = Self::class_for(len);
+            if claimed_free[class] < self.free[class].len() {
+                claimed_free[class] += 1;
+            } else {
+                growth = growth.saturating_add(capacity);
+            }
+        }
+        growth
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,9 +167,37 @@ pub enum CacheTtl {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheWriteError {
+    KeyTooLarge,
+    ValueTooLarge,
+    EntryLimitReached,
+    ArenaLimitReached,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheIncrementError {
     NotInteger,
     Overflow,
+    WriteRejected(CacheWriteError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheConfig {
+    pub max_key_bytes: usize,
+    pub max_value_bytes: usize,
+    pub max_entries: usize,
+    pub max_arena_bytes: usize,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            max_key_bytes: DEFAULT_MAX_KEY_BYTES,
+            max_value_bytes: DEFAULT_MAX_VALUE_BYTES,
+            max_entries: DEFAULT_MAX_ENTRIES,
+            max_arena_bytes: DEFAULT_MAX_ARENA_BYTES,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -286,6 +336,8 @@ pub struct CacheMemoryStats {
 /// internally.
 #[derive(Debug)]
 pub struct CacheStore {
+    config: CacheConfig,
+    hash_builder: RandomState,
     arena: ByteArena,
     slots: Vec<EntrySlot>,
     free_slots: Vec<u32>,
@@ -305,7 +357,26 @@ impl Default for CacheStore {
 
 impl CacheStore {
     pub fn new() -> Self {
+        Self::with_config(CacheConfig::default())
+    }
+
+    pub fn with_config(config: CacheConfig) -> Self {
+        assert!(
+            config.max_key_bytes > 0,
+            "cache max_key_bytes must be non-zero"
+        );
+        assert!(
+            config.max_value_bytes > 0,
+            "cache max_value_bytes must be non-zero"
+        );
+        assert!(config.max_entries > 0, "cache max_entries must be non-zero");
+        assert!(
+            config.max_arena_bytes > 0,
+            "cache max_arena_bytes must be non-zero"
+        );
         Self {
+            config,
+            hash_builder: RandomState::new(),
             arena: ByteArena::new(),
             slots: Vec::new(),
             free_slots: Vec::new(),
@@ -318,11 +389,96 @@ impl CacheStore {
         }
     }
 
+    pub fn config(&self) -> CacheConfig {
+        self.config
+    }
+
     #[inline]
-    fn hash(key: &[u8]) -> u64 {
-        let mut hasher = FxHasher::default();
+    fn hash(&self, key: &[u8]) -> u64 {
+        let mut hasher = self.hash_builder.build_hasher();
         hasher.write(key);
         hasher.finish()
+    }
+
+    fn validate_bytes_write(&self, key: &[u8], value: &[u8]) -> Result<(), CacheWriteError> {
+        if key.len() > self.config.max_key_bytes {
+            return Err(CacheWriteError::KeyTooLarge);
+        }
+        if value.len() > self.config.max_value_bytes {
+            return Err(CacheWriteError::ValueTooLarge);
+        }
+
+        let hash = self.hash(key);
+        let existing = self.find_slot(key, hash).is_some();
+        if !existing && self.index_len >= self.config.max_entries {
+            return Err(CacheWriteError::EntryLimitReached);
+        }
+
+        let lengths = if existing {
+            [value.len(), 0]
+        } else {
+            [key.len(), value.len()]
+        };
+        let additional = self.arena.additional_reserved_for(&lengths);
+        if self.arena.reserved_bytes().saturating_add(additional) > self.config.max_arena_bytes {
+            return Err(CacheWriteError::ArenaLimitReached);
+        }
+        Ok(())
+    }
+
+    fn validate_bytes_batch(&self, pairs: &[(&[u8], &[u8])]) -> Result<(), CacheWriteError> {
+        let mut new_entries = 0usize;
+        let mut arena_lengths = Vec::with_capacity(pairs.len().saturating_mul(2));
+
+        for (index, &(key, value)) in pairs.iter().enumerate() {
+            if key.len() > self.config.max_key_bytes {
+                return Err(CacheWriteError::KeyTooLarge);
+            }
+            if value.len() > self.config.max_value_bytes {
+                return Err(CacheWriteError::ValueTooLarge);
+            }
+
+            let hash = self.hash(key);
+            let exists_in_store = self.find_slot(key, hash).is_some();
+            let exists_earlier_in_batch = pairs[..index]
+                .iter()
+                .any(|(previous_key, _)| *previous_key == key);
+            if !exists_in_store && !exists_earlier_in_batch {
+                new_entries = new_entries.saturating_add(1);
+                arena_lengths.push(key.len());
+            }
+            // Conservatively account for every value in the batch. Sequential
+            // replacements may release an older block earlier, so this is an
+            // upper bound on peak arena growth rather than an underestimate.
+            arena_lengths.push(value.len());
+        }
+
+        if self.index_len.saturating_add(new_entries) > self.config.max_entries {
+            return Err(CacheWriteError::EntryLimitReached);
+        }
+        let additional = self.arena.additional_reserved_for(&arena_lengths);
+        if self.arena.reserved_bytes().saturating_add(additional) > self.config.max_arena_bytes {
+            return Err(CacheWriteError::ArenaLimitReached);
+        }
+        Ok(())
+    }
+
+    fn validate_integer_write(&self, key: &[u8]) -> Result<(), CacheWriteError> {
+        if key.len() > self.config.max_key_bytes {
+            return Err(CacheWriteError::KeyTooLarge);
+        }
+        let hash = self.hash(key);
+        if self.find_slot(key, hash).is_some() {
+            return Ok(());
+        }
+        if self.index_len >= self.config.max_entries {
+            return Err(CacheWriteError::EntryLimitReached);
+        }
+        let additional = self.arena.additional_reserved_for(&[key.len()]);
+        if self.arena.reserved_bytes().saturating_add(additional) > self.config.max_arena_bytes {
+            return Err(CacheWriteError::ArenaLimitReached);
+        }
+        Ok(())
     }
 
     #[inline]
@@ -348,7 +504,7 @@ impl CacheStore {
     }
 
     fn live_slot_id(&mut self, key: &[u8], now_ms: u64) -> Option<u32> {
-        let hash = Self::hash(key);
+        let hash = self.hash(key);
         let slot_id = self.find_slot(key, hash)?;
         let expired = self.slots[slot_id as usize]
             .entry
@@ -457,7 +613,7 @@ impl CacheStore {
     }
 
     fn set_value(&mut self, key: &[u8], value: CacheValue, ttl_ms: Option<u64>, now_ms: u64) {
-        let hash = Self::hash(key);
+        let hash = self.hash(key);
         let expires_at_ms = ttl_ms.map(|ttl| now_ms.saturating_add(ttl));
 
         if let Some(slot_id) = self.find_slot(key, hash) {
@@ -509,13 +665,56 @@ impl CacheStore {
         self.stats.sets += 1;
     }
 
-    pub fn set_bytes(&mut self, key: &[u8], value: &[u8], ttl_ms: Option<u64>, now_ms: u64) {
+    fn set_bytes_unchecked(&mut self, key: &[u8], value: &[u8], ttl_ms: Option<u64>, now_ms: u64) {
         let value = CacheValue::Bytes(PackedBytes::pack(value, &mut self.arena));
         self.set_value(key, value, ttl_ms, now_ms);
     }
 
-    pub fn set_integer(&mut self, key: &[u8], value: i64, ttl_ms: Option<u64>, now_ms: u64) {
+    pub fn try_set_bytes(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        ttl_ms: Option<u64>,
+        now_ms: u64,
+    ) -> Result<(), CacheWriteError> {
+        self.validate_bytes_write(key, value)?;
+        self.set_bytes_unchecked(key, value, ttl_ms, now_ms);
+        Ok(())
+    }
+
+    pub fn try_set_many_bytes(
+        &mut self,
+        pairs: &[(&[u8], &[u8])],
+        ttl_ms: Option<u64>,
+        now_ms: u64,
+    ) -> Result<(), CacheWriteError> {
+        self.validate_bytes_batch(pairs)?;
+        for &(key, value) in pairs {
+            self.set_bytes_unchecked(key, value, ttl_ms, now_ms);
+        }
+        Ok(())
+    }
+
+    pub fn set_bytes(&mut self, key: &[u8], value: &[u8], ttl_ms: Option<u64>, now_ms: u64) {
+        self.try_set_bytes(key, value, ttl_ms, now_ms)
+            .expect("trusted cache write exceeds configured limits");
+    }
+
+    pub fn try_set_integer(
+        &mut self,
+        key: &[u8],
+        value: i64,
+        ttl_ms: Option<u64>,
+        now_ms: u64,
+    ) -> Result<(), CacheWriteError> {
+        self.validate_integer_write(key)?;
         self.set_value(key, CacheValue::Integer(value), ttl_ms, now_ms);
+        Ok(())
+    }
+
+    pub fn set_integer(&mut self, key: &[u8], value: i64, ttl_ms: Option<u64>, now_ms: u64) {
+        self.try_set_integer(key, value, ttl_ms, now_ms)
+            .expect("trusted cache write exceeds configured limits");
     }
 
     pub fn get(&mut self, key: &[u8], now_ms: u64) -> Option<CacheValueView<'_>> {
@@ -599,7 +798,8 @@ impl CacheStore {
         now_ms: u64,
     ) -> Result<i64, CacheIncrementError> {
         let Some(slot_id) = self.live_slot_id(key, now_ms) else {
-            self.set_integer(key, delta, None, now_ms);
+            self.try_set_integer(key, delta, None, now_ms)
+                .map_err(CacheIncrementError::WriteRejected)?;
             return Ok(delta);
         };
 
@@ -634,7 +834,7 @@ impl CacheStore {
     }
 
     pub fn delete(&mut self, key: &[u8]) -> bool {
-        let hash = Self::hash(key);
+        let hash = self.hash(key);
         let Some(slot_id) = self.find_slot(key, hash) else {
             return false;
         };
@@ -890,6 +1090,77 @@ mod tests {
         assert_eq!(
             default_physical_shard(slot, 8),
             default_physical_shard(slot, 8)
+        );
+    }
+
+    #[test]
+    fn admission_limits_reject_oversized_network_writes_without_mutation() {
+        let mut store = CacheStore::with_config(CacheConfig {
+            max_key_bytes: 4,
+            max_value_bytes: 8,
+            max_entries: 2,
+            max_arena_bytes: 64,
+        });
+
+        assert_eq!(
+            store.try_set_bytes(b"toolong", b"v", None, 0),
+            Err(CacheWriteError::KeyTooLarge)
+        );
+        assert_eq!(
+            store.try_set_bytes(b"k", b"123456789", None, 0),
+            Err(CacheWriteError::ValueTooLarge)
+        );
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn entry_limit_is_enforced_before_index_growth() {
+        let mut store = CacheStore::with_config(CacheConfig {
+            max_key_bytes: 64,
+            max_value_bytes: 64,
+            max_entries: 1,
+            max_arena_bytes: 1024,
+        });
+        assert_eq!(store.try_set_bytes(b"a", b"1", None, 0), Ok(()));
+        assert_eq!(
+            store.try_set_bytes(b"b", b"2", None, 0),
+            Err(CacheWriteError::EntryLimitReached)
+        );
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn mset_style_batch_rejects_before_partial_mutation() {
+        let mut store = CacheStore::with_config(CacheConfig {
+            max_key_bytes: 64,
+            max_value_bytes: 64,
+            max_entries: 1,
+            max_arena_bytes: 1024,
+        });
+        let pairs = [
+            (b"a".as_slice(), b"1".as_slice()),
+            (b"b".as_slice(), b"2".as_slice()),
+        ];
+        assert_eq!(
+            store.try_set_many_bytes(&pairs, None, 0),
+            Err(CacheWriteError::EntryLimitReached)
+        );
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn arena_limit_accounts_for_large_value_growth() {
+        let mut store = CacheStore::with_config(CacheConfig {
+            max_key_bytes: 64,
+            max_value_bytes: 1024,
+            max_entries: 8,
+            max_arena_bytes: 64,
+        });
+        assert_eq!(store.try_set_bytes(b"k", &[7; 40], None, 0), Ok(()));
+        assert_eq!(store.memory_stats().arena_reserved_bytes, 64);
+        assert_eq!(
+            store.try_set_bytes(b"k2", &[8; 40], None, 0),
+            Err(CacheWriteError::ArenaLimitReached)
         );
     }
 }
