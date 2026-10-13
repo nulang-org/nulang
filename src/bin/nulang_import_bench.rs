@@ -96,7 +96,10 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .map_err(|e| e.to_string())?
             .as_nanos();
-        let dir = env::temp_dir().join(format!("nulang-import-bench-{}-{nonce}", std::process::id()));
+        let dir = env::temp_dir().join(format!(
+            "nulang-import-bench-{}-{nonce}",
+            std::process::id()
+        ));
         fs::create_dir(&dir).map_err(|e| format!("cannot create fixture: {e}"))?;
 
         // One unchanged parent repeatedly resolves multiple imported leaves.
