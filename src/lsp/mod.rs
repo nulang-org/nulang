@@ -3802,6 +3802,57 @@ mod lsp_tests {
     }
 
     #[test]
+    fn test_hover_reports_inferred_effects_from_checked_function_rows() {
+        let source = "fn greet(s: String) -> String {\n    perform IO.print(s)\n    s\n}";
+        let result = NulangLanguageServer::compute_diagnostics(source);
+        let hover = NulangLanguageServer::hover_at_with_rows(
+            source,
+            Position::new(0, 4),
+            Some(&result.function_rows),
+        )
+        .expect("hover for greet");
+        let HoverContents::Scalar(MarkedString::String(contents)) = hover.contents else {
+            panic!("expected function hover text");
+        };
+        assert!(contents.contains("effects (inferred):"), "{contents}");
+        assert!(contents.contains("IO"), "{contents}");
+        assert!(contents.contains("do not grant external authority"), "{contents}");
+    }
+
+    #[test]
+    fn test_hover_does_not_invent_effects_for_pure_function() {
+        let source = "fn add(a: Int, b: Int) -> Int { a + b }";
+        let result = NulangLanguageServer::compute_diagnostics(source);
+        let hover = NulangLanguageServer::hover_at_with_rows(
+            source,
+            Position::new(0, 4),
+            Some(&result.function_rows),
+        )
+        .expect("hover for add");
+        let HoverContents::Scalar(MarkedString::String(contents)) = hover.contents else {
+            panic!("expected function hover text");
+        };
+        assert!(!contents.contains("effects (inferred)"), "{contents}");
+    }
+
+    #[test]
+    fn test_hover_retains_explicit_effect_annotation() {
+        let source = "fn greet(s: String) -> Unit ! {IO} { perform IO.print(s) }";
+        let result = NulangLanguageServer::compute_diagnostics(source);
+        let hover = NulangLanguageServer::hover_at_with_rows(
+            source,
+            Position::new(0, 4),
+            Some(&result.function_rows),
+        )
+        .expect("hover for greet");
+        let HoverContents::Scalar(MarkedString::String(contents)) = hover.contents else {
+            panic!("expected function hover text");
+        };
+        assert!(contents.contains("effects: "), "{contents}");
+        assert!(!contents.contains("effects (inferred)"), "{contents}");
+    }
+
+    #[test]
     fn test_effect_row_inlay_hint() {
         // A function that performs an effect should get an effect-row hint.
         let source = "fn greet(s: String) -> String {\n    perform IO.print(s)\n    s\n}";
