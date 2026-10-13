@@ -1,0 +1,22 @@
+// Lazy single-pass list transforms: compose map/filter without intermediate arrays.
+import stdlib::list
+
+fn main() {
+    let values = [1, 2, 3, 4, 5]
+    let transform = chain_transforms(
+        mapping(fn(x) { x * 2 }),
+        filtering(fn(x) { x % 4 == 0 })
+    )
+
+    let total = transduce(values, transform, 0, fn(acc, x) { acc + x })
+    perform IO.print("sum=" + perform Int.to_string(total))
+
+    let selected = collect_transduced(values, transform)
+    perform IO.print("count=" + perform Int.to_string(length(selected)))
+    perform IO.print("first=" + perform Int.to_string(selected[0]))
+    perform IO.print("second=" + perform Int.to_string(selected[1]))
+    perform IO.print("original=" + perform Int.to_string(values[0]))
+
+    let empty_sum = transduce([], mapping(fn(x) { x * 2 }), 42, fn(acc, x) { acc + x })
+    perform IO.print("empty=" + perform Int.to_string(empty_sum))
+}
