@@ -1,4 +1,9 @@
 # Nulang Changelog
+### BSD portability and platform downloads — 2026-10-13
+- **FreeBSD x86_64 is added to the release rehearsal as a native-VM build and extracted-archive smoke test.** Tag publication is blocked unless the FreeBSD artifact and its SHA-256 checksum pass. This is not a claim that a FreeBSD binary has already shipped.
+- **OpenBSD and NetBSD have native minimal-CLI build/run smoke workflows.** They remain source-build candidates; their full release-profile features are not certified.
+- **The installation page exposes per-platform archive/checksum choices** for the published Linux, macOS and Windows targets, while leaving FreeBSD downloads pending the first validated tag.
+
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
