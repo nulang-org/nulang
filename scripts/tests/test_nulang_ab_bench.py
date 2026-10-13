@@ -17,13 +17,13 @@ spec.loader.exec_module(nulang_ab_bench)
 class BenchmarkRecordValidationTests(unittest.TestCase):
     @staticmethod
     def valid_records():
-        return "\\n".join(
+        return "\n".join(
             f"[cross-bench] runtime=nulang benchmark={name} messages=100 elapsed_ns=1000"
             for name in nulang_ab_bench.BENCHMARKS
         )
 
     def test_accepts_one_record_per_benchmark_and_optional_diagnostic(self):
-        output = self.valid_records() + "\\n[ab-bench] benchmark=jit operations=25 elapsed_ns=1200"
+        output = self.valid_records() + "\n[ab-bench] benchmark=jit operations=25 elapsed_ns=1200"
         rows = nulang_ab_bench.parse_records(output)
 
         self.assertEqual(5, len(rows))
@@ -33,7 +33,7 @@ class BenchmarkRecordValidationTests(unittest.TestCase):
     def test_rejects_duplicate_required_benchmark_record(self):
         output = (
             self.valid_records()
-            + "\\n[cross-bench] runtime=nulang benchmark=counting messages=100 elapsed_ns=500"
+            + "\n[cross-bench] runtime=nulang benchmark=counting messages=100 elapsed_ns=500"
         )
         with self.assertRaisesRegex(RuntimeError, "duplicate.*counting"):
             nulang_ab_bench.parse_records(output)
@@ -41,14 +41,14 @@ class BenchmarkRecordValidationTests(unittest.TestCase):
     def test_rejects_duplicate_optional_diagnostic_record(self):
         output = (
             self.valid_records()
-            + "\\n[ab-bench] benchmark=jit operations=25 elapsed_ns=1200"
-            + "\\n[ab-bench] benchmark=jit operations=25 elapsed_ns=1300"
+            + "\n[ab-bench] benchmark=jit operations=25 elapsed_ns=1200"
+            + "\n[ab-bench] benchmark=jit operations=25 elapsed_ns=1300"
         )
         with self.assertRaisesRegex(RuntimeError, "duplicate.*ab/jit"):
             nulang_ab_bench.parse_records(output)
 
     def test_rejects_zero_operation_count(self):
-        output = self.valid_records() + "\\n[ab-bench] benchmark=jit operations=0 elapsed_ns=10"
+        output = self.valid_records() + "\n[ab-bench] benchmark=jit operations=0 elapsed_ns=10"
         with self.assertRaisesRegex(RuntimeError, "positive.*ab/jit"):
             nulang_ab_bench.parse_records(output)
 
