@@ -32,8 +32,9 @@ every workload. It rejects missing/duplicate/unknown benchmark records, wrong
 runtime labels, zero-duration samples, and workload message counts that differ
 from the checked-in fixture contract. It also rotates the runtime invocation
 order per measured round: with a multiple of N measured rounds for N selected
-runtimes, each runtime occupies every timing position equally often. The JSON also records OS/CPU counts, git SHA, toolchain
-versions, and the CPU topology used for measurement.
+runtimes, each runtime occupies every timing position equally often.
+The JSON also records OS/CPU counts, git SHA, toolchain versions, and the
+CPU topology used for measurement.
 
 ## CPU-topology rule
 
