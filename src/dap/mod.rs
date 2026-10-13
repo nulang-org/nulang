@@ -1297,7 +1297,7 @@ pub(crate) mod tests {
 
         fn flush(&mut self) -> std::io::Result<()> {
             if !self.signaled
-                && parse_output(self.output)
+                && parse_output(&self.output[..])
                     .iter()
                     .any(|msg| msg["event"] == "terminated")
             {
