@@ -2,6 +2,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use nulang::database::store::WalBackedTablet;
+use nulang::database::tablet::{KeyRange, TabletDescriptor, TabletId, TabletMutation};
 use nulang::durable_effect::{DurableEffectId, DurableEffectRecord, DurableEffectSpec};
 use nulang::durable_effect_persistence::DurableEffectPersistenceRecord;
 use nulang::primitives::{DeliverySemantics, EffectBoundary};
@@ -213,6 +215,123 @@ fn invalid_transition_is_rejected_without_publishing_partial_state() {
     assert_eq!(journal.tablet_sequence(), 0);
     assert!(journal.load_tail_position(8).unwrap().is_none());
     assert!(journal.load_transition(8, 1).unwrap().is_none());
+    drop(journal);
+    cleanup(&path);
+}
+
+fn mutate_raw_tablet(path: &PathBuf, mutation: TabletMutation) {
+    let descriptor = TabletDescriptor::new(
+        TabletId::new(1).unwrap(),
+        KeyRange::new(Vec::new(), None).unwrap(),
+        1,
+    )
+    .unwrap();
+    let mut tablet = WalBackedTablet::open(descriptor, path).unwrap();
+    let write = tablet
+        .prepare_write(1, tablet.current_sequence(), vec![mutation])
+        .unwrap();
+    tablet.commit(write).unwrap();
+}
+
+fn raw_transition_key(actor_id: u64, sequence: u64) -> Vec<u8> {
+    let mut key = vec![b'T'];
+    key.extend_from_slice(&actor_id.to_be_bytes());
+    key.extend_from_slice(&sequence.to_be_bytes());
+    key
+}
+
+fn raw_tail_key(actor_id: u64) -> Vec<u8> {
+    let mut key = vec![b'L'];
+    key.extend_from_slice(&actor_id.to_be_bytes());
+    key
+}
+
+#[test]
+fn missing_tail_transition_is_not_reported_as_committed_on_retry() {
+    let path = temp_wal("missing_last_transition");
+    cleanup(&path);
+    let original = transition(42, 1, 2);
+    {
+        let mut journal = NuDbTransitionJournal::open(&path).unwrap();
+        journal.commit_transition(original.clone()).unwrap();
+    }
+    mutate_raw_tablet(
+        &path,
+        TabletMutation::Delete {
+            key: raw_transition_key(42, 1),
+        },
+    );
+
+    let mut journal = NuDbTransitionJournal::open(&path).unwrap();
+    assert_eq!(
+        journal.load_tail_position(42).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    assert_eq!(
+        journal.commit_transition(original).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    assert_eq!(journal.tablet_sequence(), 2);
+    drop(journal);
+    cleanup(&path);
+}
+
+#[test]
+fn forged_actor_tail_cannot_override_recovered_transition_digest() {
+    let path = temp_wal("forged_tail");
+    cleanup(&path);
+    {
+        let mut journal = NuDbTransitionJournal::open(&path).unwrap();
+        journal.commit_transition(transition(55, 1, 1)).unwrap();
+    }
+    let forged_tail = serde_json::to_vec(&serde_json::json!({
+        "activation_epoch": 1,
+        "sequence": 1,
+        "digest": vec![0u8; 32],
+    }))
+    .unwrap();
+    mutate_raw_tablet(
+        &path,
+        TabletMutation::Put {
+            key: raw_tail_key(55),
+            value: forged_tail,
+        },
+    );
+
+    let journal = NuDbTransitionJournal::open(&path).unwrap();
+    assert_eq!(
+        journal.load_tail_position(55).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    drop(journal);
+    cleanup(&path);
+}
+
+#[test]
+fn deleted_actor_tail_does_not_allow_resetting_existing_history() {
+    let path = temp_wal("missing_tail");
+    cleanup(&path);
+    {
+        let mut journal = NuDbTransitionJournal::open(&path).unwrap();
+        journal.commit_transition(transition(77, 1, 1)).unwrap();
+    }
+    mutate_raw_tablet(
+        &path,
+        TabletMutation::Delete {
+            key: raw_tail_key(77),
+        },
+    );
+
+    let mut journal = NuDbTransitionJournal::open(&path).unwrap();
+    assert_eq!(
+        journal.load_tail_position(77).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    assert_eq!(
+        journal.commit_transition(transition(77, 1, 1)).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    assert_eq!(journal.tablet_sequence(), 2);
     drop(journal);
     cleanup(&path);
 }
