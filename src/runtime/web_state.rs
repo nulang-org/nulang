@@ -37,8 +37,9 @@ impl SqliteWebStore {
             let mut mode = connection.query("PRAGMA journal_mode=WAL", ())
                 .await.map_err(sql_error)?;
             while mode.next().await.map_err(sql_error)?.is_some() {}
-            connection.execute("PRAGMA synchronous=FULL", ())
+            let mut sync = connection.query("PRAGMA synchronous=FULL", ())
                 .await.map_err(sql_error)?;
+            while sync.next().await.map_err(sql_error)?.is_some() {}
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS nulang_web_kv (
                     key TEXT PRIMARY KEY NOT NULL,
