@@ -132,7 +132,7 @@ fn merge_imported_decls(
     // A repeated import/reexport is safe only if the declaration has the
     // *same defining source*. Same short name or same underlying type is not
     // sufficient: they may represent unrelated opaque types.
-    let mut existing: BTreeMap<String, PathBuf> = module
+    let existing: BTreeMap<String, PathBuf> = module
         .iter()
         .filter_map(|entry| {
             decl_name(&entry.decl).map(|name| (name.to_string(), entry.origin.clone()))
@@ -158,8 +158,9 @@ fn merge_imported_decls(
                     span: Span::default(),
                 });
             }
-            existing.insert(name.to_string(), entry.origin.clone());
         }
+        // Preserve multiple declarations in one import payload. Collision
+        // checking across separate imports happens at the module boundary.
         filtered.push(entry);
     }
 
@@ -385,6 +386,30 @@ mod tests {
         );
         assert_eq!(r.len(), 1);
         assert_eq!(decl_name(&r[0].decl), Some("a"));
+    }
+
+    #[test]
+    fn declarations_from_one_import_keep_their_original_multiplicity() {
+        // The resolver must not silently drop two same-named declarations
+        // supplied by one file; later phases decide whether they are valid.
+        let origin = PathBuf::from("overloads.nula");
+        let mut module = Vec::new();
+        merge_imported_decls(
+            &mut module,
+            vec![
+                SourcedDecl {
+                    decl: fn_decl("handler"),
+                    origin: origin.clone(),
+                },
+                SourcedDecl {
+                    decl: fn_decl("handler"),
+                    origin,
+                },
+            ],
+            "overloads",
+        )
+        .unwrap();
+        assert_eq!(module.len(), 2);
     }
 
     #[test]
