@@ -34,6 +34,8 @@ class NativeCiWiringTests(unittest.TestCase):
         self.assertIn('scripts/measure_native_binaries.sh "$cargo_target/debug/nulang"', native)
         self.assertIn('--nulang "$cargo_target/debug/nulang"', native)
         self.assertIn("native-binary-size.json", native)
+        self.assertIn("scripts/measure_native_runtime.py", native)
+        self.assertIn("native-runtime-profile.json", native)
         self.assertIn("Upload native executable size report", native)
 
 

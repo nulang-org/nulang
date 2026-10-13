@@ -69,9 +69,34 @@ controlled performance study.
 
 Compare **identical programs and linking requirements**, not a
 dynamically linked Nulang hello-world against a fully static Go binary.
-Measure bytes on disk (uncompressed and stripped), executable dependencies
-(`readelf -d` and `ldd`), startup, peak RSS and output parity with the
-bytecode backend.
+The size and linkage report does not establish startup or memory efficiency.
+
+## Process overhead probe (Linux)
+
+The opt-in native CI lane also produces `native-runtime-profile.json` for the
+same emitted Nulang, C, and available Rust/Go/TinyGo executables:
+
+```sh
+python3 scripts/measure_native_runtime.py --runs 21 --warmup 3 \
+  --json-out native-runtime-profile.json \
+  "nulang=/absolute/path/hello-nulang" \
+  "c=/absolute/path/hello-c"
+```
+
+The harness compiles a small C probe that uses `fork`, `exec`, `wait4`
+and a monotonic clock to capture process launch-to-exit wall time, child CPU
+time and child peak RSS (Linux KiB). The C probe avoids attributing Python's
+large memory footprint to tiny child processes, which can happen when Python
+`posix_spawn` uses `CLONE_VM`. Executables must exit successfully. Stdout and
+stderr are redirected to `/dev/null`; functional output parity is checked by
+the separate size harness first.
+
+These are **warm-cache process lifecycle samples**, not true cold starts or
+isolated application initialization measurements. Wall time includes fork/exec
+and kernel scheduling. CI shared-host timing variance makes the samples
+informational, **not a blocking relative-performance gate**. For trustworthy
+comparisons, rerun multiple times on stable, identical hardware, with the
+same linkage model and program behavior.
 
 ## Promotion gates
 

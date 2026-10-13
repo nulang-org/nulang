@@ -275,6 +275,19 @@ jobs:
             --nulang "$cargo_target/debug/nulang" \
             --json-out native-binary-size.json
           cp "$cargo_target/native-size-smoke/report.tsv" native-size-report.tsv
+          profile_binaries=(
+            "nulang=$cargo_target/native-size-smoke/hello-nulang"
+            "c=$cargo_target/native-size-smoke/hello-c"
+          )
+          for language in rust go tinygo; do
+            if [[ -x "$cargo_target/native-size-smoke/hello-$language" ]]; then
+              profile_binaries+=("$language=$cargo_target/native-size-smoke/hello-$language")
+            fi
+          done
+          python3 scripts/measure_native_runtime.py \
+            --runs 21 --warmup 3 \
+            --json-out native-runtime-profile.json \
+            "${profile_binaries[@]}"
 
       - name: Upload native executable size report
         uses: actions/upload-artifact@v7
@@ -283,6 +296,7 @@ jobs:
           path: |
             native-binary-size.json
             native-size-report.tsv
+            native-runtime-profile.json
           if-no-files-found: error
           retention-days: 7
 
