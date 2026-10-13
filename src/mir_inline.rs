@@ -293,7 +293,7 @@ fn callee_is_small_and_pure(candidate: &Candidate) -> bool {
         || callee.locals.len() > MAX_INLINE_BODY_LOCALS
         || candidate.call_sites.len() > MAX_INLINE_CALL_SITES
         || callee.captures.len() != candidate.captures.len()
-        || !matches!(callee.blocks[0].terminator, Terminator::Return(Some(_)))
+        || !matches!(&callee.blocks[0].terminator, Terminator::Return(Some(_)))
         || candidate
             .call_sites
             .iter()
@@ -1190,6 +1190,26 @@ mod tests {
             panic!("expected call");
         }
         assert_eq!(inline_local_closures(&mut m), 0, "arity mismatch must retain runtime error");
+    }
+
+    #[test]
+    fn test_no_inline_effectful_body() {
+        let mut m = make_module();
+        let mut callee = crate::mir::FunctionBuilder::new("effectful", None);
+        let result = callee.add_temp(crate::types::Type::int());
+        callee.assign(result, RValue::Panic("reachable failure".into()));
+        callee.terminate(Terminator::Return(Some(result)));
+        m.functions.push(callee.build());
+
+        let mut caller = crate::mir::FunctionBuilder::new("caller", None);
+        let clos = caller.add_temp(crate::types::Type::unit());
+        let dst = caller.add_temp(crate::types::Type::int());
+        caller.assign(clos, RValue::Closure { func: 0, captures: vec![] });
+        caller.assign(dst, RValue::Call { func: FuncRef::Local(clos), args: vec![] });
+        caller.terminate(Terminator::Return(Some(dst)));
+        m.functions.push(caller.build());
+
+        assert_eq!(inline_local_closures(&mut m), 0, "diverging operations must not be copied into caller");
     }
 
     #[test]
