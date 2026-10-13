@@ -1,4 +1,8 @@
 # Nulang Changelog
+
+### Isolated compiler-stage timing probe — 2026-10-13
+- **A feature-independent `nulang-compile-bench` runner measures lexing, parsing, type/effect/capability checks, HIR/MIR lowering, and bytecode generation separately.** JSONL records include total compiler wall time, individual stage times, source size, workload, and repetition, with correctness/schema regressions for the benchmark harness.
+- **The probe explicitly excludes CLI startup, prelude/import handling, native linking, and JIT execution.** No production compiler semantics, optimization thresholds, or cache behavior change; native Go comparisons still require matched end-to-end build measurements.
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
