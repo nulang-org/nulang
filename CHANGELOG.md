@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Static bytecode allocation eligibility diagnostics — 2026-10-13
+- **`nulang explain allocations <file.nbc>` emits a deterministic, read-only JSON report of aggregate allocation candidates.** It reuses the existing iso-arena eligibility proof for arrays, tuples, and record creation, and reports record-copy operations explicitly as outside the proof.
+- **The diagnostic does not claim observed heap or arena allocations.** The CLI validates the NBC artifact first; regression tests cover activation-local values, escaping messages, unsupported operations, malformed artifacts, and stable output order.
+
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
