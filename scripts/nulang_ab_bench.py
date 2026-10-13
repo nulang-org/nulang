@@ -103,16 +103,22 @@ def maybe_output(command: list[str], *, cwd: Path = ROOT) -> str | None:
 
 def parse_records(output: str) -> dict[str, dict[str, int]]:
     rows: dict[str, dict[str, int]] = {}
-    for match in RECORD_RE.finditer(output):
-        rows[match.group("benchmark")] = {
-            "messages": int(match.group("messages")),
-            "elapsed_ns": int(match.group("elapsed_ns")),
-        }
-    for match in AB_RECORD_RE.finditer(output):
-        rows["ab/" + match.group("benchmark")] = {
-            "messages": int(match.group("messages")),
-            "elapsed_ns": int(match.group("elapsed_ns")),
-        }
+    for pattern, prefix in ((RECORD_RE, ""), (AB_RECORD_RE, "ab/")):
+        for match in pattern.finditer(output):
+            name = prefix + match.group("benchmark")
+            if name in rows:
+                raise RuntimeError(f"duplicate Nulang benchmark record: {name}")
+            messages = int(match.group("messages"))
+            elapsed_ns = int(match.group("elapsed_ns"))
+            if messages <= 0 or elapsed_ns <= 0:
+                raise RuntimeError(
+                    f"Nulang benchmark values must be positive for {name}: "
+                    f"messages={messages}, elapsed_ns={elapsed_ns}"
+                )
+            rows[name] = {
+                "messages": messages,
+                "elapsed_ns": elapsed_ns,
+            }
     missing = [name for name in BENCHMARKS if name not in rows]
     if missing:
         raise RuntimeError(
