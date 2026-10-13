@@ -255,7 +255,6 @@ pub struct HeapAllocationSnapshot {
     pub peak_committed_bump_bytes: usize,
 }
 
-
 /// Per-actor heap allocator with ORCA-compatible object headers.
 ///
 /// `ActorHeap` combines a fast bump allocator with size-class free lists.
