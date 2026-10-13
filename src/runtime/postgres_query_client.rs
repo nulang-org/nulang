@@ -181,7 +181,10 @@ mod tests {
     fn incompatible_type_and_nan_are_explicit_errors() {
         assert!(bind_owned_param(&OwnedDbParam::Bool(true), &Type::TEXT).is_err());
         assert!(bind_owned_param(&OwnedDbParam::Float(f64::NAN), &Type::FLOAT8).is_err());
-        assert!(bind_owned_param(&OwnedDbParam::Json(serde_json::json!({"x": 1})), &Type::JSONB).is_ok());
+        assert!(
+            bind_owned_param(&OwnedDbParam::Json(serde_json::json!({"x": 1})), &Type::JSONB)
+                .is_ok()
+        );
     }
 
     #[test]
