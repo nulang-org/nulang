@@ -272,6 +272,94 @@ mod tests {
         assert_eq!(diags[1].code.as_deref(), Some("E0102"));
     }
 
+
+    #[test]
+    fn test_unbound_variable_exposes_reviewable_text_edit() {
+        let source = "let counter = 1\nlet value = countr + 1\n";
+        set_source_map_with_file(source, Some("program.nula"));
+        let start = source.find("countr +").unwrap() as u32;
+        let error = NuError::unbound_variable(
+            "countr",
+            Span::new(start, start + "countr".len() as u32),
+            Some(vec!["counter".into()]),
+        );
+
+        let diagnostics = diagnostics_from_error(&error);
+        let suggestion = diagnostics[0].suggestion.as_ref().expect("suggestion");
+        assert_eq!(suggestion.replacement.as_deref(), Some("counter"));
+        assert_eq!(suggestion.applicability.as_deref(), Some("requires-review"));
+        let edit = suggestion.edit.as_ref().expect("machine-readable edit");
+        assert_eq!(edit.file, "program.nula");
+        assert_eq!(edit.start_byte, start);
+        assert_eq!(edit.end_byte, start + 6);
+        assert_eq!(edit.expected_text, "countr");
+        assert_eq!(edit.new_text, "counter");
+
+        let report = JsonReport::new("check", Some("program.nula".into()), diagnostics);
+        let json: serde_json::Value = serde_json::from_str(&report.to_json_string()).unwrap();
+        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["diagnostics"][0]["suggestion"]["edit"]["start_byte"], start);
+        assert_eq!(json["diagnostics"][0]["suggestion"]["edit"]["new_text"], "counter");
+        clear_source_map();
+    }
+
+    #[test]
+    fn test_ambiguous_unbound_variable_does_not_offer_edit() {
+        let source = "let count = 1\nlet value = countr\n";
+        set_source_map_with_file(source, Some("ambiguous.nula"));
+        let start = source.find("countr").unwrap() as u32;
+        let error = NuError::unbound_variable(
+            "countr",
+            Span::new(start, start + 6),
+            Some(vec!["counter".into(), "count".into()]),
+        );
+
+        assert!(diagnostics_from_error(&error)[0].suggestion.is_none());
+        clear_source_map();
+    }
+
+    #[test]
+    fn test_unbound_variable_mismatched_or_missing_source_never_offers_edit() {
+        let source = "let value = different\n";
+        set_source_map_with_file(source, Some("mismatch.nula"));
+        let start = source.find("different").unwrap() as u32;
+        let error = NuError::unbound_variable(
+            "countr",
+            Span::new(start, start + "different".len() as u32),
+            Some(vec!["counter".into()]),
+        );
+        let diagnostic = &diagnostics_from_error(&error)[0];
+        assert!(diagnostic.suggestion.as_ref().and_then(|s| s.edit.as_ref()).is_none());
+        clear_source_map();
+
+        assert!(diagnostics_from_error(&error)[0]
+            .suggestion
+            .as_ref()
+            .and_then(|s| s.edit.as_ref())
+            .is_none());
+    }
+
+    #[test]
+    fn test_unbound_variable_edit_offsets_are_utf8_bytes() {
+        let source = "let café = 1\nlet output = cafè\n";
+        set_source_map_with_file(source, Some("unicode.nula"));
+        let start = source.find("cafè").unwrap() as u32;
+        let end = start + "cafè".len() as u32;
+        let error = NuError::unbound_variable(
+            "cafè",
+            Span::new(start, end),
+            Some(vec!["café".into()]),
+        );
+
+        let diagnostics = diagnostics_from_error(&error);
+        let edit = diagnostics[0].suggestion.as_ref().unwrap().edit.as_ref().unwrap();
+        assert_eq!(edit.start_byte, start);
+        assert_eq!(edit.end_byte, end);
+        assert_eq!(&source[edit.start_byte as usize..edit.end_byte as usize], "cafè");
+        assert_eq!(edit.new_text, "café");
+        clear_source_map();
+    }
+
     #[test]
     fn test_ok_report_has_empty_diagnostics() {
         let report = JsonReport::new("check", Some("ok.nula".to_string()), Vec::new());
