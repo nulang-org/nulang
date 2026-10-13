@@ -2946,6 +2946,35 @@ mod tests {
     }
 
     #[test]
+    fn test_mir_const_fold_preserves_checked_int48_min_negation() {
+        let operand = mir::LocalId(0);
+        let mut known = std::collections::HashMap::new();
+        known.insert(operand, Constant::Int(crate::value_layout::INT48_MIN));
+
+        let expression = mir::RValue::Unary(crate::ast::UnOp::Neg, operand);
+        let optimized = fold_rvalue(expression.clone(), &known, &[false]);
+
+        assert_eq!(
+            optimized, expression,
+            "negating INT48_MIN must remain a checked runtime operation, not a wrapped constant"
+        );
+    }
+
+    #[test]
+    fn test_mir_const_fold_negates_in_range_integer() {
+        let operand = mir::LocalId(0);
+        let mut known = std::collections::HashMap::new();
+        known.insert(operand, Constant::Int(42));
+
+        let optimized = fold_rvalue(
+            mir::RValue::Unary(crate::ast::UnOp::Neg, operand),
+            &known,
+            &[false],
+        );
+        assert_eq!(optimized, mir::RValue::Const(Constant::Int(-42)));
+    }
+
+    #[test]
     fn test_mir_codegen_simple_arithmetic() {
         let value = run_mir_source("1 + 2 * 3").unwrap();
         assert_eq!(value.as_int(), Some(7));
