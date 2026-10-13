@@ -36,6 +36,7 @@ pub fn serve_stream<R: BufRead, W: Write>(
     server: &McpServer,
 ) -> io::Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
         .build()
         .map_err(io::Error::other)?;
     let mut initialized = false;
