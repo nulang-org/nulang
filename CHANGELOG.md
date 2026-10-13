@@ -1,4 +1,10 @@
 # Nulang Changelog
+### Closure inliner safety and growth bounds — 2026-10-13
+- **Existing MIR closure inlining now requires a single dominating definition and stable captured values within the same basic block.** Calls before construction, rebinding of a closure or a captured local, incompatible arity, and callee parameter/capture writes stay on the normal call path.
+- **Inlining now has conservative limits** on body size, local count, and call-site count, and accepts only small expression bodies without effect sites or control-flow machinery. This preserves effect-site/replay identity and bounds optimizer growth while more general proofs are developed.
+- **Actor state and event emissions now count as closure escapes.** The inliner will not remove a closure stored to actor state or emitted as an event payload.
+- **Regressions cover** reassignment, call dominance, capture snapshots, parameter isolation, invalid arity, oversized and divergent bodies, state/event escape, plus a source-level capture-snapshot conformance fixture. No benchmark speedup is claimed.
+
 ### MIR same-block capture-free callee devirtualization — 2026-10-13
 - **Conservative MIR optimization resolves calls through locally created capture-free closures to direct function-table calls.** It considers only definitions earlier in the same basic block and invalidates the candidate on reassignment; captured closures, load aliases, and cross-block definitions remain dynamic.
 - **Compiler unit tests cover direct rewriting, captured-closure preservation, reassignment, and cross-block non-dominance.** A conformance fixture checks capture-free, captured, and zero-argument closure behavior. This is callee devirtualization, not general closure inlining, generic monomorphization, or zero-overhead iterator codegen.
