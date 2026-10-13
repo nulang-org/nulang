@@ -1119,6 +1119,97 @@ fn view() -> Html {
         );
     }
 
+    fn assert_shadowed_expression_has_no_signal_binding(mut expr: Expr) {
+        let signals = HashSet::from(["count".to_string()]);
+        let mut graph = SignalGraph::default();
+        scan_expr(
+            &expr,
+            &mut Vec::new(),
+            false,
+            &signals,
+            &mut graph,
+            None,
+        );
+        assert!(
+            !graph.nodes.iter().any(
+                |node| matches!(node, GraphNode::Read { signal, .. } if signal == "count")
+            ),
+            "a locally bound count must not be tracked as a global signal"
+        );
+
+        rewrite_expr(&mut expr, false, &signals, None);
+        assert!(
+            !format!("{expr:?}").contains("data-signal"),
+            "a locally bound count must not receive a hydration marker"
+        );
+    }
+
+    #[test]
+    fn test_lambda_parameter_shadows_global_signal() {
+        let module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+signal count: Html = text("global")
+
+fn view() -> Html { <span>{count}</span> }
+"#,
+        );
+        let html = find_function_body(&module, "view").clone();
+        let expr = Expr::Lambda {
+            params: vec![crate::ast::Param::new("count", None)],
+            ret_type: None,
+            body: Box::new(html),
+            effect: None,
+            span: Span::default(),
+        };
+        assert_shadowed_expression_has_no_signal_binding(expr);
+    }
+
+    #[test]
+    fn test_match_pattern_shadows_global_signal() {
+        let module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+signal count: Html = text("global")
+
+fn view() -> Html { <span>{count}</span> }
+"#,
+        );
+        let html = find_function_body(&module, "view").clone();
+        let expr = Expr::Match {
+            scrutinee: Box::new(Expr::Literal(Literal::Int(1), Span::default())),
+            arms: vec![(Pattern::Var("count".to_string()), None, html)],
+            span: Span::default(),
+        };
+        assert_shadowed_expression_has_no_signal_binding(expr);
+    }
+
+    #[test]
+    fn test_for_binding_shadows_global_signal() {
+        let module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+signal count: Html = text("global")
+
+fn view() -> Html { <span>{count}</span> }
+"#,
+        );
+        let html = find_function_body(&module, "view").clone();
+        let expr = Expr::For {
+            var: "count".to_string(),
+            iterable: Box::new(Expr::Array(Vec::new(), Span::default())),
+            body: Box::new(html),
+            span: Span::default(),
+        };
+        assert_shadowed_expression_has_no_signal_binding(expr);
+    }
+
     #[test]
     fn test_signal_decl_collected() {
         let module = parse(
