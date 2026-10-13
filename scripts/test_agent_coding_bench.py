@@ -55,6 +55,7 @@ class AgentCodingBenchTests(unittest.TestCase):
         ]
         proc, report = self.run_report(["one", "two"], rows)
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertRegex(report["manifest_sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual([m["model"] for m in report["models"]], ["A", "B"])
         a = report["models"][0]
         self.assertEqual(a["completed"], 4)
@@ -102,6 +103,19 @@ class AgentCodingBenchTests(unittest.TestCase):
         self.assertEqual(a["coverage"], 0.25)
         self.assertEqual(a["success_rate_observed"], 1.0)
         self.assertEqual(a["success_rate_all_tasks"], 0.25)
+
+    def test_manifest_changes_produce_distinct_fingerprints(self):
+        proc_one, report_one = self.run_report(
+            ["one"], [record("A", "one", 1)], trials=1
+        )
+        proc_two, report_two = self.run_report(
+            ["one", "two"], [record("A", "one", 1)], trials=1
+        )
+        self.assertEqual(proc_one.returncode, 0)
+        self.assertEqual(proc_two.returncode, 0)
+        self.assertNotEqual(
+            report_one["manifest_sha256"], report_two["manifest_sha256"]
+        )
 
     def test_empty_results_fail_instead_of_fabricating_scores(self):
         proc, _ = self.run_report(["one"], [])
