@@ -109,6 +109,11 @@ jobs:
         # nextest intentionally does not execute rustdoc tests.
         run: cargo test --locked --doc
 
+      - name: Run behavioral conformance suite
+        # Rust unit tests do not execute standalone .nula + .json fixtures.
+        # This verifies the actual compiled CLI against their expected output.
+        run: python3 conformance/run.py
+
       - name: Test benchmark harness scripts
         run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 
