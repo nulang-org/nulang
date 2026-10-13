@@ -1,9 +1,11 @@
-//! MCP (Model Context Protocol) JSON-RPC host — OSS stub.
+//! MCP (Model Context Protocol) JSON-RPC host and local coding tools.
 
 pub mod dev_plane;
 pub mod forge;
 pub mod forge_tools;
 pub mod gitea;
+pub mod local_tools;
+pub mod stdio;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -89,10 +91,23 @@ impl McpServer {
 
     pub async fn handle_request(&self, req: JsonRpcRequest) -> JsonRpcResponse {
         let id = req.id.clone();
-        let result = match req.method.as_str() {
-            "tools/list" => self.tools_list().await,
-            "tools/call" => self.tools_call(req.params.unwrap_or_default()).await,
-            _ => Err("Method not found".to_string()),
+        let result: Result<Value, (i32, String)> = if req.jsonrpc != "2.0" {
+            Err((-32600, "Invalid JSON-RPC version".to_string()))
+        } else {
+            match req.method.as_str() {
+                "initialize" => Ok(serde_json::json!({
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "nulang-ai-mcp", "version": env!("CARGO_PKG_VERSION")}
+                })),
+                "ping" => Ok(serde_json::json!({})),
+                "tools/list" => Ok(self.tools_list().await),
+                "tools/call" => self
+                    .tools_call(req.params.unwrap_or_default())
+                    .await
+                    .map_err(|message| (-32602, message)),
+                _ => Err((-32601, "Method not found".to_string())),
+            }
         };
         match result {
             Ok(value) => JsonRpcResponse {
@@ -101,12 +116,12 @@ impl McpServer {
                 result: Some(value),
                 error: None,
             },
-            Err(message) => JsonRpcResponse {
+            Err((code, message)) => JsonRpcResponse {
                 jsonrpc: "2.0".into(),
                 id,
                 result: None,
                 error: Some(JsonRpcError {
-                    code: -32603,
+                    code,
                     message,
                     data: None,
                 }),
@@ -114,13 +129,18 @@ impl McpServer {
         }
     }
 
-    async fn tools_list(&self) -> Result<Value, String> {
-        let tools = self.registry.list_tools().await;
+    async fn tools_list(&self) -> Value {
+        let mut tools = self.registry.list_tools().await;
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
         let tools_json: Vec<Value> = tools
             .into_iter()
-            .map(|t| serde_json::json!({"name": t.name, "description": t.description, "inputSchema": t.parameters}))
+            .map(|t| serde_json::json!({
+                "name": t.name,
+                "description": t.description,
+                "inputSchema": t.parameters
+            }))
             .collect();
-        Ok(serde_json::json!({"tools": tools_json}))
+        serde_json::json!({"tools": tools_json})
     }
 
     async fn tools_call(&self, params: Value) -> Result<Value, String> {
@@ -132,11 +152,23 @@ impl McpServer {
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| serde_json::json!({}));
-        let tools = self.registry.tools.read().await;
-        let (_, handler) = tools
-            .get(name)
-            .ok_or_else(|| format!("Unknown tool: {name}"))?;
-        let result = handler.call(args).await?;
-        Ok(serde_json::json!({"content": [{"type": "text", "text": result.to_string()}]}))
+        let handler = {
+            let tools = self.registry.tools.read().await;
+            Arc::clone(&tools
+                .get(name)
+                .ok_or_else(|| format!("Unknown tool: {name}"))?
+                .1)
+        };
+        match handler.call(args).await {
+            Ok(value) => Ok(serde_json::json!({
+                "content": [{"type": "text", "text": value.to_string()}],
+                "structuredContent": value,
+                "isError": false
+            })),
+            Err(message) => Ok(serde_json::json!({
+                "content": [{"type": "text", "text": message}],
+                "isError": true
+            })),
+        }
     }
 }
