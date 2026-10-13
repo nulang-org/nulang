@@ -1,4 +1,8 @@
 # Nulang Changelog
+
+### Per-import filtering correctness for resolver cache — 2026-10-13
+- **In-process import resolution now caches complete unfiltered declaration sets and applies each import's selection independently.** A second import of the same file can no longer lose symbols because the first import requested a different subset; the existing per-top-level cache reset remains unchanged to prevent stale results between compilations.
+- **Regression fixtures cover repeated selective imports and modified files across top-level compilation calls.** This is a correctness prerequisite for any persistent incremental semantic cache, not an implementation of cross-build caching.
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
