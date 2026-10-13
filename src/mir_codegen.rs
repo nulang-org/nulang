@@ -1708,13 +1708,14 @@ fn fold_function(
     for block in &mut func.blocks {
         for stmt in &mut block.stmts {
             if let mir::Stmt::Assign { op, .. } = stmt {
-                let mut original = mir::RValue::Const(Constant::Nil);
-                std::mem::swap(op, &mut original);
-                let folded = fold_rvalue(original, const_locals, is_float);
-                if folded != *op {
-                    *op = folded;
-                    changed = true;
-                }
+                // Compare with the original expression, not the temporary Nil
+                // placeholder used while fold_rvalue consumes the RValue.
+                // Otherwise non-foldable assignments look changed on every pass,
+                // while a real fold to Nil can be reported as unchanged.
+                let original = std::mem::replace(op, mir::RValue::Const(Constant::Nil));
+                let folded = fold_rvalue(original.clone(), const_locals, is_float);
+                changed |= folded != original;
+                *op = folded;
             }
         }
     }
