@@ -1,4 +1,8 @@
 # Nulang Changelog
+
+### Experimental indentation-layout token lowering — 2026-10-13
+- **An opt-in compiler library experiment lowers colon-terminated `fn`, `actor`, `entity`, `organization`, and `behavior` headers into the existing brace tokens.** The default source grammar, parser, runtime, and compiled formats are unchanged.
+- **Experimental layout tests cover nested actor behaviors, sibling dedents, typechecker parity, classic-brace compatibility, original-source spans, blank/comment lines, and indentation rejection.** This is not yet available through the CLI, LSP, or formatter and is not promoted to Stable syntax.
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
