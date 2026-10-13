@@ -856,6 +856,14 @@ fn prepare_package_with_lock_policy(locked: bool) -> NuResult<PathBuf> {
         }
     }
 
+    // Fail before a resolver can fetch or update its local dependency cache.
+    if locked {
+        Lockfile::load(&root).map_err(|e| NuError::PackageError {
+            msg: format!("--locked requires an existing valid {}: {}", LOCKFILE_FILE, e),
+            span: Span::default(),
+        })?;
+    }
+
     eprintln!("  Resolving dependencies...");
     let resolution = resolve(&root, &manifest).map_err(|e| NuError::PackageError {
         msg: format!(
