@@ -110,7 +110,10 @@ pub(crate) use callbacks::{BytecodeDistributedCallbacks, BytecodeRuntimeCallback
 pub use cluster::*;
 pub use crdt::*;
 pub use db_query::{DbQueryError, DbQueryErrorCode, DbQueryOutcome};
-pub use db_executor::{BoundedDbQueryExecutor, DbQueryCompletion, DbQueryTicket, OwnedDbParam, OwnedDbQuery, OwnedDbQueryClient};
+pub use db_executor::{
+    BoundedDbQueryExecutor, DbQueryCompletion, DbQueryTicket, OwnedDbParam, OwnedDbQuery,
+    OwnedDbQueryClient,
+};
 #[cfg(feature = "postgres")]
 pub use postgres_query_client::PostgresOwnedQueryClient;
 pub use crdt_manager::*;
