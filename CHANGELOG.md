@@ -1,4 +1,8 @@
 # Nulang Changelog
+
+### Locked Nula package builds — 2026-10-13
+- **Nula build/test/run commands accept `--locked` for CI-safe lockfile checks.** Missing or changed package pins, Git commit pins, and recorded strong path-source identities are rejected without rewriting `Nulang.lock`. Normal resolution remains the default; locked mode is not offline and does not yet guarantee registry tarball integrity.
+
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.

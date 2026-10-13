@@ -77,26 +77,44 @@ pub fn run(args: &[String]) -> NuResult<()> {
         }
         Some("init") => cmd_init(),
         Some("build") => {
-            let web = args.get(1).map(String::as_str) == Some("--web");
-            if web {
-                cmd_build_web()
-            } else {
-                let json = args[1..].iter().any(|a| a == "--json");
-                if args.len() > 1 && !json {
+            let web = args[1..].iter().any(|a| a == "--web");
+            let json = args[1..].iter().any(|a| a == "--json");
+            let locked = args[1..].iter().any(|a| a == "--locked");
+            for flag in &args[1..] {
+                if !matches!(flag.as_str(), "--web" | "--json" | "--locked") {
                     return Err(NuError::PackageError {
-                        msg: format!("unknown flag '{}' for nula build", args[1]),
+                        msg: format!("unknown flag '{}' for nula build", flag),
                         span: Span::default(),
                     });
                 }
-                cmd_build(json)
+            }
+            if web && json {
+                return Err(NuError::PackageError {
+                    msg: "nula build --web does not support --json".to_string(),
+                    span: Span::default(),
+                });
+            }
+            if web {
+                cmd_build_web(locked)
+            } else {
+                cmd_build(json, locked)
             }
         }
-        Some("build-wasm") => cmd_build_wasm(),
+        Some("build-wasm") => {
+            if args[1..].iter().any(|a| a.as_str() != "--locked") {
+                return Err(NuError::PackageError {
+                    msg: format!("unknown flag '{}' for nula build-wasm", args[1]),
+                    span: Span::default(),
+                });
+            }
+            cmd_build_wasm(args[1..].iter().any(|a| a == "--locked"))
+        }
         Some("test") => {
             let mut filter: Option<&str> = None;
             let mut verbose = false;
             let mut watch = false;
             let mut json = false;
+            let mut locked = false;
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
@@ -109,6 +127,7 @@ pub fn run(args: &[String]) -> NuResult<()> {
                     "--verbose" | "-v" => verbose = true,
                     "--watch" | "-w" => watch = true,
                     "--json" => json = true,
+                    "--locked" => locked = true,
                     other => {
                         return Err(NuError::PackageError {
                             msg: format!("unknown flag '{}' for nula test", other),
@@ -119,19 +138,29 @@ pub fn run(args: &[String]) -> NuResult<()> {
                 i += 1;
             }
             if watch {
-                cmd_test_watch(filter, verbose)
+                cmd_test_watch(filter, verbose, locked)
             } else {
-                cmd_test(filter, verbose, json)
+                cmd_test(filter, verbose, json, locked)
             }
         }
         Some("run") => {
-            if args.get(1).map(String::as_str) == Some("--watch") {
-                cmd_run_watch()
+            for flag in &args[1..] {
+                if !matches!(flag.as_str(), "--watch" | "--locked") {
+                    return Err(NuError::PackageError {
+                        msg: format!("unknown flag '{}' for nula run", flag),
+                        span: Span::default(),
+                    });
+                }
+            }
+            let watch = args[1..].iter().any(|a| a == "--watch");
+            let locked = args[1..].iter().any(|a| a == "--locked");
+            if watch {
+                cmd_run_watch(locked)
             } else {
-                cmd_run()
+                cmd_run(locked)
             }
         }
-        Some("watch") => cmd_run_watch(),
+        Some("watch") => cmd_run_watch(false),
         Some("dev") => {
             let mut port: Option<u16> = None;
             let mut i = 1;
@@ -288,11 +317,13 @@ fn print_usage() {
     println!("                Scaffold a new package directory");
     println!("                Templates: default, cli, lib, full");
     println!("  init          Scaffold a new package in the current directory");
-    println!("  build         Build .nbc + RFC 0020 behavior sidecar in .nula/dist/");
-    println!("  build-wasm    Build package to .wasm + .cwasm in .nula/dist/");
-    println!("  test [--filter <substr>] [--verbose|-v] [--watch|-w]  Run .nula test files");
-    println!("  run           Build and run the package entry point");
-    println!("  run --watch   Build and re-run on source changes");
+    println!("  build [--locked]         Build .nbc + RFC 0020 behavior sidecar");
+    println!("  build --web [--locked]   Build static web output");
+    println!("  build-wasm [--locked]    Build .wasm + .cwasm");
+    println!("  test [--locked] [--filter <substr>] [--verbose|-v] [--watch|-w]");
+    println!("                             Run .nula test files");
+    println!("  run [--locked] [--watch]  Build and run the package entry point");
+    println!("  --locked                 Require unchanged Nulang.lock; never rewrite it");
     println!("  watch         Alias for 'run --watch'");
     println!("  add   <name>  Add a dependency to Nulang.toml");
     println!("  remove <name> Remove a dependency from Nulang.toml");
@@ -766,6 +797,11 @@ button {
 /// Resolve the package in the current directory, write `Nulang.lock`, and
 /// return the entry point path.
 fn prepare_package() -> NuResult<PathBuf> {
+    prepare_package_with_lock_policy(false)
+}
+
+/// Locked mode rejects a missing or stale lockfile and never rewrites it.
+fn prepare_package_with_lock_policy(locked: bool) -> NuResult<PathBuf> {
     let root = package_root()?;
     let manifest_path = root.join(MANIFEST_FILE);
     let manifest = Manifest::load(&root).map_err(|e| NuError::PackageError {
@@ -820,6 +856,17 @@ fn prepare_package() -> NuResult<PathBuf> {
         }
     }
 
+    // Fail before a resolver can fetch or update its local dependency cache.
+    if locked {
+        Lockfile::load(&root).map_err(|e| NuError::PackageError {
+            msg: format!(
+                "--locked requires an existing valid {}: {}",
+                LOCKFILE_FILE, e
+            ),
+            span: Span::default(),
+        })?;
+    }
+
     eprintln!("  Resolving dependencies...");
     let resolution = resolve(&root, &manifest).map_err(|e| NuError::PackageError {
         msg: format!(
@@ -832,13 +879,15 @@ fn prepare_package() -> NuResult<PathBuf> {
     })?;
 
     let lock_path = root.join(LOCKFILE_FILE);
-    resolution
-        .to_lockfile()
-        .save(&root)
-        .map_err(|e| NuError::PackageError {
+    let candidate = resolution.to_lockfile();
+    if locked {
+        verify_locked_resolution(&root, &candidate)?;
+    } else {
+        candidate.save(&root).map_err(|e| NuError::PackageError {
             msg: format!("failed to write {}: {}", lock_path.display(), e),
             span: Span::default(),
         })?;
+    }
 
     let entry = root.join(&manifest.package.entry);
     if !entry.exists() {
@@ -1061,10 +1110,51 @@ fn build_module_path() -> Option<String> {
     }
 }
 
+/// Reject lockfile changes before building, without writing Nulang.lock.
+/// Existing strong path identities are verified; legacy locks without them
+/// cannot detect all content drift.
+fn verify_locked_resolution(root: &Path, candidate: &Lockfile) -> NuResult<()> {
+    let current = Lockfile::load(root).map_err(|e| NuError::PackageError {
+        msg: format!(
+            "--locked requires an existing valid {} (run 'nulang nula build' to generate it): {}",
+            LOCKFILE_FILE, e
+        ),
+        span: Span::default(),
+    })?;
+    if current.package != candidate.package {
+        return Err(NuError::PackageError {
+            msg: format!(
+                "--locked dependency resolution differs from {}; run 'nulang nula build' to update it",
+                LOCKFILE_FILE
+            ),
+            span: Span::default(),
+        });
+    }
+
+    // Legacy content_hash and strong SourceId have distinct meanings.
+    let fresh = candidate.with_available_source_identities()?;
+    for identity in &current.identity {
+        if !identity.source.starts_with("path+") || identity.source_id.is_empty() {
+            continue;
+        }
+        let updated = fresh.package_identity(&identity.name, &identity.version, &identity.source);
+        if updated.map(|record| record.source_id.as_str()) != Some(identity.source_id.as_str()) {
+            return Err(NuError::PackageError {
+                msg: format!(
+                    "--locked source identity changed for package '{}' {}; run 'nulang nula build' to update {}",
+                    identity.name, identity.version, LOCKFILE_FILE
+                ),
+                span: Span::default(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// `nula build`: resolve dependencies, write the lockfile, type-check entry.
 /// `nula build`: resolve dependencies, write the lockfile, type-check and
 /// compile to a .nbc artifact in .nula/dist/.
-fn cmd_build(json: bool) -> NuResult<()> {
+fn cmd_build(json: bool, locked: bool) -> NuResult<()> {
     let root = package_root()?;
     let manifest_path = root.join(MANIFEST_FILE);
     let manifest = Manifest::load(&root).map_err(|e| NuError::PackageError {
@@ -1074,7 +1164,7 @@ fn cmd_build(json: bool) -> NuResult<()> {
     let name = manifest.package.name.clone();
     let version = manifest.package.version.clone();
 
-    let entry = prepare_package()?;
+    let entry = prepare_package_with_lock_policy(locked)?;
     let entry_str = entry.to_string_lossy().into_owned();
 
     if json {
@@ -1238,7 +1328,7 @@ fn nulang_exe_output(args: &[&str]) -> NuResult<std::process::Output> {
 
 /// `nula build-wasm`: compile package to .wasm + AOT .cwasm.
 /// `nula build-wasm`: compile package to .wasm + AOT .cwasm in .nula/dist/.
-fn cmd_build_wasm() -> NuResult<()> {
+fn cmd_build_wasm(locked: bool) -> NuResult<()> {
     let root = package_root()?;
     let manifest_path = root.join(MANIFEST_FILE);
     let manifest = Manifest::load(&root).map_err(|e| NuError::PackageError {
@@ -1247,7 +1337,7 @@ fn cmd_build_wasm() -> NuResult<()> {
     })?;
     let name = manifest.package.name.clone();
 
-    let entry = prepare_package()?;
+    let entry = prepare_package_with_lock_policy(locked)?;
     let entry_str = entry.to_string_lossy().into_owned();
 
     let dist_dir = root.join(".nula").join("dist");
@@ -1267,9 +1357,9 @@ fn cmd_build_wasm() -> NuResult<()> {
 }
 
 /// `nula run`: build, then execute the entry point.
-fn cmd_run() -> NuResult<()> {
+fn cmd_run(locked: bool) -> NuResult<()> {
     eprintln!("Building and running...");
-    let entry = prepare_package()?;
+    let entry = prepare_package_with_lock_policy(locked)?;
     let entry_str = entry.to_string_lossy().into_owned();
     let caps = capability_args();
     let cap_refs: Vec<&str> = caps.iter().map(|s| s.as_str()).collect();
@@ -1278,9 +1368,9 @@ fn cmd_run() -> NuResult<()> {
 
 /// `nula run --watch` (or `nula watch`): build, run, and re-run when source
 /// files change under `src/`. Uses simple mtime polling.
-fn cmd_run_watch() -> NuResult<()> {
+fn cmd_run_watch(locked: bool) -> NuResult<()> {
     let root = package_root()?;
-    let entry = prepare_package()?;
+    let entry = prepare_package_with_lock_policy(locked)?;
     let entry_str = entry.to_string_lossy().into_owned();
 
     // Initial run
@@ -1299,7 +1389,7 @@ fn cmd_run_watch() -> NuResult<()> {
             last_mtimes = current;
             eprintln!("\n--- change detected, rebuilding ---");
             // Re-resolve in case dependencies changed
-            match prepare_package() {
+            match prepare_package_with_lock_policy(locked) {
                 Ok(entry) => {
                     let es = entry.to_string_lossy().into_owned();
                     let _ = nulang_exe(&[&es]);
@@ -1343,13 +1433,13 @@ fn collect_mtimes_recursive(dir: &Path, out: &mut Vec<(PathBuf, std::time::Syste
 /// `nula build --web`: static-site build. Compile the entry point, run it to
 /// collect `Web.route` registrations, render each static handler to an HTML
 /// file, and copy the static directory into the output directory.
-fn cmd_build_web() -> NuResult<()> {
+fn cmd_build_web(locked: bool) -> NuResult<()> {
     let root = package_root()?;
     let manifest = Manifest::load(&root).map_err(|e| NuError::PackageError {
         msg: format!("failed to load {}: {}", MANIFEST_FILE, e),
         span: Span::default(),
     })?;
-    let entry = prepare_package()?;
+    let entry = prepare_package_with_lock_policy(locked)?;
     let entry_str = entry.to_string_lossy().into_owned();
 
     let build_dir = root.join(".nula");
@@ -1595,7 +1685,7 @@ fn cmd_dev(port_override: Option<u16>) -> NuResult<()> {
     ])?;
 
     if runtime_routes.is_empty() {
-        cmd_build_web()?;
+        cmd_build_web(false)?;
         let output_dir = root.join(&manifest.web.output_dir);
         let addr = format!("127.0.0.1:{}", port);
         let listener = std::net::TcpListener::bind(&addr).map_err(|e| NuError::PackageError {
@@ -1700,9 +1790,9 @@ fn guess_content_type(path: &Path) -> &'static str {
 /// With `--verbose` (or `-v`): prints each test file name before execution,
 /// shows ✓ PASS / ✗ FAIL per file, and displays error messages for failures.
 /// Default (non-verbose) output is clean and greppable.
-fn cmd_test(filter: Option<&str>, verbose: bool, json: bool) -> NuResult<()> {
+fn cmd_test(filter: Option<&str>, verbose: bool, json: bool, locked: bool) -> NuResult<()> {
     eprintln!("Preparing package...");
-    let _entry = prepare_package()?;
+    let _entry = prepare_package_with_lock_policy(locked)?;
     let tests_dir = package_root()?.join("tests");
     let mut test_files: Vec<PathBuf> = match std::fs::read_dir(&tests_dir) {
         Ok(entries) => entries
@@ -1876,11 +1966,11 @@ fn cmd_test(filter: Option<&str>, verbose: bool, json: bool) -> NuResult<()> {
 
 /// `nula test --watch` (or `nula test -w`): run tests and re-run when source
 /// files change under `src/` or `tests/`. Uses simple mtime polling.
-fn cmd_test_watch(filter: Option<&str>, verbose: bool) -> NuResult<()> {
+fn cmd_test_watch(filter: Option<&str>, verbose: bool, locked: bool) -> NuResult<()> {
     let root = package_root()?;
 
     // Initial run
-    let _ = cmd_test(filter, verbose, false);
+    let _ = cmd_test(filter, verbose, false, locked);
 
     // Collect initial mtimes for all .nula files under src/ and tests/
     let src_dir = root.join("src");
@@ -1899,7 +1989,7 @@ fn cmd_test_watch(filter: Option<&str>, verbose: bool) -> NuResult<()> {
             // Clear screen
             print!("\x1B[2J\x1B[H");
             eprintln!("re-running tests...");
-            let _ = cmd_test(filter, verbose, false);
+            let _ = cmd_test(filter, verbose, false, locked);
         }
     }
 }
@@ -2204,7 +2294,7 @@ fn cmd_deploy(
     let version = manifest.package.version.clone();
 
     // Build the web output so dist/ contains the IR and static assets.
-    cmd_build_web()?;
+    cmd_build_web(false)?;
 
     let dist_dir = root.join(&manifest.web.output_dir);
 
@@ -2596,6 +2686,109 @@ mod tests {
     use super::*;
 
     #[test]
+    fn locked_mode_rejects_missing_lockfile_for_build_run_and_test() {
+        let dir = std::env::temp_dir().join(format!("nula_locked_missing_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        scaffold_package(&dir, "locked-app", "default").unwrap();
+        let _guard = ChangeDir::new(&dir);
+
+        for command in ["build", "run", "test", "build-wasm"] {
+            let args = vec![command.to_string(), "--locked".to_string()];
+            let error = run(&args).expect_err("locked command must require an existing lockfile");
+            assert!(error.to_string().contains("Nulang.lock"), "{error}");
+            assert!(!dir.join(LOCKFILE_FILE).exists());
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn locked_mode_preserves_unchanged_lockfile_bytes() {
+        let dir =
+            std::env::temp_dir().join(format!("nula_locked_unchanged_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        scaffold_package(&dir, "locked-app", "default").unwrap();
+        let _guard = ChangeDir::new(&dir);
+        prepare_package().unwrap();
+        let before = std::fs::read(dir.join(LOCKFILE_FILE)).unwrap();
+
+        prepare_package_with_lock_policy(true).expect("unchanged lockfile must be accepted");
+        assert_eq!(std::fs::read(dir.join(LOCKFILE_FILE)).unwrap(), before);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn locked_mode_rejects_changed_dependency_pin_without_rewriting() {
+        let dir =
+            std::env::temp_dir().join(format!("nula_locked_pin_drift_{}", std::process::id()));
+        let root = dir.join("root");
+        let util = dir.join("util");
+        let _ = std::fs::remove_dir_all(&dir);
+        scaffold_package(&root, "locked-app", "default").unwrap();
+        scaffold_package(&util, "util", "lib").unwrap();
+        let mut manifest = Manifest::load(&root).unwrap();
+        manifest.dependencies.insert(
+            "util".to_string(),
+            Dependency::Detailed(DependencyDetail {
+                path: Some("../util".to_string()),
+                ..Default::default()
+            }),
+        );
+        manifest.save(&root).unwrap();
+        let _guard = ChangeDir::new(&root);
+        prepare_package().unwrap();
+        let before = std::fs::read(root.join(LOCKFILE_FILE)).unwrap();
+
+        let mut util_manifest = Manifest::load(&util).unwrap();
+        util_manifest.package.version = "0.2.0".to_string();
+        util_manifest.save(&util).unwrap();
+
+        let error = prepare_package_with_lock_policy(true)
+            .expect_err("a changed dependency version must invalidate the lock");
+        assert!(error.to_string().contains("--locked"), "{error}");
+        assert_eq!(std::fs::read(root.join(LOCKFILE_FILE)).unwrap(), before);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn locked_mode_detects_changed_path_dependency_source_identity() {
+        let dir =
+            std::env::temp_dir().join(format!("nula_locked_source_drift_{}", std::process::id()));
+        let root = dir.join("root");
+        let util = dir.join("util");
+        let _ = std::fs::remove_dir_all(&dir);
+        scaffold_package(&root, "locked-app", "default").unwrap();
+        scaffold_package(&util, "util", "lib").unwrap();
+        let mut manifest = Manifest::load(&root).unwrap();
+        manifest.dependencies.insert(
+            "util".to_string(),
+            Dependency::Detailed(DependencyDetail {
+                path: Some("../util".to_string()),
+                ..Default::default()
+            }),
+        );
+        manifest.save(&root).unwrap();
+        let _guard = ChangeDir::new(&root);
+        prepare_package().unwrap();
+        let before = std::fs::read(root.join(LOCKFILE_FILE)).unwrap();
+        assert!(!Lockfile::load(&root).unwrap().identity.is_empty());
+
+        let lib_path = util.join("src/lib.nula");
+        let mut contents = std::fs::read_to_string(&lib_path).unwrap();
+        contents.push_str("\n// modification after locking\n");
+        std::fs::write(&lib_path, contents).unwrap();
+
+        let error = prepare_package_with_lock_policy(true)
+            .expect_err("changed dependency source must invalidate its identity");
+        assert!(error.to_string().contains("--locked"), "{error}");
+        assert_eq!(std::fs::read(root.join(LOCKFILE_FILE)).unwrap(), before);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_manifest_language_pin() {
         let dir = std::env::temp_dir().join(format!("nulang_lang_pin_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2761,7 +2954,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let _guard = ChangeDir::new(&dir);
 
-        let result = cmd_test(None, false, false);
+        let result = cmd_test(None, false, false, false);
         assert!(result.is_err(), "test outside package should fail");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -3082,7 +3275,7 @@ app "counter" {
         .unwrap();
 
         let _guard = ChangeDir::new(&dir);
-        cmd_build_web().expect("web build should succeed");
+        cmd_build_web(false).expect("web build should succeed");
 
         let html =
             std::fs::read_to_string(dir.join("dist/index.html")).expect("index.html should exist");
