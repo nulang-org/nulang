@@ -1924,6 +1924,8 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### ORCA deferred reclamation scan reduction — 2026-09-21
+- **Deferred ORCA reclamation avoids redundant linear scans.** Foreign-ref reclamation no longer searches the deferred list twice, and `process_deferred` skips the self-removal lookup after it already `swap_remove`s the current header. Recursive child cleanup keeps the defensive removal path.
 ### Cloud control-plane placement foundation — 2026-09-24
 - **Nulang Cloud now has an isolated deterministic control-plane planner** (`crates/nulang-cloud-control`) that turns deployment intent plus node/allocation snapshots into a pure `PlacementPlan` without mutating runtimes or provisioning infrastructure.
 - **Placement separates hard feasibility from soft ranking.** Node state, architecture, region/zone, trust tier, required labels/capabilities, resource availability, and per-node replica limits reject candidates before region-locality, failure-domain spread, node spread, and headroom scoring.
