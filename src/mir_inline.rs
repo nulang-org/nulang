@@ -694,15 +694,41 @@ fn inline_one_call(
 /// allocated the now-dead closure.
 fn remove_closure_allocation(func: &mut Function, clos: LocalId) {
     for block in &mut func.blocks {
-        block.stmts.retain(|stmt| {
-            !matches!(
-                stmt,
-                Stmt::Assign {
-                    dst,
-                    op: RValue::Closure { .. }
-                } if *dst == clos
-            )
+        let removed: Vec<usize> = block
+            .stmts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, stmt)| {
+                matches!(
+                    stmt,
+                    Stmt::Assign {
+                        dst,
+                        op: RValue::Closure { .. }
+                    } if *dst == clos
+                )
+                .then_some(index)
+            })
+            .collect();
+        if removed.is_empty() {
+            continue;
+        }
+        let block_id = block.id;
+        block.stmts = std::mem::take(&mut block.stmts)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, stmt)| (!removed.contains(&index)).then_some(stmt))
+            .collect();
+
+        // Source lines are keyed by statement index. Removing an allocation
+        // must discard its line and shift later indices in that basic block.
+        func.line_table.retain(|((bid, index), _)| {
+            *bid != block_id || !removed.contains(index)
         });
+        for ((bid, index), _) in &mut func.line_table {
+            if *bid == block_id {
+                *index -= removed.iter().filter(|&&old| old < *index).count();
+            }
+        }
     }
 }
 
