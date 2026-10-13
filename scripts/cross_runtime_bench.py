@@ -32,6 +32,9 @@ EXPECTED_MESSAGES = {
     "thread_ring": 20_000,
     "fork_join": 100_000,
 }
+# Nulang's standalone runner also emits Skynet; there is no matched
+# Go/Rust/Erlang fixture for it, so validate and exclude it from comparisons.
+NULANG_ONLY_MESSAGES = {"skynet": 1110}
 RECORD_RE = re.compile(
     r"\[cross-bench\]\s+runtime=(?P<runtime>[a-z0-9_-]+)\s+"
     r"benchmark=(?P<benchmark>[a-z0-9_-]+)\s+"
@@ -81,6 +84,11 @@ def maybe_version(command: list[str]) -> str | None:
 
 def parse_records(output: str, expected_runtime: str) -> dict[str, dict[str, int]]:
     records: dict[str, dict[str, int]] = {}
+    seen: set[str] = set()
+    allowed_messages = dict(EXPECTED_MESSAGES)
+    if expected_runtime == "nulang":
+        allowed_messages.update(NULANG_ONLY_MESSAGES)
+
     for match in RECORD_RE.finditer(output):
         runtime = match.group("runtime")
         if runtime != expected_runtime:
@@ -88,13 +96,14 @@ def parse_records(output: str, expected_runtime: str) -> dict[str, dict[str, int
                 f"unexpected runtime {runtime!r}; expected {expected_runtime!r}"
             )
         name = match.group("benchmark")
-        if name not in BENCHMARKS:
+        if name not in allowed_messages:
             raise RuntimeError(f"{expected_runtime}: unexpected benchmark {name!r}")
-        if name in records:
+        if name in seen:
             raise RuntimeError(f"{expected_runtime}: duplicate benchmark {name}")
+        seen.add(name)
 
         messages = int(match.group("messages"))
-        expected_messages = EXPECTED_MESSAGES[name]
+        expected_messages = allowed_messages[name]
         if messages != expected_messages:
             raise RuntimeError(
                 f"{expected_runtime}/{name}: got {messages} messages; "
@@ -106,7 +115,9 @@ def parse_records(output: str, expected_runtime: str) -> dict[str, dict[str, int
                 f"{expected_runtime}/{name}: elapsed_ns must be positive"
             )
 
-        records[name] = {"messages": messages, "elapsed_ns": elapsed_ns}
+        # Nulang-only controls are checked but excluded from the matched table.
+        if name in BENCHMARKS:
+            records[name] = {"messages": messages, "elapsed_ns": elapsed_ns}
 
     missing = [name for name in BENCHMARKS if name not in records]
     if missing:
@@ -115,7 +126,6 @@ def parse_records(output: str, expected_runtime: str) -> dict[str, dict[str, int
             f"{expected_runtime} did not emit records for: {', '.join(missing)}"
         )
     return records
-
 
 def measurement_order(selected: list[str], round_idx: int) -> list[str]:
     """Rotate measured runtime order to counterbalance within-round drift.
