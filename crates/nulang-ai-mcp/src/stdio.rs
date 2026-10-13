@@ -82,10 +82,13 @@ pub fn serve_stream<R: BufRead, W: Write>(
             )?;
             continue;
         }
-        if request.method == "initialize" {
+        let is_initialize = request.method == "initialize";
+        let response = runtime.block_on(server.handle_request(request));
+        // An invalid JSON-RPC version (or any unsuccessful handshake) must
+        // not authorize later tools/list or tools/call messages.
+        if is_initialize && response.error.is_none() {
             initialized = true;
         }
-        let response = runtime.block_on(server.handle_request(request));
         write_response(&mut output, &response)?;
     }
 }
