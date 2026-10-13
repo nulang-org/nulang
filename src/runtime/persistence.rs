@@ -2770,6 +2770,129 @@ impl PersistenceStore for RocksDbStore {
     }
 }
 
+// Database result decoding is deliberately separate from actor snapshots.
+// Never use Row::get on externally controlled SQL results: an unexpected
+// PostgreSQL type or NULL must be a recoverable error rather than a panic.
+#[cfg(feature = "postgres")]
+fn postgres_decode_column<T>(row: &postgres::Row, index: usize) -> io::Result<serde_json::Value>
+where
+    T: postgres::types::FromSqlOwned + serde::Serialize,
+{
+    let value: Option<T> = row.try_get(index).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed decoding PostgreSQL column {index}: {error}"),
+        )
+    })?;
+    serde_json::to_value(value).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+#[cfg(feature = "postgres")]
+fn postgres_column_to_json(row: &postgres::Row, index: usize) -> io::Result<serde_json::Value> {
+    use postgres::types::Type;
+
+    let data_type = row.columns()[index].type_();
+    if data_type == &Type::BOOL {
+        postgres_decode_column::<bool>(row, index)
+    } else if data_type == &Type::INT2 {
+        postgres_decode_column::<i16>(row, index)
+    } else if data_type == &Type::INT4 {
+        postgres_decode_column::<i32>(row, index)
+    } else if data_type == &Type::INT8 {
+        postgres_decode_column::<i64>(row, index)
+    } else if data_type == &Type::FLOAT4 {
+        postgres_decode_column::<f32>(row, index)
+    } else if data_type == &Type::FLOAT8 {
+        postgres_decode_column::<f64>(row, index)
+    } else if data_type == &Type::TEXT
+        || data_type == &Type::VARCHAR
+        || data_type == &Type::BPCHAR
+        || data_type == &Type::NAME
+    {
+        postgres_decode_column::<String>(row, index)
+    } else if data_type == &Type::JSON || data_type == &Type::JSONB {
+        postgres_decode_column::<serde_json::Value>(row, index)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported PostgreSQL result type {} at column {index}", data_type.name()),
+        ))
+    }
+}
+
+// Bind integer parameters at their prepared-statement widths rather than
+// assuming every Nulang Int is a PostgreSQL BIGINT. Range violations fail
+// before sending a query; the driver remains responsible for SQL-type checks.
+#[cfg(feature = "postgres")]
+fn postgres_bind_value(
+    value: &Value,
+    expected: &postgres::types::Type,
+) -> io::Result<Box<dyn postgres::types::ToSql + Sync>> {
+    use postgres::types::Type;
+
+    if let Some(number) = value.as_int() {
+        if expected == &Type::INT2 {
+            return Ok(Box::new(i16::try_from(number).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "integer is out of PostgreSQL SMALLINT range")
+            })?));
+        }
+        if expected == &Type::INT4 {
+            return Ok(Box::new(i32::try_from(number).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "integer is out of PostgreSQL INTEGER range")
+            })?));
+        }
+        if expected == &Type::FLOAT4 {
+            return Ok(Box::new(number as f32));
+        }
+        if expected == &Type::FLOAT8 {
+            return Ok(Box::new(number as f64));
+        }
+        return Ok(Box::new(number));
+    }
+    if let Some(number) = value.as_float() {
+        if expected == &Type::FLOAT4 {
+            let narrowed = number as f32;
+            if number.is_finite() && !narrowed.is_finite() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "float is out of PostgreSQL REAL range",
+                ));
+            }
+            return Ok(Box::new(narrowed));
+        }
+        return Ok(Box::new(number));
+    }
+    if let Some(boolean) = value.as_bool() {
+        return Ok(Box::new(boolean));
+    }
+    if value.is_nil() {
+        if expected == &Type::INT2 {
+            return Ok(Box::new(None::<i16>));
+        }
+        if expected == &Type::INT4 {
+            return Ok(Box::new(None::<i32>));
+        }
+        if expected == &Type::INT8 {
+            return Ok(Box::new(None::<i64>));
+        }
+        if expected == &Type::FLOAT4 {
+            return Ok(Box::new(None::<f32>));
+        }
+        if expected == &Type::FLOAT8 {
+            return Ok(Box::new(None::<f64>));
+        }
+        if expected == &Type::BOOL {
+            return Ok(Box::new(None::<bool>));
+        }
+        if expected == &Type::JSON || expected == &Type::JSONB {
+            return Ok(Box::new(None::<serde_json::Value>));
+        }
+        return Ok(Box::new(None::<String>));
+    }
+    // Preserve the existing string representation for source compatibility.
+    Ok(Box::new(value.to_string_repr()))
+}
+
 // ---------------------------------------------------------------------------
 // PostgresStore — production relational persistence backend
 // ---------------------------------------------------------------------------
@@ -3157,58 +3280,42 @@ impl PersistenceStore for PostgresStore {
 
     fn query(&self, sql: &str, params: &[Value]) -> io::Result<Vec<String>> {
         let mut conn = self.conn.lock().unwrap();
-        // Preserve Nulang Value types when binding Postgres parameters so
-        // numeric/boolean comparisons work without explicit SQL casts.
+        // Prepare first so PostgreSQL, not the Nulang runtime, determines
+        // integer widths and the actual parameter types.
+        let statement = conn
+            .prepare(sql)
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+        if statement.params().len() != params.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "SQL expects {} parameters, received {}",
+                    statement.params().len(),
+                    params.len(),
+                ),
+            ));
+        }
         let typed_params: Vec<Box<dyn postgres::types::ToSql + Sync>> = params
             .iter()
-            .map(|v| {
-                if let Some(i) = v.as_int() {
-                    Box::new(i) as Box<dyn postgres::types::ToSql + Sync>
-                } else if let Some(f) = v.as_float() {
-                    Box::new(f) as Box<dyn postgres::types::ToSql + Sync>
-                } else if let Some(b) = v.as_bool() {
-                    Box::new(b) as Box<dyn postgres::types::ToSql + Sync>
-                } else {
-                    Box::new(v.to_string_repr()) as Box<dyn postgres::types::ToSql + Sync>
-                }
-            })
-            .collect();
+            .zip(statement.params())
+            .map(|(value, expected)| postgres_bind_value(value, expected))
+            .collect::<io::Result<_>>()?;
         let param_refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
-            typed_params.iter().map(|p| p.as_ref()).collect();
+            typed_params.iter().map(|param| param.as_ref()).collect();
         let rows = conn
-            .query(sql, &param_refs)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-        let mut results = Vec::new();
+            .query(&statement, &param_refs)
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+
+        let mut results = Vec::with_capacity(rows.len());
         for row in &rows {
-            let mut cols: Vec<serde_json::Value> = Vec::with_capacity(row.len());
-            for i in 0..row.len() {
-                let json_val = match row.columns().get(i).map(|c| c.type_().name()) {
-                    Some("bool") => {
-                        let v: bool = row.get(i);
-                        serde_json::Value::Bool(v)
-                    }
-                    Some("int2") | Some("int4") | Some("int8") => {
-                        let v: i64 = row.get(i);
-                        serde_json::value::Number::from_i128(v as i128)
-                            .map(serde_json::Value::Number)
-                            .unwrap_or(serde_json::Value::Null)
-                    }
-                    Some("float4") | Some("float8") => {
-                        let v: f64 = row.get(i);
-                        serde_json::value::Number::from_f64(v)
-                            .map(serde_json::Value::Number)
-                            .unwrap_or(serde_json::Value::Null)
-                    }
-                    _ => {
-                        let v: String = row.get(i);
-                        serde_json::Value::String(v)
-                    }
-                };
-                cols.push(json_val);
+            let mut columns = Vec::with_capacity(row.len());
+            for index in 0..row.len() {
+                columns.push(postgres_column_to_json(row, index)?);
             }
-            let json = serde_json::to_string(&cols)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            results.push(json);
+            results.push(
+                serde_json::to_string(&columns)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+            );
         }
         Ok(results)
     }
