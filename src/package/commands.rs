@@ -101,7 +101,7 @@ pub fn run(args: &[String]) -> NuResult<()> {
             }
         }
         Some("build-wasm") => {
-            if args[1..].iter().any(|a| a != "--locked") {
+            if args[1..].iter().any(|a| a.as_str() != "--locked") {
                 return Err(NuError::PackageError {
                     msg: format!("unknown flag '{}' for nula build-wasm", args[1]),
                     span: Span::default(),
