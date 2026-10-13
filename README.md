@@ -86,6 +86,25 @@ Windows x86_64; other platform/architecture combinations are not release-tested.
 
 ## Quick Start
 
+The simplest package commands can be invoked directly (the existing
+`nulang nula <command>` form remains supported):
+
+```bash
+nulang new hello-app
+cd hello-app
+nulang run
+nulang test
+```
+
+For a standalone file, `nulang check hello.nula` aliases
+`nulang --check hello.nula`. To avoid writing `perform` at every ordinary
+IO/string call, opt into `import stdlib::prelude`; it exposes `println`,
+`string_length`, and `int_to_string` as wrappers around the existing
+effects. See [the ergonomic quick start](docs/DX_QUICK_START.md).
+The existing `nulang init <name>` experiment command is unchanged;
+package initialization still uses `nulang nula init`.
+
+
 A pre-built release binary needs no Rust toolchain. To build from source, use
 Rust 1.95.0:
 
