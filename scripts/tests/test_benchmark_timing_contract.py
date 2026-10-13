@@ -40,7 +40,7 @@ class BenchmarkTimingContractTests(unittest.TestCase):
 
         self.assertNotIn("git push", persist)
         self.assertNotIn("git commit", persist)
-        self.assertIn("::warning::", persist)
+        self.assertIn("::warning title=Benchmark history requires a PR::", persist)
         self.assertIn("automation/benchmark-history", persist)
         self.assertIn(
             "- name: Fail the job if a regression was confirmed",
