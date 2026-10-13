@@ -38,6 +38,34 @@ fn classifies_every_supported_aggregate_site_in_instruction_order() {
 }
 
 #[test]
+fn report_rejects_nested_pointer_store_after_scalar_prefix() {
+    // A zero-pointer prefix must not prevent the forward analysis from
+    // seeing the later child pointer stored into an aggregate container.
+    let mut module = CodeModule::new("nested-pointer-after-nop");
+    module.emit(Instruction::new0(OpCode::Nop));
+    module.emit(Instruction::new1(OpCode::Const0, 0));
+    module.emit(Instruction::new2(OpCode::ArrAlloc, 0, 1));
+    module.emit(Instruction::new2(OpCode::ArrAlloc, 0, 2));
+    module.emit(Instruction::new3(OpCode::ArrStore, 1, 0, 2));
+    module.emit(Instruction::new1(OpCode::Drop, 1));
+    module.emit(Instruction::new1(OpCode::Drop, 2));
+    module.emit(Instruction::new0(OpCode::Halt));
+
+    let report = analyze_aggregate_allocations(&module);
+    assert_eq!(report.total_sites, 2);
+    assert_eq!(report.arena_eligible, 0);
+    assert_eq!(report.not_proven, 2);
+    assert_eq!(
+        report.sites[0].disposition,
+        AllocationDisposition::NotProven
+    );
+    assert_eq!(
+        report.sites[1].disposition,
+        AllocationDisposition::NotProven
+    );
+}
+
+#[test]
 fn report_fails_closed_for_escaping_actor_messages() {
     let mut module = CodeModule::new("send-escapes");
     module.emit(Instruction::new2(OpCode::ArrAlloc, 0, 1));
