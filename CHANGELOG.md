@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Iso-arena may-pointer CFG reachability fix — 2026-10-13
+- **Corrected a conservative pointer-analysis traversal bug affecting opt-in iso-arena allocation.** Successor instructions are visited even when their current may-pointer set is empty; previously scalar/no-op prefixes could prevent analysis of later heap-pointer stores and incorrectly qualify an arena container without child retains.
+- **Added a fail-closed regression test for a nested pointer store behind a zero-pointer prefix.** This change does not alter ORCA ownership semantics or bytecode format; it restricts arena eligibility when a pointer child may be present.
+
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
