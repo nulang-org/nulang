@@ -1708,13 +1708,24 @@ fn fold_function(
     for block in &mut func.blocks {
         for stmt in &mut block.stmts {
             if let mir::Stmt::Assign { op, .. } = stmt {
-                let mut original = mir::RValue::Const(Constant::Nil);
-                std::mem::swap(op, &mut original);
-                let folded = fold_rvalue(original, const_locals, is_float);
-                if folded != *op {
-                    *op = folded;
-                    changed = true;
-                }
+                // Compare with the original expression, not the temporary Nil
+                // placeholder used while fold_rvalue consumes the RValue.
+                // Otherwise non-foldable assignments look changed on every pass,
+                // while a real fold to Nil can be reported as unchanged.
+                let original = std::mem::replace(op, mir::RValue::Const(Constant::Nil));
+                let folded = fold_rvalue(original.clone(), const_locals, is_float);
+                // Float PartialEq is not reflexive for NaN. Compare bits
+                // for floating constants so an unchanged NaN (or signed zero)
+                // does not confuse fixed-point convergence.
+                let expression_changed = match (&original, &folded) {
+                    (
+                        mir::RValue::Const(Constant::Float(before)),
+                        mir::RValue::Const(Constant::Float(after)),
+                    ) => before.to_bits() != after.to_bits(),
+                    _ => folded != original,
+                };
+                changed |= expression_changed;
+                *op = folded;
             }
         }
     }
@@ -2943,6 +2954,80 @@ mod tests {
         let mut vm = VM::new();
         vm.load_module(module);
         vm.run()
+    }
+
+    #[test]
+    fn test_fold_function_reports_no_change_when_expression_cannot_fold() {
+        let mut builder = mir::FunctionBuilder::new("no_fold", Some(Type::int()));
+        let left = builder.add_param("left", Type::int());
+        let right = builder.add_param("right", Type::int());
+        let result = builder.add_temp(Type::int());
+        builder.assign(
+            result,
+            mir::RValue::Binary(crate::ast::BinOp::Add, left, right),
+        );
+        builder.terminate(mir::Terminator::Return(Some(result)));
+        let mut function = builder.build();
+        let before = function.clone();
+        let float_locals = vec![false; function.locals.len()];
+
+        assert!(
+            !fold_function(&mut function, &std::collections::HashMap::new(), &float_locals),
+            "an unchanged non-constant expression must not trigger another optimization iteration"
+        );
+        assert_eq!(function, before);
+    }
+
+    #[test]
+    fn test_fold_function_does_not_revisit_unchanged_nan_constant() {
+        let mut builder = mir::FunctionBuilder::new("nan_no_fold", Some(Type::float()));
+        let result = builder.add_temp(Type::float());
+        builder.assign(result, mir::RValue::Const(Constant::Float(f64::NAN)));
+        builder.terminate(mir::Terminator::Return(Some(result)));
+        let mut function = builder.build();
+        let float_locals = vec![true; function.locals.len()];
+
+        assert!(
+            !fold_function(&mut function, &std::collections::HashMap::new(), &float_locals),
+            "unchanged NaN constants must not force the optimizer to its iteration cap"
+        );
+        assert!(matches!(
+            &function.blocks[0].stmts[0],
+            mir::Stmt::Assign {
+                op: mir::RValue::Const(Constant::Float(value)),
+                ..
+            } if value.is_nan()
+        ));
+    }
+
+    #[test]
+    fn test_fold_function_reports_change_when_division_folds_to_nil() {
+        let mut builder = mir::FunctionBuilder::new("nil_fold", Some(Type::int()));
+        let numerator = builder.add_param("numerator", Type::int());
+        let denominator = builder.add_param("denominator", Type::int());
+        let result = builder.add_temp(Type::int());
+        builder.assign(
+            result,
+            mir::RValue::Binary(crate::ast::BinOp::Div, numerator, denominator),
+        );
+        builder.terminate(mir::Terminator::Return(Some(result)));
+        let mut function = builder.build();
+        let mut constants = std::collections::HashMap::new();
+        constants.insert(numerator, Constant::Int(42));
+        constants.insert(denominator, Constant::Int(0));
+        let float_locals = vec![false; function.locals.len()];
+
+        assert!(
+            fold_function(&mut function, &constants, &float_locals),
+            "folding to Nil must count as a change"
+        );
+        assert!(matches!(
+            &function.blocks[0].stmts[0],
+            mir::Stmt::Assign {
+                op: mir::RValue::Const(Constant::Nil),
+                ..
+            }
+        ));
     }
 
     #[test]
