@@ -18,7 +18,9 @@ cargo run --release --locked --no-default-features --features difffuzz --bin nul
 cargo run --release --locked --no-default-features --features difffuzz --bin nula_difffuzz -- --seeds 8000 --seed-base 100000
 ```
 
-The seed ranges used in the campaign are **0..22400** and **100000..108000**,
-as documented in `docs/DIFFERENTIAL_FUZZING.md`. Crashers are written under
-`fuzz/differential/crashers/` (grouped by divergence class, e.g.
-`known-overflow/`) with filenames of the form `seed_<16-hex-digit-seed>.nula`.
+The seed ranges used in the historical campaign are **0..22400** and
+**100000..108000**, as documented in `docs/DIFFERENTIAL_FUZZING.md`. New
+crashers are written directly under `fuzz/differential/crashers/` with
+filenames of the form `seed_<16-hex-digit-seed>.nula`. Legacy subdirectories
+such as `known-overflow/` describe historical campaign triage only; current
+campaigns do not exempt any divergence class.

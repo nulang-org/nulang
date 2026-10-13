@@ -97,25 +97,17 @@ fn main() {
         nulang::difffuzz::run_campaign(seed_base, seeds, deadline, Some(&crashers), verbose);
 
     println!(
-        "campaign: {} programs generated in {:.1}s\n  agreed: {} ({} also agreed under AOT)\n  uncomparable: {}\n  compile failures: {}\n  known-overflow divergences: {}\n  divergences: {}",
+        "campaign: {} programs generated in {:.1}s\n  agreed: {} ({} also agreed under AOT)\n  uncomparable: {}\n  compile failures: {}\n  divergences: {}",
         stats.generated,
         started.elapsed().as_secs_f64(),
         stats.agreed,
         stats.aot_agreed,
         stats.uncomparable,
         stats.compile_failures.len(),
-        stats.known_overflow.len(),
         stats.divergences.len(),
     );
     for (seed, _) in stats.compile_failures.iter().take(10) {
         println!("  compile-failure seed: {0} (0x{0:x})", seed);
-    }
-    for d in stats.known_overflow.iter().take(10) {
-        println!(
-            "  known-overflow seed: {0} (0x{0:x}): {1}",
-            d.seed,
-            d.message.lines().next().unwrap_or("")
-        );
     }
     for d in stats.divergences.iter().take(20) {
         println!(

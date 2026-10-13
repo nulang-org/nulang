@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Differential oracle fail-closed — 2026-09-25
+- **Cross-backend differential campaigns no longer whitelist 48-bit overflow mismatches as a known divergence class** (`src/difffuzz.rs`, `src/bin/nula_difffuzz.rs`). Once a backend accepts a program, any VM/JIT/native/WASM disagreement is an ordinary fatal divergence, is written to the main crasher directory, and makes the standalone campaign exit nonzero.
+- **Historical overflow crashers remain provenance, not policy.** The differential-fuzzing documentation now distinguishes the August 2026 bring-up findings from the current fail-closed oracle.
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
