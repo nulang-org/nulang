@@ -1,0 +1,14 @@
+// Capture-free closure calls should preserve behavior when lowered to direct calls.
+// Closures carrying an environment must remain dynamic.
+fn main() {
+    let plain = fn(x) { x * 2 }
+    let result = plain(21)
+    perform IO.print("plain=" + perform Int.to_string(result))
+
+    let offset = 40
+    let with_capture = fn(x) { x + offset }
+    perform IO.print("captured=" + perform Int.to_string(with_capture(2)))
+
+    let zero = fn() { 7 }
+    perform IO.print("zero=" + perform Int.to_string(zero()))
+}
