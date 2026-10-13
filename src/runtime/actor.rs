@@ -316,6 +316,9 @@ pub struct Actor {
     cycle_sentinel: Option<*mut OrcaHeader>,
     /// Suspended VM state for a workflow step waiting on a signal.
     pub suspended_execution: Option<SuspendedExecution>,
+    /// Unique runtime-local async SQL request identity. Never persisted.
+    /// A reused actor ID cannot consume a previous instance's completion.
+    pub db_operation_id: Option<u64>,
     /// JIT safepoint counter: decremented per JIT region entry in JIT code.
     /// When it reaches 0, the JIT yields back to the scheduler.
     pub jit_safepoint_counter: u64,
@@ -465,6 +468,7 @@ impl Actor {
             workflow_replay_event_ordinal: 0,
             cycle_sentinel: None,
             suspended_execution: None,
+            db_operation_id: None,
             waiting_signal: None,
             received_signals: Vec::new(),
             query_handlers: HashMap::new(),
@@ -535,6 +539,7 @@ impl Actor {
         self.workflow_replay_event_ordinal = 0;
         self.cycle_sentinel = None;
         self.suspended_execution = None;
+        self.db_operation_id = None;
         self.waiting_signal = None;
         self.received_signals.clear();
         self.query_handlers.clear();
