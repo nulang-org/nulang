@@ -22,6 +22,7 @@ pub mod cache_routing;
 pub mod cache_server;
 mod foreign_call;
 mod foreign_executor;
+mod db_effect;
 mod gc;
 pub mod heap;
 pub(crate) mod heap_serialize;
@@ -460,6 +461,12 @@ pub struct Runtime {
 
     // Persistence engine (v0.7)
     pub persistence: Box<dyn PersistenceStore>,
+    // Application SQL runs on bounded workers; this state is scheduler-owned
+    // and must never be included in durable actor snapshots.
+    pub(crate) db_query_executor: Option<BoundedDbQueryExecutor>,
+    pub(crate) db_pending: HashMap<u64, db_effect::PendingDbEffect>,
+    pub(crate) db_ticket_actors: HashMap<DbQueryTicket, u64>,
+    pub(crate) db_next_token: u64,
     // Immutable shared object store for large `val` buffers.
     pub object_store: ObjectStore,
     // Virtual actor (grain) type registry and resident mapping.
@@ -694,6 +701,10 @@ impl Runtime {
             process_groups: ProcessGroups::new(),
             pending_fetched_messages: HashMap::new(),
             persistence: Box::new(MemoryStore::new()),
+            db_query_executor: None,
+            db_pending: HashMap::new(),
+            db_ticket_actors: HashMap::new(),
+            db_next_token: 0,
             object_store: ObjectStore::new(),
             grain_registry: GrainRegistry::new(),
             grain_residents: HashMap::new(),
@@ -3176,10 +3187,14 @@ impl Runtime {
         let mut ticks: u64 = 0;
         loop {
             self.drain_cross_shard_messages();
+            self.poll_db_query_completions();
             let actor_id = match self.claim_next_ready_actor() {
                 Some(actor_id) => actor_id,
                 None => {
-                    if self.llm_inflight_count() == 0 && self.timer_wheel.is_empty() {
+                    if self.llm_inflight_count() == 0
+                        && self.db_pending.is_empty()
+                        && self.timer_wheel.is_empty()
+                    {
                         if let Some(ref mut cb) = self.idle_callback {
                             cb();
                         }
