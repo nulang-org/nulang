@@ -3,6 +3,16 @@
 > Practical orientation for AI assistants working in the Nulang codebase.
 > All paths are relative to the repo root (`~/nulang`).
 
+## Compiler-guided check loop for coding agents
+
+- Run `nulang --json --check path/to/file.nula` for source changes and parse
+  versioned diagnostics rather than scraping terminal output.
+- Read [docs/AGENT_DIAGNOSTICS.md](docs/AGENT_DIAGNOSTICS.md) before consuming
+  machine-readable fixes. Treat `suggestion.edit` as requiring review:
+  verify the source revision and `expected_text`, then re-run checks/tests.
+- Do not infer edits from natural-language advice or assume all backends have
+  equal language support. Keep the bytecode runtime as the semantic reference.
+
 ## Project Overview
 
 **Nulang** is a typed programming language for concurrent, durable, and distributed software, written in Rust (edition 2021, Cargo workspace with a primary `nulang` crate and a `nulang-ai` support crate). Actors are the addressable-isolation model rather than the ontology for all computation. Nulang combines Erlang-style fault-tolerant actors with a Rust/Pony-inspired type system (Hindley-Milner inference + reference capabilities + row-polymorphic algebraic effects), a register-based bytecode VM, a Cranelift JIT, a WASM backend (MIR→WASM via `wasm-encoder`) with a Wasmtime host runtime, BEAM/OTP primitives, CRDTs, location-transparent distribution, multi-backend persistence (memory/JSON/libSQL, with optional RocksDB/PostgreSQL), PyO3 Python interop, a C-compatible FFI layer, a v0.9 AI runtime (pure types in `crates/nulang-ai/`, `Runtime` glue in `src/runtime/`), and a format-stability layer (`src/format/` — frozen `.nbc` bytecode artifacts, NUL0 wire protocol versioning, migration registry). Status: Alpha; 1558 tests pass in the core crate (`cargo test`), 1596 with `--features wasm-backend`; the `nulang-ai` crate ships 58 additional tests (`cargo test -p nulang-ai`). License: Apache-2.0.
