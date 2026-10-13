@@ -2840,6 +2840,8 @@ mod host_authority_tests {
         let mut module = crate::bytecode::CodeModule::new("actor-host-effects");
         module.add_constant(Constant::String("PATH".into()));
         module.add_constant(Constant::String(file.to_string_lossy().into_owned()));
+        module.add_constant(Constant::String("replacement".into()));
+        module.add_constant(Constant::String("-appended".into()));
         let callbacks_runtime = Rc::new(RefCell::new(Runtime::new()));
         let mut callbacks = super::RuntimeVmCallbacks::new(callbacks_runtime);
 
@@ -2868,6 +2870,21 @@ mod host_authority_tests {
             .perform_builtin_effect_in_module("FS", Some("exists"), &module, &[Value::string(1)])
             .expect("FS.exists must be handled by the actor-backed top-level VM");
         assert_eq!(exists, Value::bool(true));
+
+        let write = callbacks
+            .perform_builtin_effect_in_module(
+                "FS", Some("write"), &module, &[Value::string(1), Value::string(2)],
+            )
+            .expect("FS.write must be handled");
+        assert_eq!(write, Value::unit());
+
+        let append = callbacks
+            .perform_builtin_effect_in_module(
+                "FS", Some("append"), &module, &[Value::string(1), Value::string(3)],
+            )
+            .expect("FS.append must be handled");
+        assert_eq!(append, Value::unit());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "replacement-appended");
 
         assert!(
             callbacks
