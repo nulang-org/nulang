@@ -11654,7 +11654,7 @@ match { a: 2, b: 9 } with {
                 .persistence
                 .load_snapshot(actor_id)
                 .and_then(|snapshot| snapshot.state.get("step_index").cloned()),
-            Some(PersistedValue::Int(1)),
+            Some(crate::runtime::PersistedValue::Int(1)),
             "terminal receipt must have a matching durable checkpoint"
         );
     }
