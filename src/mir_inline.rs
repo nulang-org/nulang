@@ -1102,6 +1102,31 @@ mod tests {
     }
 
     #[test]
+    fn test_inlining_removes_stale_closure_source_lines() {
+        let mut m = build_inlinable_program();
+        let caller = &mut m.functions[1];
+        caller.line_table = vec![
+            ((BlockId(0), 0), 10),
+            ((BlockId(0), 1), 20),
+            ((BlockId(0), 2), 30),
+        ];
+
+        assert_eq!(inline_local_closures(&mut m), 1);
+
+        let caller = &m.functions[1];
+        assert_eq!(caller.blocks[0].stmts.len(), 1);
+        assert!(
+            caller.line_table.iter().all(|((bid, si), _)| {
+                caller.blocks.get(bid.0 as usize)
+                    .is_some_and(|block| *si < block.stmts.len())
+            }),
+            "all debugger line indices must refer to surviving statements"
+        );
+        assert!(caller.line_table.contains(&((BlockId(0), 0), 10)));
+        assert!(!caller.line_table.iter().any(|(_, line)| *line == 20));
+    }
+
+    #[test]
     fn test_closure_used_in_state_write_is_not_removed() {
         let mut m = build_inlinable_program();
         let closure = match &m.functions[1].blocks[0].stmts[1] {
