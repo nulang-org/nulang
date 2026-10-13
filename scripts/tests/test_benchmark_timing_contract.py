@@ -7,6 +7,7 @@ BENCH_FILES = (
     ROOT / "benches" / "interp_bench.rs",
     ROOT / "benches" / "vm_bench.rs",
     ROOT / "benches" / "jit_bench.rs",
+    ROOT / "benches" / "gc_bench.rs",
 )
 CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 
