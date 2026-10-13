@@ -832,7 +832,7 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
                     _ => None,
                 });
             let outcome = match sql {
-                Some(sql) => {
+                Some(sql) if !sql.trim().is_empty() => {
                     let rt = self.runtime.borrow();
                     let result = rt.persistence.query(sql, &regs[1..]);
                     if let Err(error) = &result {
@@ -1683,7 +1683,7 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
                         _ => None,
                     });
                 let outcome = match sql {
-                    Some(sql) => {
+                    Some(sql) if !sql.trim().is_empty() => {
                         let result = (*self.runtime).persistence.query(sql, &regs[1..]);
                         if let Err(error) = &result {
                             tracing::warn!(%error, "DB.query_checked failed");
@@ -3165,6 +3165,19 @@ mod checked_query_effect_tests {
         // The callback owns the live allocation until the runtime is dropped.
         let encoded = unsafe { CStr::from_ptr(ptr.cast()).to_str().unwrap() };
         assert!(encoded.contains(r#""status":"error""#));
+        assert!(encoded.contains(r#""code":"invalid_input""#));
+
+        let blank = [crate::bytecode::Constant::String("   ".into())];
+        let empty_sql = callbacks
+            .perform_builtin_effect(
+                "DB",
+                Some("query_checked"),
+                &blank,
+                &[crate::vm::Value::string(0)],
+            )
+            .expect("blank SQL must return a checked error");
+        let ptr = empty_sql.as_ptr().expect("error envelope is a heap string");
+        let encoded = unsafe { CStr::from_ptr(ptr.cast()).to_str().unwrap() };
         assert!(encoded.contains(r#""code":"invalid_input""#));
 
         let sql = [crate::bytecode::Constant::String("SELECT 1".into())];
