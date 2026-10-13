@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::package::lockfile::{LockedPackage, Lockfile};
+use crate::package::lockfile::{registry_cache_dir, LockedPackage, Lockfile};
 use crate::package::manifest::{Dependency, DependencyDetail, Manifest, MANIFEST_FILE};
 use crate::types::{NuError, NuResult, Span};
 
@@ -183,6 +183,9 @@ pub fn resolve_offline(
     manifest: &Manifest,
     lockfile: &Lockfile,
 ) -> NuResult<Resolution> {
+    // Validate each cached registry pin before traversing any dependency graph.
+    // Nothing in this check fetches, extracts, or repairs source code.
+    lockfile.verify_cached_registry_source_identities(root_dir)?;
     let resolution = resolve_with_lock(root_dir, manifest, Some(lockfile.clone()))?;
     if resolution.to_lockfile().package != lockfile.package {
         return Err(NuError::PackageError {
@@ -328,17 +331,12 @@ impl Resolver {
     ) -> NuResult<()> {
         let (dep_dir, source) = match dep {
             Dependency::Version(req) => {
-                if self.offline_lock.is_some() {
-                    return Err(NuError::PackageError {
-                        msg: format!(
-                            "offline registry dependency '{}' is unsupported until cached artifact integrity is verified",
-                            dep_name
-                        ),
-                        span: Span::default(),
-                    });
-                }
                 let registry_url = self.resolve_dependency_registry(parent_dir)?;
-                let (dir, _ver) = self.fetch_registry(dep_name, req, &registry_url)?;
+                let (dir, _ver) = if let Some(lockfile) = &self.offline_lock {
+                    self.fetch_registry_offline(dep_name, req, &registry_url, lockfile)?
+                } else {
+                    self.fetch_registry(dep_name, req, &registry_url)?
+                };
                 (dir, PackageSource::Registry(registry_url))
             }
             Dependency::Detailed(detail) => {
@@ -654,6 +652,52 @@ impl Resolver {
             msg: "No registry configured — set `registry` in `[package]` of Nulang.toml, or use path/git dependencies".to_string(),
             span: Span::default(),
         })
+    }
+
+    /// Resolve an already-verified registry cache at the exact lockfile pin.
+    /// The full cached tree was checked by resolve_offline before traversal;
+    /// this method only selects a matching package without a remote request.
+    fn fetch_registry_offline(
+        &self,
+        dep_name: &str,
+        requirement: &str,
+        registry_url: &str,
+        lockfile: &Lockfile,
+    ) -> NuResult<(PathBuf, String)> {
+        let source = format!("reg+{}", registry_url);
+        let matches = lockfile
+            .package
+            .iter()
+            .filter(|package| package.name == dep_name && package.source == source)
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err(NuError::PackageError {
+                msg: format!(
+                    "offline registry dependency '{}' requires one exact package pin from {} in Nulang.lock",
+                    dep_name, registry_url
+                ),
+                span: Span::default(),
+            });
+        }
+        let pinned = matches[0];
+        if !version_satisfies(requirement, &pinned.version)? {
+            return Err(NuError::PackageError {
+                msg: format!(
+                    "offline registry dependency '{}' requires version {} but lockfile pins {}",
+                    dep_name, requirement, pinned.version
+                ),
+                span: Span::default(),
+            });
+        }
+        let cached = registry_cache_dir(&self.root_dir, dep_name, &pinned.version)?;
+        let path = std::fs::canonicalize(&cached).map_err(|e| NuError::PackageError {
+            msg: format!(
+                "offline registry cache missing for '{}' {} at {}: {}",
+                dep_name, pinned.version, cached.display(), e
+            ),
+            span: Span::default(),
+        })?;
+        Ok((path, pinned.version.clone()))
     }
 
     /// Fetch a package from the registry, extract it to
