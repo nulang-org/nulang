@@ -3723,6 +3723,40 @@ mod postgres_store_tests {
     }
 
     #[test]
+    fn postgres_query_decodes_scalar_widths_nulls_and_jsonb() {
+        let Some(url) = pg_url() else {
+            // An actual PostgreSQL server is required for the wire decoding path.
+            return;
+        };
+        let store = PostgresStore::new(&url).unwrap();
+        let rows = store.query(
+            "SELECT 7::int2, 100::int4, 9000000000::int8, \
+                    1.5::float4, 2.25::float8, TRUE::bool, \
+                    'hello'::text, NULL::int4, NULL::text, \
+                    '{\"ok\":true}'::jsonb",
+            &[],
+        ).unwrap();
+
+        assert_eq!(rows.len(), 1);
+        let values: serde_json::Value = serde_json::from_str(&rows[0]).unwrap();
+        assert_eq!(values, serde_json::json!([
+            7, 100, 9000000000_i64, 1.5, 2.25, true,
+            "hello", null, null, {"ok": true}
+        ]));
+    }
+
+    #[test]
+    fn postgres_query_reports_unsupported_columns_instead_of_panicking() {
+        let Some(url) = pg_url() else {
+            return;
+        };
+        let store = PostgresStore::new(&url).unwrap();
+        let error = store.query("SELECT decode('abcd', 'hex')::bytea", &[])
+            .expect_err("unknown column codecs must produce an error");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
     fn test_postgres_store_save_load_snapshot() {
         let url = match pg_url() {
             Some(u) => u,
