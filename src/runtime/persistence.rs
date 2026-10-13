@@ -3846,7 +3846,7 @@ mod postgres_store_tests {
             Err(error) if error.kind() == io::ErrorKind::InvalidInput
         ));
         assert!(postgres_bind_value(&Value::int(32_767), &postgres::types::Type::INT2).is_ok());
-        assert!(postgres_bind_value(&Value::int(i64::MAX), &postgres::types::Type::INT4).is_err());
+        assert!(postgres_bind_value(&Value::int(3_000_000_000), &postgres::types::Type::INT4).is_err());
     }
 
     #[test]
