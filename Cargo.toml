@@ -254,3 +254,8 @@ rcgen = "0.14"
 [[bench]]
 name = "bench_main"
 harness = false
+
+[[example]]
+name = "libc_interop_probe"
+path = "examples/libc_interop_probe.rs"
+required-features = ["tcp", "tls"]

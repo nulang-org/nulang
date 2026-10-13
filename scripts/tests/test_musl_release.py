@@ -64,6 +64,49 @@ class MuslReleaseTests(unittest.TestCase):
         ):
             self.assertIn("fn " + test_name + "(", runtime)
 
+    def test_cross_libc_interop_is_a_separate_pr_only_gate(self):
+        """Build separate GNU and musl probe processes and exercise both directions."""
+        with (ROOT / "Cargo.toml").open("rb") as fh:
+            manifest = tomllib.load(fh)
+        probe = next(
+            (ex for ex in manifest.get("example", [])
+             if ex.get("name") == "libc_interop_probe"), None
+        )
+        self.assertIsNotNone(probe)
+        self.assertEqual(probe["required-features"], ["tcp", "tls"])
+        self.assertTrue((ROOT / probe["path"]).is_file())
+
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        job = workflow.split("  musl-verify:\n", 1)[1].split("  publish:\n", 1)[0]
+        self.assertIn("--target x86_64-unknown-linux-gnu --no-default-features", job)
+        self.assertIn("--target x86_64-unknown-linux-musl --no-default-features", job)
+        self.assertIn("--example libc_interop_probe", job)
+        self.assertIn("python3 scripts/check_libc_interop.py", job)
+        self.assertIn("--gnu target/x86_64-unknown-linux-gnu/release/examples/libc_interop_probe", job)
+        self.assertIn("--musl target/x86_64-unknown-linux-musl/release/examples/libc_interop_probe", job)
+        self.assertIn("  publish:\n", workflow)
+
+    def test_cross_libc_readiness_rejects_unexpected_addresses_and_ids(self):
+        import importlib.util
+        script = ROOT / "scripts/check_libc_interop.py"
+        spec = importlib.util.spec_from_file_location("libc_interop", script)
+        self.assertIsNotNone(spec)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(
+            module.parse_ready("READY 127.0.0.1:30001 42"),
+            ("127.0.0.1:30001", "42"),
+        )
+        for invalid in (
+            "", "READY 192.168.1.1:30001 42",
+            "READY 127.0.0.1:0 42",
+            "READY 127.0.0.1:30001 -1",
+            "READY 127.0.0.1:30001 18446744073709551616",
+        ):
+            with self.subTest(value=invalid):
+                with self.assertRaises(RuntimeError):
+                    module.parse_ready(invalid)
+
     @unittest.skipUnless(
         sys.platform.startswith('linux') and shutil.which('gcc') and shutil.which('readelf'),
         'requires Linux, gcc, and binutils',

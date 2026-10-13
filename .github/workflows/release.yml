@@ -15,6 +15,8 @@ on:
       - 'scripts/tests/test_release_cli_profile.py'
       - 'scripts/tests/test_musl_release.py'
       - 'scripts/check_release_linux_static.sh'
+      - 'scripts/check_libc_interop.py'
+      - 'examples/libc_interop_probe.rs'
       - 'docs/src/content/docs/getting-started/installation.mdx'
 
 env:
@@ -340,6 +342,15 @@ jobs:
               test "$("$bin" --eval "1 + 2 * 3")" = "7"
               test "$("$bin" --backend native --eval "1 + 2 * 3")" = "7"
             '
+
+      - name: Validate GNU/musl NUL0 and mTLS interoperability
+        shell: bash
+        run: |
+          cargo build --locked --release --target x86_64-unknown-linux-gnu --no-default-features --features release-musl --example libc_interop_probe
+          cargo build --locked --release --target x86_64-unknown-linux-musl --no-default-features --features release-musl --example libc_interop_probe
+          python3 scripts/check_libc_interop.py \
+            --gnu target/x86_64-unknown-linux-gnu/release/examples/libc_interop_probe \
+            --musl target/x86_64-unknown-linux-musl/release/examples/libc_interop_probe
 
       - name: Upload isolated preview
         uses: actions/upload-artifact@v7
