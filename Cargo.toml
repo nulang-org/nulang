@@ -41,6 +41,10 @@ language-version = "1.0.0-frozen"
 # compatibility profile before the default is eventually minimized.
 default = ["full"]
 full = ["native-codegen", "python", "sqlite", "lsp", "ai-runtime", "tls", "ffi", "tcp", "ureq"]
+# Public prebuilt CLI profile: retain the full non-Python developer experience
+# without linking against the runner's exact libpython SONAME. Developers who
+# need Python interoperability can explicitly build --features full.
+release-cli = ["native-codegen", "sqlite", "lsp", "ai-runtime", "tls", "ffi", "tcp", "ureq"]
 # Cranelift-backed tiered JIT plus the current native/AOT backend.
 native-codegen = [
     "dep:cranelift",

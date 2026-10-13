@@ -153,11 +153,14 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Build (release)
-        run: cargo build --locked --release
+      - name: Build (public CLI release profile)
+        run: cargo build --locked --release --no-default-features --features release-cli --bin nulang
 
-      - name: Test (release)
-        run: cargo test --locked --release
+      - name: Test (same profile as public release artifacts)
+        run: cargo test --locked --release --no-default-features --features release-cli
+
+      - name: Verify Linux CLI has no Python ABI linkage
+        run: bash scripts/check_release_linux.sh /tmp/cargo-target/release/nulang
 
       - name: Stage tested release binary
         run: |
@@ -201,6 +204,9 @@ jobs:
 
       - name: Run nula test
         run: cd test-pkg && ../target/release/nulang nula test
+
+      - name: Test documentation example discovery
+        run: bash scripts/test_verify_doc_examples.sh
 
       - name: Verify documentation examples
         run: NULANG_BIN=./target/release/nulang bash scripts/verify_doc_examples.sh
