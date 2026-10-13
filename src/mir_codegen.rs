@@ -1714,7 +1714,17 @@ fn fold_function(
                 // while a real fold to Nil can be reported as unchanged.
                 let original = std::mem::replace(op, mir::RValue::Const(Constant::Nil));
                 let folded = fold_rvalue(original.clone(), const_locals, is_float);
-                changed |= folded != original;
+                // Float PartialEq is not reflexive for NaN. Compare bits
+                // for floating constants so an unchanged NaN (or signed zero)
+                // does not confuse fixed-point convergence.
+                let expression_changed = match (&original, &folded) {
+                    (
+                        mir::RValue::Const(Constant::Float(before)),
+                        mir::RValue::Const(Constant::Float(after)),
+                    ) => before.to_bits() != after.to_bits(),
+                    _ => folded != original,
+                };
+                changed |= expression_changed;
                 *op = folded;
             }
         }
