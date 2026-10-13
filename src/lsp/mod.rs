@@ -4653,6 +4653,87 @@ mod lsp_tests {
     }
 
     #[test]
+    fn test_unbound_variable_diagnostic_keeps_structured_typo_candidates() {
+        let err = NuError::unbound_variable(
+            "countr",
+            crate::types::Span::default(),
+            Some(vec!["counter".to_string()]),
+        );
+        let diagnostic = single_diagnostic(err);
+        assert_eq!(
+            diagnostic.code,
+            Some(NumberOrString::String("E0202".to_string()))
+        );
+        assert_eq!(
+            diagnostic.data.as_ref().unwrap()["similar_names"][0],
+            "counter"
+        );
+    }
+
+    #[test]
+    fn test_typo_quickfix_edits_only_the_diagnostic_identifier() {
+        let source = "fn main() {\n    let counter = 5\n    countr\n}\n";
+        let uri = Url::parse("file:///typo.nula").unwrap();
+        let range = Range::new(Position::new(2, 4), Position::new(2, 10));
+        let diagnostic = Diagnostic {
+            range,
+            severity: Some(DiagnosticSeverity::ERROR),
+            code: Some(NumberOrString::String("E0202".to_string())),
+            message: "Unbound variable: 'countr'".to_string(),
+            data: Some(serde_json::json!({"similar_names": ["counter"]})),
+            ..Diagnostic::default()
+        };
+        let actions = NulangLanguageServer::typo_quickfix_actions(
+            source,
+            &Range::new(Position::new(2, 5), Position::new(2, 5)),
+            &uri,
+            &[diagnostic],
+        );
+        assert_eq!(actions.len(), 1);
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("expected an LSP quick-fix action");
+        };
+        assert_eq!(action.title, "Replace 'countr' with 'counter'");
+        assert_eq!(action.kind, Some(CodeActionKind::QUICKFIX));
+        let edits = action
+            .edit
+            .as_ref()
+            .unwrap()
+            .changes
+            .as_ref()
+            .unwrap()
+            .get(&uri)
+            .unwrap();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "counter");
+        assert_eq!(edits[0].range, range);
+    }
+
+    #[test]
+    fn test_typo_quickfix_rejects_stale_and_unrelated_diagnostics() {
+        let source = "fn main() {\n    let counter = 5\n    otherx\n}\n";
+        let uri = Url::parse("file:///typo.nula").unwrap();
+        let range = Range::new(Position::new(2, 4), Position::new(2, 10));
+        let diagnostic = Diagnostic {
+            range,
+            severity: Some(DiagnosticSeverity::ERROR),
+            code: Some(NumberOrString::String("E0202".to_string())),
+            message: "Unbound variable: 'countr'".to_string(),
+            data: Some(serde_json::json!({"similar_names": ["counter"]})),
+            ..Diagnostic::default()
+        };
+        let cursor = Range::new(Position::new(2, 5), Position::new(2, 5));
+        assert!(NulangLanguageServer::typo_quickfix_actions(
+            source, &cursor, &uri, &[diagnostic.clone()]
+        ).is_empty(), "stale diagnostic must not rewrite different source");
+        let mut unrelated = diagnostic;
+        unrelated.code = Some(NumberOrString::String("E0401".to_string()));
+        assert!(NulangLanguageServer::typo_quickfix_actions(
+            source, &cursor, &uri, &[unrelated]
+        ).is_empty(), "ownership and capability errors must never be auto-rewritten");
+    }
+
+    #[test]
     fn test_code_action_add_import() {
         let import_index = vec![Importable {
             name: "insert".to_string(),
