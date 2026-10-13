@@ -466,6 +466,64 @@ mod tests {
     }
 
     #[test]
+    fn nil_singleton_guard_does_not_prove_coverage() {
+        let arms = vec![(Pattern::Lit(Literal::Nil), true)];
+        let report = analyze_match(&Type::nil(), &arms).expect("nil is finite");
+        assert_eq!(report.missing, vec!["nil"]);
+        assert!(report.redundant_arms.is_empty());
+    }
+
+    #[test]
+    fn nil_singleton_literal_makes_later_arms_redundant() {
+        let arms = vec![
+            (Pattern::Lit(Literal::Nil), false),
+            (Pattern::Wild, false),
+            (Pattern::Lit(Literal::Nil), true),
+        ];
+        let report = analyze_match(&Type::nil(), &arms).expect("nil is finite");
+        assert!(report.is_exhaustive());
+        assert_eq!(report.redundant_arms, vec![1, 2]);
+    }
+
+    #[test]
+    fn unit_singleton_missing_and_literal_coverage() {
+        let missing = analyze_match(&Type::unit(), &[]).expect("unit is finite");
+        assert_eq!(missing.missing, vec!["unit"]);
+        let arms = vec![(Pattern::Lit(Literal::Unit), false)];
+        let report = analyze_match(&Type::unit(), &arms).expect("unit is finite");
+        assert!(report.is_exhaustive());
+        assert!(report.redundant_arms.is_empty());
+    }
+
+    #[test]
+    fn unit_singleton_wildcard_and_guarded_literal() {
+        let arms = vec![
+            (Pattern::Lit(Literal::Unit), true),
+            (Pattern::Wild, false),
+            (Pattern::Lit(Literal::Unit), false),
+        ];
+        let report = analyze_match(&Type::unit(), &arms).expect("unit is finite");
+        assert!(report.is_exhaustive());
+        assert_eq!(report.redundant_arms, vec![2]);
+    }
+
+    #[test]
+    fn singleton_coverage_emits_existing_warning_codes() {
+        let missing = warnings_for_match(&Type::nil(), &[], Span::default());
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].code, "W0201");
+        assert!(missing[0].msg.contains("nil"));
+
+        let arms = vec![
+            (Pattern::Lit(Literal::Unit), false),
+            (Pattern::Wild, false),
+        ];
+        let warnings = warnings_for_match(&Type::unit(), &arms, Span::default());
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "W0202");
+    }
+
+    #[test]
     fn leaves_infinite_domains_to_runtime_fallback() {
         let arms = vec![(Pattern::Wild, true)];
         assert!(analyze_match(&Type::int(), &arms).is_none());
