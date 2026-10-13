@@ -218,7 +218,7 @@ impl RegistryServer {
                     Self::write_response(stream, 401, "text/plain", b"Unauthorized");
                     return;
                 }
-                Self::handle_put(stream, data_dir, name, version, body);
+                Self::handle_put(stream, data_dir, name, version, headers, body);
             }
             ("GET", Some(version)) => Self::handle_get_tarball(stream, data_dir, name, version),
             ("GET", None) => Self::handle_list_versions(stream, data_dir, name),
@@ -227,31 +227,64 @@ impl RegistryServer {
     }
 
     /// PUT /api/v1/packages/<name>/<version> — store a tarball.
-    fn handle_put(stream: &mut TcpStream, data_dir: &Path, name: &str, version: &str, body: &[u8]) {
+    fn handle_put(
+        stream: &mut TcpStream,
+        data_dir: &Path,
+        name: &str,
+        version: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) {
+        let signature = headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("x-nula-signature"))
+            .map(|(_, value)| value.as_str());
+        let Some(signature) = signature else {
+            Self::write_response(stream, 400, "text/plain", b"Publisher signature required");
+            return;
+        };
+        if signature.len() != 128 || !signature.bytes().all(|ch| ch.is_ascii_hexdigit()) {
+            Self::write_response(stream, 400, "text/plain", b"Invalid publisher signature");
+            return;
+        }
         let dir = data_dir.join(name);
         let file = dir.join(format!("{}.tar.gz", version));
-        if file.exists() {
+        let sig_file = dir.join(format!("{}.sig", version));
+        if file.exists() || sig_file.exists() {
             Self::write_response(stream, 409, "text/plain", b"Version already exists");
             return;
         }
-        if let Err(_) = std::fs::create_dir_all(&dir) {
+        if std::fs::create_dir_all(&dir).is_err() {
             Self::write_response(stream, 500, "text/plain", b"Internal server error");
             return;
         }
-        match std::fs::write(&file, body) {
-            Ok(()) => Self::write_response(stream, 201, "text/plain", b"Created"),
-            Err(_) => Self::write_response(stream, 500, "text/plain", b"Internal server error"),
+        // The detached signature is transport metadata. Consumers verify it
+        // against their OWN pinned publisher keys; this server does not
+        // authenticate or distribute the trusted keys.
+        if std::fs::write(&sig_file, signature).is_err()
+            || std::fs::write(&file, body).is_err()
+        {
+            Self::write_response(stream, 500, "text/plain", b"Internal server error");
+            return;
         }
+        Self::write_response(stream, 201, "text/plain", b"Created");
     }
 
     /// GET /api/v1/packages/<name>/<version> — return the stored tarball.
     fn handle_get_tarball(stream: &mut TcpStream, data_dir: &Path, name: &str, version: &str) {
         let file = data_dir.join(name).join(format!("{}.tar.gz", version));
-        match std::fs::read(&file) {
-            Ok(bytes) => {
-                Self::write_response(stream, 200, "application/octet-stream", &bytes);
+        let signature = data_dir
+            .join(name)
+            .join(format!("{}.sig", version));
+        match (std::fs::read(&file), std::fs::read_to_string(&signature)) {
+            (Ok(bytes), Ok(signature)) if signature.len() == 128
+                && signature.bytes().all(|ch| ch.is_ascii_hexdigit()) => {
+                Self::write_response_with_signature(stream, &bytes, &signature);
             }
-            Err(_) => Self::write_response(stream, 404, "text/plain", b"Not found"),
+            (Ok(_), _) => {
+                Self::write_response(stream, 409, "text/plain", b"Package is unsigned");
+            }
+            _ => Self::write_response(stream, 404, "text/plain", b"Not found"),
         }
     }
 
@@ -276,6 +309,16 @@ impl RegistryServer {
         let payload = serde_json::json!({ "name": name, "versions": versions });
         let body = payload.to_string();
         Self::write_response(stream, 200, "application/json", body.as_bytes());
+    }
+
+    fn write_response_with_signature(stream: &mut TcpStream, body: &[u8], signature: &str) {
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nX-Nula-Signature: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            signature, body.len()
+        );
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(body);
+        let _ = stream.flush();
     }
 
     fn write_response(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8]) {

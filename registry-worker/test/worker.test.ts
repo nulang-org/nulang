@@ -40,7 +40,11 @@ function publish(
   return worker.fetch(
     new Request('http://localhost/api/v1/packages/foo/1.0.0', {
       method: 'PUT',
-      headers: { Authorization: 'Bearer secret', ...extraHeaders },
+      headers: {
+        Authorization: 'Bearer secret',
+        'X-Nula-Signature': 'ab'.repeat(64),
+        ...extraHeaders,
+      },
       body,
       duplex: 'half',
     } as RequestInit),
@@ -127,5 +131,80 @@ describe('without QUOTA_HOOK_URL', () => {
     const res = await publish(env, 'tarball-bytes', { 'Content-Length': '13' });
     expect(res.status).toBe(201);
     expect(env.stored).toEqual(['foo/1.0.0.tar.gz']);
+  });
+});
+
+describe('publisher signature transport', () => {
+  it('rejects an unsigned package even with valid publish authorization', async () => {
+    const env = makeEnv();
+    const res = await publish(env, 'tarball-bytes', {
+      'Content-Length': '13',
+      'X-Nula-Signature': '',
+    });
+    expect(res.status).toBe(400);
+    expect(env.stored).toHaveLength(0);
+  });
+
+  it('rejects a malformed detached Ed25519 signature', async () => {
+    const env = makeEnv();
+    const res = await publish(env, 'tarball-bytes', {
+      'Content-Length': '13',
+      'X-Nula-Signature': 'not-a-signature',
+    });
+    expect(res.status).toBe(400);
+    expect(env.stored).toHaveLength(0);
+  });
+
+  it('persists signature as immutable object metadata on publish', async () => {
+    const stored: Array<{ key: string; signature: string }> = [];
+    const env = makeEnv({
+      BUCKET: {
+        head: async () => null,
+        put: async (key: string, _body: unknown, options: { customMetadata: Record<string, string> }) => {
+          stored.push({ key, signature: options.customMetadata.nulaSignature });
+        },
+      } as unknown as Env['BUCKET'],
+    });
+    const res = await publish(env, 'tarball-bytes', { 'Content-Length': '13' });
+    expect(res.status).toBe(201);
+    expect(stored).toEqual([{
+      key: 'foo/1.0.0.tar.gz',
+      signature: 'ab'.repeat(64),
+    }]);
+  });
+});
+
+describe('signed package download', () => {
+  function envWithObject(signature?: string): Env {
+    return makeEnv({
+      BUCKET: {
+        get: async () => ({
+          body: new Blob(['tarball-bytes']).stream(),
+          customMetadata: signature === undefined ? {} : { nulaSignature: signature },
+          writeHttpMetadata: (_headers: Headers) => {},
+        }),
+      } as unknown as Env['BUCKET'],
+    });
+  }
+
+  it('returns the publisher signature with the exact archive bytes', async () => {
+    const signature = 'cd'.repeat(64);
+    const response = await worker.fetch(
+      new Request('http://localhost/api/v1/packages/foo/1.0.0'),
+      envWithObject(signature),
+      {} as ExecutionContext,
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get('X-Nula-Signature')).toBe(signature);
+    expect(await response.text()).toBe('tarball-bytes');
+  });
+
+  it('does not serve a legacy unsigned registry object', async () => {
+    const response = await worker.fetch(
+      new Request('http://localhost/api/v1/packages/foo/1.0.0'),
+      envWithObject(),
+      {} as ExecutionContext,
+    );
+    expect(response.status).toBe(409);
   });
 });

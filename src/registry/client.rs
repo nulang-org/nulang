@@ -52,6 +52,87 @@ impl RegistryClient {
         }
     }
 
+    /// Publish bytes with the project publisher's detached signature.
+    /// The registry transports the signature, but never chooses trust roots.
+    pub fn publish_signed(
+        &self,
+        name: &str,
+        version: &str,
+        tarball: &[u8],
+        signature: &str,
+    ) -> Result<(), String> {
+        #[cfg(feature = "ureq")]
+        {
+            if signature.len() != 128 || !signature.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err("publisher signature must be 128 hexadecimal characters".to_string());
+            }
+            let url = format!("{}/api/v1/packages/{}/{}", self.base_url(), name, version);
+            let request = ureq::put(&url)
+                .set(crate::registry::trust::SIGNATURE_HEADER, signature);
+            let request = match &self.token {
+                Some(token) => request.set("Authorization", &format!("Bearer {}", token)),
+                None => request,
+            };
+            match request.send_bytes(tarball) {
+                Ok(_) => Ok(()),
+                Err(err) => Err(Self::describe_error(err)),
+            }
+        }
+        #[cfg(not(feature = "ureq"))]
+        {
+            let _ = (&self.registry_url, &self.token, name, version, tarball, signature);
+            Err("registry client disabled (feature 'ureq' not enabled)".to_string())
+        }
+    }
+
+    /// Fetch only when the compressed archive has a valid publisher signature
+    /// under a public key pinned in <project>/Nulang.trust.toml. No TOFU.
+    pub fn fetch_verified(
+        &self,
+        name: &str,
+        version: &str,
+        project_root: &std::path::Path,
+    ) -> Result<Vec<u8>, String> {
+        #[cfg(feature = "ureq")]
+        {
+            let keys = crate::registry::trust::trusted_publisher_keys(
+                project_root,
+                &self.registry_url,
+            )?;
+            let url = format!("{}/api/v1/packages/{}/{}", self.base_url(), name, version);
+            let response = ureq::get(&url).call().map_err(Self::describe_error)?;
+            let signature = response
+                .header(crate::registry::trust::SIGNATURE_HEADER)
+                .ok_or_else(|| format!(
+                    "registry archive '{}@{}' has no publisher signature",
+                    name, version
+                ))?
+                .to_string();
+
+            let limit = crate::package::registry_archive::MAX_REGISTRY_ARCHIVE_BYTES;
+            let mut reader = response.into_reader().take(limit as u64 + 1);
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+            if bytes.len() > limit {
+                return Err(format!("registry archive exceeds {} byte limit", limit));
+            }
+            crate::registry::trust::verify_publisher_signature(
+                &self.registry_url,
+                name,
+                version,
+                &bytes,
+                &signature,
+                &keys,
+            )?;
+            Ok(bytes)
+        }
+        #[cfg(not(feature = "ureq"))]
+        {
+            let _ = (&self.registry_url, &self.token, name, version, project_root);
+            Err("registry client disabled (feature 'ureq' not enabled)".to_string())
+        }
+    }
+
     /// Fetch the stored tarball for `name@version`.
     pub fn fetch(&self, name: &str, version: &str) -> Result<Vec<u8>, String> {
         #[cfg(feature = "ureq")]
