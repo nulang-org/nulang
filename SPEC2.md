@@ -1827,7 +1827,16 @@ fn log(msg: String) -> Unit ! {IO} {
 }
 ```
 
-Named functions may recurse by referring to their own name. Functions may be preceded by annotations; the only supported annotation is `@tool(description: "...")`, which exposes the function as an agent tool (§11.4):
+Named functions may recurse by referring to their own name. Functions may be preceded by annotations. The Experimental `@noalloc` marker requires the compiler to prove that the optimized function and its statically resolved direct-call graph contain no allocation-capable runtime operations. The proof fails closed for indirect calls and for effect, suspension, FFI/Python, actor, distributed, I/O, capture, spill, copy, heap, or string-materialization boundaries that are not mechanically allocation-free.
+
+```nulang
+@noalloc
+fn hash_slot(key: Int) -> Int {
+  key % 16384
+}
+```
+
+Agent-tool annotations (§11.4) are separate from the allocation contract:
 
 ```nulang
 // fragment
@@ -1836,6 +1845,8 @@ fn search(query: String) -> String {
   ...
 }
 ```
+
+`@noalloc` describes allocation behavior, not ownership or lifetime. In particular, an allocation proven eligible for the activation-local iso arena is still an allocation and therefore does not satisfy `@noalloc`.
 
 ## 7.3 Type Definitions
 

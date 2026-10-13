@@ -747,6 +747,16 @@ impl Parser {
         self.skip_newlines();
         let public = self.consume_if(&TokenKind::Pub);
         self.skip_newlines();
+        if annotations
+            .iter()
+            .any(|annotation| matches!(annotation, FunctionAnnotation::NoAlloc))
+            && !matches!(self.peek_kind(), TokenKind::Fn)
+        {
+            return Err(NuError::parse_error(
+                "@noalloc may only annotate a function declaration".to_string(),
+                self.current_span(),
+            ));
+        }
         match self.peek_kind() {
             TokenKind::Fn => self.parse_function(public, annotations),
             TokenKind::Actor
@@ -849,6 +859,13 @@ impl Parser {
                     ));
                 }
             };
+            // Marker annotations intentionally do not need empty parentheses.
+            // Keep accepting `@noalloc()` for tools that normalize annotations.
+            if name == "noalloc" && !self.match_token(&TokenKind::LParen) {
+                annotations.push(FunctionAnnotation::NoAlloc);
+                self.skip_newlines();
+                continue;
+            }
             self.expect(TokenKind::LParen)?;
             let mut fields: FxHashMap<String, String> = FxHashMap::default();
             self.skip_newlines();
@@ -897,6 +914,15 @@ impl Parser {
                         .map(|(k, v)| if k.is_empty() { v } else { k })
                         .collect();
                     annotations.push(FunctionAnnotation::Derive(names));
+                }
+                "noalloc" => {
+                    if !fields.is_empty() {
+                        return Err(NuError::parse_error(
+                            "@noalloc does not accept arguments".to_string(),
+                            self.current_span(),
+                        ));
+                    }
+                    annotations.push(FunctionAnnotation::NoAlloc);
                 }
                 "placement" => {
                     let value = fields.remove("").unwrap_or_default();
@@ -8206,6 +8232,32 @@ mod tests {
         assert!(
             result.is_err(),
             "Expected parse error for effect op missing arrow"
+        );
+    }
+
+    #[test]
+    fn test_parse_noalloc_annotation_without_parentheses() {
+        let ast = parse("@noalloc\nfn add(a: Int, b: Int) -> Int { a + b }")
+            .expect("@noalloc marker should parse without parentheses");
+        match &ast.decls[0] {
+            Decl::Function { annotations, .. } => assert!(
+                annotations
+                    .iter()
+                    .any(|annotation| matches!(annotation, FunctionAnnotation::NoAlloc)),
+                "function must retain the @noalloc contract"
+            ),
+            other => panic!("expected function declaration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_noalloc_rejects_non_function_declaration() {
+        let err =
+            parse("@noalloc\ntype Id = Int").expect_err("@noalloc must only annotate functions");
+        assert!(
+            err.to_string()
+                .contains("@noalloc may only annotate a function"),
+            "unexpected diagnostic: {err}"
         );
     }
 

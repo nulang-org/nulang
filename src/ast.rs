@@ -566,6 +566,10 @@ pub enum FunctionAnnotation {
     /// `@placement(static|server|edge|client|actor|workflow)` marks a web
     /// framework function's compile-time execution target.
     Placement(crate::types::Placement),
+    /// `@noalloc` requires the compiler to prove that the optimized function
+    /// and every statically resolved direct callee contain no
+    /// allocation-capable runtime operations.
+    NoAlloc,
     /// Contextual parameter syntax such as `limit: Int from query`.
     RequestBinding {
         param: String,

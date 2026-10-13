@@ -212,6 +212,9 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
                 crate::ast::FunctionAnnotation::Placement(p) => Some(*p),
                 _ => None,
             });
+            let no_alloc = annotations
+                .iter()
+                .any(|annotation| matches!(annotation, crate::ast::FunctionAnnotation::NoAlloc));
             // Default placement inference from declared effect row (only when the
             // user explicitly declared effects; inferred rows remain None here).
             let inferred_placement =
@@ -256,6 +259,7 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
                 },
                 public: *public,
                 placement: inferred_placement,
+                no_alloc,
                 span: *span,
             })
         }
