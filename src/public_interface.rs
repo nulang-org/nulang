@@ -325,7 +325,13 @@ mod tests {
         Type::Primitive(p)
     }
 
-    fn function(name: &str, public: bool, parameter: Type, result: Type, effects: Vec<Effect>) -> Decl {
+    fn function(
+        name: &str,
+        public: bool,
+        parameter: Type,
+        result: Type,
+        effects: Vec<Effect>,
+    ) -> Decl {
         Decl::Function(hir::FunctionDef {
             name: name.to_string(),
             type_params: Vec::new(),
@@ -349,7 +355,13 @@ mod tests {
     fn private_declarations_and_declaration_order_do_not_change_api_digest() {
         let int = primitive(PrimitiveType::Int);
         let exported = function("exported", true, int.clone(), int.clone(), vec![]);
-        let private = function("private", false, int.clone(), primitive(PrimitiveType::String), vec![]);
+        let private = function(
+            "private",
+            false,
+            int.clone(),
+            primitive(PrimitiveType::String),
+            vec![],
+        );
         let first = interface_for_hir(&module(vec![exported.clone()])).unwrap();
         let second = interface_for_hir(&module(vec![private, exported])).unwrap();
         assert_eq!(first.api_digest, second.api_digest);
