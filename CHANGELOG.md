@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Static rejection of impossible typed match patterns — 2026-09-29
+- **Pattern matching now rejects contradictions that are already provable from the scrutinee type.** Unknown variant constructors, variant payload-shape mismatches, tuple arity/type mismatches, and invalid closed-record fields fail during type checking instead of compiling as dead arms that can only fail to match at runtime.
+- **Inference remains conservative for unresolved shapes and open record rows.** This change does not make non-exhaustive matches fatal and does not replace the separate finite-domain coverage diagnostics work.
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
