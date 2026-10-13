@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### Bounded staged registry extraction — 2026-10-13
+- **Registry packages are staged and validated before entering the cache.** Tar extraction rejects traversal, links/special files, duplicate paths, malformed gzip, mismatched package metadata and excessive compressed/decompressed sizes or entry counts; failures leave installed caches untouched.
+- **Registry uploads require a declared body length and enforce a 64 MiB compressed package cap.** The Cloudflare worker returns HTTP 411 for chunked uploads and HTTP 413 for oversized declared packages, independent of billing-quota hooks. No publisher signing or authenticity claim is added.
+
 ### Registry cache source integrity — 2026-10-13
 - **Offline registry dependencies now require strong source IDs pinned in `Nulang.lock`.** The lockfile records a canonical digest of every file in each available extracted registry package; `--locked` and `--offline` reject missing identities, altered assets, absent caches, and invalid package metadata without repairing or rewriting the cache.
 - **This is lockfile-relative integrity, not publisher authentication.** Cached package content is hashed at initial lock time. Authentic registry signatures and published-archive attestations are future work.
