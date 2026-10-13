@@ -50,6 +50,13 @@ pub struct ToolSpec {
 #[async_trait]
 pub trait ToolHandler: Send + Sync {
     async fn call(&self, args: Value) -> Result<Value, String>;
+
+    /// Opt into MCP tool-level `isError` replies. The default preserves the
+    /// existing forge gateway contract, which reports authorization failures
+    /// as JSON-RPC errors for compatibility with current clients/tests.
+    fn errors_as_tool_results(&self) -> bool {
+        false
+    }
 }
 
 pub struct ToolRegistry {
@@ -154,21 +161,25 @@ impl McpServer {
             .unwrap_or_else(|| serde_json::json!({}));
         let handler = {
             let tools = self.registry.tools.read().await;
-            Arc::clone(&tools
-                .get(name)
-                .ok_or_else(|| format!("Unknown tool: {name}"))?
-                .1)
+            Arc::clone(
+                &tools
+                    .get(name)
+                    .ok_or_else(|| format!("Unknown tool: {name}"))?
+                    .1,
+            )
         };
+        let errors_as_tool_results = handler.errors_as_tool_results();
         match handler.call(args).await {
             Ok(value) => Ok(serde_json::json!({
                 "content": [{"type": "text", "text": value.to_string()}],
                 "structuredContent": value,
                 "isError": false
             })),
-            Err(message) => Ok(serde_json::json!({
+            Err(message) if errors_as_tool_results => Ok(serde_json::json!({
                 "content": [{"type": "text", "text": message}],
                 "isError": true
             })),
+            Err(message) => Err(message),
         }
     }
 }
