@@ -1033,6 +1033,11 @@ mod tests {
         let dir = fresh_dir("offline_registry");
         let app = dir.join("app");
         write_manifest(&app, "app", "1.0.0", "util = \"0.1.0\"\n");
+        std::fs::write(
+            app.join(MANIFEST_FILE),
+            "[package]\nname = \"app\"\nversion = \"1.0.0\"\nregistry = \"https://registry.test\"\n\n[dependencies]\nutil = \"0.1.0\"\n",
+        )
+        .unwrap();
         let manifest = Manifest::load(&app).unwrap();
         let lock = Lockfile::new();
         let error = resolve_offline(&app, &manifest, &lock)
