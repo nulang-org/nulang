@@ -7,12 +7,20 @@ fn main() {
     let b2i = fn(b) { if b then 1 else 0 }
     let is_even = fn(x) { x - (x / 2) * 2 == 0 }
     let is_pos = fn(x) { x > 0 }
+    // find returns Option[Int]. Test both the Some payload and None case,
+    // rather than converting a tagged Option with Int.to_string.
+    let show_find = fn(opt: Option[Int]) {
+        match opt {
+            Some(x) => perform Int.to_string(x),
+            None => "None",
+        }
+    }
     perform IO.print("any_even=" + perform Int.to_string(b2i(any(is_even, [1, 2, 3]))))
     perform IO.print("any_none=" + perform Int.to_string(b2i(any(is_even, [1, 3, 5]))))
     perform IO.print("any_empty=" + perform Int.to_string(b2i(any(is_even, []))))
     perform IO.print("all_pos=" + perform Int.to_string(b2i(all(is_pos, [1, 2, 3]))))
     perform IO.print("all_mixed=" + perform Int.to_string(b2i(all(is_pos, [1, -2, 3]))))
     perform IO.print("all_empty=" + perform Int.to_string(b2i(all(is_pos, []))))
-    perform IO.print("find_even=" + perform Int.to_string(find(is_even, [1, 2, 3])))
-    perform IO.print("find_miss=" + perform Int.to_string(find(is_even, [1, 3, 5])))
+    perform IO.print("find_even=" + show_find(find(is_even, [1, 2, 3])))
+    perform IO.print("find_miss=" + show_find(find(is_even, [1, 3, 5])))
 }
