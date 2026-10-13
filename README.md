@@ -84,6 +84,22 @@ Source builds use Rust 1.95.0, pinned by `rust-toolchain.toml`. The tagged
 release matrix currently validates Linux x86_64/aarch64, macOS aarch64, and
 Windows x86_64; other platform/architecture combinations are not release-tested.
 
+### Lean self-hosted server build (experimental)
+
+To compile a Nulang CLI with the bytecode runtime, HTTP/TCP/TLS, outbound HTTP,
+and SQLite persistence but without Python, AI provider packages, native JIT,
+LSP, or FFI:
+
+```bash
+cargo build --locked --release --no-default-features --features server --bin nulang
+bash scripts/check_server_profile.sh
+```
+
+This is a smaller **dependency profile**, not a claim of a statically linked
+native application, production-ready durable jobs, or one-command hosting.
+See [server-profile usage and limitations](docs/SERVER_PROFILE.md).
+
+
 ## Quick Start
 
 A pre-built release binary needs no Rust toolchain. To build from source, use
