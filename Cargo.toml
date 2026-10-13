@@ -45,6 +45,10 @@ full = ["native-codegen", "python", "sqlite", "lsp", "ai-runtime", "tls", "ffi",
 # without linking against the runner's exact libpython SONAME. Developers who
 # need Python interoperability can explicitly build --features full.
 release-cli = ["native-codegen", "sqlite", "lsp", "ai-runtime", "tls", "ffi", "tcp", "ureq"]
+# Experimental static Linux/musl CLI: native compiler + actor TCP/TLS without
+# platform ABI dependencies such as PyO3, dynamic FFI, or libsql. Not feature-
+# equivalent to release-cli; expand only after real musl build/smoke validation.
+release-musl = ["native-codegen", "tcp", "tls"]
 # Cranelift-backed tiered JIT plus the current native/AOT backend.
 native-codegen = [
     "dep:cranelift",

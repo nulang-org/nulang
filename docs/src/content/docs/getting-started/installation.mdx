@@ -19,6 +19,8 @@ Tagged releases publish checksummed archives on [GitHub Releases](https://github
 | macOS Apple Silicon | `nulang-macos-aarch64.tar.gz` |
 | Windows x86_64 | `nulang-windows-x86_64.tar.gz` |
 
+**Experimental static Linux x86_64 (musl):** Pull requests that change the release workflow exercise a separate, reduced-feature `release-musl` CLI build. A passing run uploads a short-lived `experimental-static-musl-x86_64` CI artifact with a checksummed archive. It is **not** a tagged GitHub Release asset yet. The static target includes native codegen and actor TCP/TLS, but excludes Python, dynamic FFI, SQLite, LSP, AI runtime, and HTTP client integrations. Keep using the regular GNU/Linux archive when you need full `release-cli` feature parity.
+
 Download the archive **and matching `.sha256` file** from the same tagged release. Choose the archive for your operating system and CPU architecture.
 
 ### Linux example (x86_64)
@@ -97,6 +99,15 @@ Nulang supports optional features for leaner builds:
 # Minimal build (no Python, SQLite, LSP, AI runtime, or networking)
 cargo build --release --no-default-features
 
+# Experimental portable x86_64 Linux musl build (requires musl-tools and Rust target)
+rustup target add x86_64-unknown-linux-musl
+CC_x86_64_unknown_linux_musl=musl-gcc \
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+  cargo build --locked --release --target x86_64-unknown-linux-musl \
+    --no-default-features --features release-musl --bin nulang
+bash scripts/check_release_linux_static.sh \
+  /tmp/cargo-target/x86_64-unknown-linux-musl/release/nulang
+
 # With WASM backend
 cargo build --release --features wasm-backend
 
@@ -106,6 +117,7 @@ cargo build --release --all-features
 
 | Feature | Default | Description |
 |---------|---------|-------------|
+| `release-musl` | Off | Experimental lean static Linux CLI profile (native codegen, TCP, TLS); explicitly omits integrations needing separate compatibility validation |
 | `native-codegen` | On | Cranelift-backed tiered JIT and the native/AOT backend |
 | `python` | On | PyO3 Python interop |
 | `sqlite` | On | libsql/Turso persistence |
