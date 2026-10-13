@@ -1372,6 +1372,36 @@ fn view() -> Html {
     }
 
     #[test]
+    fn test_shadowed_attribute_signal_does_not_hydrate() {
+        let mut module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+signal label: Html = text("global")
+
+fn view(label: Html) -> Html {
+    <button title={label}>Local label</button>
+}
+"#,
+        );
+        let graph = analyze_module(&module, None);
+        assert!(
+            !graph.nodes.iter().any(|node| matches!(
+                node,
+                GraphNode::AttributeRead { signal, .. } if signal == "label"
+            )),
+            "a parameter shadowing the signal must not create attribute bindings"
+        );
+        rewrite_module(&mut module, None);
+        let html = format!("{:?}", find_function_body(&module, "view"));
+        assert!(
+            !html.contains("data-nulang-bind-title"),
+            "a shadowed attribute must not receive a hydration marker"
+        );
+    }
+
+    #[test]
     fn test_unsafe_url_attribute_does_not_get_a_reactive_dom_binding() {
         let mut module = parse(
             r#"
