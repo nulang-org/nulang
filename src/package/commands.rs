@@ -391,6 +391,7 @@ fn cmd_new(path_arg: Option<&str>, template: Option<&str>) -> NuResult<()> {
         "distributed",
         "ai-agent",
         "web",
+        "service",
     ];
     if !valid.contains(&tmpl) {
         return Err(NuError::PackageError {
@@ -471,7 +472,7 @@ fn scaffold_package(dir: &Path, name: &str, template: &str) -> NuResult<()> {
         msg: format!("cannot write {}: {}", manifest_path.display(), e),
         span: Span::default(),
     })?;
-    if template == "web" {
+    if template == "web" || template == "service" {
         let mut web_manifest =
             std::fs::read_to_string(&manifest_path).map_err(|e| NuError::PackageError {
                 msg: format!("cannot read {}: {}", manifest_path.display(), e),
@@ -562,6 +563,83 @@ fn template_files(name: &str) -> Vec<(&'static str, &'static str)> {
             (
                 "src/main.nula",
                 "// AI-agent template — an actor with conversation memory backed by the\n// `Inference.ask` effect (LLM). Demonstrates actor state, behaviors,\n// and a non-blocking inference call.\n//\n// Requires the `ai-runtime` cargo feature (enabled by default).\n//\n// Run with: nula run\n\nactor ChatAgent {\n    state history: String = \"\"\n    state turn: Int = 0\n\n    behavior ask(prompt: String) {\n        self.turn = self.turn + 1\n        let reply = perform Inference.ask(prompt)\n        self.history = self.history + \"\\nQ: \" + prompt + \"\\nA: \" + reply\n        perform IO.print(\"[Turn \" + perform Int.to_string(self.turn) + \"] \" + reply)\n    }\n\n    behavior summary() {\n        let s = perform Inference.ask(\n            \"Summarize this conversation:\\n\" + self.history\n        )\n        perform IO.print(\"Summary: \" + s)\n    }\n}\n\nfn main() {\n    let chat = spawn ChatAgent {}\n    chat ! ask(\"Hello! Introduce yourself in one sentence.\")\n    chat ! summary()\n    perform IO.print(\"Agent ready. Configure your provider in Nulang.toml.\")\n}\n",
+            ),
+        ],
+        "service" => vec![
+            (
+                "src/main.nula",
+                r#"// Minimal HTTP service. Start with `nulang nula dev`.
+//
+// /health is liveness only: it does not attest to persistence, queues,
+// remote systems, or readiness of a separate database.
+
+import stdlib::web::html
+import stdlib::web::types
+
+fn home() -> Html {
+    document(
+        head([title("Nulang Service")]),
+        body([
+            el("h1", [], [text("Nulang Service")]),
+            el("p", [], [text("Local HTTP service is responding.")])
+        ])
+    )
+}
+
+fn health() -> Html {
+    text("ok")
+}
+
+app "service" {
+    route "GET" "/" -> home
+    route "GET" "/health" -> health
+}
+"#,
+            ),
+            (
+                "README.md",
+                r#"# Nulang HTTP service
+
+This template registers two HTTP routes using the built-in Web effect:
+
+- GET / — HTML homepage
+- GET /health — **liveness only** (not a persistence or readiness probe)
+
+## Start locally
+
+From this package directory:
+
+```sh
+nulang nula dev
+```
+
+The [web] manifest port is 8787 by default. Visit
+http://127.0.0.1:8787/ or run:
+
+```sh
+curl --fail http://127.0.0.1:8787/health
+```
+
+The current routed-app listener is the **development server**, not a
+hardened production deployment mode. Exposing this to the public internet
+requires additional deployment and security review.
+
+## SQLite and durable jobs
+
+This template deliberately has **no stateful endpoints**. It does not
+claim that `Web.kv_get` / `Web.kv_set` survive process restarts: those
+effects currently use an ephemeral in-memory store.
+
+The optional server build profile (`--no-default-features --features
+server`) includes libSQL/SQLite for Nulang's existing durable actor
+persistence APIs, but the web request handler is not automatically backed
+by a SQLite database. See docs/SERVER_PROFILE.md in the Nulang repository.
+
+Use tested persistence APIs for application data, rather than storing
+important user data in the demo web KV. Durable background jobs and
+transactional web storage require a separate end-to-end integration and
+crash-recovery validation before production use.
+"#,
             ),
         ],
         "web" => vec![
@@ -2683,6 +2761,7 @@ mod tests {
             "distributed",
             "ai-agent",
             "web",
+            "service",
         ] {
             let dir = std::env::temp_dir().join(format!(
                 "nulang_tmpl_test_{}_{}",
@@ -2706,6 +2785,36 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn test_service_template_scaffolds_dynamic_http_routes() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_service_tmpl_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        scaffold_package(&dir, "service-app", "service")
+            .expect("service template must scaffold");
+        let manifest = Manifest::load(&dir).expect("service manifest must parse");
+        assert_eq!(manifest.web.port, 8787);
+
+        let source = std::fs::read_to_string(dir.join("src/main.nula"))
+            .expect("service must provide an app entry point");
+        assert!(source.contains("app \"service\""));
+        assert!(source.contains("route \"GET\" \"/\" -> home"));
+        assert!(source.contains("route \"GET\" \"/health\" -> health"));
+        assert!(
+            !source.contains("kv_set"),
+            "service template must not imply durable state through ephemeral web KV"
+        );
+        let readme = std::fs::read_to_string(dir.join("README.md"))
+            .expect("service template needs usage instructions");
+        assert!(readme.contains("nula dev"));
+        assert!(readme.contains("SQLite"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
