@@ -6,6 +6,7 @@ compiler/test outcomes are authentic. A trusted evaluator must produce JSONL.
 """
 
 import argparse
+import hashlib
 import json
 import statistics
 import sys
@@ -31,10 +32,11 @@ def nonempty_string(value, field):
 
 def load_manifest(path):
     try:
-        manifest = json.loads(path.read_text(encoding="utf-8"))
+        raw = path.read_bytes()
+        manifest = json.loads(raw)
     except (OSError, ValueError) as exc:
         raise InvalidBenchmark(f"cannot read task manifest: {exc}") from exc
-    if not isinstance(manifest, dict) or manifest.get("schema_version") != 1:
+    if not isinstance(manifest, dict) or type(manifest.get("schema_version")) is not int or manifest["schema_version"] != 1:
         raise InvalidBenchmark("task manifest requires schema_version 1")
     suite_id = nonempty_string(manifest.get("suite_id"), "suite_id")
     trials = integer(manifest.get("trials"), "trials", 1)
@@ -50,7 +52,7 @@ def load_manifest(path):
         identifiers.append(nonempty_string(task.get("id"), "task id"))
     if len(set(identifiers)) != len(identifiers):
         raise InvalidBenchmark("duplicate task identifiers")
-    return suite_id, trials, set(identifiers)
+    return suite_id, trials, set(identifiers), hashlib.sha256(raw).hexdigest()
 
 
 def load_results(path, tasks, trials):
@@ -91,7 +93,7 @@ def load_results(path, tasks, trials):
     return rows
 
 
-def summarize(suite, trials, tasks, rows):
+def summarize(suite, trials, tasks, rows, manifest_sha256):
     by_model = defaultdict(list)
     for row in rows:
         by_model[row["model"]].append(row)
@@ -129,6 +131,7 @@ def summarize(suite, trials, tasks, rows):
     return {
         "schema_version": 1,
         "suite_id": suite,
+        "manifest_sha256": manifest_sha256,
         "task_count": len(tasks),
         "trials": trials,
         "verification": "self-reported; external evaluator must attest outcomes",
@@ -142,9 +145,9 @@ def main(argv=None):
     parser.add_argument("--results", type=Path, required=True)
     arguments = parser.parse_args(argv)
     try:
-        suite, trials, tasks = load_manifest(arguments.tasks)
+        suite, trials, tasks, manifest_sha256 = load_manifest(arguments.tasks)
         rows = load_results(arguments.results, tasks, trials)
-        report = summarize(suite, trials, tasks, rows)
+        report = summarize(suite, trials, tasks, rows, manifest_sha256)
     except InvalidBenchmark as exc:
         print(f"agent coding benchmark: {exc}", file=sys.stderr)
         return 2
