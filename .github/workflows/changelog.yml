@@ -28,9 +28,10 @@ jobs:
 
       - name: Determine if changelog update is needed
         id: check
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_LABELS: ${{ toJson(github.event.pull_request.labels.*.name) }}
         run: |
-          PR_TITLE="${{ github.event.pull_request.title }}"
-          PR_LABELS="${{ toJson(github.event.pull_request.labels.*.name) }}"
 
           # Explicit exemption wins over title classification. Without this
           # ordering, feat/fix/perf PRs can never use the documented label.
