@@ -105,6 +105,13 @@ jobs:
         # the default-feature test selection.
         run: cargo nextest run --locked
 
+      - name: Test renderer-neutral UI protocol crate
+        # The workspace root has a [package] and no default-members, so the
+        # preceding nextest command selects only the root nulang package.
+        # Explicitly exercise protocol validators and wire-format regressions.
+        run: cargo test --locked -p nulang-ui-protocol
+
+
       - name: Test doctests
         # nextest intentionally does not execute rustdoc tests.
         run: cargo test --locked --doc
