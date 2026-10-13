@@ -206,6 +206,18 @@ where
     ))
 }
 
+/// Alpha-normalized, backend-independent encoding of one public type.
+///
+/// Unlike `canonical_type_bytes`, this removes process-global TypeVar,
+/// Region, and Skolem IDs using the same canonical encoder as MIR identity.
+/// It is an additive interface-sidecar encoding, not a frozen wire format.
+pub fn canonical_public_type_bytes(ty: &Type) -> Vec<u8> {
+    let mut encoder = Encoder::default();
+    encoder.bytes(b"nulang.public-type.v1\0");
+    encoder.ty(ty);
+    encoder.out
+}
+
 /// Produce the canonical MIR byte stream used by [`semantic_id_for_mir`].
 ///
 /// Declaration-vector order and compiler-assigned function/behavior indices are
