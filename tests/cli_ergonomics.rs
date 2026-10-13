@@ -115,3 +115,23 @@ fn run_alias_rejects_a_file_argument_instead_of_silently_ignoring_it() {
     );
     std::fs::remove_dir_all(root).expect("remove temp directory");
 }
+
+#[test]
+fn prelude_does_not_erase_effects_from_closed_function_signatures() {
+    let root = temp_dir("effects");
+    let file = root.join("impure.nula");
+    std::fs::write(
+        &file,
+        "import stdlib::prelude\nfn main() -> Unit ! {} {\n    println(\"IO is an effect\")\n}\n",
+    )
+    .expect("write source");
+    let output = command(
+        &root,
+        &["check", file.to_str().expect("utf-8 path")],
+    );
+    assert!(
+        !output.status.success(),
+        "prelude wrappers must preserve effect-row checking: {output:?}"
+    );
+    std::fs::remove_dir_all(root).expect("remove temp directory");
+}
