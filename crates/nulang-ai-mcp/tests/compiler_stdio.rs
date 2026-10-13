@@ -6,6 +6,14 @@ use std::io::Cursor;
 use std::sync::Arc;
 
 fn run_messages(lines: &[Value], workspace: &std::path::Path) -> Vec<Value> {
+    run_messages_with_compiler(lines, workspace, std::path::Path::new("nulang"))
+}
+
+fn run_messages_with_compiler(
+    lines: &[Value],
+    workspace: &std::path::Path,
+    compiler: &std::path::Path,
+) -> Vec<Value> {
     let root = workspace.canonicalize().unwrap();
     let mut input = Vec::new();
     for line in lines {
@@ -16,7 +24,7 @@ fn run_messages(lines: &[Value], workspace: &std::path::Path) -> Vec<Value> {
     let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
     runtime.block_on(register_local_tools(
         &registry,
-        LocalToolConfig::new(root, "nulang".into()),
+        LocalToolConfig::new(root, compiler.to_path_buf()),
     ));
     let server = McpServer::new(registry);
     let mut output = Vec::new();
@@ -110,4 +118,33 @@ fn compiler_tool_rejects_symlink_that_escapes_workspace() {
     assert_eq!(replies[1]["result"]["isError"], true);
     std::fs::remove_file(&link).unwrap();
     std::fs::remove_file(&outside).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn compiler_tool_roundtrip_returns_structured_diagnostics() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = temp_workspace();
+    std::fs::write(root.join("valid.nula"), "let x = 1\n").unwrap();
+    let compiler = root.join("fake-nulang");
+    std::fs::write(
+        &compiler,
+        "#!/bin/sh\nprintf '%s\\n' '{\"schema_version\":1,\"command\":\"check\",\"ok\":true,\"diagnostics\":[]}'\n",
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&compiler).unwrap().permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&compiler, permissions).unwrap();
+    let replies = run_messages_with_compiler(
+        &[
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"nulang_check","arguments":{"path":"valid.nula"}}}),
+        ],
+        &root,
+        &compiler,
+    );
+    assert_eq!(replies[1]["result"]["isError"], false);
+    assert_eq!(replies[1]["result"]["structuredContent"]["exit_success"], true);
+    assert_eq!(replies[1]["result"]["structuredContent"]["report"]["ok"], true);
+    assert_eq!(replies[1]["result"]["structuredContent"]["report"]["diagnostics"], json!([]));
 }
