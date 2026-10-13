@@ -1694,11 +1694,14 @@ fn cmd_dev(port_override: Option<u16>) -> NuResult<()> {
         }
         Ok(())
     } else {
-        let server = WebDevServer::bind_runtime(
+        // Explicit opt-in only: invalid or unsafe database locations abort startup.
+        let sqlite_path = resolve_web_sqlite_path(&root, &manifest.web)?;
+        let server = WebDevServer::bind_runtime_with_state(
             port,
             Some(static_dir),
             Some(output_dir.clone()),
             runtime_routes,
+            sqlite_path,
         )
         .map_err(|e| NuError::PackageError {
             msg: format!("cannot bind dev server: {}", e),
@@ -1709,6 +1712,64 @@ fn cmd_dev(port_override: Option<u16>) -> NuResult<()> {
         loop {
             std::thread::park();
         }
+    }
+}
+
+/// Resolve a package-local database path without trusting absolute paths,
+/// parent traversal, or symlinked storage directories. A bad configuration
+/// must never result in a silent fallback to the ephemeral store.
+fn resolve_web_sqlite_path(
+    root: &Path,
+    web: &crate::package::manifest::WebSection,
+) -> NuResult<Option<PathBuf>> {
+    match web.kv_backend.as_str() {
+        "memory" => Ok(None),
+        "sqlite" => {
+            let rel = Path::new(&web.kv_path);
+            if rel.as_os_str().is_empty()
+                || !rel.components().all(|c| matches!(c, std::path::Component::Normal(_)))
+            {
+                return Err(NuError::PackageError {
+                    msg: "web.kv_path must be a non-empty package-relative path without traversal".into(),
+                    span: Span::default(),
+                });
+            }
+            let root = root.canonicalize().map_err(|e| NuError::PackageError {
+                msg: format!("cannot resolve package root: {e}"),
+                span: Span::default(),
+            })?;
+            let path = root.join(rel);
+            let parent = path.parent().ok_or_else(|| NuError::PackageError {
+                msg: "web.kv_path has no parent".into(),
+                span: Span::default(),
+            })?;
+            std::fs::create_dir_all(parent).map_err(|e| NuError::PackageError {
+                msg: format!("cannot create web storage directory: {e}"),
+                span: Span::default(),
+            })?;
+            let parent = parent.canonicalize().map_err(|e| NuError::PackageError {
+                msg: format!("cannot resolve web storage directory: {e}"),
+                span: Span::default(),
+            })?;
+            if !parent.starts_with(&root) {
+                return Err(NuError::PackageError {
+                    msg: "web storage directory escapes package root".into(),
+                    span: Span::default(),
+                });
+            }
+            let path = parent.join(rel.file_name().expect("validated file name"));
+            if path.symlink_metadata().is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+                return Err(NuError::PackageError {
+                    msg: "web SQLite file must not be a symlink".into(),
+                    span: Span::default(),
+                });
+            }
+            Ok(Some(path))
+        }
+        other => Err(NuError::PackageError {
+            msg: format!("unsupported web.kv_backend '{other}'; use 'memory' or 'sqlite'"),
+            span: Span::default(),
+        }),
     }
 }
 
