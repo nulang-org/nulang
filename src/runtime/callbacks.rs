@@ -158,7 +158,7 @@ fn required_host_authority(
             }
             other("System", "Arg", Some(index.to_string()))
         }
-        ("DB", Some("query")) => other("DB", "Query", None),
+        ("DB", Some("query" | "query_checked")) => other("DB", "Query", None),
         ("Python", Some(op)) if !op.is_empty() => other("Python", op, None),
         ("Provider", Some("ask")) => other("Provider", "Ask", Some(string_arg(0)?)),
         // Inference/LLM asks are runtime-mediated: the node already holds the
@@ -820,6 +820,29 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
             };
             let mut rt = self.runtime.borrow_mut();
             return rt.query_workflow(workflow_id, &query_name);
+        }
+        #[cfg(any(feature = "sqlite", feature = "postgres"))]
+        if effect_name == "DB" && op_name == Some("query_checked") {
+            let sql = regs
+                .first()
+                .and_then(|value| value.as_string_id())
+                .and_then(|id| constants.get(id as usize))
+                .and_then(|constant| match constant {
+                    crate::bytecode::Constant::String(sql) => Some(sql.as_str()),
+                    _ => None,
+                });
+            let outcome = match sql {
+                Some(sql) if !sql.trim().is_empty() => {
+                    let rt = self.runtime.borrow();
+                    let result = rt.persistence.query(sql, &regs[1..]);
+                    if let Err(error) = &result {
+                        tracing::warn!(%error, "DB.query_checked failed");
+                    }
+                    crate::runtime::DbQueryOutcome::from_legacy_rows(result)
+                }
+                None => crate::runtime::DbQueryOutcome::invalid_query_argument(),
+            };
+            return Some(self.alloc_string(&outcome.to_json()));
         }
         #[cfg(any(feature = "sqlite", feature = "postgres"))]
         if effect_name == "DB" && op_name == Some("query") {
@@ -1648,6 +1671,32 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
                     _ => return None,
                 };
                 return (*self.runtime).query_workflow(workflow_id, &query_name);
+            }
+            #[cfg(any(feature = "sqlite", feature = "postgres"))]
+            if effect_name == "DB" && op_name == Some("query_checked") {
+                let sql = regs
+                    .first()
+                    .and_then(|value| value.as_string_id())
+                    .and_then(|id| constants.get(id as usize))
+                    .and_then(|constant| match constant {
+                        crate::bytecode::Constant::String(sql) => Some(sql.as_str()),
+                        _ => None,
+                    });
+                let outcome = match sql {
+                    Some(sql) if !sql.trim().is_empty() => {
+                        let result = (*self.runtime).persistence.query(sql, &regs[1..]);
+                        if let Err(error) = &result {
+                            tracing::warn!(%error, "DB.query_checked failed");
+                        }
+                        crate::runtime::DbQueryOutcome::from_legacy_rows(result)
+                    }
+                    None => crate::runtime::DbQueryOutcome::invalid_query_argument(),
+                };
+                let json = outcome.to_json();
+                return Some(match &mut (*self.runtime).vm {
+                    Some(vm) => vm.allocate_string(&json),
+                    None => crate::vm::Value::nil(),
+                });
             }
             #[cfg(any(feature = "sqlite", feature = "postgres"))]
             if effect_name == "DB" && op_name == Some("query") {
@@ -3081,4 +3130,68 @@ fn postgres_only_build_dispatches_db_query() {
         result.is_some(),
         "DB.query must be handled even when SQLite is disabled"
     );
+}
+
+
+#[cfg(test)]
+mod checked_query_effect_tests {
+    use super::required_host_authority;
+
+    #[test]
+    fn checked_queries_require_the_same_host_authority_as_legacy_queries() {
+        let legacy = required_host_authority("DB", Some("query"), &[], &[]).unwrap();
+        let checked = required_host_authority("DB", Some("query_checked"), &[], &[]).unwrap();
+        assert!(legacy.is_some(), "DB.query requires explicit actor authority");
+        assert_eq!(legacy, checked, "a checked query cannot bypass DB authority");
+    }
+
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[test]
+    fn checked_query_effect_returns_explicit_error_instead_of_nil() {
+        use super::RuntimeVmCallbacks;
+        use crate::runtime::Runtime;
+        use crate::vm::ActorVmCallbacks;
+        use std::cell::RefCell;
+        use std::ffi::CStr;
+        use std::rc::Rc;
+
+        let runtime = Rc::new(RefCell::new(Runtime::new()));
+        let mut callbacks = RuntimeVmCallbacks::new(runtime);
+
+        let missing_sql = callbacks
+            .perform_builtin_effect("DB", Some("query_checked"), &[], &[])
+            .expect("checked DB effect must be handled");
+        let ptr = missing_sql.as_ptr().expect("checked effect returns a heap string");
+        // The callback owns the live allocation until the runtime is dropped.
+        let encoded = unsafe { CStr::from_ptr(ptr.cast()).to_str().unwrap() };
+        assert!(encoded.contains(r#""status":"error""#));
+        assert!(encoded.contains(r#""code":"invalid_input""#));
+
+        let blank = [crate::bytecode::Constant::String("   ".into())];
+        let empty_sql = callbacks
+            .perform_builtin_effect(
+                "DB",
+                Some("query_checked"),
+                &blank,
+                &[crate::vm::Value::string(0)],
+            )
+            .expect("blank SQL must return a checked error");
+        let ptr = empty_sql.as_ptr().expect("error envelope is a heap string");
+        let encoded = unsafe { CStr::from_ptr(ptr.cast()).to_str().unwrap() };
+        assert!(encoded.contains(r#""code":"invalid_input""#));
+
+        let sql = [crate::bytecode::Constant::String("SELECT 1".into())];
+        let result = callbacks
+            .perform_builtin_effect(
+                "DB",
+                Some("query_checked"),
+                &sql,
+                &[crate::vm::Value::string(0)],
+            )
+            .expect("checked query is handled on supported builds");
+        let ptr = result.as_ptr().expect("checked query returns a heap string");
+        let encoded = unsafe { CStr::from_ptr(ptr.cast()).to_str().unwrap() };
+        assert!(encoded.contains(r#""status":"error""#));
+        assert!(encoded.contains(r#""code":"unsupported""#));
+    }
 }
