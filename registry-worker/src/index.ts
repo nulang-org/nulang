@@ -101,6 +101,11 @@ export default {
         const headers = new Headers();
         object.writeHttpMetadata(headers);
         headers.set('Content-Type', 'application/octet-stream');
+        const signature = object.customMetadata?.nulaSignature;
+        if (!signature) {
+          return new Response('Registry package has no publisher signature', { status: 409 });
+        }
+        headers.set('X-Nula-Signature', signature);
 
         return new Response(object.body as ReadableStream, {
           headers
@@ -132,6 +137,13 @@ export default {
           return new Response('Payload Too Large: package upload exceeds 64 MiB', { status: 413 });
         }
 
+        const signature = request.headers.get('X-Nula-Signature');
+        if (!signature || !/^[a-fA-F0-9]{128}$/.test(signature)) {
+          return new Response('Bad Request: X-Nula-Signature must be 128 hexadecimal characters', {
+            status: 400,
+          });
+        }
+
         // Check if version already exists
         const existing = await env.BUCKET.head(key);
         if (existing) {
@@ -149,7 +161,9 @@ export default {
           return quotaRejection;
         }
         
-        await env.BUCKET.put(key, request.body);
+        await env.BUCKET.put(key, request.body, {
+          customMetadata: { nulaSignature: signature },
+        });
         return new Response('Created', { status: 201 });
       }
     }
