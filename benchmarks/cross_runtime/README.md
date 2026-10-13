@@ -17,13 +17,13 @@ The default comparison uses each platform's standard message primitive:
 - **Go** — channels + goroutines
 - **Erlang/BEAM** — native processes + mailboxes
 
-One **opt-in real actor-framework** fixture is also available:
+Three **opt-in real actor-framework** fixtures are also available:
 
-- **Erlang/OTP** (`erlang_otp`) — `gen_server` actors, `gen_server:cast`
-  envelopes, handler dispatch and actor-owned state. It deliberately reuses
-  the existing Erlang installation; no additional dependencies are required.
-  Unlike the lower-level `erlang` baseline, this includes OTP server dispatch
-  overhead in every workload message.
+- **Erlang/OTP** (`erlang_otp`) — `gen_server` actors and `gen_server:cast`
+  envelope + handler dispatch, using the existing Erlang installation.
+- **Pony** (`pony`) — language-native actors and behaviors compiled by `ponyc`.
+- **C++ Actor Framework** (`caf`) — event-based actors compiled using CMake
+  and an installed `CAF::core` package.
 
 Run all installed runtimes on the same host:
 
@@ -46,6 +46,20 @@ python3 scripts/cross_runtime_bench.py \
 Each measured runtime process has a default 120-second wall-clock timeout
 (`--timeout-seconds` overrides it). A deadlocked fixture fails the run
 instead of leaving CI hung without a measurement.
+
+To run the optional Pony and CAF fixtures when their toolchains are installed:
+
+```bash
+python3 scripts/cross_runtime_bench.py \
+  --runtimes nulang,erlang_otp,pony,caf \
+  --runs 5 --warmup 1 --cpu-mode single \
+  --output /tmp/nulang-pony-caf.json
+```
+
+The default remains `nulang,rust,go,erlang`. Neither Pony nor CAF is a
+required dependency of the standard benchmark workflow. These fixtures have
+**no verified same-host performance result yet**, and must not appear as
+measured on nulang.org until built and run with recorded toolchain versions.
 
 The runner **fails closed** when a fixture emits a missing or duplicate
 workload, an incorrect logical-message count, or a non-positive duration.
@@ -103,9 +117,7 @@ In particular:
   and repeat important results on controlled hardware before publishing them.
 - Do not turn one workload into a blanket "X is faster than Y" claim.
 
-For additional actor-framework comparisons (Pony, Actix/Kameo,
-Proto.Actor, or Pekko/Akka), add separate pinned fixtures and matching test
-runs instead of silently changing the default standard-runtime baselines.
-An existing [Pony/CAF opt-in PR](https://github.com/nulang-org/nulang/pull/894)
-is being tracked separately; its fixtures are not part of this PR or
-published results.
+For additional framework comparisons (Actix/Kameo, Proto.Actor, Pekko/Akka),
+add separate version-pinned fixtures and same-host runs. The Pony and CAF
+sources were carried forward from [their existing PR](https://github.com/nulang-org/nulang/pull/894);
+availability in source does **not** establish a successful build or any speed ranking.

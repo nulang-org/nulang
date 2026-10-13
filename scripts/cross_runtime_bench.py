@@ -31,7 +31,7 @@ EXPECTED_MESSAGES = {
     "fork_join": 100_000,
 }
 DEFAULT_RUNTIMES = ("nulang", "rust", "go", "erlang")
-OPTIONAL_RUNTIMES = ("erlang_otp",)
+OPTIONAL_RUNTIMES = ("erlang_otp", "pony", "caf")
 ALL_RUNTIMES = frozenset(DEFAULT_RUNTIMES + OPTIONAL_RUNTIMES)
 
 
@@ -230,6 +230,33 @@ def build_commands(selected: list[str]) -> dict[str, list[str]]:
             "main", "-s", "init", "stop",
         ]
 
+    if "pony" in selected:
+        ponyc = shutil.which("ponyc")
+        if ponyc is None:
+            raise RuntimeError("ponyc is required for the Pony actor benchmark")
+        pony_dir = BUILD / "pony"
+        pony_dir.mkdir(parents=True, exist_ok=True)
+        command_output([
+            ponyc, "--output", str(pony_dir), "--bin-name", "pony_baseline",
+            str(FIXTURES / "pony_baseline"),
+        ])
+        binary = "pony_baseline.exe" if os.name == "nt" else "pony_baseline"
+        commands["pony"] = [str(pony_dir / binary)]
+
+    if "caf" in selected:
+        cmake = shutil.which("cmake")
+        if cmake is None:
+            raise RuntimeError("cmake is required for the CAF actor benchmark")
+        caf_dir = BUILD / "caf"
+        command_output([
+            cmake, "-S", str(FIXTURES / "caf_baseline"), "-B", str(caf_dir),
+            "-DCMAKE_BUILD_TYPE=Release",
+        ])
+        command_output([cmake, "--build", str(caf_dir), "--config", "Release",
+                        "--parallel"])
+        binary = "Release/caf_baseline.exe" if os.name == "nt" else "caf_baseline"
+        commands["caf"] = [str(caf_dir / binary)]
+
     return commands
 
 
@@ -297,6 +324,9 @@ def environment_metadata(
         "cargo": maybe_version(["cargo", "--version"]) if shutil.which("cargo") else None,
         "go": maybe_version(["go", "version"]) if shutil.which("go") else None,
         "erlang_otp": otp,
+        "ponyc": maybe_version(["ponyc", "--version"]) if shutil.which("ponyc") else None,
+        "cmake": maybe_version(["cmake", "--version"]) if shutil.which("cmake") else None,
+        "cxx": maybe_version(["c++", "--version"]) if shutil.which("c++") else None,
     }
 
 
@@ -348,7 +378,7 @@ def main() -> int:
     parser.add_argument(
         "--runtimes",
         default="nulang,rust,go,erlang",
-        help="comma-separated subset of nulang,rust,go,erlang,erlang_otp",
+        help="comma-separated subset of nulang,rust,go,erlang,erlang_otp,pony,caf",
     )
     parser.add_argument(
         "--cpu-mode",

@@ -1,5 +1,10 @@
 # Nulang Changelog
 
+### Optional Pony and CAF actor benchmark fixtures — 2026-10-12
+- **The matched cross-runtime benchmark runner accepts opt-in `pony` and `caf` actors alongside Nulang, Erlang/OTP and language baselines.** Compilers and CAF libraries are required only when selected; the normal benchmark command remains unchanged.
+- **This is fixture integration, not a measured performance ranking.** Tests cover fixture-command selection and missing compiler prerequisites. Exact toolchain versions and single-CPU affinity must be recorded before any public numerical comparison.
+
+
 ### Matched Erlang/OTP gen_server actor benchmarks — 2026-10-12
 - **An opt-in `erlang_otp` cross-runtime fixture measures real OTP generic-server actor dispatch.** Counting, ping-pong, thread-ring, and fork-join execute the existing logical-message contracts via `gen_server:cast`, leaving standard Rust/Go/BEAM baselines unchanged.
 - **Cross-runtime reporting rejects invalid benchmark records before summarizing them.** Duplicate workloads, non-positive timing, inconsistent workload message counts, and duplicate selected runtimes fail closed; eleven Python contract tests are run by the comparison workflow.

@@ -97,6 +97,32 @@ class ErlangOtpBuildPlanTests(unittest.TestCase):
         self.assertEqual("erl", pathlib.Path(commands["erlang_otp"][0]).name)
         self.assertIn("cross_runtime_otp", commands["erlang_otp"])
 
+    def test_pony_requires_ponyc(self):
+        with mock.patch.object(bench.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "ponyc"):
+                bench.build_commands(["pony"])
+
+    def test_caf_requires_cmake(self):
+        with mock.patch.object(bench.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "cmake"):
+                bench.build_commands(["caf"])
+
+    def test_optional_actor_fixtures_build_only_when_explicitly_selected(self):
+        with mock.patch.object(bench.shutil, "which", side_effect=lambda name: "/usr/bin/" + name):
+            with mock.patch.object(bench, "command_output") as output:
+                commands = bench.build_commands(["pony", "caf"])
+        self.assertIn("pony", commands)
+        self.assertIn("caf", commands)
+        builds = " ".join(str(arg) for call in output.call_args_list
+                          for arg in call.args[0])
+        self.assertIn("pony_baseline", builds)
+        self.assertIn("caf_baseline", builds)
+
+    def test_validate_runtimes_includes_opt_in_pony_and_caf(self):
+        self.assertEqual(["pony", "caf"], bench.validate_runtimes(["pony", "caf"]))
+        with self.assertRaisesRegex(ValueError, "unknown runtimes"):
+            bench.validate_runtimes(["actix"])
+
 
 if __name__ == "__main__":
     unittest.main()
