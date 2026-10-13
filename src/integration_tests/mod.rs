@@ -11617,6 +11617,46 @@ match { a: 2, b: 9 } with {
             }),
             "a JIT preemption must not commit StepCompleted: {events:?}"
         );
+        drop(runtime);
+
+        // The same activation must be requeued even if its mailbox is empty;
+        // JIT yielding is CPU preemption, not a request for another message.
+        // The original send has already enqueued the actor on the scheduler.
+        rt.borrow_mut().run_scheduler();
+
+        let runtime = rt.borrow();
+        let actor = runtime.actors.get(&actor_id).expect("resumed workflow");
+        assert!(!actor.jit_yield_pending, "the JIT continuation must finish");
+        assert!(actor.suspended_execution.is_none());
+        assert_eq!(
+            actor.get_state_field("step_index").and_then(|v| v.as_int()),
+            Some(1),
+            "compiled hot step must advance durable progress exactly once"
+        );
+        let terminal_events: Vec<_> = runtime
+            .persistence
+            .read_workflow_events(actor_id)
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    WorkflowEvent::StepCompleted { step_name, .. } if step_name == "hot"
+                )
+            })
+            .collect();
+        assert_eq!(
+            terminal_events.len(),
+            1,
+            "preemption and resume must write one terminal receipt"
+        );
+        assert_eq!(
+            runtime
+                .persistence
+                .load_snapshot(actor_id)
+                .and_then(|snapshot| snapshot.state.get("step_index").cloned()),
+            Some(PersistedValue::Int(1)),
+            "terminal receipt must have a matching durable checkpoint"
+        );
     }
 
     /// Verify the JIT safepoint infrastructure does not cause hangs or
