@@ -228,9 +228,23 @@ pub fn bind_document_action_payload(
                 "expected object payload for parameterized action".to_owned(),
             ));
         };
-        if fields.len() != params.len() {
+        // Neither duplicate parameter names nor extra payload keys may be
+        // interpreted as an authorized field by matching only the field count.
+        let mut parameter_names = std::collections::BTreeSet::new();
+        for param in params {
+            if !parameter_names.insert(param.name.as_str()) {
+                return Err(UiActionDispatchError::InvalidPayload(
+                    "duplicate compiler parameter name".to_owned(),
+                ));
+            }
+        }
+        if fields.len() != params.len()
+            || fields
+                .keys()
+                .any(|name| !parameter_names.contains(name.as_str()))
+        {
             return Err(UiActionDispatchError::InvalidPayload(
-                "payload field count does not match compiler parameter count".to_owned(),
+                "payload fields do not match compiler parameter names".to_owned(),
             ));
         }
         let mut arguments = Vec::with_capacity(params.len());
