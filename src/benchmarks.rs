@@ -120,6 +120,33 @@ fn bench_ab_mailbox_push_inline_1() {
     report_ab("mailbox_push_inline_1", N as u64, elapsed);
 }
 
+/// Verify that the benchmark fixture explicitly selects a trace state after
+/// spawn-time scheduler work; otherwise a previous handler may determine the
+/// admission benchmark's trace mode without the caller realizing it.
+#[test]
+fn test_enqueue_trace_control_fixture_selects_expected_context() {
+    for traced in [false, true] {
+        let (mut runtime, actor_id) = trace_controlled_enqueue_runtime(traced);
+        assert_eq!(runtime.current_trace.is_some(), traced);
+
+        runtime.send_message_by_id(actor_id, 0, &[]);
+        let msg = runtime
+            .actors
+            .get_mut(&actor_id)
+            .expect("benchmark target is resident")
+            .receive()
+            .expect("trace-control send was admitted");
+        assert_eq!(msg.trace_id.is_some(), traced);
+        if let Some(traceparent) = msg.trace_id {
+            let propagated = crate::runtime::TraceContext::from_traceparent(&traceparent)
+                .expect("admitted traceparent is valid W3C");
+            let expected = runtime.current_trace.expect("traced fixture has context");
+            assert_eq!(propagated.trace_id(), expected.trace_id());
+            assert_eq!(propagated.span_id(), expected.span_id());
+        }
+    }
+}
+
 /// Local enqueue hot-path sweep around the inline-payload boundary.
 ///
 /// 0/1/4 values are the common small-message cases; 5 crosses the proposed
