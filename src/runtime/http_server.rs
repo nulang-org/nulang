@@ -511,6 +511,138 @@ pub fn parse_form_urlencoded(body: &[u8]) -> Vec<(String, String)> {
     pairs
 }
 
+/// Route-scoped web state. SQLite is explicit; the default preserves the
+/// existing ephemeral store and never silently falls back after SQLite fails.
+#[derive(Clone)]
+enum WebStateProvider {
+    Memory,
+    #[cfg(feature = "sqlite")]
+    Sqlite(Arc<Mutex<crate::runtime::web_state::SqliteWebStore>>),
+}
+
+impl WebStateProvider {
+    fn from_sqlite_path(path: Option<PathBuf>) -> std::io::Result<Self> {
+        match path {
+            None => Ok(Self::Memory),
+            Some(path) => {
+                #[cfg(feature = "sqlite")]
+                {
+                    return Ok(Self::Sqlite(Arc::new(Mutex::new(
+                        crate::runtime::web_state::SqliteWebStore::open(path)?,
+                    ))));
+                }
+                #[cfg(not(feature = "sqlite"))]
+                {
+                    let _ = path;
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "web SQLite backend requires the sqlite Cargo feature",
+                    ))
+                }
+            }
+        }
+    }
+
+    fn get(&self, key: &str) -> std::io::Result<Option<String>> {
+        match self {
+            Self::Memory => Ok(kv_get(key)),
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite(store) => store
+                .lock()
+                .map_err(|_| std::io::Error::other("web SQLite mutex poisoned"))?
+                .get(key),
+        }
+    }
+
+    fn set(&self, key: &str, value: &str) -> std::io::Result<()> {
+        match self {
+            Self::Memory => {
+                kv_set(key, value);
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite(store) => store
+                .lock()
+                .map_err(|_| std::io::Error::other("web SQLite mutex poisoned"))?
+                .set(key, value),
+        }
+    }
+
+    fn delete(&self, key: &str) -> std::io::Result<()> {
+        match self {
+            Self::Memory => {
+                kv_delete(key);
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite(store) => store
+                .lock()
+                .map_err(|_| std::io::Error::other("web SQLite mutex poisoned"))?
+                .delete(key),
+        }
+    }
+
+    fn all(&self) -> std::io::Result<Vec<(String, String)>> {
+        match self {
+            Self::Memory => Ok(kv_all()),
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite(store) => store
+                .lock()
+                .map_err(|_| std::io::Error::other("web SQLite mutex poisoned"))?
+                .all(),
+        }
+    }
+}
+
+thread_local! {
+    static WEB_REQUEST_STATE: RefCell<Option<WebStateProvider>> = const { RefCell::new(None) };
+    static WEB_REQUEST_STATE_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+fn with_web_request_state<R>(backend: WebStateProvider, f: impl FnOnce() -> R) -> (R, Option<String>) {
+    WEB_REQUEST_STATE.with(|state| *state.borrow_mut() = Some(backend));
+    WEB_REQUEST_STATE_ERROR.with(|error| *error.borrow_mut() = None);
+    let result = f();
+    let error = WEB_REQUEST_STATE_ERROR.with(|error| error.borrow_mut().take());
+    WEB_REQUEST_STATE.with(|state| *state.borrow_mut() = None);
+    (result, error)
+}
+
+fn web_state_call<R>(f: impl FnOnce(&WebStateProvider) -> std::io::Result<R>) -> Option<R> {
+    let backend = WEB_REQUEST_STATE.with(|state| state.borrow().clone()).unwrap_or(WebStateProvider::Memory);
+    match f(&backend) {
+        Ok(result) => Some(result),
+        Err(error) => {
+            WEB_REQUEST_STATE_ERROR.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(error.to_string());
+                }
+            });
+            None
+        }
+    }
+}
+
+/// These entry points are for source-level Web.kv_* effects. On SQLite I/O
+/// failure, the route is forced to HTTP 500 even if user code discards the
+/// returned nil/unit value. Never treat a failed write as acknowledged.
+pub(crate) fn request_kv_get(key: &str) -> Option<String> {
+    web_state_call(|store| store.get(key)).flatten()
+}
+
+pub(crate) fn request_kv_set(key: &str, value: &str) {
+    let _ = web_state_call(|store| store.set(key, value));
+}
+
+pub(crate) fn request_kv_delete(key: &str) {
+    let _ = web_state_call(|store| store.delete(key));
+}
+
+pub(crate) fn request_kv_all() -> Vec<(String, String)> {
+    web_state_call(|store| store.all()).unwrap_or_default()
+}
+
 // ---------------------------------------------------------------------------
 // In-memory key/value store for the web framework.
 // ---------------------------------------------------------------------------
@@ -766,6 +898,18 @@ impl WebDevServer {
         output_dir: Option<PathBuf>,
         routes: Vec<RuntimeWebRoute>,
     ) -> std::io::Result<Self> {
+        Self::bind_runtime_with_state(port, static_dir, output_dir, routes, None)
+    }
+
+    /// Bind with opt-in SQLite-backed Web.kv_*; open failure prevents serving.
+    pub fn bind_runtime_with_state(
+        port: u16,
+        static_dir: Option<PathBuf>,
+        output_dir: Option<PathBuf>,
+        routes: Vec<RuntimeWebRoute>,
+        sqlite_path: Option<PathBuf>,
+    ) -> std::io::Result<Self> {
+        let web_state = WebStateProvider::from_sqlite_path(sqlite_path)?;
         let listener = TcpListener::bind(("0.0.0.0", port))?;
         let actual_port = listener.local_addr()?.port();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -782,6 +926,7 @@ impl WebDevServer {
                     static_dir_clone,
                     output_dir_clone,
                     routes_clone,
+                    web_state,
                     shutdown_clone,
                 );
             })?;
@@ -798,6 +943,7 @@ impl WebDevServer {
         static_dir: Option<PathBuf>,
         output_dir: Option<PathBuf>,
         routes: Vec<RuntimeWebRoute>,
+        web_state: WebStateProvider,
         shutdown: Arc<AtomicBool>,
     ) {
         listener.set_nonblocking(true).ok();
@@ -811,9 +957,10 @@ impl WebDevServer {
                     let static_dir = static_dir.clone();
                     let output_dir = output_dir.clone();
                     let routes = routes.clone();
+                    let web_state = web_state.clone();
                     let shutdown = shutdown.clone();
                     std::thread::spawn(move || {
-                        Self::handle_connection(stream, static_dir, output_dir, routes, shutdown);
+                        Self::handle_connection(stream, static_dir, output_dir, routes, web_state, shutdown);
                     });
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -829,6 +976,7 @@ impl WebDevServer {
         static_dir: Option<PathBuf>,
         output_dir: Option<PathBuf>,
         routes: Vec<RuntimeWebRoute>,
+        web_state: WebStateProvider,
         shutdown: Arc<AtomicBool>,
     ) {
         let mut buf = [0u8; 8192];
@@ -918,7 +1066,7 @@ impl WebDevServer {
                                         request: request.clone(),
                                         params: params.clone(),
                                     };
-                                    let rendered = with_request_context(ctx, || {
+                                    let (rendered, storage_error) = with_web_request_state(web_state.clone(), || with_request_context(ctx, || {
                                         match render_direct_request(route, &values) {
                                             Ok(Some(rendered)) => Ok(Some(rendered)),
                                             Ok(None) => Ok(render_route_handler(
@@ -928,7 +1076,17 @@ impl WebDevServer {
                                             )),
                                             Err(error) => Err(error),
                                         }
-                                    });
+                                    }));
+                                    if let Some(error) = storage_error {
+                                        eprintln!("web SQLite state error: {error}");
+                                    }
+                                    if storage_error.is_some() {
+                                        HttpResponse {
+                                            status: 500,
+                                            headers: vec![("Content-Type".into(), "text/plain".into())],
+                                            body: b"Internal server error".to_vec(),
+                                        }
+                                    } else {
                                     match rendered {
                                         Ok(Some(html)) => HttpResponse {
                                             status: 200,
@@ -965,6 +1123,7 @@ impl WebDevServer {
                                                 body: b"Internal server error".to_vec(),
                                             }
                                         }
+                                    }
                                     }
                                 }
                             } else {
