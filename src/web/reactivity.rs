@@ -1122,18 +1122,13 @@ fn view() -> Html {
     fn assert_shadowed_expression_has_no_signal_binding(mut expr: Expr) {
         let signals = HashSet::from(["count".to_string()]);
         let mut graph = SignalGraph::default();
-        scan_expr(
-            &expr,
-            &mut Vec::new(),
-            false,
-            &signals,
-            &mut graph,
-            None,
-        );
+        scan_expr(&expr, &mut Vec::new(), false, &signals, &mut graph, None);
+        let has_shadowed_read = graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node, GraphNode::Read { signal, .. } if signal == "count"));
         assert!(
-            !graph.nodes.iter().any(
-                |node| matches!(node, GraphNode::Read { signal, .. } if signal == "count")
-            ),
+            !has_shadowed_read,
             "a locally bound count must not be tracked as a global signal"
         );
 
