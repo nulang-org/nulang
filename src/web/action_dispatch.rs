@@ -495,6 +495,38 @@ mod tests {
     }
 
     #[test]
+    fn document_bound_scalar_payload_rejects_duplicate_contract_parameter_names() {
+        let module = module_with_action("save", vec![0, 1]);
+        let document = trusted_document("save", ActionPlacement::Server);
+        let message = action_payload(&[
+            ("title", WireValue::from("value")),
+            ("admin", WireValue::Bool(true)),
+        ]);
+        let params = [typed_param("title", "String"), typed_param("title", "String")];
+
+        assert!(matches!(
+            bind_document_action_payload(&module, &document, &message, &params),
+            Err(UiActionDispatchError::InvalidPayload(_))
+        ));
+    }
+
+    #[test]
+    fn document_bound_scalar_payload_rejects_nonfinite_float() {
+        let module = module_with_action("save", vec![0]);
+        let document = trusted_document("save", ActionPlacement::Server);
+        let params = [typed_param("ratio", "Float")];
+        let message = action_payload(&[(
+            "ratio",
+            WireValue::F64(nulang_ui_protocol::F64Bits::from_f64(f64::NAN)),
+        )]);
+
+        assert!(matches!(
+            bind_document_action_payload(&module, &document, &message, &params),
+            Err(UiActionDispatchError::InvalidPayload(_))
+        ));
+    }
+
+    #[test]
     fn document_bound_scalar_payload_rejects_foreign_or_unregistered_actions() {
         let module = module_with_action("save", vec![0]);
         let document = trusted_document("save", ActionPlacement::Server);
