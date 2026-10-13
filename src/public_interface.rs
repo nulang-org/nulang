@@ -822,6 +822,32 @@ mod tests {
     }
 
     #[test]
+    fn checked_interface_rejects_private_public_short_name_collision() {
+        let source = crate::ast::AstModule {
+            name: "api".to_string(),
+            decls: vec![
+                ast_fn("lookup", Some(EffectRow::empty())),
+                crate::ast::Decl::Module {
+                    name: "Internal".to_string(),
+                    exports: Vec::new(),
+                    decls: vec![{
+                        let mut hidden = ast_fn("lookup", Some(EffectRow::empty()));
+                        if let crate::ast::Decl::Function { public, .. } = &mut hidden {
+                            *public = false;
+                        }
+                        hidden
+                    }],
+                    span: Span::default(),
+                },
+            ],
+        };
+        let mut inferred = rustc_hash::FxHashMap::default();
+        inferred.insert("lookup".to_string(), inferred_function(Type::int()));
+        let err = interface_for_checked_ast(&source, &inferred).unwrap_err();
+        assert!(err.contains("ambiguous inferred function name"));
+    }
+
+    #[test]
     fn checked_interface_rejects_unverified_effect_rows() {
         let source = crate::ast::AstModule {
             name: "api".to_string(),
