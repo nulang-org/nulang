@@ -2905,6 +2905,40 @@ mod tests {
     }
 
     #[test]
+    fn web_sqlite_path_rejects_traversal_and_unsupported_backends() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_web_path_validation_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut config = crate::package::manifest::WebSection::default();
+        config.kv_backend = "sqlite".into();
+        for unsafe_path in ["../outside.sqlite", "/tmp/outside.sqlite", "data/../../outside.db"] {
+            config.kv_path = unsafe_path.into();
+            assert!(
+                resolve_web_sqlite_path(&dir, &config).is_err(),
+                "path {unsafe_path} must be rejected"
+            );
+        }
+
+        config.kv_path = "data/web-state.sqlite".into();
+        config.kv_backend = "unknown".into();
+        assert!(resolve_web_sqlite_path(&dir, &config).is_err());
+
+        config.kv_backend = "memory".into();
+        assert_eq!(resolve_web_sqlite_path(&dir, &config).unwrap(), None);
+
+        config.kv_backend = "sqlite".into();
+        let path = resolve_web_sqlite_path(&dir, &config)
+            .expect("safe storage path should resolve")
+            .expect("SQLite must have a concrete path");
+        assert!(path.starts_with(dir.canonicalize().unwrap()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn test_cmd_new_rejects_unknown_template() {
         let dir = std::env::temp_dir().join(format!("nulang_unk_tmpl_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
