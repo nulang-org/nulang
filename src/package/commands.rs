@@ -1160,6 +1160,10 @@ fn verify_locked_resolution(root: &Path, candidate: &Lockfile) -> NuResult<()> {
         });
     }
 
+    // Registry packages must match their complete pinned cache contents,
+    // whether --locked is invoked with or without --offline.
+    current.verify_cached_registry_source_identities(root)?;
+
     // Legacy content_hash and strong SourceId have distinct meanings.
     let fresh = candidate.with_available_source_identities()?;
     for identity in &current.identity {
