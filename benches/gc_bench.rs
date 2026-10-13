@@ -94,16 +94,16 @@ fn bench_orca_foreign_ref_send(c: &mut Criterion) {
     group.throughput(Throughput::Elements(REFS as u64));
 
     group.bench_function("256", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || foreign_ref_fixture(REFS),
-            |(mut rt, owner, target, ptrs)| {
-                rt.current_actor = Some(owner);
-                for ptr in ptrs {
+            |(rt, owner, target, ptrs)| {
+                rt.current_actor = Some(*owner);
+                for ptr in ptrs.iter().copied() {
                     // SAFETY: every pointer comes from the live owner actor's
                     // heap in this iteration and the Runtime owns that heap for
                     // the entire send sequence.
                     let value = unsafe { Value::ptr(ptr) };
-                    rt.send_message_by_id(target, 0, &[value]);
+                    rt.send_message_by_id(*target, 0, &[value]);
                 }
                 assert_eq!(
                     rt.gc_stats().foreign_refs_sent,
@@ -132,9 +132,9 @@ fn bench_actor_heap_small_alloc(c: &mut Criterion) {
 
     for payload_bytes in [8usize, 16, 32, 64, 128] {
         group.bench_function(format!("payload_{}", payload_bytes), |b| {
-            b.iter_batched(
+            b.iter_batched_ref(
                 || ActorHeap::new(64 * 1024),
-                |mut heap| {
+                |heap| {
                     for _ in 0..OBJECTS {
                         let ptr = heap
                             .alloc(payload_bytes, TypeTag::Raw)
@@ -163,21 +163,21 @@ fn bench_orca_local_alloc_drop(c: &mut Criterion) {
 
     for payload_bytes in [8usize, 16, 32, 64, 128] {
         group.bench_function(format!("payload_{}", payload_bytes), |b| {
-            b.iter_batched(
+            b.iter_batched_ref(
                 || {
                     let mut heap = ActorHeap::new(64 * 1024);
                     heap.set_actor_id(1);
                     (heap, OrcaGc::new(1))
                 },
-                |(mut heap, mut gc)| {
+                |(heap, gc)| {
                     for _ in 0..OPERATIONS {
                         let ptr = gc
-                            .alloc_object(&mut heap, payload_bytes, TypeTag::Raw)
+                            .alloc_object(heap, payload_bytes, TypeTag::Raw)
                             .expect("benchmark ORCA allocation");
                         // SAFETY: this is a live local reference on actor 1
                         // created immediately above; no other references exist.
                         unsafe {
-                            assert!(gc.drop_local_ref(&mut heap, ptr));
+                            assert!(gc.drop_local_ref(heap, ptr));
                         }
                     }
                     assert_eq!(heap.live_count(), 0);
