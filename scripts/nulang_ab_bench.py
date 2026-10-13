@@ -33,6 +33,7 @@ EXPECTED_MESSAGES = {
     "thread_ring": 20_000,
     "fork_join": 100_000,
 }
+
 RECORD_RE = re.compile(
     r"\[cross-bench\]\s+runtime=(?P<runtime>[a-z0-9_-]+)\s+"
     r"benchmark=(?P<benchmark>[a-z0-9_-]+)\s+"
@@ -164,6 +165,7 @@ def parse_records(output: str) -> dict[str, dict[str, int]]:
             + output
         )
     return rows
+
 
 def measurement_affinity(cpu_mode: str) -> set[int] | None:
     if cpu_mode == "host":
