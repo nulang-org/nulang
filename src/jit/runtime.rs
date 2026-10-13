@@ -1981,6 +1981,18 @@ macro_rules! define_aot_perform_async {
     };
 }
 
+#[cfg(test)]
+mod db_async_aot_tests {
+    #[test]
+    fn native_backend_refuses_async_sql_with_a_checked_error() {
+        let response = super::aot_checked_db_unavailable_result();
+        assert_eq!(
+            response,
+            r#"{"status":"error","error":{"code":"unsupported","message":"Database queries are unavailable on this backend."}}"#
+        );
+    }
+}
+
 define_aot_perform_async!(nulang_aot_perform_async_0,);
 define_aot_perform_async!(nulang_aot_perform_async_1, a0);
 define_aot_perform_async!(nulang_aot_perform_async_2, a0, a1);
