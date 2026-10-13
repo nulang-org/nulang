@@ -2815,7 +2815,10 @@ fn postgres_column_to_json(row: &postgres::Row, index: usize) -> io::Result<serd
     } else {
         Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("unsupported PostgreSQL result type {} at column {index}", data_type.name()),
+            format!(
+                "unsupported PostgreSQL result type {} at column {index}",
+                data_type.name()
+            ),
         ))
     }
 }
@@ -2833,12 +2836,18 @@ fn postgres_bind_value(
     if let Some(number) = value.as_int() {
         if expected == &Type::INT2 {
             return Ok(Box::new(i16::try_from(number).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "integer is out of PostgreSQL SMALLINT range")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "integer is out of PostgreSQL SMALLINT range",
+                )
             })?));
         }
         if expected == &Type::INT4 {
             return Ok(Box::new(i32::try_from(number).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "integer is out of PostgreSQL INTEGER range")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "integer is out of PostgreSQL INTEGER range",
+                )
             })?));
         }
         if expected == &Type::FLOAT4 {
@@ -3830,19 +3839,34 @@ mod postgres_store_tests {
     }
 
     #[test]
+    fn postgres_bind_value_checks_smallint_range_without_server() {
+        let bound = postgres_bind_value(&Value::int(32_768), &postgres::types::Type::INT2);
+        assert!(matches!(
+            bound,
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput
+        ));
+        assert!(postgres_bind_value(&Value::int(32_767), &postgres::types::Type::INT2).is_ok());
+        assert!(postgres_bind_value(&Value::int(i64::MAX), &postgres::types::Type::INT4).is_err());
+    }
+
+    #[test]
     fn postgres_query_decodes_scalar_widths_nulls_and_jsonb() {
         let Some(url) = pg_url() else {
             // An actual PostgreSQL server is required for the wire decoding path.
             return;
         };
         let store = PostgresStore::new(&url).unwrap();
-        let rows = store.query(
-            "SELECT 7::int2, 100::int4, 9000000000::int8, \
-                    1.5::float4, 2.25::float8, TRUE::bool, \
-                    'hello'::text, NULL::int4, NULL::text, \
-                    '{\"ok\":true}'::jsonb",
-            &[],
-        ).unwrap();
+        let rows = store
+            .query(
+                concat!(
+                    "SELECT 7::int2, 100::int4, 9000000000::int8, ",
+                    "1.5::float4, 2.25::float8, TRUE::bool, ",
+                    "'hello'::text, NULL::int4, NULL::text, ",
+                    "'{\"ok\":true}'::jsonb"
+                ),
+                &[],
+            )
+            .unwrap();
 
         assert_eq!(rows.len(), 1);
         let values: serde_json::Value = serde_json::from_str(&rows[0]).unwrap();
@@ -3858,13 +3882,16 @@ mod postgres_store_tests {
             return;
         };
         let store = PostgresStore::new(&url).unwrap();
-        let rows = store.query(
-            "SELECT $1::int2, $2::int4, $3::int8",
-            &[Value::int(7), Value::int(100), Value::int(9_000_000_000)],
-        ).unwrap();
+        let rows = store
+            .query(
+                "SELECT $1::int2, $2::int4, $3::int8",
+                &[Value::int(7), Value::int(100), Value::int(9_000_000_000)],
+            )
+            .unwrap();
         assert_eq!(rows, vec!["[7,100,9000000000]".to_owned()]);
 
-        let error = store.query("SELECT $1::int2", &[Value::int(100_000)])
+        let error = store
+            .query("SELECT $1::int2", &[Value::int(100_000)])
             .expect_err("out-of-range parameters must not silently truncate");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
@@ -3875,7 +3902,8 @@ mod postgres_store_tests {
             return;
         };
         let store = PostgresStore::new(&url).unwrap();
-        let error = store.query("SELECT decode('abcd', 'hex')::bytea", &[])
+        let error = store
+            .query("SELECT decode('abcd', 'hex')::bytea", &[])
             .expect_err("unknown column codecs must produce an error");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
