@@ -85,10 +85,7 @@ fn leased_delivery_and_ack_remain_blocked_until_application_quorum() {
         .fabric_stream_replicated_append("leases", 0, 2, b"do-not-run")
         .unwrap();
     assert!(!append.status.committed);
-    assert_eq!(
-        leader.fabric_stream_read("leases", 1, 10).unwrap().len(),
-        1
-    );
+    assert_eq!(leader.fabric_stream_read("leases", 1, 10).unwrap().len(), 1);
     assert!(leader
         .fabric_stream_read_committed("leases", 1, 10)
         .unwrap()
@@ -101,9 +98,14 @@ fn leased_delivery_and_ack_remain_blocked_until_application_quorum() {
         .is_empty());
     assert!(leader
         .fabric_stream_deliver_consumer("leases", "worker", 10, Duration::from_secs(30))
-        .unwrap().is_empty());
-    assert!(leader.fabric_stream_ack_consumer("leases", "worker", 1).is_err());
-    assert!(leader.fabric_stream_commit_cursor("leases", "worker", 1).is_err());
+        .unwrap()
+        .is_empty());
+    assert!(leader
+        .fabric_stream_ack_consumer("leases", "worker", 1)
+        .is_err());
+    assert!(leader
+        .fabric_stream_commit_cursor("leases", "worker", 1)
+        .is_err());
     assert_eq!(leader.fabric_stream_cursor("leases", "worker").unwrap(), 0);
 
     // Persisted raw tail exists on reopen, but quorum is still absent.
@@ -116,12 +118,17 @@ fn leased_delivery_and_ack_remain_blocked_until_application_quorum() {
     assert!(reopened
         .fabric_stream_deliver_consumer("leases", "worker", 10, Duration::from_secs(30))
         .is_err());
-    assert!(reopened.fabric_stream_ack_consumer("leases", "worker", 1).is_err());
+    assert!(reopened
+        .fabric_stream_ack_consumer("leases", "worker", 1)
+        .is_err());
 
     follower.process_network();
     leader.process_network();
 
-    assert_eq!(leader.fabric_stream_committed_sequence("leases").unwrap(), 1);
+    assert_eq!(
+        leader.fabric_stream_committed_sequence("leases").unwrap(),
+        1
+    );
     let delivery = leader
         .fabric_stream_deliver_consumer("leases", "worker", 10, Duration::from_secs(30))
         .unwrap();
@@ -129,17 +136,13 @@ fn leased_delivery_and_ack_remain_blocked_until_application_quorum() {
     assert_eq!(delivery[0].record.sequence, 1);
     assert_eq!(delivery[0].record.payload, b"do-not-run");
     leader
-        .fabric_stream_ack_consumer_fenced(
-            "leases",
-            "worker",
-            1,
-            delivery[0].leader_epoch.unwrap(),
-        )
+        .fabric_stream_ack_consumer_fenced("leases", "worker", 1, delivery[0].leader_epoch.unwrap())
         .unwrap();
     assert_eq!(leader.fabric_stream_cursor("leases", "worker").unwrap(), 1);
     assert!(leader
         .fabric_stream_deliver_consumer("leases", "worker", 10, Duration::from_secs(30))
-        .unwrap().is_empty());
+        .unwrap()
+        .is_empty());
 
     drop(reopened);
     let _ = std::fs::remove_dir_all(root_a);
