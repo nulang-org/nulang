@@ -1,5 +1,11 @@
 # Nulang Changelog
 
+### Fabric successor consumer admission fails closed — 2026-10-08
+- **Replicated application-consumer operations now stop after stream leader epoch replacement.** Until ACK-gap and lease recovery is verified, the successor cannot silently replay records or accept even correctly epoch-stamped consumer mutations; standalone streams and raw diagnostic reads retain their prior semantics.
+- **Added a private full-old-policy metadata witness evaluator.** Missing, duplicate, pending or conflicting snapshots are rejected; the evaluator does not fetch/authenticate witnesses, transfer state, or authorize delivery.
+- **Unblocked CI remains a prerequisite.** Existing stacked GitHub CI flagged a focused Fabric follower prepare/receipt vote regression and rustfmt differences. Added focused diagnosis, not a claim of passing Rust tests.
+
+
 ### Fabric consumer metadata COMMIT-fsync confirmations (experimental) — 2026-10-08
 - **Distinguished leader metadata COMMIT decisions from follower COMMIT fsync.** Followers reply with a separate commit-specific application receipt only after the exact decision is persisted; the leader checks peer identity, installed membership/epoch, sequence and digest before fsyncing a `CommitReceipt` event.
 - **A contiguous, restart-recoverable confirmation frontier prevents skipped metadata decisions.** Unique post-COMMIT follower votes are persisted per index; a gap keeps later decisions from being reported confirmed. A bounded history replay API resends up to 256 ordered committed metadata updates after packet loss.

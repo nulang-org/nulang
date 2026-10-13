@@ -10,6 +10,32 @@ The public consumer cursor, ACK gap, and lease APIs still use node-local
 storage. Draft #1432 checks the locally installed leader epoch but does
 not prove live quorum.
 
+### Post-promotion consumer admission (fail closed)
+
+The application consumer Runtime now rejects replicated `read_consumer`,
+`deliver_consumer`, epoch-bearing ACK/NACK, and explicit cursor commits
+whenever an installed stream policy has advanced beyond initial epoch 1.
+Neither a valid new-epoch token nor quorum-committed stream data is
+evidence that the successor has recovered ACK gaps and outstanding leases.
+This safety stop is intentional and has no operator bypass in this slice.
+
+A private, **read-only** old-policy recovery evaluator now requires every
+old replica to supply matching, complete, non-pending metadata history,
+ACK cursor/gap snapshot, and installed policy. Any missing, conflicting,
+duplicate or unresolved witness fails closed. It is deliberately stricter
+than a quorum because a missing old leader could have a later locally
+persisted decision that was never propagated. These witness records are
+not transport-authenticated and no protocol collects them across nodes;
+the evaluator never unblocks application consumers. This is a
+conservative audit primitive, not a replacement-leader recovery system.
+
+**Current validation blocker:** GitHub Actions for #1449 reached actual Rust
+build/tests, but one deterministic Fabric metadata prepare/receipt test
+failed (leader observed one rather than two votes). Rustfmt also failed;
+these issues and all stacked exact-head CI must be resolved before
+promotion. The follow-up adds a specific follower-prepared assertion to
+distinguish receive-side rejection from receipt transport/leader fsync.
+
 ### Experimental transport slice
 
 The leader can stage a private metadata prepare and dispatch it over the
