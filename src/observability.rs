@@ -191,6 +191,10 @@ pub struct MetricsExporter {
     allocator_heap_requested_bytes: opentelemetry::metrics::Gauge<u64>,
     allocator_heap_live_objects: opentelemetry::metrics::Gauge<u64>,
     allocator_arena_epoch_allocations: opentelemetry::metrics::Gauge<u64>,
+    orca_local_refs_created: opentelemetry::metrics::Gauge<u64>,
+    orca_local_refs_dropped: opentelemetry::metrics::Gauge<u64>,
+    orca_foreign_refs_sent: opentelemetry::metrics::Gauge<u64>,
+    orca_foreign_refs_received: opentelemetry::metrics::Gauge<u64>,
     resolver_local: opentelemetry::metrics::Counter<u64>,
     resolver_remote: opentelemetry::metrics::Counter<u64>,
     resolver_failed: opentelemetry::metrics::Counter<u64>,
@@ -235,6 +239,18 @@ impl MetricsExporter {
                 .init(),
             allocator_arena_epoch_allocations: meter
                 .u64_gauge("nulang.allocator.arena.epoch_allocations")
+                .init(),
+            orca_local_refs_created: meter
+                .u64_gauge("nulang.orca.local_refs_created.active")
+                .init(),
+            orca_local_refs_dropped: meter
+                .u64_gauge("nulang.orca.local_refs_dropped.active")
+                .init(),
+            orca_foreign_refs_sent: meter
+                .u64_gauge("nulang.orca.foreign_refs_sent.active")
+                .init(),
+            orca_foreign_refs_received: meter
+                .u64_gauge("nulang.orca.foreign_refs_received.active")
                 .init(),
             resolver_local: meter.u64_counter("nulang.resolver.local").init(),
             resolver_remote: meter.u64_counter("nulang.resolver.remote").init(),
@@ -343,6 +359,12 @@ impl MetricsExporter {
             .record(a.heap_live_objects, &[]);
         self.allocator_arena_epoch_allocations
             .record(a.arena_epoch_allocations, &[]);
+
+        let o = &snap.orca_traffic;
+        self.orca_local_refs_created.record(o.local_refs_created, &[]);
+        self.orca_local_refs_dropped.record(o.local_refs_dropped, &[]);
+        self.orca_foreign_refs_sent.record(o.foreign_refs_sent, &[]);
+        self.orca_foreign_refs_received.record(o.foreign_refs_received, &[]);
 
         let r = &snap.resolver;
         let p_r = prev_ref.map(|p| &p.resolver);
