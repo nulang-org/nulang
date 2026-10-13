@@ -336,6 +336,11 @@ pub fn interface_for_checked_ast(
     source: &crate::ast::AstModule,
     inferred: &rustc_hash::FxHashMap<String, Type>,
 ) -> Result<PublicModuleInterface, String> {
+    // The current typechecker records inference by short name. Even private
+    // names in another namespace can overwrite a public entry. Disallow all
+    // collisions until the compiler records fully-qualified identity.
+    let mut all_functions = std::collections::BTreeSet::new();
+    check_global_function_name_uniqueness(&source.decls, &mut all_functions)?;
     let mut observed_functions = std::collections::BTreeSet::new();
     let decls = checked_decls(
         &source.decls,
@@ -347,6 +352,29 @@ pub fn interface_for_checked_ast(
         name: source.name.clone(),
         decls,
     })
+}
+
+fn check_global_function_name_uniqueness(
+    decls: &[crate::ast::Decl],
+    seen: &mut std::collections::BTreeSet<String>,
+) -> Result<(), String> {
+    for decl in decls {
+        match decl {
+            crate::ast::Decl::Function { name, .. } => {
+                if !seen.insert(name.clone()) {
+                    return Err(format!(
+                        "public interface: ambiguous inferred function name '{}'",
+                        name
+                    ));
+                }
+            }
+            crate::ast::Decl::Module { decls, .. } => {
+                check_global_function_name_uniqueness(decls, seen)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn checked_decls(
