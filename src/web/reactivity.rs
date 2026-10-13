@@ -24,6 +24,12 @@ pub enum GraphNode {
     Signal { name: String },
     /// A read of a signal at a given DOM path.
     Read { signal: String, path: String },
+    /// A signal read bound to an explicitly permitted HTML attribute.
+    AttributeRead {
+        signal: String,
+        path: String,
+        attribute: String,
+    },
     /// An action handler attached to an element at a DOM path.
     Action {
         handler: String,
@@ -63,6 +69,7 @@ impl SignalGraph {
         let mut nodes = Vec::with_capacity(self.nodes.len() + 1);
         let mut signal_index = 0usize;
         let mut read_index = 0usize;
+        let mut attribute_read_index = 0usize;
         let mut action_index = 0usize;
 
         for graph_node in &self.nodes {
@@ -85,6 +92,30 @@ impl SignalGraph {
                         .insert("signal".to_string(), WireValue::from(signal.clone()));
                     node.properties
                         .insert("path".to_string(), WireValue::from(path.clone()));
+                    node.properties.insert("value".to_string(), WireValue::Null);
+                    root.children.push(id);
+                    node
+                }
+                GraphNode::AttributeRead {
+                    signal,
+                    path,
+                    attribute,
+                } => {
+                    let id = NodeId::new(format!("attribute:{attribute_read_index}:{signal}"));
+                    attribute_read_index += 1;
+                    let mut node = UiNode::new(id.clone(), "attribute_read");
+                    node.properties.insert(
+                        "signal".to_string(),
+                        WireValue::from(signal.clone()),
+                    );
+                    node.properties.insert(
+                        "path".to_string(),
+                        WireValue::from(path.clone()),
+                    );
+                    node.properties.insert(
+                        "attribute".to_string(),
+                        WireValue::from(attribute.clone()),
+                    );
                     node.properties.insert("value".to_string(), WireValue::Null);
                     root.children.push(id);
                     node
@@ -133,6 +164,7 @@ impl SignalGraph {
         let mut operations = Vec::new();
         let mut signal_index = 0usize;
         let mut read_index = 0usize;
+        let mut attribute_read_index = 0usize;
         let mut found_signal = false;
 
         for graph_node in &self.nodes {
@@ -160,6 +192,21 @@ impl SignalGraph {
                         });
                     }
                     read_index += 1;
+                }
+                GraphNode::AttributeRead {
+                    signal: read_signal,
+                    ..
+                } => {
+                    if read_signal == signal {
+                        operations.push(PatchOperation::SetProperty {
+                            node_id: NodeId::new(format!(
+                                "attribute:{attribute_read_index}:{read_signal}"
+                            )),
+                            name: "value".to_string(),
+                            value: value.clone(),
+                        });
+                    }
+                    attribute_read_index += 1;
                 }
                 GraphNode::Action { .. } => {}
             }
@@ -262,6 +309,16 @@ fn scan_expr(
             let children = array_elements(&args[2]);
 
             for (name, value) in &attrs {
+                if let Expr::Var(signal, ..) = value {
+                    if signals.contains(signal) && reactive_attribute_marker(name).is_some() {
+                        graph.push(GraphNode::AttributeRead {
+                            signal: signal.clone(),
+                            path: path_with_tag(path, &tag),
+                            attribute: name.clone(),
+                        });
+                        continue;
+                    }
+                }
                 if name == "action" {
                     if let Some(handler) = action_handler_name(value) {
                         graph.push(GraphNode::Action {
@@ -271,10 +328,13 @@ fn scan_expr(
                         });
                     }
                 }
+                // Only a compiler-emitted binding is a live DOM patch target.
+                // Other attribute expressions may still contain nested HTML,
+                // but ordinary signal references there are not hydratable.
                 scan_expr(
                     value,
                     &mut path_with(path, &tag),
-                    true,
+                    false,
                     signals,
                     graph,
                     checker,
@@ -553,6 +613,16 @@ fn array_tuples(expr: &Expr) -> Vec<(String, &Expr)> {
     out
 }
 
+/// Allow only inert, text-valued attributes into dynamic DOM updates. URL,
+/// event, style, and raw HTML attributes require separate security contracts.
+fn reactive_attribute_marker(name: &str) -> Option<&'static str> {
+    match name {
+        "title" => Some("data-nulang-bind-title"),
+        "aria-label" => Some("data-nulang-bind-aria-label"),
+        _ => None,
+    }
+}
+
 fn action_handler_name(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Var(name, ..) => Some(name.clone()),
@@ -583,7 +653,11 @@ fn path_with_tag(path: &[String], tag: &str) -> String {
 /// client-side signal micro-runtime can hydrate the page. The tag is placed
 /// just before `</body>` when present, otherwise appended at the end.
 pub fn inject_client_runtime_script(html: &str) -> String {
-    if !html.contains("data-signal=") && !html.contains("data-action=") {
+    if !html.contains("data-signal=")
+        && !html.contains("data-action=")
+        && !html.contains("data-nulang-bind-title=")
+        && !html.contains("data-nulang-bind-aria-label=")
+    {
         return html.to_string();
     }
     let script = r#"<script src="/app.client.js"></script>"#;
@@ -645,12 +719,19 @@ fn rewrite_expr(
 
             let mut data_attrs: Vec<Expr> = Vec::new();
 
-            // Inspect attrs array for action={fn} attributes.
+            // Attach hydration metadata only for inert, direct signal attributes.
             if let Expr::Array(attrs, _) = &mut args[1] {
                 for attr in attrs.iter_mut() {
                     if let Expr::Tuple(parts, _) = attr {
                         if parts.len() == 2 {
                             if let Some(name) = string_literal(&parts[0]) {
+                                if let Expr::Var(signal, ..) = &parts[1] {
+                                    if signals.contains(signal) {
+                                        if let Some(marker) = reactive_attribute_marker(&name) {
+                                            data_attrs.push(data_attr(marker, signal, *span));
+                                        }
+                                    }
+                                }
                                 if name == "action" {
                                     if let Some(handler) = action_handler_name(&parts[1]) {
                                         let placement = classify_action(&handler, checker);
@@ -885,15 +966,27 @@ fn data_attr(name: &str, value: &str, span: Span) -> Expr {
 /// `data-signal` and `data-action` attributes emitted by the compiler.
 pub fn generate_client_runtime() -> String {
     r#"(function () {
-  const signals = {};
+  const signals = Object.create(null);
   const signalBindings = Object.create(null);
+  const attributeBindings = Object.create(null);
+  const safeAttributes = [
+    ['title', 'data-nulang-bind-title'],
+    ['aria-label', 'data-nulang-bind-aria-label']
+  ];
 
   function refreshSignal(name) {
     const bindings = signalBindings[name];
-    if (!bindings) return;
-    bindings.forEach(function (el) {
-      el.textContent = signals[name];
-    });
+    if (bindings) {
+      bindings.forEach(function (el) {
+        el.textContent = signals[name];
+      });
+    }
+    const attributes = attributeBindings[name];
+    if (attributes) {
+      attributes.forEach(function (binding) {
+        binding.el.setAttribute(binding.attribute, String(signals[name]));
+      });
+    }
   }
 
   function runClientAction(handler) {
@@ -972,6 +1065,22 @@ pub fn generate_client_runtime() -> String {
         signalBindings[name] = [];
       }
       signalBindings[name].push(el);
+    });
+
+    safeAttributes.forEach(function (entry) {
+      const attribute = entry[0];
+      const marker = entry[1];
+      document.querySelectorAll('[' + marker + ']').forEach(function (el) {
+        const name = el.getAttribute(marker);
+        if (!name) return;
+        if (!(name in signals)) {
+          signals[name] = el.getAttribute(attribute);
+        }
+        if (!attributeBindings[name]) {
+          attributeBindings[name] = [];
+        }
+        attributeBindings[name].push({ el: el, attribute: attribute });
+      });
     });
 
     document.querySelectorAll('[data-action]').forEach(function (el) {
@@ -1203,6 +1312,107 @@ fn view() -> Html { <span>{count}</span> }
             span: Span::default(),
         };
         assert_shadowed_expression_has_no_signal_binding(expr);
+    }
+
+    #[test]
+    fn test_safe_signal_attribute_has_a_compiler_binding() {
+        let mut module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+signal label: Html = text("Start")
+
+fn view() -> Html {
+    <button title={label} aria-label={label}>Start</button>
+}
+"#,
+        );
+        let graph = analyze_module(&module, None);
+        for attribute in ["title", "aria-label"] {
+            assert!(graph.nodes.contains(&GraphNode::AttributeRead {
+                signal: "label".to_string(),
+                path: "button".to_string(),
+                attribute: attribute.to_string(),
+            }));
+        }
+
+        let mut document = graph.to_ui_document("app", nulang_ui_protocol::Revision(1));
+        document
+            .validate()
+            .expect("attribute graph must project to valid UI IR");
+        let patch = graph
+            .signal_patch(
+                "app",
+                nulang_ui_protocol::Revision(1),
+                nulang_ui_protocol::Revision(2),
+                "label",
+                nulang_ui_protocol::WireValue::from("Updated"),
+            )
+            .expect("attribute-only signal must be patchable");
+        assert_eq!(patch.operations.len(), 3);
+        document
+            .apply_patch(&patch)
+            .expect("attribute patches must apply");
+        let attributes: Vec<_> = document
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "attribute_read")
+            .collect();
+        assert_eq!(attributes.len(), 2);
+        assert!(attributes.iter().all(|node| {
+            node.properties.get("value")
+                == Some(&nulang_ui_protocol::WireValue::from("Updated"))
+        }));
+
+        rewrite_module(&mut module, None);
+        let rendered = format!("{:?}", find_function_body(&module, "view"));
+        assert!(rendered.contains("data-nulang-bind-title"));
+        assert!(rendered.contains("data-nulang-bind-aria-label"));
+    }
+
+    #[test]
+    fn test_unsafe_url_attribute_does_not_get_a_reactive_dom_binding() {
+        let mut module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+signal label: Html = text("safe")
+
+fn view() -> Html {
+    <a href={label}>Link</a>
+}
+"#,
+        );
+        let graph = analyze_module(&module, None);
+        assert!(!graph.nodes.iter().any(|node| matches!(
+            node,
+            GraphNode::AttributeRead { attribute, .. } if attribute == "href"
+        )));
+        assert!(
+            !graph.nodes.iter().any(|node| matches!(
+                node,
+                GraphNode::Read { signal, .. } if signal == "label"
+            )),
+            "unsupported attributes must not emit DOM read patch targets"
+        );
+        rewrite_module(&mut module, None);
+        let rendered = format!("{:?}", find_function_body(&module, "view"));
+        assert!(!rendered.contains("data-nulang-bind-href"));
+    }
+
+    #[test]
+    fn test_attribute_only_interaction_loads_client_runtime() {
+        let html = r#"<button title="Start" data-nulang-bind-title="label">Start</button>"#;
+        let out = inject_client_runtime_script(html);
+        assert!(out.contains(r#"<script src="/app.client.js"></script>"#));
+        assert_eq!(out.matches("app.client.js").count(), 1);
+
+        let js = generate_client_runtime();
+        assert!(js.contains("data-nulang-bind-title"));
+        assert!(js.contains("data-nulang-bind-aria-label"));
+        assert!(js.contains("setAttribute"));
     }
 
     #[test]
