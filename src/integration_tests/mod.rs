@@ -11758,41 +11758,54 @@ match { a: 2, b: 9 } with {
             }
             let w = spawn JitReject {} in { w }
         "#;
-        let store = SharedMemoryStore::new();
-        let rt = Rc::new(RefCell::new(Runtime::new()));
-        rt.borrow_mut().persistence = Box::new(RejectStepCompletedStore(store.clone()));
-        let (value, _) = run_source_with_runtime(source, rt.clone()).unwrap();
-        let actor_id = value.as_actor_id().expect("workflow actor");
 
-        rt.borrow_mut().send_message_by_id(actor_id, 0, &[]);
-        rt.borrow_mut().step_actor(actor_id);
-        assert!(
-            rt.borrow()
-                .actors
-                .get(&actor_id)
-                .expect("preempted actor still live")
-                .jit_yield_pending,
-            "fixture must exercise JIT preemption before terminal write failure"
-        );
+        // One failure before StepCompleted is stored, another between the
+        // accepted terminal event and its legacy two-write checkpoint.
+        for failure_mode in 0..2 {
+            let store = SharedMemoryStore::new();
+            let rt = Rc::new(RefCell::new(Runtime::new()));
+            rt.borrow_mut().persistence = Box::new(store.clone());
+            let (value, _) = run_source_with_runtime(source, rt.clone()).unwrap();
+            let actor_id = value.as_actor_id().expect("workflow actor");
+            rt.borrow_mut().persistence = if failure_mode == 0 {
+                Box::new(RejectStepCompletedStore(store.clone()))
+            } else {
+                Box::new(RejectStepFailedCheckpointStore(store.clone()))
+            };
 
-        rt.borrow_mut().run_scheduler();
+            rt.borrow_mut().send_message_by_id(actor_id, 0, &[]);
+            rt.borrow_mut().step_actor(actor_id);
+            assert!(
+                rt.borrow()
+                    .actors
+                    .get(&actor_id)
+                    .expect("preempted actor still live")
+                    .jit_yield_pending,
+                "fixture must exercise JIT preemption before terminal write failure"
+            );
+            rt.borrow_mut().run_scheduler();
 
-        assert!(
-            !rt.borrow().actors.contains_key(&actor_id),
-            "failed terminal append must quarantine the speculative JIT actor"
-        );
-        let snapshot = store.load_snapshot(actor_id).expect("last safe checkpoint");
-        assert_eq!(
-            snapshot.state.get("step_index"),
-            Some(&crate::runtime::PersistedValue::Int(0)),
-            "failed terminal write cannot checkpoint a speculative step index"
-        );
-        assert!(
-            !store.read_workflow_events(actor_id).iter().any(|event| {
-                matches!(event, WorkflowEvent::StepCompleted { .. })
-            }),
-            "rejected terminal append must not produce a completion receipt"
-        );
+            assert!(
+                !rt.borrow().actors.contains_key(&actor_id),
+                "rejected terminal append/checkpoint must quarantine JIT actor"
+            );
+            let snapshot = store.load_snapshot(actor_id).expect("last safe checkpoint");
+            assert_eq!(
+                snapshot.state.get("step_index"),
+                Some(&crate::runtime::PersistedValue::Int(0)),
+                "failed terminal transition cannot checkpoint speculative progress"
+            );
+            let completions = store
+                .read_workflow_events(actor_id)
+                .iter()
+                .filter(|event| matches!(event, WorkflowEvent::StepCompleted { .. }))
+                .count();
+            assert_eq!(
+                completions,
+                if failure_mode == 0 { 0 } else { 1 },
+                "checkpoint rejection may leave an orphan StepCompleted event"
+            );
+        }
     }
 
     /// JIT-resumed VM failures may have already mutated durable fields.
