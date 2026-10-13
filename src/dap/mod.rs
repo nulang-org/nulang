@@ -1252,26 +1252,21 @@ pub(crate) mod tests {
             }
             // Only a terminal event permits clean EOF. The timeout is a
             // deadlock guard, not a production quiescence heuristic.
-            match self
-                .terminal
-                .recv_timeout(std::time::Duration::from_secs(10))
-            {
+            match self.terminal.recv_timeout(std::time::Duration::from_secs(10)) {
                 Ok(()) => {
                     self.released = true;
                     Ok(0)
                 }
-                Err(crossbeam::channel::RecvTimeoutError::Timeout) => Err(
-                    std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "scripted DAP session never emitted terminated",
-                    ),
-                ),
-                Err(crossbeam::channel::RecvTimeoutError::Disconnected) => Err(
-                    std::io::Error::new(
+                Err(crossbeam::channel::RecvTimeoutError::Timeout) => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "scripted DAP session never emitted terminated",
+                )),
+                Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
+                    Err(std::io::Error::new(
                         std::io::ErrorKind::BrokenPipe,
                         "terminal event writer closed without completion",
-                    ),
-                ),
+                    ))
+                }
             }
         }
     }
@@ -1386,8 +1381,7 @@ pub(crate) mod tests {
         let mut output = Vec::new();
         if wait_for_termination {
             let (terminal_tx, terminal_rx) = crossbeam::channel::bounded(1);
-            let reader =
-                TerminalGatedReader::new(std::io::Cursor::new(input), terminal_rx);
+            let reader = TerminalGatedReader::new(std::io::Cursor::new(input), terminal_rx);
             let writer = TerminalEventWriter::new(&mut output, terminal_tx);
             run_dap_server_io(std::io::BufReader::new(reader), writer);
         } else {
