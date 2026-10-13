@@ -25,6 +25,17 @@ class BenchmarkTimingContractTests(unittest.TestCase):
                 )
                 self.assertIn(".iter_batched_ref(", source)
 
+    def test_allocation_benchmarks_are_registered_in_gc_group(self):
+        source = (ROOT / "benches" / "gc_bench.rs").read_text()
+        group = source.split("criterion_group!(", 1)[1]
+        for name in ("bench_actor_heap_small_alloc", "bench_orca_local_alloc_drop"):
+            with self.subTest(benchmark=name):
+                self.assertIn(
+                    name + ",",
+                    group,
+                    "defined allocation benchmark is not registered; cargo bench never runs it",
+                )
+
     def test_benchmark_history_persists_all_canonical_snapshots(self):
         source = CI_WORKFLOW.read_text()
         persist = source.split("- name: Persist benchmark history", 1)[1].split(
