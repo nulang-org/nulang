@@ -23,8 +23,8 @@
 function compareNumeric(a: string, b: string): number {
   // Preserve existing lenient behavior for malformed version keys by using
   // any leading decimal digits, falling back to zero when there are none.
-  const left = (a.match(/^\\d+/)?.[0] ?? '0').replace(/^0+(?=\\d)/, '');
-  const right = (b.match(/^\\d+/)?.[0] ?? '0').replace(/^0+(?=\\d)/, '');
+  const left = (a.match(/^\d+/)?.[0] ?? '0').replace(/^0+(?=\d)/, '');
+  const right = (b.match(/^\d+/)?.[0] ?? '0').replace(/^0+(?=\d)/, '');
   if (left.length !== right.length) return left.length < right.length ? -1 : 1;
   if (left === right) return 0;
   return left < right ? -1 : 1;
