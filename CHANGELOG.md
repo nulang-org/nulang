@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Relocatable native object emission — 2026-09-25
+- **Nulang now has a true Cranelift `ObjectModule` artifact path behind the opt-in `native-object` feature.** Ordinary MIR functions compile into relocatable native object bytes with a stable exported `nulang_entry` symbol when a top-level entry exists; runtime helpers remain explicit unresolved imports for the later linker/runtime packaging layer.
+- **The MIR-to-CLIF AOT lowering is now generic over Cranelift's `Module` trait.** The executable JIT-backed native path and relocatable object path therefore share one native semantic lowering instead of maintaining parallel compilers.
+- **The first object slice fails closed on actor modules.** Actor object artifacts will land only after the existing stable `NativeActorEntry` wrapper ABI and behavior metadata are exported deliberately; library modules without `main` already emit objects without an entry symbol.
+- **Default/JIT-only dependency cost is unchanged.** `cranelift-object` is optional and activated only by `native-object`; CI executes the focused object-artifact tests under a no-default-features profile.
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
