@@ -2726,6 +2726,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn offline_flag_requires_a_lockfile_before_creating_dependency_cache() {
+        let dir = std::env::temp_dir().join(format!(
+            "nula_offline_missing_{}", std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        scaffold_package(&dir, "offline-app", "default").unwrap();
+        let _guard = ChangeDir::new(&dir);
+
+        for command in ["build", "run", "test", "build-wasm"] {
+            let args = vec![command.to_string(), "--offline".to_string()];
+            let error = run(&args).expect_err("offline implies a strict lockfile");
+            assert!(error.to_string().contains("Nulang.lock"), "{error}");
+        }
+        assert!(!dir.join(".nula").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn offline_path_only_build_keeps_exact_lockfile_bytes() {
+        let dir = std::env::temp_dir().join(format!(
+            "nula_offline_path_{}", std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        scaffold_package(&dir, "offline-app", "default").unwrap();
+        let _guard = ChangeDir::new(&dir);
+        prepare_package().unwrap();
+        let before = std::fs::read(dir.join(LOCKFILE_FILE)).unwrap();
+
+        prepare_package_with_options(true, true)
+            .expect("offline local package resolution should succeed");
+        assert_eq!(std::fs::read(dir.join(LOCKFILE_FILE)).unwrap(), before);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn locked_mode_rejects_missing_lockfile_for_build_run_and_test() {
         let dir = std::env::temp_dir().join(format!("nula_locked_missing_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
