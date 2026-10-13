@@ -91,6 +91,19 @@ use std::collections::HashSet;
 /// retained across epochs, so a steady-state handler reuses the same memory.
 const BLOCK_SIZE: usize = 64 * 1024;
 
+/// Actual successful requests served by one IsoArena over its lifetime.
+///
+/// A reset starts another allocation epoch without clearing lifetime counters.
+/// Actor pooling may reuse the same arena object, so do not attribute the
+/// lifetime totals to a single actor ID after pool reuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct ArenaAllocationSnapshot {
+    pub allocations: usize,
+    pub epoch_allocations: usize,
+    pub requested_payload_bytes: u64,
+    pub resets: usize,
+}
+
 /// Per-actor (per-activation) bump arena for message-scoped allocations.
 ///
 /// Objects are bump-allocated with a standard [`OrcaHeader`] prefix (so
@@ -109,6 +122,8 @@ pub struct IsoArena {
     epoch_allocs: usize,
     /// Total allocations served over the arena's lifetime.
     total_allocs: usize,
+    /// Requested payload bytes across all successful arena allocation epochs.
+    requested_payload_bytes: u64,
     /// Number of epoch resets.
     resets: usize,
 }
@@ -127,6 +142,7 @@ impl IsoArena {
             offset: 0,
             epoch_allocs: 0,
             total_allocs: 0,
+            requested_payload_bytes: 0,
             resets: 0,
         }
     }
@@ -177,6 +193,9 @@ impl IsoArena {
         self.offset += total;
         self.epoch_allocs += 1;
         self.total_allocs += 1;
+        self.requested_payload_bytes = self
+            .requested_payload_bytes
+            .saturating_add(payload_size as u64);
         debug_assert!(self.contains(payload));
         debug_assert!(payload as usize % 8 == 0);
         Some(payload)
@@ -203,6 +222,19 @@ impl IsoArena {
         self.offset = 0;
         self.epoch_allocs = 0;
         self.resets += 1;
+    }
+
+    /// Snapshot actual allocation requests served by this arena.
+    ///
+    /// Payload bytes exclude headers, alignment, retained block capacity,
+    /// and allocator overhead. Lifetime counters persist across epoch resets.
+    pub fn allocation_snapshot(&self) -> ArenaAllocationSnapshot {
+        ArenaAllocationSnapshot {
+            allocations: self.total_allocs,
+            epoch_allocations: self.epoch_allocs,
+            requested_payload_bytes: self.requested_payload_bytes,
+            resets: self.resets,
+        }
     }
 
     /// Allocations served in the current epoch.

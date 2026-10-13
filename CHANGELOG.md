@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Runtime allocation counter snapshots — 2026-10-13
+- **Allocation performance baselines are now reachable through the Criterion harness.** The previously unregistered `gc/actor_heap_small_alloc` and `gc/orca_local_alloc_drop` groups are registered, and all GC fixture-bearing benchmarks use `iter_batched_ref` so owned setup/teardown is not included in measured time. The benchmark timing-contract test guards both semantics and registration.
+- **Actor heaps and iso arenas expose read-only snapshots of successful allocation operations and requested payload bytes.** Heap counting covers bump, large-object-space, and free-list reuse paths; arena counting covers successful allocations across resettable activation epochs.
+- **Actor-level snapshots keep heap-since-reset and arena-lifetime scopes separate.** Tests pin free/reuse counting, reset behavior, rejected arena size requests, actor pooling, and JSON serialization. These metrics are not estimates of physical heap/RSS usage.
+
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.

@@ -239,6 +239,22 @@ impl OrcaHeader {
 // ActorHeap
 // ---------------------------------------------------------------------------
 
+/// Runtime-observed operations on one ActorHeap since its last reset.
+///
+/// `requested_payload_bytes` sums successful requested payload sizes,
+/// including allocations served by free lists. It excludes ORCA headers,
+/// size-class padding, bump-block capacity and native allocator overhead.
+/// `committed_bump_bytes` does not include the large-object space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct HeapAllocationSnapshot {
+    pub allocations: usize,
+    pub frees: usize,
+    pub requested_payload_bytes: u64,
+    pub live_objects: usize,
+    pub committed_bump_bytes: usize,
+    pub peak_committed_bump_bytes: usize,
+}
+
 /// Per-actor heap allocator with ORCA-compatible object headers.
 ///
 /// `ActorHeap` combines a fast bump allocator with size-class free lists.
@@ -297,6 +313,8 @@ pub struct ActorHeap {
     total_allocs: usize,
     /// Cumulative frees.
     total_frees: usize,
+    /// Sum of requested payload sizes for successful alloc calls (reuses included).
+    requested_payload_bytes: u64,
     /// High-water mark of `used_bytes`.
     peak_used: usize,
 }
@@ -355,6 +373,7 @@ impl ActorHeap {
             live_count: 0,
             total_allocs: 0,
             total_frees: 0,
+            requested_payload_bytes: 0,
             peak_used: 0,
         }
     }
@@ -449,7 +468,7 @@ impl ActorHeap {
                 self.add_to_live_list(header_ptr);
             }
             self.live_count += 1;
-            self.total_allocs += 1;
+            self.record_successful_allocation(payload_size);
             return Some(payload_ptr);
         }
 
@@ -486,7 +505,7 @@ impl ActorHeap {
 
             self.add_to_live_list(header_ptr);
             self.live_count += 1;
-            self.total_allocs += 1;
+            self.record_successful_allocation(payload_size);
 
             let committed = self.prior_used + self.used_bytes;
             if committed > self.peak_used {
@@ -495,6 +514,15 @@ impl ActorHeap {
 
             Some(payload_ptr)
         }
+    }
+
+    /// Count a successful allocation operation, including free-list reuse.
+    #[inline(always)]
+    fn record_successful_allocation(&mut self, payload_size: usize) {
+        self.total_allocs += 1;
+        self.requested_payload_bytes = self
+            .requested_payload_bytes
+            .saturating_add(payload_size as u64);
     }
 
     // ------------------------------------------------------------------
@@ -576,6 +604,21 @@ impl ActorHeap {
     // ------------------------------------------------------------------
     // Queries
     // ------------------------------------------------------------------
+
+    /// A read-only snapshot of successful heap allocation operations.
+    ///
+    /// Counters reset on `ActorHeap::reset`. The snapshot is not a measure
+    /// of process RSS or physical OS allocation calls.
+    pub fn allocation_snapshot(&self) -> HeapAllocationSnapshot {
+        HeapAllocationSnapshot {
+            allocations: self.total_allocs,
+            frees: self.total_frees,
+            requested_payload_bytes: self.requested_payload_bytes,
+            live_objects: self.live_count,
+            committed_bump_bytes: self.used(),
+            peak_committed_bump_bytes: self.peak_used,
+        }
+    }
 
     /// Total bytes committed by the bump allocator across all chained blocks.
     pub fn used(&self) -> usize {
@@ -676,6 +719,7 @@ impl ActorHeap {
         self.free_lists = [std::ptr::null_mut(); NUM_SIZE_CLASSES];
         self.total_allocs = 0;
         self.total_frees = 0;
+        self.requested_payload_bytes = 0;
         self.peak_used = 0;
     }
 
@@ -797,7 +841,7 @@ impl ActorHeap {
         }
         self.los_blocks.push(payload_ptr);
         self.live_count += 1;
-        self.total_allocs += 1;
+        self.record_successful_allocation(payload_size);
         Some(payload_ptr)
     }
 
