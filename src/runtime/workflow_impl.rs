@@ -339,6 +339,60 @@ pub(crate) fn commit_step_completed(
     Ok(())
 }
 
+/// Close a completed, previously suspended legacy workflow step.
+///
+/// The compiled workflow path does not yet have RFC 0022 atomic activation
+/// replay. Its terminal event and checkpoint are two separate writes. If
+/// either write fails, quarantine the live actor rather than allow execution
+/// on state that recovery has not committed. Do not automatically recover:
+/// a successful event append followed by a failed checkpoint leaves partial
+/// legacy history that requires explicit recovery reconciliation.
+pub(crate) fn finish_resumed_workflow_step(
+    rt: &mut Runtime,
+    actor_id: u64,
+    activation: Option<WorkflowActivationId>,
+    step_name: String,
+) -> bool {
+    let Some(actor) = rt.actors.get_mut(&actor_id) else {
+        return false;
+    };
+    // Clearing the active suspension marker belongs to terminal completion,
+    // not to an individual LLM/signal/timer resume adapter.
+    actor.waiting_signal = None;
+    if let Some(step) = actor
+        .get_state_field("step_index")
+        .and_then(|value| value.as_int())
+    {
+        actor.set_state_field("step_index", Value::int(step + 1));
+    }
+
+    let sequence = next_sequence(rt, actor_id);
+    let result = rt
+        .persistence
+        .append_workflow_event(
+            actor_id,
+            WorkflowEvent::StepCompleted {
+                sequence,
+                activation,
+                step_name,
+            },
+        )
+        .and_then(|_| try_checkpoint_actor(rt, actor_id));
+
+    if let Err(error) = result {
+        tracing::error!(
+            actor_id,
+            %error,
+            "nulang-workflow: resumed terminal persistence failed; quarantining uncommitted actor"
+        );
+        rt.actors.remove(&actor_id);
+        rt.pending_receive_wakes
+            .retain(|queued| *queued != actor_id);
+        return false;
+    }
+    true
+}
+
 /// Snapshot the durable and CRDT state of a persistent actor.
 ///
 /// This wrapper intentionally preserves the legacy best-effort API for call
