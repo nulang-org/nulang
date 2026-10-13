@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Checked 48-bit negation in MIR constant folding — 2026-10-13
+- **Constant folding preserves the VM's checked negation semantics at `INT48_MIN`.** The compiler no longer converts `-INT48_MIN` into an out-of-range positive constant that reloads as a wrapped 48-bit integer; it retains the runtime negation opcode so the required overflow error is raised.
+- **Three focused regressions cover the optimizer boundary and the complete bytecode execution path.** In-range negation still folds; no public syntax or integer representation changes.
+
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
