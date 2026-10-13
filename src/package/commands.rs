@@ -1763,15 +1763,33 @@ fn resolve_web_sqlite_path(
                 msg: format!("cannot resolve package root: {e}"),
                 span: Span::default(),
             })?;
-            let path = root.join(rel);
-            let parent = path.parent().ok_or_else(|| NuError::PackageError {
-                msg: "web.kv_path has no parent".into(),
-                span: Span::default(),
-            })?;
-            std::fs::create_dir_all(parent).map_err(|e| NuError::PackageError {
-                msg: format!("cannot create web storage directory: {e}"),
-                span: Span::default(),
-            })?;
+            // Walk one directory at a time to reject symlinked ancestors
+            // before attempting to create a subdirectory through them.
+            let mut parent = root.clone();
+            for component in rel.parent().expect("validated path").components() {
+                parent.push(component.as_os_str());
+                match std::fs::symlink_metadata(&parent) {
+                    Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                        return Err(NuError::PackageError {
+                            msg: "web SQLite storage parent must be a real directory".into(),
+                            span: Span::default(),
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        std::fs::create_dir(&parent).map_err(|e| NuError::PackageError {
+                            msg: format!("cannot create web storage directory: {e}"),
+                            span: Span::default(),
+                        })?;
+                    }
+                    Err(error) => {
+                        return Err(NuError::PackageError {
+                            msg: format!("cannot inspect web storage directory: {error}"),
+                            span: Span::default(),
+                        });
+                    }
+                }
+            }
             let parent = parent.canonicalize().map_err(|e| NuError::PackageError {
                 msg: format!("cannot resolve web storage directory: {e}"),
                 span: Span::default(),
