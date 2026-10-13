@@ -1,4 +1,9 @@
 # Nulang Changelog
+
+### Explain actor-send capability inference — 2026-10-13
+- **Provenance in errors:** Rejected local and remote actor-send arguments now identify the nearest lexical capability binding, a direct reference constructor, an explicit capability annotation, or a conservative expression-level fallback.
+- **Existing sendability remains authoritative:** Local/remote acceptance checks, ownership transfers and external authority are unchanged. Focused tests cover shadowing, remote `iso` rejection and explicit capability origins.
+
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
