@@ -3,6 +3,7 @@
 ### Guarded LSP diagnostic quick fixes — 2026-10-13
 - **Unbound variable quick fix:** LSP `E0202` diagnostics preserve the typechecker's in-scope similar names and offer an explicit source-verified replacement; stale diagnostic spans are not edited, and ambiguous candidates remain separate actions.
 - **Diagnostics retain stable codes:** The LSP publishes the compiler's stable `Exxxx` codes and appends structured capability explanations when present. No inference, ownership, runtime, authority, or effect semantics change.
+- **Safe annotation actions:** Only obvious literal initializer types get a suggested annotation; complex expressions no longer receive speculative `: a` edits, and insertion positions correctly account for whitespace and UTF-16 columns.
 
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
