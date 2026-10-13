@@ -1642,52 +1642,69 @@ impl NulangLanguageServer {
             }
         }
 
-        // Existing: add type annotations for `let` bindings without explicit types.
+        // Annotation edits are offered only for unambiguous literal types.
+        // The old fallback of `: a` was a guess, not a valid inference, and
+        // its trimmed-line offset could insert an annotation mid-expression.
         for (li, line) in source.lines().enumerate() {
-            let t = line.trim();
-            let ln = li as u32;
-            if let Some(pos) = t.find("let ") {
-                if !t[pos..].contains(':') {
-                    let after = pos + 4;
-                    let rest = &t[after..];
-                    if let Some(end) = rest.find(|c: char| c == ' ' || c == '=') {
-                        let vname = &rest[..end];
-                        let Some(eq) = t.find('=') else { continue };
-                        let rhs = t[eq + 1..].trim();
-                        let ty = if rhs.parse::<i64>().is_ok() {
-                            "Int"
-                        } else if rhs.starts_with('"') {
-                            "String"
-                        } else if rhs == "true" || rhs == "false" {
-                            "Bool"
-                        } else {
-                            "a"
-                        };
-                        let edit = TextEdit {
-                            range: Range {
-                                start: Position::new(ln, (pos + eq) as u32),
-                                end: Position::new(ln, (pos + eq) as u32),
-                            },
-                            new_text: format!(" : {}", ty),
-                        };
-                        let mut changes = std::collections::HashMap::new();
-                        changes.insert(uri.clone(), vec![edit]);
-                        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                            title: format!("Add type annotation ': {}' for '{}'", ty, vname),
-                            kind: Some(CodeActionKind::QUICKFIX),
-                            diagnostics: None,
-                            edit: Some(WorkspaceEdit {
-                                changes: Some(changes),
-                                ..WorkspaceEdit::default()
-                            }),
-                            command: None,
-                            is_preferred: Some(false),
-                            disabled: None,
-                            data: None,
-                        }));
-                    }
-                }
+            let prefix_bytes = line.len() - line.trim_start().len();
+            let trimmed = line.trim_start();
+            let Some(rest) = trimmed.strip_prefix("let ") else {
+                continue;
+            };
+            let name_bytes = rest
+                .find(|ch: char| !ch.is_alphanumeric() && ch != '_')
+                .unwrap_or(rest.len());
+            let name = &rest[..name_bytes];
+            if name.is_empty()
+                || name.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+            {
+                continue;
             }
+            // An existing annotation or an incomplete declaration is not a
+            // candidate. A complex RHS belongs to type inference/inlay hints.
+            let after_name = rest[name_bytes..].trim_start();
+            let Some(rhs) = after_name.strip_prefix('=') else {
+                continue;
+            };
+            let rhs = rhs.trim();
+            let literal_type = if rhs.parse::<i64>().is_ok() {
+                Some("Int")
+            } else if rhs == "true" || rhs == "false" {
+                Some("Bool")
+            } else if rhs.len() >= 2
+                && rhs.starts_with('"')
+                && rhs.ends_with('"')
+                && !rhs[1..rhs.len() - 1].contains('"')
+            {
+                Some("String")
+            } else {
+                None
+            };
+            let Some(ty) = literal_type else {
+                continue;
+            };
+            let insert_byte = prefix_bytes + 4 + name_bytes;
+            let insert_col = line[..insert_byte].encode_utf16().count() as u32;
+            let position = Position::new(li as u32, insert_col);
+            let edit = TextEdit {
+                range: Range::new(position, position),
+                new_text: format!(": {}", ty),
+            };
+            let mut changes = std::collections::HashMap::new();
+            changes.insert(uri.clone(), vec![edit]);
+            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                title: format!("Add type annotation ': {}' for '{}'", ty, name),
+                kind: Some(CodeActionKind::QUICKFIX),
+                diagnostics: None,
+                edit: Some(WorkspaceEdit {
+                    changes: Some(changes),
+                    ..WorkspaceEdit::default()
+                }),
+                command: None,
+                is_preferred: Some(false),
+                disabled: None,
+                data: None,
+            }));
         }
         if actions.is_empty() {
             None
