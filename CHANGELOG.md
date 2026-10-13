@@ -1,4 +1,8 @@
 # Nulang Changelog
+### MIR folding change detection — 2026-10-13
+- **MIR optimization passes now report actual expression changes rather than changes relative to a temporary Nil placeholder.** Non-foldable assignments no longer force the optimizer through its ten-pass cap, while folds to Nil correctly report a change for the next iteration.
+- **Two focused regression tests pin both cases.** Source-language semantics, arithmetic rules, and public syntax are unchanged; the improvement is to optimizer convergence and correctness of its change signal.
+
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
