@@ -481,7 +481,7 @@ fn scaffold_package(dir: &Path, name: &str, template: &str) -> NuResult<()> {
         web_manifest
             .push_str("[web]\nport = 8787\nstatic_dir = \"public\"\noutput_dir = \"dist\"\n");
         if template == "service" {
-            web_manifest.push_str("kv_backend = \"sqlite\"\\nkv_path = \"data/web-state.sqlite\"\\n");
+            web_manifest.push_str("kv_backend = \"sqlite\"\nkv_path = \"data/web-state.sqlite\"\n");
         }
         std::fs::write(&manifest_path, web_manifest).map_err(|e| NuError::PackageError {
             msg: format!(
@@ -578,6 +578,7 @@ fn template_files(name: &str) -> Vec<(&'static str, &'static str)> {
 
 import stdlib::web::html
 import stdlib::web::types
+import stdlib::web::host
 
 fn home() -> Html {
     document(
