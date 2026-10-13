@@ -1452,7 +1452,7 @@ impl<'c> FnLowerer<'c> {
                     // not a variable-length argument slice. Stage the exact
                     // number of SQL parameters as a compiler-owned Int in r1.
                     // Layout: r0=SQL, r1=param_count, r2..=parameters.
-                    if args.len() > 255 {
+                    if args.len() > 11 {
                         return Err(compile_err(
                             "DB.query_checked_async supports at most 254 parameters".to_string(),
                             Span::default(),
