@@ -193,6 +193,27 @@ dependencies with recorded strong `source_id` metadata, it also rejects
 source-content drift. It never rewrites `Nulang.lock`. Commit the lockfile
 after running a normal build whenever dependency changes are intentional.
 
+### Safe registry archive downloads
+
+Normal registry downloads now enforce a **64 MiB compressed archive limit** and
+extract tar.gz packages into a new staging directory rather than directly
+into the installed cache. The extractor rejects absolute/parent paths, links,
+special files, repeated paths, more than 2,048 entries, individual files over
+32 MiB, more than 128 MiB of extracted file content, and compressed streams
+that exceed the decompression bound. The downloaded `Nulang.toml` must match
+the requested package name and version before the staged contents become
+visible in the cache. Failed extraction never replaces an existing cache.
+
+The hosted registry worker also requires a declared `Content-Length` for
+package uploads and rejects payloads declared larger than 64 MiB. Previously
+accepted chunked package uploads without a quota hook now receive HTTP 411.
+
+These protections address malicious archives and resource exhaustion. They
+do **not** authenticate a package publisher. The existing cached-tree
+`source_id` verifies integrity relative to a committed lockfile, not who
+initially published the archive; authenticated registry metadata or signatures
+remain a future security gate.
+
 ### Cache-only offline mode
 
 `--offline` implies `--locked`, so a committed `Nulang.lock` is required
