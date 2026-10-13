@@ -36,6 +36,31 @@ Focused regressions cover reuse of identical tokens, same-length source
 edits, cache-hit SourceMap restoration, and the visibility of transitive
 dependency edits while the parent's tokens are cached.
 
+## Reproducible paired benchmark
+
+Build the test runner once, outside its timed region:
+
+```sh
+cargo build --release --no-default-features --bin nulang-import-bench
+python3 -m unittest scripts.tests.test_compare_import_compile
+python3 scripts/compare_import_compile.py --pairs 4 --repeat 20 --warmup 5
+```
+
+`nulang-import-bench` compiles a generated graph of eight leaf modules (16
+functions each) through import resolution, type/effect/capability checks,
+HIR/MIR, and bytecode. Each invocation performs several warmup compilations
+followed by timed compilations in the same process. The paired script
+alternates separate cache-on/cache-off invocations of **one compiled binary**.
+The emergency/experiment override is
+`NULANG_DISABLE_IMPORT_TOKEN_CACHE=1`, sampled once per process.
+
+The JSON comparison reports the median of within-pair ratios:
+`cache_disabled_median_ns / cache_enabled_median_ns`. A value above 1
+indicates faster compilation with caching in this specific setup, but it is
+**not** statistical proof. Profile a larger real dependency graph and peak
+memory before promotion. The runner does not measure binary linking, process
+startup, or Go native builds.
+
 ## Performance decision
 
 Do **not** assume this cache is faster. It avoids lexing on a hit, but still
