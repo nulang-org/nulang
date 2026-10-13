@@ -57,14 +57,33 @@ class ReportingTests(unittest.TestCase):
             perf.parse_density(output, 100000)
 
     def test_allocation_distribution_preserves_physical_overhead(self):
-        output = '\n'.join([
-          json.dumps({'payload_bytes': 16, 'allocations': 100, 'physical_bytes': 12800, 'payload_total_bytes': 1600}),
-          json.dumps({'payload_bytes': 64, 'allocations': 100, 'physical_bytes': 12800, 'payload_total_bytes': 6400}),
-        ])
+        # The synthetic profiler emits exactly these six payload sizes.
+        physical_extents = [(8, 64), (16, 128), (32, 128),
+                            (64, 128), (128, 256), (256, 312)]
+        output = '\n'.join(json.dumps({
+            'payload_bytes': size, 'allocations': 100,
+            'physical_bytes': extent * 100, 'payload_total_bytes': size * 100,
+        }) for size, extent in physical_extents)
         data = perf.parse_allocation_profile(output, 100)
-        self.assertEqual(data['total_physical_bytes'], 25600)
-        self.assertEqual(data['total_payload_bytes'], 8000)
-        self.assertEqual(len(data['buckets']), 2)
+        self.assertEqual(data['total_physical_bytes'], 101600)
+        self.assertEqual(data['total_payload_bytes'], 50400)
+        self.assertEqual(len(data['buckets']), 6)
+
+    def test_allocation_distribution_rejects_missing_bucket(self):
+        output = '\n'.join(json.dumps({
+            'payload_bytes': size, 'allocations': 10,
+            'physical_bytes': 10000, 'payload_total_bytes': size * 10,
+        }) for size in (8, 16, 32, 64, 128))
+        with self.assertRaisesRegex(ValueError, 'missing allocation size'):
+            perf.parse_allocation_profile(output, 10)
+
+    def test_allocation_distribution_rejects_unknown_bucket(self):
+        output = json.dumps({
+            'payload_bytes': 512, 'allocations': 10,
+            'physical_bytes': 10000, 'payload_total_bytes': 5120,
+        })
+        with self.assertRaisesRegex(ValueError, 'unexpected allocation size'):
+            perf.parse_allocation_profile(output, 10)
 
     def test_allocation_distribution_rejects_duplicated_sizes(self):
         row = json.dumps({'payload_bytes':16, 'allocations':10, 'physical_bytes':1280, 'payload_total_bytes':160})
