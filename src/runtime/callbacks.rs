@@ -483,23 +483,23 @@ pub(crate) fn perform_web_builtin(
         }
         Some("kv_get") => {
             let key = resolve(constants, *regs.first()?);
-            crate::runtime::http_server::kv_get(&key)
+            crate::runtime::http_server::request_kv_get(&key)
                 .map(|s| callbacks.alloc_string(&s))
                 .or(Some(crate::vm::Value::nil()))
         }
         Some("kv_set") => {
             let key = resolve(constants, *regs.first()?);
             let value = resolve(constants, *regs.get(1)?);
-            crate::runtime::http_server::kv_set(&key, &value);
+            crate::runtime::http_server::request_kv_set(&key, &value);
             Some(crate::vm::Value::unit())
         }
         Some("kv_delete") => {
             let key = resolve(constants, *regs.first()?);
-            crate::runtime::http_server::kv_delete(&key);
+            crate::runtime::http_server::request_kv_delete(&key);
             Some(crate::vm::Value::unit())
         }
         Some("kv_all") => {
-            let pairs = crate::runtime::http_server::kv_all();
+            let pairs = crate::runtime::http_server::request_kv_all();
             let mut tuples: Vec<crate::vm::Value> = Vec::new();
             for (k, v) in pairs {
                 let k_val = callbacks.alloc_string(&k);
