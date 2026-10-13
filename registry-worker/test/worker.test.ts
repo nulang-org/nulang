@@ -40,7 +40,11 @@ function publish(
   return worker.fetch(
     new Request('http://localhost/api/v1/packages/foo/1.0.0', {
       method: 'PUT',
-      headers: { Authorization: 'Bearer secret', ...extraHeaders },
+      headers: {
+        Authorization: 'Bearer secret',
+        'X-Nula-Signature': 'ab'.repeat(64),
+        ...extraHeaders,
+      },
       body,
       duplex: 'half',
     } as RequestInit),
@@ -127,5 +131,45 @@ describe('without QUOTA_HOOK_URL', () => {
     const res = await publish(env, 'tarball-bytes', { 'Content-Length': '13' });
     expect(res.status).toBe(201);
     expect(env.stored).toEqual(['foo/1.0.0.tar.gz']);
+  });
+});
+
+describe('publisher signature transport', () => {
+  it('rejects an unsigned package even with valid publish authorization', async () => {
+    const env = makeEnv();
+    const res = await publish(env, 'tarball-bytes', {
+      'Content-Length': '13',
+      'X-Nula-Signature': '',
+    });
+    expect(res.status).toBe(400);
+    expect(env.stored).toHaveLength(0);
+  });
+
+  it('rejects a malformed detached Ed25519 signature', async () => {
+    const env = makeEnv();
+    const res = await publish(env, 'tarball-bytes', {
+      'Content-Length': '13',
+      'X-Nula-Signature': 'not-a-signature',
+    });
+    expect(res.status).toBe(400);
+    expect(env.stored).toHaveLength(0);
+  });
+
+  it('persists signature as immutable object metadata on publish', async () => {
+    const stored: Array<{ key: string; signature: string }> = [];
+    const env = makeEnv({
+      BUCKET: {
+        head: async () => null,
+        put: async (key: string, _body: unknown, options: { customMetadata: Record<string, string> }) => {
+          stored.push({ key, signature: options.customMetadata.nulaSignature });
+        },
+      } as unknown as Env['BUCKET'],
+    });
+    const res = await publish(env, 'tarball-bytes', { 'Content-Length': '13' });
+    expect(res.status).toBe(201);
+    expect(stored).toEqual([{
+      key: 'foo/1.0.0.tar.gz',
+      signature: 'ab'.repeat(64),
+    }]);
   });
 });
