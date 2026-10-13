@@ -587,6 +587,69 @@ pub(crate) fn vm_value_to_string_or_default(
 }
 
 /// Look up a tool by name and invoke the corresponding exported function.
+/// Bind model-produced tool arguments in the declared Nulang function ABI order.
+///
+/// Our compiler emits every tool parameter as required, in source declaration
+/// order, in JSON Schema's `required` array. The `properties` object is a
+/// name-to-schema map, NOT a positional parameter list: serde_json::Map may
+/// reorder its keys. No tool is invoked if that compiler-owned order is
+/// absent, ambiguous, or disagrees with the provided arguments.
+///
+/// If optional tool parameters are supported in the future, add explicit
+/// versioned ABI order metadata rather than guessing from JSON object order.
+fn ordered_tool_arguments(
+    tool: &crate::tool_schema::ToolSchema,
+    arguments: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let properties = tool
+        .parameters
+        .get("properties")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| format!("Tool '{}' has no parameter schema", tool.name))?;
+    let required = tool
+        .parameters
+        .get("required")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| format!("Tool '{}' has no ordered parameter list", tool.name))?;
+
+    if required.len() != properties.len() || required.len() > 256 {
+        return Err(format!(
+            "Tool '{}' parameter schema is incomplete or exceeds 256 arguments",
+            tool.name
+        ));
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut ordered = Vec::with_capacity(required.len());
+    for field in required {
+        let name = field
+            .as_str()
+            .ok_or_else(|| format!("Tool '{}' has a non-string parameter name", tool.name))?;
+        if !seen.insert(name) {
+            return Err(format!("Tool '{}' has duplicate parameter '{}'", tool.name, name));
+        }
+        if !properties.contains_key(name) {
+            return Err(format!(
+                "Tool '{}' has unknown parameter '{}' in its schema",
+                tool.name, name
+            ));
+        }
+        let value = arguments
+            .get(name)
+            .ok_or_else(|| format!("Tool '{}' missing required argument '{}'", tool.name, name))?;
+        ordered.push(value.clone());
+    }
+
+    if let Some(unexpected) = arguments.keys().find(|name| !properties.contains_key(*name)) {
+        return Err(format!(
+            "Tool '{}' received unexpected argument '{}'",
+            tool.name, unexpected
+        ));
+    }
+
+    Ok(ordered)
+}
+
 pub(crate) fn invoke_tool_function(
     _rt: &Runtime,
     module: &crate::bytecode::CodeModule,
@@ -616,11 +679,7 @@ pub(crate) fn invoke_tool_function(
         .get(func_idx)
         .ok_or_else(|| format!("Function table missing entry for '{}'", name))?;
 
-    let properties = tool
-        .parameters
-        .get("properties")
-        .and_then(|v| v.as_object())
-        .ok_or_else(|| format!("Tool '{}' has no parameter schema", name))?;
+    let ordered_arguments = ordered_tool_arguments(tool, arguments)?;
 
     let mut vm = crate::vm::VM::new();
     vm.load_module(module.clone());
@@ -628,11 +687,7 @@ pub(crate) fn invoke_tool_function(
     let mut frame = crate::vm::Frame::new(None, module_idx);
     frame.pc = offset;
 
-    for (i, (param_name, _)) in properties.iter().enumerate().take(256) {
-        let json_val = arguments
-            .get(param_name)
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
+    for (i, json_val) in ordered_arguments.into_iter().enumerate() {
         frame.regs[i] = crate::runtime::json_to_vm_value(&mut vm, json_val)?;
     }
 
