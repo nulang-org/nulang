@@ -90,3 +90,23 @@ fn orca_ref_traffic_snapshot_is_read_only() {
     assert_eq!(first.foreign_refs_sent, second.foreign_refs_sent);
     assert_eq!(first.foreign_refs_received, second.foreign_refs_received);
 }
+
+#[test]
+fn existing_orca_foreign_reference_operations_are_visible() {
+    let mut runtime = Runtime::new();
+    let mut actor = Actor::new(12, "sender", 8);
+    let ptr = actor.orca_gc
+        .alloc_object(&mut actor.heap, 8, TypeTag::Raw)
+        .expect("allocated ORCA object");
+    // Exercise the existing in-flight and returned-to-owner protocol without
+    // changing GC behavior or injecting fabricated metrics.
+    unsafe {
+        let _in_flight = actor.orca_gc.send_ref_to(&actor.heap, ptr, 99);
+        actor.orca_gc.receive_ref(&actor.heap, ptr);
+    }
+    runtime.actors.insert(12, actor);
+
+    let stats = runtime.metrics_snapshot().orca_traffic;
+    assert_eq!(stats.foreign_refs_sent, 1);
+    assert_eq!(stats.foreign_refs_received, 1);
+}
