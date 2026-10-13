@@ -4415,6 +4415,18 @@ impl Parser {
         }
     }
 
+    /// HTML attributes may contain hyphen-separated names such as
+    /// `aria-label`. Keep this grammar local to JSX, not ordinary identifiers.
+    fn expect_html_attribute_name(&mut self) -> NuResult<String> {
+        let mut name = self.expect_html_ident("HTML attribute name")?;
+        while self.consume_if(&TokenKind::Minus) {
+            let segment = self.expect_html_ident("HTML attribute name segment")?;
+            name.push('-');
+            name.push_str(&segment);
+        }
+        Ok(name)
+    }
+
     /// Parse a JSX/HTML element: `<tag attrs>children</tag>` or `<tag attrs />`.
     /// Desugars to `el("tag", attrs, children)` where `attrs` and `children`
     /// are arrays. Text children are wrapped in `text("...")` calls.
@@ -4436,7 +4448,7 @@ impl Parser {
             }
 
             // Attribute: name="value" or name={expr} or boolean name
-            let attr_name = self.expect_html_ident("HTML attribute name")?;
+            let attr_name = self.expect_html_attribute_name()?;
             let attr_val = if self.consume_if(&TokenKind::Assign) {
                 if self.consume_if(&TokenKind::LBrace) {
                     let expr = self.parse_expr()?;
