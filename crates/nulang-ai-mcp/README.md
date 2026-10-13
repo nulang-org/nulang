@@ -57,7 +57,7 @@ The source file and compiler must still be **trusted**. Canonical path checks
 are not an operating-system sandbox: an existing project may import files
 outside its root, and the compiler runs with the host account's privileges.
 Use a restricted OS account or sandbox for untrusted repositories. The initial
-implementation is serialized and does not yet enforce subprocess timeouts.
+implementation processes stdio requests serially and caps compiler execution at\n30 seconds, killing the tracked subprocess when the deadline expires. The host\ndoes not yet enforce full process-group cleanup or a strict memory limit.
 
 The MCP stdio channel supports `initialize`, `notifications/initialized`,
 `ping`, `tools/list`, and `tools/call`. Notification messages never
