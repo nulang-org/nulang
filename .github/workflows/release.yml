@@ -6,7 +6,7 @@ on:
   push:
     tags: ['v*']
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
     paths:
       - '.github/workflows/release.yml'
       - 'Cargo.toml'
@@ -31,7 +31,9 @@ env:
 
 jobs:
   preflight:
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    # The four-platform rehearsal is opt-in on pull requests (add the
+    # `run-release-matrix` label); tag builds always run it.
+    if: github.event_name != 'pull_request' || (github.event.pull_request.draft == false && contains(github.event.pull_request.labels.*.name, 'run-release-matrix'))
     name: Release preflight
     runs-on: ubuntu-latest
     permissions:
@@ -75,7 +77,7 @@ jobs:
           PY
 
   release:
-    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.preflight.result == 'success'
+    if: (github.event_name != 'pull_request' || (github.event.pull_request.draft == false && contains(github.event.pull_request.labels.*.name, 'run-release-matrix'))) && needs.preflight.result == 'success'
     name: Build (${{ matrix.target }})
     needs: preflight
     runs-on: ${{ matrix.os }}

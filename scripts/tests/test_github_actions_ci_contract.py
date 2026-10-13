@@ -138,6 +138,21 @@ class GitHubActionsCIContractTests(unittest.TestCase):
             "release.yml release job (needs: preflight) must keep the dependency-success requirement",
         )
 
+    def test_release_rehearsal_is_opt_in_and_tags_still_publish(self):
+        release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "contains(github.event.pull_request.labels.*.name, 'run-release-matrix')",
+            release,
+            "the four-platform PR rehearsal must be opt-in via the run-release-matrix label",
+        )
+        self.assertIn("labeled", release, "adding the label must trigger the rehearsal")
+        self.assertIn(
+            "if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')",
+            release,
+            "the publish job must stay tag-only",
+        )
+
     def test_contract_is_enforced_by_the_implementation_gate(self):
         gate = (ROOT / "scripts" / "verify_implementation.py").read_text(encoding="utf-8")
 
