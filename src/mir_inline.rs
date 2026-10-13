@@ -1006,6 +1006,118 @@ mod tests {
     }
 
     #[test]
+    fn test_no_inline_reassigned_closure_local() {
+        let mut m = make_module();
+        for value in [1, 2] {
+            let mut callee = crate::mir::FunctionBuilder::new("constant", None);
+            let ret = callee.add_temp(crate::types::Type::int());
+            callee.assign(ret, RValue::Const(Constant::Int(value)));
+            callee.terminate(Terminator::Return(Some(ret)));
+            m.functions.push(callee.build());
+        }
+        let mut caller = crate::mir::FunctionBuilder::new("caller", None);
+        let clos = caller.add_temp(crate::types::Type::unit());
+        let dst = caller.add_temp(crate::types::Type::int());
+        caller.assign(clos, RValue::Closure { func: 0, captures: vec![] });
+        caller.assign(clos, RValue::Closure { func: 1, captures: vec![] });
+        caller.assign(dst, RValue::Call { func: FuncRef::Local(clos), args: vec![] });
+        caller.terminate(Terminator::Return(Some(dst)));
+        m.functions.push(caller.build());
+
+        assert_eq!(inline_local_closures(&mut m), 0, "reassigned closure identity is not invariant");
+        assert!(m.functions[2].blocks[0].stmts.iter().any(|stmt|
+            matches!(stmt, Stmt::Assign { op: RValue::Call { func: FuncRef::Local(_), .. }, .. })
+        ));
+    }
+
+    #[test]
+    fn test_no_inline_when_call_precedes_closure_definition() {
+        let mut m = build_inlinable_program();
+        let caller = &mut m.functions[1];
+        caller.blocks[0].stmts.swap(1, 2);
+        assert_eq!(inline_local_closures(&mut m), 0, "definition must dominate the call");
+    }
+
+    #[test]
+    fn test_no_inline_after_capture_reassignment() {
+        let mut m = make_module();
+        let mut callee = crate::mir::FunctionBuilder::new("capture", None);
+        let capture = callee.add_capture("captured", crate::types::Type::int());
+        callee.terminate(Terminator::Return(Some(capture)));
+        m.functions.push(callee.build());
+
+        let mut caller = crate::mir::FunctionBuilder::new("caller", None);
+        let captured = caller.add_temp(crate::types::Type::int());
+        let clos = caller.add_temp(crate::types::Type::unit());
+        let result = caller.add_temp(crate::types::Type::int());
+        caller.assign(captured, RValue::Const(Constant::Int(4)));
+        caller.assign(clos, RValue::Closure { func: 0, captures: vec![captured] });
+        caller.assign(captured, RValue::Const(Constant::Int(9)));
+        caller.assign(result, RValue::Call { func: FuncRef::Local(clos), args: vec![] });
+        caller.terminate(Terminator::Return(Some(result)));
+        m.functions.push(caller.build());
+
+        assert_eq!(inline_local_closures(&mut m), 0, "closures capture values at construction");
+    }
+
+    #[test]
+    fn test_no_inline_when_callee_reassigns_parameter() {
+        let mut m = make_module();
+        let mut callee = crate::mir::FunctionBuilder::new("assign_param", None);
+        let param = callee.add_param("p", crate::types::Type::int());
+        callee.assign(param, RValue::Const(Constant::Int(99)));
+        callee.terminate(Terminator::Return(Some(param)));
+        m.functions.push(callee.build());
+
+        let mut caller = crate::mir::FunctionBuilder::new("caller", None);
+        let arg = caller.add_temp(crate::types::Type::int());
+        let clos = caller.add_temp(crate::types::Type::unit());
+        let dst = caller.add_temp(crate::types::Type::int());
+        caller.assign(arg, RValue::Const(Constant::Int(3)));
+        caller.assign(clos, RValue::Closure { func: 0, captures: vec![] });
+        caller.assign(dst, RValue::Call { func: FuncRef::Local(clos), args: vec![arg] });
+        caller.terminate(Terminator::Return(Some(dst)));
+        m.functions.push(caller.build());
+
+        assert_eq!(inline_local_closures(&mut m), 0, "callee param writes must not clobber caller locals");
+    }
+
+    #[test]
+    fn test_no_inline_wrong_call_arity() {
+        let mut m = build_inlinable_program();
+        if let Stmt::Assign { op: RValue::Call { args, .. }, .. } =
+            &mut m.functions[1].blocks[0].stmts[2] {
+            args.clear();
+        } else {
+            panic!("expected call");
+        }
+        assert_eq!(inline_local_closures(&mut m), 0, "arity mismatch must retain runtime error");
+    }
+
+    #[test]
+    fn test_no_inline_oversized_body() {
+        let mut m = make_module();
+        let mut callee = crate::mir::FunctionBuilder::new("oversized", None);
+        let mut last = callee.add_temp(crate::types::Type::int());
+        for i in 0..20 {
+            last = callee.add_temp(crate::types::Type::int());
+            callee.assign(last, RValue::Const(Constant::Int(i)));
+        }
+        callee.terminate(Terminator::Return(Some(last)));
+        m.functions.push(callee.build());
+
+        let mut caller = crate::mir::FunctionBuilder::new("caller", None);
+        let clos = caller.add_temp(crate::types::Type::unit());
+        let dst = caller.add_temp(crate::types::Type::int());
+        caller.assign(clos, RValue::Closure { func: 0, captures: vec![] });
+        caller.assign(dst, RValue::Call { func: FuncRef::Local(clos), args: vec![] });
+        caller.terminate(Terminator::Return(Some(dst)));
+        m.functions.push(caller.build());
+
+        assert_eq!(inline_local_closures(&mut m), 0, "large bodies should remain out of line");
+    }
+
+    #[test]
     fn test_idempotent() {
         let mut m = build_inlinable_program();
         let c1 = inline_local_closures(&mut m);
