@@ -376,6 +376,91 @@ mod tests {
         assert_eq!(decl_name(&r[0]), Some("a"));
     }
 
+    // Selective imports are represented in the AST even though the current
+    // surface parser only constructs unfiltered imports. A file-only cache key
+    // must never retain the first import's selection for later requests.
+    #[test]
+    fn import_cache_does_not_reuse_a_previous_selection() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time is after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "nulang-resolver-selective-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).expect("create isolated fixture directory");
+        std::fs::write(
+            dir.join("dep.nula"),
+            "fn alpha() -> Int { 1 }; fn beta() -> Int { 2 }",
+        )
+        .expect("write fixture source");
+        let mut module = AstModule {
+            name: "selective_import_regression".into(),
+            decls: vec![
+                Decl::Import {
+                    path: "dep".into(),
+                    items: vec!["alpha".into()],
+                    span: sp(),
+                },
+                Decl::Import {
+                    path: "dep".into(),
+                    items: vec!["beta".into()],
+                    span: sp(),
+                },
+            ],
+        };
+        let result = resolve_imports(
+            &mut module,
+            &dir.join("main.nula"),
+            &mut HashSet::new(),
+        );
+        std::fs::remove_dir_all(&dir).expect("remove fixture directory");
+        result.expect("resolve both selections from the same imported file");
+        let names: HashSet<&str> = module.decls.iter().filter_map(decl_name).collect();
+        assert!(names.contains("alpha"), "first requested function is present");
+        assert!(names.contains("beta"), "second requested function is present");
+        assert_eq!(names.len(), 2, "imports must not duplicate declarations");
+    }
+
+    #[test]
+    fn top_level_resolve_imports_discards_stale_declarations() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time is after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "nulang-resolver-freshness-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).expect("create isolated fixture directory");
+        let dep = dir.join("dep.nula");
+        let compile = || {
+            let mut module = AstModule {
+                name: "freshness".into(),
+                decls: vec![Decl::Import {
+                    path: "dep".into(),
+                    items: vec![],
+                    span: sp(),
+                }],
+            };
+            resolve_imports(
+                &mut module,
+                &dir.join("main.nula"),
+                &mut HashSet::new(),
+            )
+            .expect("resolve top-level import");
+            module.decls.into_iter().filter_map(|d| decl_name(&d).map(str::to_string)).collect::<Vec<_>>()
+        };
+        std::fs::write(&dep, "fn alpha() -> Int { 1 }").expect("write first revision");
+        let first = compile();
+        std::fs::write(&dep, "fn beta() -> Int { 2 }").expect("write second revision");
+        let second = compile();
+        std::fs::remove_dir_all(&dir).expect("remove fixture directory");
+        assert_eq!(first, vec!["alpha"]);
+        assert_eq!(second, vec!["beta"], "a new build must reread the source");
+    }
+
     #[test]
     fn test_resolve_module_path() {
         std::env::set_var("NULANG_MODULE_PATH", "@nulang/auth=/tmp/nulang_auth_mod");
