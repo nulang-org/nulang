@@ -159,6 +159,63 @@ impl MetricsSnapshot {
             g.cycles_detected
         );
 
+        // Allocator snapshots are gauges because actor removal, pooling, and
+        // epoch resets can decrease their values. They are not cumulative
+        // process-wide allocation counters or OS memory metrics.
+        let a = &self.allocator;
+        macro_rules! allocator_gauge {
+            ($name:literal, $help:literal, $value:expr) => {
+                out.push_str(concat!("# HELP ", $name, " ", $help, "\n"));
+                out.push_str(concat!("# TYPE ", $name, " gauge\n"));
+                out.push_str(&format!(concat!($name, " {}\n"), $value));
+            };
+        }
+        allocator_gauge!(
+            "nulang_allocator_heap_allocations_since_reset",
+            "Successful allocator requests in live heaps since each heap reset",
+            a.heap_allocations_since_reset
+        );
+        allocator_gauge!(
+            "nulang_allocator_heap_requested_payload_bytes_since_reset",
+            "Requested payload bytes served by live heaps since reset",
+            a.heap_requested_payload_bytes_since_reset
+        );
+        allocator_gauge!(
+            "nulang_allocator_heap_live_objects",
+            "Live objects in active actor and top-level heaps",
+            a.heap_live_objects
+        );
+        allocator_gauge!(
+            "nulang_allocator_arena_epoch_allocations",
+            "Successful allocations in the current epochs of live actor arenas",
+            a.arena_epoch_allocations
+        );
+
+        // These are observations of already-recorded OrcaGc operations.
+        // Active actor counts can disappear on actor exit, so these must
+        // be gauges instead of monotonic counters or rate() inputs.
+        let o = &self.orca_traffic;
+        allocator_gauge!(
+            "nulang_orca_local_refs_created_active",
+            "Local reference creates recorded by active ORCA GC engines",
+            o.local_refs_created
+        );
+        allocator_gauge!(
+            "nulang_orca_local_refs_dropped_active",
+            "Local reference drops recorded by active ORCA GC engines",
+            o.local_refs_dropped
+        );
+        allocator_gauge!(
+            "nulang_orca_foreign_refs_sent_active",
+            "Foreign reference sends recorded by active ORCA GC engines",
+            o.foreign_refs_sent
+        );
+        allocator_gauge!(
+            "nulang_orca_foreign_refs_received_active",
+            "Foreign reference receives recorded by active ORCA GC engines",
+            o.foreign_refs_received
+        );
+
         // Resolver counters
         let r = &self.resolver;
         counter!(

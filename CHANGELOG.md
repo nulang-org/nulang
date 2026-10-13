@@ -1,4 +1,12 @@
 # Nulang Changelog
+### ORCA reference traffic export — 2026-10-13
+- **Existing per-GC local-reference and foreign-reference operation counters are exposed as active-GC Prometheus and OpenTelemetry gauges.** The runtime includes `main_gc` and live actors, without changing reference-count updates or message ownership.
+- **The gauges intentionally decline across actor exit/pooling and do not represent lifetime process traffic.** Tests cover GC operations, actor churn, and exporter metric types; direct header mutations bypassing `OrcaGc` are outside the counters.
+
+### Live allocator gauges for Prometheus and OTLP — 2026-10-13
+- **Runtime allocator snapshots now aggregate active heaps and current arena epochs into Prometheus and OpenTelemetry gauges.** The main heap is included; pooled actors and retired heaps are excluded. Successful allocation requests and requested payload bytes are not conflated with physical memory/RSS.
+- **Values can decrease when actors exit or allocators reset.** The four exported series are gauges, not cumulative counters. Regression tests cover active vs pooled actors, JSON output, epoch resets, and exact Prometheus metric types.
+
 ### Runtime allocation counter snapshots — 2026-10-13
 - **Actor heaps and iso arenas expose read-only snapshots of successful allocation operations and requested payload bytes.** Heap counting covers bump, large-object-space, and free-list reuse paths; arena counting covers successful allocations across resettable activation epochs.
 - **Actor-level snapshots keep heap-since-reset and arena-lifetime scopes separate.** Tests pin free/reuse counting, reset behavior, rejected arena size requests, actor pooling, and JSON serialization. These metrics are not estimates of physical heap/RSS usage.
