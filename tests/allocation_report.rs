@@ -55,14 +55,8 @@ fn report_rejects_nested_pointer_store_after_scalar_prefix() {
     assert_eq!(report.total_sites, 2);
     assert_eq!(report.arena_eligible, 0);
     assert_eq!(report.not_proven, 2);
-    assert_eq!(
-        report.sites[0].disposition,
-        AllocationDisposition::NotProven
-    );
-    assert_eq!(
-        report.sites[1].disposition,
-        AllocationDisposition::NotProven
-    );
+    assert_eq!(report.sites[0].disposition, AllocationDisposition::NotProven);
+    assert_eq!(report.sites[1].disposition, AllocationDisposition::NotProven);
 }
 
 #[test]
