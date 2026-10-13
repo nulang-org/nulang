@@ -1676,20 +1676,12 @@ fn devirtualize_captureless_calls(func: &mut mir::Function) -> bool {
         let mut local_targets: FxHashMap<mir::LocalId, usize> = FxHashMap::default();
         for stmt in &mut block.stmts {
             if let mir::Stmt::Assign { dst, op } = stmt {
-                if let mir::RValue::Call {
-                    func: mir::FuncRef::Local(callee),
-                    ..
-                } = op
-                {
-                    if let Some(&target) = local_targets.get(callee) {
-                        *op = match std::mem::replace(op, mir::RValue::Const(Constant::Nil)) {
-                            mir::RValue::Call { args, .. } => mir::RValue::Call {
-                                func: mir::FuncRef::Index(target),
-                                args,
-                            },
-                            _ => unreachable!(),
-                        };
-                        changed = true;
+                if let mir::RValue::Call { func, .. } = op {
+                    if let mir::FuncRef::Local(callee) = func {
+                        if let Some(&target) = local_targets.get(callee) {
+                            *func = mir::FuncRef::Index(target);
+                            changed = true;
+                        }
                     }
                 }
 
