@@ -358,6 +358,66 @@ mod tests {
     }
 
     #[test]
+    fn retries_with_new_trace_id_are_duplicates_but_bad_protocol_is_rejected() {
+        let registry = SessionActionAdmission::default();
+        let owner = identity("session-1", "owner-1");
+        registry.register_document(&owner, document(1)).unwrap();
+        let original = request(1, "key-1", "Hello");
+        registry.reserve(&owner, &module(), &original, &params()).unwrap();
+
+        let mut retried = original.clone();
+        let HostToRuntimeMessage::InvokeAction { request, .. } = &mut retried;
+        request.correlation_id = "new-transport-attempt".into();
+        assert_eq!(
+            registry.reserve(&owner, &module(), &retried, &params()),
+            Ok(AdmissionDecision::Duplicate)
+        );
+
+        let HostToRuntimeMessage::InvokeAction { protocol, .. } = &mut retried;
+        *protocol = "nulang-ui-msg/invalid".into();
+        assert!(matches!(
+            registry.reserve(&owner, &module(), &retried, &params()),
+            Err(AdmissionError::Binding(
+                crate::web::action_dispatch::UiActionDispatchError::InvalidEnvelope(_)
+            ))
+        ));
+    }
+
+    #[test]
+    fn concurrent_retries_have_exactly_one_admission_in_this_process() {
+        use std::sync::Arc;
+        let registry = Arc::new(SessionActionAdmission::default());
+        let owner = identity("session-1", "owner-1");
+        registry.register_document(&owner, document(1)).unwrap();
+
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let registry = Arc::clone(&registry);
+                let owner = owner.clone();
+                std::thread::spawn(move || {
+                    registry.reserve(
+                        &owner,
+                        &module(),
+                        &request(1, "shared-key", "Hello"),
+                        &params(),
+                    )
+                })
+            })
+            .collect();
+        let results: Vec<_> = threads.into_iter().map(|handle| handle.join().unwrap()).collect();
+        let accepted = results
+            .iter()
+            .filter(|result| matches!(result, Ok(AdmissionDecision::Accepted(_))))
+            .count();
+        let duplicate = results
+            .iter()
+            .filter(|result| matches!(result, Ok(AdmissionDecision::Duplicate)))
+            .count();
+        assert_eq!(accepted, 1);
+        assert_eq!(duplicate, 7);
+    }
+
+    #[test]
     fn host_verified_identity_must_have_nonempty_parts() {
         assert!(VerifiedUiIdentity::from_verified_host("", "owner").is_none());
         assert!(VerifiedUiIdentity::from_verified_host("session", " ").is_none());
