@@ -532,6 +532,75 @@ mod tests {
         assert!(err.contains("unsupported exported declaration"));
     }
 
+    fn ast_fn(name: &str, annotated_effect: Option<EffectRow>) -> crate::ast::Decl {
+        use crate::ast::{Decl as AstDecl, Expr, Literal, Param};
+        AstDecl::Function {
+            name: name.to_string(),
+            type_params: Vec::new(),
+            type_param_constraints: Vec::new(),
+            params: vec![Param::new("value", None)],
+            default_values: vec![None],
+            using_params: Vec::new(),
+            ret_type: None,
+            error_type: None,
+            effect: annotated_effect,
+            cap: None,
+            requires: Vec::new(),
+            ensures: Vec::new(),
+            body: Expr::Literal(Literal::Int(1), Span::default()),
+            annotations: Vec::new(),
+            public: true,
+            span: Span::default(),
+        }
+    }
+
+    fn inferred_function(ret: Type) -> Type {
+        Type::Function {
+            param: Box::new(Type::int()),
+            ret: Box::new(ret),
+            effect: EffectRow::empty(),
+            cap: Capability::Ref,
+        }
+    }
+
+    #[test]
+    fn checked_interface_uses_inferred_return_type_not_hir_unit_fallback() {
+        let source = crate::ast::AstModule {
+            name: "api".to_string(),
+            decls: vec![ast_fn("answer", Some(EffectRow::empty()))],
+        };
+        let mut left = rustc_hash::FxHashMap::default();
+        left.insert("answer".to_string(), inferred_function(Type::int()));
+        let mut right = rustc_hash::FxHashMap::default();
+        right.insert("answer".to_string(), inferred_function(Type::string()));
+
+        let before = interface_for_checked_ast(&source, &left).unwrap();
+        let after = interface_for_checked_ast(&source, &right).unwrap();
+        assert_ne!(before.api_digest, after.api_digest);
+    }
+
+    #[test]
+    fn checked_interface_rejects_unverified_effect_rows() {
+        let source = crate::ast::AstModule {
+            name: "api".to_string(),
+            decls: vec![ast_fn("answer", None)],
+        };
+        let mut inferred = rustc_hash::FxHashMap::default();
+        inferred.insert("answer".to_string(), inferred_function(Type::int()));
+        let err = interface_for_checked_ast(&source, &inferred).unwrap_err();
+        assert!(err.contains("effect"));
+    }
+
+    #[test]
+    fn checked_interface_rejects_missing_inference_record() {
+        let source = crate::ast::AstModule {
+            name: "api".to_string(),
+            decls: vec![ast_fn("answer", Some(EffectRow::empty()))],
+        };
+        let err = interface_for_checked_ast(&source, &rustc_hash::FxHashMap::default()).unwrap_err();
+        assert!(err.contains("inferred"));
+    }
+
     #[test]
     fn json_sidecar_is_deterministic() {
         let int = primitive(PrimitiveType::Int);
