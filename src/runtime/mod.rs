@@ -1330,8 +1330,11 @@ impl Runtime {
         }
 
         self.restore_suspended_workflow_activation(actor_id, suspended.activation);
+        // Capture all shared VM state before crossing the durable commit and
+        // deferred receive-wake boundaries. A nested wake can replace the
+        // shared VM's frames, so it must not execute until this is complete.
         let self_ptr: *mut Runtime = self;
-        unsafe {
+        let (result, jit_yielded, recaptured) = unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
             vm.set_actor_callbacks(Box::new(BytecodeRuntimeCallbacks::new(self_ptr, actor_id)));
             vm.set_distributed_callbacks(Box::new(BytecodeDistributedCallbacks {
@@ -1339,67 +1342,144 @@ impl Runtime {
             }));
             vm.restore_suspended_state(suspended.vm_state);
 
-            // Reset the safepoint budget and wire the pointer for JIT code.
             if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
                 actor.jit_safepoint_counter = crate::backends::JIT_SAFEPOINT_BUDGET;
                 crate::jit::runtime::set_jit_safepoint_ptr(&mut actor.jit_safepoint_counter);
             }
 
+            let saved_suspend = (*self_ptr).suspend_enabled;
+            (*self_ptr).suspend_enabled = true;
             (*self_ptr).vm_exec_begin();
             let result = vm.resume();
             crate::jit::runtime::clear_jit_safepoint_ptr();
+            (*self_ptr).suspend_enabled = saved_suspend;
 
-            match result {
-                Ok(_) if vm.yield_pending => {
-                    // JIT safepoint yield: re-capture VM state.
-                    if let Some(vm_state) = vm.take_suspended_state() {
-                        if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
-                            actor.suspended_execution =
-                                Some(crate::runtime::actor::SuspendedExecution {
-                                    vm_state,
-                                    behavior_idx: suspended.behavior_idx,
-                                    activation: suspended.activation,
-                                    step_name: suspended.step_name.clone(),
-                                });
-                            actor.jit_yield_pending = true;
-                        }
+            let jit_yielded = vm.yield_pending;
+            let needs_capture = jit_yielded
+                || matches!(&result, Err(crate::types::NuError::Suspended(_)));
+            let recaptured = if needs_capture {
+                vm.take_suspended_state().map(|vm_state| {
+                    (
+                        vm_state,
+                        vm.suspended_signal_name.take(),
+                        vm.suspended_receive_timeout.take(),
+                    )
+                })
+            } else {
+                None
+            };
+            (result, jit_yielded, recaptured)
+        };
+
+        match result {
+            Ok(_) if jit_yielded => {
+                // A safepoint is an in-memory continuation, never a durable
+                // step boundary. Preserve the original workflow activation.
+                if let Some((vm_state, _, _)) = recaptured {
+                    if let Some(actor) = self.actors.get_mut(&actor_id) {
+                        actor.suspended_execution =
+                            Some(crate::runtime::actor::SuspendedExecution {
+                                vm_state,
+                                behavior_idx: suspended.behavior_idx,
+                                activation: suspended.activation,
+                                step_name: suspended.step_name,
+                            });
+                        actor.jit_yield_pending = true;
                     }
+                } else {
+                    tracing::error!(
+                        actor_id,
+                        "nulang-jit: missing VM state at safepoint; quarantining actor"
+                    );
+                    self.actors.remove(&actor_id);
+                    self.pending_receive_wakes.retain(|queued| *queued != actor_id);
                 }
-                Ok(_) => {
-                    // Behavior completed: clear suspension.
-                    if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
+            }
+            Ok(_) => {
+                if let Some(actor) = self.actors.get_mut(&actor_id) {
+                    actor.jit_yield_pending = false;
+                }
+                if self.actor_is_workflow(actor_id)
+                    && !self.is_internal_behavior(actor_id, suspended.behavior_idx)
+                {
+                    // Ordinary compiled steps increment their own durable
+                    // index; synthetic parallel steps do it in the runtime.
+                    let advance = self.is_parallel_step(actor_id, suspended.behavior_idx);
+                    let step_name = if suspended.step_name.is_empty() {
+                        self.step_name_for(actor_id, suspended.behavior_idx)
+                    } else {
+                        suspended.step_name
+                    };
+                    // This checked append + checkpoint must precede any
+                    // mailbox dispatch or deferred receive-wake.
+                    let _ = workflow::finish_jit_resumed_workflow_step(
+                        self,
+                        actor_id,
+                        suspended.activation,
+                        step_name,
+                        advance,
+                    );
+                }
+            }
+            Err(crate::types::NuError::Suspended(_)) => {
+                // Signal, LLM, or receive-wait: this is no longer a runnable
+                // JIT preemption. The corresponding wakeup owns resumption.
+                if let Some((vm_state, signal_name, receive_timeout)) = recaptured {
+                    if let Some(actor) = self.actors.get_mut(&actor_id) {
                         actor.jit_yield_pending = false;
+                        let marker = suspension_marker(actor, signal_name);
+                        actor.waiting_signal = marker;
+                        actor.suspended_execution =
+                            Some(crate::runtime::actor::SuspendedExecution {
+                                vm_state,
+                                behavior_idx: suspended.behavior_idx,
+                                activation: suspended.activation,
+                                step_name: suspended.step_name,
+                            });
                     }
+                    self.maybe_schedule_receive_wait(actor_id, receive_timeout);
+                } else {
+                    tracing::error!(
+                        actor_id,
+                        "nulang-jit: missing suspended VM state; quarantining actor"
+                    );
+                    self.actors.remove(&actor_id);
+                    self.pending_receive_wakes.retain(|queued| *queued != actor_id);
                 }
-                Err(crate::types::NuError::Suspended(_)) => {
-                    // Re-suspended (e.g. signal wait or receive-wait):
-                    // re-capture VM state.
-                    if let Some(vm_state) = vm.take_suspended_state() {
-                        let signal_name = vm.suspended_signal_name.take();
-                        let receive_timeout = vm.suspended_receive_timeout.take();
-                        if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
-                            let marker = suspension_marker(actor, signal_name);
-                            actor.waiting_signal = marker;
-                            actor.suspended_execution =
-                                Some(crate::runtime::actor::SuspendedExecution {
-                                    vm_state,
-                                    behavior_idx: suspended.behavior_idx,
-                                    activation: suspended.activation,
-                                    step_name: suspended.step_name,
-                                });
-                        }
-                        (*self_ptr).maybe_schedule_receive_wait(actor_id, receive_timeout);
+            }
+            Err(error) => {
+                if self.actor_is_workflow(actor_id) {
+                    // The parent stack's last-safe-state helper records
+                    // StepFailed against the previous committed snapshot,
+                    // never against speculative JIT-mutated fields. It
+                    // quarantines on any rejected write or state divergence.
+                    let step_name = if suspended.step_name.is_empty() {
+                        self.step_name_for(actor_id, suspended.behavior_idx)
+                    } else {
+                        suspended.step_name
+                    };
+                    if workflow::finish_resumed_workflow_failure(
+                        self,
+                        actor_id,
+                        suspended.activation,
+                        step_name,
+                        error.to_string(),
+                    ) {
+                        // Only compensate after the safe failure receipt
+                        // commits and the actor remains non-speculative.
+                        self.run_saga_compensation(actor_id, suspended.behavior_idx);
                     }
-                }
-                Err(_) => {
-                    // Other error: clear suspension.
-                    if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
+                } else {
+                    tracing::warn!(actor_id, %error, "nulang-jit: actor VM resume failed");
+                    if let Some(actor) = self.actors.get_mut(&actor_id) {
                         actor.jit_yield_pending = false;
                     }
                 }
             }
-            (*self_ptr).vm_exec_end();
         }
+
+        // Deferred receive-wake callbacks can re-enter the shared VM.
+        self.vm_exec_end();
         self.requeue_if_mail_pending(actor_id);
     }
 
@@ -3126,8 +3206,11 @@ impl Runtime {
             .actors
             .get(&actor_id)
             .map(|actor| {
-                !actor.mailbox.is_empty()
-                    && actor.suspended_execution.is_none()
+                // A JIT safepoint is cooperative preemption, not a mailbox
+                // suspension. The continuation must be scheduled even when
+                // there are no new messages.
+                (actor.jit_yield_pending
+                    || (!actor.mailbox.is_empty() && actor.suspended_execution.is_none()))
                     && matches!(
                         actor.state,
                         ActorState::Running | ActorState::Created | ActorState::Waiting
@@ -5351,7 +5434,12 @@ impl Runtime {
                     }
                     crate::jit::runtime::clear_jit_safepoint_ptr();
                     (*self_ptr).vm_exec_end();
-                    return Ok(Value::nil());
+                    // A JIT safepoint is not terminal success. Propagate a
+                    // distinct suspension so the normal workflow dispatcher
+                    // does not checkpoint or append StepCompleted.
+                    return Err(crate::types::NuError::Suspended(
+                        crate::types::VmSuspension::JitSafepoint,
+                    ));
                 }
             }
             // Capture VM state for a workflow signal wait, a non-blocking
