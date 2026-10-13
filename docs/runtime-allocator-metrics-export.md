@@ -14,6 +14,28 @@ is introduced.
 | `nulang_allocator_heap_live_objects` | `nulang.allocator.heap.live_objects` | Current objects in the live lists of those heaps |
 | `nulang_allocator_arena_epoch_allocations` | `nulang.allocator.arena.epoch_allocations` | Successful allocations served in each live actor's current arena epoch, summed |
 
+### Existing ORCA reference traffic
+
+The same runtime snapshot now includes `orca_traffic`. These are views of
+**existing** `OrcaGc::stats()` counters, not newly instrumented reference
+operations.
+
+| Prometheus gauge | OpenTelemetry gauge | Meaning |
+| --- | --- | --- |
+| `nulang_orca_local_refs_created_active` | `nulang.orca.local_refs_created.active` | Local references created by active ORCA GC engines |
+| `nulang_orca_local_refs_dropped_active` | `nulang.orca.local_refs_dropped.active` | Local references dropped by active ORCA GC engines |
+| `nulang_orca_foreign_refs_sent_active` | `nulang.orca.foreign_refs_sent.active` | Foreign send operations recorded by active ORCA GC engines |
+| `nulang_orca_foreign_refs_received_active` | `nulang.orca.foreign_refs_received.active` | Foreign receive operations recorded by active ORCA GC engines |
+
+ORCA gauges include the runtime's `main_gc` and live actors' GC engines,
+excluding pooled actors and GC instances destroyed on exit. They can fall
+as actors exit, restart, or get pooled, so **do not use `rate()` on them**.
+These counters do not include direct header changes bypassing `OrcaGc`,
+standalone VMs, or destroyed actor history. They do not distinguish
+unnecessary retains from required retains and therefore are not proof of an
+optimization opportunity. The correct next step is a controlled workload
+comparison, followed by MIR-level ownership analysis.
+
 **Scope:** Heap gauges include `Runtime::main_heap` and the heaps owned by
 currently live actors. Arena epoch allocations include only arenas owned by
 currently live actors. The actor pool, exited/retired heaps retained for
@@ -37,6 +59,7 @@ does not change the publishing cadence.
 ```sh
 cargo test --test runtime_allocation_counters
 cargo test --test runtime_allocator_metrics
+cargo test --test runtime_orca_traffic_metrics
 cargo test
 cargo fmt --all -- --check
 ```
