@@ -745,7 +745,7 @@ impl Resolver {
 
         // Download and extract.
         let tarball = client
-            .fetch(dep_name, best)
+            .fetch_verified(dep_name, best, &self.root_dir)
             .map_err(|e| NuError::PackageError {
                 msg: format!(
                     "failed to fetch '{}-{}' from {}: {}",
