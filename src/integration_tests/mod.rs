@@ -11791,6 +11791,101 @@ match { a: 2, b: 9 } with {
         );
     }
 
+    /// JIT-resumed VM failures may have already mutated durable fields.
+    /// Terminal StepFailed must checkpoint the last safe state, not the live
+    /// speculative actor. Rejected event/checkpoint writes must also fence
+    /// further dispatch without inventing a successful durable receipt.
+    #[cfg(feature = "native-codegen")]
+    #[test]
+    fn test_workflow_jit_failed_resume_preserves_safe_checkpoint_and_fences_writes() {
+        let source = r#"
+            fn bump(n: Int) -> Int {
+                let a = n + 1
+                let b = a + 2
+                b - 2
+            }
+            workflow JitFailed {
+                step hot {
+                    var i = 0
+                    while i < 50000 {
+                        i = bump(i)
+                    }
+                    self.step_index = self.step_index + 1
+                    perform Fail.now()
+                }
+            }
+            let w = spawn JitFailed {} in { w }
+        "#;
+
+        // Normal receipt, rejected receipt, then receipt accepted but safe
+        // snapshot rejected. Each case uses a new actor and storage backend.
+        for failure_mode in 0..3 {
+            let store = SharedMemoryStore::new();
+            let runtime = Rc::new(RefCell::new(Runtime::new()));
+            runtime.borrow_mut().persistence = Box::new(store.clone());
+            let (value, _) = run_source_with_runtime(source, runtime.clone()).unwrap();
+            let actor_id = value.as_actor_id().expect("workflow reference");
+            assert_eq!(
+                store
+                    .load_snapshot(actor_id)
+                    .and_then(|snapshot| snapshot.state.get("step_index").cloned()),
+                Some(crate::runtime::PersistedValue::Int(0)),
+                "fixture must have a persisted pre-execution state"
+            );
+
+            runtime.borrow_mut().persistence = match failure_mode {
+                1 => Box::new(RejectStepFailedStore(store.clone())),
+                2 => Box::new(RejectStepFailedCheckpointStore(store.clone())),
+                _ => Box::new(store.clone()),
+            };
+
+            runtime.borrow_mut().send_message_by_id(actor_id, 0, &[]);
+            runtime.borrow_mut().step_actor(actor_id);
+            {
+                let rt = runtime.borrow();
+                let actor = rt.actors.get(&actor_id).expect("JIT actor preempted");
+                assert!(
+                    actor.jit_yield_pending,
+                    "test must exercise a real compiled safepoint before VM error"
+                );
+                assert_eq!(
+                    actor.suspended_execution.as_ref().map(|s| s.step_name.as_str()),
+                    Some("hot")
+                );
+            }
+
+            runtime.borrow_mut().run_scheduler();
+
+            assert!(
+                !runtime.borrow().actors.contains_key(&actor_id),
+                "speculative or uncommitted JIT failure must quarantine the actor"
+            );
+            assert_eq!(
+                store
+                    .load_snapshot(actor_id)
+                    .and_then(|snapshot| snapshot.state.get("step_index").cloned()),
+                Some(crate::runtime::PersistedValue::Int(0)),
+                "no VM error may checkpoint the speculative increment"
+            );
+            let events = store.read_workflow_events(actor_id);
+            let failures = events
+                .iter()
+                .filter(|event| matches!(event, WorkflowEvent::StepFailed { .. }))
+                .count();
+            assert_eq!(
+                failures,
+                if failure_mode == 1 { 0 } else { 1 },
+                "accepted/rejected StepFailed receipts must match the store result"
+            );
+            assert!(
+                !events.iter().any(|event| {
+                    matches!(event, WorkflowEvent::StepCompleted { .. })
+                }),
+                "VM failure must never report a successful terminal step"
+            );
+        }
+    }
+
     /// Verify the JIT safepoint infrastructure does not cause hangs or
     /// crashes when an actor with a tight loop yields to the scheduler.
     /// The busy-loop actor is given a minimal safepoint budget so the
