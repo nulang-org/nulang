@@ -1,0 +1,46 @@
+name: HTTP Actor OpenTelemetry Lineage
+
+on:
+  pull_request:
+    paths:
+      - 'src/runtime/trace.rs'
+      - 'src/runtime/mod.rs'
+      - 'src/runtime/http_server.rs'
+      - 'docs/OTEL_INTEROPERABILITY.md'
+      - '.github/workflows/otel-lineage.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'src/runtime/trace.rs'
+      - 'src/runtime/mod.rs'
+      - 'src/runtime/http_server.rs'
+      - 'docs/OTEL_INTEROPERABILITY.md'
+      - '.github/workflows/otel-lineage.yml'
+
+permissions:
+  contents: read
+concurrency:
+  group: otel-lineage-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  otel-lineage:
+    name: HTTP ingress and actor span-parent semantics
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.95.0'
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: No-OTel actor trace regressions
+        run: cargo test --locked --no-default-features --lib incoming_http_traceparent_is_case_insensitive_and_rejects_duplicates
+      - name: OTel parent-child context and exported actor identity
+        run: cargo test --locked --no-default-features --features otel --lib exported_actor_span_reuses_actual_otel_identity_for_outgoing_messages -- --nocapture
+      - name: HTTP ingress OpenTelemetry parent test
+        run: cargo test --locked --no-default-features --features otel --lib http_ingress_uses_remote_traceparent_as_real_otel_parent -- --nocapture
+      - name: Check minimal OpenTelemetry integration and test targets
+        run: cargo check --locked --no-default-features --features otel --all-targets

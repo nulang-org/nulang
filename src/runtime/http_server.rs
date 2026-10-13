@@ -78,6 +78,27 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
 }
 
+/// Enter a server span around a decoded HTTP request. HTTP trace headers
+/// are untrusted: invalid/duplicate traceparent is ignored and produces a
+/// new root instead. Only the method is recorded, never unbounded URLs,
+/// userinfo, headers, secrets, request body, or dynamic path segments.
+fn enter_http_request_span(request: &HttpRequest) -> Option<tracing::span::EnteredSpan> {
+    if !tracing::enabled!(tracing::Level::TRACE) {
+        return None;
+    }
+    let span = tracing::span!(
+        parent: None,
+        tracing::Level::TRACE,
+        "http_server_request",
+        http_request_method = request.method.as_str(),
+    );
+    #[cfg(feature = "otel")]
+    if let Some(remote) = super::TraceContext::from_http_headers(&request.headers) {
+        remote.attach_as_otel_parent(&span);
+    }
+    Some(span.entered())
+}
+
 /// Manages the background HTTP listener thread.
 /// Stored on Runtime; `HttpServerState::bind()` spawns the thread.
 pub struct HttpServerState {
@@ -232,6 +253,7 @@ impl HttpServerState {
                                 headers,
                                 body,
                             };
+                            let _request_span = enter_http_request_span(&request);
                             let response =
                                 Self::dispatch(handler_module, handler_func_idx, &request);
                             let keep_alive = false; // Phase 1: close after each request
@@ -893,6 +915,8 @@ impl WebDevServer {
                                 body,
                             };
 
+                            let _request_span = enter_http_request_span(&request);
+
                             let mut response = if path.starts_with(Self::SSE_PATH_PREFIX) {
                                 let room = &path[Self::SSE_PATH_PREFIX.len()..];
                                 Self::serve_sse(room, &mut stream, shutdown.clone());
@@ -1105,6 +1129,43 @@ fn guess_content_type(path: &Path) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn http_ingress_uses_remote_traceparent_as_real_otel_parent() {
+        use opentelemetry::trace::{TraceContextExt as _, TracerProvider as _};
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        use tracing_subscriber::prelude::*;
+
+        let provider = opentelemetry_sdk::trace::TracerProvider::builder().build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("http-ingress-test")));
+        tracing::subscriber::with_default(subscriber, || {
+            let request = HttpRequest {
+                method: HttpMethod::Get,
+                path: "/users/42?token=hidden".to_string(),
+                headers: vec![(
+                    "TrAcEpArEnT".to_string(),
+                    "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string(),
+                )],
+                body: Vec::new(),
+            };
+            let _entered =
+                enter_http_request_span(&request).expect("enabled TRACE level has a request span");
+            let active = tracing::Span::current().context();
+            let span = active.span();
+            let ctx = span.span_context();
+            assert!(ctx.is_valid());
+            assert_eq!(
+                ctx.trace_id().to_bytes(),
+                0x4bf92f3577b34da6a3ce929d0e0e4736u128.to_be_bytes()
+            );
+            assert_ne!(
+                ctx.span_id().to_bytes(),
+                0x00f067aa0ba902b7u64.to_be_bytes()
+            );
+        });
+    }
 
     #[test]
     fn test_match_route_exact() {
