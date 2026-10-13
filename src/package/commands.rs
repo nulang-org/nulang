@@ -2596,6 +2596,114 @@ mod tests {
     use super::*;
 
     #[test]
+    fn locked_mode_rejects_missing_lockfile_for_build_run_and_test() {
+        let dir = std::env::temp_dir().join(format!(
+            "nula_locked_missing_{}", std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        scaffold_package(&dir, "locked-app", "default").unwrap();
+        let _guard = ChangeDir::new(&dir);
+
+        for command in ["build", "run", "test"] {
+            let args = vec![command.to_string(), "--locked".to_string()];
+            let error = run(&args).expect_err("locked command must require an existing lockfile");
+            assert!(error.to_string().contains("Nulang.lock"), "{error}");
+            assert!(!dir.join(LOCKFILE_FILE).exists());
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn locked_mode_preserves_unchanged_lockfile_bytes() {
+        let dir = std::env::temp_dir().join(format!(
+            "nula_locked_unchanged_{}", std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        scaffold_package(&dir, "locked-app", "default").unwrap();
+        let _guard = ChangeDir::new(&dir);
+        prepare_package().unwrap();
+        let before = std::fs::read(dir.join(LOCKFILE_FILE)).unwrap();
+
+        prepare_package_with_lock_policy(true).expect("unchanged lockfile must be accepted");
+        assert_eq!(std::fs::read(dir.join(LOCKFILE_FILE)).unwrap(), before);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn locked_mode_rejects_changed_dependency_pin_without_rewriting() {
+        let dir = std::env::temp_dir().join(format!(
+            "nula_locked_pin_drift_{}", std::process::id()
+        ));
+        let root = dir.join("root");
+        let util = dir.join("util");
+        let _ = std::fs::remove_dir_all(&dir);
+        scaffold_package(&root, "locked-app", "default").unwrap();
+        scaffold_package(&util, "util", "lib").unwrap();
+        let mut manifest = Manifest::load(&root).unwrap();
+        manifest.dependencies.insert(
+            "util".to_string(),
+            Dependency::Detailed(DependencyDetail {
+                path: Some("../util".to_string()),
+                ..Default::default()
+            }),
+        );
+        manifest.save(&root).unwrap();
+        let _guard = ChangeDir::new(&root);
+        prepare_package().unwrap();
+        let before = std::fs::read(root.join(LOCKFILE_FILE)).unwrap();
+
+        let mut util_manifest = Manifest::load(&util).unwrap();
+        util_manifest.package.version = "0.2.0".to_string();
+        util_manifest.save(&util).unwrap();
+
+        let error = prepare_package_with_lock_policy(true)
+            .expect_err("a changed dependency version must invalidate the lock");
+        assert!(error.to_string().contains("--locked"), "{error}");
+        assert_eq!(std::fs::read(root.join(LOCKFILE_FILE)).unwrap(), before);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn locked_mode_detects_changed_path_dependency_source_identity() {
+        let dir = std::env::temp_dir().join(format!(
+            "nula_locked_source_drift_{}", std::process::id()
+        ));
+        let root = dir.join("root");
+        let util = dir.join("util");
+        let _ = std::fs::remove_dir_all(&dir);
+        scaffold_package(&root, "locked-app", "default").unwrap();
+        scaffold_package(&util, "util", "lib").unwrap();
+        let mut manifest = Manifest::load(&root).unwrap();
+        manifest.dependencies.insert(
+            "util".to_string(),
+            Dependency::Detailed(DependencyDetail {
+                path: Some("../util".to_string()),
+                ..Default::default()
+            }),
+        );
+        manifest.save(&root).unwrap();
+        let _guard = ChangeDir::new(&root);
+        prepare_package().unwrap();
+        let before = std::fs::read(root.join(LOCKFILE_FILE)).unwrap();
+        assert!(!Lockfile::load(&root).unwrap().identity.is_empty());
+
+        let lib_path = util.join("src/lib.nula");
+        let mut contents = std::fs::read_to_string(&lib_path).unwrap();
+        contents.push_str("\n// modification after locking\n");
+        std::fs::write(&lib_path, contents).unwrap();
+
+        let error = prepare_package_with_lock_policy(true)
+            .expect_err("changed dependency source must invalidate its identity");
+        assert!(error.to_string().contains("--locked"), "{error}");
+        assert_eq!(std::fs::read(root.join(LOCKFILE_FILE)).unwrap(), before);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_manifest_language_pin() {
         let dir = std::env::temp_dir().join(format!("nulang_lang_pin_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
