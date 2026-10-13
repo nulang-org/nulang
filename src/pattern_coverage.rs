@@ -2,7 +2,7 @@
 //!
 //! The runtime already retains a non-exhaustive-match fallback for cases the
 //! compiler cannot prove. This module handles decidable finite domains first:
-//! declared variants and booleans. It deliberately prefers false negatives
+//! declared variants, booleans, and singleton `Nil`/`Unit` types. It deliberately prefers false negatives
 //! (leave the runtime fallback in place) over false positives (claim an arm is
 //! exhaustive when it is not).
 //!
@@ -36,7 +36,8 @@ impl CoverageReport {
 ///
 /// Supported today:
 /// - declared variant types;
-/// - `Bool`.
+/// - `Bool`;
+/// - singleton `Nil` and `Unit` types.
 ///
 /// `arms` stores the pattern and whether that arm has a guard. Guarded arms do
 /// not contribute to exhaustiveness because the guard may evaluate to false.
@@ -46,6 +47,12 @@ pub fn analyze_match(scrutinee_ty: &Type, arms: &[(Pattern, bool)]) -> Option<Co
     match peel_reference(scrutinee_ty) {
         Type::Variant(_) => analyze_variant_match(scrutinee_ty, arms),
         Type::Primitive(PrimitiveType::Bool) => Some(analyze_bool_match(arms)),
+        Type::Primitive(PrimitiveType::Nil) => {
+            Some(analyze_singleton_match(arms, Literal::Nil, "nil"))
+        }
+        Type::Primitive(PrimitiveType::Unit) => {
+            Some(analyze_singleton_match(arms, Literal::Unit, "unit"))
+        }
         _ => None,
     }
 }
@@ -172,6 +179,44 @@ fn analyze_bool_match(arms: &[(Pattern, bool)]) -> CoverageReport {
 
     CoverageReport {
         missing,
+        redundant_arms,
+    }
+}
+
+/// A singleton type has exactly one inhabitant. An unguarded literal or
+/// catch-all covers it; guarded arms cannot prove coverage. Once covered,
+/// subsequent arms are provably unreachable.
+fn analyze_singleton_match(
+    arms: &[(Pattern, bool)],
+    expected: Literal,
+    witness: &str,
+) -> CoverageReport {
+    let mut covered = false;
+    let mut redundant_arms = Vec::new();
+
+    for (index, (pattern, guarded)) in arms.iter().enumerate() {
+        if covered {
+            redundant_arms.push(index);
+            continue;
+        }
+        if *guarded {
+            continue;
+        }
+
+        let pattern = strip_alias(pattern);
+        if is_unconditional_catch_all(pattern)
+            || matches!(pattern, Pattern::Lit(value) if value == &expected)
+        {
+            covered = true;
+        }
+    }
+
+    CoverageReport {
+        missing: if covered {
+            Vec::new()
+        } else {
+            vec![witness.to_string()]
+        },
         redundant_arms,
     }
 }
