@@ -5034,6 +5034,45 @@ mod lsp_tests {
     }
 
     #[test]
+    fn test_typo_fix_uses_utf16_positions_after_multibyte_text() {
+        let source = "fn main() {\n    let counter = 5\n    perform IO.print(\"😀\"); countr\n}\n";
+        crate::types::set_source_map(source);
+        let start = source.find("countr").expect("misspelled identifier");
+        let misspelled = "countr";
+        let err = NuError::unbound_variable(
+            misspelled,
+            crate::types::Span::new(start as u32, (start + misspelled.len()) as u32),
+            Some(vec!["counter".to_string()]),
+        );
+        let diagnostic = single_diagnostic(err);
+        let target_line = source.lines().nth(2).unwrap();
+        let start_byte = target_line.find(misspelled).unwrap();
+        let start_utf16 = target_line[..start_byte].encode_utf16().count() as u32;
+        let expected = Range::new(
+            Position::new(2, start_utf16),
+            Position::new(2, start_utf16 + misspelled.len() as u32),
+        );
+        assert_eq!(diagnostic.range, expected, "LSP columns must use UTF-16");
+
+        let uri = Url::parse("file:///unicode-typo.nula").unwrap();
+        let actions = NulangLanguageServer::typo_quickfix_actions(
+            source,
+            &Range::new(expected.start, expected.start),
+            &uri,
+            &[diagnostic],
+        );
+        assert!(
+            actions.iter().any(|action| match action {
+                CodeActionOrCommand::CodeAction(action) => {
+                    action.title == "Replace 'countr' with 'counter'"
+                }
+                _ => false,
+            }),
+            "the source-verified typo fix must work after non-ASCII text"
+        );
+    }
+
+    #[test]
     fn test_typo_quickfix_from_real_frontend_diagnostic() {
         let source = "fn main() {\n    let counter = 5\n    perform IO.print(perform Int.to_string(countr + 1))\n}\n";
         let uri = Url::parse("file:///real-typo.nula").unwrap();
