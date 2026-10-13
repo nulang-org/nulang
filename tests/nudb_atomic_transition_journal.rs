@@ -335,3 +335,136 @@ fn deleted_actor_tail_does_not_allow_resetting_existing_history() {
     drop(journal);
     cleanup(&path);
 }
+
+#[test]
+fn actor_history_audit_accepts_contiguous_interleaved_history_after_checkpoint() {
+    let path = temp_wal("history_audit_valid");
+    cleanup(&path);
+    {
+        let mut journal = NuDbTransitionJournal::open(&path).unwrap();
+        journal.commit_transition(transition(100, 1, 1)).unwrap();
+        journal.commit_transition(transition(200, 1, 3)).unwrap();
+        journal.commit_transition(transition(100, 2, 2)).unwrap();
+        journal.commit_transition(transition(100, 3, 2)).unwrap();
+        journal.checkpoint().unwrap();
+    }
+
+    let journal = NuDbTransitionJournal::open(&path).unwrap();
+    let sequence_before = journal.tablet_sequence();
+    assert_eq!(
+        journal.verify_actor_history(100).unwrap().unwrap().sequence,
+        3
+    );
+    assert_eq!(
+        journal.verify_actor_history(100).unwrap().unwrap().activation_epoch,
+        2
+    );
+    assert_eq!(
+        journal.verify_actor_history(200).unwrap().unwrap().sequence,
+        1
+    );
+    assert!(journal.verify_actor_history(300).unwrap().is_none());
+    assert_eq!(journal.tablet_sequence(), sequence_before);
+    drop(journal);
+    cleanup(&path);
+}
+
+#[test]
+fn actor_history_audit_rejects_missing_middle_transition_after_checkpoint() {
+    let path = temp_wal("history_audit_missing_middle");
+    cleanup(&path);
+    {
+        let mut journal = NuDbTransitionJournal::open(&path).unwrap();
+        for sequence in 1..=3 {
+            journal
+                .commit_transition(transition(900, sequence, 2))
+                .unwrap();
+        }
+    }
+    mutate_raw_tablet(
+        &path,
+        TabletMutation::Delete {
+            key: raw_transition_key(900, 2),
+        },
+    );
+    {
+        let mut journal = NuDbTransitionJournal::open(&path).unwrap();
+        journal.checkpoint().unwrap();
+    }
+
+    let journal = NuDbTransitionJournal::open(&path).unwrap();
+    // Tail-only checks still see an intact final transition.
+    assert_eq!(journal.load_tail_position(900).unwrap().unwrap().sequence, 3);
+    let sequence_before = journal.tablet_sequence();
+    assert_eq!(
+        journal.verify_actor_history(900).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    assert_eq!(journal.tablet_sequence(), sequence_before);
+    drop(journal);
+    cleanup(&path);
+}
+
+#[test]
+fn actor_history_audit_rejects_corrupt_intermediate_payload() {
+    let path = temp_wal("history_audit_corrupt_middle");
+    cleanup(&path);
+    {
+        let mut journal = NuDbTransitionJournal::open(&path).unwrap();
+        for sequence in 1..=3 {
+            journal
+                .commit_transition(transition(901, sequence, 1))
+                .unwrap();
+        }
+    }
+    mutate_raw_tablet(
+        &path,
+        TabletMutation::Put {
+            key: raw_transition_key(901, 2),
+            value: b"not-a-valid-transition-envelope".to_vec(),
+        },
+    );
+
+    let journal = NuDbTransitionJournal::open(&path).unwrap();
+    assert_eq!(journal.load_tail_position(901).unwrap().unwrap().sequence, 3);
+    assert_eq!(
+        journal.verify_actor_history(901).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    drop(journal);
+    cleanup(&path);
+}
+
+#[test]
+fn actor_history_audit_rejects_orphan_transition_beyond_rewritten_tail() {
+    let path = temp_wal("history_audit_orphan");
+    cleanup(&path);
+    let first = transition(902, 1, 1);
+    let digest = first.digest().unwrap();
+    {
+        let mut journal = NuDbTransitionJournal::open(&path).unwrap();
+        journal.commit_transition(first).unwrap();
+        journal.commit_transition(transition(902, 2, 1)).unwrap();
+    }
+    mutate_raw_tablet(
+        &path,
+        TabletMutation::Put {
+            key: raw_tail_key(902),
+            value: serde_json::to_vec(&serde_json::json!({
+                "activation_epoch": 1,
+                "sequence": 1,
+                "digest": digest,
+            }))
+            .unwrap(),
+        },
+    );
+
+    let journal = NuDbTransitionJournal::open(&path).unwrap();
+    assert_eq!(journal.load_tail_position(902).unwrap().unwrap().sequence, 1);
+    assert_eq!(
+        journal.verify_actor_history(902).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    drop(journal);
+    cleanup(&path);
+}
