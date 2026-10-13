@@ -1737,7 +1737,12 @@ fn fold_rvalue(
         },
         RValue::Unary(uop, local) => match const_locals.get(&local) {
             Some(c) => match (uop, c) {
-                (UnOp::Neg, Int(n)) => RValue::Const(Int(n.wrapping_neg())),
+                // The VM raises an overflow error for -INT48_MIN, even
+                // though its i64 negation fits: the result cannot fit in
+                // the signed 48-bit value payload. Keep the checked opcode.
+                (UnOp::Neg, Int(n)) if *n != crate::value_layout::INT48_MIN => {
+                    RValue::Const(Int(n.wrapping_neg()))
+                }
                 (UnOp::Neg, Float(f)) => RValue::Const(Float(-f)),
                 (UnOp::Not, Bool(b)) => RValue::Const(Bool(!b)),
                 // The remaining Not rules never fire on well-typed MIR
@@ -2943,6 +2948,48 @@ mod tests {
         let mut vm = VM::new();
         vm.load_module(module);
         vm.run()
+    }
+
+    #[test]
+    fn test_mir_const_fold_preserves_checked_int48_min_negation() {
+        let operand = mir::LocalId(0);
+        let mut known = std::collections::HashMap::new();
+        known.insert(operand, Constant::Int(crate::value_layout::INT48_MIN));
+
+        let expression = mir::RValue::Unary(crate::ast::UnOp::Neg, operand);
+        let optimized = fold_rvalue(expression.clone(), &known, &[false]);
+
+        assert_eq!(
+            optimized, expression,
+            "negating INT48_MIN must remain a checked runtime operation, not a wrapped constant"
+        );
+    }
+
+    #[test]
+    fn test_mir_codegen_reports_overflow_when_negating_int48_min() {
+        // Construct INT48_MIN without an out-of-range positive literal.
+        // The optimizer must not turn the final checked negation into a
+        // wrapped 48-bit constant before the VM can raise the error.
+        let result = run_mir_source("let lowest = (0 - 140737488355327) - 1 in -lowest");
+        let err = result.expect_err("negating INT48_MIN must be a runtime error");
+        assert!(
+            err.to_string().contains("integer overflow"),
+            "unexpected error when negating INT48_MIN: {err}"
+        );
+    }
+
+    #[test]
+    fn test_mir_const_fold_negates_in_range_integer() {
+        let operand = mir::LocalId(0);
+        let mut known = std::collections::HashMap::new();
+        known.insert(operand, Constant::Int(42));
+
+        let optimized = fold_rvalue(
+            mir::RValue::Unary(crate::ast::UnOp::Neg, operand),
+            &known,
+            &[false],
+        );
+        assert_eq!(optimized, mir::RValue::Const(Constant::Int(-42)));
     }
 
     #[test]
