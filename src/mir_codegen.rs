@@ -3812,7 +3812,7 @@ mod optimize_tests {
     }
 
     #[test]
-    fn test_drop_plan_transfers_single_use_ownership_through_load_chain() {
+    fn test_drop_plan_transfers_owned_token_through_moveout() {
         let arr_ty = Type::Array(Box::new(Type::int()));
         let mut b = mir::FunctionBuilder::new("move_chain", Some(Type::int()));
         let root = b.add_temp(arr_ty.clone());
@@ -3821,8 +3821,8 @@ mod optimize_tests {
         let len = b.add_temp(Type::int());
 
         b.assign(root, mir::RValue::ArrayLit(vec![]));
-        b.assign(mid, mir::RValue::Load(root));
-        b.assign(leaf, mir::RValue::Load(mid));
+        b.assign(mid, mir::RValue::MoveOut(root));
+        b.assign(leaf, mir::RValue::MoveOut(mid));
         b.assign(len, mir::RValue::ArrayLen(leaf));
         b.terminate(mir::Terminator::Return(Some(len)));
 
@@ -3836,89 +3836,45 @@ mod optimize_tests {
                 .after_stmt
                 .get(&(0, 1))
                 .is_some_and(|ids| ids.contains(&root)),
-            "transfer source must not be RC-dropped after the move"
+            "MoveOut source must not be RC-dropped at transfer"
         );
         assert!(
             !plan
                 .after_stmt
                 .get(&(0, 2))
                 .is_some_and(|ids| ids.contains(&mid)),
-            "chained transfer source must not be RC-dropped after the move"
+            "chained MoveOut source must not be RC-dropped at transfer"
         );
         assert!(
             plan.after_stmt
                 .get(&(0, 3))
                 .is_some_and(|ids| ids.contains(&leaf)),
-            "final owner should be released after its last read-only use"
+            "final ownership-proven destination should drop after last read"
         );
     }
 
     #[test]
-    fn test_drop_plan_does_not_transfer_when_source_has_another_use() {
+    fn test_drop_plan_never_infers_move_from_plain_load() {
         let arr_ty = Type::Array(Box::new(Type::int()));
-        let mut b = mir::FunctionBuilder::new("not_a_move", Some(Type::int()));
-        let root = b.add_temp(arr_ty.clone());
-        let first_len = b.add_temp(Type::int());
-        let copied = b.add_temp(arr_ty);
-        let second_len = b.add_temp(Type::int());
-
-        b.assign(root, mir::RValue::ArrayLit(vec![]));
-        b.assign(first_len, mir::RValue::ArrayLen(root));
-        b.assign(copied, mir::RValue::Load(root));
-        b.assign(second_len, mir::RValue::ArrayLen(copied));
-        b.terminate(mir::Terminator::Return(Some(second_len)));
-
-        let func = b.build();
-        let plan = plan_drops(&func);
-        assert!(
-            !plan.ownership_transfer.contains_key(&(0, 2)),
-            "a source with another use is a copy, not an ownership move"
-        );
-    }
-
-    #[test]
-    fn test_drop_plan_prunes_transfer_when_destination_escapes() {
-        let arr_ty = Type::Array(Box::new(Type::int()));
-        let mut b = mir::FunctionBuilder::new("escaping_move", Some(arr_ty.clone()));
-        let root = b.add_temp(arr_ty.clone());
-        let moved = b.add_temp(arr_ty);
-
-        b.assign(root, mir::RValue::ArrayLit(vec![]));
-        b.assign(moved, mir::RValue::Load(root));
-        b.terminate(mir::Terminator::Return(Some(moved)));
-
-        let func = b.build();
-        let plan = plan_drops(&func);
-        assert!(
-            !plan.ownership_transfer.contains_key(&(0, 1)),
-            "transfer must be pruned when the destination escapes by copy"
-        );
-    }
-
-    #[test]
-    fn test_drop_plan_does_not_transfer_when_source_is_redefined() {
-        let arr_ty = Type::Array(Box::new(Type::int()));
-        let mut b = mir::FunctionBuilder::new("redefined_source", Some(Type::int()));
+        let mut b = mir::FunctionBuilder::new("plain_load", Some(Type::int()));
         let root = b.add_temp(arr_ty.clone());
         let copied = b.add_temp(arr_ty);
         let len = b.add_temp(Type::int());
 
         b.assign(root, mir::RValue::ArrayLit(vec![]));
         b.assign(copied, mir::RValue::Load(root));
-        b.assign(root, mir::RValue::ArrayLit(vec![]));
         b.assign(len, mir::RValue::ArrayLen(copied));
         b.terminate(mir::Terminator::Return(Some(len)));
 
-        let func = b.build();
-        let plan = plan_drops(&func);
+        let plan = plan_drops(&b.build());
         assert!(
-            !plan.ownership_transfer.contains_key(&(0, 1)),
-            "a source with multiple definitions cannot be moved safely"
+            plan.ownership_transfer.is_empty(),
+            "ordinary Load must remain a copy even when it is the source's only use"
         );
     }
 
     #[test]
-    fn test_codegen_clears_transfer_source_without_drop() {
+    fn test_codegen_clears_explicit_moveout_source_without_drop() {
         let arr_ty = Type::Array(Box::new(Type::int()));
         let mut b = mir::FunctionBuilder::new("main", Some(Type::int()));
         let root = b.add_temp(arr_ty.clone());
@@ -3926,13 +3882,13 @@ mod optimize_tests {
         let len = b.add_temp(Type::int());
 
         b.assign(root, mir::RValue::ArrayLit(vec![]));
-        b.assign(moved, mir::RValue::Load(root));
+        b.assign(moved, mir::RValue::MoveOut(root));
         b.assign(len, mir::RValue::ArrayLen(moved));
         b.terminate(mir::Terminator::Return(Some(len)));
 
-        let mut module = mir::Module::new("move_codegen");
+        let mut module = mir::Module::new("moveout_codegen");
         module.functions.push(b.build());
-        let code = compile_mir(&mut module, "move_codegen").unwrap();
+        let code = compile_mir(&mut module, "moveout_codegen").unwrap();
         let root_reg = (LOCAL_BASE + root.0) as u8;
 
         let clears_root_to_nil = code.instructions.iter().any(|ins| {
@@ -3943,10 +3899,7 @@ mod optimize_tests {
                     Some(Constant::Nil)
                 )
         });
-        assert!(
-            clears_root_to_nil,
-            "ownership transfer must clear the dead source register to nil"
-        );
+        assert!(clears_root_to_nil, "MoveOut must clear the source to nil");
 
         let mut vm = VM::new();
         vm.load_module(code);
@@ -3954,7 +3907,53 @@ mod optimize_tests {
         assert_eq!(
             value.as_int(),
             Some(0),
-            "clearing the moved-from source must not invalidate the destination"
+            "clearing the moved-from source must not invalidate destination"
+        );
+    }
+
+    #[test]
+    fn test_codegen_moveout_clears_spilled_source_slot() {
+        let mut b = mir::FunctionBuilder::new("main", Some(Type::unit()));
+        let moved = b.add_temp(Type::unit());
+        let spilled_threshold = FUNC_VALUE_REG as u32 - LOCAL_BASE;
+        for _ in 1..spilled_threshold {
+            let _ = b.add_temp(Type::int());
+        }
+        let source = b.add_temp(Type::unit());
+        assert!(source.0 >= spilled_threshold);
+
+        b.assign(source, mir::RValue::ArrayLit(vec![]));
+        b.assign(moved, mir::RValue::MoveOut(source));
+        // Deliberately observe the physical source slot. Source-language
+        // capability analysis rejects this use; backend tests need it to
+        // verify spill invalidation.
+        b.terminate(mir::Terminator::Return(Some(source)));
+
+        let mut module = mir::Module::new("spill_moveout_source");
+        module.functions.push(b.build());
+        let code = compile_mir(&mut module, "spill_moveout_source").unwrap();
+        let mut vm = VM::new();
+        vm.load_module(code);
+        let value = vm.run().unwrap();
+        assert!(value.is_nil(), "MoveOut must clear the actual spill slot");
+    }
+
+    #[test]
+    fn test_codegen_rejects_moveout_to_same_local() {
+        let mut b = mir::FunctionBuilder::new("main", Some(Type::unit()));
+        let x = b.add_temp(Type::unit());
+        b.assign(x, mir::RValue::ArrayLit(vec![]));
+        b.assign(x, mir::RValue::MoveOut(x));
+        b.terminate(mir::Terminator::Return(Some(x)));
+
+        let mut module = mir::Module::new("self_moveout");
+        module.functions.push(b.build());
+        let err = compile_mir(&mut module, "self_moveout")
+            .expect_err("self MoveOut must fail before bytecode emission");
+        assert!(
+            err.to_string()
+                .contains("source and destination must be distinct"),
+            "unexpected error: {err}"
         );
     }
 
