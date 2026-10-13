@@ -34,4 +34,4 @@ Keep unrelated work out of this PR; identify any stacked dependency and exact ba
 - [ ] All blocking review comments are addressed and discussions resolved.
 - [ ] I have not represented unexecuted tests or unmeasured speedups as verified.
 
-See [Maintainer review policy](../docs/MAINTAINER_REVIEW.md).
+See [Maintainer review policy](https://github.com/nulang-org/nulang/blob/main/docs/MAINTAINER_REVIEW.md).
