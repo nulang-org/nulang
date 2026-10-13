@@ -22,6 +22,9 @@
   wrapping. Focused CoreVM, AOT, and JIT regression tests added; no change to
   source type inference or WASM source semantics.
 
+### Unary-negation backend parity — 2026-09-25
+- **Unary `-` now rejects concrete nonnumeric operands during type checking.** Known booleans, tuples, functions, and other nonnumeric values fail before code generation; unresolved inference variables remain dynamic until Nulang has a principled numeric constraint/typeclass.
+
 ### Actor scheduler LIFO handoff and lifecycle pooling — 2026-10-10
 - **Performance:** Optimized actor scheduler LIFO handoff with strict
   priority gating, and added actor lifecycle pooling.
