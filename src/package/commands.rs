@@ -2730,6 +2730,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn registry_integrity_locked_mode_rejects_tampered_cached_assets() {
+        use crate::package::lockfile::LockedPackage;
+
+        let root = std::env::temp_dir().join(format!(
+            "nula_locked_registry_integrity_{}", std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let cached = root.join(".nula/registry/util-0.1.0");
+        std::fs::create_dir_all(&cached).unwrap();
+        std::fs::write(
+            cached.join(MANIFEST_FILE),
+            "[package]\nname = \"util\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let asset = cached.join("asset.json");
+        std::fs::write(&asset, "{\"enabled\":true}").unwrap();
+
+        let mut lock = Lockfile::new();
+        lock.package.push(LockedPackage {
+            name: "util".to_string(),
+            version: "0.1.0".to_string(),
+            source: "reg+https://registry.test".to_string(),
+            content_hash: String::new(),
+            commit: String::new(),
+        });
+        lock.save(&root).unwrap();
+        let pinned = Lockfile::load(&root).unwrap();
+        verify_locked_resolution(&root, &pinned)
+            .expect("original locked registry cache should pass");
+
+        std::fs::write(&asset, "{\"enabled\":false}").unwrap();
+        let error = verify_locked_resolution(&root, &pinned)
+            .expect_err("strict mode must reject changes to registry assets");
+        assert!(error.to_string().contains("integrity mismatch"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(root.join(LOCKFILE_FILE)).unwrap(),
+            pinned.to_toml().unwrap(),
+            "locked verification cannot rewrite Nulang.lock"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn offline_flag_requires_a_lockfile_before_creating_dependency_cache() {
         let dir = std::env::temp_dir().join(format!(
             "nula_offline_missing_{}", std::process::id()
