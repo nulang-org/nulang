@@ -2974,6 +2974,120 @@ mod tests {
     }
 
     #[test]
+    fn test_devirtualize_captureless_same_block_call() {
+        let mut builder = mir::FunctionBuilder::new("captureless", Some(Type::int()));
+        let closure = builder.add_temp(Type::unit());
+        let result = builder.add_temp(Type::int());
+        builder.assign(
+            closure,
+            mir::RValue::Closure {
+                func: 7,
+                captures: vec![],
+            },
+        );
+        builder.assign(
+            result,
+            mir::RValue::Call {
+                func: mir::FuncRef::Local(closure),
+                args: vec![],
+            },
+        );
+        builder.terminate(mir::Terminator::Return(Some(result)));
+
+        let mut function = builder.build();
+        assert!(devirtualize_captureless_calls(&mut function));
+        assert!(matches!(
+            &function.blocks[0].stmts[1],
+            mir::Stmt::Assign {
+                op: mir::RValue::Call {
+                    func: mir::FuncRef::Index(7),
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_devirtualize_does_not_drop_closure_captures() {
+        let mut builder = mir::FunctionBuilder::new("captured", Some(Type::int()));
+        let captured = builder.add_temp(Type::int());
+        let closure = builder.add_temp(Type::unit());
+        let result = builder.add_temp(Type::int());
+        builder.assign(
+            closure,
+            mir::RValue::Closure {
+                func: 7,
+                captures: vec![captured],
+            },
+        );
+        builder.assign(
+            result,
+            mir::RValue::Call {
+                func: mir::FuncRef::Local(closure),
+                args: vec![],
+            },
+        );
+        builder.terminate(mir::Terminator::Return(Some(result)));
+
+        let mut function = builder.build();
+        assert!(!devirtualize_captureless_calls(&mut function));
+        assert!(matches!(
+            &function.blocks[0].stmts[1],
+            mir::Stmt::Assign {
+                op: mir::RValue::Call {
+                    func: mir::FuncRef::Local(_),
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_devirtualize_respects_callee_reassignment() {
+        let mut builder = mir::FunctionBuilder::new("reassigned", Some(Type::int()));
+        let closure = builder.add_temp(Type::unit());
+        let captured = builder.add_temp(Type::int());
+        let result = builder.add_temp(Type::int());
+        builder.assign(
+            closure,
+            mir::RValue::Closure {
+                func: 3,
+                captures: vec![],
+            },
+        );
+        builder.assign(
+            closure,
+            mir::RValue::Closure {
+                func: 4,
+                captures: vec![captured],
+            },
+        );
+        builder.assign(
+            result,
+            mir::RValue::Call {
+                func: mir::FuncRef::Local(closure),
+                args: vec![],
+            },
+        );
+        builder.terminate(mir::Terminator::Return(Some(result)));
+
+        let mut function = builder.build();
+        assert!(!devirtualize_captureless_calls(&mut function));
+        assert!(matches!(
+            &function.blocks[0].stmts[2],
+            mir::Stmt::Assign {
+                op: mir::RValue::Call {
+                    func: mir::FuncRef::Local(_),
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn test_mir_codegen_closure_capture() {
         let value = run_mir_source("let a = 40 in let add = fn(x) { x + a } in add(2)").unwrap();
         assert_eq!(value.as_int(), Some(42));
