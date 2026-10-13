@@ -5445,7 +5445,8 @@ impl Runtime {
                     "nulang-workflow: compensation receipt not durable; quarantining actor"
                 );
                 self.actors.remove(&actor_id);
-                self.pending_receive_wakes.retain(|queued| *queued != actor_id);
+                self.pending_receive_wakes
+                    .retain(|queued| *queued != actor_id);
                 self.current_actor = None;
                 return;
             }
