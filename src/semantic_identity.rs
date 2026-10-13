@@ -953,6 +953,13 @@ impl Encoder {
                 self.byte(2);
                 self.u32(ids.local(*local));
             }
+            RValue::MoveOut(local) => {
+                // Additive tag: keep every pre-existing RValue tag stable so
+                // semantic identities for programs without MoveOut do not
+                // change merely because the IR gained a new operation.
+                self.byte(33);
+                self.u32(ids.local(*local));
+            }
             RValue::LoadFieldNamed { obj, field } => {
                 self.byte(3);
                 self.u32(ids.local(*obj));

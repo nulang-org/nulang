@@ -83,8 +83,8 @@ pub struct MirCodegen {
     /// string every time (unlike record fields, `state` is string-keyed at
     /// runtime, not a positional slot `field_id` could cover).
     state_field_constants: FxHashMap<String, usize>,
-    /// Shared constant-pool slot used when a proven last-use ownership
-    /// transfer clears its dead source local to nil without touching RC.
+    /// Shared constant-pool slot used when an explicit MoveOut clears its
+    /// source local to nil without touching RC.
     nil_constant: Option<usize>,
     /// Per-function float-ness of MIR locals (see `float_locals`), used to
     /// pick float opcode variants for arithmetic and comparisons. Rebuilt
@@ -222,9 +222,9 @@ impl MirCodegen {
 
     /// Clear a local to nil without releasing its pointer.
     ///
-    /// Used only after a proven last-use `Load` ownership transfer: the
-    /// destination now carries the sole local ORCA ownership token, so
-    /// decrementing the dead source would free the transferred value.
+    /// Used after explicit `MoveOut`: the destination receives the source
+    /// slot's counted ownership, so decrementing the source would release the
+    /// transferred value instead of merely invalidating the old binding.
     fn clear_local_after_transfer(&mut self, id: mir::LocalId) {
         let nil_idx = match self.nil_constant {
             Some(idx) => idx,
@@ -781,6 +781,15 @@ impl MirCodegen {
         effect_site: Option<&MirEffectSite>,
     ) -> NuResult<()> {
         match stmt {
+            mir::Stmt::Assign {
+                dst,
+                op: mir::RValue::MoveOut(src),
+            } if dst == src => {
+                return Err(compile_err(
+                    "internal: MoveOut source and destination must be distinct locals",
+                    Span::default(),
+                ));
+            }
             mir::Stmt::Assign { dst, op } => {
                 let _spill_dst = self.local_dst(*dst);
                 self.compile_rvalue_with_site(_spill_dst, op, effect_site)?;
@@ -911,6 +920,12 @@ impl MirCodegen {
                 self.emit(Instruction::new0(OpCode::Panic));
             }
             mir::RValue::Load(id) => {
+                let src = self.local_reg(*id);
+                if src != dst {
+                    self.emit(Instruction::new2(OpCode::Move, src, dst));
+                }
+            }
+            mir::RValue::MoveOut(id) => {
                 let src = self.local_reg(*id);
                 if src != dst {
                     self.emit(Instruction::new2(OpCode::Move, src, dst));
@@ -1582,7 +1597,7 @@ pub(crate) fn float_locals(func: &mir::Function) -> Vec<bool> {
                 };
                 let result = match op {
                     mir::RValue::Const(Constant::Float(_)) => true,
-                    mir::RValue::Load(src) => is_float[src.0 as usize],
+                    mir::RValue::Load(src) | mir::RValue::MoveOut(src) => is_float[src.0 as usize],
                     mir::RValue::Unary(crate::ast::UnOp::Neg, src) => is_float[src.0 as usize],
                     mir::RValue::Binary(op, l, r)
                         if matches!(
@@ -1731,6 +1746,8 @@ fn fold_rvalue(
     use Constant::{Bool, Float, Int, Nil, String as CString};
 
     match op {
+        // Folding MoveOut to a constant would erase source invalidation.
+        RValue::MoveOut(local) => RValue::MoveOut(local),
         RValue::Load(local) => match const_locals.get(&local) {
             Some(c) => RValue::Const(c.clone()),
             None => RValue::Load(local),
@@ -2096,6 +2113,7 @@ fn rvalue_side_effecting(rv: &mir::RValue) -> bool {
             | mir::RValue::Send { .. }
             | mir::RValue::Resume(..)
             | mir::RValue::Ask { .. }
+            | mir::RValue::MoveOut(..)
     )
 }
 
@@ -2153,6 +2171,7 @@ fn rvalue_reads(rv: &mir::RValue, out: &mut HashSet<mir::LocalId>) {
         | RValue::Panic(_)
         | RValue::StateGet { .. } => {}
         RValue::Load(x)
+        | RValue::MoveOut(x)
         | RValue::ArrayLen(x)
         | RValue::Unary(_, x)
         | RValue::Resume(x)
@@ -2267,10 +2286,9 @@ pub fn compile_mir(mir: &mut mir::Module, module_name: impl Into<String>) -> NuR
 //   - no use copies the value through an uncounted channel: Move/Load,
 //     `&`/`*`, call or effect arguments, closure captures, sends/asks,
 //     returns/resumes, `StateSet`, or the AI builtins' staging moves.
-//     The one exception is a single-definition local whose only use is
-//     `dst = Load(src)`: that edge is a provable ownership transfer. Codegen
-//     copies the bits, clears `src` to nil *without* decrementing RC, and the
-//     destination inherits the ownership proof.
+//     Explicit `dst = MoveOut(src)` is not a copy: codegen transfers the bits,
+//     clears `src` to nil *without* decrementing RC, and the destination
+//     inherits ownership only when `src` already has a proven ownership token.
 //
 // Uses through the retaining barriers (container element stores) and
 // read-only uses (container base/length, operands, branch conditions) do
@@ -2300,6 +2318,9 @@ enum UseKind {
     /// Copied through a channel that takes no counted reference (Move/Load,
     /// call staging, send, capture, return, actor state).
     Copy,
+    /// Explicit ownership transfer. The source binding is invalidated without
+    /// a retain/release and may propagate a proven ownership token.
+    Transfer,
 }
 
 /// Locals of these types can hold NaN-boxed heap pointers at runtime. MIR
@@ -2371,6 +2392,7 @@ fn rvalue_uses(op: &mir::RValue) -> Vec<(usize, UseKind)> {
         // uncounted copy channel like call/effect argument staging.
         ReceiveWait { timeout, .. } => cp(&mut out, *timeout),
         Load(x) => cp(&mut out, *x),
+        MoveOut(x) => out.push((x.0 as usize, UseKind::Transfer)),
         LoadFieldNamed { obj, .. } | LoadFieldPos { obj, .. } => ro(&mut out, *obj),
         ArrayLoad { arr, idx } => {
             ro(&mut out, *arr);
@@ -2499,8 +2521,8 @@ struct DropPlan {
     block_entry: FxHashMap<usize, Vec<mir::LocalId>>,
     before_stmt: FxHashMap<(usize, usize), Vec<mir::LocalId>>,
     after_stmt: FxHashMap<(usize, usize), Vec<mir::LocalId>>,
-    /// `dst = Load(src)` sites proven to consume the source's final use.
-    /// Codegen clears `src` to nil after the copy without decrementing RC.
+    /// Explicit `dst = MoveOut(src)` sites. Codegen clears `src` to nil
+    /// after the destination write without decrementing reference counts.
     ownership_transfer: FxHashMap<(usize, usize), mir::LocalId>,
 }
 
@@ -2534,42 +2556,18 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
         }
     }
 
-    // First count definitions and uses. A Load can be treated as an
-    // ownership move only when its source has exactly one MIR definition and
-    // this Load is its only use in the whole function. That rules out later
-    // redefinitions (which would otherwise try to Drop the stale source
-    // alias) and every competing read/copy path.
-    let mut def_count = vec![0usize; nlocals];
-    let mut use_count = vec![0usize; nlocals];
-    for block in &func.blocks {
-        for stmt in &block.stmts {
-            for (u, _) in stmt_uses(stmt) {
-                use_count[u] += 1;
-            }
-            if let mir::Stmt::Assign { dst, .. } = stmt {
-                def_count[dst.0 as usize] += 1;
-            }
-        }
-        for (u, _) in terminator_uses(&block.terminator) {
-            use_count[u] += 1;
-        }
-    }
-
-    // Raw transfer candidates: (dst, src), keyed by statement location.
-    // Whether the transfer is *active* still depends on proving src owns its
-    // value; that is resolved by the candidate fixed point below.
-    let mut transfer_sites: FxHashMap<(usize, usize), (usize, usize)> = FxHashMap::default();
+    // Every explicit MoveOut must invalidate its physical source slot after
+    // the destination write. This is semantic, not an optimizer decision, so
+    // it applies even when the destination escapes and cannot be early-dropped.
     for (bi, block) in func.blocks.iter().enumerate() {
         for (si, stmt) in block.stmts.iter().enumerate() {
             if let mir::Stmt::Assign {
                 dst,
-                op: mir::RValue::Load(src),
+                op: mir::RValue::MoveOut(src),
             } = stmt
             {
-                let s = src.0 as usize;
-                let d = dst.0 as usize;
-                if s != d && def_count[s] == 1 && use_count[s] == 1 {
-                    transfer_sites.insert((bi, si), (d, s));
+                if dst != src {
+                    plan.ownership_transfer.insert((bi, si), *src);
                 }
             }
         }
@@ -2577,22 +2575,23 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
 
     // Scan defs and uses for the whole function.
     let mut has_def = vec![false; nlocals];
-    let mut defs_owning = vec![true; nlocals];
+    // Every definition of a candidate must either create a fresh owned value
+    // or transfer one from another ownership-proven local. Any ordinary
+    // borrowed/copied definition permanently disqualifies the destination.
+    let mut defs_supported = vec![true; nlocals];
+    let mut transfer_sources: Vec<Vec<usize>> = (0..nlocals).map(|_| Vec::new()).collect();
+    let mut transfer_edges: Vec<(usize, usize)> = Vec::new(); // (dst, src)
     let mut no_copy_use = vec![true; nlocals];
-    // A destination defined by a transfer becomes owning only after every
-    // transfer source has itself been proven owning.
-    let mut transfer_inputs: Vec<Vec<usize>> = (0..nlocals).map(|_| Vec::new()).collect();
     let mut block_defs: Vec<HashSet<usize>> = (0..nblocks).map(|_| HashSet::new()).collect();
     let mut block_uses: Vec<HashSet<usize>> = (0..nblocks).map(|_| HashSet::new()).collect();
     // (dst, base) pairs of field/element loads, for escapee tracking.
     let mut loads: Vec<(usize, usize)> = Vec::new();
 
     for (bi, block) in func.blocks.iter().enumerate() {
-        for (si, stmt) in block.stmts.iter().enumerate() {
-            let transfer_src = transfer_sites.get(&(bi, si)).map(|(_, src)| *src);
+        for stmt in &block.stmts {
             for (u, kind) in stmt_uses(stmt) {
                 block_uses[bi].insert(u);
-                if kind == UseKind::Copy && transfer_src != Some(u) {
+                if kind == UseKind::Copy {
                     no_copy_use[u] = false;
                 }
             }
@@ -2601,16 +2600,18 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
                 has_def[d] = true;
                 block_defs[bi].insert(d);
 
-                let self_read = rvalue_uses(op).iter().any(|(u, _)| *u == d);
-                if self_read {
-                    defs_owning[d] = false;
-                } else if rvalue_is_owning(op) {
-                    // Fresh allocation / non-aliasing value: owns directly.
-                } else if let Some(&(transfer_dst, src)) = transfer_sites.get(&(bi, si)) {
-                    debug_assert_eq!(transfer_dst, d);
-                    transfer_inputs[d].push(src);
-                } else {
-                    defs_owning[d] = false;
+                match op {
+                    mir::RValue::MoveOut(src) if src.0 as usize != d => {
+                        let s = src.0 as usize;
+                        transfer_sources[d].push(s);
+                        transfer_edges.push((d, s));
+                    }
+                    _ if rvalue_is_owning(op) && !rvalue_uses(op).iter().any(|(u, _)| *u == d) => {}
+                    _ => {
+                        // Ordinary Load/call/field access/etc. does not prove
+                        // a unique counted owner for the destination.
+                        defs_supported[d] = false;
+                    }
                 }
 
                 match op {
@@ -2629,48 +2630,21 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
         }
     }
 
-    // Ownership can flow through chains of last-use Loads, so solve
-    // candidates to a fixed point. Base owning definitions seed the graph;
-    // transfer-defined locals become candidates only after their source does.
+    // Least fixed point of ownership provenance. Fresh owning definitions
+    // seed the graph; MoveOut destinations become owners only after every
+    // transfer source is itself proven. Starting false deliberately rejects
+    // transfer-only cycles with no fresh root.
     let mut candidate = vec![false; nlocals];
     loop {
         let mut changed = false;
         for i in 0..nlocals {
-            if candidate[i]
-                || !ptr_ty[i]
-                || excluded[i]
-                || !has_def[i]
-                || !defs_owning[i]
-                || !no_copy_use[i]
-                || !transfer_inputs[i].iter().all(|src| candidate[*src])
-            {
+            if candidate[i] {
                 continue;
             }
-            candidate[i] = true;
-            changed = true;
-        }
-        if !changed {
-            break;
-        }
-    }
-
-    // Prune transfer chains that do not end in another ownership candidate.
-    // If the destination escapes through an ordinary copy/return/etc., moving
-    // ownership there would add a clear instruction without enabling early
-    // reclamation. In that case the source must also stop being a candidate:
-    // its Load is semantically an ordinary uncounted alias and dropping the
-    // source would free the destination out from under that alias.
-    loop {
-        let mut changed = false;
-        for (_, &(dst, src)) in &transfer_sites {
-            if candidate[src] && !candidate[dst] {
-                candidate[src] = false;
-                changed = true;
-            }
-        }
-        for i in 0..nlocals {
-            if candidate[i] && transfer_inputs[i].iter().any(|src| !candidate[*src]) {
-                candidate[i] = false;
+            let structurally_eligible =
+                ptr_ty[i] && !excluded[i] && has_def[i] && defs_supported[i] && no_copy_use[i];
+            if structurally_eligible && transfer_sources[i].iter().all(|src| candidate[*src]) {
+                candidate[i] = true;
                 changed = true;
             }
         }
@@ -2679,27 +2653,45 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
         }
     }
 
-    // Only transfers whose source and destination both retain the ownership
-    // proof become real move-and-clear operations.
-    for (&site, &(dst, src)) in &transfer_sites {
-        if candidate[src] && candidate[dst] {
-            plan.ownership_transfer.insert(site, func.locals[src].id);
+    // MoveOut changes which local owns an object without changing the object.
+    // Build undirected ownership-lineage components so an uncounted field/
+    // element alias loaded before a transfer still blocks dropping the later
+    // owner (and vice versa).
+    let mut owner_adj: Vec<Vec<usize>> = (0..nlocals).map(|_| Vec::new()).collect();
+    for &(dst, src) in &transfer_edges {
+        if candidate[dst] && candidate[src] {
+            owner_adj[dst].push(src);
+            owner_adj[src].push(dst);
         }
     }
 
-    // Escapees: locals defined by field/element loads from a candidate or
-    // another escapee (transitively).
+    // Escapees: locals defined by field/element loads from any owner in the
+    // same MoveOut lineage, followed transitively through further loads.
     let mut escapees: Vec<Vec<usize>> = (0..nlocals).map(|_| Vec::new()).collect();
     for c in 0..nlocals {
         if !candidate[c] {
             continue;
         }
+
+        let mut owners = HashSet::new();
+        let mut owner_frontier = vec![c];
+        while let Some(x) = owner_frontier.pop() {
+            if !owners.insert(x) {
+                continue;
+            }
+            for &next in &owner_adj[x] {
+                owner_frontier.push(next);
+            }
+        }
+
         let mut seen = HashSet::new();
-        let mut frontier = vec![c];
+        let mut frontier: Vec<usize> = owners.iter().copied().collect();
         while let Some(x) = frontier.pop() {
             for &(dst, base) in &loads {
                 if base == x && ptr_ty[dst] && seen.insert(dst) {
-                    escapees[c].push(dst);
+                    if !owners.contains(&dst) {
+                        escapees[c].push(dst);
+                    }
                     frontier.push(dst);
                 }
             }
@@ -2746,18 +2738,15 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
         }
         for (si, stmt) in block.stmts.iter().enumerate().rev() {
             let uses = stmt_uses(stmt);
-            let transfer_src = plan
-                .ownership_transfer
-                .get(&(bi, si))
-                .map(|id| id.0 as usize);
-            // Last-use drops for candidates this statement reads. A proven
-            // ownership-transfer source is cleared without an RC decrement
-            // after the copy, so it must not receive the ordinary Drop here.
-            for (u, _) in &uses {
-                if transfer_src == Some(*u) {
-                    continue;
-                }
-                if candidate[*u] && !live.contains(u) && esc_clear(*u, &live) {
+            // Last-use drops for candidates this statement reads. Transfer is
+            // different: MoveOut invalidates the source without releasing it,
+            // and the counted ownership continues in the destination.
+            for (u, kind) in &uses {
+                if *kind != UseKind::Transfer
+                    && candidate[*u]
+                    && !live.contains(u)
+                    && esc_clear(*u, &live)
+                {
                     plan.after_stmt
                         .entry((bi, si))
                         .or_default()
