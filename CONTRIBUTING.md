@@ -78,9 +78,12 @@ Every contributor, including maintainers and dependency bots, follows the
 - Do not bypass check failures by weakening tests, disabling audits, or
   silently changing policy. Disclose and justify any requested exception.
 
-Sensitive paths request review via `.github/CODEOWNERS`. Enforce review,
-up-to-date CI, and non-bypassable merge requirements in the GitHub ruleset;
-repository files alone cannot enforce server-side branch protection.
+Independent review is required for critical code, but do **not** add a sole
+maintainer to `.github/CODEOWNERS` while GitHub's active ruleset requires
+code-owner review. That would block the maintainer's own PRs, or encourage
+bypass. Add CODEOWNERS only after onboarding a second trusted reviewer.
+Enforce up-to-date CI and reviewed merges in the GitHub ruleset; repository
+files alone cannot enforce server-side branch protection.
 
 ## Questions?
 
