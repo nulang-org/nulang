@@ -93,18 +93,14 @@ impl LlmClient for OpenAiClient {
             .unwrap_or_default()
             .into_iter()
             .map(|tc| {
-                let arguments = match tc.function.arguments {
-                    serde_json::Value::Object(map) => map,
-                    serde_json::Value::String(s) => serde_json::from_str(&s).unwrap_or_default(),
-                    _ => serde_json::Map::new(),
-                };
-                ToolCall {
+                let arguments = crate::response::parse_tool_arguments(tc.function.arguments)?;
+                Ok(ToolCall {
                     id: tc.id,
                     name: tc.function.name,
                     arguments,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<_, LlmError>>()?;
 
         let usage = response.usage.unwrap_or_default();
 
@@ -363,11 +359,7 @@ mod tests {
     #[test]
     fn test_argument_string_parsing_roundtrip() {
         let raw = json!("{\"location\":\"NYC\"}");
-        let arguments = match raw {
-            serde_json::Value::Object(map) => map,
-            serde_json::Value::String(s) => serde_json::from_str(&s).unwrap_or_default(),
-            _ => serde_json::Map::new(),
-        };
+        let arguments = crate::response::parse_tool_arguments(raw).unwrap();
         assert_eq!(arguments.get("location").unwrap(), "NYC");
     }
 }
