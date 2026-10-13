@@ -47,7 +47,7 @@ if (isHome) {
     author: org,
     keywords:
       'programming language, actor model, algebraic effects, distributed systems, Rust, WASM, JIT, type inference, reference capabilities, BEAM, OTP',
-    operatingSystem: 'Linux, macOS',
+    operatingSystem: 'Linux, macOS, Windows',
   });
 } else if (!is404) {
   const article: any = {
@@ -61,7 +61,7 @@ if (isHome) {
     isPartOf: { '@type': 'WebSite', name: 'Nulang', url: site },
   };
   if (lastUpdated instanceof Date) {
-    article.datePublished = lastUpdated.toISOString();
+    // A git edit timestamp is not the original publication date.
     article.dateModified = lastUpdated.toISOString();
   }
   graph.push(article);

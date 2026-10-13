@@ -1,6 +1,6 @@
 ---
 title: Distribution & Clustering
-description: Location-transparent actors across networked nodes with gossip membership and CRDT state replication.
+description: Experimental multi-node actor transport, gossip membership, and CRDT runtime primitives.
 ---
 import CopyMarkdown from '../../../components/CopyMarkdown.astro';
 
@@ -8,7 +8,7 @@ import CopyMarkdown from '../../../components/CopyMarkdown.astro';
 
 <CopyMarkdown />
 
-Nulang actors are location-transparent: you `send` to an actor without knowing (or caring) which node it lives on. The runtime resolves actor addresses — local or remote — transparently.
+Nulang has an **experimental** location-transparent actor-addressing layer. Code can address local or remote actors through an abstraction, but transparent distribution, durable remote delivery, automatic placement, and failover must not be assumed production-ready.
 
 ```nulang
 actor Counter {
@@ -59,8 +59,8 @@ Remote spawn is accessed via the Rust API: behaviors are registered with `Runtim
 The distribution layer uses a custom TCP protocol:
 
 - **Magic**: `NUL0` (4 bytes)
-- **Handshake**: 8-byte node id exchange
-- **Frames**: Length-prefixed, big-endian encoded
+- **Handshake**: 16 bytes — `NUL0` magic (4), wire version (4), node ID (8)
+- **Frames**: 4-byte length prefix followed by the NUL0/type/sequence envelope and a packet-specific payload
 - **Packet types**: `ActorMessage`, `Heartbeat`, `Ack`, `SpawnRequest`, `SpawnResponse`, `CrdtSync`, `CrdtDeltaSync`, `Gossip`
 
 String values travel **by content** — the sender populates a string table and the receiver interns strings into its module pool. Heap pointers, closures, actor refs, and nil are rejected at send time.
@@ -97,7 +97,7 @@ Each op is rejected (returns `nil`) when the field's CRDT type doesn't match, an
 
 ## Persistence
 
-Actors can be persisted for durability:
+The runtime offers persistence backends for actors that opt into durability. Cross-node state replication and recovery should be treated as separate capabilities, not guaranteed by the existence of a store:
 
 | Store | Description |
 |-------|-------------|
@@ -105,13 +105,13 @@ Actors can be persisted for durability:
 | `JsonFileStore` | JSON file on disk |
 | `SqliteStore` | SQLite database (via rusqlite) |
 
-Persistent actors support journaling and checkpointing for crash recovery.
+Persistent actors have journaling and checkpointing mechanisms. Verify end-to-end recovery behavior for your target CLI/runtime path and storage backend; the presence of the mechanisms does not guarantee that every supervised restart or node failure restores state.
 
 ```nulang
 // State durability is configured at the runtime level
 // (Local, Durable, EventSourced, Crdt — see PersistenceStore)
-actor DurableWorker {
-    state tasks: [String] = []
+persistent actor DurableWorker {
+    state durable tasks: [String] = []
 
     behavior add_task(task: String) {
         self.tasks = self.tasks + [task]

@@ -51,7 +51,7 @@ import ResourceRail from '../../components/ResourceRail.astro';
     <div class="durable-row">
       <div class="benefit-text">
         <h2>Persistence without bolting on an ORM</h2>
-        <p>Ordinary actors are in-memory. Mark an actor <code>persistent</code> and declare durable or event-sourced state to opt into checkpointing and journaling. The CLI can reopen a durable store and hydrate persistent actors across process restarts. Nulang is still alpha, so validate recovery semantics for your workload before production use.</p>
+        <p>Ordinary actors are in-memory. Use <code>persistent actor</code> with durable or event-sourced state, or an <code>entity</code> declaration, to opt into persistence semantics. Store reopening and runtime recovery support exist, but supervision recovery, process restarts, migration, and external effects have distinct guarantees. Nulang is alpha: reproduce the failure-and-recovery sequence with your selected binary and store before trusting it with important data.</p>
         <ul class="durable-checklist">
           <li>
             <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
@@ -63,7 +63,7 @@ import ResourceRail from '../../components/ResourceRail.astro';
           </li>
           <li>
             <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-            Recovery and supervisor hydration are covered by runtime tests
+            Persistence and recovery mechanisms have runtime tests; verify end-to-end CLI recovery for your workload
           </li>
           <li>
             <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>

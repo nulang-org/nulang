@@ -1,6 +1,6 @@
 ---
 title: Actor Model
-description: Erlang-style actors with location transparency — spawn, send, receive, and supervise.
+description: Local actor model — spawn, send, receive, monitor, and supervise; experimental cross-node distribution.
 ---
 import CopyMarkdown from '../../../components/CopyMarkdown.astro';
 
@@ -92,7 +92,7 @@ let counter = spawn Counter {}
 send counter tick()
 ```
 
-Messages are always delivered and never dropped. The sender does not block.
+`send` is asynchronous; do not assume end-to-end delivery, processing, or replay guarantees from a successful send. Actors can terminate, queues can fill when capacity is configured, and multi-node delivery is experimental. Use explicit acknowledgements, retries, idempotency, and persistence where your application requires them.
 
 ## Receiving Messages
 
@@ -169,6 +169,10 @@ perform Actor.exit(2)   // Kill (cannot be trapped)
 Actors are scheduled cooperatively with reduction-bounded fairness. Each actor gets a budget of 1000 message reductions per turn. When exhausted, it yields and requeues at the back of its priority queue.
 
 Priorities: High → Normal (default) → Low. All High-priority actors run before any Normal; Normal before Low.
+
+## Durability and recovery
+
+Ordinary actors are in-memory. `persistent actor` declarations and `entity` state models opt into a persistence layer; the effective guarantees depend on the store, runtime path, and recovery wiring. A supervisor keeping other actors running is **crash containment**, not automatically proof that a failed actor's state was recovered. Validate behavior against process restarts before relying on it for important data.
 
 ## Next
 

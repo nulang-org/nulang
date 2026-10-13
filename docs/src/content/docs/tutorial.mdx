@@ -1,28 +1,20 @@
 ---
 title: Tutorial
-description: A guided tour of Nulang — from installation to distributed actors.
+description: A guided tour of Nulang — from installation to local actors and effects.
 ---
 
-Welcome to Nulang! This tutorial walks you through the language from first principles. By the end, you'll be writing actors, handling effects, and building distributed systems.
+Welcome to Nulang! This tutorial covers language basics, local actors, and effect handlers. Multi-node distribution and durable workflow features are experimental; this tutorial does not establish production readiness.
 
 ## 1. Installation
 
-Install Nulang by building from source:
+Install a checksummed, platform-specific release binary using the [Installation](/getting-started/installation/) guide. Verify its dependencies on your system and confirm the CLI is on your `PATH`. Building from source is an alternative for contributors and unsupported systems.
 
 ```bash
-git clone https://github.com/nulang-org/nulang.git
-cd nulang
-cargo build --release
+nulang --version
+nulang --repl
 ```
 
-Verify your installation:
-
-```bash
-cargo run -- --version
-cargo run -- --repl
-```
-
-For detailed platform-specific instructions, see the [Installation](/getting-started/installation/) page.
+**Browser playground:** the [playground](/playground/) runs a restricted WebAssembly Core subset. The actor examples below require the native runtime. Examples from current documentation may differ from older tagged release behavior; use a compatible release or source build.
 
 ## 2. Hello, World!
 
@@ -35,13 +27,13 @@ perform IO.print("Hello, Nulang!")
 Run it:
 
 ```bash
-cargo run -- --eval 'perform IO.print("Hello, Nulang!")'
+nulang --eval 'perform IO.print("Hello, Nulang!")'
 ```
 
 Or start the REPL and type interactively:
 
 ```bash
-cargo run -- --repl
+nulang --repl
 nulang> perform IO.print("Hello, Nulang!")
 ```
 
@@ -156,7 +148,7 @@ actor Worker {
 }
 ```
 
-See [Distributed Actors](/actors/overview/) for distribution, clustering, and supervision trees.
+See the [Actor Model](/actors/overview/) and [Supervision Trees](/actors/supervision/) for local actors and failure containment; [Distribution & Clustering](/actors/distribution/) is experimental.
 
 ## 6. Algebraic Effects
 
@@ -187,7 +179,8 @@ You've covered the foundations. Here's where to go next:
 
 - **[Language Syntax](/language/syntax/)** — deep dive into expressions, declarations, and modules
 - **[Type System](/language/types/)** — reference capabilities, row polymorphism, and effect rows
-- **[Distributed Actors](/actors/overview/)** — clustering, location transparency, and CRDTs
+- **[Actor Model](/actors/overview/)** — local actor syntax and messaging
+- **[Distribution & Clustering](/actors/distribution/)** — experimental transport and CRDTs
 - **[AI Agents](/ai/overview/)** — LLM integration, pipelines, debates, and supervisor teams
 - **[Durable Workflows](/workflows/overview/)** — signals, timers, queries, and saga transactions
 
