@@ -7291,6 +7291,28 @@ impl Runtime {
                 .saturating_add(actor.iso_arena.allocation_snapshot().epoch_allocations as u64);
         }
 
+        // OrcaGc already counts reference operations. Export only the
+        // currently active GC instances, including the top-level main GC.
+        // These totals can decrease when an actor exits or is recycled.
+        let mut orca_traffic = OrcaTrafficMetric::default();
+        for gc in std::iter::once(&self.main_gc)
+            .chain(self.actors.values().map(|actor| &actor.orca_gc))
+        {
+            let stats = gc.stats();
+            orca_traffic.local_refs_created = orca_traffic
+                .local_refs_created
+                .saturating_add(stats.local_refs_created);
+            orca_traffic.local_refs_dropped = orca_traffic
+                .local_refs_dropped
+                .saturating_add(stats.local_refs_dropped);
+            orca_traffic.foreign_refs_sent = orca_traffic
+                .foreign_refs_sent
+                .saturating_add(stats.foreign_refs_sent);
+            orca_traffic.foreign_refs_received = orca_traffic
+                .foreign_refs_received
+                .saturating_add(stats.foreign_refs_received);
+        }
+
         MetricsSnapshot {
             actors_live: self.actor_count() as u64,
             actors_mailboxes: mailboxes,
@@ -7301,6 +7323,7 @@ impl Runtime {
             supervisors,
             crdt,
             allocator,
+            orca_traffic,
         }
     }
 
@@ -7711,6 +7734,21 @@ pub struct MetricsSnapshot {
     pub crdt: CrdtMetric,
     /// Non-monotonic live-allocator gauges. Not whole-process totals.
     pub allocator: AllocatorMetric,
+    /// Active-GC ORCA reference traffic. Can decrease across actor lifecycle.
+    pub orca_traffic: OrcaTrafficMetric,
+}
+
+/// Already-recorded OrcaGc reference operations summed across active GCs.
+///
+/// Includes the main GC and currently active actors. Excludes pooled and
+/// exited actors, and operations bypassing OrcaGc. Not monotonic across
+/// actor churn/reset and not a whole-process lifetime reference count.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct OrcaTrafficMetric {
+    pub local_refs_created: u64,
+    pub local_refs_dropped: u64,
+    pub foreign_refs_sent: u64,
+    pub foreign_refs_received: u64,
 }
 
 /// Instantaneous totals from active heaps and activation-local arenas.
