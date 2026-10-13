@@ -1290,9 +1290,7 @@ impl Runtime {
         from: NodeId,
     ) -> io::Result<()> {
         let policy = self.consumer_progress_validate_leader(&receipt.stream)?;
-        self.fabric_consumer_progress_record_replica_receipt_with_policy(
-            receipt, from, policy,
-        )
+        self.fabric_consumer_progress_record_replica_receipt_with_policy(receipt, from, policy)
     }
 
     /// Network-specific path: the caller supplies the current membership
@@ -1303,12 +1301,9 @@ impl Runtime {
         from: NodeId,
         cluster: &ClusterState,
     ) -> io::Result<()> {
-        let policy = self.consumer_progress_validate_leader_from_cluster(
-            &receipt.stream, cluster,
-        )?;
-        self.fabric_consumer_progress_record_replica_receipt_with_policy(
-            receipt, from, policy,
-        )
+        let policy =
+            self.consumer_progress_validate_leader_from_cluster(&receipt.stream, cluster)?;
+        self.fabric_consumer_progress_record_replica_receipt_with_policy(receipt, from, policy)
     }
 
     fn fabric_consumer_progress_record_replica_receipt_with_policy(
@@ -1524,9 +1519,7 @@ impl Runtime {
         from: NodeId,
     ) -> io::Result<()> {
         let policy = self.consumer_progress_validate_leader(&receipt.stream)?;
-        self.fabric_consumer_progress_record_commit_receipt_with_policy(
-            receipt, from, policy,
-        )
+        self.fabric_consumer_progress_record_commit_receipt_with_policy(receipt, from, policy)
     }
 
     pub(crate) fn fabric_consumer_progress_record_commit_receipt_from_cluster(
@@ -1535,12 +1528,9 @@ impl Runtime {
         from: NodeId,
         cluster: &ClusterState,
     ) -> io::Result<()> {
-        let policy = self.consumer_progress_validate_leader_from_cluster(
-            &receipt.stream, cluster,
-        )?;
-        self.fabric_consumer_progress_record_commit_receipt_with_policy(
-            receipt, from, policy,
-        )
+        let policy =
+            self.consumer_progress_validate_leader_from_cluster(&receipt.stream, cluster)?;
+        self.fabric_consumer_progress_record_commit_receipt_with_policy(receipt, from, policy)
     }
 
     fn fabric_consumer_progress_record_commit_receipt_with_policy(
