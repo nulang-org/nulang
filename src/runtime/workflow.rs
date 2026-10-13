@@ -14,6 +14,9 @@ pub(crate) use workflow_impl::{
     register_workflow_query, schedule_workflow_timer, signal_workflow, try_checkpoint_actor,
 };
 
+#[cfg(feature = "native-codegen")]
+pub(crate) use workflow_impl::finish_jit_resumed_workflow_step;
+
 #[allow(dead_code)]
 pub(crate) fn vm_value_to_string_in_actor(
     value: &crate::vm::Value,
