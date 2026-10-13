@@ -821,7 +821,7 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
             let mut rt = self.runtime.borrow_mut();
             return rt.query_workflow(workflow_id, &query_name);
         }
-        #[cfg(feature = "sqlite")]
+        #[cfg(any(feature = "sqlite", feature = "postgres"))]
         if effect_name == "DB" && op_name == Some("query") {
             let sql = match regs.first().and_then(|v| v.as_string_id()) {
                 Some(id) => match constants.get(id as usize) {
@@ -1646,7 +1646,7 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
                 };
                 return (*self.runtime).query_workflow(workflow_id, &query_name);
             }
-            #[cfg(feature = "sqlite")]
+            #[cfg(any(feature = "sqlite", feature = "postgres"))]
             if effect_name == "DB" && op_name == Some("query") {
                 let sql = match regs.first().and_then(|v| v.as_string_id()) {
                     Some(id) => match constants.get(id as usize) {
