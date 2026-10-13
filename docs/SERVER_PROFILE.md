@@ -50,10 +50,35 @@ compile/runtime profile can opt into those capabilities when needed.
   permission/capability enforcement, TLS termination, secrets, health checks
   and deployment supervision.
 
+## HTTP service template (stacked preview)
+
+The new `service` package template provides an HTTP homepage and a liveness
+endpoint through the existing routed-web development server:
+
+```bash
+nulang nula new my-service --template service
+cd my-service
+nulang nula dev
+# In a second shell:
+curl --fail http://127.0.0.1:8787/health
+```
+
+This template is currently **stateless**. The web development server's
+`Web.kv_*` effects are **not** SQLite-backed and do not persist across
+restarts; the `server` Cargo feature simply makes the separate SQLite
+persistence adapter available in the binary. Do not expose `nula dev` as a
+production-ready public server.
+
+CI's `scripts/test_service_template.py` will scaffold the template, run it
+on a localhost-only ephemeral port, and check both HTTP routes using the
+release CLI. The test is not a substitute for independent production security
+or durability tests.
+
 ## Next integration slice
 
-Once the release gates above are green, provide a **single-host service
-template** using existing HTTP and SQLite APIs, followed by a crash-tested
-SQLite job dispatcher built on the canonical atomic durable-transition
-coordinator. Do not create a second workflow engine or promise implicit
-exactly-once execution of arbitrary external effects.
+Design an explicit **runtime-owned request-to-persistence boundary** with
+structured errors and tenant/capability enforcement before connecting web
+operations to SQLite. The later durable-job dispatcher must reuse the canonical
+atomic durable-transition coordinator and pass crash/restart testing. Do not
+create a second workflow engine or promise exactly-once execution of arbitrary
+external effects.
