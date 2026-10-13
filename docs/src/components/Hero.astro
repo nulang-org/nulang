@@ -1,13 +1,11 @@
 ---
+import { homepageExamples } from '../lib/homepage-examples.mjs';
 const { entry } = Astro.locals.starlightRoute;
 const { data } = entry;
 const { title = data.title, tagline, actions = [] } = data.hero || {};
 const PAGE_TITLE_ID = '_top';
 
-const starter = `let double = fn(x) { x * 2 }
-
-let answer = double(21)
-perform IO.print("double(21) = " + perform Int.to_string(answer))`;
+const starter = homepageExamples[0].code;
 ---
 
 <div class="hero hero-cloud">
@@ -82,6 +80,13 @@ perform IO.print("double(21) = " + perform Int.to_string(answer))`;
 			</span>
 		</div>
 
+		<div class="hero-example-picker" role="group" aria-label="Choose a runnable Nulang Core example">
+			{homepageExamples.map((example, index) => (
+				<button type="button" class="hero-example" data-hero-example data-hero-example-code={example.code} aria-pressed={index === 0}>
+					{example.label}
+				</button>
+			))}
+		</div>
 		<label class="sr-only" for="hero-source">Nulang source code</label>
 		<textarea id="hero-source" class="hero-source" spellcheck="false">{starter}</textarea>
 
@@ -93,6 +98,7 @@ perform IO.print("double(21) = " + perform Int.to_string(answer))`;
 			<span class="hero-runtime-note">Ctrl / ⌘ + Enter</span>
 		</div>
 
+		<p class="hero-core-note">Runs Nulang Core in the browser. <a href="/getting-started/installation/">Actors and durable state require the native runtime.</a></p>
 		<div class="output-shell">
 			<span class="output-label">output</span>
 			<pre class="hero-output" aria-live="polite">Compiler loads on first run.</pre>
@@ -210,6 +216,19 @@ perform IO.print("double(21) = " + perform Int.to_string(answer))`;
 				wasm.nulang_free(ptr, encoded.length);
 			}
 		}
+
+		root.querySelectorAll('[data-hero-example]').forEach((button) => {
+			button.addEventListener('click', () => {
+				const code = button.getAttribute('data-hero-example-code');
+				if (code === null) return;
+				source.value = code;
+				root.querySelectorAll('[data-hero-example]').forEach((option) => {
+					option.setAttribute('aria-pressed', String(option === button));
+				});
+				output.classList.remove('is-error');
+				output.textContent = 'Example loaded. Run program to see the output.';
+			});
+		});
 
 		run.addEventListener('click', execute);
 		source.addEventListener('keydown', (event) => {
@@ -454,6 +473,50 @@ perform IO.print("double(21) = " + perform Int.to_string(answer))`;
 		box-shadow: 0 0 0 3px rgba(74, 222, 128, 0.1);
 	}
 
+	.hero-example-picker {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.4rem;
+		padding: 0.6rem 0.85rem;
+		background: #0e141d;
+		border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+	}
+
+	.hero-example {
+		min-height: 2.75rem;
+		padding: 0.45rem 0.75rem;
+		border: 1px solid #475569;
+		border-radius: 0.45rem;
+		background: transparent;
+		color: #cbd5e1;
+		font: inherit;
+		font-size: 0.78rem;
+		cursor: pointer;
+	}
+
+	.hero-example[aria-pressed="true"] {
+		border-color: #60a5fa;
+		background: #1e3a5f;
+		color: #fff;
+	}
+
+	.hero-example:hover { border-color: #93c5fd; }
+	.hero-example:focus-visible, .hero-run:focus-visible {
+		outline: 2px solid #93c5fd;
+		outline-offset: 2px;
+	}
+
+	.hero-core-note {
+		margin: 0;
+		padding: 0.6rem 0.9rem;
+		background: #0e141d;
+		color: #cbd5e1;
+		font-size: 0.75rem;
+		line-height: 1.5;
+	}
+
+	.hero-core-note a { color: #bfdbfe; text-underline-offset: 2px; }
+
 	.hero-source,
 	.hero-output {
 		width: 100%;
@@ -492,8 +555,8 @@ perform IO.print("double(21) = " + perform Int.to_string(answer))`;
 		display: inline-flex;
 		align-items: center;
 		gap: 0.5rem;
-		min-height: 2.25rem;
-		padding: 0.42rem 0.75rem;
+		min-height: 2.75rem;
+		padding: 0.5rem 0.85rem;
 		border: 1px solid #2563eb;
 		border-radius: 0.48rem;
 		background: #2563eb;
@@ -531,9 +594,9 @@ perform IO.print("double(21) = " + perform Int.to_string(answer))`;
 		top: 0.55rem;
 		right: 0.8rem;
 		z-index: 1;
-		color: #475569;
+		color: #94a3b8;
 		font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-		font-size: 0.56rem;
+		font-size: 0.75rem;
 		font-weight: 750;
 		letter-spacing: 0.08em;
 		text-transform: uppercase;
