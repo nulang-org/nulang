@@ -188,7 +188,7 @@ fn apply_candidates(
             continue;
         }
 
-        if c.callee.has_handlers || c.callee.is_recursive || c.callee.blocks.len() != 1 {
+        if c.callee.has_handlers || c.callee.is_recursive || !callee_is_small_and_pure(c) {
             continue;
         }
 
@@ -274,6 +274,95 @@ fn apply_candidates(
 // Eligibility analysis
 // ---------------------------------------------------------------------------
 
+/// Keep the inlining budget small until call-site specialization and code-size
+/// accounting are available. Large functions and repeated call sites retain
+/// their normal compiled function call.
+const MAX_INLINE_BODY_STMTS: usize = 12;
+const MAX_INLINE_BODY_LOCALS: usize = 24;
+const MAX_INLINE_CALL_SITES: usize = 4;
+
+/// This pass runs before the normal MIR optimizer. Only a small, single-block,
+/// side-effect-free subset is eligible: effect sites carry replay and source
+/// identities which cannot safely be copied into the caller by this pass.
+/// Parameter/capture assignments must also be rejected because the inliner
+/// currently maps those locals directly to the caller's live registers.
+fn callee_is_small_and_pure(candidate: &Candidate) -> bool {
+    let callee = &candidate.callee;
+    if callee.blocks.len() != 1
+        || callee.blocks[0].stmts.len() > MAX_INLINE_BODY_STMTS
+        || callee.locals.len() > MAX_INLINE_BODY_LOCALS
+        || candidate.call_sites.len() > MAX_INLINE_CALL_SITES
+        || callee.captures.len() != candidate.captures.len()
+        || !matches!(callee.blocks[0].terminator, Terminator::Return(Some(_)))
+        || candidate
+            .call_sites
+            .iter()
+            .any(|site| site.args.len() != callee.params.len())
+    {
+        return false;
+    }
+    callee.blocks[0].stmts.iter().all(|stmt| match stmt {
+        Stmt::Assign { dst, op } => {
+            !callee.params.contains(dst)
+                && !callee.captures.contains(dst)
+                && matches!(
+                    op,
+                    RValue::Const(_)
+                        | RValue::Load(_)
+                        | RValue::Unary(..)
+                        | RValue::Binary(..)
+                        | RValue::StringEq(..)
+                )
+        }
+        _ => false,
+    })
+}
+
+/// Require a single definition that dominates *every* call and an unchanged
+/// capture snapshot. A broader dataflow proof can replace this conservative
+/// same-basic-block restriction in a future optimization.
+fn call_sites_have_stable_definition(
+    caller: &Function,
+    closure: LocalId,
+    definition_block: usize,
+    definition_stmt: usize,
+    captures: &[LocalId],
+    calls: &[CallSite],
+) -> bool {
+    if calls.is_empty()
+        || calls.len() > MAX_INLINE_CALL_SITES
+        || caller.params.contains(&closure)
+        || caller.captures.contains(&closure)
+    {
+        return false;
+    }
+    let definitions = caller
+        .blocks
+        .iter()
+        .flat_map(|block| block.stmts.iter())
+        .filter(|stmt| matches!(stmt, Stmt::Assign { dst, .. } if *dst == closure))
+        .count();
+    if definitions != 1 {
+        return false;
+    }
+    let Some(block) = caller.blocks.get(definition_block) else {
+        return false;
+    };
+    let mut last_call = definition_stmt;
+    for call in calls {
+        if call.block != block.id || call.stmt_idx <= definition_stmt || call.dst == closure {
+            return false;
+        }
+        last_call = last_call.max(call.stmt_idx);
+    }
+    // Captures are values taken at closure construction, not live reads of the
+    // caller's variables. Until we snapshot them explicitly, any later write
+    // invalidates inlining.
+    !block.stmts[definition_stmt + 1..=last_call]
+        .iter()
+        .any(|stmt| matches!(stmt, Stmt::Assign { dst, .. } if captures.contains(dst)))
+}
+
 /// A discovered call site for an eligible closure.
 struct CallSite {
     block: BlockId,
@@ -298,8 +387,8 @@ fn find_eligible_closures(
     };
     let mut result = Vec::new();
 
-    for (_block_idx, block) in caller.blocks.iter().enumerate() {
-        for (_si, stmt) in block.stmts.iter().enumerate() {
+    for (block_idx, block) in caller.blocks.iter().enumerate() {
+        for (stmt_idx, stmt) in block.stmts.iter().enumerate() {
             let (clos_local, callee_idx, captures) = match stmt {
                 Stmt::Assign {
                     dst,
@@ -309,7 +398,16 @@ fn find_eligible_closures(
             };
 
             let mut calls = Vec::new();
-            if !all_uses_are_calls(caller, clos_local, &mut calls) {
+            if !all_uses_are_calls(caller, clos_local, &mut calls)
+                || !call_sites_have_stable_definition(
+                    caller,
+                    clos_local,
+                    block_idx,
+                    stmt_idx,
+                    &captures,
+                    &calls,
+                )
+            {
                 continue;
             }
 
