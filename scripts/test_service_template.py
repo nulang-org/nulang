@@ -71,7 +71,59 @@ def main() -> int:
                     homepage = response.read().decode("utf-8")
                     assert response.status == 200
                     assert "Nulang Service" in homepage, homepage
-                print("service template smoke: GET /health + GET / OK")
+                # The service template explicitly opts into SQLite state.
+                write_request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/state",
+                    data=b"value=committed-after-restart",
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(write_request, timeout=3) as response:
+                    assert response.status == 200
+                    assert "saved" in response.read().decode("utf-8")
+
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/state", timeout=3
+                ) as response:
+                    assert response.status == 200
+                    assert "committed-after-restart" in response.read().decode("utf-8")
+
+                db_file = package / "data" / "web-state.sqlite"
+                assert db_file.is_file(), "opt-in SQLite backend must create a real database file"
+
+                # Hard-kill the process AFTER a successful HTTP acknowledgement.
+                # Restart from the same database to prove that the web request
+                # path does not silently use the in-memory demo KV backend.
+                server.kill()
+                server.wait(timeout=5)
+                server = subprocess.Popen(
+                    [str(binary), "nula", "dev", "--port", str(port)],
+                    cwd=package,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                )
+
+                deadline = time.monotonic() + 30
+                while time.monotonic() < deadline:
+                    if server.poll() is not None:
+                        raise RuntimeError(f"restarted server exited with {server.returncode}")
+                    try:
+                        with urllib.request.urlopen(
+                            f"http://127.0.0.1:{port}/state", timeout=1
+                        ) as response:
+                            body = response.read().decode("utf-8")
+                            assert response.status == 200
+                            assert "committed-after-restart" in body, (
+                                f"acknowledged web write lost after restart: {body!r}"
+                            )
+                        break
+                    except (OSError, urllib.error.URLError):
+                        time.sleep(0.2)
+                else:
+                    raise RuntimeError("restart did not serve persisted web state")
+
+                print("service template smoke: HTTP routes + acknowledged SQLite write survives SIGKILL")
                 return 0
             except Exception:
                 log.flush()
