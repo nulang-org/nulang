@@ -110,6 +110,37 @@ by `render_warning`/`format_warning` (src/diagnostic.rs) with a
 
 See `docs/MIGRATION_RFC_0015.md` for the `catch`/`fail` migration guide.
 
+## Editor quick fixes and safety
+
+LSP diagnostic ranges are UTF-16 positions even though internal compiler spans
+use UTF-8 byte offsets. The LSP converts using the current source map so
+quick fixes continue to target the correct identifier after non-ASCII text.
+
+
+
+The LSP carries stable diagnostic codes (the same `Exxxx` codes as the
+terminal). For **E0202 unbound variables**, if the compiler supplies
+`similar_names` for identifiers already in scope, the editor may offer
+`Replace '<misspelling>' with '<candidate>'` quick fixes.
+
+A replacement is offered only when the diagnostic is current, the requested
+range intersects it, and the source still matches the exact misspelled
+identifier. Multiple candidates are choices, not automatic edits. The
+server never fabricates fixes for reference-capability or effect violations.
+
+Function hover now distinguishes explicitly declared effect annotations
+from the **inferred checked effect row**, when a fresh compiler result is
+available. Effect and reference-capability inlay tooltips explain the
+difference between requested operations, aliasing/transfer constraints,
+and external authority. A pending diagnostics pass suppresses cached
+inferred effect rows; these explanations never grant authority or alter
+the inferred types.
+
+Reference-capability diagnostics also display their structured
+`explanation` when available, without changing capability inference or
+permissions. Quick fixes require explicit editor selection: compilation and
+LSP publication do not silently rewrite source.
+
 ## Output modes
 
 - **tty**: ariadne report — `[Exxxx] Error: msg` header, `╭─[file:line:col]`

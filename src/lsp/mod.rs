@@ -431,6 +431,12 @@ impl LanguageServer for NulangLanguageServer {
         };
         let source = doc.source.clone();
         let type_map = doc.type_map.clone();
+        // An in-progress diagnostic update invalidates inferred rows.
+        let function_rows = if doc.diagnostics_pending {
+            None
+        } else {
+            doc.function_rows.clone()
+        };
         drop(docs);
 
         // Check type_map first for inferred/explicit types
@@ -453,10 +459,12 @@ impl LanguageServer for NulangLanguageServer {
             }
         }
 
-        Ok(Self::hover_at(
-            &source,
-            params.text_document_position_params.position,
-        ))
+        let position = params.text_document_position_params.position;
+        Ok(if let Some(ref rows) = function_rows {
+            Self::hover_at_with_rows(&source, position, Some(rows))
+        } else {
+            Self::hover_at(&source, position)
+        })
     }
 
     async fn goto_definition(
@@ -651,8 +659,12 @@ impl LanguageServer for NulangLanguageServer {
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
         let uri = params.text_document.uri.clone();
         let docs = self.documents.lock().unwrap();
-        let source = match docs.get(&uri) {
-            Some(doc) => doc.source.clone(),
+        let (source, diagnostics, diagnostics_pending) = match docs.get(&uri) {
+            Some(doc) => (
+                doc.source.clone(),
+                doc.diagnostics.clone(),
+                doc.diagnostics_pending,
+            ),
             None => return Ok(None),
         };
         drop(docs);
@@ -662,7 +674,16 @@ impl LanguageServer for NulangLanguageServer {
             .ok()
             .and_then(|p| p.parent().map(|p| p.to_path_buf()));
         let import_index = self.import_index(doc_dir.as_deref());
-        Ok(Self::code_actions(&source, range, &uri, &import_index))
+        let mut actions = Self::code_actions(&source, range, &uri, &import_index)
+            .unwrap_or_default();
+        // Only act on compiler diagnostics for this exact document version.
+        // A pending debounced pass means earlier diagnostics are stale.
+        if !diagnostics_pending {
+            actions.extend(Self::typo_quickfix_actions(
+                &source, &params.range, &uri, &diagnostics,
+            ));
+        }
+        Ok(if actions.is_empty() { None } else { Some(actions) })
     }
 
     async fn folding_range(&self, params: FoldingRangeParams) -> Result<Option<Vec<FoldingRange>>> {
@@ -770,6 +791,17 @@ impl NulangLanguageServer {
     /// first fatal error in a stage is reported. Effect and capability checks
     /// also report accumulated warnings from their internal diagnostic lists.
     fn hover_at(source: &str, position: Position) -> Option<Hover> {
+        Self::hover_at_with_rows(source, position, None)
+    }
+
+    /// Render the function's checked effect row when one is already cached.
+    /// The effect checker owns this information; we do not infer semantics
+    /// from text or grant any new external authority.
+    fn hover_at_with_rows(
+        source: &str,
+        position: Position,
+        function_rows: Option<&FxHashMap<String, crate::types::EffectRow>>,
+    ) -> Option<Hover> {
         let line = position.line as usize;
         let col = position.character as usize;
         let target_line = source.lines().nth(line)?;
@@ -807,10 +839,25 @@ impl NulangLanguageServer {
                         .map(|ty| format!("{:?}", ty))
                         .unwrap_or_else(|| "?".into());
                     let mut hover_text = format!("fn {}({}) -> {}", name, p, r);
-                    // Append effects if present
+                    // Distinguish the declared contract from the checked
+                    // inferred effect row. The latter is informational and
+                    // does not authorize filesystem or network access.
                     if let Some(ref eff) = effect {
                         use std::fmt::Write;
                         let _ = write!(hover_text, "\n\neffects: {}", eff);
+                    } else if let Some(row) = function_rows.and_then(|rows| rows.get(name)) {
+                        let nonempty = match row {
+                            crate::types::EffectRow::Closed(effects) => !effects.is_empty(),
+                            crate::types::EffectRow::Open(effects, _) => !effects.is_empty(),
+                        };
+                        if nonempty {
+                            use std::fmt::Write;
+                            let _ = write!(
+                                hover_text,
+                                "\n\neffects (inferred): {}\nEffect rows describe requested operations; they do not grant external authority.",
+                                row
+                            );
+                        }
                     }
                     // Append doc comment if present
                     let decl_line = span.line().saturating_sub(1);
@@ -1629,58 +1676,157 @@ impl NulangLanguageServer {
             }
         }
 
-        // Existing: add type annotations for `let` bindings without explicit types.
+        // Annotation edits are offered only for unambiguous literal types.
+        // The old fallback of `: a` was a guess, not a valid inference, and
+        // its trimmed-line offset could insert an annotation mid-expression.
         for (li, line) in source.lines().enumerate() {
-            let t = line.trim();
-            let ln = li as u32;
-            if let Some(pos) = t.find("let ") {
-                if !t[pos..].contains(':') {
-                    let after = pos + 4;
-                    let rest = &t[after..];
-                    if let Some(end) = rest.find(|c: char| c == ' ' || c == '=') {
-                        let vname = &rest[..end];
-                        let Some(eq) = t.find('=') else { continue };
-                        let rhs = t[eq + 1..].trim();
-                        let ty = if rhs.parse::<i64>().is_ok() {
-                            "Int"
-                        } else if rhs.starts_with('"') {
-                            "String"
-                        } else if rhs == "true" || rhs == "false" {
-                            "Bool"
-                        } else {
-                            "a"
-                        };
-                        let edit = TextEdit {
-                            range: Range {
-                                start: Position::new(ln, (pos + eq) as u32),
-                                end: Position::new(ln, (pos + eq) as u32),
-                            },
-                            new_text: format!(" : {}", ty),
-                        };
-                        let mut changes = std::collections::HashMap::new();
-                        changes.insert(uri.clone(), vec![edit]);
-                        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                            title: format!("Add type annotation ': {}' for '{}'", ty, vname),
-                            kind: Some(CodeActionKind::QUICKFIX),
-                            diagnostics: None,
-                            edit: Some(WorkspaceEdit {
-                                changes: Some(changes),
-                                ..WorkspaceEdit::default()
-                            }),
-                            command: None,
-                            is_preferred: Some(false),
-                            disabled: None,
-                            data: None,
-                        }));
-                    }
-                }
+            let prefix_bytes = line.len() - line.trim_start().len();
+            let trimmed = line.trim_start();
+            let Some(rest) = trimmed.strip_prefix("let ") else {
+                continue;
+            };
+            let name_bytes = rest
+                .find(|ch: char| !ch.is_alphanumeric() && ch != '_')
+                .unwrap_or(rest.len());
+            let name = &rest[..name_bytes];
+            if name.is_empty()
+                || name.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+            {
+                continue;
             }
+            // An existing annotation or an incomplete declaration is not a
+            // candidate. A complex RHS belongs to type inference/inlay hints.
+            let after_name = rest[name_bytes..].trim_start();
+            let Some(rhs) = after_name.strip_prefix('=') else {
+                continue;
+            };
+            let rhs = rhs.trim();
+            let literal_type = if rhs.parse::<i64>().is_ok() {
+                Some("Int")
+            } else if rhs == "true" || rhs == "false" {
+                Some("Bool")
+            } else if rhs.len() >= 2
+                && rhs.starts_with('"')
+                && rhs.ends_with('"')
+                && !rhs[1..rhs.len() - 1].contains('"')
+            {
+                Some("String")
+            } else {
+                None
+            };
+            let Some(ty) = literal_type else {
+                continue;
+            };
+            let insert_byte = prefix_bytes + 4 + name_bytes;
+            let insert_col = line[..insert_byte].encode_utf16().count() as u32;
+            let position = Position::new(li as u32, insert_col);
+            let edit = TextEdit {
+                range: Range::new(position, position),
+                new_text: format!(": {}", ty),
+            };
+            let mut changes = std::collections::HashMap::new();
+            changes.insert(uri.clone(), vec![edit]);
+            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                title: format!("Add type annotation ': {}' for '{}'", ty, name),
+                kind: Some(CodeActionKind::QUICKFIX),
+                diagnostics: None,
+                edit: Some(WorkspaceEdit {
+                    changes: Some(changes),
+                    ..WorkspaceEdit::default()
+                }),
+                command: None,
+                is_preferred: Some(false),
+                disabled: None,
+                data: None,
+            }));
         }
         if actions.is_empty() {
             None
         } else {
             Some(actions)
         }
+    }
+
+    /// Offer a source-verified replacement for a compiler-suggested in-scope
+    /// name. We deliberately do not guess edits for effects or capabilities.
+    /// The source range must still contain precisely the reported identifier.
+    fn typo_quickfix_actions(
+        source: &str,
+        requested: &Range,
+        uri: &Url,
+        diagnostics: &[Diagnostic],
+    ) -> Vec<CodeActionOrCommand> {
+        let mut actions = Vec::new();
+        let requested_start = (requested.start.line, requested.start.character);
+        let requested_end = (requested.end.line, requested.end.character);
+
+        for diagnostic in diagnostics {
+            if diagnostic.severity != Some(DiagnosticSeverity::ERROR)
+                || diagnostic.code
+                    != Some(NumberOrString::String("E0202".to_string()))
+            {
+                continue;
+            }
+            let diag_start = (
+                diagnostic.range.start.line,
+                diagnostic.range.start.character,
+            );
+            let diag_end = (diagnostic.range.end.line, diagnostic.range.end.character);
+            if requested_start > diag_end || requested_end < diag_start {
+                continue;
+            }
+            let Some(misspelled) = diagnostic.message
+                .strip_prefix("Unbound variable: '")
+                .and_then(|message| message.strip_suffix('\''))
+            else {
+                continue;
+            };
+            let (Some(start), Some(end)) = (
+                Self::position_to_byte_offset(source, &diagnostic.range.start),
+                Self::position_to_byte_offset(source, &diagnostic.range.end),
+            ) else {
+                continue;
+            };
+            if start >= end || source.get(start..end) != Some(misspelled) {
+                continue;
+            }
+            let Some(candidates) = diagnostic.data
+                .as_ref()
+                .and_then(|data| data.get("similar_names"))
+                .and_then(|value| value.as_array())
+            else {
+                continue;
+            };
+            let valid: Vec<&str> = candidates
+                .iter()
+                .filter_map(|value| value.as_str())
+                .filter(|name| {
+                    *name != misspelled
+                        && !name.is_empty()
+                        && name.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
+                })
+                .collect();
+            for candidate in valid.iter() {
+                let edit = TextEdit {
+                    range: diagnostic.range,
+                    new_text: (*candidate).to_string(),
+                };
+                let mut changes = std::collections::HashMap::new();
+                changes.insert(uri.clone(), vec![edit]);
+                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title: format!("Replace '{}' with '{}'", misspelled, candidate),
+                    kind: Some(CodeActionKind::QUICKFIX),
+                    diagnostics: Some(vec![diagnostic.clone()]),
+                    edit: Some(WorkspaceEdit {
+                        changes: Some(changes),
+                        ..WorkspaceEdit::default()
+                    }),
+                    is_preferred: Some(valid.len() == 1),
+                    ..CodeAction::default()
+                }));
+            }
+        }
+        actions
     }
 
     /// Offer "Extract to variable" for a selected expression.
@@ -2364,8 +2510,48 @@ fn nu_error_to_diagnostic(err: NuError) -> Vec<Diagnostic> {
     }
 }
 
+/// Convert the SourceMap's 1-based UTF-8 byte column into an LSP UTF-16
+/// column. If source text is absent (synthetic diagnostics), retain the
+/// legacy best-effort column rather than guessing an unrelated source.
+fn lsp_position_from_byte_column(source: Option<&str>, line: usize, col: usize) -> Position {
+    let byte_col = col.saturating_sub(1);
+    let utf16_col = source
+        .and_then(|text| text.split('\n').nth(line.saturating_sub(1)))
+        .map(|line_text| {
+            line_text
+                .char_indices()
+                .take_while(|(byte, _)| *byte < byte_col)
+                .map(|(_, ch)| ch.len_utf16())
+                .sum::<usize>()
+        })
+        .unwrap_or(byte_col);
+    Position::new(line.saturating_sub(1) as u32, utf16_col as u32)
+}
+
 /// Build a single LSP Diagnostic from a non-Multiple NuError.
 fn single_diagnostic(err: NuError) -> Diagnostic {
+    let error_code = err
+        .stable_code()
+        .map(|code| NumberOrString::String(code.to_string()));
+    let capability_help = match &err {
+        NuError::CapError {
+            explanation: Some(explanation),
+            ..
+        } => Some(explanation.clone()),
+        _ => None,
+    };
+    // Preserve the typechecker's exact in-scope suggestions for the editor,
+    // rather than reconstructing them from the rendered error message.
+    let candidates = match &err {
+        NuError::TypeError {
+            msg,
+            similar_names: Some(names),
+            ..
+        } if msg.starts_with("Unbound variable: '") && !names.is_empty() => {
+            Some(names.clone())
+        }
+        _ => None,
+    };
     let (message, start_line, start_col, end_line, end_col) = match err {
         NuError::LexError { msg, span }
         | NuError::ParseError { msg, span, .. }
@@ -2394,25 +2580,31 @@ fn single_diagnostic(err: NuError) -> Diagnostic {
         NuError::Multiple(_) => unreachable!("Multiple handled by caller"),
     };
 
-    let start = Position::new(
-        start_line.saturating_sub(1) as u32,
-        start_col.saturating_sub(1) as u32,
-    );
-    let end = Position::new(
-        end_line.saturating_sub(1) as u32,
-        end_col.saturating_sub(1) as u32,
-    );
+    // Span columns are UTF-8 byte offsets; LSP columns are UTF-16 code
+    // units. Convert against the lexer's current SourceMap instead of
+    // publishing byte-indexed ranges that fail after non-ASCII text.
+    let source = crate::types::current_source_text();
+    let start = lsp_position_from_byte_column(source.as_deref(), start_line, start_col);
+    let end = lsp_position_from_byte_column(source.as_deref(), end_line, end_col);
 
     Diagnostic {
         range: Range::new(start, end),
         severity: Some(DiagnosticSeverity::ERROR),
-        code: None,
+        code: error_code,
         code_description: None,
         source: Some("nulang".to_string()),
-        message,
+        message: if let Some(help) = capability_help {
+            if message.contains(&help) {
+                message
+            } else {
+                format!("{message}\nhelp: {help}")
+            }
+        } else {
+            message
+        },
         related_information: None,
         tags: None,
-        data: None,
+        data: candidates.map(|names| serde_json::json!({ "similar_names": names })),
     }
 }
 
@@ -2678,9 +2870,13 @@ impl<'a> InlayHintEngine<'a> {
             }),
             text_edits: None,
             tooltip: Some(InlayHintTooltip::String(match ann.kind {
-                AnnotationKind::Type => "Inferred type".to_string(),
-                AnnotationKind::Capability => "Reference capability".to_string(),
-                AnnotationKind::Effect => "Effect row".to_string(),
+                AnnotationKind::Type => "Inferred type (display only; no code change)".to_string(),
+                AnnotationKind::Capability => {
+                    "Reference capability: rules for aliasing, mutation and transfer of values. External authority is checked separately.".to_string()
+                }
+                AnnotationKind::Effect => {
+                    "Effect row: operations a function may request. An effect annotation does not grant external authority (filesystem, network or OS).".to_string()
+                },
             })),
             padding_left: Some(false),
             padding_right: Some(false),
@@ -3660,6 +3856,89 @@ mod lsp_tests {
     }
 
     #[test]
+    fn test_effect_inlay_tooltip_distinguishes_effects_from_authority() {
+        let engine = InlayHintEngine::new("fn main() { 42 }");
+        let hint = engine.annotation_to_inlay(TypeAnnotation {
+            line: 0,
+            character: 0,
+            label: " ! {IO}".to_string(),
+            kind: AnnotationKind::Effect,
+        });
+        let Some(InlayHintTooltip::String(tooltip)) = hint.tooltip else {
+            panic!("expected explanatory effect tooltip");
+        };
+        assert!(tooltip.contains("operations"), "{tooltip}");
+        assert!(tooltip.contains("authority"), "{tooltip}");
+    }
+
+    #[test]
+    fn test_reference_capability_tooltip_explains_aliasing_and_transfer() {
+        let engine = InlayHintEngine::new("fn main() { 42 }");
+        let hint = engine.annotation_to_inlay(TypeAnnotation {
+            line: 0,
+            character: 0,
+            label: " : val".to_string(),
+            kind: AnnotationKind::Capability,
+        });
+        let Some(InlayHintTooltip::String(tooltip)) = hint.tooltip else {
+            panic!("expected explanatory capability tooltip");
+        };
+        assert!(tooltip.contains("aliasing"), "{tooltip}");
+        assert!(tooltip.contains("transfer"), "{tooltip}");
+    }
+
+    #[test]
+    fn test_hover_reports_inferred_effects_from_checked_function_rows() {
+        let source = "fn greet(s: String) -> String {\n    perform IO.print(s)\n    s\n}";
+        let result = NulangLanguageServer::compute_diagnostics(source);
+        let hover = NulangLanguageServer::hover_at_with_rows(
+            source,
+            Position::new(0, 4),
+            Some(&result.function_rows),
+        )
+        .expect("hover for greet");
+        let HoverContents::Scalar(MarkedString::String(contents)) = hover.contents else {
+            panic!("expected function hover text");
+        };
+        assert!(contents.contains("effects (inferred):"), "{contents}");
+        assert!(contents.contains("IO"), "{contents}");
+        assert!(contents.contains("do not grant external authority"), "{contents}");
+    }
+
+    #[test]
+    fn test_hover_does_not_invent_effects_for_pure_function() {
+        let source = "fn add(a: Int, b: Int) -> Int { a + b }";
+        let result = NulangLanguageServer::compute_diagnostics(source);
+        let hover = NulangLanguageServer::hover_at_with_rows(
+            source,
+            Position::new(0, 4),
+            Some(&result.function_rows),
+        )
+        .expect("hover for add");
+        let HoverContents::Scalar(MarkedString::String(contents)) = hover.contents else {
+            panic!("expected function hover text");
+        };
+        assert!(!contents.contains("effects (inferred)"), "{contents}");
+    }
+
+    #[test]
+    fn test_hover_retains_explicit_effect_annotation() {
+        let source = "fn greet(s: String) -> Unit ! {IO} { perform IO.print(s) }";
+        let result = NulangLanguageServer::compute_diagnostics(source);
+        let hover = NulangLanguageServer::hover_at_with_rows(
+            source,
+            Position::new(0, 4),
+            Some(&result.function_rows),
+        )
+        .expect("hover for greet");
+        let HoverContents::Scalar(MarkedString::String(contents)) = hover.contents else {
+            panic!("expected function hover text");
+        };
+        assert!(contents.contains("effects: "), "{contents}");
+        assert!(!contents.contains("effects (inferred)"), "{contents}");
+    }
+
+    #[test]
     fn test_effect_row_inlay_hint() {
         // A function that performs an effect should get an effect-row hint.
         let source = "fn greet(s: String) -> String {\n    perform IO.print(s)\n    s\n}";
@@ -3859,6 +4138,41 @@ mod lsp_tests {
     }
 
     // -- Crash-safety regression tests --
+
+    #[test]
+    fn test_type_annotation_action_uses_exact_identifier_boundary() {
+        let uri = Url::parse("file:///types.nula").unwrap();
+        let actions = NulangLanguageServer::code_actions(
+            "  let answer = 42",
+            None,
+            &uri,
+            &[],
+        )
+        .expect("simple literal should support a type annotation");
+        let annotation = actions.iter().find_map(|action| match action {
+            CodeActionOrCommand::CodeAction(action)
+                if action.title.contains("Add type annotation") => Some(action),
+            _ => None,
+        }).expect("missing annotation action");
+        let edits = annotation.edit.as_ref().unwrap()
+            .changes.as_ref().unwrap().get(&uri).unwrap();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].range.start, Position::new(0, 12));
+        assert_eq!(edits[0].range.end, Position::new(0, 12));
+        assert_eq!(edits[0].new_text, ": Int");
+    }
+
+    #[test]
+    fn test_type_annotation_action_never_guesses_unknown_type() {
+        let uri = Url::parse("file:///types.nula").unwrap();
+        let actions = NulangLanguageServer::code_actions(
+            "fn main() {\n    let result = calculate(42)\n}\n",
+            None,
+            &uri,
+            &[],
+        );
+        assert!(actions.is_none(), "unknown type must use inlay hints, not a bogus ': a' edit");
+    }
 
     #[test]
     fn test_code_action_let_binding_without_rhs() {
@@ -4650,6 +4964,180 @@ mod lsp_tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn test_unbound_variable_diagnostic_keeps_structured_typo_candidates() {
+        let err = NuError::unbound_variable(
+            "countr",
+            crate::types::Span::default(),
+            Some(vec!["counter".to_string()]),
+        );
+        let diagnostic = single_diagnostic(err);
+        assert_eq!(
+            diagnostic.code,
+            Some(NumberOrString::String("E0202".to_string()))
+        );
+        assert_eq!(
+            diagnostic.data.as_ref().unwrap()["similar_names"][0],
+            "counter"
+        );
+    }
+
+    #[test]
+    fn test_capability_diagnostic_explains_rule_without_auto_fix() {
+        let error = NuError::CapError {
+            msg: "Value cannot cross actor boundary".to_string(),
+            span: crate::types::Span::default(),
+            explanation: Some("Only sendable values may cross actor boundaries".to_string()),
+        };
+        let diagnostic = single_diagnostic(error);
+        assert_eq!(
+            diagnostic.code,
+            Some(NumberOrString::String("E0400".to_string()))
+        );
+        assert!(
+            diagnostic.message.contains("Only sendable values may cross actor boundaries"),
+            "capability diagnostics must explain why an ownership rule failed"
+        );
+        let source = "fn main() { 42 }";
+        let uri = Url::parse("file:///caps.nula").unwrap();
+        assert!(NulangLanguageServer::typo_quickfix_actions(
+            source,
+            &Range::new(Position::new(0, 0), Position::new(0, 0)),
+            &uri,
+            &[diagnostic],
+        ).is_empty(), "an ownership error must not create a speculative edit");
+    }
+
+    #[test]
+    fn test_typo_quickfix_edits_only_the_diagnostic_identifier() {
+        let source = "fn main() {\n    let counter = 5\n    countr\n}\n";
+        let uri = Url::parse("file:///typo.nula").unwrap();
+        let range = Range::new(Position::new(2, 4), Position::new(2, 10));
+        let diagnostic = Diagnostic {
+            range,
+            severity: Some(DiagnosticSeverity::ERROR),
+            code: Some(NumberOrString::String("E0202".to_string())),
+            message: "Unbound variable: 'countr'".to_string(),
+            data: Some(serde_json::json!({"similar_names": ["counter"]})),
+            ..Diagnostic::default()
+        };
+        let actions = NulangLanguageServer::typo_quickfix_actions(
+            source,
+            &Range::new(Position::new(2, 5), Position::new(2, 5)),
+            &uri,
+            &[diagnostic],
+        );
+        assert_eq!(actions.len(), 1);
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("expected an LSP quick-fix action");
+        };
+        assert_eq!(action.title, "Replace 'countr' with 'counter'");
+        assert_eq!(action.kind, Some(CodeActionKind::QUICKFIX));
+        let edits = action
+            .edit
+            .as_ref()
+            .unwrap()
+            .changes
+            .as_ref()
+            .unwrap()
+            .get(&uri)
+            .unwrap();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "counter");
+        assert_eq!(edits[0].range, range);
+    }
+
+    #[test]
+    fn test_typo_fix_uses_utf16_positions_after_multibyte_text() {
+        let source = "fn main() {\n    let counter = 5\n    perform IO.print(\"😀\"); countr\n}\n";
+        crate::types::set_source_map(source);
+        let start = source.find("countr").expect("misspelled identifier");
+        let misspelled = "countr";
+        let err = NuError::unbound_variable(
+            misspelled,
+            crate::types::Span::new(start as u32, (start + misspelled.len()) as u32),
+            Some(vec!["counter".to_string()]),
+        );
+        let diagnostic = single_diagnostic(err);
+        let target_line = source.lines().nth(2).unwrap();
+        let start_byte = target_line.find(misspelled).unwrap();
+        let start_utf16 = target_line[..start_byte].encode_utf16().count() as u32;
+        let expected = Range::new(
+            Position::new(2, start_utf16),
+            Position::new(2, start_utf16 + misspelled.len() as u32),
+        );
+        assert_eq!(diagnostic.range, expected, "LSP columns must use UTF-16");
+
+        let uri = Url::parse("file:///unicode-typo.nula").unwrap();
+        let actions = NulangLanguageServer::typo_quickfix_actions(
+            source,
+            &Range::new(expected.start, expected.start),
+            &uri,
+            &[diagnostic],
+        );
+        assert!(
+            actions.iter().any(|action| match action {
+                CodeActionOrCommand::CodeAction(action) => {
+                    action.title == "Replace 'countr' with 'counter'"
+                }
+                _ => false,
+            }),
+            "the source-verified typo fix must work after non-ASCII text"
+        );
+    }
+
+    #[test]
+    fn test_typo_quickfix_from_real_frontend_diagnostic() {
+        let source = "fn main() {\n    let counter = 5\n    perform IO.print(perform Int.to_string(countr + 1))\n}\n";
+        let uri = Url::parse("file:///real-typo.nula").unwrap();
+        let result = NulangLanguageServer::compute_diagnostics(source);
+        let typo = result
+            .diagnostics
+            .iter()
+            .find(|diag| {
+                diag.code == Some(NumberOrString::String("E0202".to_string()))
+                    && diag.message.contains("countr")
+            })
+            .expect("the compiler must report an unbound-variable diagnostic");
+        let cursor = Range::new(typo.range.start, typo.range.start);
+        let actions = NulangLanguageServer::typo_quickfix_actions(
+            source, &cursor, &uri, &result.diagnostics,
+        );
+        assert!(
+            actions.iter().any(|action| match action {
+                CodeActionOrCommand::CodeAction(action) => {
+                    action.title == "Replace 'countr' with 'counter'"
+                }
+                _ => false,
+            }),
+            "a real compiler-produced typo must produce the guarded editor fix"
+        );
+    }
+
+    #[test]
+    fn test_typo_quickfix_rejects_stale_and_unrelated_diagnostics() {
+        let source = "fn main() {\n    let counter = 5\n    otherx\n}\n";
+        let uri = Url::parse("file:///typo.nula").unwrap();
+        let range = Range::new(Position::new(2, 4), Position::new(2, 10));
+        let diagnostic = Diagnostic {
+            range,
+            severity: Some(DiagnosticSeverity::ERROR),
+            code: Some(NumberOrString::String("E0202".to_string())),
+            message: "Unbound variable: 'countr'".to_string(),
+            data: Some(serde_json::json!({"similar_names": ["counter"]})),
+            ..Diagnostic::default()
+        };
+        let cursor = Range::new(Position::new(2, 5), Position::new(2, 5));
+        assert!(NulangLanguageServer::typo_quickfix_actions(
+            source, &cursor, &uri, &[diagnostic.clone()]
+        ).is_empty(), "stale diagnostic must not rewrite different source");
+        let mut unrelated = diagnostic;
+        unrelated.code = Some(NumberOrString::String("E0401".to_string()));
+        assert!(NulangLanguageServer::typo_quickfix_actions(
+            source, &cursor, &uri, &[unrelated]
+        ).is_empty(), "ownership and capability errors must never be auto-rewritten");
     }
 
     #[test]
