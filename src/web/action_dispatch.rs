@@ -1,11 +1,11 @@
 //! Renderer-neutral UI action resolution for Web hosts.
 //!
-//! This layer deliberately stops before parameter binding. A protocol action may
-//! be invoked directly only when compiler bytecode metadata proves the target is
-//! a top-level zero-argument function. Parameterized handlers must wait for a
-//! compiler-owned action binding plan rather than guessing from transport data.
+//! Only document-bound, compiler-described scalar arguments may be decoded.
+//! Binding never invokes a parameterized handler or authorizes external effects;
+//! hosts must enforce session authority and idempotency before execution.
 
-use crate::bytecode::CodeModule;
+use crate::bytecode::{CodeModule, Constant};
+use crate::web::contracts::HandlerParamContract;
 use crate::vm::{Value, VM};
 use nulang_ui_protocol::{ActionPlacement, HostToRuntimeMessage, Revision, UiDocument, WireValue};
 
@@ -20,6 +20,7 @@ pub enum UiActionDispatchError {
     },
     UnregisteredAction(String),
     UnexpectedPayload,
+    InvalidPayload(String),
     ClientPlacement,
     UnknownAction(String),
     RequiresBindingPlan {
@@ -49,6 +50,7 @@ impl std::fmt::Display for UiActionDispatchError {
             Self::UnexpectedPayload => f.write_str(
                 "zero-argument UI action received data without a compiler-owned binding plan"
             ),
+            Self::InvalidPayload(message) => write!(f, "invalid UI action payload: {message}"),
             Self::ClientPlacement => {
                 f.write_str("client-placement action cannot be executed by the server runtime")
             }
@@ -127,15 +129,12 @@ pub fn invoke_zero_arg_action(
         .map_err(|error| UiActionDispatchError::Execution(error.to_string()))
 }
 
-/// Resolve a zero-argument server action against a *trusted, server-owned* UI
-/// document. A client-supplied document must never be used as the authority.
-/// This is a dispatch building block; it does not provide authentication,
-/// authorization or idempotent execution on its own.
-pub fn resolve_document_zero_arg_action(
-    module: &CodeModule,
+/// Shared document authorization preflight. A session host must supply a
+/// server-owned document and authenticate the session before calling this.
+fn authorize_document_action(
     document: &UiDocument,
     message: &HostToRuntimeMessage,
-) -> Result<ResolvedUiAction, UiActionDispatchError> {
+) -> Result<(), UiActionDispatchError> {
     document
         .validate()
         .map_err(|error| UiActionDispatchError::InvalidDocument(error.to_string()))?;
@@ -166,7 +165,150 @@ pub fn resolve_document_zero_arg_action(
             request.action_id.as_str().to_owned(),
         ));
     }
+    Ok(())
+}
 
+/// A validated, non-executing action binding. Constants must still cross the
+/// compiler-owned runtime binding ABI before execution; this type grants no
+/// authentication, effect authority, or idempotent execution privileges.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundUiAction {
+    pub action_id: String,
+    pub code_offset: usize,
+    pub arguments: Vec<Constant>,
+}
+
+/// Bind primitive action payloads only after checking the server-owned UI
+/// document and the compiler's declared function arity. The caller must pass
+/// compiler-owned parameter metadata, not a client-provided binding plan.
+///
+/// This stage deliberately does not invoke the handler; the session host still
+/// has to authenticate the principal, authorize the action, and deduplicate
+/// idempotency keys before scheduling effects.
+pub fn bind_document_action_payload(
+    module: &CodeModule,
+    document: &UiDocument,
+    message: &HostToRuntimeMessage,
+    params: &[HandlerParamContract],
+) -> Result<BoundUiAction, UiActionDispatchError> {
+    authorize_document_action(document, message)?;
+    let HostToRuntimeMessage::InvokeAction { request, .. } = message;
+    let action_id = request.action_id.as_str();
+    let Some(info) = module
+        .debug_functions
+        .iter()
+        .find(|function| function.name == action_id)
+    else {
+        return Err(UiActionDispatchError::UnknownAction(action_id.to_owned()));
+    };
+    if !module
+        .function_table
+        .iter()
+        .any(|offset| *offset == info.code_offset)
+    {
+        return Err(UiActionDispatchError::UnknownAction(action_id.to_owned()));
+    }
+    if params.len() != info.params.len() {
+        return Err(UiActionDispatchError::RequiresBindingPlan {
+            action_id: action_id.to_owned(),
+            parameter_count: info.params.len(),
+        });
+    }
+
+    let arguments = if params.is_empty() {
+        if !matches!(&request.payload, WireValue::Null)
+            && !matches!(&request.payload, WireValue::Object(fields) if fields.is_empty())
+        {
+            return Err(UiActionDispatchError::UnexpectedPayload);
+        }
+        Vec::new()
+    } else {
+        let WireValue::Object(fields) = &request.payload else {
+            return Err(UiActionDispatchError::InvalidPayload(
+                "expected object payload for parameterized action".to_owned(),
+            ));
+        };
+        if fields.len() != params.len() {
+            return Err(UiActionDispatchError::InvalidPayload(
+                "payload field count does not match compiler parameter count".to_owned(),
+            ));
+        }
+        let mut arguments = Vec::with_capacity(params.len());
+        for param in params {
+            if param.name.trim().is_empty()
+                || param.capability.is_some()
+                || param.request.is_some()
+            {
+                return Err(UiActionDispatchError::InvalidPayload(
+                    "unsupported or privileged compiler parameter contract".to_owned(),
+                ));
+            }
+            let Some(ty) = param.ty.as_deref() else {
+                return Err(UiActionDispatchError::InvalidPayload(format!(
+                    "parameter '{}' has no proven type",
+                    param.name
+                )));
+            };
+            let Some(value) = fields.get(&param.name) else {
+                return Err(UiActionDispatchError::InvalidPayload(format!(
+                    "missing parameter '{}'",
+                    param.name
+                )));
+            };
+            arguments.push(decode_action_scalar(value, ty).ok_or_else(|| {
+                UiActionDispatchError::InvalidPayload(format!(
+                    "parameter '{}' is not a valid {} scalar",
+                    param.name, ty
+                ))
+            })?);
+        }
+        arguments
+    };
+
+    Ok(BoundUiAction {
+        action_id: action_id.to_owned(),
+        code_offset: info.code_offset,
+        arguments,
+    })
+}
+
+fn decode_action_scalar(value: &WireValue, ty: &str) -> Option<Constant> {
+    match (ty.trim(), value) {
+        ("String", WireValue::String(value)) => Some(Constant::String(value.clone())),
+        ("Int", WireValue::I64(value)) => Some(Constant::Int(value.0)),
+        ("Int", WireValue::String(value)) => value.parse::<i64>().ok().map(Constant::Int),
+        ("Bool", WireValue::Bool(value)) => Some(Constant::Bool(*value)),
+        ("Bool", WireValue::String(value)) if value == "true" => {
+            Some(Constant::Bool(true))
+        }
+        ("Bool", WireValue::String(value)) if value == "false" => {
+            Some(Constant::Bool(false))
+        }
+        ("Float", WireValue::F64(value)) => {
+            let float = value.to_f64();
+            float.is_finite().then_some(Constant::Float(float))
+        }
+        ("Float", WireValue::String(value)) => value
+            .parse::<f64>()
+            .ok()
+            .filter(|parsed| parsed.is_finite())
+            .map(Constant::Float),
+        _ => None,
+    }
+}
+
+/// Resolve a zero-argument server action against a *trusted, server-owned* UI
+/// document. A client-supplied document must never be used as the authority.
+/// This is a dispatch building block; it does not provide authentication,
+/// authorization or idempotent execution on its own.
+pub fn resolve_document_zero_arg_action(
+    module: &CodeModule,
+    document: &UiDocument,
+    message: &HostToRuntimeMessage,
+) -> Result<ResolvedUiAction, UiActionDispatchError> {
+    authorize_document_action(document, message)?;
+
+    let HostToRuntimeMessage::InvokeAction { request, .. } = message;
     // A zero-argument action has no defined payload decoder. Do not silently
     // discard client-supplied fields, or reinterpret them as VM registers.
     let payload_empty = match &request.payload {
