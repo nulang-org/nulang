@@ -3055,3 +3055,24 @@ mod host_authority_tests {
         );
     }
 }
+
+
+// PostgreSQL builds without SQLite must still dispatch the public DB effect.
+#[cfg(all(test, feature = "postgres", not(feature = "sqlite")))]
+#[test]
+fn postgres_only_build_dispatches_db_query() {
+    use crate::vm::ActorVmCallbacks;
+
+    let runtime = Rc::new(RefCell::new(Runtime::new()));
+    let mut callbacks = RuntimeVmCallbacks::new(runtime);
+    let result = callbacks.perform_builtin_effect(
+        "DB",
+        Some("query"),
+        &[crate::bytecode::Constant::String("SELECT 1".to_owned())],
+        &[crate::vm::Value::string(0)],
+    );
+    assert!(
+        result.is_some(),
+        "DB.query must be handled even when SQLite is disabled"
+    );
+}
