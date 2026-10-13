@@ -24,12 +24,14 @@ const BENCHMARKS: &[&str] = &[
     "ping_pong",
     "thread_ring",
     "fork_join",
+    "actor_compute",
     "skynet",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Backend {
     Bytecode,
+    Jit,
     Aot,
 }
 
@@ -37,6 +39,7 @@ impl Backend {
     fn label(self) -> &'static str {
         match self {
             Self::Bytecode => "nulang",
+            Self::Jit => "nulang-jit",
             Self::Aot => "nulang-aot",
         }
     }
@@ -101,7 +104,14 @@ fn main() -> ExitCode {
             {
                 continue;
             }
-            if config.cross_runtime_only && name == "skynet" {
+            if config.cross_runtime_only && (name == "skynet" || name == "actor_compute") {
+                continue;
+            }
+            if config.backend == Backend::Jit && name == "skynet" {
+                if config.benchmark.as_deref() == Some("skynet") {
+                    eprintln!("warmed JIT mode has no Skynet fixture");
+                    return ExitCode::from(2);
+                }
                 continue;
             }
 
@@ -110,6 +120,7 @@ fn main() -> ExitCode {
                 "ping_pong" => bench_ping_pong(config.backend),
                 "thread_ring" => bench_thread_ring(config.backend),
                 "fork_join" => bench_fork_join(config.backend),
+                "actor_compute" => bench_actor_compute(config.backend),
                 "skynet" => bench_skynet(config.backend),
                 _ => unreachable!("benchmark list and dispatcher must stay in sync"),
             };
@@ -134,8 +145,9 @@ fn parse_args() -> Result<Option<Config>, String> {
             "--backend" => {
                 backend = match args.next().as_deref() {
                     Some("bytecode") => Backend::Bytecode,
+                    Some("jit") => Backend::Jit,
                     Some("aot") => Backend::Aot,
-                    _ => return Err("--backend requires bytecode or aot".to_string()),
+                    _ => return Err("--backend requires bytecode, jit or aot".to_string()),
                 };
             }
             "--format" => {
@@ -179,8 +191,8 @@ fn parse_args() -> Result<Option<Config>, String> {
         }
     }
 
-    if backend == Backend::Aot && !cfg!(feature = "native-codegen") {
-        return Err("AOT backend requires --features native-codegen".to_string());
+    if backend != Backend::Bytecode && !cfg!(feature = "native-codegen") {
+        return Err("JIT and AOT backends require --features native-codegen".to_string());
     }
 
     Ok(Some(Config {
@@ -194,7 +206,7 @@ fn parse_args() -> Result<Option<Config>, String> {
 
 fn print_usage() {
     eprintln!(
-        "Usage: nulang-savina [--backend bytecode|aot] [--format human|jsonl] [--benchmark NAME] [--cross-runtime-only] [--repeat N] [--list]"
+        "Usage: nulang-savina [--backend bytecode|jit|aot] [--format human|jsonl] [--benchmark NAME] [--cross-runtime-only] [--repeat N] [--list]"
     );
 }
 
@@ -262,7 +274,7 @@ fn compile_run_with_runtime(
         runtime.borrow_mut().register_aot_module(aot);
     }
     #[cfg(not(feature = "native-codegen"))]
-    assert_eq!(backend, Backend::Bytecode, "AOT requires native-codegen");
+    assert_eq!(backend, Backend::Bytecode, "JIT/AOT require native-codegen");
 
     let module =
         nulang::mir_codegen::compile_mir(&mut mir, "savina").expect("bench: codegen failed");
@@ -303,6 +315,26 @@ fn compile_run_with_runtime(
     value
 }
 
+/// A warmed-JIT measurement is valid only after the actor runtime's own VM
+/// has compiled at least one native region, rather than just enabling the
+/// native-codegen Cargo feature. This check is deliberately outside timing.
+fn warm_and_verify_jit(runtime: &Rc<RefCell<Runtime>>, workload: &str) {
+    #[cfg(feature = "native-codegen")]
+    {
+        let compiled = runtime.borrow().benchmark_jit_compiled_count();
+        assert!(
+            compiled > 0,
+            "bench: warmed JIT did not compile an actor-VM region for {workload}"
+        );
+        eprintln!("[jit-warm] workload={workload} actor_vm_compiled_regions={compiled}");
+    }
+    #[cfg(not(feature = "native-codegen"))]
+    {
+        let _ = runtime;
+        panic!("bench: warmed JIT requires native-codegen for {workload}");
+    }
+}
+
 fn bench_counting(backend: Backend) -> Measurement {
     const N: i64 = 200_000;
     let source = r#"
@@ -316,6 +348,19 @@ fn bench_counting(backend: Backend) -> Measurement {
     let actor_id = compile_run_with_runtime(source, rt.clone(), backend)
         .as_actor_id()
         .expect("spawn returns an actor ref");
+
+    if backend == Backend::Jit {
+        for _ in 0..20_000 {
+            rt.borrow_mut().send_message(actor_id, "inc", &[]);
+        }
+        rt.borrow_mut().run_scheduler();
+        warm_and_verify_jit(&rt, "counting");
+        rt.borrow_mut()
+            .actors
+            .get_mut(&actor_id)
+            .expect("warmed counter still exists")
+            .set_state_field("count", Value::int(0));
+    }
 
     let start = Instant::now();
     for _ in 0..N {
@@ -386,6 +431,18 @@ fn bench_ping_pong(backend: Backend) -> Measurement {
 
     rt.borrow_mut().run_scheduler();
 
+    if backend == Backend::Jit {
+        rt.borrow_mut()
+            .send_message(pinger, "kick", &[Value::int(20_000)]);
+        rt.borrow_mut().run_scheduler();
+        warm_and_verify_jit(&rt, "ping_pong");
+        rt.borrow_mut()
+            .actors
+            .get_mut(&ponger)
+            .expect("warmed pong actor still exists")
+            .set_state_field("count", Value::int(0));
+    }
+
     let start = Instant::now();
     rt.borrow_mut()
         .send_message(pinger, "kick", &[Value::int(N)]);
@@ -450,6 +507,18 @@ let s = spawn Sink {} in
     };
 
     rt.borrow_mut().run_scheduler();
+
+    if backend == Backend::Jit {
+        rt.borrow_mut()
+            .send_message(r0, "token", &[Value::int(20_000), Value::int(0)]);
+        rt.borrow_mut().run_scheduler();
+        warm_and_verify_jit(&rt, "thread_ring");
+        rt.borrow_mut()
+            .actors
+            .get_mut(&sink)
+            .expect("warmed ring sink exists")
+            .set_state_field("total", Value::int(-1));
+    }
 
     let start = Instant::now();
     rt.borrow_mut()
@@ -516,6 +585,24 @@ let s = spawn Sink {} in
     assert_eq!(worker_ids.len(), WORKERS, "exactly W workers spawned");
 
     rt.borrow_mut().run_scheduler();
+
+    if backend == Backend::Jit {
+        for i in 0..TASKS {
+            let worker = worker_ids[(i as usize) % WORKERS];
+            rt.borrow_mut()
+                .send_message(worker, "task", &[Value::int(i)]);
+        }
+        rt.borrow_mut().run_scheduler();
+        warm_and_verify_jit(&rt, "fork_join");
+        let mut runtime = rt.borrow_mut();
+        for id in worker_ids.iter().copied().chain(std::iter::once(sink)) {
+            runtime
+                .actors
+                .get_mut(&id)
+                .expect("warmed worker or sink exists")
+                .set_state_field("count", Value::int(0));
+        }
+    }
 
     let start = Instant::now();
     for i in 0..TASKS {
@@ -600,6 +687,92 @@ spawn Skynet {}
     Measurement {
         benchmark: "skynet",
         messages: EXPECTED as u64 - 1,
+        elapsed,
+    }
+}
+
+/// Compute-heavy actor backend comparison (not a Savina message benchmark).
+/// All three execution backends compile the same source and validate state.
+fn bench_actor_compute(backend: Backend) -> Measurement {
+    const N: i64 = 128;
+    const ITERATIONS: i64 = 4_096;
+    let source = r#"
+        actor Compute {
+            state total = 0
+            behavior work() {
+                var i = 0;
+                var sum = 0;
+                while i < 4096 {
+                    sum = sum + i * 3 - i / 7;
+                    i = i + 1
+                };
+                self.total = self.total + sum
+            }
+        }
+        spawn Compute {}
+    "#;
+
+    let rt = Rc::new(RefCell::new(Runtime::new()));
+    let actor_id = compile_run_with_runtime(source, Rc::clone(&rt), backend)
+        .as_actor_id()
+        .expect("compute benchmark must spawn an actor");
+
+    // Give bytecode, JIT and AOT the same untimed actor activation,
+    // amortizing cold actor state independently of native tier-up.
+    #[cfg(feature = "native-codegen")]
+    let compiled_before = if backend == Backend::Jit {
+        rt.borrow().benchmark_jit_compiled_count()
+    } else {
+        0
+    };
+    rt.borrow_mut().send_message(actor_id, "work", &[]);
+    rt.borrow_mut().run_scheduler();
+    if backend == Backend::Jit {
+        // A nonzero total is not enough: the new region must have been
+        // compiled by this actor's untimed work, not earlier initialization.
+        warm_and_verify_jit(&rt, "actor_compute");
+        #[cfg(feature = "native-codegen")]
+        {
+            assert!(
+                rt.borrow().benchmark_jit_compiled_count() > compiled_before,
+                "bench: compute actor warmup did not compile a new native JIT region"
+            );
+            // Retain warmup-specific compilation evidence in both CI logs
+            // and the benchmark JSON (via the Python harness).
+            eprintln!(
+                "[jit-proof] workload=actor_compute actor_vm_new_compiled_regions={}",
+                rt.borrow().benchmark_jit_compiled_count() - compiled_before
+            );
+        }
+    }
+    rt.borrow_mut()
+        .actors
+        .get_mut(&actor_id)
+        .expect("warmed compute actor exists")
+        .set_state_field("total", Value::int(0));
+
+    let start = Instant::now();
+    for _ in 0..N {
+        rt.borrow_mut().send_message(actor_id, "work", &[]);
+    }
+    rt.borrow_mut().run_scheduler();
+    let elapsed = start.elapsed();
+
+    let per_message: i64 = (0..ITERATIONS).map(|i| i * 3 - i / 7).sum();
+    let actual = rt
+        .borrow()
+        .actors
+        .get(&actor_id)
+        .and_then(|actor| actor.get_state_field("total"))
+        .and_then(|value| value.as_int());
+    assert_eq!(
+        actual,
+        Some(per_message * N),
+        "each backend must execute every actor arithmetic operation"
+    );
+    Measurement {
+        benchmark: "actor_compute",
+        messages: N as u64,
         elapsed,
     }
 }

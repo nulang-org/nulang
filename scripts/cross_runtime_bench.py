@@ -26,6 +26,9 @@ ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "benchmarks" / "cross_runtime"
 BUILD = ROOT / "target" / "cross-runtime"
 BENCHMARKS = ("counting", "ping_pong", "thread_ring", "fork_join")
+COMPUTE_BENCHMARKS = ("actor_compute",)
+JIT_PROOF_RE = re.compile(r"\[jit-warm\] workload=actor_compute actor_vm_compiled_regions=(\d+)")
+JIT_NEW_REGION_RE = re.compile(r"\[jit-proof\] workload=actor_compute actor_vm_new_compiled_regions=(\d+)")
 RECORD_RE = re.compile(
     r"\[cross-bench\]\s+runtime=(?P<runtime>[a-z0-9_-]+)\s+"
     r"benchmark=(?P<benchmark>[a-z0-9_-]+)\s+"
@@ -80,40 +83,63 @@ def maybe_version(command: list[str]) -> str | None:
         return None
 
 
-def parse_records(output: str, expected_runtime: str) -> dict[str, dict[str, int]]:
+def parse_records(
+    output: str, expected_runtime: str, benchmarks: tuple[str, ...] = BENCHMARKS
+) -> dict[str, dict[str, int]]:
     records: dict[str, dict[str, int]] = {}
     for match in RECORD_RE.finditer(output):
         runtime = match.group("runtime")
         if runtime != expected_runtime:
             continue
         name = match.group("benchmark")
-        if name not in BENCHMARKS:
+        if name not in benchmarks:
             continue
+        if name in records:
+            raise RuntimeError(f"{expected_runtime}/{name}: duplicate benchmark record")
+        if int(match.group("messages")) <= 0 or int(match.group("elapsed_ns")) <= 0:
+            raise RuntimeError(f"{expected_runtime}/{name}: nonpositive work or elapsed time")
         records[name] = {
             "messages": int(match.group("messages")),
             "elapsed_ns": int(match.group("elapsed_ns")),
         }
 
-    missing = [name for name in BENCHMARKS if name not in records]
+    missing = [name for name in benchmarks if name not in records]
     if missing:
         print(output, file=sys.stderr)
         raise RuntimeError(
             f"{expected_runtime} did not emit records for: {', '.join(missing)}"
         )
+    if expected_runtime == "nulang-jit" and benchmarks == COMPUTE_BENCHMARKS:
+        proofs = JIT_PROOF_RE.findall(output)
+        if len(proofs) != 1 or int(proofs[0]) <= 0:
+            raise RuntimeError("actor_compute: missing or invalid scheduler actor-VM native JIT proof")
+        # Preserve independently auditable compilation evidence in the JSON
+        # artifact, rather than relying only on transient Actions logs.
+        records["actor_compute"]["jit_actor_vm_compiled_regions"] = int(proofs[0])
+        new_regions = JIT_NEW_REGION_RE.findall(output)
+        if len(new_regions) != 1 or not 0 < int(new_regions[0]) <= int(proofs[0]):
+            raise RuntimeError("actor_compute: missing or invalid new JIT proof from actor work")
+        records["actor_compute"]["jit_actor_vm_new_compiled_regions"] = int(new_regions[0])
     return records
 
 
-def build_commands(selected: list[str]) -> dict[str, list[str]]:
+def build_commands(
+    selected: list[str], benchmarks: tuple[str, ...] = BENCHMARKS
+) -> dict[str, list[str]]:
     BUILD.mkdir(parents=True, exist_ok=True)
     commands: dict[str, list[str]] = {}
 
-    for runtime in ("nulang", "nulang-aot"):
+    for runtime in ("nulang", "nulang-jit", "nulang-aot"):
         if runtime not in selected:
             continue
         if shutil.which("cargo") is None:
             raise RuntimeError("cargo is required for the Nulang benchmark")
-        backend = "aot" if runtime == "nulang-aot" else "bytecode"
-        features = "savina-bench,native-codegen" if backend == "aot" else "savina-bench"
+        backend = runtime.removeprefix("nulang-") if runtime != "nulang" else "bytecode"
+        features = (
+            "savina-bench,native-codegen"
+            if backend in {"jit", "aot"}
+            else "savina-bench"
+        )
         # Build each distinct Cargo feature set outside measured rounds.
         # Copy immediately so a subsequent cargo build with different features
         # cannot overwrite a command's executable or silently relabel data.
@@ -138,9 +164,14 @@ def build_commands(selected: list[str]) -> dict[str, list[str]]:
         binary = Path(metadata["target_directory"]) / "savina" / ("nulang-savina" + suffix)
         isolated_binary = BUILD / (runtime + suffix)
         shutil.copy2(binary, isolated_binary)
+        mode_flags = (
+            ["--benchmark", "actor_compute"]
+            if benchmarks == COMPUTE_BENCHMARKS
+            else ["--cross-runtime-only"]
+        )
         commands[runtime] = [
-            str(isolated_binary), "--backend", backend, "--cross-runtime-only",
-            "--format", "human"
+            str(isolated_binary), "--backend", backend,
+            *mode_flags, "--format", "human"
         ]
 
     if "rust" in selected:
@@ -298,12 +329,45 @@ def summarize(
     return summary
 
 
-def print_table(summary: dict[str, dict[str, dict[str, float | int]]]) -> None:
+def paired_backend_speedups(
+    samples: dict[str, dict[str, list[dict[str, int]]]]
+) -> dict[str, dict[str, float | int]]:
+    """Compute same-round native/bytecode ratios; never divide independent medians."""
+    if "nulang" not in samples:
+        return {}
+    baseline = samples["nulang"]["actor_compute"]
+    ratios: dict[str, dict[str, float | int]] = {}
+    for runtime in ("nulang-jit", "nulang-aot"):
+        if runtime not in samples:
+            continue
+        candidate = samples[runtime]["actor_compute"]
+        if len(candidate) != len(baseline) or not baseline:
+            raise RuntimeError(f"{runtime}: paired sample count mismatch")
+        paired = []
+        for base, contender in zip(baseline, candidate):
+            if base["messages"] != contender["messages"]:
+                raise RuntimeError(f"{runtime}: paired work count mismatch")
+            if base["elapsed_ns"] <= 0 or contender["elapsed_ns"] <= 0:
+                raise RuntimeError(f"{runtime}: nonpositive paired duration")
+            paired.append(base["elapsed_ns"] / contender["elapsed_ns"])
+        ratios[runtime] = {
+            "paired_rounds": len(paired),
+            "median_speedup_vs_bytecode": statistics.median(paired),
+            "min_paired_speedup": min(paired),
+            "max_paired_speedup": max(paired),
+        }
+    return ratios
+
+
+def print_table(
+    summary: dict[str, dict[str, dict[str, float | int]]],
+    benchmarks: tuple[str, ...] = BENCHMARKS,
+) -> None:
     print()
     print("runtime     benchmark      median msg/s   median ns/msg")
     print("----------  -------------  -------------  -------------")
     for runtime in sorted(summary):
-        for name in BENCHMARKS:
+        for name in benchmarks:
             row = summary[runtime][name]
             print(
                 f"{runtime:<10}  {name:<13}  "
@@ -315,11 +379,15 @@ def print_table(summary: dict[str, dict[str, dict[str, float | int]]]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--runs", type=int, default=8, help="measured runs per runtime")
+    parser.add_argument(
+        "--workloads", choices=("savina", "actor_compute"), default="savina",
+        help="Savina-style messaging, or Nulang-only compute actor backend probe",
+    )
     parser.add_argument("--warmup", type=int, default=1, help="discarded warm-up runs")
     parser.add_argument(
         "--runtimes",
         default="nulang,rust,go,erlang",
-        help="comma-separated subset of nulang,nulang-aot,rust,go,erlang",
+        help="comma-separated subset of nulang,nulang-jit,nulang-aot,rust,go,erlang",
     )
     parser.add_argument(
         "--cpu-mode",
@@ -338,9 +406,27 @@ def main() -> int:
         parser.error("--runs must be >= 1 and --warmup must be >= 0")
 
     selected = [item.strip() for item in args.runtimes.split(",") if item.strip()]
-    unknown = sorted(set(selected) - {"nulang", "nulang-aot", "rust", "go", "erlang"})
+    if not selected:
+        parser.error("at least one runtime must be selected")
+    if len(selected) != len(set(selected)):
+        parser.error("duplicate runtimes are not allowed")
+    unknown = sorted(set(selected) - {"nulang", "nulang-jit", "nulang-aot", "rust", "go", "erlang"})
     if unknown:
         parser.error(f"unknown runtimes: {', '.join(unknown)}")
+
+    if args.workloads == "savina" and "nulang-jit" in selected:
+        parser.error(
+            "warmed JIT is not verified for short Savina actor behaviors; "
+            "use --workloads actor_compute for a native-JIT-backed actor probe"
+        )
+
+    benchmarks = COMPUTE_BENCHMARKS if args.workloads == "actor_compute" else BENCHMARKS
+    if args.workloads == "actor_compute" and any(
+        runtime not in {"nulang", "nulang-jit", "nulang-aot"} for runtime in selected
+    ):
+        parser.error("actor_compute is Nulang-only; no cross-language comparison is valid")
+    if args.workloads == "actor_compute" and "nulang" not in selected:
+        parser.error("actor_compute requires the nulang bytecode reference backend")
 
     cpu_affinity = measurement_affinity(args.cpu_mode)
     if cpu_affinity is not None:
@@ -356,9 +442,9 @@ def main() -> int:
             flush=True,
         )
 
-    commands = build_commands(selected)
+    commands = build_commands(selected, benchmarks)
     samples: dict[str, dict[str, list[dict[str, int]]]] = {
-        runtime: {name: [] for name in BENCHMARKS} for runtime in selected
+        runtime: {name: [] for name in benchmarks} for runtime in selected
     }
 
     # Cycle across runtimes per sample rather than exhausting one runtime at a
@@ -382,23 +468,40 @@ def main() -> int:
                 commands[runtime],
                 cpu_affinity=cpu_affinity,
             )
-            records = parse_records(output, runtime)
+            records = parse_records(output, runtime, benchmarks)
             if measured:
                 for name, row in records.items():
                     samples[runtime][name].append(row)
 
     summary = summarize(samples)
-    print_table(summary)
+    print_table(summary, benchmarks)
+    paired_speedups = (
+        paired_backend_speedups(samples)
+        if args.workloads == "actor_compute"
+        else {}
+    )
+    for runtime, stats in paired_speedups.items():
+        print(
+            f"[backend-paired] {runtime} vs bytecode "
+            f"median_speedup={stats['median_speedup_vs_bytecode']:.3f}x "
+            f"paired_rounds={stats['paired_rounds']}"
+        )
 
     report = {
         "schema": 2,
-        "methodology": "standard-runtime Savina-style messaging baselines",
+        "methodology": (
+            "Nulang-only compute-heavy actor backend comparison (not Savina)"
+            if args.workloads == "actor_compute"
+            else "standard-runtime Savina-style messaging baselines"
+        ),
+        "benchmark_profile": args.workloads,
         "warmup_runs": args.warmup,
         "measured_runs": args.runs,
         "measured_execution_orders": measured_execution_orders,
         "environment": environment_metadata(args.cpu_mode, cpu_affinity),
         "samples": samples,
         "summary": summary,
+        "backend_paired_speedups": paired_speedups,
     }
 
     if args.output:

@@ -1,0 +1,189 @@
+"""Fail-closed contract for compute-bearing Nulang actor backend comparisons."""
+from __future__ import annotations
+
+import sys
+import unittest
+from contextlib import redirect_stderr
+from io import StringIO
+from pathlib import Path
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import cross_runtime_bench as harness
+from cross_runtime_bench import COMPUTE_BENCHMARKS, paired_backend_speedups, parse_records
+
+
+class ActorComputeBackendTests(unittest.TestCase):
+    def test_accepts_warmed_actor_jit_with_compilation_proof(self):
+        output = (
+            "[jit-warm] workload=actor_compute actor_vm_compiled_regions=1\n"
+            "[jit-proof] workload=actor_compute actor_vm_new_compiled_regions=1\n"
+            "[cross-bench] runtime=nulang-jit benchmark=actor_compute "
+            "messages=128 elapsed_ns=190000\n"
+        )
+        self.assertEqual(
+            parse_records(output, "nulang-jit", COMPUTE_BENCHMARKS)["actor_compute"],
+            {"messages": 128, "elapsed_ns": 190000, "jit_actor_vm_compiled_regions": 1,
+             "jit_actor_vm_new_compiled_regions": 1},
+        )
+
+    def test_rejects_jit_enabled_without_actual_compilation(self):
+        output = "[cross-bench] runtime=nulang-jit benchmark=actor_compute messages=128 elapsed_ns=1"
+        with self.assertRaisesRegex(RuntimeError, "native JIT proof"):
+            parse_records(output, "nulang-jit", COMPUTE_BENCHMARKS)
+
+    def test_rejects_zero_or_duplicate_native_compilation_proof(self):
+        record = "[cross-bench] runtime=nulang-jit benchmark=actor_compute messages=128 elapsed_ns=1"
+        for proof in (
+            "[jit-warm] workload=actor_compute actor_vm_compiled_regions=0\n",
+            "[jit-warm] workload=actor_compute actor_vm_compiled_regions=1\n" * 2,
+        ):
+            with self.subTest(proof=proof), self.assertRaisesRegex(RuntimeError, "native JIT proof"):
+                parse_records(proof + record, "nulang-jit", COMPUTE_BENCHMARKS)
+
+    def test_rejects_old_regions_without_new_actor_work_compilation(self):
+        row = "[cross-bench] runtime=nulang-jit benchmark=actor_compute messages=128 elapsed_ns=1"
+        original = "[jit-warm] workload=actor_compute actor_vm_compiled_regions=2\n"
+        for delta in ("", "[jit-proof] workload=actor_compute actor_vm_new_compiled_regions=0\n"):
+            with self.subTest(delta=delta), self.assertRaisesRegex(RuntimeError, "new JIT proof"):
+                parse_records(original + delta + row, "nulang-jit", COMPUTE_BENCHMARKS)
+
+    def test_rejects_duplicate_result(self):
+        record = "[cross-bench] runtime=nulang-aot benchmark=actor_compute messages=128 elapsed_ns=1"
+        with self.assertRaisesRegex(RuntimeError, "duplicate"):
+            parse_records(record + "\n" + record, "nulang-aot", COMPUTE_BENCHMARKS)
+
+    def test_rejects_zero_duration(self):
+        record = "[cross-bench] runtime=nulang benchmark=actor_compute messages=128 elapsed_ns=0"
+        with self.assertRaisesRegex(RuntimeError, "nonpositive"):
+            parse_records(record, "nulang", COMPUTE_BENCHMARKS)
+
+    def test_never_relabels_savina_counting_as_compute(self):
+        record = "[cross-bench] runtime=nulang-aot benchmark=counting messages=200000 elapsed_ns=100"
+        with self.assertRaisesRegex(RuntimeError, "did not emit"):
+            parse_records(record, "nulang-aot", COMPUTE_BENCHMARKS)
+
+    def test_savina_rejects_uncompiled_jit_before_any_cargo_build(self):
+        stderr = StringIO()
+        with (
+            mock.patch.object(
+                sys, "argv",
+                ["cross_runtime_bench.py", "--workloads", "savina",
+                 "--runtimes", "nulang,nulang-jit,nulang-aot"],
+            ),
+            mock.patch.object(
+                harness, "build_commands",
+                side_effect=AssertionError("must fail before building"),
+            ),
+            redirect_stderr(stderr),
+            self.assertRaises(SystemExit) as failure,
+        ):
+            harness.main()
+        self.assertEqual(failure.exception.code, 2)
+        self.assertIn("not verified", stderr.getvalue())
+
+    def test_compute_rejects_external_runtimes_before_building(self):
+        stderr = StringIO()
+        with (
+            mock.patch.object(
+                sys, "argv",
+                ["cross_runtime_bench.py", "--workloads", "actor_compute",
+                 "--runtimes", "nulang,go"],
+            ),
+            mock.patch.object(
+                harness, "build_commands",
+                side_effect=AssertionError("must fail before building"),
+            ),
+            redirect_stderr(stderr),
+            self.assertRaises(SystemExit) as failure,
+        ):
+            harness.main()
+        self.assertEqual(failure.exception.code, 2)
+        self.assertIn("Nulang-only", stderr.getvalue())
+
+    def test_compute_requires_bytecode_reference_before_building(self):
+        stderr = StringIO()
+        with (
+            mock.patch.object(
+                sys, "argv",
+                ["cross_runtime_bench.py", "--workloads", "actor_compute",
+                 "--runtimes", "nulang-jit,nulang-aot"],
+            ),
+            mock.patch.object(harness, "build_commands",
+                              side_effect=AssertionError("must fail before building")),
+            redirect_stderr(stderr),
+            self.assertRaises(SystemExit) as failure,
+        ):
+            harness.main()
+        self.assertEqual(failure.exception.code, 2)
+        self.assertIn("bytecode reference", stderr.getvalue())
+
+    def test_duplicate_runtime_names_cannot_skew_sample_counts(self):
+        stderr = StringIO()
+        with (
+            mock.patch.object(
+                sys, "argv",
+                ["cross_runtime_bench.py", "--workloads", "actor_compute",
+                 "--runtimes", "nulang,nulang,nulang-jit"],
+            ),
+            mock.patch.object(harness, "build_commands",
+                              side_effect=AssertionError("must fail before building")),
+            redirect_stderr(stderr),
+            self.assertRaises(SystemExit) as failure,
+        ):
+            harness.main()
+        self.assertEqual(failure.exception.code, 2)
+        self.assertIn("duplicate runtimes", stderr.getvalue())
+
+    def test_empty_runtime_list_is_rejected(self):
+        stderr = StringIO()
+        with (
+            mock.patch.object(
+                sys, "argv",
+                ["cross_runtime_bench.py", "--workloads", "actor_compute",
+                 "--runtimes", ""],
+            ),
+            mock.patch.object(harness, "build_commands",
+                              side_effect=AssertionError("must fail before building")),
+            redirect_stderr(stderr),
+            self.assertRaises(SystemExit) as failure,
+        ):
+            harness.main()
+        self.assertEqual(failure.exception.code, 2)
+        self.assertIn("at least one runtime", stderr.getvalue())
+
+    def test_paired_speedups_align_same_round_samples(self):
+        samples = {
+            "nulang": {"actor_compute": [
+                {"messages": 128, "elapsed_ns": 300},
+                {"messages": 128, "elapsed_ns": 600},
+                {"messages": 128, "elapsed_ns": 900},
+            ]},
+            "nulang-jit": {"actor_compute": [
+                {"messages": 128, "elapsed_ns": 100},
+                {"messages": 128, "elapsed_ns": 300},
+                {"messages": 128, "elapsed_ns": 300},
+            ]},
+            "nulang-aot": {"actor_compute": [
+                {"messages": 128, "elapsed_ns": 150},
+                {"messages": 128, "elapsed_ns": 300},
+                {"messages": 128, "elapsed_ns": 450},
+            ]},
+        }
+        result = paired_backend_speedups(samples)
+        self.assertEqual(result["nulang-jit"]["median_speedup_vs_bytecode"], 3.0)
+        self.assertEqual(result["nulang-aot"]["median_speedup_vs_bytecode"], 2.0)
+        self.assertEqual(result["nulang-jit"]["paired_rounds"], 3)
+
+    def test_paired_speedups_reject_mismatched_sample_counts(self):
+        samples = {
+            "nulang": {"actor_compute": [{"messages": 128, "elapsed_ns": 200}]},
+            "nulang-aot": {"actor_compute": []},
+        }
+        with self.assertRaisesRegex(RuntimeError, "paired sample count"):
+            paired_backend_speedups(samples)
+
+
+if __name__ == "__main__":
+    unittest.main()
