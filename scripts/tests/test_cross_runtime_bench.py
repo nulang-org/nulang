@@ -47,6 +47,24 @@ class BenchmarkRecordContractTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "unexpected runtime"):
             cross_runtime_bench.parse_records(output, "nulang")
 
+    def test_accepts_nulang_only_skynet_without_reporting_it(self):
+        # The standalone Nulang Savina runner emits a fifth, unmatched workload.
+        output = valid_output() + "\\n" + record("nulang", "skynet", 1110)
+        records = cross_runtime_bench.parse_records(output, "nulang")
+        self.assertEqual(set(ROWS), set(records))
+        self.assertNotIn("skynet", records)
+
+    def test_rejects_duplicate_nulang_only_skynet_record(self):
+        output = valid_output() + "\\n" + record("nulang", "skynet", 1110)
+        output += "\\n" + record("nulang", "skynet", 1110)
+        with self.assertRaisesRegex(RuntimeError, "duplicate.*skynet"):
+            cross_runtime_bench.parse_records(output, "nulang")
+
+    def test_rejects_changed_nulang_only_skynet_count(self):
+        output = valid_output() + "\\n" + record("nulang", "skynet", 1109)
+        with self.assertRaisesRegex(RuntimeError, "skynet.*expected 1110"):
+            cross_runtime_bench.parse_records(output, "nulang")
+
     def test_rejects_unknown_workload_instead_of_silently_ignoring_it(self):
         output = valid_output() + "\n" + record("nulang", "surprise", 100)
         with self.assertRaisesRegex(RuntimeError, "unexpected benchmark"):
