@@ -216,5 +216,7 @@ criterion_group!(
     benches,
     bench_orca_throughput,
     bench_orca_foreign_ref_send,
+    bench_actor_heap_small_alloc,
+    bench_orca_local_alloc_drop,
     bench_cycle_detection
 );
