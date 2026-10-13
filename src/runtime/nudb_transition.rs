@@ -183,6 +183,60 @@ impl NuDbTransitionJournal {
         }))
     }
 
+    /// Audit an actor's complete acknowledged transition chain before runtime
+    /// replay or publication of recovered state. A valid tail alone does not
+    /// establish that every intermediate transition survived.
+    ///
+    /// This is an explicit O(actor sequence) recovery operation, not a
+    /// per-commit hot-path check. It retains only one decoded record at a time,
+    /// performs no writes, and never repairs or silently skips missing data.
+    /// Callers must complete this audit before applying any recovered effects.
+    pub fn verify_actor_history(
+        &self,
+        actor_id: u64,
+    ) -> io::Result<Option<DurableTailPosition>> {
+        let Some(tail) = self.load_tail(actor_id)? else {
+            return Ok(None);
+        };
+        if tail.sequence > self.tablet.current_sequence() {
+            return Err(invalid_data(
+                "NuDB actor tail exceeds the tablet's committed sequence",
+            ));
+        }
+
+        let mut previous_epoch = 0;
+        for sequence in 1..=tail.sequence {
+            let record = self
+                .load_transition(actor_id, sequence)?
+                .ok_or_else(|| invalid_data("NuDB actor history has a missing transition"))?;
+            if record.expected_previous_sequence != sequence - 1 {
+                return Err(invalid_data("NuDB actor history predecessor mismatch"));
+            }
+            if record.activation_epoch < previous_epoch {
+                return Err(invalid_data("NuDB actor history activation epoch regressed"));
+            }
+            previous_epoch = record.activation_epoch;
+        }
+        if previous_epoch != tail.activation_epoch {
+            return Err(invalid_data(
+                "NuDB actor history final activation epoch disagrees with tail",
+            ));
+        }
+        // A rewritten or stale tail must not suppress an already committed
+        // next transition. This also catches orphaned next records before
+        // a future actor admission would attempt to reuse that sequence.
+        if let Some(next_sequence) = tail.sequence.checked_add(1) {
+            if self.load_transition(actor_id, next_sequence)?.is_some() {
+                return Err(invalid_data("NuDB actor transition exists beyond its tail"));
+            }
+        }
+
+        Ok(Some(DurableTailPosition {
+            activation_epoch: tail.activation_epoch,
+            sequence: tail.sequence,
+        }))
+    }
+
     pub fn load_transition(
         &self,
         actor_id: u64,
