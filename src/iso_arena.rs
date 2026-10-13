@@ -104,7 +104,6 @@ pub struct ArenaAllocationSnapshot {
     pub resets: usize,
 }
 
-
 /// Per-actor (per-activation) bump arena for message-scoped allocations.
 ///
 /// Objects are bump-allocated with a standard [`OrcaHeader`] prefix (so
