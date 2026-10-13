@@ -489,7 +489,6 @@ impl OrcaGc {
                 // SAFETY: object_header came from a live allocation; the
                 // coordinator only delivers ops for live objects.
                 unsafe { self.free_object(heap, payload_ptr) };
-
             }
         }
     }
