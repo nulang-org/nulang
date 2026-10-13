@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Playground request validation hardening — 2026-10-13
+- **The local playground HTTP handler now rejects negative Content-Length values before reading the request body.** This prevents read-until-EOF behavior on malformed lengths; wrong-type JSON source and compile-target values also return controlled HTTP errors instead of raising unhandled exceptions. Added focused parser regressions with in-memory request streams. This does not provide a production sandbox for untrusted code.
+
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
