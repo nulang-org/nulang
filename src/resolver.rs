@@ -413,11 +413,7 @@ mod tests {
                 },
             ],
         };
-        let result = resolve_imports(
-            &mut module,
-            &dir.join("main.nula"),
-            &mut HashSet::new(),
-        );
+        let result = resolve_imports(&mut module, &dir.join("main.nula"), &mut HashSet::new());
         std::fs::remove_dir_all(&dir).expect("remove fixture directory");
         result.expect("resolve both selections from the same imported file");
         let names: HashSet<&str> = module.decls.iter().filter_map(decl_name).collect();
@@ -447,12 +443,8 @@ mod tests {
                     span: sp(),
                 }],
             };
-            resolve_imports(
-                &mut module,
-                &dir.join("main.nula"),
-                &mut HashSet::new(),
-            )
-            .expect("resolve top-level import");
+            resolve_imports(&mut module, &dir.join("main.nula"), &mut HashSet::new())
+                .expect("resolve top-level import");
             module\n                .decls\n                .into_iter()\n                .filter_map(|d| decl_name(&d).map(str::to_string))\n                .collect::<Vec<_>>()
         };
         std::fs::write(&dep, "fn alpha() -> Int { 1 }").expect("write first revision");
