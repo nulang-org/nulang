@@ -2461,6 +2461,16 @@ fn nu_error_to_diagnostic(err: NuError) -> Vec<Diagnostic> {
 
 /// Build a single LSP Diagnostic from a non-Multiple NuError.
 fn single_diagnostic(err: NuError) -> Diagnostic {
+    let error_code = err
+        .stable_code()
+        .map(|code| NumberOrString::String(code.to_string()));
+    let capability_help = match &err {
+        NuError::CapError {
+            explanation: Some(explanation),
+            ..
+        } => Some(explanation.clone()),
+        _ => None,
+    };
     // Preserve the typechecker's exact in-scope suggestions for the editor,
     // rather than reconstructing them from the rendered error message.
     let candidates = match &err {
@@ -2513,12 +2523,18 @@ fn single_diagnostic(err: NuError) -> Diagnostic {
     Diagnostic {
         range: Range::new(start, end),
         severity: Some(DiagnosticSeverity::ERROR),
-        code: candidates
-            .as_ref()
-            .map(|_| NumberOrString::String("E0202".to_string())),
+        code: error_code,
         code_description: None,
         source: Some("nulang".to_string()),
-        message,
+        message: if let Some(help) = capability_help {
+            if message.contains(&help) {
+                message
+            } else {
+                format!("{message}\nhelp: {help}")
+            }
+        } else {
+            message
+        },
         related_information: None,
         tags: None,
         data: candidates.map(|names| serde_json::json!({ "similar_names": names })),
