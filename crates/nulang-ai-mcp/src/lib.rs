@@ -112,7 +112,7 @@ impl McpServer {
                 "tools/call" => self
                     .tools_call(req.params.unwrap_or_default())
                     .await
-                    .map_err(|message| (-32602, message)),
+                    .map_err(|message| (-32603, message)),
                 _ => Err((-32601, "Method not found".to_string())),
             }
         };
