@@ -360,7 +360,7 @@ mod tests {
     #[test]
     fn outstanding_query_never_dispatches_for_persistent_actors() {
         let mut rt = Runtime::new();
-        let actor_id = rt.spawn_persistent_actor(Box::new(Vec::new()), Default::default());
+        let actor_id = rt.spawn_persistent_actor(Box::new(|| Vec::new()), Default::default());
         rt.suspend_enabled = true;
         let outcome = rt.start_or_resume_db_query(
             actor_id,
@@ -399,7 +399,7 @@ mod tests {
         let mut rt = Runtime::new();
         rt.install_db_query_executor(BoundedDbQueryExecutor::new(vec![client], 2).unwrap())
             .unwrap();
-        let id = rt.spawn_actor(Box::new(Vec::new()));
+        let id = rt.spawn_actor(Box::new(|| Vec::new()));
         rt.suspend_enabled = true;
         let first = rt.start_or_resume_db_query(
             id,
@@ -433,7 +433,7 @@ mod tests {
         let mut rt = Runtime::new();
         rt.install_db_query_executor(BoundedDbQueryExecutor::new(vec![client], 2).unwrap())
             .unwrap();
-        let id = rt.spawn_actor(Box::new(Vec::new()));
+        let id = rt.spawn_actor(Box::new(|| Vec::new()));
         rt.suspend_enabled = true;
         let constants = [Constant::String("SELECT 42".into())];
         let args = [Value::string(0), Value::int(0)];
@@ -474,7 +474,7 @@ mod tests {
         let mut rt = Runtime::new();
         rt.install_db_query_executor(BoundedDbQueryExecutor::new(vec![client], 2).unwrap())
             .unwrap();
-        let id = rt.spawn_actor(Box::new(Vec::new()));
+        let id = rt.spawn_actor(Box::new(|| Vec::new()));
         rt.suspend_enabled = true;
         assert!(matches!(
             rt.start_or_resume_db_query(
@@ -500,7 +500,7 @@ mod tests {
     #[test]
     fn admission_without_pool_returns_an_explicit_error() {
         let mut rt = Runtime::new();
-        let id = rt.spawn_actor(Box::new(Vec::new()));
+        let id = rt.spawn_actor(Box::new(|| Vec::new()));
         rt.suspend_enabled = true;
         let result = rt.start_or_resume_db_query(
             id,
