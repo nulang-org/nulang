@@ -122,6 +122,14 @@ range intersects it, and the source still matches the exact misspelled
 identifier. Multiple candidates are choices, not automatic edits. The
 server never fabricates fixes for reference-capability or effect violations.
 
+Function hover now distinguishes explicitly declared effect annotations
+from the **inferred checked effect row**, when a fresh compiler result is
+available. Effect and reference-capability inlay tooltips explain the
+difference between requested operations, aliasing/transfer constraints,
+and external authority. A pending diagnostics pass suppresses cached
+inferred effect rows; these explanations never grant authority or alter
+the inferred types.
+
 Reference-capability diagnostics also display their structured
 `explanation` when available, without changing capability inference or
 permissions. Quick fixes require explicit editor selection: compilation and
