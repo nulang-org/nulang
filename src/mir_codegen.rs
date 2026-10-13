@@ -2969,6 +2969,28 @@ mod tests {
     }
 
     #[test]
+    fn test_fold_function_does_not_revisit_unchanged_nan_constant() {
+        let mut builder = mir::FunctionBuilder::new("nan_no_fold", Some(Type::float()));
+        let result = builder.add_temp(Type::float());
+        builder.assign(result, mir::RValue::Const(Constant::Float(f64::NAN)));
+        builder.terminate(mir::Terminator::Return(Some(result)));
+        let mut function = builder.build();
+        let float_locals = vec![true; function.locals.len()];
+
+        assert!(
+            !fold_function(&mut function, &std::collections::HashMap::new(), &float_locals),
+            "unchanged NaN constants must not force the optimizer to its iteration cap"
+        );
+        assert!(matches!(
+            &function.blocks[0].stmts[0],
+            mir::Stmt::Assign {
+                op: mir::RValue::Const(Constant::Float(value)),
+                ..
+            } if value.is_nan()
+        ));
+    }
+
+    #[test]
     fn test_fold_function_reports_change_when_division_folds_to_nil() {
         let mut builder = mir::FunctionBuilder::new("nil_fold", Some(Type::int()));
         let numerator = builder.add_param("numerator", Type::int());
