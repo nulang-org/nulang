@@ -98,7 +98,12 @@ fn main() {
             .init();
     }
 
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().collect();
+    // A simpler spelling for the existing type-check path. Keep its option
+    // parser, diagnostics, and JSON output completely unchanged.
+    if args.get(1).map(String::as_str) == Some("check") {
+        args[1] = "--check".to_string();
+    }
 
     if args.len() <= 1 {
         // If stdin is piped, execute as a script; otherwise start REPL.
@@ -260,8 +265,21 @@ fn main() {
         }
     }
 
-    if args[1] == "nula" {
-        if let Err(e) = nulang::package::commands::run(&args[2..]) {
+    // Reuse the package-manager dispatch instead of implementing duplicate
+    // commands. Retain `nula` and the distinct legacy `init <name>` action.
+    if args[1] == "nula"
+        || matches!(
+            args[1].as_str(),
+            "new" | "build" | "build-wasm" | "test" | "run" | "add" | "remove"
+                | "list" | "clean" | "watch" | "dev" | "doc" | "publish" | "deploy"
+        )
+    {
+        let package_args = if args[1] == "nula" {
+            &args[2..]
+        } else {
+            &args[1..]
+        };
+        if let Err(e) = nulang::package::commands::run(package_args) {
             print_error(&e, true);
             std::process::exit(exit_code(&e));
         }
@@ -1122,7 +1140,7 @@ fn print_help() {
     println!("Usage: nulang [OPTIONS] <FILE>");
     println!("       nulang --repl");
     println!("       nulang --eval <CODE>");
-    println!("       nulang --check <FILE>");
+    println!("       nulang check <FILE>  (or --check <FILE>)");
     println!("       nulang --lsp");
     println!("       nulang --dap");
     println!("       nulang fmt [--check] [<file>]");
@@ -1173,9 +1191,9 @@ fn print_help() {
     println!(
         "  --verify <src>   When running a .nbc artifact, verify its source hash against <src>"
     );
-    println!(
-        "  nula <cmd>       Package manager (new, init, build, build-wasm, test, run, add, remove, watch, doc, list, clean)"
-    );
+    println!("  <cmd>            Package commands: new, build, test, run, add, remove,");
+    println!("                   list, clean, watch, dev, doc, publish, deploy");
+    println!("  nula <cmd>       Legacy spelling (also supports init and build-wasm)");
     println!("  --version, -V    Print version and exit");
     println!("  init <name>      Scaffold experiment");
     println!("  --watch <file>   Re-run on changes");
