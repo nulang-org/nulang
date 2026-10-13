@@ -25,8 +25,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BENCHMARKS = ("counting", "ping_pong", "thread_ring", "fork_join")
+# These four workloads are part of the matched Savina-style contract.
+# Additional Nulang-only [cross-bench] or [ab-bench] probes remain allowed.
+EXPECTED_MESSAGES = {
+    "counting": 200_000,
+    "ping_pong": 40_001,
+    "thread_ring": 20_000,
+    "fork_join": 100_000,
+}
 RECORD_RE = re.compile(
-    r"\[cross-bench\]\s+runtime=nulang\s+"
+    r"\[cross-bench\]\s+runtime=(?P<runtime>[a-z0-9_-]+)\s+"
     r"benchmark=(?P<benchmark>[a-z0-9_-]+)\s+"
     r"messages=(?P<messages>\d+)\s+elapsed_ns=(?P<elapsed_ns>\d+)"
 )
@@ -102,17 +110,51 @@ def maybe_output(command: list[str], *, cwd: Path = ROOT) -> str | None:
 
 
 def parse_records(output: str) -> dict[str, dict[str, int]]:
+    """Fail closed on ambiguous or invalid timed measurements.
+
+    Cargo's --nocapture output can prefix a benchmark record with a test name,
+    so search within each line rather than requiring the marker at column zero.
+    All four matched workloads must be present exactly once. Additional
+    Nulang-only probes are allowed, but they must also be well formed and
+    unique within an invocation.
+    """
     rows: dict[str, dict[str, int]] = {}
-    for match in RECORD_RE.finditer(output):
-        rows[match.group("benchmark")] = {
-            "messages": int(match.group("messages")),
-            "elapsed_ns": int(match.group("elapsed_ns")),
-        }
-    for match in AB_RECORD_RE.finditer(output):
-        rows["ab/" + match.group("benchmark")] = {
-            "messages": int(match.group("messages")),
-            "elapsed_ns": int(match.group("elapsed_ns")),
-        }
+    for line in output.splitlines():
+        if "[cross-bench]" in line:
+            match = RECORD_RE.search(line)
+            if match is None:
+                raise RuntimeError("malformed cross-bench record: " + line)
+            if match.group("runtime") != "nulang":
+                raise RuntimeError(
+                    "unexpected runtime " + repr(match.group("runtime"))
+                    + " in cross-bench record"
+                )
+            name = match.group("benchmark")
+            messages = int(match.group("messages"))
+            if name in EXPECTED_MESSAGES and messages != EXPECTED_MESSAGES[name]:
+                raise RuntimeError(
+                    f"{name}: got {messages} messages; "
+                    f"expected {EXPECTED_MESSAGES[name]}"
+                )
+        elif "[ab-bench]" in line:
+            match = AB_RECORD_RE.search(line)
+            if match is None:
+                raise RuntimeError("malformed ab-bench record: " + line)
+            name = "ab/" + match.group("benchmark")
+            messages = int(match.group("messages"))
+        else:
+            continue
+
+        if name in rows:
+            raise RuntimeError(f"duplicate benchmark record: {name}")
+        elapsed_ns = int(match.group("elapsed_ns"))
+        if messages <= 0:
+            raise RuntimeError(f"{name}: operations must be positive")
+        if elapsed_ns <= 0:
+            raise RuntimeError(f"{name}: elapsed_ns must be positive")
+
+        rows[name] = {"messages": messages, "elapsed_ns": elapsed_ns}
+
     missing = [name for name in BENCHMARKS if name not in rows]
     if missing:
         raise RuntimeError(
@@ -122,7 +164,6 @@ def parse_records(output: str) -> dict[str, dict[str, int]]:
             + output
         )
     return rows
-
 
 def measurement_affinity(cpu_mode: str) -> set[int] | None:
     if cpu_mode == "host":
