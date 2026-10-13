@@ -201,7 +201,13 @@ impl Runtime {
                 _ => false,
             };
             if !valid {
-                self.db_pending.remove(&actor_id);
+                if let Some(stale) = self.db_pending.remove(&actor_id) {
+                    if let Some(actor) = self.actors.get_mut(&actor_id) {
+                        if actor.db_operation_id == Some(stale.token) {
+                            actor.db_operation_id = None;
+                        }
+                    }
+                }
                 continue;
             }
             let (_, result) = completion.into_result();
@@ -288,7 +294,7 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{BlockingSubmitError, OwnedDbQueryClient};
+    use crate::runtime::OwnedDbQueryClient;
     use std::sync::{Arc, Barrier, Mutex};
     use std::time::{Duration, Instant};
 
@@ -386,6 +392,83 @@ mod tests {
         }
         assert!(rt.db_pending.is_empty());
         assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn completed_query_is_consumed_exactly_once_and_preserves_rows() {
+        let started = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let calls = Arc::new(Mutex::new(0));
+        let client = Box::new(FakeClient {
+            started: started.clone(),
+            release: release.clone(),
+            calls: calls.clone(),
+        });
+        let mut rt = Runtime::new();
+        rt.install_db_query_executor(BoundedDbQueryExecutor::new(vec![client], 2).unwrap())
+            .unwrap();
+        let id = rt.spawn_actor(Box::new(Vec::new()));
+        rt.suspend_enabled = true;
+        let constants = [Constant::String("SELECT 42".into())];
+        let args = [Value::string(0)];
+        assert!(matches!(
+            rt.start_or_resume_db_query(id, &constants, &args),
+            PerformAsyncResult::Pending
+        ));
+        started.wait();
+        release.wait();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while rt.db_pending.get(&id).is_some_and(|p| p.completed.is_none())
+            && Instant::now() < deadline
+        {
+            rt.poll_db_query_completions();
+            std::thread::yield_now();
+        }
+        let completed = rt.start_or_resume_db_query(id, &constants, &args);
+        match completed {
+            PerformAsyncResult::Ready(Some(encoded)) => {
+                assert_eq!(encoded, r#"{"status":"ok","rows":[[42]]}"#);
+            }
+            other => panic!("unexpected SQL result: {other:?}"),
+        }
+        assert!(!rt.db_pending.contains_key(&id));
+        assert_eq!(rt.actors[&id].db_operation_id, None);
+        assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn changed_activation_epoch_discards_old_sql_completion() {
+        let started = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let client = Box::new(FakeClient {
+            started: started.clone(),
+            release: release.clone(),
+            calls: Arc::new(Mutex::new(0)),
+        });
+        let mut rt = Runtime::new();
+        rt.install_db_query_executor(BoundedDbQueryExecutor::new(vec![client], 2).unwrap())
+            .unwrap();
+        let id = rt.spawn_actor(Box::new(Vec::new()));
+        rt.suspend_enabled = true;
+        assert!(matches!(
+            rt.start_or_resume_db_query(
+                id,
+                &[Constant::String("SELECT 42".into())],
+                &[Value::string(0)]
+            ),
+            PerformAsyncResult::Pending
+        ));
+        started.wait();
+        rt.actors.get_mut(&id).unwrap().activation_epoch += 1;
+        release.wait();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !rt.db_pending.is_empty() && Instant::now() < deadline {
+            rt.poll_db_query_completions();
+            std::thread::yield_now();
+        }
+        assert!(rt.db_pending.is_empty());
+        assert!(rt.db_ticket_actors.is_empty());
+        assert_eq!(rt.actors[&id].db_operation_id, None);
     }
 
     #[test]
