@@ -9,7 +9,7 @@
 //! by `nula build --web` and `nula dev`. It is intentionally conservative:
 //! it only reports dependencies that are statically visible in the same module.
 
-use crate::ast::{AstModule, Decl, Expr, Literal};
+use crate::ast::{AstModule, Decl, Expr, Literal, Pattern};
 use crate::effect_checker::EffectChecker;
 use crate::types::{Effect, EffectRow, Span};
 pub use nulang_ui_protocol::ActionPlacement;
@@ -186,14 +186,60 @@ pub fn analyze_module(module: &AstModule, checker: Option<&EffectChecker>) -> Si
         }
     }
 
-    // Pass 2: scan function bodies for HTML expressions and action attributes.
+    // Pass 2: resolve function-local names before scanning HTML expressions.
     for decl in &module.decls {
-        if let Decl::Function { body, .. } = decl {
-            scan_expr(body, &mut Vec::new(), false, &signals, &mut graph, checker);
+        if let Decl::Function {
+            body,
+            params,
+            using_params,
+            ..
+        } = decl
+        {
+            let visible = without_bindings(
+                &signals,
+                params.iter().chain(using_params).map(|param| param.name.as_str()),
+            );
+            scan_expr(body, &mut Vec::new(), false, &visible, &mut graph, checker);
         }
     }
 
     graph
+}
+
+/// Remove local bindings from the visible global signals. Resolve lexical names
+/// in the compiler pass rather than letting a similarly named local capture a
+/// browser-side global signal binding.
+fn without_bindings<'a>(
+    signals: &HashSet<String>,
+    names: impl IntoIterator<Item = &'a str>,
+) -> HashSet<String> {
+    let mut visible = signals.clone();
+    for name in names {
+        visible.remove(name);
+    }
+    visible
+}
+
+fn pattern_bindings(pattern: &Pattern, names: &mut Vec<String>) {
+    match pattern {
+        Pattern::Var(name) => names.push(name.clone()),
+        Pattern::Alias(name, nested) => {
+            names.push(name.clone());
+            pattern_bindings(nested, names);
+        }
+        Pattern::Tuple(parts) => {
+            for part in parts {
+                pattern_bindings(part, names);
+            }
+        }
+        Pattern::Record(fields) => {
+            for (_, part) in fields {
+                pattern_bindings(part, names);
+            }
+        }
+        Pattern::Variant(_, Some(inner)) => pattern_bindings(inner, names),
+        Pattern::Wild | Pattern::Lit(_) | Pattern::Variant(_, None) => {}
+    }
 }
 
 /// Scan an expression for signal reads and action attributes.
@@ -267,16 +313,29 @@ fn scan_expr(
             });
         }
 
-        Expr::Lambda { body, .. } => scan_expr(body, path, in_html, signals, graph, checker),
+        Expr::Lambda { params, body, .. } => {
+            let visible = without_bindings(signals, params.iter().map(|p| p.name.as_str()));
+            scan_expr(body, path, in_html, &visible, graph, checker);
+        },
         Expr::App { func, args, .. } => {
             scan_expr(func, path, in_html, signals, graph, checker);
             for arg in args {
                 scan_expr(arg, path, in_html, signals, graph, checker);
             }
         }
-        Expr::Let { value, body, .. } | Expr::LetRec { value, body, .. } => {
+        Expr::Let { name, value, body, .. } => {
             scan_expr(value, path, in_html, signals, graph, checker);
-            scan_expr(body, path, in_html, signals, graph, checker);
+            let visible = without_bindings(signals, std::iter::once(name.as_str()));
+            scan_expr(body, path, in_html, &visible, graph, checker);
+        }
+        Expr::LetRec { name, params, value, body, .. } => {
+            let visible = without_bindings(signals, std::iter::once(name.as_str()));
+            let recursive = without_bindings(
+                &visible,
+                params.iter().map(|p| p.name.as_str()),
+            );
+            scan_expr(value, path, in_html, &recursive, graph, checker);
+            scan_expr(body, path, in_html, &visible, graph, checker);
         }
         Expr::If {
             cond,
@@ -294,11 +353,14 @@ fn scan_expr(
             scrutinee, arms, ..
         } => {
             scan_expr(scrutinee, path, in_html, signals, graph, checker);
-            for (_, guard, body) in arms {
+            for (pattern, guard, body) in arms {
+                let mut names = Vec::new();
+                pattern_bindings(pattern, &mut names);
+                let visible = without_bindings(signals, names.iter().map(String::as_str));
                 if let Some(guard) = guard {
-                    scan_expr(guard, path, in_html, signals, graph, checker);
+                    scan_expr(guard, path, in_html, &visible, graph, checker);
                 }
-                scan_expr(body, path, in_html, signals, graph, checker);
+                scan_expr(body, path, in_html, &visible, graph, checker);
             }
         }
         Expr::Block { exprs, .. } | Expr::Par { exprs, .. } => {
@@ -334,9 +396,10 @@ fn scan_expr(
             scan_expr(left, path, in_html, signals, graph, checker);
             scan_expr(right, path, in_html, signals, graph, checker);
         }
-        Expr::For { iterable, body, .. } => {
+        Expr::For { var, iterable, body, .. } => {
             scan_expr(iterable, path, in_html, signals, graph, checker);
-            scan_expr(body, path, in_html, signals, graph, checker);
+            let visible = without_bindings(signals, std::iter::once(var.as_str()));
+            scan_expr(body, path, in_html, &visible, graph, checker);
         }
         Expr::While { cond, body, .. } => {
             scan_expr(cond, path, in_html, signals, graph, checker);
@@ -365,7 +428,8 @@ fn scan_expr(
         Expr::Handle { body, handlers, .. } => {
             scan_expr(body, path, in_html, signals, graph, checker);
             for h in handlers {
-                scan_expr(&h.body, path, in_html, signals, graph, checker);
+                let visible = without_bindings(signals, h.params.iter().map(String::as_str));
+                scan_expr(&h.body, path, in_html, &visible, graph, checker);
             }
         }
         Expr::Perform { args, .. } => {
@@ -393,11 +457,16 @@ fn scan_expr(
             }
         }
         Expr::Receive { arms, after, .. } => {
-            for (_, _, guard, body) in arms {
-                if let Some(guard) = guard {
-                    scan_expr(guard, path, in_html, signals, graph, checker);
+            for (_, patterns, guard, body) in arms {
+                let mut names = Vec::new();
+                for pattern in patterns {
+                    pattern_bindings(pattern, &mut names);
                 }
-                scan_expr(body, path, in_html, signals, graph, checker);
+                let visible = without_bindings(signals, names.iter().map(String::as_str));
+                if let Some(guard) = guard {
+                    scan_expr(guard, path, in_html, &visible, graph, checker);
+                }
+                scan_expr(body, path, in_html, &visible, graph, checker);
             }
             if let Some((t, b)) = after {
                 scan_expr(t, path, in_html, signals, graph, checker);
@@ -542,8 +611,18 @@ pub fn rewrite_module(module: &mut AstModule, checker: Option<&EffectChecker>) {
         }
     }
     for decl in &mut module.decls {
-        if let Decl::Function { body, .. } = decl {
-            rewrite_expr(body, false, &signals, checker);
+        if let Decl::Function {
+            body,
+            params,
+            using_params,
+            ..
+        } = decl
+        {
+            let visible = without_bindings(
+                &signals,
+                params.iter().chain(using_params).map(|param| param.name.as_str()),
+            );
+            rewrite_expr(body, false, &visible, checker);
         }
     }
 }
@@ -613,16 +692,29 @@ fn rewrite_expr(
         }
 
         // Recurse through other expression forms.
-        Expr::Lambda { body, .. } => rewrite_expr(body, in_html, signals, checker),
+        Expr::Lambda { params, body, .. } => {
+            let visible = without_bindings(signals, params.iter().map(|p| p.name.as_str()));
+            rewrite_expr(body, in_html, &visible, checker);
+        },
         Expr::App { func, args, .. } => {
             rewrite_expr(func, in_html, signals, checker);
             for arg in args.iter_mut() {
                 rewrite_expr(arg, in_html, signals, checker);
             }
         }
-        Expr::Let { value, body, .. } | Expr::LetRec { value, body, .. } => {
+        Expr::Let { name, value, body, .. } => {
             rewrite_expr(value, in_html, signals, checker);
-            rewrite_expr(body, in_html, signals, checker);
+            let visible = without_bindings(signals, std::iter::once(name.as_str()));
+            rewrite_expr(body, in_html, &visible, checker);
+        }
+        Expr::LetRec { name, params, value, body, .. } => {
+            let visible = without_bindings(signals, std::iter::once(name.as_str()));
+            let recursive = without_bindings(
+                &visible,
+                params.iter().map(|p| p.name.as_str()),
+            );
+            rewrite_expr(value, in_html, &recursive, checker);
+            rewrite_expr(body, in_html, &visible, checker);
         }
         Expr::If {
             cond,
@@ -640,11 +732,14 @@ fn rewrite_expr(
             scrutinee, arms, ..
         } => {
             rewrite_expr(scrutinee, in_html, signals, checker);
-            for (_, guard, body) in arms {
+            for (pattern, guard, body) in arms {
+                let mut names = Vec::new();
+                pattern_bindings(pattern, &mut names);
+                let visible = without_bindings(signals, names.iter().map(String::as_str));
                 if let Some(guard) = guard {
-                    rewrite_expr(guard, in_html, signals, checker);
+                    rewrite_expr(guard, in_html, &visible, checker);
                 }
-                rewrite_expr(body, in_html, signals, checker);
+                rewrite_expr(body, in_html, &visible, checker);
             }
         }
         Expr::Block { exprs, .. } | Expr::Par { exprs, .. } => {
@@ -680,9 +775,10 @@ fn rewrite_expr(
             rewrite_expr(left, in_html, signals, checker);
             rewrite_expr(right, in_html, signals, checker);
         }
-        Expr::For { iterable, body, .. } => {
+        Expr::For { var, iterable, body, .. } => {
             rewrite_expr(iterable, in_html, signals, checker);
-            rewrite_expr(body, in_html, signals, checker);
+            let visible = without_bindings(signals, std::iter::once(var.as_str()));
+            rewrite_expr(body, in_html, &visible, checker);
         }
         Expr::While { cond, body, .. } => {
             rewrite_expr(cond, in_html, signals, checker);
@@ -711,7 +807,8 @@ fn rewrite_expr(
         Expr::Handle { body, handlers, .. } => {
             rewrite_expr(body, in_html, signals, checker);
             for h in handlers.iter_mut() {
-                rewrite_expr(&mut h.body, in_html, signals, checker);
+                let visible = without_bindings(signals, h.params.iter().map(String::as_str));
+                rewrite_expr(&mut h.body, in_html, &visible, checker);
             }
         }
         Expr::Perform { args, .. } => {
@@ -739,11 +836,16 @@ fn rewrite_expr(
             }
         }
         Expr::Receive { arms, after, .. } => {
-            for (_, _, guard, body) in arms {
-                if let Some(guard) = guard {
-                    rewrite_expr(guard, in_html, signals, checker);
+            for (_, patterns, guard, body) in arms {
+                let mut names = Vec::new();
+                for pattern in patterns {
+                    pattern_bindings(pattern, &mut names);
                 }
-                rewrite_expr(body, in_html, signals, checker);
+                let visible = without_bindings(signals, names.iter().map(String::as_str));
+                if let Some(guard) = guard {
+                    rewrite_expr(guard, in_html, &visible, checker);
+                }
+                rewrite_expr(body, in_html, &visible, checker);
             }
             if let Some((t, b)) = after {
                 rewrite_expr(t, in_html, signals, checker);
