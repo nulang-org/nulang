@@ -27,7 +27,11 @@
         "kind": "checked-effect-row",
         "effect": "Inference"
       },
-      "replay_class": "journal-result"
+      "replay_class": "journal-result",
+      "source": {
+        "effect": "Inference",
+        "operation": "ask"
+      }
     },
     {
       "canonical_id": "nulang.host-effects/v0alpha1:nulang:storage/string#Write",
@@ -52,7 +56,11 @@
         "kind": "checked-effect-row",
         "effect": "Storage"
       },
-      "replay_class": "journal-result"
+      "replay_class": "journal-result",
+      "source": {
+        "effect": "Storage",
+        "operation": "write"
+      }
     },
     {
       "canonical_id": "nulang.host-effects/v0alpha1:nulang:storage/string#Read",
@@ -75,7 +83,11 @@
         "kind": "checked-effect-row",
         "effect": "Storage"
       },
-      "replay_class": "journal-result"
+      "replay_class": "journal-result",
+      "source": {
+        "effect": "Storage",
+        "operation": "read"
+      }
     },
     {
       "canonical_id": "nulang.host-effects/v0alpha1:nulang:storage/string#Delete",
@@ -97,7 +109,11 @@
         "kind": "checked-effect-row",
         "effect": "Storage"
       },
-      "replay_class": "journal-result"
+      "replay_class": "journal-result",
+      "source": {
+        "effect": "Storage",
+        "operation": "delete"
+      }
     },
     {
       "canonical_id": "nulang.host-effects/v0alpha1:nulang:queue/string#Send",
@@ -122,7 +138,11 @@
         "kind": "checked-effect-row",
         "effect": "Queue"
       },
-      "replay_class": "journal-result"
+      "replay_class": "journal-result",
+      "source": {
+        "effect": "Queue",
+        "operation": "push"
+      }
     },
     {
       "canonical_id": "nulang.host-effects/v0alpha1:nulang:queue/string#Receive",
@@ -145,7 +165,11 @@
         "kind": "checked-effect-row",
         "effect": "Queue"
       },
-      "replay_class": "journal-result"
+      "replay_class": "journal-result",
+      "source": {
+        "effect": "Queue",
+        "operation": "pop"
+      }
     },
     {
       "canonical_id": "nulang.host-effects/v0alpha1:nulang:http/string#GET",
@@ -170,7 +194,11 @@
         "kind": "checked-effect-row",
         "effect": "Http"
       },
-      "replay_class": "journal-result"
+      "replay_class": "journal-result",
+      "source": {
+        "effect": "Http",
+        "operation": "get"
+      }
     },
     {
       "canonical_id": "nulang.host-effects/v0alpha1:nulang:timer/timer#sleep",
@@ -191,7 +219,11 @@
         "kind": "checked-effect-row",
         "effect": "Timer"
       },
-      "replay_class": "journal-result"
+      "replay_class": "journal-result",
+      "source": {
+        "effect": "Timer",
+        "operation": "sleep"
+      }
     },
     {
       "canonical_id": "nulang.host-effects/v0alpha1:nulang:comms/comms#send",
@@ -234,7 +266,11 @@
         "kind": "checked-effect-row",
         "effect": "Comms"
       },
-      "replay_class": "external-requires-idempotency-key"
+      "replay_class": "external-requires-idempotency-key",
+      "source": {
+        "effect": "Comms",
+        "operation": "send"
+      }
     },
     {
       "canonical_id": "nulang.host-effects/v0alpha1:nulang:comms/comms#call",
@@ -265,7 +301,11 @@
         "kind": "checked-effect-row",
         "effect": "Comms"
       },
-      "replay_class": "external-nonreplayable"
+      "replay_class": "external-nonreplayable",
+      "source": {
+        "effect": "Comms",
+        "operation": "call"
+      }
     },
     {
       "canonical_id": "nulang.host-effects/v0alpha1:nulang:agent/agent#create",
@@ -293,7 +333,11 @@
         "kind": "checked-effect-row",
         "effect": "Agent"
       },
-      "replay_class": "journal-result"
+      "replay_class": "journal-result",
+      "source": {
+        "effect": "Agent",
+        "operation": "create"
+      }
     },
     {
       "canonical_id": "nulang.host-effects/v0alpha1:nulang:agent/agent#send",
@@ -318,7 +362,11 @@
         "kind": "checked-effect-row",
         "effect": "Agent"
       },
-      "replay_class": "journal-result"
+      "replay_class": "journal-result",
+      "source": {
+        "effect": "Agent",
+        "operation": "send"
+      }
     },
     {
       "canonical_id": "nulang.host-effects/v0alpha1:nulang:agent/agent#state",
@@ -340,7 +388,11 @@
         "kind": "checked-effect-row",
         "effect": "Agent"
       },
-      "replay_class": "journal-result"
+      "replay_class": "journal-result",
+      "source": {
+        "effect": "Agent",
+        "operation": "state"
+      }
     },
     {
       "canonical_id": "nulang.host-effects/v0alpha1:nulang:agent/agent#list",
@@ -359,7 +411,11 @@
         "kind": "checked-effect-row",
         "effect": "Agent"
       },
-      "replay_class": "journal-result"
+      "replay_class": "journal-result",
+      "source": {
+        "effect": "Agent",
+        "operation": "list"
+      }
     },
     {
       "canonical_id": "nulang.host-effects/v0alpha1:nulang:agent/agent#delete",
@@ -381,7 +437,11 @@
         "kind": "checked-effect-row",
         "effect": "Agent"
       },
-      "replay_class": "journal-result"
+      "replay_class": "journal-result",
+      "source": {
+        "effect": "Agent",
+        "operation": "delete"
+      }
     },
     {
       "canonical_id": "nulang.host-effects/v0alpha1:nulang:agent/agent#remember",
@@ -409,7 +469,11 @@
         "kind": "checked-effect-row",
         "effect": "Agent"
       },
-      "replay_class": "journal-result"
+      "replay_class": "journal-result",
+      "source": {
+        "effect": "Agent",
+        "operation": "remember"
+      }
     },
     {
       "canonical_id": "nulang.host-effects/v0alpha1:nulang:agent/agent#recall",
@@ -437,7 +501,11 @@
         "kind": "checked-effect-row",
         "effect": "Agent"
       },
-      "replay_class": "journal-result"
+      "replay_class": "journal-result",
+      "source": {
+        "effect": "Agent",
+        "operation": "recall"
+      }
     }
   ]
 }

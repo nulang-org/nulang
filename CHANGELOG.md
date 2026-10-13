@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Compiler-owned host-effect source identity — 2026-09-25
+- **The experimental `nulang.host-effects/v0alpha1` descriptor now exports structured source effect/operation identity alongside canonical host IDs.** Compatibility adapters such as Nulang Cloud can generate source-name bridges from compiler-owned data instead of maintaining an independent semantic mapping.
+- **Canonical host identity remains the execution contract.** Source identity is exported for adapter generation and conformance tooling; it does not replace the versioned `effect_id` / `operation_id` pair.
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
