@@ -87,7 +87,7 @@ before running a model evaluation.
 
 The report includes, per model:
 
-- `coverage` = recorded attempts / (tasks × trials)
+- `manifest_sha256` = SHA-256 of the exact manifest bytes; only compare runs\n  with the same task and protocol identity, or document intentional differences\n- `coverage` = recorded attempts / (tasks × trials)
 - `success_rate_observed` = compiler-and-test successes / recorded attempts
 - `success_rate_all_tasks` = successes / expected attempts (missing = not passed)
 - `tokens_per_success` = all spent tokens, including failed attempts, divided
