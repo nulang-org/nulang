@@ -113,14 +113,23 @@ export default {
           return new Response('Unauthorized', { status: 401 });
         }
 
-        // Quota hooks need a byte count, which chunked transfers (no
-        // Content-Length) cannot provide pre-flight. Reject them rather than
-        // reporting size_bytes: 0 and letting the quota check be bypassed.
-        if (env.QUOTA_HOOK_URL && !request.headers.has('Content-Length')) {
-          return new Response(
-            'Length Required: Content-Length header required when quota hook is enabled',
-            { status: 411 }
-          );
+        // Do not accept unbounded chunked package uploads, regardless of
+        // whether a billing quota hook has been configured.
+        const lengthHeader = request.headers.get('Content-Length');
+        if (lengthHeader === null) {
+          return new Response('Length Required: Content-Length is required for package uploads', {
+            status: 411,
+          });
+        }
+        if (!/^[0-9]+$/.test(lengthHeader)) {
+          return new Response('Bad Request: invalid Content-Length', { status: 400 });
+        }
+        const sizeBytes = Number(lengthHeader);
+        if (!Number.isSafeInteger(sizeBytes) || sizeBytes <= 0) {
+          return new Response('Bad Request: invalid Content-Length', { status: 400 });
+        }
+        if (sizeBytes > 64 * 1024 * 1024) {
+          return new Response('Payload Too Large: package upload exceeds 64 MiB', { status: 413 });
         }
 
         // Check if version already exists
@@ -134,7 +143,7 @@ export default {
           env,
           name,
           version,
-          Number(request.headers.get('Content-Length') ?? 0)
+          sizeBytes
         );
         if (quotaRejection) {
           return quotaRejection;
