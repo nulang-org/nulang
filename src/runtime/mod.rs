@@ -63,6 +63,9 @@ mod ai_impls;
 pub(crate) mod callbacks;
 pub mod crdt;
 pub mod db_query;
+pub mod db_executor;
+#[cfg(feature = "postgres")]
+mod postgres_query_client;
 pub mod crdt_manager;
 pub mod crdt_reg;
 mod distribution;
@@ -107,6 +110,12 @@ pub(crate) use callbacks::{BytecodeDistributedCallbacks, BytecodeRuntimeCallback
 pub use cluster::*;
 pub use crdt::*;
 pub use db_query::{DbQueryError, DbQueryErrorCode, DbQueryOutcome};
+pub use db_executor::{
+    BoundedDbQueryExecutor, DbQueryCompletion, DbQueryTicket, OwnedDbParam, OwnedDbQuery,
+    OwnedDbQueryClient,
+};
+#[cfg(feature = "postgres")]
+pub use postgres_query_client::PostgresOwnedQueryClient;
 pub use crdt_manager::*;
 pub use crdt_reg::{LWWRegister, MVRegister, RGAElement, RGA};
 pub use distributed::*;

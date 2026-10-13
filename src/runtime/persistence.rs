@@ -2788,7 +2788,7 @@ where
 }
 
 #[cfg(feature = "postgres")]
-fn postgres_column_to_json(row: &postgres::Row, index: usize) -> io::Result<serde_json::Value> {
+pub(crate) fn postgres_column_to_json(row: &postgres::Row, index: usize) -> io::Result<serde_json::Value> {
     use postgres::types::Type;
 
     let data_type = row.columns()[index].type_();
