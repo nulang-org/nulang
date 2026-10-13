@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Workflow runtime control protocol — 2026-09-25
+- **Added the experimental `nulang-workflow-control/v0alpha1` transport-neutral protocol.** Hosts can start, inspect, signal, cancel, and query Nulang-owned workflows through opaque workflow identifiers without importing runtime internals.
+- **The protocol separates runtime semantics from hosting concerns.** It carries lifecycle snapshots, wait reasons, query results, idempotency keys, and explicit retryable error codes, but no Cloud workflow graph, actor-local ID, persistence record, or transport implementation.
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
