@@ -7,9 +7,10 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 thread_local! {
-    /// Cache of fully resolved import declarations keyed by canonical file path.
-    /// Cleared at the start of every top-level `resolve_imports` call so that
-    /// repeated compilations in the same process do not reuse stale ASTs.
+    /// Cache of complete, unfiltered resolved declarations, keyed by canonical
+    /// file path. Each import applies its own requested item selection after
+    /// lookup, so a prior selective import cannot hide later declarations.
+    /// Cleared at the start of each top-level resolve to avoid stale ASTs.
     static IMPORT_CACHE: RefCell<BTreeMap<PathBuf, Vec<Decl>>> = const { RefCell::new(BTreeMap::new()) };
 }
 
@@ -53,7 +54,7 @@ pub fn resolve_imports(
         // If the file has already been fully resolved in this compilation,
         // reuse its cached declarations.
         if let Some(cached) = IMPORT_CACHE.with(|c| c.borrow().get(&resolved_canonical).cloned()) {
-            merge_imported_decls(module, cached, import_path, true)?;
+            merge_imported_decls(module, filter_decls(cached, items), import_path, true)?;
             continue;
         }
 
@@ -85,17 +86,19 @@ pub fn resolve_imports(
 
         resolve_imports(&mut imported, &resolved_canonical, stack)?;
 
-        let imported_decls = if items.is_empty() {
-            imported.decls
-        } else {
-            filter_decls(imported.decls, items)
-        };
-
+        // Store the full resolved module. Caching a filtered selection under
+        // a file-only key would make later imports lose requested symbols.
+        let imported_decls = imported.decls;
         IMPORT_CACHE.with(|c| {
             c.borrow_mut()
                 .insert(resolved_canonical, imported_decls.clone())
         });
-        merge_imported_decls(module, imported_decls, import_path, false)?;
+        merge_imported_decls(
+            module,
+            filter_decls(imported_decls, items),
+            import_path,
+            false,
+        )?;
     }
     module.decls.retain(|d| !matches!(d, Decl::Import { .. }));
     stack.remove(&canonical_file);
