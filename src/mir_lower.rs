@@ -1448,8 +1448,29 @@ impl<'c> FnLowerer<'c> {
                 // Durable actors are rejected by the runtime until SQL effect
                 // receipts/replay are defined.
                 if effect == "DB" && op == "query_checked_async" {
-                    let mut sql_args = Vec::with_capacity(args.len());
-                    for arg in args {
+                    // The VM passes a full register frame to PerformAsync,
+                    // not a variable-length argument slice. Stage the exact
+                    // number of SQL parameters as a compiler-owned Int in r1.
+                    // Layout: r0=SQL, r1=param_count, r2..=parameters.
+                    if args.len() > 255 {
+                        return Err(compile_err(
+                            "DB.query_checked_async supports at most 254 parameters".to_string(),
+                            Span::default(),
+                        ));
+                    }
+                    let mut sql_args = Vec::with_capacity(args.len() + 1);
+                    if let Some(sql) = args.first() {
+                        sql_args.push(self.lower_operand(sql)?);
+                    } else {
+                        sql_args.push(self.unit_temp());
+                    }
+                    let count = self.b.add_temp(Type::int());
+                    self.b.assign(
+                        count,
+                        mir::RValue::Const(Constant::Int(args.len().saturating_sub(1) as i64)),
+                    );
+                    sql_args.push(count);
+                    for arg in args.iter().skip(1) {
                         sql_args.push(self.lower_operand(arg)?);
                     }
                     self.b.assign(
