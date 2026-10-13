@@ -187,3 +187,38 @@ fn compiler_timeout_returns_tool_error_instead_of_blocking_session() {
         .contains("timed out"));
     assert_eq!(responses[2]["result"], json!({}));
 }
+
+
+#[cfg(unix)]
+#[test]
+fn compiler_stdout_is_limited_during_capture_not_after_allocation() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = temp_workspace();
+    std::fs::write(root.join("large.nula"), "let x = 1\n").unwrap();
+    let compiler = root.join("oversized-compiler");
+    std::fs::write(
+        &compiler,
+        "#!/bin/sh\ndd if=/dev/zero bs=1048576 count=5 2>/dev/null\n",
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&compiler).unwrap().permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&compiler, permissions).unwrap();
+    let responses = run_messages_with_timeout(
+        &[
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"nulang_check","arguments":{"path":"large.nula"}}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"ping"}),
+        ],
+        &root,
+        &compiler,
+        std::time::Duration::from_secs(5),
+    );
+    assert_eq!(responses.len(), 3);
+    assert_eq!(responses[1]["result"]["isError"], true);
+    assert!(responses[1]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("4 MiB output limit"));
+    assert_eq!(responses[2]["result"], json!({}));
+}
