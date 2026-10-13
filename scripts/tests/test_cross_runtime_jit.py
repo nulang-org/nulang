@@ -85,8 +85,20 @@ class JitExecutionContract(unittest.TestCase):
         # Warm up all three backends equally before timing. Only JIT requires
         # proof that its one-message loop compiled native code.
         self.assertLess(
+            body.index("let compiled_before ="),
             body.index('rt.borrow_mut().send_message(actor_id, "work", &[]);'),
-            body.index("if backend == Backend::Jit {"),
+        )
+        self.assertLess(
+            body.index('rt.borrow_mut().send_message(actor_id, "work", &[]);'),
+            body.index('warm_and_verify_jit(&rt, "actor_compute")'),
+        )
+        self.assertLess(
+            body.index('warm_and_verify_jit(&rt, "actor_compute")'),
+            body.index('set_state_field("total", Value::int(0))'),
+        )
+        self.assertLess(
+            body.index('set_state_field("total", Value::int(0))'),
+            body.index("let start = Instant::now();"),
         )
         self.assertLess(
             body.index('warm_and_verify_jit(&rt, "actor_compute")'),
