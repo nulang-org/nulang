@@ -1,1 +1,1 @@
-{"exit_code":0,"stdout":"any_even=1\nany_none=0\nany_empty=0\nall_pos=1\nall_mixed=0\nall_empty=1\nfind_even=2\nfind_miss=-1","stderr":""}
+{"exit_code":0,"stdout":"any_even=1\nany_none=0\nany_empty=0\nall_pos=1\nall_mixed=0\nall_empty=1\nfind_even=2\nfind_miss=None","stderr":""}
