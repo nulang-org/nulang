@@ -105,20 +105,21 @@ The existing `nulang init <name>` experiment command is unchanged;
 package initialization still uses `nulang nula init`.
 
 
-A pre-built release binary needs no Rust toolchain. To build from source, use
-Rust 1.95.0:
+An installed release binary can be run as `nulang` when it is on your
+`PATH`. For a **fresh source checkout**, use Rust 1.95.0 and invoke the
+just-built binary at its actual location. This repository configures Cargo's
+target directory as `/tmp/cargo-target` in `.cargo/config.toml` (unless you
+override it with `CARGO_TARGET_DIR`):
 
 ```bash
 git clone https://github.com/nulang-org/nulang.git
 cd nulang
 cargo build --release
-```
-
-```bash
-nulang hello.nula              # compile + run
-nulang --check hello.nula      # type-check only
-nulang --eval '40 + 2'         # evaluate inline code
-nulang --repl                  # interactive REPL
+NULANG_BIN="${CARGO_TARGET_DIR:-/tmp/cargo-target}/release/nulang"
+"$NULANG_BIN" examples/01_hello.nula         # compile + run a checked-in example
+"$NULANG_BIN" --check examples/01_hello.nula # type-check only
+"$NULANG_BIN" --eval '40 + 2'                # evaluate inline code
+"$NULANG_BIN" --repl                         # interactive REPL
 ```
 
 A Nulang program:
