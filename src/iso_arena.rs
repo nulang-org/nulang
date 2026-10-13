@@ -724,11 +724,11 @@ mod tests {
         // into it without the ORCA retain barrier.
         let m = send_module(
             vec![
-                Instruction::new0(OpCode::Nop),          // 0: empty state
-                Instruction::new1(OpCode::Const0, 0),    // 1: empty state
-                arr_alloc(0, 1),                         // 2: outer container
-                arr_alloc(0, 2),                         // 3: heap child
-                Instruction::new3(OpCode::ArrStore, 1, 0, 2), // 4: outer[0] = child
+                Instruction::new0(OpCode::Nop),
+                Instruction::new1(OpCode::Const0, 0),
+                arr_alloc(0, 1),
+                arr_alloc(0, 2),
+                Instruction::new3(OpCode::ArrStore, 1, 0, 2),
                 Instruction::new1(OpCode::Drop, 1),
                 Instruction::new1(OpCode::Drop, 2),
                 Instruction::new0(OpCode::Halt),
