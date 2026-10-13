@@ -15,6 +15,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+# PR code is untrusted; only the main-branch benchmark history job needs writes.
+permissions:
+  contents: read
+
 jobs:
   # -----------------------------------------------------------------------
   # Documentation site + zero-install browser playground
