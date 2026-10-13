@@ -322,6 +322,45 @@ mod tests {
     }
 
     #[test]
+    fn safe_registry_archive_rejects_duplicate_paths() {
+        let root = fresh_root("duplicate");
+        let dest = root.join(".nula/registry/util-0.1.0");
+        let bytes = archive_with_files(&[
+            ("Nulang.toml", "[package]\nname = \"util\"\nversion = \"0.1.0\"\n"),
+            ("Nulang.toml", "[package]\nname = \"evil\"\nversion = \"0.1.0\"\n"),
+        ]);
+        assert!(extract_registry_archive(&bytes, &dest, "util", "0.1.0").is_err());
+        assert!(!dest.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn safe_registry_archive_limits_entry_count() {
+        let root = fresh_root("entry_count");
+        let dest = root.join(".nula/registry/util-0.1.0");
+        let gzip = flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        );
+        let mut tar = tar::Builder::new(gzip);
+        for index in 0..=MAX_ENTRIES {
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o644);
+            header.set_size(0);
+            header.set_cksum();
+            tar.append_data(
+                &mut header,
+                format!("src/file{}.nula", index),
+                std::io::empty(),
+            ).unwrap();
+        }
+        let bytes = tar.into_inner().unwrap().finish().unwrap();
+        assert!(extract_registry_archive(&bytes, &dest, "util", "0.1.0").is_err());
+        assert!(!dest.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn safe_registry_archive_rejects_truncated_gzip_without_cache() {
         let root = fresh_root("truncated");
         let dest = root.join(".nula/registry/util-0.1.0");
@@ -336,11 +375,6 @@ mod tests {
     fn safe_registry_archive_rejects_oversized_entry_before_writing_it() {
         let root = fresh_root("size");
         let dest = root.join(".nula/registry/util-0.1.0");
-        let gzip = flate2::write::GzEncoder::new(
-            Vec::new(),
-            flate2::Compression::default(),
-        );
-        let mut tar = tar::Builder::new(gzip);
         let mut header = tar::Header::new_gnu();
         header.set_path("huge.nula").unwrap();
         header.set_mode(0o644);
@@ -355,7 +389,6 @@ mod tests {
         );
         gz.write_all(&raw).unwrap();
         let bytes = gz.finish().unwrap();
-        let _ = tar; // Header construction uses tar's supported format.
         assert!(extract_registry_archive(&bytes, &dest, "util", "0.1.0").is_err());
         assert!(!dest.exists());
         let _ = std::fs::remove_dir_all(&root);
