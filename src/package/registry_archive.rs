@@ -200,8 +200,7 @@ pub fn extract_registry_archive(
     )))
 }
 
-//! Safe extraction of untrusted Nula registry archives.
-//! The archive is staged separately and only promoted after full validation.
+// Regression tests for archive validation and staging behavior.
 
 #[cfg(test)]
 mod tests {
