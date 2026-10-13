@@ -187,6 +187,10 @@ pub struct MetricsExporter {
     gc_bytes_allocated: opentelemetry::metrics::Counter<u64>,
     gc_bytes_freed: opentelemetry::metrics::Counter<u64>,
     gc_cycles_detected: opentelemetry::metrics::Counter<u64>,
+    allocator_heap_allocations: opentelemetry::metrics::Gauge<u64>,
+    allocator_heap_requested_bytes: opentelemetry::metrics::Gauge<u64>,
+    allocator_heap_live_objects: opentelemetry::metrics::Gauge<u64>,
+    allocator_arena_epoch_allocations: opentelemetry::metrics::Gauge<u64>,
     resolver_local: opentelemetry::metrics::Counter<u64>,
     resolver_remote: opentelemetry::metrics::Counter<u64>,
     resolver_failed: opentelemetry::metrics::Counter<u64>,
@@ -220,6 +224,18 @@ impl MetricsExporter {
             gc_bytes_allocated: meter.u64_counter("nulang.gc.bytes.allocated").init(),
             gc_bytes_freed: meter.u64_counter("nulang.gc.bytes.freed").init(),
             gc_cycles_detected: meter.u64_counter("nulang.gc.cycles.detected").init(),
+            allocator_heap_allocations: meter
+                .u64_gauge("nulang.allocator.heap.allocations_since_reset")
+                .init(),
+            allocator_heap_requested_bytes: meter
+                .u64_gauge("nulang.allocator.heap.requested_payload_bytes_since_reset")
+                .init(),
+            allocator_heap_live_objects: meter
+                .u64_gauge("nulang.allocator.heap.live_objects")
+                .init(),
+            allocator_arena_epoch_allocations: meter
+                .u64_gauge("nulang.allocator.arena.epoch_allocations")
+                .init(),
             resolver_local: meter.u64_counter("nulang.resolver.local").init(),
             resolver_remote: meter.u64_counter("nulang.resolver.remote").init(),
             resolver_failed: meter.u64_counter("nulang.resolver.failed").init(),
@@ -315,6 +331,18 @@ impl MetricsExporter {
             g.cycles_detected,
             p_g.map(|p| p.cycles_detected),
         );
+
+        // Actor churn and allocator resets can decrease these snapshots,
+        // so export absolute gauges rather than OTLP counters with deltas.
+        let a = &snap.allocator;
+        self.allocator_heap_allocations
+            .record(a.heap_allocations_since_reset, &[]);
+        self.allocator_heap_requested_bytes
+            .record(a.heap_requested_payload_bytes_since_reset, &[]);
+        self.allocator_heap_live_objects
+            .record(a.heap_live_objects, &[]);
+        self.allocator_arena_epoch_allocations
+            .record(a.arena_epoch_allocations, &[]);
 
         let r = &snap.resolver;
         let p_r = prev_ref.map(|p| &p.resolver);
