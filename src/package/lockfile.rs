@@ -367,6 +367,77 @@ mod tests {
     }
 
     #[test]
+    fn registry_integrity_save_records_full_cached_tree_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "nula_registry_identity_save_{}", std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let registry_dir = root.join(".nula/registry/util-0.1.0");
+        std::fs::create_dir_all(&registry_dir).unwrap();
+        std::fs::write(
+            registry_dir.join("Nulang.toml"),
+            "[package]\nname = \"util\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(registry_dir.join("module.nula"), "fn main() { 1 }").unwrap();
+        std::fs::write(registry_dir.join("icon.svg"), "<svg/>").unwrap();
+
+        let mut lock = Lockfile::new();
+        lock.package.push(LockedPackage {
+            name: "util".to_string(),
+            version: "0.1.0".to_string(),
+            source: "reg+https://registry.test".to_string(),
+            content_hash: String::new(),
+            commit: String::new(),
+        });
+        lock.save(&root).unwrap();
+        let persisted = Lockfile::load(&root).unwrap();
+        let pin = persisted
+            .package_identity("util", "0.1.0", "reg+https://registry.test")
+            .expect("registry cache must have a strong identity");
+        assert!(pin.parsed_source_id().unwrap().is_some());
+        persisted
+            .verify_cached_registry_source_identities(&root)
+            .expect("unchanged cached registry package must verify");
+
+        std::fs::write(registry_dir.join("icon.svg"), "<svg>modified</svg>").unwrap();
+        assert!(
+            persisted.verify_cached_registry_source_identities(&root).is_err(),
+            "non-.nula assets must also be part of the registry integrity digest"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn registry_integrity_missing_identity_fails_closed() {
+        let root = std::env::temp_dir().join(format!(
+            "nula_registry_identity_absent_{}", std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let registry_dir = root.join(".nula/registry/util-0.1.0");
+        std::fs::create_dir_all(&registry_dir).unwrap();
+        std::fs::write(
+            registry_dir.join("Nulang.toml"),
+            "[package]\nname = \"util\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let mut legacy_lock = Lockfile::new();
+        legacy_lock.package.push(LockedPackage {
+            name: "util".to_string(),
+            version: "0.1.0".to_string(),
+            source: "reg+https://registry.test".to_string(),
+            content_hash: String::new(),
+            commit: String::new(),
+        });
+        assert!(
+            legacy_lock.verify_cached_registry_source_identities(&root).is_err(),
+            "a legacy registry lockfile without an identity must not be trusted offline"
+        );
+        assert!(registry_dir.join("Nulang.toml").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn test_lockfile_toml_round_trip() {
         let lockfile = sample_lockfile();
         let toml_text = lockfile.to_toml().expect("lockfile should serialize");
