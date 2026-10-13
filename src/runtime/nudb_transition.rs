@@ -177,7 +177,10 @@ impl NuDbTransitionJournal {
 
     /// Validate, serialize, and append the full transition plus its actor tail
     /// as a single durable NuDB write before publishing either key.
-    pub fn commit_transition(&mut self, transition: DurableTransition) -> io::Result<DurableCommit> {
+    pub fn commit_transition(
+        &mut self,
+        transition: DurableTransition,
+    ) -> io::Result<DurableCommit> {
         let digest = transition.digest()?;
         let envelope = TransitionEnvelope::encode(&transition, digest)?;
         let tail = self.load_tail(transition.actor_id)?;
