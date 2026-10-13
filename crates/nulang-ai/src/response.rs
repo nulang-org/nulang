@@ -135,6 +135,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tool_arguments_accept_valid_json_objects() {
+        let object = serde_json::json!({"query": "Nulang"});
+        let from_object = parse_tool_arguments(object.clone()).unwrap();
+        let from_string = parse_tool_arguments(serde_json::Value::String(object.to_string())).unwrap();
+        assert_eq!(from_object, from_string);
+        assert_eq!(from_object["query"], "Nulang");
+        assert!(parse_tool_arguments(serde_json::json!("{}")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn tool_arguments_reject_malformed_json() {
+        let err = parse_tool_arguments(serde_json::json!("{broken")).unwrap_err();
+        assert_eq!(err.kind, LlmErrorKind::FormatError);
+    }
+
+    #[test]
+    fn tool_arguments_reject_non_object_payloads() {
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!(42),
+            serde_json::json!([]),
+            serde_json::json!("[1, 2]"),
+            serde_json::json!("null"),
+        ] {
+            let err = parse_tool_arguments(value).unwrap_err();
+            assert_eq!(err.kind, LlmErrorKind::FormatError);
+        }
+    }
+
+    #[test]
     fn test_llm_response_construction() {
         let response = LlmResponse {
             content: Some("Hello".to_string()),
