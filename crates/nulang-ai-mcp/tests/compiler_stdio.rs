@@ -222,3 +222,23 @@ fn compiler_stdout_is_limited_during_capture_not_after_allocation() {
         .contains("4 MiB output limit"));
     assert_eq!(responses[2]["result"], json!({}));
 }
+
+
+#[test]
+fn malformed_initialize_does_not_authorize_subsequent_requests() {
+    let root = temp_workspace();
+    let replies = run_messages(
+        &[
+            json!({"jsonrpc":"1.0","id":1,"method":"initialize","params":{}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+            json!({"jsonrpc":"2.0","id":3,"method":"initialize","params":{}}),
+            json!({"jsonrpc":"2.0","id":4,"method":"tools/list"}),
+        ],
+        &root,
+    );
+    assert_eq!(replies.len(), 4);
+    assert_eq!(replies[0]["error"]["code"], -32600);
+    assert_eq!(replies[1]["error"]["code"], -32000);
+    assert_eq!(replies[2]["result"]["protocolVersion"], "2025-11-25");
+    assert!(replies[3]["result"]["tools"].is_array());
+}
