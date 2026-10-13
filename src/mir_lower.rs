@@ -1454,7 +1454,7 @@ impl<'c> FnLowerer<'c> {
                     // Layout: r0=SQL, r1=param_count, r2..=parameters.
                     if args.len() > 11 {
                         return Err(compile_err(
-                            "DB.query_checked_async supports at most 254 parameters".to_string(),
+                            "DB.query_checked_async supports at most 10 parameters".to_string(),
                             Span::default(),
                         ));
                     }
