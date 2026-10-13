@@ -1,17 +1,84 @@
 use crate::ast::{AstModule, Decl};
-use crate::lexer::Lexer;
+use crate::lexer::{Lexer, Token};
 use crate::parser::Parser;
 use crate::types::{NuError, NuResult, Span};
 use std::cell::RefCell;
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 thread_local! {
-    /// Cache of complete, unfiltered resolved declarations, keyed by canonical
-    /// file path. Each import applies its own requested item selection after
-    /// lookup, so a prior selective import cannot hide later declarations.
-    /// Cleared at the start of each top-level resolve to avoid stale ASTs.
+    /// Fully resolved declarations are only reused within one top-level build.
+    /// Parsed ASTs contain process-global fresh TypeVar identities and parser
+    /// type lookup can read imports; neither can be reused across builds safely.
     static IMPORT_CACHE: RefCell<BTreeMap<PathBuf, Vec<Decl>>> = const { RefCell::new(BTreeMap::new()) };
+
+    /// Only context-independent lexer tokens survive across builds. Source
+    /// content is read and hashed on every request; parsing always runs fresh.
+    static TOKEN_CACHE: RefCell<BTreeMap<PathBuf, CachedTokens>> = const { RefCell::new(BTreeMap::new()) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static TOKEN_CACHE_HITS: Cell<usize> = const { Cell::new(0) };
+}
+
+const MAX_TOKEN_CACHE_FILES: usize = 64;
+const MAX_TOKEN_CACHE_SOURCE_BYTES: usize = 128 * 1024;
+const MAX_TOKEN_CACHE_TOKENS: usize = 8192;
+
+struct CachedTokens {
+    fingerprint: blake3::Hash,
+    tokens: Vec<Token>,
+}
+
+/// Reuse context-independent tokens only when the exact source bytes match.
+/// Always re-read the file and re-run the parser so imported type definitions
+/// and globally fresh parser type variables are never reused incorrectly.
+fn lex_import_tokens(path: &Path, source: &str) -> NuResult<Vec<Token>> {
+    let eligible = source.len() <= MAX_TOKEN_CACHE_SOURCE_BYTES;
+    let fingerprint = blake3::hash(source.as_bytes());
+    if eligible {
+        let cached = TOKEN_CACHE.with(|cache| {
+            cache
+                .borrow()
+                .get(path)
+                .filter(|entry| entry.fingerprint == fingerprint)
+                .map(|entry| entry.tokens.clone())
+        });
+        if let Some(tokens) = cached {
+            // Lexer::new installs the source map. Repeat that side effect on
+            // hits or later diagnostics can point into an unrelated file.
+            let _ = Lexer::new(source);
+            #[cfg(test)]
+            TOKEN_CACHE_HITS.with(|hits| hits.set(hits.get() + 1));
+            return Ok(tokens);
+        }
+    }
+
+    let tokens = Lexer::new(source).lex()?;
+    TOKEN_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if eligible && tokens.len() <= MAX_TOKEN_CACHE_TOKENS {
+            if !cache.contains_key(path) && cache.len() >= MAX_TOKEN_CACHE_FILES {
+                // Deterministic bounded eviction, no unbounded daemon memory.
+                if let Some(oldest_key) = cache.keys().next().cloned() {
+                    cache.remove(&oldest_key);
+                }
+            }
+            cache.insert(
+                path.to_path_buf(),
+                CachedTokens {
+                    fingerprint,
+                    tokens: tokens.clone(),
+                },
+            );
+        } else {
+            cache.remove(path);
+        }
+    });
+    Ok(tokens)
 }
 
 pub fn resolve_imports(
@@ -70,8 +137,7 @@ pub fn resolve_imports(
             msg: format!("cannot read '{}': {}", import_path, e),
             span: Span::default(),
         })?;
-        let tokens = Lexer::new(&source)
-            .lex()
+        let tokens = lex_import_tokens(&resolved_canonical, &source)
             .map_err(|e| NuError::RuntimeError {
                 msg: format!("lex error in '{}': {}", import_path, e),
                 span: Span::default(),
