@@ -2,6 +2,7 @@
 //! Counters reflect successful allocator requests, not OS allocations or RSS.
 use nulang::iso_arena::IsoArena;
 use nulang::runtime::heap::{ActorHeap, TypeTag};
+use nulang::runtime::Actor;
 
 #[test]
 fn heap_counts_bump_los_and_free_list_reuse_without_double_counting_frees() {
@@ -107,4 +108,29 @@ fn allocator_snapshot_json_exposes_counters_not_eligibility_guesses() {
     assert_eq!(json["allocations"], 1);
     assert_eq!(json["epoch_allocations"], 1);
     assert_eq!(json["requested_payload_bytes"], 5);
+}
+
+#[test]
+fn actor_snapshot_keeps_heap_and_arena_lifetimes_separate() {
+    let mut actor = Actor::new(42, "metrics", 16);
+    actor.heap.alloc(11, TypeTag::Raw).expect("actor heap alloc");
+    actor.iso_arena.alloc(7, TypeTag::Raw).expect("actor arena alloc");
+
+    let first = actor.allocation_snapshot();
+    assert_eq!(first.actor_id, 42);
+    assert_eq!(first.heap.allocations, 1);
+    assert_eq!(first.heap.requested_payload_bytes, 11);
+    assert_eq!(first.arena.allocations, 1);
+    assert_eq!(first.arena.requested_payload_bytes, 7);
+
+    // Actor pooling resets heap counters, but an arena epoch reset preserves
+    // its lifetime counters. The snapshot must never combine those scopes.
+    actor.reset(43, "reused", 16);
+    let recycled = actor.allocation_snapshot();
+    assert_eq!(recycled.actor_id, 43);
+    assert_eq!(recycled.heap.allocations, 0);
+    assert_eq!(recycled.heap.requested_payload_bytes, 0);
+    assert_eq!(recycled.arena.allocations, 1);
+    assert_eq!(recycled.arena.epoch_allocations, 0);
+    assert!(recycled.arena.resets >= 1);
 }
