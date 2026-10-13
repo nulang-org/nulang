@@ -7,6 +7,7 @@ use std::cell::RefCell;
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 thread_local! {
     /// Fully resolved declarations are only reused within one top-level build.
@@ -24,6 +25,19 @@ thread_local! {
     static TOKEN_CACHE_HITS: Cell<usize> = const { Cell::new(0) };
 }
 
+/// Diagnostic/benchmark opt-out, selected once per process before the first
+/// imported module is lexed. This is also a rollback switch if reuse regresses.
+static DISABLE_IMPORT_TOKEN_CACHE: OnceLock<bool> = OnceLock::new();
+
+fn import_token_cache_disabled() -> bool {
+    *DISABLE_IMPORT_TOKEN_CACHE.get_or_init(|| {
+        std::env::var("NULANG_DISABLE_IMPORT_TOKEN_CACHE")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
+}
+
 const MAX_TOKEN_CACHE_FILES: usize = 64;
 const MAX_TOKEN_CACHE_SOURCE_BYTES: usize = 128 * 1024;
 const MAX_TOKEN_CACHE_TOKENS: usize = 8192;
@@ -37,6 +51,10 @@ struct CachedTokens {
 /// Always re-read the file and re-run the parser so imported type definitions
 /// and globally fresh parser type variables are never reused incorrectly.
 fn lex_import_tokens(path: &Path, source: &str) -> NuResult<Vec<Token>> {
+    if import_token_cache_disabled() {
+        return Lexer::new(source).lex();
+    }
+
     let eligible = source.len() <= MAX_TOKEN_CACHE_SOURCE_BYTES;
     let fingerprint = blake3::hash(source.as_bytes());
     if eligible {
