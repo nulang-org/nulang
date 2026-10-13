@@ -390,4 +390,80 @@ mod tests {
         );
         std::env::remove_var("NULANG_MODULE_PATH");
     }
+
+    // Import identity must be about the declaration's origin, not its short
+    // name or structurally identical source text.
+    fn resolve_fixture(main_source: &str, imported: &[(&str, &str)]) -> NuResult<AstModule> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+        let n = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_nominal_import_{}_{}", std::process::id(), n
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let main_file = dir.join("main.nula");
+        std::fs::write(&main_file, main_source).unwrap();
+        for (name, contents) in imported {
+            std::fs::write(dir.join(format!("{name}.nula")), contents).unwrap();
+        }
+        let tokens = Lexer::new(main_source).lex().unwrap();
+        let mut module = Parser::new(tokens).parse_module().unwrap();
+        let result = resolve_imports(&mut module, &main_file, &mut HashSet::new())
+            .map(|()| module);
+        std::fs::remove_dir_all(dir).unwrap();
+        result
+    }
+
+    #[test]
+    fn independent_opaque_types_with_same_name_must_conflict() {
+        let err = resolve_fixture(
+            "import \"first\"\nimport \"second\"\n",
+            &[
+                ("first", "opaque type Token = Int\n"),
+                ("second", "opaque type Token = Int\n"),
+            ],
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("import conflict"));
+        assert!(format!("{err}").contains("Token"));
+    }
+
+    #[test]
+    fn imported_type_cannot_silently_shadow_local_type() {
+        let err = resolve_fixture(
+            "opaque type Token = Int\nimport \"foreign\"\n",
+            &[("foreign", "opaque type Token = Int\n")],
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("import conflict"));
+    }
+
+    #[test]
+    fn repeated_import_of_same_type_origin_is_idempotent() {
+        let module = resolve_fixture(
+            "import \"shared\"\nimport \"shared\"\n",
+            &[("shared", "opaque type Token = Int\n")],
+        )
+        .unwrap();
+        assert_eq!(
+            module.decls.iter().filter(|d| decl_name(d) == Some("Token")).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn transitive_reexport_of_same_type_origin_is_idempotent() {
+        let module = resolve_fixture(
+            "import \"shared\"\nimport \"wrapper\"\n",
+            &[
+                ("shared", "opaque type Token = Int\n"),
+                ("wrapper", "import \"shared\"\n"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            module.decls.iter().filter(|d| decl_name(d) == Some("Token")).count(),
+            1
+        );
+    }
 }
