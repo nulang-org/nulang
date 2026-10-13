@@ -191,6 +191,31 @@ impl MetricsSnapshot {
             a.arena_epoch_allocations
         );
 
+        // These are observations of already-recorded OrcaGc operations.
+        // Active actor counts can disappear on actor exit, so these must
+        // be gauges instead of monotonic counters or rate() inputs.
+        let o = &self.orca_traffic;
+        allocator_gauge!(
+            "nulang_orca_local_refs_created_active",
+            "Local reference creates recorded by active ORCA GC engines",
+            o.local_refs_created
+        );
+        allocator_gauge!(
+            "nulang_orca_local_refs_dropped_active",
+            "Local reference drops recorded by active ORCA GC engines",
+            o.local_refs_dropped
+        );
+        allocator_gauge!(
+            "nulang_orca_foreign_refs_sent_active",
+            "Foreign reference sends recorded by active ORCA GC engines",
+            o.foreign_refs_sent
+        );
+        allocator_gauge!(
+            "nulang_orca_foreign_refs_received_active",
+            "Foreign reference receives recorded by active ORCA GC engines",
+            o.foreign_refs_received
+        );
+
         // Resolver counters
         let r = &self.resolver;
         counter!(
