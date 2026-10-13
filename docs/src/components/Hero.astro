@@ -185,6 +185,9 @@ const starter = homepageExamples[0].code;
 		}
 
 		async function execute() {
+			// Keyboard shortcuts can fire while the first WASM load is pending.
+			// Respect the same disabled state as the Run button.
+			if (run.disabled) return;
 			if (!wasm) {
 				try {
 					await loadCompiler();
