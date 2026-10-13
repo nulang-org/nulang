@@ -277,3 +277,59 @@ pub fn uniq(xs: [Int]) -> [Int] {
     };
     result
 }
+
+// ---------------------------------------------------------------------------
+// Single-pass, composable transforms (experimental)
+//
+// A transform wraps a reducer rather than creating an intermediate array.
+// Transform construction does not visit the input.  transduce traverses the
+// source once; collect_transduced materializes only the final result.
+//
+// These combinators preserve source order and callback evaluation order. They
+// are an allocation-avoiding library foundation, NOT yet a zero-overhead
+// compiler optimization: closure calls still require specialization/inlining.
+// ---------------------------------------------------------------------------
+
+/// Identity transform: forward every value to the reducer unchanged.
+pub fn identity_transform() {
+    fn(reducer) { reducer }
+}
+
+/// Transform each element before passing it to the downstream reducer.
+pub fn mapping(f) {
+    fn(reducer) {
+        fn(acc, value) { reducer(acc, f(value)) }
+    }
+}
+
+/// Skip elements not accepted by predicate, without constructing an array.
+pub fn filtering(predicate) {
+    fn(reducer) {
+        fn(acc, value) {
+            if predicate(value) then reducer(acc, value) else acc
+        }
+    }
+}
+
+/// Compose transforms in processing order: first, then second.
+pub fn chain_transforms(first, second) {
+    fn(reducer) { first(second(reducer)) }
+}
+
+/// Fold a collection once through a composed transform, without intermediate
+/// arrays. The accumulator belongs to the caller and is passed by value.
+pub fn transduce(xs, transform, init, reducer) {
+    let step = transform(reducer);
+    var acc = init;
+    for x in xs {
+        acc = step(acc, x)
+    };
+    acc
+}
+
+/// Materialize only the final array after running a composed transform.
+pub fn collect_transduced(xs, transform) {
+    transduce(xs, transform, [], fn(acc, value) {
+        perform Array.push(acc, value)
+    })
+}
