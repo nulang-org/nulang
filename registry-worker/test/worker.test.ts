@@ -173,3 +173,38 @@ describe('publisher signature transport', () => {
     }]);
   });
 });
+
+describe('signed package download', () => {
+  function envWithObject(signature?: string): Env {
+    return makeEnv({
+      BUCKET: {
+        get: async () => ({
+          body: new Blob(['tarball-bytes']).stream(),
+          customMetadata: signature === undefined ? {} : { nulaSignature: signature },
+          writeHttpMetadata: (_headers: Headers) => {},
+        }),
+      } as unknown as Env['BUCKET'],
+    });
+  }
+
+  it('returns the publisher signature with the exact archive bytes', async () => {
+    const signature = 'cd'.repeat(64);
+    const response = await worker.fetch(
+      new Request('http://localhost/api/v1/packages/foo/1.0.0'),
+      envWithObject(signature),
+      {} as ExecutionContext,
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get('X-Nula-Signature')).toBe(signature);
+    expect(await response.text()).toBe('tarball-bytes');
+  });
+
+  it('does not serve a legacy unsigned registry object', async () => {
+    const response = await worker.fetch(
+      new Request('http://localhost/api/v1/packages/foo/1.0.0'),
+      envWithObject(),
+      {} as ExecutionContext,
+    );
+    expect(response.status).toBe(409);
+  });
+});
