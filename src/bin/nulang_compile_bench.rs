@@ -2,7 +2,7 @@
 //!
 //! This deliberately excludes CLI startup, prelude injection, import resolution,
 //! native linking, execution, and JIT compilation. It is not an end-to-end
-//! \`nulang\` or apples-to-apples Go build benchmark.
+//! `nulang` or apples-to-apples Go build benchmark.
 
 use std::env;
 use std::process::ExitCode;
