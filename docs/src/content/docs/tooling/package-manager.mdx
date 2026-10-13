@@ -292,7 +292,11 @@ nulang nula build-wasm
 ```
 
 `nula build-wasm` compiles the entry point with the WASM backend and emits
-`<name>.wasm` plus an AOT-compiled `<name>.cwasm` into `.nula/dist/`.
+`<name>.wasm`, an AOT-compiled `<name>.cwasm`, and
+`<name>.behavior.json` into `.nula/dist/`. The RFC 0020 sidecar is derived
+from the same typed HIR/MIR as the executable and is cryptographically bound to
+the exact canonical `.wasm` bytes; the host-specific `.cwasm` is a
+precompiled derivative, not the manifest identity target.
 
 :::caution
 This requires a `nulang` binary built with the `wasm-backend` cargo feature

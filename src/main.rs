@@ -577,8 +577,19 @@ fn main() {
     }
 
     if opts.emit_behavior_manifest.is_some() && !opts.emit_nbc {
-        eprintln!("Error: --emit-behavior-manifest currently requires --emit-nbc");
-        std::process::exit(1);
+        let artifact_wasm = matches!(opts.backend.as_str(), "wasm" | "wasm-aot");
+        let normal_file_build = !positional.is_empty()
+            && opts.eval_code.is_none()
+            && opts.check_file.is_none()
+            && opts.watch.is_none()
+            && !opts.repl
+            && opts.bench_count.is_none();
+        if !artifact_wasm || !normal_file_build {
+            eprintln!(
+                "Error: --emit-behavior-manifest requires --emit-nbc or a direct file build with --backend wasm|wasm-aot"
+            );
+            std::process::exit(1);
+        }
     }
 
     // Resolve color mode once after all args are parsed.
@@ -963,7 +974,7 @@ fn main() {
                 std::process::exit(exit_code(&e));
             }
         } else {
-            if let Err(e) = run_source(
+            if let Err(e) = run_source_with_manifest(
                 &source,
                 Some(path),
                 opts.verbose,
@@ -974,6 +985,9 @@ fn main() {
                 &opts.with_capabilities,
                 opts.store_path.as_deref(),
                 opts.deny_warnings,
+                opts.emit_behavior_manifest.as_deref(),
+                opts.behavior_package_name.as_deref(),
+                opts.behavior_package_version.as_deref(),
             ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
@@ -1168,7 +1182,7 @@ fn print_help() {
         println!("  --out <file>     Output file for WASM backends (default: out.wasm)");
     }
     println!("  --out <file>     Output path for --emit-nbc (default: <FILE> with .nbc extension)");
-    println!("  --emit-behavior-manifest <file>  Emit RFC 0020 durable-schema behavior sidecar");
+    println!("  --emit-behavior-manifest <file>  Emit RFC 0020 behavior sidecar bound to .nbc/.wasm bytes");
     println!("  <FILE>.nbc       Run a pre-compiled .nbc artifact directly (no compiler invoked)");
     println!(
         "  --verify <src>   When running a .nbc artifact, verify its source hash against <src>"
@@ -1787,7 +1801,6 @@ fn run_frontend(
     Ok((ast, type_checker))
 }
 
-#[cfg_attr(not(feature = "wasm-backend"), allow(unused_variables))]
 fn run_source(
     source: &str,
     file_path: Option<&str>,
@@ -1799,6 +1812,101 @@ fn run_source(
     with_capabilities: &[String],
     store_path: Option<&str>,
     deny_warnings: bool,
+) -> NuResult<()> {
+    run_source_with_manifest(
+        source,
+        file_path,
+        verbose,
+        backend,
+        out_file,
+        metrics_port,
+        target,
+        with_capabilities,
+        store_path,
+        deny_warnings,
+        None,
+        None,
+        None,
+    )
+}
+
+#[cfg(feature = "wasm-backend")]
+fn emit_wasm_behavior_manifest(
+    source: &str,
+    hir: &nulang::hir::Module,
+    mir: &nulang::mir::Module,
+    wasm_bytes: &[u8],
+    manifest_path: &str,
+    behavior_package_name: Option<&str>,
+    behavior_package_version: Option<&str>,
+) -> NuResult<()> {
+    let artifact_identity = nulang::compiler_identity::artifact_identity_for_typed_program(
+        Some(source.as_bytes()),
+        hir,
+        mir,
+        [],
+        concat!("nulang-rust-", env!("CARGO_PKG_VERSION")),
+        "wasm32-core",
+        "nulang-wasm-module-v0alpha1",
+        "wasm",
+        std::iter::empty::<&str>(),
+    )
+    .map_err(|error| nulang::types::NuError::VMError {
+        msg: format!("failed to derive WASM artifact semantic identity: {error}"),
+        span: Span::default(),
+    })?;
+
+    let behavior_manifest =
+        nulang::behavior_manifest::BehaviorManifest::from_typed_hir_with_artifact_kind(
+            behavior_package_name.unwrap_or("main"),
+            behavior_package_version.unwrap_or("0.0.0"),
+            nulang::behavior_manifest::BEHAVIOR_ARTIFACT_KIND_WASM_MODULE,
+            &artifact_identity,
+            wasm_bytes,
+            hir,
+        )
+        .map_err(|error| nulang::types::NuError::VMError {
+            msg: format!("failed to build WASM behavior manifest: {error}"),
+            span: Span::default(),
+        })?;
+    let manifest_bytes =
+        behavior_manifest
+            .to_json()
+            .map_err(|error| nulang::types::NuError::VMError {
+                msg: format!("failed to serialize WASM behavior manifest: {error}"),
+                span: Span::default(),
+            })?;
+    std::fs::write(manifest_path, manifest_bytes).map_err(|error| {
+        nulang::types::NuError::VMError {
+            msg: format!("failed to write behavior manifest {manifest_path}: {error}"),
+            span: Span::default(),
+        }
+    })?;
+    println!(
+        "Wrote {manifest_path} ({}, {})",
+        behavior_manifest.schema,
+        behavior_manifest
+            .digest()
+            .unwrap_or_else(|_| "digest-unavailable".to_string())
+    );
+    Ok(())
+}
+
+#[cfg_attr(not(feature = "wasm-backend"), allow(unused_variables))]
+fn run_source_with_manifest(
+    source: &str,
+    file_path: Option<&str>,
+    verbose: bool,
+    backend: &str,
+    out_file: Option<&str>,
+    metrics_port: Option<u16>,
+    target: &str,
+    with_capabilities: &[String],
+    store_path: Option<&str>,
+    deny_warnings: bool,
+    behavior_manifest_path: Option<&str>,
+    behavior_package_name: Option<&str>,
+    behavior_package_version: Option<&str>,
 ) -> NuResult<()> {
     let (ast, type_checker) =
         run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
@@ -1821,6 +1929,17 @@ fn run_source(
                 }
             })?;
             println!("Wrote {} ({} bytes)", wasm_file, wasm_bytes.len());
+            if let Some(manifest_path) = behavior_manifest_path {
+                emit_wasm_behavior_manifest(
+                    source,
+                    &hir,
+                    &mir,
+                    &wasm_bytes,
+                    manifest_path,
+                    behavior_package_name,
+                    behavior_package_version,
+                )?;
+            }
             return Ok(());
         }
         #[cfg(feature = "wasm-backend")]
@@ -1878,6 +1997,17 @@ fn run_source(
                 }
             })?;
             println!("Wrote {} ({} bytes)", wasm_file, wasm_bytes.len());
+            if let Some(manifest_path) = behavior_manifest_path {
+                emit_wasm_behavior_manifest(
+                    source,
+                    &hir,
+                    &mir,
+                    &wasm_bytes,
+                    manifest_path,
+                    behavior_package_name,
+                    behavior_package_version,
+                )?;
+            }
             nulang::wasm_runtime::aot_compile(&wasm_file, &cwasm_file)?;
             println!("Wrote {} (precompiled)", cwasm_file);
             return Ok(());

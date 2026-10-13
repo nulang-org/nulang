@@ -289,7 +289,7 @@ fn print_usage() {
     println!("                Templates: default, cli, lib, full");
     println!("  init          Scaffold a new package in the current directory");
     println!("  build         Build .nbc + RFC 0020 behavior sidecar in .nula/dist/");
-    println!("  build-wasm    Build package to .wasm + .cwasm in .nula/dist/");
+    println!("  build-wasm    Build .wasm + .cwasm + RFC 0020 behavior sidecar in .nula/dist/");
     println!("  test [--filter <substr>] [--verbose|-v] [--watch|-w]  Run .nula test files");
     println!("  run           Build and run the package entry point");
     println!("  run --watch   Build and re-run on source changes");
@@ -1258,10 +1258,25 @@ fn cmd_build_wasm() -> NuResult<()> {
 
     let wasm_path = dist_dir.join(format!("{}.wasm", name));
     let wasm_path_str = wasm_path.to_string_lossy().into_owned();
+    let behavior_path = dist_dir.join(format!("{}.behavior.json", name));
+    let behavior_path_str = behavior_path.to_string_lossy().into_owned();
+    let version = manifest.package.version.clone();
 
     eprintln!("Building {} (WASM AOT)...", name);
     eprintln!("  Compiling {} to WASM...", entry.display());
-    nulang_exe(&["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str])?;
+    nulang_exe(&[
+        "--backend",
+        "wasm-aot",
+        "--out",
+        &wasm_path_str,
+        "--emit-behavior-manifest",
+        &behavior_path_str,
+        "--behavior-package-name",
+        &name,
+        "--behavior-package-version",
+        &version,
+        &entry_str,
+    ])?;
     println!("WASM AOT build succeeded.");
     Ok(())
 }
