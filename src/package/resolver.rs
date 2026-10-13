@@ -1022,6 +1022,38 @@ mod tests {
             commit: String::new(),
         });
         lock.save(&app).unwrap();
+
+        // Offline registry tests must establish independently trusted signed
+        // archive provenance for the *same* files in the extracted cache.
+        let seed = [23u8; 32];
+        let public = crate::registry::trust::signing_public_key(&seed);
+        std::fs::write(
+            app.join("Nulang.trust.toml"),
+            format!(
+                "[registries.\"https://registry.test\"]\npublic_keys = [\"{}\"]\n",
+                public
+            ),
+        ).unwrap();
+        let gzip = flate2::write::GzEncoder::new(
+            Vec::new(), flate2::Compression::default()
+        );
+        let mut archive_builder = tar::Builder::new(gzip);
+        for name in [MANIFEST_FILE, "module.nula", "static.json"] {
+            let bytes = std::fs::read(cached.join(name)).unwrap();
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive_builder.append_data(&mut header, name, bytes.as_slice()).unwrap();
+        }
+        let tarball = archive_builder.into_inner().unwrap().finish().unwrap();
+        let signature = crate::registry::trust::sign_registry_archive(
+            "https://registry.test", "util", "0.1.0", &tarball, &seed
+        );
+        crate::package::registry_provenance::store_signed_provenance(
+            &app, "https://registry.test", "util", "0.1.0", &tarball, &signature
+        ).unwrap();
+
         (dir, app.clone(), Manifest::load(&app).unwrap(), Lockfile::load(&app).unwrap())
     }
 
