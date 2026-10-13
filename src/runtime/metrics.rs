@@ -159,6 +159,38 @@ impl MetricsSnapshot {
             g.cycles_detected
         );
 
+        // Allocator snapshots are gauges because actor removal, pooling, and
+        // epoch resets can decrease their values. They are not cumulative
+        // process-wide allocation counters or OS memory metrics.
+        let a = &self.allocator;
+        macro_rules! allocator_gauge {
+            ($name:literal, $help:literal, $value:expr) => {
+                out.push_str(concat!("# HELP ", $name, " ", $help, "\n"));
+                out.push_str(concat!("# TYPE ", $name, " gauge\n"));
+                out.push_str(&format!(concat!($name, " {}\n"), $value));
+            };
+        }
+        allocator_gauge!(
+            "nulang_allocator_heap_allocations_since_reset",
+            "Successful allocator requests in live heaps since each heap reset",
+            a.heap_allocations_since_reset
+        );
+        allocator_gauge!(
+            "nulang_allocator_heap_requested_payload_bytes_since_reset",
+            "Requested payload bytes served by live heaps since reset",
+            a.heap_requested_payload_bytes_since_reset
+        );
+        allocator_gauge!(
+            "nulang_allocator_heap_live_objects",
+            "Live objects in active actor and top-level heaps",
+            a.heap_live_objects
+        );
+        allocator_gauge!(
+            "nulang_allocator_arena_epoch_allocations",
+            "Successful allocations in the current epochs of live actor arenas",
+            a.arena_epoch_allocations
+        );
+
         // Resolver counters
         let r = &self.resolver;
         counter!(
