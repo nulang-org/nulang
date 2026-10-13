@@ -23,7 +23,10 @@ cargo test --features wasm-backend                  # WASM backend suite
 NULANG_BIN=./target/release/nulang bash scripts/verify_doc_examples.sh  # doc snippets
 ```
 
-Please make sure these pass before opening a PR. CI runs them all.
+Please make sure these pass before opening a PR. CI runs the Rust suites (under
+nextest) and the documentation-example check on every pull request; the
+behavioral conformance suite is not wired into CI, so run it locally when your
+change touches language semantics.
 
 ## Continuous integration
 
