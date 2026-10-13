@@ -60,7 +60,9 @@ After the tag workflow publishes the release:
 - [ ] Linux aarch64 archive + `.sha256` are present
 - [ ] macOS aarch64 archive + `.sha256` are present
 - [ ] Windows x86_64 archive + `.sha256` are present
+- [ ] FreeBSD x86_64 archive + `.sha256` are present (native VM build and extracted executable smoke both passed)
 - [ ] Every published checksum verifies against its archive
+- [ ] OpenBSD and NetBSD minimal-bytecode VM smoke workflows have terminal results; do not call them supported if they are red or unrun
 - [ ] Extract each native-host archive and run `nulang --version`
 - [ ] Follow the README install commands from a clean environment rather than
       relying on a maintainer checkout

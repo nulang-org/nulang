@@ -13,10 +13,12 @@ How to publish a Nulang release with prebuilt binaries. Run
 
 ## 2. Validate the release candidate before tagging
 
-The same four-target `.github/workflows/release.yml` matrix runs as a
+The Linux/macOS/Windows matrix plus the FreeBSD native-VM release job in
+`.github/workflows/release.yml` run as a
 **non-publishing rehearsal** when a pull request changes the release workflow,
 `Cargo.toml`, `Cargo.lock`, `src/main.rs`, or release verification scripts.
 Confirm the `Release` PR workflow reaches terminal success for all targets,
+**including the FreeBSD x86_64 VM**,
 including artifact packaging, checksums, and native-on-runner smoke tests.
 On pull requests, the version-tag check is skipped (there is no tag) and the
 `Publish Release` job is explicitly disabled. A queued/skipped build is not
@@ -37,8 +39,8 @@ git push origin v0.2.0
 ## 4. Watch the workflow
 
 The `Release` workflow first verifies that the pushed tag matches both
-`Cargo.toml` and the CLI `VERSION`, then builds four targets in parallel
-(`linux-x86_64`, `linux-aarch64`, `macos-aarch64`, `windows-x86_64`), using
+`Cargo.toml` and the CLI `VERSION`, then builds five targets (`linux-x86_64`, `linux-aarch64`,
+`macos-aarch64`, `windows-x86_64`, and native `freebsd-x86_64`), using
 `--no-default-features --features release-cli`. This distribution includes
 the standard non-Python CLI functionality (native compiler/runtime, LSP,
 SQLite-backed storage, network/TLS/AI runtime and FFI) but **not Python
@@ -64,14 +66,17 @@ creates a GitHub Release with:
 >
 > That build may require a compatible system Python development library.
 > The prebuilt `release-cli` profile does not include Python interoperability.
-> The Linux aarch64 archive is cross-compiled without PyO3. Do **not** claim
+> The Linux aarch64 archive is cross-compiled without PyO3.
+> FreeBSD x86_64 is compiled and executed natively in a FreeBSD VM before
+> its archive can be published. OpenBSD and NetBSD run smaller source-build
+> smoke tests in `.github/workflows/bsd.yml`; they have no release archives. Do **not** claim
 > that a cross-compiled binary has passed a native arm64 smoke test unless
 > such a check actually ran.
 
 ## 5. Verify the release
 
-- Open https://github.com/nulang-org/nulang/releases and confirm all 8 files
-  (4 tarballs + 4 checksums) are attached.
+- Open https://github.com/nulang-org/nulang/releases and confirm all 10 files
+  (5 tarballs + 5 checksums) are attached.
 - Smoke-test one artifact:
 
   ```bash
@@ -94,7 +99,7 @@ creates a GitHub Release with:
   ```
   This rejects `libpython*.so` ELF dependencies and missing shared libraries.
   It does not certify portability to every Linux distribution or CPU.
-- Verify the extracted executables on clean supported Linux, macOS and Windows
+- Verify the extracted executables on clean supported Linux, macOS, Windows, and FreeBSD
   machines, **not only on their build runners**. In particular, require a
   Python-3.13-only or Python-absent Linux environment so the old Python-3.12
   linkage defect cannot be hidden by CI-installed libraries.

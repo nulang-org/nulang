@@ -56,6 +56,9 @@ Tagged releases publish checksummed archives from the release CI matrix:
 - **Linux (aarch64)**: `nulang-linux-aarch64.tar.gz`
 - **macOS (Apple Silicon / aarch64)**: `nulang-macos-aarch64.tar.gz`
 - **Windows (x86_64)**: `nulang-windows-x86_64.tar.gz`
+- **FreeBSD (x86_64)**: `nulang-freebsd-x86_64.tar.gz` (**planned for the next validated tagged release**; check assets before downloading)
+
+OpenBSD and NetBSD run a minimal, source-built CLI in portability CI; no prebuilt archives are published for them.
 
 Download the latest archive and its matching `.sha256` file from
 [GitHub Releases](https://github.com/nulang-org/nulang/releases), verify the
@@ -81,8 +84,10 @@ cargo build --release
 ```
 
 Source builds use Rust 1.95.0, pinned by `rust-toolchain.toml`. The tagged
-release matrix currently validates Linux x86_64/aarch64, macOS aarch64, and
-Windows x86_64; other platform/architecture combinations are not release-tested.
+release matrix builds Linux x86_64/aarch64, macOS aarch64, Windows x86_64,
+and (after the first successful BSD release rehearsal) FreeBSD x86_64.
+OpenBSD and NetBSD have native minimal-runtime smoke workflows; they are not
+part of the binary release matrix. Other combinations are not release-tested.
 
 ## Quick Start
 

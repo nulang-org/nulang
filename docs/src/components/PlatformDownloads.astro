@@ -1,0 +1,50 @@
+---
+/** Release assets are published only by a successful tag workflow.
+ * FreeBSD stays on the releases index until its first validated release exists.
+ */
+const releasePage = 'https://github.com/nulang-org/nulang/releases';
+const latestAsset = `${releasePage}/latest/download`;
+const platforms = [
+  { name: 'Linux', arch: 'x86_64', artifact: 'nulang-linux-x86_64', published: true },
+  { name: 'Linux', arch: 'ARM64', artifact: 'nulang-linux-aarch64', published: true },
+  { name: 'macOS', arch: 'Apple Silicon', artifact: 'nulang-macos-aarch64', published: true },
+  { name: 'Windows', arch: 'x86_64', artifact: 'nulang-windows-x86_64', published: true },
+  { name: 'FreeBSD', arch: 'x86_64', artifact: 'nulang-freebsd-x86_64', published: false },
+];
+---
+
+<div class="downloads" aria-label="Download Nulang by operating system">
+  {platforms.map((platform) => (
+    <div class="download-option">
+      <div class="platform-name">{platform.name} <span>{platform.arch}</span></div>
+      <code>{platform.artifact}.tar.gz</code>
+      {platform.published ? (
+        <div class="download-links">
+          <a href={`${latestAsset}/${platform.artifact}.tar.gz`}>Download archive</a>
+          <a href={`${latestAsset}/${platform.artifact}.tar.gz.sha256`}>SHA-256 checksum</a>
+        </div>
+      ) : (
+        <div class="download-links">
+          <span class="pending">Pending first tested BSD release</span>
+          <a href={releasePage}>Check release assets</a>
+        </div>
+      )}
+    </div>
+  ))}
+</div>
+<p class="download-note">
+  Download links target the latest published GitHub release. Check that the asset exists
+  for that tag and verify its matching checksum before running it. OpenBSD, NetBSD,
+  macOS Intel, and other architectures currently require a source build.
+</p>
+
+<style>
+  .downloads { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 15rem), 1fr)); gap: 0.85rem; margin-block: 1rem; }
+  .download-option { border: 1px solid var(--sl-color-gray-5); border-radius: 0.65rem; padding: 1rem; min-width: 0; }
+  .platform-name { font-weight: 700; margin-bottom: 0.4rem; }
+  .platform-name span { font-size: 0.85rem; font-weight: 400; color: var(--sl-color-gray-3); }
+  .download-option code { font-size: 0.78rem; overflow-wrap: anywhere; }
+  .download-links { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; margin-top: 0.85rem; font-size: 0.88rem; }
+  .pending { color: var(--sl-color-gray-3); }
+  .download-note { font-size: 0.85rem; color: var(--sl-color-gray-3); }
+</style>
