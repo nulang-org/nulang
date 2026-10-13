@@ -708,6 +708,101 @@ mod tests {
     }
 
     #[test]
+    fn offline_path_dependencies_match_locked_graph() {
+        let dir = fresh_dir("offline_path");
+        let app = dir.join("app");
+        let util = dir.join("util");
+        write_manifest(&util, "util", "0.1.0", "");
+        write_manifest(&app, "app", "1.0.0", "util = { path = \"../util\" }\n");
+        let manifest = Manifest::load(&app).unwrap();
+        let lock = resolve(&app, &manifest).unwrap().to_lockfile();
+
+        let offline = resolve_offline(&app, &manifest, &lock)
+            .expect("local path packages must resolve without network access");
+        assert_eq!(offline.to_lockfile().package, lock.package);
+
+        let mut stale = lock.clone();
+        stale.package[0].version = "0.9.0".to_string();
+        assert!(
+            resolve_offline(&app, &manifest, &stale).is_err(),
+            "offline resolution must reject a stale lockfile pin"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn offline_cached_git_uses_locked_commit_without_remote() {
+        let dir = fresh_dir("offline_git_no_remote");
+        let remote = dir.join("remote");
+        let app = dir.join("app");
+        let commit = git_remote(&remote, "util", "0.1.0", "fn main() { 1 }");
+        write_manifest(
+            &app,
+            "app",
+            "1.0.0",
+            &format!("util = {{ git = \"{}\" }}\n", remote.display()),
+        );
+        let manifest = Manifest::load(&app).unwrap();
+        let lock = resolve(&app, &manifest).unwrap().to_lockfile();
+        assert_eq!(lock.package[0].commit, commit);
+        std::fs::remove_dir_all(&remote).unwrap();
+
+        let offline = resolve_offline(&app, &manifest, &lock)
+            .expect("offline must reuse an exact cached commit without a remote");
+        assert_eq!(offline.to_lockfile().package, lock.package);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn offline_cached_git_rejects_dirty_or_missing_checkout_without_repair() {
+        let dir = fresh_dir("offline_git_dirty");
+        let remote = dir.join("remote");
+        let app = dir.join("app");
+        git_remote(&remote, "util", "0.1.0", "fn main() { 1 }");
+        write_manifest(
+            &app,
+            "app",
+            "1.0.0",
+            &format!("util = {{ git = \"{}\" }}\n", remote.display()),
+        );
+        let manifest = Manifest::load(&app).unwrap();
+        let lock = resolve(&app, &manifest).unwrap().to_lockfile();
+        let cache = app.join(".nula").join("git").join("util");
+        let file = cache.join("lib.nula");
+        std::fs::write(&file, "fn main() { 999 }").unwrap();
+
+        assert!(
+            resolve_offline(&app, &manifest, &lock).is_err(),
+            "offline must reject a dirty cached Git worktree"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "fn main() { 999 }");
+        std::fs::remove_dir_all(&cache).unwrap();
+        assert!(
+            resolve_offline(&app, &manifest, &lock).is_err(),
+            "offline must not reclone an absent Git cache"
+        );
+        assert!(!cache.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn offline_registry_dependency_fails_closed_before_network() {
+        let dir = fresh_dir("offline_registry");
+        let app = dir.join("app");
+        write_manifest(&app, "app", "1.0.0", "util = \"0.1.0\"\n");
+        let manifest = Manifest::load(&app).unwrap();
+        let lock = Lockfile::new();
+        let error = resolve_offline(&app, &manifest, &lock)
+            .expect_err("offline registry sources need pinned verified artifacts");
+        assert!(
+            error.to_string().contains("offline"),
+            "expected an offline-specific actionable error: {error}"
+        );
+        assert!(!app.join(".nula").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_parse_semver_and_ordering() {
         assert_eq!(parse_semver("1.2.3").unwrap(), (1, 2, 3));
         assert_eq!(parse_semver("0.1").unwrap(), (0, 1, 0));
