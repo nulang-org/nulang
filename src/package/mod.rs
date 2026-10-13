@@ -16,3 +16,4 @@ mod identity_verify;
 pub mod lockfile;
 pub mod manifest;
 pub mod resolver;
+pub mod registry_archive;
