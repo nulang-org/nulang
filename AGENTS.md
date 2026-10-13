@@ -25,13 +25,19 @@ source &str
   -> VM::load_module() + VM::run()        -> Value                 src/vm.rs (register VM + JIT tiering)
 ```
 
-**Native/AOT backend** (`--backend native`):
+**Native backend** (`--backend native`):
 ```
 source &str
   -> ... (same frontend pipeline through MIR)
-  -> aot::codegen::compile_module()         -> native object code      src/aot/codegen.rs (MIR → Cranelift CLIF → native)
+  -> AotModule::compile()                   -> eager native code       src/aot/ (MIR → Cranelift CLIF → executable memory)
 ```
-Uses Cranelift AOT compilation (`src/aot/`) with compile-time type metadata (`src/type_metadata.rs`) for unboxed native operations. Selectable via `--backend native`.
+The current implementation compiles whole MIR modules eagerly but is backed by
+`cranelift_jit::JITModule`; it does **not** yet emit object files or linked
+standalone binaries. Keep the native product surface distinct from the
+implementation mechanism: a future `ObjectModule` artifact path should reuse
+the same native semantic lowering rather than introducing a second semantics
+implementation. Compile-time type metadata (`src/type_metadata.rs`) supplies
+unboxed native operations.
 
 **WASM backend** (`--backend wasm|wasm-run|wasm-aot`, requires `--features wasm-backend`):
 ```
@@ -157,6 +163,7 @@ python3 verify_report.py                          # gate: validates codebase_ana
 - **Naming**: `test_<subject>` (unit/integration), `stress_<scenario>` (chaos).
 - **Counts**: 1596 total in the core crate with `wasm-backend`, 1558 without; 58 more in `nulang-ai`. The suite covers `src/integration_tests/mod.rs` (end-to-end pipeline via `run_source`/`assert_int`/`run_source_with_runtime` plus MIR-pipeline variants, WASM backend e2e tests, selective-receive and receive-after, `Actor.*` builtin-effect and actor-priority, non-blocking LLM suspend/resume, typed-JIT tiering, float-threading regression tests, behavior-internal send/spawn, workflow query, and Otp supervisor effects), `stress_tests.rs`, `runtime/tests.rs`, `jit/tests.rs`, `src/mir_wasm.rs`, `src/wasm_runtime.rs`, `src/aot/codegen.rs`, `src/package/`, `src/docgen.rs`, `src/stdlib.rs`, `src/lsp/mod.rs`, plus inline `mod tests` across `lexer.rs`, `parser.rs`, `typechecker.rs`, `effect_checker.rs`, `value_layout.rs`, `vm.rs`, `runtime/*.rs`, `jit/*.rs`, `python/*`, `ffi/*`, and every `crates/nulang-ai/src/*.rs`. Per-file breakdowns are too volatile to maintain manually — run `cargo test 2>&1 | grep "test result:"` for the current split.
 - **Run**: `cargo test` (test profile: LTO off, 16 codegen-units for fast parallel builds). `cargo test --release` for optimized runs.
+- **Verification profiles**: `python3 scripts/nula_verify.py fast|native|wasm|durability|full`. Every profile validates `spec/invariants/v0alpha1.json` and `spec/backend_conformance/v0alpha1.json` first; `full` delegates to `scripts/ci-local.sh` instead of duplicating CI.
 - **Gate scripts**: `verify_implementation.py` (forbidden-pattern scans for known anti-patterns — Box'd frames, string leaks, `crdt_reg` temp Vec, timer BinaryHeap rebuild, check-then-unwrap — + asserts JIT integration, escape-analysis deadness, scheduler-stats and cycle-detector wiring, then runs `cargo test` and `cargo check --tests` against a zero-warning baseline) and `verify_report.py` (validates `codebase_analysis_report.md`: required sections, ≥5 code snippets, referenced `src/*.rs` paths exist). Each exits 0 only on full pass.
 - **Audit**: `.cargo/audit.toml` ignores `RUSTSEC-2026-0186` (memmap2 unsound; vulnerable APIs unused; upgrade blocked on cranelift-jit).
 

@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "updated": "2026-09-25",
+  "reference_backend": "bytecode",
+  "backends": [
+    {
+      "id": "bytecode",
+      "role": "semantic-reference",
+      "status": "primary"
+    },
+    {
+      "id": "jit",
+      "role": "hot-region-native-tier",
+      "status": "enabled"
+    },
+    {
+      "id": "native",
+      "role": "whole-module-native",
+      "status": "experimental"
+    },
+    {
+      "id": "wasm",
+      "role": "portable-cloud-target",
+      "status": "experimental"
+    }
+  ],
+  "features": [
+    {
+      "id": "generated-core-subset",
+      "invariant": "SEM-CROSSBACKEND-001",
+      "support": {
+        "bytecode": "reference",
+        "jit": "partial",
+        "native": "partial",
+        "wasm": "partial"
+      }
+    },
+    {
+      "id": "integer-arithmetic",
+      "invariant": "SEM-INT-001",
+      "support": {
+        "bytecode": "reference",
+        "jit": "partial",
+        "native": "partial",
+        "wasm": "partial"
+      }
+    },
+    {
+      "id": "float-arithmetic",
+      "invariant": "SEM-FLOAT-001",
+      "support": {
+        "bytecode": "reference",
+        "jit": "partial",
+        "native": "partial",
+        "wasm": "partial"
+      }
+    },
+    {
+      "id": "algebraic-effects",
+      "invariant": "SEM-CROSSBACKEND-001",
+      "support": {
+        "bytecode": "reference",
+        "jit": "partial",
+        "native": "unsupported",
+        "wasm": "partial"
+      }
+    }
+  ]
+}

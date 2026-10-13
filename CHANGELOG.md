@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Semantic verification contract — 2026-09-25
+- **Backend semantic status is now machine-readable.** `spec/invariants/v0alpha1.json` records scoped semantic/runtime invariants and evidence, while `spec/backend_conformance/v0alpha1.json` records bytecode/JIT/native/WASM support as reference, verified, partial, unsupported, or not-applicable instead of relying on prose claims.
+- **Semantic metadata now fails CI on drift.** `scripts/verify_semantics.py` validates ids, status values, backend coverage, invariant references, and evidence paths; focused Python unit tests are executed from the existing `verify_implementation.py` gate.
+- **Contributors and coding agents now have stable focused verification profiles.** `scripts/nula_verify.py` exposes `fast`, `native`, `wasm`, `durability`, and `full`; the full profile delegates to the existing local CI contract rather than duplicating it.
+- **Native-backend documentation now matches implementation reality.** `--backend native` eagerly compiles MIR to native code using Cranelift `JITModule` today; object-file/`ObjectModule` AOT remains a future artifact path that should share the same native semantic lowering.
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.

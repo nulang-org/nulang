@@ -1,6 +1,6 @@
 # Nulang Implementation Status
 
-**Updated:** 2026-09-23  
+**Updated:** 2026-09-25  
 **Scope:** current `main` implementation, not roadmap promises
 
 This document is the compact status map for contributors who need to know what
@@ -39,7 +39,7 @@ effects, variants/records, and Pony-inspired reference capabilities
 |---|---|---|
 | Register bytecode VM | Default execution path and semantic reference implementation | Primary |
 | Cranelift JIT | Tiers hot bytecode regions into native code while preserving VM semantics | Enabled by `native-codegen` |
-| Native/AOT | MIR-to-Cranelift native compilation for supported workloads and differential validation | Secondary / Experimental |
+| Native | Whole-module MIR-to-Cranelift native compilation; the current executor eagerly emits native code through `JITModule` rather than producing object-file artifacts | Secondary / Experimental |
 | Plain WASM | Canonical portable/cloud target through MIR-to-WASM and Wasmtime | Experimental; semantic coverage is narrower than bytecode |
 | WasmFX | Stack-switching experiment for suspending effects | Experimental |
 
@@ -59,6 +59,14 @@ source
 
 Do not claim backend parity unless the relevant conformance and differential
 tests establish it. Bytecode remains the semantic reference.
+
+Machine-readable semantic status lives in
+`spec/invariants/v0alpha1.json` and
+`spec/backend_conformance/v0alpha1.json`. A backend row may be
+`reference`, `verified`, `partial`, `unsupported`, or
+`not-applicable`; known gaps must remain `partial` until executable evidence
+establishes parity. `scripts/verify_semantics.py` validates these manifests and
+their evidence paths.
 
 ## Actor runtime
 
@@ -189,14 +197,17 @@ current behavior.
 
 ## Contributor verification
 
-Useful local gates:
+Useful local gates are exposed through stable verification profiles:
 
 ```bash
-cargo test --locked
-cargo test --locked --features wasm-backend
-python3 verify_implementation.py
+python3 scripts/nula_verify.py fast
+python3 scripts/nula_verify.py native
+python3 scripts/nula_verify.py wasm
+python3 scripts/nula_verify.py durability
+python3 scripts/nula_verify.py full
 ```
 
-For backend-specific, minimal-feature, release, and benchmark validation, use
-the repository workflows and commands documented in `AGENTS.md` and
-`CONTRIBUTING.md`.
+Every profile validates the semantic invariant/conformance manifests first.
+`full` delegates to the existing `scripts/ci-local.sh` contract rather than
+duplicating the CI matrix. The lower-level Cargo commands remain available for
+focused debugging.
