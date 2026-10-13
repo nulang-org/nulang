@@ -1,0 +1,20 @@
+// Transform composition is left-to-right, and folding can avoid collection.
+import stdlib::list
+
+fn main() {
+    let values = [1, 2, 3, 4]
+    let map_then_filter = chain_transforms(
+        mapping(fn(x) { x + 1 }),
+        filtering(fn(x) { x % 2 == 0 })
+    )
+    let filter_then_map = chain_transforms(
+        filtering(fn(x) { x % 2 == 0 }),
+        mapping(fn(x) { x + 1 })
+    )
+    let first = collect_transduced(values, map_then_filter)
+    let second = collect_transduced(values, filter_then_map)
+
+    perform IO.print("first=" + perform Int.to_string(first[0]) + "," + perform Int.to_string(first[1]))
+    perform IO.print("second=" + perform Int.to_string(second[0]) + "," + perform Int.to_string(second[1]))
+    perform IO.print("fold=" + perform Int.to_string(transduce(values, identity_transform(), 1, fn(acc, x) { acc * x })))
+}
