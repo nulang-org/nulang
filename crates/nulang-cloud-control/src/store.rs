@@ -1,6 +1,7 @@
 use crate::model::{
     AllocationState, Evaluation, ObservedAllocation, PlacementPlan, SupersededReason,
 };
+use crate::workload_revision::{WorkloadRevisionRegistrationOutcome, WorkloadRevisionSpec};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -88,6 +89,7 @@ pub enum StoreError {
     },
     CommandNotFound(String),
     CommandClaim(String),
+    WorkloadRevision(String),
 }
 
 impl fmt::Display for StoreError {
@@ -116,6 +118,9 @@ impl fmt::Display for StoreError {
             Self::CommandClaim(message) => {
                 write!(f, "allocation command claim error: {message}")
             }
+            Self::WorkloadRevision(message) => {
+                write!(f, "workload revision error: {message}")
+            }
         }
     }
 }
@@ -131,6 +136,20 @@ pub trait ControlStore: Send + Sync {
     fn committed_plan(&self, evaluation_id: &str) -> Result<Option<PlacementPlan>, StoreError>;
 
     fn allocations_for(&self, deployment_id: &str) -> Result<Vec<ObservedAllocation>, StoreError>;
+
+    /// Register the immutable launch identity for one deployment revision.
+    /// Exact retries are idempotent; the same (deployment_id, revision) key
+    /// can never be rebound to different executable/manifest identity.
+    fn register_workload_revision(
+        &self,
+        revision: &WorkloadRevisionSpec,
+    ) -> Result<WorkloadRevisionRegistrationOutcome, StoreError>;
+
+    fn workload_revision(
+        &self,
+        deployment_id: &str,
+        revision: u64,
+    ) -> Result<Option<WorkloadRevisionSpec>, StoreError>;
 
     /// Atomically commit the plan, allocation ownership changes, and execution
     /// outbox commands. Implementations must compare current allocation epochs
@@ -217,9 +236,53 @@ struct PersistedState {
     commands: BTreeMap<String, AllocationCommand>,
     #[serde(default)]
     command_claims: BTreeMap<String, AllocationCommandClaimRecord>,
+    #[serde(default)]
+    workload_revisions: BTreeMap<String, WorkloadRevisionSpec>,
 }
 
 impl PersistedState {
+    fn register_workload_revision(
+        &mut self,
+        revision: &WorkloadRevisionSpec,
+    ) -> Result<WorkloadRevisionRegistrationOutcome, StoreError> {
+        let normalized = revision
+            .clone()
+            .normalized()
+            .map_err(|error| StoreError::WorkloadRevision(error.to_string()))?;
+        let key = workload_revision_key(&normalized.deployment_id, normalized.revision);
+
+        match self.workload_revisions.get(&key) {
+            Some(existing) if existing == &normalized => {
+                Ok(WorkloadRevisionRegistrationOutcome::AlreadyRegistered)
+            }
+            Some(existing) => Err(StoreError::WorkloadRevision(format!(
+                "deployment {} revision {} is already bound to workload {} and cannot be rebound to {}",
+                normalized.deployment_id,
+                normalized.revision,
+                existing
+                    .digest()
+                    .unwrap_or_else(|_| "<invalid-existing>".into()),
+                normalized
+                    .digest()
+                    .unwrap_or_else(|_| "<invalid-incoming>".into())
+            ))),
+            None => {
+                self.workload_revisions.insert(key, normalized);
+                Ok(WorkloadRevisionRegistrationOutcome::Applied)
+            }
+        }
+    }
+
+    fn workload_revision(
+        &self,
+        deployment_id: &str,
+        revision: u64,
+    ) -> Option<WorkloadRevisionSpec> {
+        self.workload_revisions
+            .get(&workload_revision_key(deployment_id, revision))
+            .cloned()
+    }
+
     fn record_evaluation(&mut self, evaluation: &Evaluation) -> Result<(), StoreError> {
         match self.evaluations.get(&evaluation.evaluation_id) {
             Some(existing) if existing.evaluation == *evaluation => Ok(()),
@@ -570,6 +633,10 @@ fn validate_plan_identity(evaluation: &Evaluation, plan: &PlacementPlan) -> Resu
     Ok(())
 }
 
+fn workload_revision_key(deployment_id: &str, revision: u64) -> String {
+    format!("{}:{}:{}", deployment_id.len(), deployment_id, revision)
+}
+
 fn same_allocation_identity(left: &ObservedAllocation, right: &ObservedAllocation) -> bool {
     left.deployment_id == right.deployment_id
         && left.revision == right.revision
@@ -665,6 +732,28 @@ impl ControlStore for MemoryControlStore {
             .filter(|allocation| allocation.deployment_id == deployment_id)
             .cloned()
             .collect())
+    }
+
+    fn register_workload_revision(
+        &self,
+        revision: &WorkloadRevisionSpec,
+    ) -> Result<WorkloadRevisionRegistrationOutcome, StoreError> {
+        self.state
+            .lock()
+            .expect("control-store mutex poisoned")
+            .register_workload_revision(revision)
+    }
+
+    fn workload_revision(
+        &self,
+        deployment_id: &str,
+        revision: u64,
+    ) -> Result<Option<WorkloadRevisionSpec>, StoreError> {
+        Ok(self
+            .state
+            .lock()
+            .expect("control-store mutex poisoned")
+            .workload_revision(deployment_id, revision))
     }
 
     fn commit_plan(
@@ -801,6 +890,25 @@ impl ControlStore for JsonFileControlStore {
             .filter(|allocation| allocation.deployment_id == deployment_id)
             .cloned()
             .collect())
+    }
+
+    fn register_workload_revision(
+        &self,
+        revision: &WorkloadRevisionSpec,
+    ) -> Result<WorkloadRevisionRegistrationOutcome, StoreError> {
+        self.mutate(|state| state.register_workload_revision(revision))
+    }
+
+    fn workload_revision(
+        &self,
+        deployment_id: &str,
+        revision: u64,
+    ) -> Result<Option<WorkloadRevisionSpec>, StoreError> {
+        Ok(self
+            .state
+            .lock()
+            .expect("control-store mutex poisoned")
+            .workload_revision(deployment_id, revision))
     }
 
     fn commit_plan(
@@ -1012,6 +1120,23 @@ impl ControlStore for PostgresControlStore {
             .collect())
     }
 
+    fn register_workload_revision(
+        &self,
+        revision: &WorkloadRevisionSpec,
+    ) -> Result<WorkloadRevisionRegistrationOutcome, StoreError> {
+        self.mutate(|state| state.register_workload_revision(revision))
+    }
+
+    fn workload_revision(
+        &self,
+        deployment_id: &str,
+        revision: u64,
+    ) -> Result<Option<WorkloadRevisionSpec>, StoreError> {
+        Ok(self
+            .load_state()?
+            .workload_revision(deployment_id, revision))
+    }
+
     fn commit_plan(
         &self,
         evaluation: &Evaluation,
@@ -1140,6 +1265,82 @@ mod tests {
                 accelerators: BTreeMap::new(),
             },
         }
+    }
+
+    fn workload_revision(revision: u64, artifact_hex: char) -> WorkloadRevisionSpec {
+        use crate::workload_revision::{
+            WorkloadArtifactIdentity, WorkloadLaunchConfig, WORKLOAD_ARTIFACT_KIND_NBC_V1,
+        };
+
+        WorkloadRevisionSpec::new(
+            "api",
+            revision,
+            "api-package",
+            format!("1.0.{revision}"),
+            WorkloadArtifactIdentity {
+                kind: WORKLOAD_ARTIFACT_KIND_NBC_V1.into(),
+                artifact_id: format!("artifact:api-{revision}"),
+                digest: format!("blake3:{}", artifact_hex.to_string().repeat(64)),
+                behavior_manifest_digest: format!("blake3:{}", "b".repeat(64)),
+                target: "x86_64-unknown-linux-gnu".into(),
+                abi: "nulang-v1".into(),
+                backend: "bytecode".into(),
+            },
+            WorkloadLaunchConfig::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_workload_revision_registration_is_immutable_and_idempotent() {
+        let store = MemoryControlStore::default();
+        let first = workload_revision(2, 'a');
+
+        assert_eq!(
+            store.register_workload_revision(&first).unwrap(),
+            WorkloadRevisionRegistrationOutcome::Applied
+        );
+        assert_eq!(
+            store.register_workload_revision(&first).unwrap(),
+            WorkloadRevisionRegistrationOutcome::AlreadyRegistered
+        );
+        assert_eq!(
+            store.workload_revision("api", 2).unwrap(),
+            Some(first.clone())
+        );
+
+        let conflicting = workload_revision(2, 'c');
+        assert!(matches!(
+            store.register_workload_revision(&conflicting),
+            Err(StoreError::WorkloadRevision(_))
+        ));
+        assert_eq!(store.workload_revision("api", 2).unwrap(), Some(first));
+    }
+
+    #[test]
+    fn test_json_store_recovers_immutable_workload_revision() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "nulang-cloud-workload-revision-{}-{unique}.json",
+            std::process::id()
+        ));
+        let revision = workload_revision(2, 'a');
+
+        {
+            let store = JsonFileControlStore::open(&path).unwrap();
+            store.register_workload_revision(&revision).unwrap();
+        }
+
+        let reopened = JsonFileControlStore::open(&path).unwrap();
+        assert_eq!(
+            reopened.workload_revision("api", 2).unwrap(),
+            Some(revision)
+        );
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -1388,7 +1589,14 @@ mod tests {
         assert_eq!(store.committed_plan("eval-postgres").unwrap(), Some(plan));
         assert_eq!(store.allocations_for("api").unwrap().len(), 1);
         assert_eq!(store.pending_commands().unwrap().len(), 1);
-        assert!(store.version().unwrap() >= 2);
+
+        let workload = workload_revision(2, 'a');
+        assert_eq!(
+            store.register_workload_revision(&workload).unwrap(),
+            WorkloadRevisionRegistrationOutcome::Applied
+        );
+        assert_eq!(store.workload_revision("api", 2).unwrap(), Some(workload));
+        assert!(store.version().unwrap() >= 3);
 
         store
             .conn

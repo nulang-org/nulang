@@ -1,5 +1,6 @@
 use crate::executor::{AllocationCommandSink, CommandApplyError};
-use crate::store::{AllocationCommand, AllocationCommandKind};
+use crate::store::{AllocationCommand, AllocationCommandKind, ControlStore};
+use crate::workload_revision::WorkloadRevisionSpec;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -42,6 +43,120 @@ pub struct NodeAllocationRecord {
 pub trait WorkloadLifecycle: Send + Sync {
     fn start(&self, command: &AllocationCommand) -> Result<(), CommandApplyError>;
     fn stop(&self, command: &AllocationCommand) -> Result<(), CommandApplyError>;
+}
+
+/// Resolver for immutable deployment revision identity.
+///
+/// Production implementations may read a local admission cache or remote
+/// control-plane API. The key invariant is that one deployment revision cannot
+/// resolve to different identities over time.
+pub trait WorkloadRevisionResolver: Send + Sync {
+    fn resolve(
+        &self,
+        deployment_id: &str,
+        revision: u64,
+    ) -> Result<Option<WorkloadRevisionSpec>, CommandApplyError>;
+}
+
+/// Direct resolver over a ControlStore. Useful for single-node deployments,
+/// tests, and controller/node-agent co-location.
+#[derive(Clone, Copy)]
+pub struct ControlStoreWorkloadResolver<'a> {
+    store: &'a dyn ControlStore,
+}
+
+impl<'a> ControlStoreWorkloadResolver<'a> {
+    pub fn new(store: &'a dyn ControlStore) -> Self {
+        Self { store }
+    }
+}
+
+impl WorkloadRevisionResolver for ControlStoreWorkloadResolver<'_> {
+    fn resolve(
+        &self,
+        deployment_id: &str,
+        revision: u64,
+    ) -> Result<Option<WorkloadRevisionSpec>, CommandApplyError> {
+        self.store
+            .workload_revision(deployment_id, revision)
+            .map_err(|error| {
+                CommandApplyError::retryable(format!(
+                    "workload revision lookup failed for {deployment_id} revision {revision}: {error}"
+                ))
+            })
+    }
+}
+
+/// Launch boundary that has received the immutable workload revision contract.
+pub trait ResolvedWorkloadLifecycle: Send + Sync {
+    fn start_resolved(
+        &self,
+        command: &AllocationCommand,
+        workload: &WorkloadRevisionSpec,
+    ) -> Result<(), CommandApplyError>;
+
+    fn stop(&self, command: &AllocationCommand) -> Result<(), CommandApplyError>;
+}
+
+/// Adapter that prevents Start from reaching a launcher unless the deployment
+/// revision resolves to an immutable admitted workload identity.
+///
+/// Stop deliberately does not depend on revision lookup: cleanup/fencing must
+/// remain available during registry or artifact-store outages.
+pub struct RevisionBoundLifecycle<R, L> {
+    resolver: R,
+    lifecycle: L,
+}
+
+impl<R, L> RevisionBoundLifecycle<R, L> {
+    pub fn new(resolver: R, lifecycle: L) -> Self {
+        Self {
+            resolver,
+            lifecycle,
+        }
+    }
+
+    pub fn into_inner(self) -> (R, L) {
+        (self.resolver, self.lifecycle)
+    }
+}
+
+impl<R, L> WorkloadLifecycle for RevisionBoundLifecycle<R, L>
+where
+    R: WorkloadRevisionResolver,
+    L: ResolvedWorkloadLifecycle,
+{
+    fn start(&self, command: &AllocationCommand) -> Result<(), CommandApplyError> {
+        let Some(workload) = self
+            .resolver
+            .resolve(&command.deployment_id, command.revision)?
+        else {
+            return Err(CommandApplyError::terminal(format!(
+                "no immutable workload revision registered for {} revision {}",
+                command.deployment_id, command.revision
+            )));
+        };
+
+        workload.validate().map_err(|error| {
+            CommandApplyError::terminal(format!(
+                "registered workload revision for {} revision {} is invalid: {error}",
+                command.deployment_id, command.revision
+            ))
+        })?;
+        if workload.deployment_id != command.deployment_id || workload.revision != command.revision
+        {
+            return Err(CommandApplyError::terminal(format!(
+                "resolved workload identity does not match allocation command {} revision {}",
+                command.deployment_id, command.revision
+            )));
+        }
+
+        self.lifecycle.start_resolved(command, &workload)
+    }
+
+    fn stop(&self, command: &AllocationCommand) -> Result<(), CommandApplyError> {
+        self.lifecycle.stop(command)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -303,6 +418,31 @@ mod tests {
         Arc,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[derive(Clone, Default)]
+    struct RecordingResolvedLifecycle {
+        starts: Arc<Mutex<Vec<(u64, String)>>>,
+        stops: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl ResolvedWorkloadLifecycle for RecordingResolvedLifecycle {
+        fn start_resolved(
+            &self,
+            command: &AllocationCommand,
+            workload: &WorkloadRevisionSpec,
+        ) -> Result<(), CommandApplyError> {
+            self.starts
+                .lock()
+                .unwrap()
+                .push((command.epoch, workload.digest().unwrap()));
+            Ok(())
+        }
+
+        fn stop(&self, command: &AllocationCommand) -> Result<(), CommandApplyError> {
+            self.stops.lock().unwrap().push(command.epoch);
+            Ok(())
+        }
+    }
 
     #[derive(Clone, Default)]
     struct RecordingLifecycle {
@@ -571,6 +711,88 @@ mod tests {
         assert_eq!(lifecycle.stops.lock().unwrap().as_slice(), &[1, 1]);
 
         let _ = fs::remove_file(state_path);
+    }
+
+    fn registered_revision(revision: u64) -> WorkloadRevisionSpec {
+        use crate::workload_revision::{
+            WorkloadArtifactIdentity, WorkloadLaunchConfig, WORKLOAD_ARTIFACT_KIND_NBC_V1,
+        };
+
+        WorkloadRevisionSpec::new(
+            "api",
+            revision,
+            "api-package",
+            format!("1.0.{revision}"),
+            WorkloadArtifactIdentity {
+                kind: WORKLOAD_ARTIFACT_KIND_NBC_V1.into(),
+                artifact_id: format!("artifact:api-{revision}"),
+                digest: format!("blake3:{}", "a".repeat(64)),
+                behavior_manifest_digest: format!("blake3:{}", "b".repeat(64)),
+                target: "x86_64-unknown-linux-gnu".into(),
+                abi: "nulang-v1".into(),
+                backend: "bytecode".into(),
+            },
+            WorkloadLaunchConfig::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn revision_bound_lifecycle_fails_closed_before_unregistered_start() {
+        use crate::store::MemoryControlStore;
+
+        let store = MemoryControlStore::default();
+        let lifecycle = RecordingResolvedLifecycle::default();
+        let bound = RevisionBoundLifecycle::new(
+            ControlStoreWorkloadResolver::new(&store),
+            lifecycle.clone(),
+        );
+
+        let error = bound
+            .start(&command(AllocationCommandKind::Start, 1))
+            .unwrap_err();
+        assert!(!error.retryable);
+        assert!(lifecycle.starts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn revision_bound_lifecycle_passes_registered_identity_to_launcher() {
+        use crate::store::MemoryControlStore;
+
+        let store = MemoryControlStore::default();
+        let revision = registered_revision(1);
+        store.register_workload_revision(&revision).unwrap();
+
+        let lifecycle = RecordingResolvedLifecycle::default();
+        let bound = RevisionBoundLifecycle::new(
+            ControlStoreWorkloadResolver::new(&store),
+            lifecycle.clone(),
+        );
+        bound
+            .start(&command(AllocationCommandKind::Start, 1))
+            .unwrap();
+
+        let starts = lifecycle.starts.lock().unwrap();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].0, 1);
+        assert_eq!(starts[0].1, revision.digest().unwrap());
+    }
+
+    #[test]
+    fn revision_bound_lifecycle_stop_does_not_require_registry_lookup() {
+        use crate::store::MemoryControlStore;
+
+        let store = MemoryControlStore::default();
+        let lifecycle = RecordingResolvedLifecycle::default();
+        let bound = RevisionBoundLifecycle::new(
+            ControlStoreWorkloadResolver::new(&store),
+            lifecycle.clone(),
+        );
+
+        bound
+            .stop(&command(AllocationCommandKind::Stop, 9))
+            .unwrap();
+        assert_eq!(lifecycle.stops.lock().unwrap().as_slice(), &[9]);
     }
 
     #[test]
