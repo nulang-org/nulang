@@ -157,7 +157,7 @@ pub fn verify_signed_provenance(root: &Path, lockfile: &Lockfile) -> NuResult<()
     Ok(())
 }
 
-//! Cached publisher provenance tests.
+// Signed cache provenance regression tests.
 
 #[cfg(test)]
 mod tests {
