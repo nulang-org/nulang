@@ -910,7 +910,9 @@ impl WebDevServer {
         sqlite_path: Option<PathBuf>,
     ) -> std::io::Result<Self> {
         let web_state = WebStateProvider::from_sqlite_path(sqlite_path)?;
-        let listener = TcpListener::bind(("0.0.0.0", port))?;
+        // The routed dev server must never expose unauthenticated demo KV
+        // writes on the public network by default.
+        let listener = TcpListener::bind(("127.0.0.1", port))?;
         let actual_port = listener.local_addr()?.port();
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
@@ -1066,8 +1068,11 @@ impl WebDevServer {
                                         request: request.clone(),
                                         params: params.clone(),
                                     };
-                                    let (rendered, storage_error) = with_web_request_state(web_state.clone(), || with_request_context(ctx, || {
-                                        match render_direct_request(route, &values) {
+                                    let (rendered, storage_error) = with_web_request_state(
+                                        web_state.clone(),
+                                        || {
+                                            with_request_context(ctx, || {
+                                                match render_direct_request(route, &values) {
                                             Ok(Some(rendered)) => Ok(Some(rendered)),
                                             Ok(None) => Ok(render_route_handler(
                                                 &route.route.handler_module,
@@ -1075,9 +1080,11 @@ impl WebDevServer {
                                                 None,
                                             )),
                                             Err(error) => Err(error),
-                                        }
-                                    }));
-                                    if let Some(error) = storage_error {
+                                                }
+                                            })
+                                        },
+                                    );
+                                    if let Some(error) = &storage_error {
                                         eprintln!("web SQLite state error: {error}");
                                     }
                                     if storage_error.is_some() {
@@ -1087,7 +1094,7 @@ impl WebDevServer {
                                             body: b"Internal server error".to_vec(),
                                         }
                                     } else {
-                                    match rendered {
+                                        match rendered {
                                         Ok(Some(html)) => HttpResponse {
                                             status: 200,
                                             headers: vec![(
@@ -1123,7 +1130,7 @@ impl WebDevServer {
                                                 body: b"Internal server error".to_vec(),
                                             }
                                         }
-                                    }
+                                        }
                                     }
                                 }
                             } else {
