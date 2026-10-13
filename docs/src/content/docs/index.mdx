@@ -23,6 +23,7 @@ import Steps from '../../components/Steps.astro';
 import TerminalCard from '../../components/TerminalCard.astro';
 import MetricsBand from '../../components/MetricsBand.astro';
 import EvidenceGrid from '../../components/EvidenceGrid.astro';
+import BenchmarkPreview from '../../components/BenchmarkPreview.astro';
 import ResourceRail from '../../components/ResourceRail.astro';
 
 <MetricsBand />
@@ -84,6 +85,28 @@ $ NULANG_STORE_PATH=.nulang/store nulang counter.nula`} />
   </div>
 </div>
 
+
+<div class="nu-section">
+  <div class="nu-container">
+    <div class="nu-section-header">
+      <h2>Durable distributed applications, with fewer moving parts</h2>
+      <p class="nu-section-subhead">Building reliable distributed software often means combining an actor framework, workflow engine, message broker, cache and database. Nulang is exploring how typed actors, supervised recovery, durable state and Fabric messaging can live within one coherent runtime.</p>
+    </div>
+    <div class="durable-row">
+      <div class="benefit-text">
+        <h3>Compare languages and actor frameworks</h3>
+        <p>Understand Nulang's tradeoffs against Erlang, Elixir, Go, Rust, Akka, Orleans and Ray—including the maturity and production guarantees those established systems already provide.</p>
+        <p><a href="/comparisons/">Explore the programming language and actor framework comparisons →</a></p>
+      </div>
+      <div class="benefit-text">
+        <h3>The infrastructure consolidation roadmap</h3>
+        <p>Experimental Fabric streams, durable workflows and early NuDB research target use cases often served by Redis, NATS, Kafka, Temporal and, eventually, databases. These are works in progress, not drop-in replacements today.</p>
+        <p><a href="/infrastructure/">See current implementations, missing guarantees and the roadmap →</a></p>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div class="nu-section">
   <div class="nu-container">
     <div class="nu-section-header">
@@ -92,6 +115,12 @@ $ NULANG_STORE_PATH=.nulang/store nulang counter.nula`} />
     </div>
 
     <FeatureGrid />
+  </div>
+</div>
+
+<div class="nu-section">
+  <div class="nu-container">
+    <BenchmarkPreview />
   </div>
 </div>
 
