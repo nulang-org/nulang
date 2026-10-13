@@ -1,13 +1,170 @@
+//! Read-only offline authentication of cached registry packages.
+//!
+//! Signed original archives and detached signatures are stored adjacent to,
+//! not inside, extracted packages. Offline mode validates signature, current
+//! project trust policy, complete archive tree, extracted cache, and lockfile.
+//! No network or filesystem writes occur during verification.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::package::identity::registry_tree_id_for_package_dir;
+use crate::package::lockfile::{registry_cache_dir, Lockfile};
+use crate::package::registry_archive::{
+    registry_tree_id_from_signed_archive, MAX_REGISTRY_ARCHIVE_BYTES,
+};
+use crate::registry::trust::{
+    trusted_publisher_keys, verify_publisher_signature,
+};
+use crate::types::{NuError, NuResult, Span};
+
+static NEXT_RECEIPT: AtomicU64 = AtomicU64::new(0);
+
+fn failure(msg: impl Into<String>) -> NuError {
+    NuError::PackageError { msg: msg.into(), span: Span::default() }
+}
+
+/// Each publisher-authenticated compressed tarball is cached outside the
+/// extracted source tree, preserving stable extracted SourceId values.
+pub fn signed_provenance_dir(root: &Path, name: &str, version: &str) -> NuResult<PathBuf> {
+    // Reuse the name/version validation boundary used by the registry cache.
+    let path = registry_cache_dir(root, name, version)?;
+    let name = path.file_name().ok_or_else(|| failure("invalid provenance path"))?;
+    Ok(root.join(".nula").join("registry-provenance").join(name))
+}
+
+struct ReceiptStaging(PathBuf);
+impl Drop for ReceiptStaging {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Store already publisher-authenticated package bytes and detached signature.
+/// An existing receipt is immutable; a different archive for the same
+/// package/version is a conflict rather than an implicit replacement.
+pub fn store_signed_provenance(
+    root: &Path,
+    registry_url: &str,
+    name: &str,
+    version: &str,
+    bytes: &[u8],
+    signature: &str,
+) -> NuResult<()> {
+    if bytes.is_empty() || bytes.len() > MAX_REGISTRY_ARCHIVE_BYTES {
+        return Err(failure("signed registry archive is empty or oversized"));
+    }
+    let keys = trusted_publisher_keys(root, registry_url).map_err(failure)?;
+    verify_publisher_signature(registry_url, name, version, bytes, signature, &keys)
+        .map_err(failure)?;
+    // Reject invalid archives before persisting any receipt.
+    registry_tree_id_from_signed_archive(bytes, name, version)?;
+
+    let dest = signed_provenance_dir(root, name, version)?;
+    if dest.exists() {
+        let existing = fs::read(dest.join("archive.tar.gz"))
+            .map_err(|e| failure(format!("cannot inspect signed registry receipt: {}", e)))?;
+        let existing_sig = fs::read_to_string(dest.join("signature.hex"))
+            .map_err(|e| failure(format!("cannot inspect signed registry signature: {}", e)))?;
+        if existing == bytes && existing_sig == signature {
+            return Ok(());
+        }
+        return Err(failure(format!(
+            "signed registry receipt for '{}' {} conflicts with existing immutable receipt",
+            name, version
+        )));
+    }
+
+    let parent = dest.parent().ok_or_else(|| failure("signed receipt has no parent"))?;
+    fs::create_dir_all(parent)
+        .map_err(|e| failure(format!("cannot create signed receipt cache: {}", e)))?;
+    let stage = loop {
+        let n = NEXT_RECEIPT.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(".receipt-{}-{}", std::process::id(), n));
+        match fs::create_dir(&candidate) {
+            Ok(()) => break ReceiptStaging(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(failure(format!("cannot stage signed receipt: {}", e))),
+        }
+    };
+    fs::write(stage.0.join("archive.tar.gz"), bytes)
+        .map_err(|e| failure(format!("cannot save signed archive: {}", e)))?;
+    fs::write(stage.0.join("signature.hex"), signature)
+        .map_err(|e| failure(format!("cannot save detached signature: {}", e)))?;
+    fs::rename(&stage.0, &dest)
+        .map_err(|e| failure(format!("cannot promote signed registry receipt: {}", e)))?;
+    Ok(())
+}
+
+/// Verify every locked registry dependency as publisher-authentic and exactly
+/// matching both Nulang.lock and the extracted cache. This function performs
+/// only filesystem reads; it does not repair, fetch, unpack, or rewrite files.
+pub fn verify_signed_provenance(root: &Path, lockfile: &Lockfile) -> NuResult<()> {
+    for package in &lockfile.package {
+        let Some(registry_url) = package.source.strip_prefix("reg+") else {
+            continue;
+        };
+        let identity = lockfile
+            .package_identity(&package.name, &package.version, &package.source)
+            .ok_or_else(|| failure(format!(
+                "offline signed provenance requires a strong Nulang.lock identity for '{}' {}",
+                package.name, package.version
+            )))?;
+        let pinned = identity.parsed_source_id()?.ok_or_else(|| failure(format!(
+            "offline signed provenance requires a nonempty SourceId for '{}' {}",
+            package.name, package.version
+        )))?;
+
+        let receipt = signed_provenance_dir(root, &package.name, &package.version)?;
+        let archive = fs::read(receipt.join("archive.tar.gz"))
+            .map_err(|e| failure(format!(
+                "offline signed archive missing for '{}' {}: {}",
+                package.name, package.version, e
+            )))?;
+        if archive.is_empty() || archive.len() > MAX_REGISTRY_ARCHIVE_BYTES {
+            return Err(failure("offline signed archive is missing or oversized"));
+        }
+        let signature = fs::read_to_string(receipt.join("signature.hex"))
+            .map_err(|e| failure(format!(
+                "offline publisher signature missing for '{}' {}: {}",
+                package.name, package.version, e
+            )))?;
+        let keys = trusted_publisher_keys(root, registry_url).map_err(failure)?;
+        verify_publisher_signature(
+            registry_url, &package.name, &package.version,
+            &archive, &signature, &keys
+        ).map_err(failure)?;
+
+        // Explicitly bind the authenticated tarball to the locked extracted
+        // tree, not merely to a signature on some unrelated valid archive.
+        let signed_tree = registry_tree_id_from_signed_archive(
+            &archive, &package.name, &package.version
+        )?;
+        let extracted = registry_tree_id_for_package_dir(
+            &registry_cache_dir(root, &package.name, &package.version)?
+        ).map_err(|e| failure(format!(
+            "cannot verify offline registry cache for '{}' {}: {}",
+            package.name, package.version, e
+        )))?;
+        if signed_tree != pinned || extracted != pinned {
+            return Err(failure(format!(
+                "offline registry package '{}' {} does not match authenticated archive and Nulang.lock",
+                package.name, package.version
+            )));
+        }
+    }
+    Ok(())
+}
+
 //! Cached publisher provenance tests.
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::SigningKey;
-    use crate::package::manifest::{Manifest, MANIFEST_FILE};
+    use crate::package::manifest::MANIFEST_FILE;
     use crate::package::registry_archive::extract_registry_archive;
     use crate::package::lockfile::{Lockfile, LockedPackage};
-    use std::io::Write;
 
     fn fixture(tag: &str) -> (std::path::PathBuf, Vec<u8>, String, Lockfile) {
         let root = std::env::temp_dir().join(format!(
@@ -123,7 +280,7 @@ mod tests {
         store_signed_provenance(
             &root, "https://registry.test", "util", "0.1.0", &archive, &signature
         ).unwrap();
-        let id = crate::package::identity::SourceId::from_bytes(b"unrelated tree");
+        let id = crate::content_identity::SourceId::from_bytes(b"unrelated tree");
         lock.set_package_identity(
             "util", "0.1.0", "reg+https://registry.test", Some(id), None
         ).unwrap();
