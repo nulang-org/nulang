@@ -2510,6 +2510,24 @@ fn nu_error_to_diagnostic(err: NuError) -> Vec<Diagnostic> {
     }
 }
 
+/// Convert the SourceMap's 1-based UTF-8 byte column into an LSP UTF-16
+/// column. If source text is absent (synthetic diagnostics), retain the
+/// legacy best-effort column rather than guessing an unrelated source.
+fn lsp_position_from_byte_column(source: Option<&str>, line: usize, col: usize) -> Position {
+    let byte_col = col.saturating_sub(1);
+    let utf16_col = source
+        .and_then(|text| text.split('\n').nth(line.saturating_sub(1)))
+        .map(|line_text| {
+            line_text
+                .char_indices()
+                .take_while(|(byte, _)| *byte < byte_col)
+                .map(|(_, ch)| ch.len_utf16())
+                .sum::<usize>()
+        })
+        .unwrap_or(byte_col);
+    Position::new(line.saturating_sub(1) as u32, utf16_col as u32)
+}
+
 /// Build a single LSP Diagnostic from a non-Multiple NuError.
 fn single_diagnostic(err: NuError) -> Diagnostic {
     let error_code = err
@@ -2562,14 +2580,12 @@ fn single_diagnostic(err: NuError) -> Diagnostic {
         NuError::Multiple(_) => unreachable!("Multiple handled by caller"),
     };
 
-    let start = Position::new(
-        start_line.saturating_sub(1) as u32,
-        start_col.saturating_sub(1) as u32,
-    );
-    let end = Position::new(
-        end_line.saturating_sub(1) as u32,
-        end_col.saturating_sub(1) as u32,
-    );
+    // Span columns are UTF-8 byte offsets; LSP columns are UTF-16 code
+    // units. Convert against the lexer's current SourceMap instead of
+    // publishing byte-indexed ranges that fail after non-ASCII text.
+    let source = crate::types::current_source_text();
+    let start = lsp_position_from_byte_column(source.as_deref(), start_line, start_col);
+    let end = lsp_position_from_byte_column(source.as_deref(), end_line, end_col);
 
     Diagnostic {
         range: Range::new(start, end),
