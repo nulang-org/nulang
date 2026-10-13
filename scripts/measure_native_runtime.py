@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import tempfile
 import platform
@@ -28,12 +29,16 @@ MEASUREMENT_CONTRACT = (
 )
 
 
-def profile_executable(binary: Path, *, runs: int = 21, warmup: int = 3) -> dict[str, int | str]:
+def profile_executable(
+    binary: Path, *, runs: int = 21, warmup: int = 3, timeout_seconds: float = 30.0
+) -> dict[str, int | str]:
     """Profile one executable; reject invalid paths and nonzero exits."""
     if not 1 <= runs <= 2000:
         raise ValueError("runs must be between 1 and 2000")
     if not 0 <= warmup <= 2000:
         raise ValueError("warmup must be between 0 and 2000")
+    if not 0 < timeout_seconds <= 600:
+        raise ValueError("timeout must be greater than 0 and at most 600 seconds")
     if sys.platform != "linux":
         raise RuntimeError("native runtime resource profiling requires Linux")
     binary = binary.resolve()
@@ -49,13 +54,25 @@ def profile_executable(binary: Path, *, runs: int = 21, warmup: int = 3) -> dict
         )
         if compiled.returncode:
             raise RuntimeError(f"cannot compile native probe: {compiled.stderr[-2000:]}")
-        completed = subprocess.run(
+        # Start a separate process group so a stuck benchmark cannot leave
+        # either the probe or its fork/exec descendants alive in CI.
+        process = subprocess.Popen(
             [str(probe), str(binary), str(runs), str(warmup)],
-            capture_output=True, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True,
         )
-        if completed.returncode:
-            raise RuntimeError(f"native probe: {completed.stderr[-2000:]}")
-    rows = completed.stdout.splitlines()
+        try:
+            stdout, stderr = process.communicate(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired as exc:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate()  # Reap the probe, close pipes.
+            raise RuntimeError(f"native probe timed out after {timeout_seconds:g}s: {binary}") from exc
+        if process.returncode:
+            raise RuntimeError(f"native probe: {stderr[-2000:]}")
+    rows = stdout.splitlines()
     if len(rows) != runs:
         raise RuntimeError(f"native probe returned {len(rows)} samples; expected {runs}")
     try:
@@ -86,6 +103,8 @@ def main() -> int:
                         help="one or more named native binaries")
     parser.add_argument("--runs", type=int, default=21)
     parser.add_argument("--warmup", type=int, default=3)
+    parser.add_argument("--timeout-seconds", type=float, default=30.0,
+                        help="maximum total measurement time per artifact (default: 30)")
     parser.add_argument("--json-out", type=Path)
     opts = parser.parse_args()
 
@@ -99,7 +118,8 @@ def main() -> int:
             seen.add(name)
             binary = Path(raw_path).resolve()
             artifacts.append({"name": name, "executable": str(binary),
-                              **profile_executable(binary, runs=opts.runs, warmup=opts.warmup)})
+                              **profile_executable(binary, runs=opts.runs, warmup=opts.warmup,
+                                                   timeout_seconds=opts.timeout_seconds)})
         report = {
             "schema_version": 1,
             "platform": {"system": platform.system(), "architecture": platform.machine()},

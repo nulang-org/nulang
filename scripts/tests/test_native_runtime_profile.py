@@ -48,6 +48,22 @@ class NativeRuntimeProfileTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "warmup"):
             profiler.profile_executable(Path("/bin/true"), runs=1, warmup=-1)
 
+    def test_hanging_executable_times_out_without_leaving_child_running(self):
+        profiler = load_profile()
+        with tempfile.TemporaryDirectory() as tmp:
+            executable = Path(tmp) / "hang"
+            # The shell starts a child process. Timeout must terminate the
+            # *whole* process group, not just the C probe parent.
+            executable.write_text("#!/bin/sh\nsleep 30\n")
+            executable.chmod(0o755)
+            with self.assertRaisesRegex(RuntimeError, "timed out"):
+                profiler.profile_executable(executable, runs=1, warmup=0, timeout_seconds=0.25)
+
+    def test_invalid_timeout_rejected(self):
+        profiler = load_profile()
+        with self.assertRaisesRegex(ValueError, "timeout"):
+            profiler.profile_executable(Path("/bin/true"), runs=1, warmup=0, timeout_seconds=0)
+
     def test_cannot_execute_non_executable_file(self):
         profiler = load_profile()
         with tempfile.TemporaryDirectory() as tmp:

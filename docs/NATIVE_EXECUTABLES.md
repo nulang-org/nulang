@@ -96,7 +96,10 @@ isolated application initialization measurements. Wall time includes fork/exec
 and kernel scheduling. CI shared-host timing variance makes the samples
 informational, **not a blocking relative-performance gate**. For trustworthy
 comparisons, rerun multiple times on stable, identical hardware, with the
-same linkage model and program behavior.
+same linkage model and program behavior. Each artifact has a **30-second
+overall sampling timeout** by default (adjustable using `--timeout-seconds`).
+A timeout terminates the entire measurement process group and fails the
+smoke run rather than leaving CI blocked by a hung executable.
 
 ## Promotion gates
 
