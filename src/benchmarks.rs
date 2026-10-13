@@ -120,6 +120,61 @@ fn bench_ab_mailbox_push_inline_1() {
     report_ab("mailbox_push_inline_1", N as u64, elapsed);
 }
 
+/// Construct one idle receiver and explicitly install the intended trace
+/// context *after* draining spawn-time scheduler work. The legacy enqueue
+/// sweep intentionally remains unchanged for longitudinal comparability.
+fn trace_controlled_enqueue_runtime(traced: bool) -> (Runtime, u64) {
+    let mut runtime = Runtime::new();
+    let actor_id = runtime.spawn_actor(Box::new(Vec::new));
+    runtime
+        .actors
+        .get_mut(&actor_id)
+        .expect("spawned benchmark actor")
+        .register_behavior("handle", ab_noop_handler);
+    runtime.run_scheduler();
+    runtime.current_trace = traced.then(crate::runtime::TraceContext::root);
+    (runtime, actor_id)
+}
+
+/// Compare zero-argument local admission with explicit, matched trace states.
+/// Setup, draining, and destruction remain outside each timed section. These
+/// controls are Nulang-only: they do not alter cross-language Savina counts.
+#[test]
+fn bench_ab_enqueue_trace_controls() {
+    const N: usize = 100_000;
+    for (mode, traced) in [("untraced", false), ("traced", true)] {
+        let (mut runtime, actor_id) = trace_controlled_enqueue_runtime(traced);
+        let start = Instant::now();
+        for _ in 0..N {
+            runtime.send_message_by_id(actor_id, 0, &[]);
+        }
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            runtime
+                .actors
+                .get(&actor_id)
+                .expect("actor still live")
+                .mailbox
+                .len(),
+            N,
+            "trace-controlled enqueue must admit all messages"
+        );
+        report_ab(&format!("enqueue_payload_0_explicit_{mode}"), N as u64, elapsed);
+
+        runtime.run_scheduler();
+        assert!(
+            runtime
+                .actors
+                .get(&actor_id)
+                .expect("actor still live")
+                .mailbox
+                .is_empty(),
+            "trace-controlled messages must all be consumed"
+        );
+    }
+}
+
 /// Verify that the benchmark fixture explicitly selects a trace state after
 /// spawn-time scheduler work; otherwise a previous handler may determine the
 /// admission benchmark's trace mode without the caller realizing it.
