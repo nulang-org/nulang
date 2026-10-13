@@ -726,7 +726,8 @@ fn remove_closure_allocation(func: &mut Function, clos: LocalId) {
         });
         for ((bid, index), _) in &mut func.line_table {
             if *bid == block_id {
-                *index -= removed.iter().filter(|&&old| old < *index).count();
+                let shift = removed.iter().filter(|&&old| old < *index).count();
+                *index -= shift;
             }
         }
     }
