@@ -651,8 +651,12 @@ impl LanguageServer for NulangLanguageServer {
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
         let uri = params.text_document.uri.clone();
         let docs = self.documents.lock().unwrap();
-        let source = match docs.get(&uri) {
-            Some(doc) => doc.source.clone(),
+        let (source, diagnostics, diagnostics_pending) = match docs.get(&uri) {
+            Some(doc) => (
+                doc.source.clone(),
+                doc.diagnostics.clone(),
+                doc.diagnostics_pending,
+            ),
             None => return Ok(None),
         };
         drop(docs);
@@ -662,7 +666,16 @@ impl LanguageServer for NulangLanguageServer {
             .ok()
             .and_then(|p| p.parent().map(|p| p.to_path_buf()));
         let import_index = self.import_index(doc_dir.as_deref());
-        Ok(Self::code_actions(&source, range, &uri, &import_index))
+        let mut actions = Self::code_actions(&source, range, &uri, &import_index)
+            .unwrap_or_default();
+        // Only act on compiler diagnostics for this exact document version.
+        // A pending debounced pass means earlier diagnostics are stale.
+        if !diagnostics_pending {
+            actions.extend(Self::typo_quickfix_actions(
+                &source, &params.range, &uri, &diagnostics,
+            ));
+        }
+        Ok(if actions.is_empty() { None } else { Some(actions) })
     }
 
     async fn folding_range(&self, params: FoldingRangeParams) -> Result<Option<Vec<FoldingRange>>> {
@@ -1683,6 +1696,88 @@ impl NulangLanguageServer {
         }
     }
 
+    /// Offer a source-verified replacement for a compiler-suggested in-scope
+    /// name. We deliberately do not guess edits for effects or capabilities.
+    /// The source range must still contain precisely the reported identifier.
+    fn typo_quickfix_actions(
+        source: &str,
+        requested: &Range,
+        uri: &Url,
+        diagnostics: &[Diagnostic],
+    ) -> Vec<CodeActionOrCommand> {
+        let mut actions = Vec::new();
+        let requested_start = (requested.start.line, requested.start.character);
+        let requested_end = (requested.end.line, requested.end.character);
+
+        for diagnostic in diagnostics {
+            if diagnostic.severity != Some(DiagnosticSeverity::ERROR)
+                || diagnostic.code
+                    != Some(NumberOrString::String("E0202".to_string()))
+            {
+                continue;
+            }
+            let diag_start = (
+                diagnostic.range.start.line,
+                diagnostic.range.start.character,
+            );
+            let diag_end = (diagnostic.range.end.line, diagnostic.range.end.character);
+            if requested_start > diag_end || requested_end < diag_start {
+                continue;
+            }
+            let Some(misspelled) = diagnostic.message
+                .strip_prefix("Unbound variable: '")
+                .and_then(|message| message.strip_suffix('\''))
+            else {
+                continue;
+            };
+            let (Some(start), Some(end)) = (
+                Self::position_to_byte_offset(source, &diagnostic.range.start),
+                Self::position_to_byte_offset(source, &diagnostic.range.end),
+            ) else {
+                continue;
+            };
+            if start >= end || source.get(start..end) != Some(misspelled) {
+                continue;
+            }
+            let Some(candidates) = diagnostic.data
+                .as_ref()
+                .and_then(|data| data.get("similar_names"))
+                .and_then(|value| value.as_array())
+            else {
+                continue;
+            };
+            let valid: Vec<&str> = candidates
+                .iter()
+                .filter_map(|value| value.as_str())
+                .filter(|name| {
+                    *name != misspelled
+                        && !name.is_empty()
+                        && name.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
+                })
+                .collect();
+            for candidate in valid.iter() {
+                let edit = TextEdit {
+                    range: diagnostic.range,
+                    new_text: (*candidate).to_string(),
+                };
+                let mut changes = std::collections::HashMap::new();
+                changes.insert(uri.clone(), vec![edit]);
+                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title: format!("Replace '{}' with '{}'", misspelled, candidate),
+                    kind: Some(CodeActionKind::QUICKFIX),
+                    diagnostics: Some(vec![diagnostic.clone()]),
+                    edit: Some(WorkspaceEdit {
+                        changes: Some(changes),
+                        ..WorkspaceEdit::default()
+                    }),
+                    is_preferred: Some(valid.len() == 1),
+                    ..CodeAction::default()
+                }));
+            }
+        }
+        actions
+    }
+
     /// Offer "Extract to variable" for a selected expression.
     ///
     /// Simple version: if the selection is on a line with `= expr`, replace
@@ -2366,6 +2461,18 @@ fn nu_error_to_diagnostic(err: NuError) -> Vec<Diagnostic> {
 
 /// Build a single LSP Diagnostic from a non-Multiple NuError.
 fn single_diagnostic(err: NuError) -> Diagnostic {
+    // Preserve the typechecker's exact in-scope suggestions for the editor,
+    // rather than reconstructing them from the rendered error message.
+    let candidates = match &err {
+        NuError::TypeError {
+            msg,
+            similar_names: Some(names),
+            ..
+        } if msg.starts_with("Unbound variable: '") && !names.is_empty() => {
+            Some(names.clone())
+        }
+        _ => None,
+    };
     let (message, start_line, start_col, end_line, end_col) = match err {
         NuError::LexError { msg, span }
         | NuError::ParseError { msg, span, .. }
@@ -2406,13 +2513,15 @@ fn single_diagnostic(err: NuError) -> Diagnostic {
     Diagnostic {
         range: Range::new(start, end),
         severity: Some(DiagnosticSeverity::ERROR),
-        code: None,
+        code: candidates
+            .as_ref()
+            .map(|_| NumberOrString::String("E0202".to_string())),
         code_description: None,
         source: Some("nulang".to_string()),
         message,
         related_information: None,
         tags: None,
-        data: None,
+        data: candidates.map(|names| serde_json::json!({ "similar_names": names })),
     }
 }
 
