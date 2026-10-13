@@ -321,8 +321,8 @@ mod tests {
 
     #[test]
     fn rejects_invalid_workloads_and_zero_repetitions() {
-        assert!(parse_args(["--workload", "not-a-workload"].map(str::to_string)).is_err());
-        assert!(parse_args(["--repeat", "0"].map(str::to_string)).is_err());
+        assert!(parse_args(["--workload", "not-a-workload"].into_iter().map(str::to_string)).is_err());
+        assert!(parse_args(["--repeat", "0"].into_iter().map(str::to_string)).is_err());
     }
 
     #[test]
