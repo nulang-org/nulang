@@ -118,7 +118,7 @@ fn resolve_imports_with_origins(
         merge_imported_decls(&mut resolved, filter_decls(full, items), import_path)?;
     }
 
-    resolved.retain(|entry| !matches!(entry.decl, Decl::Import { .. }));
+    resolved.retain(|entry| !matches!(&entry.decl, Decl::Import { .. }));
     module.decls = resolved.iter().map(|entry| entry.decl.clone()).collect();
     stack.remove(&canonical_file);
     Ok(resolved)
