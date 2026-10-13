@@ -1,4 +1,7 @@
 # Nulang Changelog
+### A/B benchmark record integrity — 2026-10-13
+- **The exact-base actor A/B harness now fails closed on duplicate benchmark names and nonpositive operation/time measurements.** A malformed emitted record can no longer silently overwrite another sample or enter a throughput comparison with an invalid denominator. Focused regression tests cover required cross-runtime records and optional A/B diagnostics.
+
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
