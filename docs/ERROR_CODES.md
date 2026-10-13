@@ -112,6 +112,12 @@ See `docs/MIGRATION_RFC_0015.md` for the `catch`/`fail` migration guide.
 
 ## Editor quick fixes and safety
 
+LSP diagnostic ranges are UTF-16 positions even though internal compiler spans
+use UTF-8 byte offsets. The LSP converts using the current source map so
+quick fixes continue to target the correct identifier after non-ASCII text.
+
+
+
 The LSP carries stable diagnostic codes (the same `Exxxx` codes as the
 terminal). For **E0202 unbound variables**, if the compiler supplies
 `similar_names` for identifiers already in scope, the editor may offer
