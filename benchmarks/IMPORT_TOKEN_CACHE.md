@@ -42,7 +42,7 @@ Build the test runner once, outside its timed region:
 
 ```sh
 cargo build --release --no-default-features --bin nulang-import-bench
-python3 -m unittest scripts.tests.test_compare_import_compile
+python3 -m unittest discover -s scripts/tests -p test_compare_import_compile.py
 python3 scripts/compare_import_compile.py --pairs 4 --repeat 20 --warmup 5
 ```
 
