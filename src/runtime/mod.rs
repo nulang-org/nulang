@@ -1427,7 +1427,8 @@ impl Runtime {
                 if let Some((vm_state, signal_name, receive_timeout)) = recaptured {
                     if let Some(actor) = self.actors.get_mut(&actor_id) {
                         actor.jit_yield_pending = false;
-                        actor.waiting_signal = suspension_marker(actor, signal_name);
+                        let marker = suspension_marker(actor, signal_name);
+                        actor.waiting_signal = marker;
                         actor.suspended_execution =
                             Some(crate::runtime::actor::SuspendedExecution {
                                 vm_state,
