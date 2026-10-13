@@ -480,6 +480,9 @@ fn scaffold_package(dir: &Path, name: &str, template: &str) -> NuResult<()> {
             })?;
         web_manifest
             .push_str("[web]\nport = 8787\nstatic_dir = \"public\"\noutput_dir = \"dist\"\n");
+        if template == "service" {
+            web_manifest.push_str("kv_backend = \"sqlite\"\\nkv_path = \"data/web-state.sqlite\"\\n");
+        }
         std::fs::write(&manifest_path, web_manifest).map_err(|e| NuError::PackageError {
             msg: format!(
                 "cannot write web section to {}: {}",
@@ -590,9 +593,21 @@ fn health() -> Html {
     text("ok")
 }
 
+fn read_state() -> Html {
+    text(kv_get("message"))
+}
+
+fn write_state() -> Html {
+    let value = form_value("value")
+    kv_set("message", value)
+    text("saved")
+}
+
 app "service" {
     route "GET" "/" -> home
     route "GET" "/health" -> health
+    route "GET" "/state" -> read_state
+    route "POST" "/state" -> write_state
 }
 "#,
             ),
@@ -604,6 +619,8 @@ This template registers two HTTP routes using the built-in Web effect:
 
 - GET / — HTML homepage
 - GET /health — **liveness only** (not a persistence or readiness probe)
+- GET /state — read persisted demo message
+- POST /state — save `value=...` to SQLite (form encoding)
 
 ## Start locally
 
@@ -626,19 +643,26 @@ requires additional deployment and security review.
 
 ## SQLite and durable jobs
 
-This template deliberately has **no stateful endpoints**. It does not
-claim that `Web.kv_get` / `Web.kv_set` survive process restarts: those
-effects currently use an ephemeral in-memory store.
+This template explicitly selects `[web] kv_backend = "sqlite"` with
+`kv_path = "data/web-state.sqlite"`. Its demo `Web.kv_*` effects use a
+SQLite table, and each acknowledged set/delete operation is committed before
+the HTTP response. Try:
 
-The optional server build profile (`--no-default-features --features
-server`) includes libSQL/SQLite for Nulang's existing durable actor
-persistence APIs, but the web request handler is not automatically backed
-by a SQLite database. See docs/SERVER_PROFILE.md in the Nulang repository.
+```sh
+curl -d 'value=hello' http://127.0.0.1:8787/state
+curl http://127.0.0.1:8787/state
+```
 
-Use tested persistence APIs for application data, rather than storing
-important user data in the demo web KV. Durable background jobs and
-transactional web storage require a separate end-to-end integration and
-crash-recovery validation before production use.
+The file survives restarts. Each KV operation commits separately, NOT the
+entire HTTP request. There is no multi-step rollback, actor/workflow atomicity,
+authentication, tenant isolation or production-ready HTTP hosting. Never use
+this demo endpoint on a publicly accessible listener; anyone who can reach it
+can overwrite the single demo key.
+
+The separate `web` template retains its existing ephemeral-memory default.
+The SQLite adapter is feature-gated and requires a Nulang binary built with
+`sqlite` (included in the `server` and public release profiles).
+Durable background jobs require separate crash-recovery validation.
 "#,
             ),
         ],
@@ -2860,16 +2884,17 @@ mod tests {
             .expect("service template must scaffold");
         let manifest = Manifest::load(&dir).expect("service manifest must parse");
         assert_eq!(manifest.web.port, 8787);
+        assert_eq!(manifest.web.kv_backend, "sqlite");
+        assert_eq!(manifest.web.kv_path, "data/web-state.sqlite");
 
         let source = std::fs::read_to_string(dir.join("src/main.nula"))
             .expect("service must provide an app entry point");
         assert!(source.contains("app \"service\""));
         assert!(source.contains("route \"GET\" \"/\" -> home"));
         assert!(source.contains("route \"GET\" \"/health\" -> health"));
-        assert!(
-            !source.contains("kv_set"),
-            "service template must not imply durable state through ephemeral web KV"
-        );
+        assert!(source.contains("route \"GET\" \"/state\" -> read_state"));
+        assert!(source.contains("route \"POST\" \"/state\" -> write_state"));
+        assert!(source.contains("kv_set(\"message\", value)"));
         let readme = std::fs::read_to_string(dir.join("README.md"))
             .expect("service template needs usage instructions");
         assert!(readme.contains("nula dev"));
