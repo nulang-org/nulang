@@ -33,10 +33,18 @@ pub(crate) fn parse_query_args(
     constants: &[Constant],
     args: &[Value],
 ) -> io::Result<OwnedDbQuery> {
-    const MAX_ARGS: usize = 256;
+    const MAX_PARAMS: usize = 254;
     const MAX_SQL_BYTES: usize = 1_048_576;
-    if args.is_empty() || args.len() > MAX_ARGS + 1 {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid SQL arguments"));
+    // PerformAsync passes all VM registers. r1 is a compiler-generated
+    // argument count; never mistake uncleared registers for SQL parameters.
+    let param_count = args
+        .get(1)
+        .and_then(Value::as_int)
+        .filter(|count| (0..=MAX_PARAMS as i64).contains(count))
+        .map(|count| count as usize)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid SQL arity"))?;
+    if args.len() < param_count + 2 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "SQL argument frame is truncated"));
     }
     let sql = args[0]
         .as_string_id()
@@ -50,8 +58,8 @@ pub(crate) fn parse_query_args(
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid SQL length"));
     }
 
-    let mut params = Vec::with_capacity(args.len() - 1);
-    for value in args.iter().skip(1) {
+    let mut params = Vec::with_capacity(param_count);
+    for value in args.iter().skip(2).take(param_count) {
         let param = if value.is_nil() {
             OwnedDbParam::Null
         } else if let Some(i) = value.as_int() {
@@ -318,17 +326,35 @@ mod tests {
         let constants = vec![crate::bytecode::Constant::String("SELECT $1".into())];
         let valid = parse_query_args(
             &constants,
-            &[Value::string(0), Value::int(7), Value::nil()],
+            &[Value::string(0), Value::int(2), Value::int(7), Value::nil()],
         ).unwrap();
         assert_eq!(valid.sql, "SELECT $1");
         assert_eq!(valid.params, vec![OwnedDbParam::Int(7), OwnedDbParam::Null]);
 
-        let invalid = parse_query_args(&constants, &[Value::string(3)]);
+        let invalid = parse_query_args(&constants, &[Value::string(3), Value::int(0)]);
         assert!(invalid.is_err());
         // Heap pointers must never escape into a Send background job.
         let pointer = unsafe { Value::ptr(1usize as *mut u8) };
-        let invalid = parse_query_args(&constants, &[Value::string(0), pointer]);
+        let invalid = parse_query_args(&constants, &[Value::string(0), Value::int(1), pointer]);
         assert!(invalid.is_err());
+    }
+
+    #[test]
+    fn sql_arity_ignores_unused_registers_and_rejects_invalid_count() {
+        let constants = [Constant::String("SELECT $1".into())];
+        let query = parse_query_args(
+            &constants,
+            &[Value::string(0), Value::int(1), Value::int(42), Value::int(999)],
+        )
+        .unwrap();
+        assert_eq!(query.params, vec![OwnedDbParam::Int(42)]);
+        assert!(parse_query_args(&constants, &[Value::string(0), Value::int(-1)]).is_err());
+        assert!(parse_query_args(&constants, &[Value::string(0), Value::int(255)]).is_err());
+        assert!(parse_query_args(
+            &constants,
+            &[Value::string(0), Value::int(2), Value::int(42)],
+        )
+        .is_err());
     }
 
     #[test]
@@ -339,7 +365,7 @@ mod tests {
         let outcome = rt.start_or_resume_db_query(
             actor_id,
             &[crate::bytecode::Constant::String("SELECT 1".into())],
-            &[Value::string(0)],
+            &[Value::string(0), Value::int(0)],
         );
         assert!(matches!(outcome, PerformAsyncResult::Ready(Some(_))));
         assert_eq!(rt.db_pending.len(), 0);
@@ -378,7 +404,7 @@ mod tests {
         let first = rt.start_or_resume_db_query(
             id,
             &[crate::bytecode::Constant::String("SELECT 42".into())],
-            &[Value::string(0)],
+            &[Value::string(0), Value::int(0)],
         );
         assert!(matches!(first, PerformAsyncResult::Pending));
         started.wait();
@@ -410,7 +436,7 @@ mod tests {
         let id = rt.spawn_actor(Box::new(Vec::new()));
         rt.suspend_enabled = true;
         let constants = [Constant::String("SELECT 42".into())];
-        let args = [Value::string(0)];
+        let args = [Value::string(0), Value::int(0)];
         assert!(matches!(
             rt.start_or_resume_db_query(id, &constants, &args),
             PerformAsyncResult::Pending
@@ -454,7 +480,7 @@ mod tests {
             rt.start_or_resume_db_query(
                 id,
                 &[Constant::String("SELECT 42".into())],
-                &[Value::string(0)]
+                &[Value::string(0), Value::int(0)]
             ),
             PerformAsyncResult::Pending
         ));
@@ -479,7 +505,7 @@ mod tests {
         let result = rt.start_or_resume_db_query(
             id,
             &[crate::bytecode::Constant::String("SELECT 1".into())],
-            &[Value::string(0)],
+            &[Value::string(0), Value::int(0)],
         );
         assert!(matches!(result, PerformAsyncResult::Ready(Some(_))));
         assert!(rt.db_pending.is_empty());
