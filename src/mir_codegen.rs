@@ -1737,7 +1737,12 @@ fn fold_rvalue(
         },
         RValue::Unary(uop, local) => match const_locals.get(&local) {
             Some(c) => match (uop, c) {
-                (UnOp::Neg, Int(n)) => RValue::Const(Int(n.wrapping_neg())),
+                // The VM raises an overflow error for -INT48_MIN, even
+                // though its i64 negation fits: the result cannot fit in
+                // the signed 48-bit value payload. Keep the checked opcode.
+                (UnOp::Neg, Int(n)) if *n != crate::value_layout::INT48_MIN => {
+                    RValue::Const(Int(n.wrapping_neg()))
+                }
                 (UnOp::Neg, Float(f)) => RValue::Const(Float(-f)),
                 (UnOp::Not, Bool(b)) => RValue::Const(Bool(!b)),
                 // The remaining Not rules never fire on well-typed MIR
