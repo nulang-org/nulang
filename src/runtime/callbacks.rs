@@ -839,7 +839,10 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
                     let json = serde_json::to_string(&rows).unwrap_or_default();
                     self.alloc_string(&json)
                 }
-                Err(_) => crate::vm::Value::nil(),
+                Err(error) => {
+                    tracing::warn!(%error, "DB.query failed; legacy API returns Nil");
+                    crate::vm::Value::nil()
+                },
             };
             return Some(result);
         }
@@ -1665,7 +1668,10 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
                             Some(crate::vm::Value::nil())
                         }
                     }
-                    Err(_) => Some(crate::vm::Value::nil()),
+                    Err(error) => {
+                        tracing::warn!(%error, "DB.query failed; legacy API returns Nil");
+                        Some(crate::vm::Value::nil())
+                    },
                 };
             }
             if effect_name == "Actor" {
