@@ -164,15 +164,84 @@ Stop blocks a Start for the same logical replica at the store boundary, and a
 dispatcher whose lease has been reclaimed cannot ACK or release the newer
 generation. The same claim state is persisted by JSON and PostgreSQL stores.
 
+## Durable node-side execution fence
+
+`FencedNodeExecutor` is the concrete node-side implementation of the
+allocation-command sink boundary. It persists a small local lifecycle record per
+logical deployment replica and applies the allocation epoch again at the point
+where external side effects occur.
+
+The state machine is intentionally conservative:
+
+```text
+Start(N)
+  -> persist Starting(N)
+  -> idempotent WorkloadLifecycle.start(N)
+  -> persist Running(N)
+
+Stop(N)
+  -> persist Stopping(N)
+  -> idempotent WorkloadLifecycle.stop(N)
+  -> persist Stopped(N)
+```
+
+A retryable launcher failure leaves `Starting` or `Stopping` durable so the
+exact operation is retried after controller/node-agent recovery. A newer Start
+cannot pass a locally live prior epoch. A delayed Start for an already-fenced
+older epoch is a safe no-op, while the same stopped epoch cannot be resurrected.
+A delayed Stop for an old epoch may clean up that exact orphaned workload but
+cannot overwrite the durable record for a newer running epoch. Commands for a
+different node fail before any launcher side effect.
+
+The node execution file is a **secondary fence**, not cluster ownership. The
+transactional control store remains authoritative. The executor serializes
+commands through one node-local state machine and requires
+`WorkloadLifecycle` implementations to make exact Start/Stop identities
+idempotent.
+
+## Immutable workload revision contract
+
+Actual Start execution now has a separate immutable admission identity instead
+of resolving a deployment revision through a mutable path, image tag, or URL.
+
+`WorkloadRevisionSpec` binds one `(deployment_id, revision)` to:
+
+- package name/version;
+- RFC 0020 artifact kind and compiler-derived artifact id;
+- BLAKE3 digest of the exact executable bytes;
+- BLAKE3 digest of the canonical behavior manifest;
+- admitted target / ABI / backend;
+- ordered application arguments;
+- names of required runtime configuration values.
+
+Configuration **values and secrets are not part of the revision document**.
+Artifact locations are also deliberately absent: a content-addressed mirror can
+move while workload identity remains unchanged.
+
+The complete revision document has its own domain-separated canonical BLAKE3
+digest. `ControlStore::register_workload_revision` persists the normalized
+document through Memory, JSON, and PostgreSQL backends. Exact registration
+retries are idempotent; reusing the same deployment revision with different
+artifact/manifest/launch identity fails closed.
+
+`RevisionBoundLifecycle` bridges that registry to the node execution fence.
+A Start does not reach `ResolvedWorkloadLifecycle` until its immutable
+revision exists and validates. A Stop bypasses revision lookup so fencing and
+cleanup remain possible during registry or artifact-store outages.
+
+The control plane still does not fetch executable bytes itself. A concrete
+launcher/CAS adapter must fetch by digest, verify the exact artifact and RFC
+0020 behavior manifest, enforce target/ABI admission, then launch it. This keeps
+artifact transport replaceable without weakening deployment identity.
+
 ## Next implementation slices
 
-1. Reconciliation event loop for deployment/node/allocation changes.
-2. PostgreSQL state normalization only if measured contention/state size justifies it.
-4. Fabric-backed service directory with generation-tagged health advertisements.
-5. Workload identity and short-lived mTLS credentials bound to node/workload
+1. Content-addressed artifact/behavior-manifest fetch + verification adapter.
+2. Workload identity and short-lived mTLS credentials bound to node/workload
    identity.
-6. Capability-to-network-policy compilation, enforced in the NUL0 transport.
-7. Optional L7 waypoint for HTTP/gRPC policy; no per-actor sidecars.
+3. Capability-to-network-policy compilation, enforced in the NUL0 transport.
+4. Optional L7 waypoint for HTTP/gRPC policy; no per-actor sidecars.
+5. PostgreSQL state normalization only if measured contention/state size justifies it.
 
 ## Non-goals
 

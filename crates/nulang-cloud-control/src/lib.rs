@@ -9,15 +9,22 @@
 
 pub mod executor;
 pub mod model;
+pub mod node_executor;
 pub mod reconciler;
 pub mod scheduler;
 pub mod store;
+pub mod workload_revision;
 
 pub use executor::{
     dispatch_pending, dispatch_pending_as, AllocationCommandSink, CommandApplyError,
     DispatchOutcome, DispatchRecord, DispatchReport,
 };
 pub use model::*;
+pub use node_executor::{
+    ControlStoreWorkloadResolver, FencedNodeExecutor, NodeAllocationPhase, NodeAllocationRecord,
+    ResolvedWorkloadLifecycle, RevisionBoundLifecycle, WorkloadLifecycle, WorkloadRevisionResolver,
+};
 pub use reconciler::{reconcile_once, ReconcileError, ReconcileResult};
 pub use scheduler::plan_evaluation;
 pub use store::*;
+pub use workload_revision::*;
