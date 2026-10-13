@@ -119,6 +119,27 @@ impl From<&str> for LlmError {
         LlmError::from_string(s)
     }
 }
+/// Parse provider-produced tool arguments without manufacturing an empty
+/// object from malformed or non-object model output. An empty object is valid
+/// only when the provider actually supplies `{}`.
+pub(crate) fn parse_tool_arguments(
+    value: serde_json::Value,
+) -> Result<serde_json::Map<String, serde_json::Value>, LlmError> {
+    match value {
+        serde_json::Value::Object(map) => Ok(map),
+        serde_json::Value::String(raw) => serde_json::from_str(&raw).map_err(|err| {
+            LlmError::new(
+                LlmErrorKind::FormatError,
+                format!("Tool arguments must be a valid JSON object: {err}"),
+            )
+        }),
+        _ => Err(LlmError::new(
+            LlmErrorKind::FormatError,
+            "Tool arguments must be a JSON object",
+        )),
+    }
+}
+
 /// A single tool invocation produced by an LLM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
