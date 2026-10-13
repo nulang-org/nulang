@@ -93,6 +93,70 @@ pub fn source_id_for_package_dir(root: &Path) -> io::Result<SourceId> {
     Ok(SourceId::from_bytes(&canonical))
 }
 
+/// Strong identity of an extracted registry package, including every regular
+/// file in the cache (not just .nula sources). This intentionally uses a
+/// separate domain from local path source identities. Build artifacts added
+/// inside the extracted source directory invalidate the cache as well.
+pub fn registry_tree_id_for_package_dir(root: &Path) -> io::Result<SourceId> {
+    let metadata = fs::symlink_metadata(root)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("registry source root is not a regular directory: {}", root.display()),
+        ));
+    }
+    let manifest = root.join("Nulang.toml");
+    if !fs::symlink_metadata(&manifest)?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("registry source manifest is not a regular file: {}", manifest.display()),
+        ));
+    }
+
+    let mut paths = Vec::new();
+    collect_registry_files(root, &mut paths)?;
+    let mut files = paths
+        .into_iter()
+        .map(|path| Ok((canonical_relative_path(root, &path)?, path)))
+        .collect::<io::Result<Vec<_>>>()?;
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut canonical = Vec::new();
+    canonical.extend_from_slice(b"nulang.registry-tree.v1\0");
+    put_u32(&mut canonical, files.len() as u32);
+    for (relative, path) in files {
+        let data = fs::read(&path)?;
+        put_bytes(&mut canonical, relative.as_bytes());
+        put_bytes(&mut canonical, &data);
+    }
+    Ok(SourceId::from_bytes(&canonical))
+}
+
+fn collect_registry_files(dir: &Path, files: &mut Vec<std::path::PathBuf>) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("registry source contains forbidden symlink: {}", path.display()),
+            ));
+        }
+        if kind.is_dir() {
+            collect_registry_files(&path, files)?;
+        } else if kind.is_file() {
+            files.push(path);
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("registry source contains a non-regular file: {}", path.display()),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Derive a package semantic identity from canonical per-module semantic IDs.
 ///
 /// Module traversal order is irrelevant, but module paths are semantic: moving
