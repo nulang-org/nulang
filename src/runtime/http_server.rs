@@ -1143,8 +1143,15 @@ impl WebDevServer {
                                     &request.path,
                                 )
                             };
-                            for cookie in take_response_cookies() {
-                                response.headers.push(("Set-Cookie".into(), cookie));
+                            // A handler whose durable write failed must not
+                            // publish session cookies or other response-side
+                            // acknowledgements alongside HTTP 500.
+                            if response.status >= 500 {
+                                let _ = take_response_cookies();
+                            } else {
+                                for cookie in take_response_cookies() {
+                                    response.headers.push(("Set-Cookie".into(), cookie));
+                                }
                             }
                             let middlewares = [Middleware::SecurityHeaders, Middleware::RequestLog];
                             for m in &middlewares {
