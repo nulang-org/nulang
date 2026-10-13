@@ -4780,6 +4780,32 @@ mod lsp_tests {
     }
 
     #[test]
+    fn test_capability_diagnostic_explains_rule_without_auto_fix() {
+        let error = NuError::CapError {
+            msg: "Value cannot cross actor boundary".to_string(),
+            span: crate::types::Span::default(),
+            explanation: Some("Only sendable values may cross actor boundaries".to_string()),
+        };
+        let diagnostic = single_diagnostic(error);
+        assert_eq!(
+            diagnostic.code,
+            Some(NumberOrString::String("E0400".to_string()))
+        );
+        assert!(
+            diagnostic.message.contains("Only sendable values may cross actor boundaries"),
+            "capability diagnostics must explain why an ownership rule failed"
+        );
+        let source = "fn main() { 42 }";
+        let uri = Url::parse("file:///caps.nula").unwrap();
+        assert!(NulangLanguageServer::typo_quickfix_actions(
+            source,
+            &Range::new(Position::new(0, 0), Position::new(0, 0)),
+            &uri,
+            &[diagnostic],
+        ).is_empty(), "an ownership error must not create a speculative edit");
+    }
+
+    #[test]
     fn test_typo_quickfix_edits_only_the_diagnostic_identifier() {
         let source = "fn main() {\n    let counter = 5\n    countr\n}\n";
         let uri = Url::parse("file:///typo.nula").unwrap();
