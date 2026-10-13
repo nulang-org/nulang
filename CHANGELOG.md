@@ -1,4 +1,8 @@
 # Nulang Changelog
+
+### Explicit ownership transfer IR (forward-port) — 2026-10-13
+- `consume x` lowers to an explicit HIR/MIR `MoveOut` transfer. Ordinary `Load` remains an uncounted copy. VM, native AOT, and plain WASM invalidate moved-from locals without changing NBC v1.
+- Regression tests cover ownership-transfer chains, ordinary copies, spilled sources, and invalid self-moves. Exact-head CI remains a release gate.
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
