@@ -101,9 +101,30 @@ describe('with QUOTA_HOOK_URL configured', () => {
 });
 
 describe('without QUOTA_HOOK_URL', () => {
-  it('accepts chunked PUTs when no quota hook is configured', async () => {
+  it('rejects unbounded chunked archive uploads even without billing', async () => {
     const env = makeEnv();
     const res = await publish(env, chunkedBody('tarball-bytes'));
+    expect(res.status).toBe(411);
+    expect(env.stored).toHaveLength(0);
+  });
+
+  it('rejects declared compressed archives over 64 MiB before storage', async () => {
+    const env = makeEnv();
+    const res = await publish(env, 'tiny-body', { 'Content-Length': String(64 * 1024 * 1024 + 1) });
+    expect(res.status).toBe(413);
+    expect(env.stored).toHaveLength(0);
+  });
+
+  it('rejects malformed upload lengths before storage', async () => {
+    const env = makeEnv();
+    const res = await publish(env, 'tiny-body', { 'Content-Length': 'NaN' });
+    expect(res.status).toBe(400);
+    expect(env.stored).toHaveLength(0);
+  });
+
+  it('accepts bounded uploads without a billing hook', async () => {
+    const env = makeEnv();
+    const res = await publish(env, 'tarball-bytes', { 'Content-Length': '13' });
     expect(res.status).toBe(201);
     expect(env.stored).toEqual(['foo/1.0.0.tar.gz']);
   });
