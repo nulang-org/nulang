@@ -1328,6 +1328,51 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_terminal_gated_reader_rejects_eof_without_completion() {
+        let (release_tx, release_rx) = crossbeam::channel::bounded(1);
+        let mut reader = TerminalGatedReader::new(std::io::Cursor::new(vec![42]), release_rx);
+        let mut byte = [0u8; 1];
+        assert_eq!(std::io::Read::read(&mut reader, &mut byte).unwrap(), 1);
+        assert_eq!(byte[0], 42);
+
+        // A closed completion channel must never look like a clean client EOF.
+        drop(release_tx);
+        assert_eq!(
+            std::io::Read::read(&mut reader, &mut byte)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[test]
+    fn test_terminal_gated_reader_allows_eof_after_completion() {
+        let (release_tx, release_rx) = crossbeam::channel::bounded(1);
+        let mut reader = TerminalGatedReader::new(std::io::Cursor::new(vec![42]), release_rx);
+        let mut byte = [0u8; 1];
+        assert_eq!(std::io::Read::read(&mut reader, &mut byte).unwrap(), 1);
+
+        release_tx.send(()).unwrap();
+        assert_eq!(std::io::Read::read(&mut reader, &mut byte).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_terminal_event_writer_signals_only_after_terminated() {
+        let (release_tx, release_rx) = crossbeam::channel::bounded(1);
+        let mut output = Vec::new();
+        {
+            let mut writer = TerminalEventWriter::new(&mut output, release_tx);
+            write_message(&mut writer, &json!({ "type": "event", "event": "stopped" }));
+            assert!(matches!(
+                release_rx.try_recv(),
+                Err(crossbeam::channel::TryRecvError::Empty)
+            ));
+            write_message(&mut writer, &json!({ "type": "event", "event": "terminated" }));
+        }
+        assert!(release_rx.try_recv().is_ok(), "terminal event did not release reader");
+    }
+
+    #[test]
     fn test_continue_reaches_exit() {
         let source = "let a = 1 in a + 1";
         let script = vec![
