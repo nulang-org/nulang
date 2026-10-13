@@ -910,6 +910,80 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn offline_registry_fixture(tag: &str) -> (PathBuf, PathBuf, Manifest, Lockfile) {
+        let dir = fresh_dir(tag);
+        let app = dir.join("app");
+        write_manifest(&app, "app", "1.0.0", "util = \"0.1.0\"\n");
+        std::fs::write(
+            app.join(MANIFEST_FILE),
+            "[package]\nname = \"app\"\nversion = \"1.0.0\"\nregistry = \"https://registry.test\"\n\n[dependencies]\nutil = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let cached = app.join(".nula/registry/util-0.1.0");
+        std::fs::create_dir_all(&cached).unwrap();
+        write_manifest(&cached, "util", "0.1.0", "");
+        std::fs::write(cached.join("module.nula"), "fn main() { 1 }").unwrap();
+        std::fs::write(cached.join("static.json"), "{\"ok\":true}").unwrap();
+
+        let mut lock = Lockfile::new();
+        lock.package.push(LockedPackage {
+            name: "util".to_string(),
+            version: "0.1.0".to_string(),
+            source: "reg+https://registry.test".to_string(),
+            content_hash: String::new(),
+            commit: String::new(),
+        });
+        lock.save(&app).unwrap();
+        (dir, app.clone(), Manifest::load(&app).unwrap(), Lockfile::load(&app).unwrap())
+    }
+
+    #[test]
+    fn registry_integrity_offline_uses_matching_pinned_cache_without_network() {
+        let (dir, app, manifest, lock) = offline_registry_fixture("registry_verified");
+        let expected_lock = lock.to_toml().unwrap();
+        let offline = resolve_offline(&app, &manifest, &lock)
+            .expect("a verified cached registry package should resolve offline");
+        assert_eq!(offline.to_lockfile().package, lock.package);
+        assert_eq!(Lockfile::load(&app).unwrap().to_toml().unwrap(), expected_lock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn registry_integrity_offline_rejects_tampering_without_repair() {
+        let (dir, app, manifest, lock) = offline_registry_fixture("registry_tamper");
+        let cached = app.join(".nula/registry/util-0.1.0");
+        let asset = cached.join("static.json");
+        std::fs::write(&asset, "{\"ok\":false}").unwrap();
+        let before = std::fs::read_to_string(&asset).unwrap();
+        assert!(
+            resolve_offline(&app, &manifest, &lock).is_err(),
+            "cached registry content changes must be detected before load"
+        );
+        assert_eq!(std::fs::read_to_string(&asset).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn registry_integrity_offline_rejects_missing_cache_or_changed_version() {
+        let (dir, app, manifest, lock) = offline_registry_fixture("registry_missing");
+        let cached = app.join(".nula/registry/util-0.1.0");
+        std::fs::remove_dir_all(&cached).unwrap();
+        assert!(
+            resolve_offline(&app, &manifest, &lock).is_err(),
+            "missing cache must not trigger network download"
+        );
+        assert!(!cached.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (dir, app, manifest, mut lock) = offline_registry_fixture("registry_wrong_pin");
+        lock.package[0].version = "0.2.0".to_string();
+        assert!(
+            resolve_offline(&app, &manifest, &lock).is_err(),
+            "a stale version pin cannot select some other version from cache"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn offline_registry_dependency_fails_closed_before_network() {
         let dir = fresh_dir("offline_registry");
