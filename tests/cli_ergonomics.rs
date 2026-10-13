@@ -102,3 +102,16 @@ fn explicit_prelude_wraps_effects_without_new_language_semantics() {
     );
     std::fs::remove_dir_all(root).expect("remove temp directory");
 }
+
+#[test]
+fn run_alias_rejects_a_file_argument_instead_of_silently_ignoring_it() {
+    let root = temp_dir("run_file");
+    let output = command(&root, &["run", "app.nula"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("nulang app.nula"),
+        "direct file execution must have actionable guidance: {output:?}"
+    );
+    std::fs::remove_dir_all(root).expect("remove temp directory");
+}
