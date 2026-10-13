@@ -141,10 +141,7 @@ pub fn signing_seed_from_env() -> Result<[u8; 32], String> {
     })
 }
 
-//! Publisher-authorized registry archive verification.
-//!
-//! Trust roots are explicit, project-controlled Ed25519 public keys in
-//! `Nulang.trust.toml`, NEVER public keys obtained from the registry server.
+// Signature, key pinning, and domain-separation regression tests.
 
 #[cfg(test)]
 mod tests {
