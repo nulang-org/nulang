@@ -3,6 +3,7 @@ title: Installation
 description: Try Nulang in the browser or install a checksummed release binary, with source-build instructions for contributors.
 ---
 import CopyMarkdown from '../../../components/CopyMarkdown.astro';
+import PlatformDownloads from '../../../components/PlatformDownloads.astro';
 
 ## Try Nulang without installing
 
@@ -12,14 +13,13 @@ The [browser playground](/playground/) runs the **Nulang Core subset** locally i
 
 Tagged releases publish checksummed archives on [GitHub Releases](https://github.com/nulang-org/nulang/releases). **A release asset is available only after its release workflow has completed successfully.** You do not need Rust or the Nulang source tree to install a published binary.
 
-| Platform | Release archive |
-| --- | --- |
-| Linux x86_64 | `nulang-linux-x86_64.tar.gz` |
-| Linux aarch64 | `nulang-linux-aarch64.tar.gz` |
-| macOS Apple Silicon | `nulang-macos-aarch64.tar.gz` |
-| Windows x86_64 | `nulang-windows-x86_64.tar.gz` |
+Select the appropriate operating system and CPU architecture:
 
-Download the archive **and matching `.sha256` file** from the same tagged release. Choose the archive for your operating system and CPU architecture.
+<PlatformDownloads />
+
+The release workflow now includes a native FreeBSD x86_64 build and smoke test. **FreeBSD is not a published binary option until that job has passed and a new tagged release contains its artifact.** OpenBSD and NetBSD are tested separately using minimal source builds, not distributed as binaries.
+
+Download the archive **and matching `.sha256` file** from the same tagged release. Never substitute a checksum from another release.
 
 ### Linux example (x86_64)
 
@@ -61,13 +61,7 @@ Rename-Item .\nulang-windows-x86_64 nulang.exe
 
 The release archive contains a platform-qualified executable that must be renamed `nulang.exe`. Move it to a dedicated folder on your `PATH` if you want to invoke `nulang` from other directories.
 
-**Platform library requirements:** The prebuilt archives contain an executable, not an isolated runtime with every shared library bundled. In an actual October 11, 2026 Linux x86_64 release-build artifact, `readelf -d nulang` identified dependencies on `libpython3.12.so.1.0`, `libssl.so.3`, and `libcrypto.so.3`. On a Linux installation with only Python 3.13, the executable failed to start with `libpython3.12.so.1.0: cannot open shared object file`. Check dependencies before assuming a downloaded binary is portable:
-
-```bash
-ldd "$HOME/.local/bin/nulang" | grep -E 'python|ssl|crypto|not found'
-```
-
-For a missing dependency, install the matching **system-provided, ABI-compatible** shared library where available, or build Nulang from source for your distribution. **Do not** symlink an incompatible Python library version (for example, Python 3.13 to a Python 3.12 SONAME). For a compiler/runtime build without the Python integration and its linkage, use `cargo build --locked --release --no-default-features`, recognizing that optional features will be unavailable. The specific shared-library dependencies of macOS and Windows archives may differ; test those binaries on clean supported machines before considering their portability verified.
+**Platform library requirements:** Prebuilt archives contain an executable but may depend on system TLS/crypto or other shared libraries. The current `release-cli` build deliberately excludes Python integration, avoiding version-specific `libpython` linkage. Older full-feature artifacts had Python ABI dependencies; do not assume that fix applies to an already-published older tag. On Linux, inspect dependencies with `ldd`; on FreeBSD use `ldd`; on macOS use `otool -L`. If anything is missing, install a compatible system package or build from source. Do not symlink incompatible shared-library versions.
 
 **Support boundary:** Releases are CI-built for the listed platforms, not guaranteed to start on every distribution or OS revision. Nulang is alpha software, not yet a production compatibility guarantee.
 
@@ -78,7 +72,7 @@ A source build requires:
 - **Rust 1.95.0**, pinned by `rust-toolchain.toml` ([rustup](https://rustup.rs))
 - **Python 3** development headers for the default PyO3 interop feature
 - A native C compiler and linker (plus other native dependencies of enabled features)
-- Linux or macOS. On Windows, the documented source-build route is **WSL**; the Windows prebuilt executable above is separate.
+- Linux, macOS, or FreeBSD for the full public `release-cli` source profile. OpenBSD and NetBSD use a smaller, experimental bytecode CLI profile. On Windows, the documented source-build route is **WSL**; the Windows prebuilt executable above is separate.
 
 ```bash
 git clone https://github.com/nulang-org/nulang.git
@@ -155,6 +149,29 @@ Install Python via Homebrew:
 ```bash
 brew install python@3.14
 ```
+
+### BSD systems
+
+On FreeBSD x86_64, install Rust 1.95.0 (via rustup), a C compiler, `pkgconf`, `openssl`, and `libffi`. Use the same public CLI profile as the release workflow:
+
+```sh
+pkg install -y curl ca_root_nss pkgconf openssl libffi
+export OPENSSL_DIR=/usr/local
+export PKG_CONFIG_PATH=/usr/local/libdata/pkgconfig
+cargo build --locked --release --no-default-features --features release-cli --bin nulang
+./target/release/nulang --eval 'perform IO.print("Hello from FreeBSD!")'
+./target/release/nulang examples/01_hello.nula
+```
+
+OpenBSD and NetBSD currently have source-build portability checks for the minimal interpreter, not the full release profile. With a compatible Rust/Cargo toolchain installed through the system package manager:
+
+```sh
+cargo build --locked --no-default-features --bin nulang
+./target/debug/nulang --eval 'perform IO.print("Hello from BSD!")'
+./target/debug/nulang examples/01_hello.nula
+```
+
+These BSD builds run programs on the host platform; they do not make a native machine-code artifact portable across operating systems. Cross-platform distribution still requires an OS-specific runtime binary, or a portable WASM program within the currently supported WASM subset.
 
 ## Next Steps
 
