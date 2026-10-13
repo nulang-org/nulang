@@ -8,11 +8,13 @@
     "dev": "astro dev",
     "start": "astro dev",
     "build": "astro build",
-    "prebuild": "pnpm run sync-playground && pnpm run generate-og",
+    "prebuild": "pnpm run test:homepage && pnpm run sync-playground && pnpm run generate-og",
     "generate-og": "node scripts/generate-og-image.mjs",
     "preview": "astro preview",
     "check": "astro check",
-    "sync-playground": "node scripts/sync-playground.mjs"
+    "sync-playground": "node scripts/sync-playground.mjs",
+    "test:homepage": "node --test scripts/tests/*.test.mjs",
+    "test:browser": "node scripts/tests/homepage-browser-smoke.mjs"
   },
   "dependencies": {
     "@astrojs/sitemap": "^3.7.4",

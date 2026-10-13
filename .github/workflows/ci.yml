@@ -70,6 +70,21 @@ jobs:
           test -s docs/dist/playground/style.css
           test -s docs/dist/playground/nulang_playground.wasm
 
+      - name: Browser smoke test (desktop, mobile and WASM examples)
+        timeout-minutes: 8
+        run: |
+          cd docs
+          pnpm run test:browser
+
+      - name: Upload browser QA screenshots on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: docs-browser-qa-${{ github.sha }}
+          path: docs/browser-artifacts/*.png
+          if-no-files-found: ignore
+          retention-days: 7
+
   # -----------------------------------------------------------------------
   # Primary build & test (default features)
   # -----------------------------------------------------------------------
