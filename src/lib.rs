@@ -61,6 +61,7 @@ pub mod iso_arena;
 pub mod jit;
 pub mod json_diagnostics;
 pub mod lexer;
+pub mod layout;
 #[cfg(feature = "lsp")]
 pub mod lsp;
 pub mod migration_purity;
