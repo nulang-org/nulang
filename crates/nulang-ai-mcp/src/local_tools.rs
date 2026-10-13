@@ -59,6 +59,10 @@ impl ToolHandler for CheckTool {
             "report": report
         }))
     }
+
+    fn errors_as_tool_results(&self) -> bool {
+        true
+    }
 }
 
 /// Resolve only existing workspace files; canonicalization rejects symlinks
