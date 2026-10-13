@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Structured `par` effect scheduling metadata — 2026-09-29
+- **The compiler now owns a conservative effect-execution classifier for future scoped-task scheduling.** Host operations reuse the canonical `HostReplayClass` registry while parallel scheduling remains a separate axis: unconstrained, actor-thread-only, or sequential-only.
+- **`parallel_analysis` records each branch's strongest effect constraint and suspension capability.** Unknown/custom effects fail closed to sequential scheduling; this does not reject existing `par` programs or enable concurrent execution.
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
