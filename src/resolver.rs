@@ -1,17 +1,102 @@
 use crate::ast::{AstModule, Decl};
-use crate::lexer::Lexer;
+use crate::lexer::{Lexer, Token};
 use crate::parser::Parser;
 use crate::types::{NuError, NuResult, Span};
 use std::cell::RefCell;
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 thread_local! {
-    /// Cache of complete, unfiltered resolved declarations, keyed by canonical
-    /// file path. Each import applies its own requested item selection after
-    /// lookup, so a prior selective import cannot hide later declarations.
-    /// Cleared at the start of each top-level resolve to avoid stale ASTs.
+    /// Fully resolved declarations are only reused within one top-level build.
+    /// Parsed ASTs contain process-global fresh TypeVar identities and parser
+    /// type lookup can read imports; neither can be reused across builds safely.
     static IMPORT_CACHE: RefCell<BTreeMap<PathBuf, Vec<Decl>>> = const { RefCell::new(BTreeMap::new()) };
+
+    /// Only context-independent lexer tokens survive across builds. Source
+    /// content is read and hashed on every request; parsing always runs fresh.
+    static TOKEN_CACHE: RefCell<BTreeMap<PathBuf, CachedTokens>> = const { RefCell::new(BTreeMap::new()) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static TOKEN_CACHE_HITS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Diagnostic/benchmark opt-out, selected once per process before the first
+/// imported module is lexed. This is also a rollback switch if reuse regresses.
+static DISABLE_IMPORT_TOKEN_CACHE: OnceLock<bool> = OnceLock::new();
+
+fn import_token_cache_disabled() -> bool {
+    *DISABLE_IMPORT_TOKEN_CACHE.get_or_init(|| {
+        std::env::var("NULANG_DISABLE_IMPORT_TOKEN_CACHE")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
+}
+
+const MAX_TOKEN_CACHE_FILES: usize = 64;
+const MAX_TOKEN_CACHE_SOURCE_BYTES: usize = 128 * 1024;
+const MAX_TOKEN_CACHE_TOKENS: usize = 8192;
+
+struct CachedTokens {
+    fingerprint: blake3::Hash,
+    tokens: Vec<Token>,
+}
+
+/// Reuse context-independent tokens only when the exact source bytes match.
+/// Always re-read the file and re-run the parser so imported type definitions
+/// and globally fresh parser type variables are never reused incorrectly.
+fn lex_import_tokens(path: &Path, source: &str) -> NuResult<Vec<Token>> {
+    if import_token_cache_disabled() {
+        return Lexer::new(source).lex();
+    }
+
+    let eligible = source.len() <= MAX_TOKEN_CACHE_SOURCE_BYTES;
+    let fingerprint = blake3::hash(source.as_bytes());
+    if eligible {
+        let cached = TOKEN_CACHE.with(|cache| {
+            cache
+                .borrow()
+                .get(path)
+                .filter(|entry| entry.fingerprint == fingerprint)
+                .map(|entry| entry.tokens.clone())
+        });
+        if let Some(tokens) = cached {
+            // Lexer::new installs the source map. Repeat that side effect on
+            // hits or later diagnostics can point into an unrelated file.
+            let _ = Lexer::new(source);
+            #[cfg(test)]
+            TOKEN_CACHE_HITS.with(|hits| hits.set(hits.get() + 1));
+            return Ok(tokens);
+        }
+    }
+
+    let tokens = Lexer::new(source).lex()?;
+    TOKEN_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if eligible && tokens.len() <= MAX_TOKEN_CACHE_TOKENS {
+            if !cache.contains_key(path) && cache.len() >= MAX_TOKEN_CACHE_FILES {
+                // Deterministic bounded eviction, no unbounded daemon memory.
+                if let Some(oldest_key) = cache.keys().next().cloned() {
+                    cache.remove(&oldest_key);
+                }
+            }
+            cache.insert(
+                path.to_path_buf(),
+                CachedTokens {
+                    fingerprint,
+                    tokens: tokens.clone(),
+                },
+            );
+        } else {
+            cache.remove(path);
+        }
+    });
+    Ok(tokens)
 }
 
 pub fn resolve_imports(
@@ -70,8 +155,7 @@ pub fn resolve_imports(
             msg: format!("cannot read '{}': {}", import_path, e),
             span: Span::default(),
         })?;
-        let tokens = Lexer::new(&source)
-            .lex()
+        let tokens = lex_import_tokens(&resolved_canonical, &source)
             .map_err(|e| NuError::RuntimeError {
                 msg: format!("lex error in '{}': {}", import_path, e),
                 span: Span::default(),
@@ -464,6 +548,107 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("remove fixture directory");
         assert_eq!(first, vec!["alpha"]);
         assert_eq!(second, vec!["beta"], "a new build must reread the source");
+    }
+
+    #[test]
+    fn import_lexer_cache_hits_unchanged_sources_and_invalidates_edits() {
+        let path = PathBuf::from("lex-cache-regression.nula");
+        TOKEN_CACHE.with(|cache| cache.borrow_mut().clear());
+        TOKEN_CACHE_HITS.with(|hits| hits.set(0));
+
+        let first = lex_import_tokens(&path, "fn alpha() -> Int { 1 }")
+            .expect("lex first version");
+        let again = lex_import_tokens(&path, "fn alpha() -> Int { 1 }")
+            .expect("lex unchanged version");
+        assert_eq!(first, again, "cache must return exactly the original token stream");
+        TOKEN_CACHE_HITS.with(|hits| assert_eq!(hits.get(), 1));
+
+        let changed = lex_import_tokens(&path, "fn beta() -> Int { 2 }")
+            .expect("lex edited version");
+        assert_ne!(first, changed, "edited source must not use stale tokens");
+        TOKEN_CACHE_HITS.with(|hits| assert_eq!(hits.get(), 1));
+
+        let _ = Lexer::new("unrelated diagnostic source");
+        let cached_changed = lex_import_tokens(&path, "fn beta() -> Int { 2 }")
+            .expect("lex unchanged edited source");
+        assert_eq!(changed, cached_changed);
+        TOKEN_CACHE_HITS.with(|hits| assert_eq!(hits.get(), 2));
+        assert_eq!(
+            crate::types::current_source_text().as_deref(),
+            Some("fn beta() -> Int { 2 }"),
+            "a cache hit must update the diagnostic source map just like Lexer::new"
+        );
+    }
+
+    #[test]
+    fn token_cache_retains_only_bounded_small_sources() {
+        TOKEN_CACHE.with(|cache| cache.borrow_mut().clear());
+        let source = "fn item() -> Int { 1 }";
+        for i in 0..(MAX_TOKEN_CACHE_FILES + 10) {
+            let path = PathBuf::from(format!("bounded-import-{i}.nula"));
+            lex_import_tokens(&path, source).expect("lex fixture");
+        }
+        TOKEN_CACHE.with(|cache| {
+            let cache = cache.borrow();
+            assert!(cache.len() <= MAX_TOKEN_CACHE_FILES);
+            assert!(cache
+                .values()
+                .all(|entry| entry.tokens.len() <= MAX_TOKEN_CACHE_TOKENS));
+        });
+
+        let large_source = " ".repeat(MAX_TOKEN_CACHE_SOURCE_BYTES + 1);
+        let large_path = PathBuf::from("oversize-import.nula");
+        lex_import_tokens(&large_path, &large_source).expect("lex large fixture");
+        TOKEN_CACHE.with(|cache| {
+            assert!(!cache.borrow().contains_key(&large_path));
+        });
+    }
+
+    #[test]
+    fn imported_transitive_edit_is_visible_with_parent_tokens_cached() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time is after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "nulang-lex-transitive-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).expect("create fixture directory");
+        std::fs::write(dir.join("parent.nula"), "import dep\nfn parent() -> Int { 1 }\n")
+            .expect("write unchanged parent");
+        let dep = dir.join("dep.nula");
+        let compile = || {
+            let mut module = AstModule {
+                name: "transitive".into(),
+                decls: vec![Decl::Import {
+                    path: "parent".into(),
+                    items: vec![],
+                    span: sp(),
+                }],
+            };
+            resolve_imports(&mut module, &dir.join("main.nula"), &mut HashSet::new())
+                .expect("resolve parent and transitive import");
+            module
+                .decls
+                .iter()
+                .filter_map(decl_name)
+                .map(str::to_string)
+                .collect::<HashSet<_>>()
+        };
+        TOKEN_CACHE_HITS.with(|hits| hits.set(0));
+        std::fs::write(&dep, "fn first() -> Int { 1 }\n").expect("write first dependency");
+        let first = compile();
+        std::fs::write(&dep, "fn second() -> Int { 2 }\n").expect("edit dependency");
+        let second = compile();
+        std::fs::remove_dir_all(&dir).expect("remove fixture directory");
+        assert!(first.contains("first"));
+        assert!(!first.contains("second"));
+        assert!(second.contains("second"));
+        assert!(!second.contains("first"));
+        TOKEN_CACHE_HITS.with(|hits| {
+            assert!(hits.get() >= 1, "unchanged parent should reuse lexed tokens")
+        });
     }
 
     #[test]

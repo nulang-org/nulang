@@ -1,5 +1,10 @@
 # Nulang Changelog
 
+### Verified imported-source lexer token reuse — 2026-10-13
+- **An in-process import-to-bytecode benchmark and alternating A/B comparison runner measure cache-on/off builds with the same binary.** The opt-out `NULANG_DISABLE_IMPORT_TOKEN_CACHE=1` provides both a benchmark control and a conservative rollback switch; JSONL schema and ordering have Python regression tests.
+- **Long-running compiler processes may now reuse lexed tokens for unchanged imported files.** Each lookup rereads source bytes and verifies a BLAKE3 fingerprint; a bounded thread-local cache stores only lexer tokens and restores diagnostic source maps on hits.
+- **Parsing, type-variable allocation, transitive dependency resolution, type checking, and later compiler stages remain fresh.** Regression tests cover same-length source edits and edits to transitive dependencies while their parent file remains unchanged. Net compilation speedup is not claimed until paired benchmarks are available.
+
 ### Per-import filtering correctness for resolver cache — 2026-10-13
 - **In-process import resolution now caches complete unfiltered declaration sets and applies each import's selection independently.** A second import of the same file can no longer lose symbols because the first import requested a different subset; the existing per-top-level cache reset remains unchanged to prevent stale results between compilations.
 - **Regression fixtures cover repeated selective imports and modified files across top-level compilation calls.** This is a correctness prerequisite for any persistent incremental semantic cache, not an implementation of cross-build caching.
