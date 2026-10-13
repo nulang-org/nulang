@@ -732,8 +732,7 @@ impl Resolver {
                 span: Span::default(),
             })?;
 
-        let cache = self.root_dir.join(".nula").join("registry");
-        let dest = cache.join(format!("{}-{}", dep_name, best));
+        let dest = registry_cache_dir(&self.root_dir, dep_name, best)?;
 
         // Reuse cached extraction.
         if dest.join(MANIFEST_FILE).exists() {
@@ -755,23 +754,9 @@ impl Resolver {
                 span: Span::default(),
             })?;
 
-        std::fs::create_dir_all(&dest).map_err(|e| NuError::PackageError {
-            msg: format!("cannot create {}: {}", dest.display(), e),
-            span: Span::default(),
-        })?;
-
-        let cursor = std::io::Cursor::new(tarball);
-        let gz = flate2::read::GzDecoder::new(cursor);
-        let mut archive = tar::Archive::new(gz);
-        archive.unpack(&dest).map_err(|e| NuError::PackageError {
-            msg: format!("cannot extract '{}' to {}: {}", dep_name, dest.display(), e),
-            span: Span::default(),
-        })?;
-
-        let dir = std::fs::canonicalize(&dest).map_err(|e| NuError::PackageError {
-            msg: format!("cannot resolve {}: {}", dest.display(), e),
-            span: Span::default(),
-        })?;
+        let dir = crate::package::registry_archive::extract_registry_archive(
+            &tarball, &dest, dep_name, best
+        )?;
         Ok((dir, best.clone()))
     }
 }
