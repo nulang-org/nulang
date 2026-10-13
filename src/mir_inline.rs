@@ -1104,6 +1104,34 @@ mod tests {
     }
 
     #[test]
+    fn test_closure_used_in_state_write_is_not_removed() {
+        let mut m = build_inlinable_program();
+        let closure = match &m.functions[1].blocks[0].stmts[1] {
+            Stmt::Assign { dst, .. } => *dst,
+            _ => panic!("expected closure allocation"),
+        };
+        m.functions[1].blocks[0].stmts.insert(
+            2,
+            Stmt::StateSet { field: "fn".into(), src: closure },
+        );
+        assert_eq!(inline_local_closures(&mut m), 0, "actor state must retain the closure");
+    }
+
+    #[test]
+    fn test_closure_used_in_emitted_event_is_not_removed() {
+        let mut m = build_inlinable_program();
+        let closure = match &m.functions[1].blocks[0].stmts[1] {
+            Stmt::Assign { dst, .. } => *dst,
+            _ => panic!("expected closure allocation"),
+        };
+        m.functions[1].blocks[0].stmts.insert(
+            2,
+            Stmt::Emit { event: "stored".into(), args: vec![closure] },
+        );
+        assert_eq!(inline_local_closures(&mut m), 0, "event payload must retain the closure");
+    }
+
+    #[test]
     fn test_no_inline_reassigned_closure_local() {
         let mut m = make_module();
         for value in [1, 2] {
