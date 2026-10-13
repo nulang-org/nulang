@@ -937,6 +937,67 @@ mod tests {
     }
 
     #[test]
+    fn test_shadowed_function_parameter_is_not_a_signal_read() {
+        let mut module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+signal count: Html = text("global")
+
+fn view(count: Html) -> Html {
+    <span>{count}</span>
+}
+"#,
+        );
+
+        let graph = analyze_module(&module, None);
+        assert!(graph.nodes.contains(&GraphNode::Signal {
+            name: "count".to_string(),
+        }));
+        assert!(!graph.nodes.iter().any(|node| matches!(node,
+            GraphNode::Read { signal, .. } if signal == "count"
+        )), "a function parameter must shadow the global signal");
+
+        rewrite_module(&mut module, None);
+        let html = format!("{:?}", find_function_body(&module, "view"));
+        assert!(!html.contains("data-signal"), "shadowed reads must not hydrate");
+    }
+
+    #[test]
+    fn test_local_binding_shadows_signal_only_in_its_body() {
+        let mut module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+signal count: Html = text("global")
+
+fn view() -> Html {
+    let earlier = <p>{count}</p>
+    let count = text("local")
+    <span>{count}</span>
+}
+"#,
+        );
+
+        let graph = analyze_module(&module, None);
+        let reads: Vec<_> = graph.nodes.iter().filter(|node| matches!(node,
+            GraphNode::Read { signal, .. } if signal == "count"
+        )).collect();
+        assert_eq!(reads.len(), 1, "the earlier read resolves to the global signal");
+        assert_eq!(reads[0], &GraphNode::Read {
+            signal: "count".to_string(),
+            path: "p".to_string(),
+        });
+
+        rewrite_module(&mut module, None);
+        let html = format!("{:?}", find_function_body(&module, "view"));
+        assert_eq!(html.matches("data-signal").count(), 1,
+            "only the unshadowed signal read should be hydrated");
+    }
+
+    #[test]
     fn test_signal_decl_collected() {
         let module = parse(
             r#"
