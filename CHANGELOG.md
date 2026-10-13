@@ -1,4 +1,7 @@
 # Nulang Changelog
+### NLAP task-attempt lease fencing contract — 2026-09-28
+- **NLAP now distinguishes logical tasks from concrete worker attempts.** `TaskAttempt` carries retry lineage, worker identity, lifecycle state, and a monotonic lease epoch so retries and reassignments do not reuse one ambiguous task execution identity.
+- **`TaskLease` provides the runtime-neutral fencing proof for one authoritative attempt.** Swarm events carry attempt and lease identity explicitly, allowing Nulang Cloud to reject stale workers and bind durable side effects to the exact attempt that owns the task.
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
