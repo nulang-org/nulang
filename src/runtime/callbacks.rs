@@ -299,6 +299,82 @@ pub(crate) fn authorize_actor_ffi(
         .map_err(|error| error.to_string())
 }
 
+/// Execute the ordinary host effects also supported by the standalone VM.
+/// Called only after the module-level actor authority gate. Never fall back
+/// from an authority denial to this function, and never treat unknown effects
+/// or operations as success.
+///
+/// Allocate resulting strings through the *calling* VM's heap: top-level
+/// actor-backed executions use Runtime::main_heap, whereas scheduler-driven
+/// actor turns use their own actor heap.
+fn perform_standard_host_builtin(
+    callbacks: &mut dyn crate::vm::ActorVmCallbacks,
+    effect_name: &str,
+    op_name: Option<&str>,
+    constants: &[crate::bytecode::Constant],
+    regs: &[crate::vm::Value],
+) -> Option<crate::vm::Value> {
+    use crate::vm::Value;
+
+    fn host_string(callbacks: &mut dyn crate::vm::ActorVmCallbacks, value: &str) -> Value {
+        let bytes = value.as_bytes();
+        let Some(ptr) = callbacks.alloc(bytes.len() + 1, HeapTypeTag::String) else {
+            return Value::nil();
+        };
+        // SAFETY: callbacks.alloc returned a writable string allocation with
+        // space for the complete byte slice and a trailing NUL.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+            *ptr.add(bytes.len()) = 0;
+            Value::ptr(ptr)
+        }
+    }
+
+    let string_arg = |index: usize| {
+        regs.get(index)
+            .map(|value| crate::vm::resolve_value_string(constants, *value))
+            .unwrap_or_default()
+    };
+
+    match (effect_name, op_name) {
+        ("Env", Some("get")) => Some(match std::env::var(string_arg(0)) {
+            Ok(value) => host_string(callbacks, &value),
+            Err(_) => Value::nil(),
+        }),
+        ("System", Some("arg")) => {
+            let index = regs.first().and_then(|value| value.as_int()).unwrap_or(-1);
+            let value = usize::try_from(index)
+                .ok()
+                .and_then(|index| std::env::args().nth(index));
+            Some(match value {
+                Some(value) => host_string(callbacks, &value),
+                None => Value::nil(),
+            })
+        }
+        ("FS", Some("read")) => Some(match std::fs::read_to_string(string_arg(0)) {
+            Ok(contents) => host_string(callbacks, &contents),
+            Err(_) => Value::nil(),
+        }),
+        ("FS", Some("write")) => {
+            let result = std::fs::write(string_arg(0), string_arg(1));
+            Some(if result.is_ok() { Value::unit() } else { Value::nil() })
+        }
+        ("FS", Some("append")) => {
+            use std::io::Write;
+            let result = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(string_arg(0))
+                .and_then(|mut file| file.write_all(string_arg(1).as_bytes()));
+            Some(if result.is_ok() { Value::unit() } else { Value::nil() })
+        }
+        ("FS", Some("exists")) => Some(Value::bool(
+            std::path::Path::new(&string_arg(0)).exists(),
+        )),
+        _ => None,
+    }
+}
+
 /// Shared Web effect host implementation for all runtime callback types.
 /// Mirrors the standalone VM dispatch in `src/vm.rs`.
 pub(crate) fn perform_web_builtin(
@@ -1036,6 +1112,9 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
         }
         if effect_name == "Realtime" {
             return perform_realtime_builtin(self, op_name, constants, regs);
+        }
+        if let Some(result) = perform_standard_host_builtin(self, effect_name, op_name, constants, regs) {
+            return Some(result);
         }
         self.perform_effect(effect_name, regs)
     }
@@ -1859,6 +1938,11 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
             }
             if effect_name == "Map" {
                 return crate::vm::hashmap_op(self, constants, op_name.unwrap_or(""), regs);
+            }
+            if let Some(result) =
+                perform_standard_host_builtin(self, effect_name, op_name, constants, regs)
+            {
+                return Some(result);
             }
             self.perform_effect(effect_name, regs)
         }
