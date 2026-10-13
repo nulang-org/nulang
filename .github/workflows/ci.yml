@@ -394,7 +394,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
-      contents: write  # Persist rolling benchmark history after regression checks pass
+      contents: read  # History updates require an approved PR; CI only reads baselines.
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     steps:
       - uses: actions/checkout@v7
@@ -492,22 +492,17 @@ jobs:
             benchmarks/savina-${{ github.sha }}.jsonl
             benchmarks/regressions-${{ github.sha }}.json
             benchmarks/paired-confirmation-${{ github.sha }}.json
+          if-no-files-found: error
           retention-days: 90
 
-      - name: Persist benchmark history
-        env:
-          BENCH_HISTORY_BRANCH: automation/benchmark-history
+      # Branch rules require an approved PR and forbid force pushes. Never
+      # mutate automation/benchmark-history directly from a CI job. The
+      # artifact above is retained for 90 days for a reviewed history import.
+      # Historical regression analysis continues to read the last approved
+      # snapshots; keep this warning visible until a PR-based importer exists.
+      - name: Persist benchmark history (review required)
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          # Stage every canonical Criterion snapshot restored from history plus
-          # the current result. Diagnostic regression/A/B JSON uses non-SHA
-          # filenames and is intentionally excluded.
-          find benchmarks -maxdepth 1 -type f -regextype posix-extended \
-            -regex 'benchmarks/[0-9a-f]{40}\.json' -print0 | \
-            xargs -0 --no-run-if-empty git add --
-          git diff --staged --quiet || git commit -m "bench: record results for ${{ github.sha }} [skip ci]"
-          git push --force-with-lease origin "HEAD:refs/heads/${BENCH_HISTORY_BRANCH}"
+          echo "::warning title=Benchmark history requires a PR::The benchmark snapshot for ${{ github.sha }} is preserved in the bench-results-${{ github.sha }} workflow artifact (90-day retention), but automation/benchmark-history was not updated. Import it through a reviewed pull request; history-based baselines may become stale."
 
       # The rolling history alert alone is informational; only a regression
       # reproduced against the exact parent on the same host blocks the job.
