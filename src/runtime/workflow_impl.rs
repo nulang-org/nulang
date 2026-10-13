@@ -353,17 +353,49 @@ pub(crate) fn finish_resumed_workflow_step(
     activation: Option<WorkflowActivationId>,
     step_name: String,
 ) -> bool {
+    finish_resumed_workflow_step_with_progress(rt, actor_id, activation, step_name, true)
+}
+
+/// JIT safepoint resumption must follow normal compiled-step progress rules:
+/// ordinary steps already advance step_index in bytecode, while synthetic
+/// parallel steps require one runtime-side increment.
+#[cfg(feature = "native-codegen")]
+pub(crate) fn finish_jit_resumed_workflow_step(
+    rt: &mut Runtime,
+    actor_id: u64,
+    activation: Option<WorkflowActivationId>,
+    step_name: String,
+    advance_step_index: bool,
+) -> bool {
+    finish_resumed_workflow_step_with_progress(
+        rt,
+        actor_id,
+        activation,
+        step_name,
+        advance_step_index,
+    )
+}
+
+fn finish_resumed_workflow_step_with_progress(
+    rt: &mut Runtime,
+    actor_id: u64,
+    activation: Option<WorkflowActivationId>,
+    step_name: String,
+    advance_step_index: bool,
+) -> bool {
     let Some(actor) = rt.actors.get_mut(&actor_id) else {
         return false;
     };
     // Clearing the active suspension marker belongs to terminal completion,
     // not to an individual LLM/signal/timer resume adapter.
     actor.waiting_signal = None;
-    if let Some(step) = actor
-        .get_state_field("step_index")
-        .and_then(|value| value.as_int())
-    {
-        actor.set_state_field("step_index", Value::int(step + 1));
+    if advance_step_index {
+        if let Some(step) = actor
+            .get_state_field("step_index")
+            .and_then(|value| value.as_int())
+        {
+            actor.set_state_field("step_index", Value::int(step + 1));
+        }
     }
 
     let sequence = next_sequence(rt, actor_id);
