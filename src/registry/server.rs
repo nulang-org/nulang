@@ -313,7 +313,7 @@ impl RegistryServer {
 
     fn write_response_with_signature(stream: &mut TcpStream, body: &[u8], signature: &str) {
         let head = format!(
-            "HTTP/1.1 200 OK\\r\\nContent-Type: application/octet-stream\\r\\nX-Nula-Signature: {}\\r\\nContent-Length: {}\\r\\nConnection: close\\r\\n\\r\\n",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nX-Nula-Signature: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             signature, body.len()
         );
         let _ = stream.write_all(head.as_bytes());
