@@ -3560,6 +3560,105 @@ mod tests {
     }
 
     #[test]
+    fn test_local_send_failure_traces_nearest_capability_binding() {
+        let ctx = CapContext::new()
+            .with_binding("target", Capability::Val)
+            .with_binding("payload", Capability::Trn)
+            .with_binding("payload", Capability::Ref);
+        let send = Expr::Send {
+            actor: Box::new(Expr::Var("target".to_string(), s())),
+            behavior: "push".to_string(),
+            args: vec![Expr::Var("payload".to_string(), s())],
+            remote: false,
+            span: s(),
+        };
+        let err = CapabilityAnalyzer::new().infer_cap(&ctx, &send).unwrap_err();
+        match err {
+            NuError::CapError { msg, explanation: Some(why), .. } => {
+                assert!(msg.contains("source: variable `payload`"), "{msg}");
+                assert!(msg.contains("nearest lexical binding"), "{msg}");
+                assert!(msg.contains("`ref`"), "{msg}");
+                assert!(why.contains("`payload`"), "{why}");
+                assert!(why.contains("`ref`"), "{why}");
+            }
+            other => panic!("expected explained capability error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_remote_send_failure_traces_iso_binding_without_weakening_policy() {
+        let ctx = CapContext::new()
+            .with_binding("target", Capability::Val)
+            .with_binding("payload", Capability::Iso);
+        let send = Expr::Send {
+            actor: Box::new(Expr::Var("target".to_string(), s())),
+            behavior: "push".to_string(),
+            args: vec![Expr::Var("payload".to_string(), s())],
+            remote: true,
+            span: s(),
+        };
+        let err = CapabilityAnalyzer::new().infer_cap(&ctx, &send).unwrap_err();
+        match err {
+            NuError::CapError { msg, explanation: Some(why), .. } => {
+                assert!(msg.contains("remote send argument with capability iso"), "{msg}");
+                assert!(msg.contains("source: variable `payload`"), "{msg}");
+                assert!(msg.contains("`iso`"), "{msg}");
+                assert!(msg.contains("serialization boundary"), "{msg}");
+                assert!(why.contains("payload"), "{why}");
+            }
+            other => panic!("expected explained remote send error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_send_failure_traces_explicit_reference_constructor() {
+        let ctx = CapContext::new().with_binding("target", Capability::Val);
+        let send = Expr::Send {
+            actor: Box::new(Expr::Var("target".to_string(), s())),
+            behavior: "push".to_string(),
+            args: vec![Expr::Unary {
+                op: UnOp::Ref(Capability::Ref),
+                expr: Box::new(Expr::Literal(Literal::Int(1), s())),
+                span: s(),
+            }],
+            remote: false,
+            span: s(),
+        };
+        let err = CapabilityAnalyzer::new().infer_cap(&ctx, &send).unwrap_err();
+        match err {
+            NuError::CapError { msg, .. } => {
+                assert!(msg.contains("source: reference constructor `&ref`"), "{msg}");
+                assert!(msg.contains("not sendable"), "{msg}");
+            }
+            other => panic!("expected non-sendable reference error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_send_failure_traces_explicit_capability_annotation() {
+        let ctx = CapContext::new().with_binding("target", Capability::Val);
+        let send = Expr::Send {
+            actor: Box::new(Expr::Var("target".to_string(), s())),
+            behavior: "push".to_string(),
+            args: vec![Expr::CapAnnotate {
+                expr: Box::new(Expr::Literal(Literal::Int(1), s())),
+                cap: Capability::Box,
+                span: s(),
+            }],
+            remote: false,
+            span: s(),
+        };
+        let err = CapabilityAnalyzer::new().infer_cap(&ctx, &send).unwrap_err();
+        match err {
+            NuError::CapError { msg, .. } => {
+                assert!(msg.contains("source: capability annotation `box`"), "{msg}");
+                assert!(!msg.contains("nearest lexical binding"), "{msg}");
+            }
+            other => panic!("expected annotated capability error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_cap_remote_send_rejects_iso() {
         let mut analyzer = CapabilityAnalyzer::new();
         let ctx = CapContext::new()
