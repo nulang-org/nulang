@@ -2819,6 +2819,120 @@ mod host_authority_tests {
     }
 
     #[test]
+    fn actor_backed_top_level_env_system_and_fs_have_real_results() {
+        use crate::vm::ActorVmCallbacks;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        // This is the callback installed by run_with_runtime whenever a
+        // program declares actors; it must not lose ordinary host builtins.
+        let unique = format!(
+            "nulang-actor-host-effects-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let file = std::env::temp_dir().join(unique);
+        std::fs::write(&file, "host-effect-file-content").unwrap();
+
+        let mut module = crate::bytecode::CodeModule::new("actor-host-effects");
+        module.add_constant(Constant::String("PATH".into()));
+        module.add_constant(Constant::String(file.to_string_lossy().into_owned()));
+        let callbacks_runtime = Rc::new(RefCell::new(Runtime::new()));
+        let mut callbacks = super::RuntimeVmCallbacks::new(callbacks_runtime);
+
+        let env = callbacks
+            .perform_builtin_effect_in_module("Env", Some("get"), &module, &[Value::string(0)])
+            .expect("Env.get must be handled by the actor-backed top-level VM");
+        match std::env::var("PATH") {
+            Ok(expected) => assert_eq!(crate::vm::resolve_value_string(&[], env), expected),
+            Err(_) => assert!(env.is_nil()),
+        }
+
+        let arg = callbacks
+            .perform_builtin_effect_in_module("System", Some("arg"), &module, &[Value::int(0)])
+            .expect("System.arg must be handled by the actor-backed top-level VM");
+        assert_eq!(
+            crate::vm::resolve_value_string(&[], arg),
+            std::env::args().next().expect("process has argv[0]")
+        );
+
+        let read = callbacks
+            .perform_builtin_effect_in_module("FS", Some("read"), &module, &[Value::string(1)])
+            .expect("FS.read must be handled by the actor-backed top-level VM");
+        assert_eq!(crate::vm::resolve_value_string(&[], read), "host-effect-file-content");
+
+        let exists = callbacks
+            .perform_builtin_effect_in_module("FS", Some("exists"), &module, &[Value::string(1)])
+            .expect("FS.exists must be handled by the actor-backed top-level VM");
+        assert_eq!(exists, Value::bool(true));
+
+        assert!(
+            callbacks
+                .perform_builtin_effect_in_module("FS", Some("remove"), &module, &[Value::string(1)])
+                .is_none(),
+            "unknown filesystem operations must remain unhandled"
+        );
+
+        std::fs::remove_file(file).unwrap();
+    }
+
+    #[test]
+    fn actor_host_fs_dispatch_retains_exact_authority_gate() {
+        use crate::vm::ActorVmCallbacks;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let unique = format!(
+            "nulang-actor-authority-effects-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let file = std::env::temp_dir().join(unique);
+        std::fs::write(&file, "privileged-content").unwrap();
+        let path = file.to_string_lossy().into_owned();
+
+        let runtime = Rc::new(RefCell::new(Runtime::new()));
+        let actor_id = 800_007;
+        {
+            let mut rt = runtime.borrow_mut();
+            rt.actors.insert(actor_id, Actor::new(actor_id, "fs-gated", 8));
+            rt.current_actor = Some(actor_id);
+        }
+        let mut module = crate::bytecode::CodeModule::new("fs-gated");
+        module.add_constant(Constant::String(path.clone()));
+        let mut callbacks = super::RuntimeVmCallbacks::new(runtime.clone());
+
+        let denied = callbacks
+            .perform_builtin_effect_in_module("FS", Some("read"), &module, &[Value::string(0)])
+            .expect("authority denial must be handled, not fall through");
+        assert!(denied.is_nil(), "FS.read without a grant must fail closed");
+
+        {
+            let grant = format!("Fs::Read({path})");
+            let manifest = AuthorityManifest::from_tokens([grant.as_str()]).unwrap();
+            runtime
+                .borrow_mut()
+                .actors
+                .get_mut(&actor_id)
+                .unwrap()
+                .install_authority_manifest(&manifest);
+        }
+
+        let permitted = callbacks
+            .perform_builtin_effect_in_module("FS", Some("read"), &module, &[Value::string(0)])
+            .expect("FS.read with an exact grant must be handled");
+        assert_eq!(crate::vm::resolve_value_string(&[], permitted), "privileged-content");
+
+        std::fs::remove_file(file).unwrap();
+    }
+
+    #[test]
     fn actor_host_access_is_deny_by_default_and_exact_match_only() {
         let mut rt = Runtime::new();
         let actor_id = 800_001;
