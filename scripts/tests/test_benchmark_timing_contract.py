@@ -24,26 +24,28 @@ class BenchmarkTimingContractTests(unittest.TestCase):
                 )
                 self.assertIn(".iter_batched_ref(", source)
 
-    def test_benchmark_history_persists_all_canonical_snapshots(self):
+    def test_benchmark_results_are_archived_without_bypassing_protected_history(self):
         source = CI_WORKFLOW.read_text()
+        archive = source.split("- name: Upload results as build artifact", 1)[1].split(
+            "- name: Persist benchmark history", 1
+        )[0]
         persist = source.split("- name: Persist benchmark history", 1)[1].split(
             "- name: Fail the job if paired confirmation failed operationally", 1
         )[0]
 
-        self.assertNotIn(
-            'git add "benchmarks/${{ github.sha }}.json"',
-            persist,
-            "persisting only the current SHA drops previously restored benchmark history",
-        )
+        self.assertIn("bench-results-${{ github.sha }}", archive)
+        self.assertIn("benchmarks/${{ github.sha }}.json", archive)
+        self.assertIn("if-no-files-found: error", archive)
+        self.assertIn("retention-days: 90", archive)
+
+        self.assertNotIn("git push", persist)
+        self.assertNotIn("git commit", persist)
+        self.assertIn("::warning::", persist)
+        self.assertIn("automation/benchmark-history", persist)
         self.assertIn(
-            "[0-9a-f]{40}",
-            persist,
-            "history persistence must stage every canonical 40-hex-SHA snapshot",
-        )
-        self.assertIn(
-            "git add --",
-            persist,
-            "canonical benchmark snapshots must be staged before the history branch is pushed",
+            "- name: Fail the job if a regression was confirmed",
+            source,
+            "archiving policy must not disable performance regression gating",
         )
 
 
