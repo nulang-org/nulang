@@ -14,6 +14,15 @@ fn run_messages_with_compiler(
     workspace: &std::path::Path,
     compiler: &std::path::Path,
 ) -> Vec<Value> {
+    run_messages_with_timeout(lines, workspace, compiler, std::time::Duration::from_secs(30))
+}
+
+fn run_messages_with_timeout(
+    lines: &[Value],
+    workspace: &std::path::Path,
+    compiler: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Vec<Value> {
     let root = workspace.canonicalize().unwrap();
     let mut input = Vec::new();
     for line in lines {
@@ -24,7 +33,7 @@ fn run_messages_with_compiler(
     let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
     runtime.block_on(register_local_tools(
         &registry,
-        LocalToolConfig::new(root, compiler.to_path_buf()),
+        LocalToolConfig::new(root, compiler.to_path_buf()).with_timeout(timeout),
     ));
     let server = McpServer::new(registry);
     let mut output = Vec::new();
@@ -147,4 +156,34 @@ fn compiler_tool_roundtrip_returns_structured_diagnostics() {
     assert_eq!(replies[1]["result"]["structuredContent"]["exit_success"], true);
     assert_eq!(replies[1]["result"]["structuredContent"]["report"]["ok"], true);
     assert_eq!(replies[1]["result"]["structuredContent"]["report"]["diagnostics"], json!([]));
+}
+
+#[cfg(unix)]
+#[test]
+fn compiler_timeout_returns_tool_error_instead_of_blocking_session() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = temp_workspace();
+    std::fs::write(root.join("slow.nula"), "let x = 1\n").unwrap();
+    let compiler = root.join("slow-compiler");
+    std::fs::write(&compiler, "#!/bin/sh\nsleep 3\n").unwrap();
+    let mut permissions = std::fs::metadata(&compiler).unwrap().permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&compiler, permissions).unwrap();
+    let responses = run_messages_with_timeout(
+        &[
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"nulang_check","arguments":{"path":"slow.nula"}}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"ping"}),
+        ],
+        &root,
+        &compiler,
+        std::time::Duration::from_millis(100),
+    );
+    assert_eq!(responses.len(), 3);
+    assert_eq!(responses[1]["result"]["isError"], true);
+    assert!(responses[1]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("timed out"));
+    assert_eq!(responses[2]["result"], json!({}));
 }
