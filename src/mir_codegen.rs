@@ -2970,9 +2970,7 @@ mod tests {
         // Construct INT48_MIN without an out-of-range positive literal.
         // The optimizer must not turn the final checked negation into a
         // wrapped 48-bit constant before the VM can raise the error.
-        let result = run_mir_source(
-            "let lowest = (0 - 140737488355327) - 1 in -lowest",
-        );
+        let result = run_mir_source("let lowest = (0 - 140737488355327) - 1 in -lowest");
         let err = result.expect_err("negating INT48_MIN must be a runtime error");
         assert!(
             err.to_string().contains("integer overflow"),
