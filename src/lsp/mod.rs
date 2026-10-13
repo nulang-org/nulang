@@ -3986,6 +3986,41 @@ mod lsp_tests {
     // -- Crash-safety regression tests --
 
     #[test]
+    fn test_type_annotation_action_uses_exact_identifier_boundary() {
+        let uri = Url::parse("file:///types.nula").unwrap();
+        let actions = NulangLanguageServer::code_actions(
+            "  let answer = 42",
+            None,
+            &uri,
+            &[],
+        )
+        .expect("simple literal should support a type annotation");
+        let annotation = actions.iter().find_map(|action| match action {
+            CodeActionOrCommand::CodeAction(action)
+                if action.title.contains("Add type annotation") => Some(action),
+            _ => None,
+        }).expect("missing annotation action");
+        let edits = annotation.edit.as_ref().unwrap()
+            .changes.as_ref().unwrap().get(&uri).unwrap();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].range.start, Position::new(0, 12));
+        assert_eq!(edits[0].range.end, Position::new(0, 12));
+        assert_eq!(edits[0].new_text, ": Int");
+    }
+
+    #[test]
+    fn test_type_annotation_action_never_guesses_unknown_type() {
+        let uri = Url::parse("file:///types.nula").unwrap();
+        let actions = NulangLanguageServer::code_actions(
+            "fn main() {\n    let result = calculate(42)\n}\n",
+            None,
+            &uri,
+            &[],
+        );
+        assert!(actions.is_none(), "unknown type must use inlay hints, not a bogus ': a' edit");
+    }
+
+    #[test]
     fn test_code_action_let_binding_without_rhs() {
         // A half-typed `let` line with no `=` (e.g. `let x y`) must not
         // panic the code action provider; no quick fix can be offered
