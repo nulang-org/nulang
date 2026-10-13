@@ -44,6 +44,8 @@ impl Default for WebSection {
             port: default_web_port(),
             static_dir: default_static_dir(),
             output_dir: default_output_dir(),
+            kv_backend: default_kv_backend(),
+            kv_path: default_kv_path(),
         }
     }
 }
@@ -98,10 +100,24 @@ pub struct WebSection {
     /// Directory where `nula build --web` emits the static site.
     #[serde(default = "default_output_dir")]
     pub output_dir: String,
+    /// "memory" (default) or opt-in "sqlite" for routed Web.kv_* operations.
+    #[serde(default = "default_kv_backend")]
+    pub kv_backend: String,
+    /// Local path relative to the package root. Only used for SQLite.
+    #[serde(default = "default_kv_path")]
+    pub kv_path: String,
 }
 
 fn default_web_port() -> u16 {
     8080
+}
+
+fn default_kv_backend() -> String {
+    "memory".to_string()
+}
+
+fn default_kv_path() -> String {
+    "data/web-state.sqlite".to_string()
 }
 
 fn default_static_dir() -> String {
@@ -223,6 +239,24 @@ mod tests {
         assert_eq!(manifest.package.version, "0.1.0");
         assert_eq!(manifest.package.entry, DEFAULT_ENTRY);
         assert!(manifest.dependencies.is_empty());
+    }
+
+    #[test]
+    fn web_state_defaults_to_ephemeral_memory_without_opt_in() {
+        let manifest = Manifest::parse("[package]\nname = \"demo\"\nversion = \"0.1.0\"\n")
+            .expect("minimal manifest must parse");
+        assert_eq!(manifest.web.kv_backend, "memory");
+        assert_eq!(manifest.web.kv_path, "data/web-state.sqlite");
+    }
+
+    #[test]
+    fn web_state_opt_in_is_parsed() {
+        let manifest = Manifest::parse(
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n[web]\nkv_backend = \"sqlite\"\nkv_path = \"data/app.sqlite\"\n",
+        )
+        .expect("SQLite manifest must parse");
+        assert_eq!(manifest.web.kv_backend, "sqlite");
+        assert_eq!(manifest.web.kv_path, "data/app.sqlite");
     }
 
     #[test]
