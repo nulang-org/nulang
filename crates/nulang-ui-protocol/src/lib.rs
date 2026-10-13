@@ -546,16 +546,26 @@ pub fn encode_runtime_message(message: &RuntimeToHostMessage) -> serde_json::Res
     serde_json::to_string(message)
 }
 
+/// Deserialize a runtime-to-host envelope and enforce its protocol invariants.
 pub fn decode_runtime_message(input: &str) -> serde_json::Result<RuntimeToHostMessage> {
-    serde_json::from_str(input)
+    let message: RuntimeToHostMessage = serde_json::from_str(input)?;
+    message
+        .validate()
+        .map_err(<serde_json::Error as serde::de::Error>::custom)?;
+    Ok(message)
 }
 
 pub fn encode_host_message(message: &HostToRuntimeMessage) -> serde_json::Result<String> {
     serde_json::to_string(message)
 }
 
+/// Deserialize a host-to-runtime envelope and reject invalid protocol metadata.
 pub fn decode_host_message(input: &str) -> serde_json::Result<HostToRuntimeMessage> {
-    serde_json::from_str(input)
+    let message: HostToRuntimeMessage = serde_json::from_str(input)?;
+    message
+        .validate()
+        .map_err(<serde_json::Error as serde::de::Error>::custom)?;
+    Ok(message)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -788,6 +798,55 @@ mod tests {
         message.validate().unwrap();
         let json = encode_host_message(&message).unwrap();
         assert_eq!(decode_host_message(&json).unwrap(), message);
+    }
+
+    #[test]
+    fn decoding_host_messages_rejects_invalid_protocol_and_action_identity() {
+        let valid = HostToRuntimeMessage::invoke_action(ActionRequest {
+            document_id: DocumentId::from("tasks"),
+            revision: Revision(1),
+            action_id: ActionId::from("task.complete"),
+            placement: ActionPlacement::Server,
+            correlation_id: CorrelationId::from("trace-123"),
+            idempotency_key: IdempotencyKey::from("mutation-456"),
+            payload: WireValue::Null,
+        });
+
+        let mut wrong_protocol = serde_json::to_value(&valid).unwrap();
+        wrong_protocol["protocol"] = serde_json::Value::String("nulang-ui-msg/999".into());
+        assert!(decode_host_message(&wrong_protocol.to_string()).is_err());
+
+        let mut missing_action = serde_json::to_value(&valid).unwrap();
+        missing_action["request"]["action_id"] = serde_json::Value::String("".into());
+        assert!(decode_host_message(&missing_action.to_string()).is_err());
+
+        let mut missing_idempotency = serde_json::to_value(&valid).unwrap();
+        missing_idempotency["request"]["idempotency_key"] =
+            serde_json::Value::String(" ".into());
+        assert!(decode_host_message(&missing_idempotency.to_string()).is_err());
+    }
+
+    #[test]
+    fn decoding_runtime_messages_rejects_invalid_snapshots_and_patches() {
+        let mut invalid_document = document();
+        invalid_document.root = NodeId::from("missing");
+        let invalid_snapshot = RuntimeToHostMessage::snapshot(invalid_document);
+        let encoded = serde_json::to_string(&invalid_snapshot).unwrap();
+        assert!(decode_runtime_message(&encoded).is_err());
+
+        let invalid_patch = RuntimeToHostMessage::patch(UiPatch::new(
+            DocumentId::from("tasks"),
+            Revision(3),
+            Revision(3),
+            vec![],
+        ));
+        let encoded = serde_json::to_string(&invalid_patch).unwrap();
+        assert!(decode_runtime_message(&encoded).is_err());
+
+        let mut wrong_protocol =
+            serde_json::to_value(RuntimeToHostMessage::snapshot(document())).unwrap();
+        wrong_protocol["protocol"] = serde_json::Value::String("nulang-ui-msg/999".into());
+        assert!(decode_runtime_message(&wrong_protocol.to_string()).is_err());
     }
 
     #[test]
