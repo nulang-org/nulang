@@ -121,15 +121,27 @@ pub fn registry_tree_id_for_package_dir(root: &Path) -> io::Result<SourceId> {
         .collect::<io::Result<Vec<_>>>()?;
     files.sort_by(|left, right| left.0.cmp(&right.0));
 
+    let data = files
+        .into_iter()
+        .map(|(relative, path)| Ok((relative, fs::read(&path)?)))
+        .collect::<io::Result<Vec<_>>>()?;
+    Ok(registry_tree_id_from_entries(&data))
+}
+
+/// Use the same canonical framing for in-memory archive entries as for the
+/// extracted registry tree. This allows offline signature verification without
+/// unpacking or writing any temporary files.
+pub fn registry_tree_id_from_entries(files: &[(String, Vec<u8>)]) -> SourceId {
+    let mut entries: Vec<_> = files.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
     let mut canonical = Vec::new();
     canonical.extend_from_slice(b"nulang.registry-tree.v1\0");
-    put_u32(&mut canonical, files.len() as u32);
-    for (relative, path) in files {
-        let data = fs::read(&path)?;
+    put_u32(&mut canonical, entries.len() as u32);
+    for (relative, bytes) in entries {
         put_bytes(&mut canonical, relative.as_bytes());
-        put_bytes(&mut canonical, &data);
+        put_bytes(&mut canonical, bytes);
     }
-    Ok(SourceId::from_bytes(&canonical))
+    SourceId::from_bytes(&canonical)
 }
 
 fn collect_registry_files(dir: &Path, files: &mut Vec<std::path::PathBuf>) -> io::Result<()> {

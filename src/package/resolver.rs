@@ -186,6 +186,7 @@ pub fn resolve_offline(
     // Validate each cached registry pin before traversing any dependency graph.
     // Nothing in this check fetches, extracts, or repairs source code.
     lockfile.verify_cached_registry_source_identities(root_dir)?;
+    crate::package::registry_provenance::verify_signed_provenance(root_dir, lockfile)?;
     let resolution = resolve_with_lock(root_dir, manifest, Some(lockfile.clone()))?;
     if resolution.to_lockfile().package != lockfile.package {
         return Err(NuError::PackageError {
@@ -740,7 +741,7 @@ impl Resolver {
         let existed = dest.exists();
 
         // Download and authenticate before using any registry source.
-        let tarball = client
+        let authenticated = client
             .fetch_verified(dep_name, best, &self.root_dir)
             .map_err(|e| NuError::PackageError {
                 msg: format!(
@@ -749,6 +750,7 @@ impl Resolver {
                 ),
                 span: Span::default(),
             })?;
+        let tarball = authenticated.bytes.as_slice();
 
         if existed {
             // Extract authenticated bytes only into a distinct verification
@@ -765,7 +767,7 @@ impl Resolver {
                     continue;
                 }
                 let fresh = crate::package::registry_archive::extract_registry_archive(
-                    &tarball, &check_dir, dep_name, best
+                    tarball, &check_dir, dep_name, best
                 )?;
                 verified = Some(fresh);
                 break;
@@ -800,11 +802,19 @@ impl Resolver {
                     span: Span::default(),
                 });
             }
+            crate::package::registry_provenance::store_signed_provenance(
+                &self.root_dir, registry_url, dep_name, best,
+                tarball, &authenticated.signature
+            )?;
             return Ok((dest, best.clone()));
         }
 
         let dir = crate::package::registry_archive::extract_registry_archive(
-            &tarball, &dest, dep_name, best
+            tarball, &dest, dep_name, best
+        )?;
+        crate::package::registry_provenance::store_signed_provenance(
+            &self.root_dir, registry_url, dep_name, best,
+            tarball, &authenticated.signature
         )?;
         Ok((dir, best.clone()))
     }
@@ -1012,6 +1022,38 @@ mod tests {
             commit: String::new(),
         });
         lock.save(&app).unwrap();
+
+        // Offline registry tests must establish independently trusted signed
+        // archive provenance for the *same* files in the extracted cache.
+        let seed = [23u8; 32];
+        let public = crate::registry::trust::signing_public_key(&seed);
+        std::fs::write(
+            app.join("Nulang.trust.toml"),
+            format!(
+                "[registries.\"https://registry.test\"]\npublic_keys = [\"{}\"]\n",
+                public
+            ),
+        ).unwrap();
+        let gzip = flate2::write::GzEncoder::new(
+            Vec::new(), flate2::Compression::default()
+        );
+        let mut archive_builder = tar::Builder::new(gzip);
+        for name in [MANIFEST_FILE, "module.nula", "static.json"] {
+            let bytes = std::fs::read(cached.join(name)).unwrap();
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive_builder.append_data(&mut header, name, bytes.as_slice()).unwrap();
+        }
+        let tarball = archive_builder.into_inner().unwrap().finish().unwrap();
+        let signature = crate::registry::trust::sign_registry_archive(
+            "https://registry.test", "util", "0.1.0", &tarball, &seed
+        );
+        crate::package::registry_provenance::store_signed_provenance(
+            &app, "https://registry.test", "util", "0.1.0", &tarball, &signature
+        ).unwrap();
+
         (dir, app.clone(), Manifest::load(&app).unwrap(), Lockfile::load(&app).unwrap())
     }
 

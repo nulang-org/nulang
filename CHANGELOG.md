@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### Signed offline registry provenance — 2026-10-13
+- **Offline Nula builds now authenticate cached registry packages using publisher signatures.** Online fetches persist the original signed archive and signature separately from extracted source; `--offline` verifies signatures against current project-pinned keys and recomputes the archived source tree identity in memory against both cache and `Nulang.lock`, without network or filesystem writes.
+- **Missing, revoked, or tampered provenance fails closed.** Unsigned legacy caches require a successful signed online revalidation; key revocation and provenance mismatch are not silently repaired.
+
 ### Publisher-authorized Nula registry downloads — 2026-10-13
 - **Ed25519 signatures on registry packages with explicit project-pinned trust keys.** A publisher signs its exact tarball digest, package name/version, and registry URL; `nula publish` uses `NULA_SIGNING_KEY_HEX`, and `nula publisher-key` prints only the corresponding public key.
 - **Registry signatures are transported, not trusted, by the registry.** The Cloudflare Worker stores signatures in R2 object metadata; the bundled Rust registry stores detached `.sig` sidecars. Clients verify signatures against `Nulang.trust.toml` before extracting online downloads, and compare reused caches to signed archive contents.

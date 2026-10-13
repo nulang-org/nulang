@@ -17,3 +17,4 @@ pub mod lockfile;
 pub mod manifest;
 pub mod resolver;
 pub mod registry_archive;
+pub mod registry_provenance;
