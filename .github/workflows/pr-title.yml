@@ -12,8 +12,17 @@ concurrency:
 
 permissions:
   pull-requests: read
+  contents: read
 
 jobs:
+  workflow-security:
+    name: Workflow script injection guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Reject untrusted event data interpolated into run scripts
+        run: python3 -m unittest discover -s scripts/tests -p test_workflow_security.py -v
+
   check-title:
     name: Validate PR title
     runs-on: ubuntu-latest
