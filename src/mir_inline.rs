@@ -1242,12 +1242,13 @@ mod tests {
     fn test_no_inline_oversized_body() {
         let mut m = make_module();
         let mut callee = crate::mir::FunctionBuilder::new("oversized", None);
-        let mut last = callee.add_temp(crate::types::Type::int());
+        let mut values = Vec::new();
         for i in 0..20 {
-            last = callee.add_temp(crate::types::Type::int());
-            callee.assign(last, RValue::Const(Constant::Int(i)));
+            let local = callee.add_temp(crate::types::Type::int());
+            callee.assign(local, RValue::Const(Constant::Int(i)));
+            values.push(local);
         }
-        callee.terminate(Terminator::Return(Some(last)));
+        callee.terminate(Terminator::Return(values.last().copied()));
         m.functions.push(callee.build());
 
         let mut caller = crate::mir::FunctionBuilder::new("caller", None);
