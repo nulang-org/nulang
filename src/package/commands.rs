@@ -7,7 +7,7 @@ use std::process::Command;
 
 use crate::package::lockfile::{Lockfile, LOCKFILE_FILE};
 use crate::package::manifest::{Dependency, DependencyDetail, Manifest, MANIFEST_FILE};
-use crate::package::resolver::resolve;
+use crate::package::resolver::{resolve, resolve_offline};
 use crate::types::{NuError, NuResult, Span};
 use crate::web::modules::{ModuleRegistry, ModuleSpec};
 
@@ -79,9 +79,10 @@ pub fn run(args: &[String]) -> NuResult<()> {
         Some("build") => {
             let web = args[1..].iter().any(|a| a == "--web");
             let json = args[1..].iter().any(|a| a == "--json");
-            let locked = args[1..].iter().any(|a| a == "--locked");
+            let offline = args[1..].iter().any(|a| a == "--offline");
+            let locked = offline || args[1..].iter().any(|a| a == "--locked");
             for flag in &args[1..] {
-                if !matches!(flag.as_str(), "--web" | "--json" | "--locked") {
+                if !matches!(flag.as_str(), "--web" | "--json" | "--locked" | "--offline") {
                     return Err(NuError::PackageError {
                         msg: format!("unknown flag '{}' for nula build", flag),
                         span: Span::default(),
@@ -95,19 +96,23 @@ pub fn run(args: &[String]) -> NuResult<()> {
                 });
             }
             if web {
-                cmd_build_web(locked)
+                cmd_build_web(locked, offline)
             } else {
-                cmd_build(json, locked)
+                cmd_build(json, locked, offline)
             }
         }
         Some("build-wasm") => {
-            if args[1..].iter().any(|a| a.as_str() != "--locked") {
+            if args[1..].iter().any(|a| !matches!(a.as_str(), "--locked" | "--offline")) {
                 return Err(NuError::PackageError {
                     msg: format!("unknown flag '{}' for nula build-wasm", args[1]),
                     span: Span::default(),
                 });
             }
-            cmd_build_wasm(args[1..].iter().any(|a| a == "--locked"))
+            let offline = args[1..].iter().any(|a| a == "--offline");
+            cmd_build_wasm(
+                offline || args[1..].iter().any(|a| a == "--locked"),
+                offline,
+            )
         }
         Some("test") => {
             let mut filter: Option<&str> = None;
@@ -115,6 +120,7 @@ pub fn run(args: &[String]) -> NuResult<()> {
             let mut watch = false;
             let mut json = false;
             let mut locked = false;
+            let mut offline = false;
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
@@ -128,6 +134,7 @@ pub fn run(args: &[String]) -> NuResult<()> {
                     "--watch" | "-w" => watch = true,
                     "--json" => json = true,
                     "--locked" => locked = true,
+                    "--offline" => offline = true,
                     other => {
                         return Err(NuError::PackageError {
                             msg: format!("unknown flag '{}' for nula test", other),
@@ -137,15 +144,16 @@ pub fn run(args: &[String]) -> NuResult<()> {
                 }
                 i += 1;
             }
+            locked |= offline;
             if watch {
-                cmd_test_watch(filter, verbose, locked)
+                cmd_test_watch(filter, verbose, locked, offline)
             } else {
-                cmd_test(filter, verbose, json, locked)
+                cmd_test(filter, verbose, json, locked, offline)
             }
         }
         Some("run") => {
             for flag in &args[1..] {
-                if !matches!(flag.as_str(), "--watch" | "--locked") {
+                if !matches!(flag.as_str(), "--watch" | "--locked" | "--offline") {
                     return Err(NuError::PackageError {
                         msg: format!("unknown flag '{}' for nula run", flag),
                         span: Span::default(),
@@ -153,14 +161,15 @@ pub fn run(args: &[String]) -> NuResult<()> {
                 }
             }
             let watch = args[1..].iter().any(|a| a == "--watch");
-            let locked = args[1..].iter().any(|a| a == "--locked");
+            let offline = args[1..].iter().any(|a| a == "--offline");
+            let locked = offline || args[1..].iter().any(|a| a == "--locked");
             if watch {
-                cmd_run_watch(locked)
+                cmd_run_watch(locked, offline)
             } else {
-                cmd_run(locked)
+                cmd_run(locked, offline)
             }
         }
-        Some("watch") => cmd_run_watch(false),
+        Some("watch") => cmd_run_watch(false, false),
         Some("dev") => {
             let mut port: Option<u16> = None;
             let mut i = 1;
@@ -324,6 +333,7 @@ fn print_usage() {
     println!("                             Run .nula test files");
     println!("  run [--locked] [--watch]  Build and run the package entry point");
     println!("  --locked                 Require unchanged Nulang.lock; never rewrite it");
+    println!("  --offline                Implies --locked; only local paths and clean cached Git");
     println!("  watch         Alias for 'run --watch'");
     println!("  add   <name>  Add a dependency to Nulang.toml");
     println!("  remove <name> Remove a dependency from Nulang.toml");
@@ -802,6 +812,17 @@ fn prepare_package() -> NuResult<PathBuf> {
 
 /// Locked mode rejects a missing or stale lockfile and never rewrites it.
 fn prepare_package_with_lock_policy(locked: bool) -> NuResult<PathBuf> {
+    prepare_package_with_options(locked, false)
+}
+
+/// Offline implies locked and only reads dependency caches; it never fetches.
+fn prepare_package_with_options(locked: bool, offline: bool) -> NuResult<PathBuf> {
+    if offline && !locked {
+        return Err(NuError::PackageError {
+            msg: "--offline requires --locked dependency pins".to_string(),
+            span: Span::default(),
+        });
+    }
     let root = package_root()?;
     let manifest_path = root.join(MANIFEST_FILE);
     let manifest = Manifest::load(&root).map_err(|e| NuError::PackageError {
@@ -856,16 +877,27 @@ fn prepare_package_with_lock_policy(locked: bool) -> NuResult<PathBuf> {
         }
     }
 
-    // Fail before a resolver can fetch or update its local dependency cache.
-    if locked {
-        Lockfile::load(&root).map_err(|e| NuError::PackageError {
+    // Validate the lockfile before the resolver can contact remote endpoints.
+    let required_lock = if locked {
+        Some(Lockfile::load(&root).map_err(|e| NuError::PackageError {
             msg: format!("--locked requires an existing valid {}: {}", LOCKFILE_FILE, e),
             span: Span::default(),
-        })?;
-    }
+        })?)
+    } else {
+        None
+    };
 
     eprintln!("  Resolving dependencies...");
-    let resolution = resolve(&root, &manifest).map_err(|e| NuError::PackageError {
+    let resolution = (if offline {
+        resolve_offline(
+            &root,
+            &manifest,
+            required_lock.as_ref().expect("offline requires a lockfile"),
+        )
+    } else {
+        resolve(&root, &manifest)
+    })
+    .map_err(|e| NuError::PackageError {
         msg: format!(
             "failed to resolve dependencies for package '{}': {}\n  help: check that all [dependencies] in {} are reachable",
             manifest.package.name,
@@ -1151,7 +1183,7 @@ fn verify_locked_resolution(root: &Path, candidate: &Lockfile) -> NuResult<()> {
 /// `nula build`: resolve dependencies, write the lockfile, type-check entry.
 /// `nula build`: resolve dependencies, write the lockfile, type-check and
 /// compile to a .nbc artifact in .nula/dist/.
-fn cmd_build(json: bool, locked: bool) -> NuResult<()> {
+fn cmd_build(json: bool, locked: bool, offline: bool) -> NuResult<()> {
     let root = package_root()?;
     let manifest_path = root.join(MANIFEST_FILE);
     let manifest = Manifest::load(&root).map_err(|e| NuError::PackageError {
@@ -1161,7 +1193,7 @@ fn cmd_build(json: bool, locked: bool) -> NuResult<()> {
     let name = manifest.package.name.clone();
     let version = manifest.package.version.clone();
 
-    let entry = prepare_package_with_lock_policy(locked)?;
+    let entry = prepare_package_with_options(locked, offline)?;
     let entry_str = entry.to_string_lossy().into_owned();
 
     if json {
@@ -1325,7 +1357,7 @@ fn nulang_exe_output(args: &[&str]) -> NuResult<std::process::Output> {
 
 /// `nula build-wasm`: compile package to .wasm + AOT .cwasm.
 /// `nula build-wasm`: compile package to .wasm + AOT .cwasm in .nula/dist/.
-fn cmd_build_wasm(locked: bool) -> NuResult<()> {
+fn cmd_build_wasm(locked: bool, offline: bool) -> NuResult<()> {
     let root = package_root()?;
     let manifest_path = root.join(MANIFEST_FILE);
     let manifest = Manifest::load(&root).map_err(|e| NuError::PackageError {
@@ -1334,7 +1366,7 @@ fn cmd_build_wasm(locked: bool) -> NuResult<()> {
     })?;
     let name = manifest.package.name.clone();
 
-    let entry = prepare_package_with_lock_policy(locked)?;
+    let entry = prepare_package_with_options(locked, offline)?;
     let entry_str = entry.to_string_lossy().into_owned();
 
     let dist_dir = root.join(".nula").join("dist");
@@ -1354,9 +1386,9 @@ fn cmd_build_wasm(locked: bool) -> NuResult<()> {
 }
 
 /// `nula run`: build, then execute the entry point.
-fn cmd_run(locked: bool) -> NuResult<()> {
+fn cmd_run(locked: bool, offline: bool) -> NuResult<()> {
     eprintln!("Building and running...");
-    let entry = prepare_package_with_lock_policy(locked)?;
+    let entry = prepare_package_with_options(locked, offline)?;
     let entry_str = entry.to_string_lossy().into_owned();
     let caps = capability_args();
     let cap_refs: Vec<&str> = caps.iter().map(|s| s.as_str()).collect();
@@ -1365,9 +1397,9 @@ fn cmd_run(locked: bool) -> NuResult<()> {
 
 /// `nula run --watch` (or `nula watch`): build, run, and re-run when source
 /// files change under `src/`. Uses simple mtime polling.
-fn cmd_run_watch(locked: bool) -> NuResult<()> {
+fn cmd_run_watch(locked: bool, offline: bool) -> NuResult<()> {
     let root = package_root()?;
-    let entry = prepare_package_with_lock_policy(locked)?;
+    let entry = prepare_package_with_options(locked, offline)?;
     let entry_str = entry.to_string_lossy().into_owned();
 
     // Initial run
@@ -1386,7 +1418,7 @@ fn cmd_run_watch(locked: bool) -> NuResult<()> {
             last_mtimes = current;
             eprintln!("\n--- change detected, rebuilding ---");
             // Re-resolve in case dependencies changed
-            match prepare_package_with_lock_policy(locked) {
+            match prepare_package_with_options(locked, offline) {
                 Ok(entry) => {
                     let es = entry.to_string_lossy().into_owned();
                     let _ = nulang_exe(&[&es]);
@@ -1430,13 +1462,13 @@ fn collect_mtimes_recursive(dir: &Path, out: &mut Vec<(PathBuf, std::time::Syste
 /// `nula build --web`: static-site build. Compile the entry point, run it to
 /// collect `Web.route` registrations, render each static handler to an HTML
 /// file, and copy the static directory into the output directory.
-fn cmd_build_web(locked: bool) -> NuResult<()> {
+fn cmd_build_web(locked: bool, offline: bool) -> NuResult<()> {
     let root = package_root()?;
     let manifest = Manifest::load(&root).map_err(|e| NuError::PackageError {
         msg: format!("failed to load {}: {}", MANIFEST_FILE, e),
         span: Span::default(),
     })?;
-    let entry = prepare_package_with_lock_policy(locked)?;
+    let entry = prepare_package_with_options(locked, offline)?;
     let entry_str = entry.to_string_lossy().into_owned();
 
     let build_dir = root.join(".nula");
@@ -1682,7 +1714,7 @@ fn cmd_dev(port_override: Option<u16>) -> NuResult<()> {
     ])?;
 
     if runtime_routes.is_empty() {
-        cmd_build_web(false)?;
+        cmd_build_web(false, false)?;
         let output_dir = root.join(&manifest.web.output_dir);
         let addr = format!("127.0.0.1:{}", port);
         let listener = std::net::TcpListener::bind(&addr).map_err(|e| NuError::PackageError {
@@ -1787,9 +1819,15 @@ fn guess_content_type(path: &Path) -> &'static str {
 /// With `--verbose` (or `-v`): prints each test file name before execution,
 /// shows ✓ PASS / ✗ FAIL per file, and displays error messages for failures.
 /// Default (non-verbose) output is clean and greppable.
-fn cmd_test(filter: Option<&str>, verbose: bool, json: bool, locked: bool) -> NuResult<()> {
+fn cmd_test(
+    filter: Option<&str>,
+    verbose: bool,
+    json: bool,
+    locked: bool,
+    offline: bool,
+) -> NuResult<()> {
     eprintln!("Preparing package...");
-    let _entry = prepare_package_with_lock_policy(locked)?;
+    let _entry = prepare_package_with_options(locked, offline)?;
     let tests_dir = package_root()?.join("tests");
     let mut test_files: Vec<PathBuf> = match std::fs::read_dir(&tests_dir) {
         Ok(entries) => entries
@@ -1963,11 +2001,16 @@ fn cmd_test(filter: Option<&str>, verbose: bool, json: bool, locked: bool) -> Nu
 
 /// `nula test --watch` (or `nula test -w`): run tests and re-run when source
 /// files change under `src/` or `tests/`. Uses simple mtime polling.
-fn cmd_test_watch(filter: Option<&str>, verbose: bool, locked: bool) -> NuResult<()> {
+fn cmd_test_watch(
+    filter: Option<&str>,
+    verbose: bool,
+    locked: bool,
+    offline: bool,
+) -> NuResult<()> {
     let root = package_root()?;
 
     // Initial run
-    let _ = cmd_test(filter, verbose, false, locked);
+    let _ = cmd_test(filter, verbose, false, locked, offline);
 
     // Collect initial mtimes for all .nula files under src/ and tests/
     let src_dir = root.join("src");
@@ -1986,7 +2029,7 @@ fn cmd_test_watch(filter: Option<&str>, verbose: bool, locked: bool) -> NuResult
             // Clear screen
             print!("\x1B[2J\x1B[H");
             eprintln!("re-running tests...");
-            let _ = cmd_test(filter, verbose, false, locked);
+            let _ = cmd_test(filter, verbose, false, locked, offline);
         }
     }
 }
@@ -2291,7 +2334,7 @@ fn cmd_deploy(
     let version = manifest.package.version.clone();
 
     // Build the web output so dist/ contains the IR and static assets.
-    cmd_build_web(false)?;
+    cmd_build_web(false, false)?;
 
     let dist_dir = root.join(&manifest.web.output_dir);
 
@@ -2948,7 +2991,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let _guard = ChangeDir::new(&dir);
 
-        let result = cmd_test(None, false, false, false);
+        let result = cmd_test(None, false, false, false, false);
         assert!(result.is_err(), "test outside package should fail");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -3269,7 +3312,7 @@ app "counter" {
         .unwrap();
 
         let _guard = ChangeDir::new(&dir);
-        cmd_build_web(false).expect("web build should succeed");
+        cmd_build_web(false, false).expect("web build should succeed");
 
         let html =
             std::fs::read_to_string(dir.join("dist/index.html")).expect("index.html should exist");
