@@ -440,7 +440,8 @@ pub(crate) fn finish_resumed_workflow_failure(
             "nulang-workflow: no verified safe failed-step snapshot; quarantining actor"
         );
         rt.actors.remove(&actor_id);
-        rt.pending_receive_wakes.retain(|queued| *queued != actor_id);
+        rt.pending_receive_wakes
+            .retain(|queued| *queued != actor_id);
         rt.current_actor = None;
         return false;
     };
@@ -466,7 +467,8 @@ pub(crate) fn finish_resumed_workflow_failure(
             "nulang-workflow: resumed failure persistence rejected; quarantining actor"
         );
         rt.actors.remove(&actor_id);
-        rt.pending_receive_wakes.retain(|queued| *queued != actor_id);
+        rt.pending_receive_wakes
+            .retain(|queued| *queued != actor_id);
         rt.current_actor = None;
         return false;
     }
@@ -481,7 +483,8 @@ pub(crate) fn finish_resumed_workflow_failure(
             "nulang-workflow: failed step mutated durable state; quarantining for safe recovery"
         );
         rt.actors.remove(&actor_id);
-        rt.pending_receive_wakes.retain(|queued| *queued != actor_id);
+        rt.pending_receive_wakes
+            .retain(|queued| *queued != actor_id);
         rt.current_actor = None;
         return false;
     }
