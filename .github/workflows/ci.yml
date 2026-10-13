@@ -269,6 +269,12 @@ jobs:
       - name: Check server build, dependency graph and SQLite recovery
         run: bash scripts/check_server_profile.sh
 
+      - name: Smoke HTTP service with lean server profile
+        run: |
+          cargo build --locked --no-default-features --features server --bin nulang
+          target_dir="$(cargo metadata --locked --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+          NULANG_BIN="$target_dir/debug/nulang" python3 scripts/test_service_template.py
+
   # -----------------------------------------------------------------------
   # WASM backend
   # -----------------------------------------------------------------------
