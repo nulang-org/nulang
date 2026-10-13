@@ -459,11 +459,12 @@ impl LanguageServer for NulangLanguageServer {
             }
         }
 
-        Ok(Self::hover_at_with_rows(
-            &source,
-            params.text_document_position_params.position,
-            function_rows.as_ref(),
-        ))
+        let position = params.text_document_position_params.position;
+        Ok(if let Some(ref rows) = function_rows {
+            Self::hover_at_with_rows(&source, position, Some(rows))
+        } else {
+            Self::hover_at(&source, position)
+        })
     }
 
     async fn goto_definition(
@@ -2853,9 +2854,13 @@ impl<'a> InlayHintEngine<'a> {
             }),
             text_edits: None,
             tooltip: Some(InlayHintTooltip::String(match ann.kind {
-                AnnotationKind::Type => "Inferred type".to_string(),
-                AnnotationKind::Capability => "Reference capability".to_string(),
-                AnnotationKind::Effect => "Effect row".to_string(),
+                AnnotationKind::Type => "Inferred type (display only; no code change)".to_string(),
+                AnnotationKind::Capability => {
+                    "Reference capability: rules for aliasing, mutation and transfer of values. External authority is checked separately.".to_string()
+                }
+                AnnotationKind::Effect => {
+                    "Effect row: operations a function may request. An effect annotation does not grant external authority (filesystem, network or OS).".to_string()
+                },
             })),
             padding_left: Some(false),
             padding_right: Some(false),
