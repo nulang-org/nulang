@@ -708,6 +708,38 @@ mod tests {
     // -- Escape analysis ----------------------------------------------------
 
     #[test]
+    fn pointer_analysis_crosses_zero_state_prefix_before_nested_allocations() {
+        // Regression: a reachable Nop/Const0 prefix leaves the may-pointer
+        // state empty. We must still visit successors, or an outer container
+        // can be classified arena-safe while a heap-owned child is stored
+        // into it without the ORCA retain barrier.
+        let m = send_module(
+            vec![
+                Instruction::new0(OpCode::Nop),          // 0: empty state
+                Instruction::new1(OpCode::Const0, 0),    // 1: empty state
+                arr_alloc(0, 1),                         // 2: outer container
+                arr_alloc(0, 2),                         // 3: heap child
+                Instruction::new3(OpCode::ArrStore, 1, 0, 2), // 4: outer[0] = child
+                Instruction::new1(OpCode::Drop, 1),
+                Instruction::new1(OpCode::Drop, 2),
+                Instruction::new0(OpCode::Halt),
+            ],
+            0,
+        );
+        let state = may_ptr_sets(&m);
+        assert!(
+            regset_contains(&state[4], 2),
+            "pointer analysis must reach stores after zero-pointer prefixes"
+        );
+        let qualified = qualifying_alloc_sites(&m);
+        assert!(
+            !qualified.contains(&2),
+            "outer container must not use arena when it stores a heap pointer"
+        );
+        assert!(!qualified.contains(&3), "stored child must not qualify");
+    }
+
+    #[test]
     fn qualifies_when_dropped_before_halt() {
         // r1 = array(r0-len); read its length; drop it; halt. r0 is an int.
         let m = send_module(
