@@ -13,6 +13,11 @@ on:
       - 'src/main.rs'
       - 'scripts/check_release_linux.sh'
       - 'scripts/tests/test_release_cli_profile.py'
+      - 'scripts/tests/test_musl_release.py'
+      - 'scripts/check_release_linux_static.sh'
+      - 'scripts/check_libc_interop.py'
+      - 'examples/libc_interop_probe.rs'
+      - 'docs/src/content/docs/getting-started/installation.mdx'
 
 env:
   CARGO_TERM_COLOR: always
@@ -31,7 +36,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Verify public CLI feature-profile parity
-        run: python3 -m unittest discover -s scripts/tests -p test_release_cli_profile.py
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*release*.py'
 
       - name: Verify tag matches crate and CLI versions
         if: github.event_name == 'push'
@@ -255,6 +260,107 @@ jobs:
           path: |
             dist/${{ matrix.artifact }}.tar.gz
             dist/${{ matrix.artifact }}.tar.gz.sha256
+
+  # PR-only proof of a fully static x86_64 Linux musl binary. This is
+  # intentionally NOT in the release matrix or the publish job's needs.
+  # Experimental assets must not be included by publish's nulang-* glob.
+  musl-verify:
+    name: Validate static Linux musl CLI (x86_64)
+    if: github.event_name == 'pull_request'
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    env:
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Install Rust with musl target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Ensure musl target stdlib
+        run: rustup target add x86_64-unknown-linux-musl
+
+      - name: Cache musl dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-x86_64-musl-preview
+
+      - name: Build static musl CLI
+        run: cargo build --locked --release --target x86_64-unknown-linux-musl --no-default-features --features release-musl --bin nulang
+
+      - name: Verify no ELF dynamic loader or shared libraries
+        run: bash scripts/check_release_linux_static.sh target/x86_64-unknown-linux-musl/release/nulang
+
+      - name: Test TCP transport under musl (existing integration test)
+        run: cargo test --locked --release --target x86_64-unknown-linux-musl --no-default-features --features release-musl --lib test_transport_send_receive -- --test-threads=1
+
+      - name: Test mutual TLS under musl (connect, converge, reject)
+        run: cargo test --locked --release --target x86_64-unknown-linux-musl --no-default-features --features release-musl --lib test_mutual_tls_ -- --test-threads=1
+
+      - name: Smoke musl CLI on Linux
+        shell: bash
+        run: |
+          bin=target/x86_64-unknown-linux-musl/release/nulang
+          "$bin" --version
+          test "$("$bin" --eval 'perform IO.print("musl-smoke")')" = "musl-smoke"
+
+      - name: Smoke native codegen on musl host
+        shell: bash
+        run: |
+          bin=target/x86_64-unknown-linux-musl/release/nulang
+          test "$("$bin" --backend native --eval '1 + 2 * 3')" = "7"
+
+      - name: Package experimental musl archive
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/nulang dist/nulang-linux-x86_64-musl
+          tar czf dist/nulang-linux-x86_64-musl.tar.gz -C dist nulang-linux-x86_64-musl
+          (cd dist && sha256sum nulang-linux-x86_64-musl.tar.gz > nulang-linux-x86_64-musl.tar.gz.sha256)
+          (cd dist && sha256sum -c nulang-linux-x86_64-musl.tar.gz.sha256)
+
+      - name: Smoke extracted artifact on clean Alpine
+        shell: bash
+        run: |
+          mkdir -p musl-clean-smoke
+          tar xzf dist/nulang-linux-x86_64-musl.tar.gz -C musl-clean-smoke
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges \
+            -v "$PWD/musl-clean-smoke:/opt/nulang:ro" alpine:3.22 \
+            sh -ec '
+              bin=/opt/nulang/nulang-linux-x86_64-musl
+              "$bin" --version
+              test "$("$bin" --eval "1 + 2 * 3")" = "7"
+              test "$("$bin" --backend native --eval "1 + 2 * 3")" = "7"
+            '
+
+      - name: Validate GNU/musl NUL0 and mTLS interoperability
+        shell: bash
+        run: |
+          cargo build --locked --release --target x86_64-unknown-linux-gnu --no-default-features --features release-musl --example libc_interop_probe
+          cargo build --locked --release --target x86_64-unknown-linux-musl --no-default-features --features release-musl --example libc_interop_probe
+          python3 scripts/check_libc_interop.py \
+            --gnu target/x86_64-unknown-linux-gnu/release/examples/libc_interop_probe \
+            --musl target/x86_64-unknown-linux-musl/release/examples/libc_interop_probe
+
+      - name: Upload isolated preview
+        uses: actions/upload-artifact@v7
+        with:
+          name: experimental-static-musl-x86_64
+          path: |
+            dist/nulang-linux-x86_64-musl.tar.gz
+            dist/nulang-linux-x86_64-musl.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 3
 
   publish:
     name: Publish Release

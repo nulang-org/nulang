@@ -1,4 +1,6 @@
 # Nulang Changelog
+### Experimental Linux musl static CLI validation — 2026-10-13
+- **A separate `release-musl` preview profile targets static x86_64 Linux builds.** PR validation compiles the reduced native-codegen/TCP/TLS CLI with musl, checks ELF linkage, executes CLI smoke tests, and uploads a short-lived checksummed archive distinct from tagged release assets. Existing GNU/Linux release targets and the full `release-cli` profile remain unchanged. Broader native integrations and clean-host portability require validation before promoting musl to a public release variant.
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
