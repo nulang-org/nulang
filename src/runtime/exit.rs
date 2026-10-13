@@ -93,6 +93,7 @@ pub(crate) fn reap_living_actor(rt: &mut Runtime, actor_id: u64, reason: ExitRea
 
     rt.registry.unregister_by_actor(actor_id);
     rt.process_groups.leave_all(actor_id);
+    rt.secrets.revoke_owner(actor_id);
     rt.fabric_unsubscribe_actor(actor_id);
 
     for watcher_id in monitors {
