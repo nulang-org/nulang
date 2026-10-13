@@ -6,7 +6,8 @@ use nulang::runtime::{Actor, Runtime};
 #[test]
 fn orca_snapshot_includes_main_and_active_gcs_but_not_pooled_actors() {
     let mut runtime = Runtime::new();
-    let main_ptr = runtime.main_gc
+    let main_ptr = runtime
+        .main_gc
         .alloc_object(&mut runtime.main_heap, 8, TypeTag::Raw)
         .expect("main GC allocation");
     unsafe {
@@ -15,7 +16,8 @@ fn orca_snapshot_includes_main_and_active_gcs_but_not_pooled_actors() {
     }
 
     let mut actor = Actor::new(20, "live", 8);
-    let actor_ptr = actor.orca_gc
+    let actor_ptr = actor
+        .orca_gc
         .alloc_object(&mut actor.heap, 16, TypeTag::Raw)
         .expect("actor GC allocation");
     unsafe {
@@ -26,17 +28,19 @@ fn orca_snapshot_includes_main_and_active_gcs_but_not_pooled_actors() {
     runtime.actors.insert(20, actor);
 
     let mut pooled = Actor::new(30, "pooled", 8);
-    let pooled_ptr = pooled.orca_gc
+    let pooled_ptr = pooled
+        .orca_gc
         .alloc_object(&mut pooled.heap, 8, TypeTag::Raw)
         .expect("pooled allocation");
-    unsafe { pooled.orca_gc.local_ref(&pooled.heap, pooled_ptr); }
+    unsafe { pooled.orca_gc.local_ref(&pooled.heap, pooled_ptr) };
     runtime.actor_pool.push(pooled);
 
     let snap = runtime.metrics_snapshot();
     assert_eq!(snap.orca_traffic.local_refs_created, 3);
     assert_eq!(snap.orca_traffic.local_refs_dropped, 2);
 
-    runtime.actor_pool.push(runtime.actors.remove(&20).unwrap());
+    let retired_actor = runtime.actors.remove(&20).expect("active actor");
+    runtime.actor_pool.push(retired_actor);
     let after = runtime.metrics_snapshot().orca_traffic;
     assert_eq!(after.local_refs_created, 1, "main GC remains active");
     assert_eq!(after.local_refs_dropped, 1);
@@ -46,10 +50,11 @@ fn orca_snapshot_includes_main_and_active_gcs_but_not_pooled_actors() {
 fn orca_traffic_exposes_nonmonotonic_gauges_in_json_and_prometheus() {
     let mut runtime = Runtime::new();
     let mut actor = Actor::new(20, "live", 8);
-    let ptr = actor.orca_gc
+    let ptr = actor
+        .orca_gc
         .alloc_object(&mut actor.heap, 8, TypeTag::Raw)
         .expect("actor allocation");
-    unsafe { actor.orca_gc.local_ref(&actor.heap, ptr); }
+    unsafe { actor.orca_gc.local_ref(&actor.heap, ptr) };
     runtime.actors.insert(20, actor);
 
     let snapshot = runtime.metrics_snapshot();
@@ -77,10 +82,11 @@ fn orca_traffic_exposes_nonmonotonic_gauges_in_json_and_prometheus() {
 fn orca_ref_traffic_snapshot_is_read_only() {
     let mut runtime = Runtime::new();
     let mut actor = Actor::new(4, "read-only", 8);
-    let ptr = actor.orca_gc
+    let ptr = actor
+        .orca_gc
         .alloc_object(&mut actor.heap, 8, TypeTag::Raw)
         .expect("actor allocation");
-    unsafe { actor.orca_gc.local_ref(&actor.heap, ptr); }
+    unsafe { actor.orca_gc.local_ref(&actor.heap, ptr) };
     runtime.actors.insert(4, actor);
 
     let first = runtime.metrics_snapshot().orca_traffic;
@@ -95,7 +101,8 @@ fn orca_ref_traffic_snapshot_is_read_only() {
 fn existing_orca_foreign_reference_operations_are_visible() {
     let mut runtime = Runtime::new();
     let mut actor = Actor::new(12, "sender", 8);
-    let ptr = actor.orca_gc
+    let ptr = actor
+        .orca_gc
         .alloc_object(&mut actor.heap, 8, TypeTag::Raw)
         .expect("allocated ORCA object");
     // Exercise the existing in-flight and returned-to-owner protocol without
