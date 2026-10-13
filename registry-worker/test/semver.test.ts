@@ -9,6 +9,22 @@ describe('compareSemver', () => {
     expect(compareSemver('0.9.0', '0.10.0')).toBeLessThan(0);
   });
 
+  it('compares numeric components beyond JavaScript safe integers exactly', () => {
+    expect(compareSemver('9007199254740993.0.0', '9007199254740992.0.0')).toBeGreaterThan(0);
+    expect(compareSemver('1.9007199254740993.0', '1.9007199254740992.0')).toBeGreaterThan(0);
+    expect(compareSemver('1.0.9007199254740993', '1.0.9007199254740992')).toBeGreaterThan(0);
+    expect(compareSemver('1.0.0-alpha.9007199254740993', '1.0.0-alpha.9007199254740992'))
+      .toBeGreaterThan(0);
+    expect(compareSemver('1.0.0-alpha.9007199254740992', '1.0.0-alpha.9007199254740993'))
+      .toBeLessThan(0);
+  });
+
+  it('uses numeric ordering, not string length, for leading zeros', () => {
+    // Invalid SemVer identifiers remain accepted for listing; ordering is lenient.
+    expect(compareSemver('0001.02.3', '1.2.3')).toBe(0);
+    expect(compareSemver('1.0.0-alpha.0009', '1.0.0-alpha.10')).toBeLessThan(0);
+  });
+
   it('ignores build metadata', () => {
     expect(compareSemver('1.0.0+meta', '1.0.0')).toBe(0);
     expect(compareSemver('1.0.0+build.5', '1.0.0+build.9')).toBe(0);
