@@ -111,6 +111,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_error_response({'ok': False, 'stderr': 'Invalid Content-Length header'})
             return None
 
+        # Buffered readers interpret read(-1) as read-until-EOF, which can
+        # indefinitely block or consume unbounded input on an HTTP connection.
+        if content_length < 0:
+            self.send_error_response({'ok': False, 'stderr': 'Invalid Content-Length header'})
+            return None
+
         if content_length > MAX_CODE_BYTES + 4096:
             self.send_error_response({'ok': False, 'stderr': 'Request body too large'})
             return None
@@ -126,6 +132,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return None
 
         code = data.get('code', '')
+        if not isinstance(code, str):
+            self.send_error_response({'ok': False, 'stderr': 'Source code must be a string'})
+            return None
         if len(code.encode('utf-8', errors='replace')) > MAX_CODE_BYTES:
             self.send_error_response({'ok': False, 'stderr': 'Source code too large'})
             return None
@@ -190,7 +199,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         # Whitelist the target so client input can never inject extra flags
         # or unexpected values into the compiler invocation.
-        if target not in _ALLOWED_COMPILE_TARGETS:
+        if not isinstance(target, str) or target not in _ALLOWED_COMPILE_TARGETS:
             self.send_error_response({
                 'ok': False,
                 'stderr': f'Invalid target {target!r}; allowed: {sorted(_ALLOWED_COMPILE_TARGETS)}'
