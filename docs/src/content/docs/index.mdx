@@ -4,7 +4,7 @@ description: An actor-based programming language with static types, algebraic ef
 template: splash
 hero:
   title: Build software that <span class="hero-emphasis">survives failure.</span>
-  tagline: Nulang is an alpha actor-based language with Hindley-Milner inference, algebraic effects, capability types, supervision, and persistent actors in one runtime.
+  tagline: Write typed, concurrent programs with actors, supervised recovery, and opt-in durable state. Explore the runtime in your browser, then validate its alpha-stage guarantees for your workload.
   actions:
     - text: Try Nulang
       link: /playground/
@@ -86,22 +86,49 @@ $ NULANG_STORE_PATH=.nulang/store nulang counter.nula`} />
 </div>
 
 
-<div class="nu-section">
+<div class="nu-section nu-explore-section" aria-labelledby="explore-heading">
   <div class="nu-container">
     <div class="nu-section-header">
-      <h2>Durable distributed applications, with fewer moving parts</h2>
-      <p class="nu-section-subhead">Building reliable distributed software often means combining an actor framework, workflow engine, message broker, cache and database. Nulang is exploring how typed actors, supervised recovery, durable state and Fabric messaging can live within one coherent runtime.</p>
+      <span class="nu-eyebrow">Explore by use case</span>
+      <h2 id="explore-heading">Find your starting point.</h2>
+      <p class="nu-section-subhead">Start with the language core, then explore durable and distributed capabilities as your requirements grow. Experimental features are labeled so you can evaluate them deliberately.</p>
     </div>
-    <div class="durable-row">
-      <div class="benefit-text">
-        <h3>Compare languages and actor frameworks</h3>
-        <p>Understand Nulang's tradeoffs against Erlang, Elixir, Go, Rust, Akka, Orleans and Ray—including the maturity and production guarantees those established systems already provide.</p>
-        <p><a href="/comparisons/">Explore the programming language and actor framework comparisons →</a></p>
-      </div>
-      <div class="benefit-text">
-        <h3>The infrastructure consolidation roadmap</h3>
-        <p>Experimental Fabric streams, durable workflows and early NuDB research target use cases often served by Redis, NATS, Kafka, Temporal and, eventually, databases. These are works in progress, not drop-in replacements today.</p>
-        <p><a href="/infrastructure/">See current implementations, missing guarantees and the roadmap →</a></p>
+
+    <div class="nu-explore-grid">
+      <a class="nu-explore-card" href="/actors/overview/">
+        <span class="nu-explore-card-top">
+          <span class="nu-explore-number" aria-hidden="true">01</span>
+          <span class="nu-explore-maturity">Core language surface</span>
+        </span>
+        <h3>Fault-tolerant services</h3>
+        <p>Model isolated state and concurrent messages using actors, links, monitors, and supervision.</p>
+        <span class="nu-explore-link">Explore actors <span aria-hidden="true">↗</span></span>
+      </a>
+      <a class="nu-explore-card" href="/workflows/overview/">
+        <span class="nu-explore-card-top">
+          <span class="nu-explore-number" aria-hidden="true">02</span>
+          <span class="nu-explore-maturity is-experimental">Experimental</span>
+        </span>
+        <h3>Recoverable workflows</h3>
+        <p>Explore durable steps, signals, and timers. Test restart and replay semantics before relying on them.</p>
+        <span class="nu-explore-link">Explore workflows <span aria-hidden="true">↗</span></span>
+      </a>
+      <a class="nu-explore-card" href="/ai/overview/">
+        <span class="nu-explore-card-top">
+          <span class="nu-explore-number" aria-hidden="true">03</span>
+          <span class="nu-explore-maturity is-experimental">Experimental</span>
+        </span>
+        <h3>Agent orchestration</h3>
+        <p>Try optional model providers, agent pipelines, and supervised teams inside the same runtime.</p>
+        <span class="nu-explore-link">Explore AI runtime <span aria-hidden="true">↗</span></span>
+      </a>
+    </div>
+
+    <div class="nu-explore-footnote">
+      <p><strong>Still evaluating?</strong> Nulang is alpha software, not a drop-in replacement for established production infrastructure.</p>
+      <div>
+        <a href="/comparisons/">Compare alternatives <span aria-hidden="true">↗</span></a>
+        <a href="/infrastructure/">Read the roadmap <span aria-hidden="true">↗</span></a>
       </div>
     </div>
   </div>
