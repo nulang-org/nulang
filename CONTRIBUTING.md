@@ -23,7 +23,29 @@ cargo test --features wasm-backend                  # WASM backend suite
 NULANG_BIN=./target/release/nulang bash scripts/verify_doc_examples.sh  # doc snippets
 ```
 
-Please make sure these pass before opening a PR. CI runs them all.
+Please make sure these pass before opening a PR. CI runs the Rust suites (under
+nextest) and the documentation-example check on every pull request; the
+behavioral conformance suite is not wired into CI, so run it locally when your
+change touches language semantics.
+
+## Continuous integration
+
+[GitHub Actions](.github/workflows/ci.yml) is Nulang's primary CI system. It
+validates pull requests and pushes to `main` with Rust builds, tests, formatting,
+Clippy, optional-feature checks, and additional release/documentation checks.
+
+Draft pull requests are exempt from CI until they are marked ready for review.
+Two expensive checks are opt-in or scheduled rather than per-push: the
+four-platform release rehearsal runs on pull requests only when the
+`run-release-matrix` label is present (tag builds always run the full matrix),
+and the A/B benchmark workflows run nightly and on demand.
+
+Before opening a pull request, run `bash scripts/ci-local.sh` (or
+`bash scripts/ci-local.sh --full` for the comprehensive local matrix).
+Woodpecker and Buildkite are retired from repository CI. Merge protection
+should require GitHub Actions checks only; remove any old external CI checks
+from repository branch protection. Performance benchmarks are maintained in
+separate GitHub Actions workflows.
 
 ## Commit style
 

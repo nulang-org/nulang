@@ -1,4 +1,12 @@
 # Nulang Changelog
+
+### Single GitHub Actions CI pipeline and cheaper per-PR validation — 2026-10-12
+- **GitHub Actions is now the only CI system.** The Woodpecker pipeline (`.woodpecker/rust.yml`) and the Buildkite entrypoint (`.buildkite/pipeline.yml`, root `ci.yml`, `scripts/ci/buildkite-rust-*.sh`) are retired, removing duplicate validation of every Rust pull request. The GHA admission contract is asserted by `scripts/tests/test_github_actions_ci_contract.py`, run from `scripts/verify_implementation.py`.
+- **Draft pull requests no longer consume CI.** Every pull-request workflow skips its jobs while a PR is a draft (the `ready_for_review` event re-runs them when the PR is marked ready) — drafts cannot merge, so those matrix runs were pure runner cost.
+- **The four-platform release rehearsal is opt-in on pull requests.** Add the `run-release-matrix` label to rehearse the packaging matrix before tagging; tag builds always run the full matrix.
+- **Benchmark workflows run nightly and on demand** instead of on every product-source pull request, and the Remote-RTT stage profile is scoped to the transport/cluster/distributed paths it measures.
+- **Superseded runs are cancelled per ref** in every PR workflow, and the publish job is never cancelled.
+- **Load-flaky cluster tests are retried under nextest** (`.config/nextest.toml`, scoped to the `cluster_split_brain` family) and all four Rust test jobs run under nextest; whitespace parity (`git diff --check`) is restored from the retired pipeline.
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.

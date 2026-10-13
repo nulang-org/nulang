@@ -2,16 +2,23 @@ name: Cluster gossip throttle
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - 'tests/cluster_gossip_throttle.rs'
       - '.github/workflows/cluster-gossip-throttle-pr.yml'
       - 'src/runtime/cluster.rs'
+
+# A newer push to the same PR supersedes the previous run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
   contract:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:

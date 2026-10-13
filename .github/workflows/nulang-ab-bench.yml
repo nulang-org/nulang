@@ -1,6 +1,8 @@
 name: Nulang actor A/B benchmarks
 
 on:
+  schedule:
+    - cron: '15 3 * * *'
   workflow_dispatch:
     inputs:
       base_ref:
@@ -23,18 +25,6 @@ on:
         options:
           - core-native
           - default
-  pull_request:
-    paths:
-      - '.github/workflows/nulang-ab-bench.yml'
-      - 'scripts/nulang_ab_bench.py'
-      - 'scripts/tests/test_nulang_ab_bench.py'
-      - 'src/runtime/**'
-      - 'src/aot/**'
-      - 'src/jit/**'
-      - 'src/vm.rs'
-      - 'src/benchmarks.rs'
-      - 'benches/actor_bench.rs'
-
 concurrency:
   group: nulang-ab-bench-${{ github.ref }}
   cancel-in-progress: true

@@ -13,15 +13,19 @@ How to publish a Nulang release with prebuilt binaries. Run
 
 ## 2. Validate the release candidate before tagging
 
-The same four-target `.github/workflows/release.yml` matrix runs as a
-**non-publishing rehearsal** when a pull request changes the release workflow,
-`Cargo.toml`, `Cargo.lock`, `src/main.rs`, or release verification scripts.
-Confirm the `Release` PR workflow reaches terminal success for all targets,
-including artifact packaging, checksums, and native-on-runner smoke tests.
-On pull requests, the version-tag check is skipped (there is no tag) and the
-`Publish Release` job is explicitly disabled. A queued/skipped build is not
-positive execution evidence. This does **not** replace clean-machine checks,
-particularly native Linux arm64 execution.
+The same four-target `.github/workflows/release.yml` matrix can run as a
+**non-publishing rehearsal** on a pull request that changes the release
+workflow, `Cargo.toml`, `Cargo.lock`, `src/main.rs`, or release verification
+scripts. Because the matrix builds four platforms, it is **opt-in on pull
+requests**: add the `run-release-matrix` label to trigger it (adding the label
+re-runs the workflow). Confirm the `Release` PR workflow reaches terminal
+success for all targets, including artifact packaging, checksums, and
+native-on-runner smoke tests. On pull requests, the version-tag check is
+skipped (there is no tag) and the `Publish Release` job is explicitly disabled.
+Without the label the rehearsal jobs are **skipped** — a skipped or queued
+build is not positive execution evidence. Tag builds always run the full
+matrix. This does **not** replace clean-machine checks, particularly native
+Linux arm64 execution.
 
 ## 3. Tag and push
 

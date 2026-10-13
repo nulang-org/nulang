@@ -111,7 +111,7 @@ cargo run -- nula build-wasm my-app                 # resolve deps + build .wasm
 cargo run -- nula test|run my-app                   # package manager: test/run
 cargo run -- --doc                                  # generate docs/api.md from .nula doc comments
 cargo run -- -v myprogram.nula                       # verbose: print AST/bytecode/inferred type
-python3 verify_implementation.py                  # gate: cargo test + forbidden-pattern scans + integration checks
+python3 verify_implementation.py                  # gate: CI contract tests + cargo test + forbidden-pattern scans + integration checks
 python3 verify_report.py                          # gate: validates codebase_analysis_report.md structure
 ```
 
@@ -157,7 +157,7 @@ python3 verify_report.py                          # gate: validates codebase_ana
 - **Naming**: `test_<subject>` (unit/integration), `stress_<scenario>` (chaos).
 - **Counts**: 1596 total in the core crate with `wasm-backend`, 1558 without; 58 more in `nulang-ai`. The suite covers `src/integration_tests/mod.rs` (end-to-end pipeline via `run_source`/`assert_int`/`run_source_with_runtime` plus MIR-pipeline variants, WASM backend e2e tests, selective-receive and receive-after, `Actor.*` builtin-effect and actor-priority, non-blocking LLM suspend/resume, typed-JIT tiering, float-threading regression tests, behavior-internal send/spawn, workflow query, and Otp supervisor effects), `stress_tests.rs`, `runtime/tests.rs`, `jit/tests.rs`, `src/mir_wasm.rs`, `src/wasm_runtime.rs`, `src/aot/codegen.rs`, `src/package/`, `src/docgen.rs`, `src/stdlib.rs`, `src/lsp/mod.rs`, plus inline `mod tests` across `lexer.rs`, `parser.rs`, `typechecker.rs`, `effect_checker.rs`, `value_layout.rs`, `vm.rs`, `runtime/*.rs`, `jit/*.rs`, `python/*`, `ffi/*`, and every `crates/nulang-ai/src/*.rs`. Per-file breakdowns are too volatile to maintain manually — run `cargo test 2>&1 | grep "test result:"` for the current split.
 - **Run**: `cargo test` (test profile: LTO off, 16 codegen-units for fast parallel builds). `cargo test --release` for optimized runs.
-- **Gate scripts**: `verify_implementation.py` (forbidden-pattern scans for known anti-patterns — Box'd frames, string leaks, `crdt_reg` temp Vec, timer BinaryHeap rebuild, check-then-unwrap — + asserts JIT integration, escape-analysis deadness, scheduler-stats and cycle-detector wiring, then runs `cargo test` and `cargo check --tests` against a zero-warning baseline) and `verify_report.py` (validates `codebase_analysis_report.md`: required sections, ≥5 code snippets, referenced `src/*.rs` paths exist). Each exits 0 only on full pass.
+- **Gate scripts**: `verify_implementation.py` (forbidden-pattern scans for known anti-patterns — Box'd frames, string leaks, `crdt_reg` temp Vec, timer BinaryHeap rebuild, check-then-unwrap — + asserts JIT integration, escape-analysis deadness, scheduler-stats and cycle-detector wiring, runs the GitHub Actions CI contract tests — provider retirement, per-ref cancellation, draft-guard invariants, tag-publish safety — then runs `cargo test` and `cargo check --tests` against a zero-warning baseline) and `verify_report.py` (validates `codebase_analysis_report.md`: required sections, ≥5 code snippets, referenced `src/*.rs` paths exist). Each exits 0 only on full pass.
 - **Audit**: `.cargo/audit.toml` ignores `RUSTSEC-2026-0186` (memmap2 unsound; vulnerable APIs unused; upgrade blocked on cranelift-jit).
 
 ## Known Hazards (for assistants)
