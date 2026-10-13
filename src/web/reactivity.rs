@@ -197,7 +197,10 @@ pub fn analyze_module(module: &AstModule, checker: Option<&EffectChecker>) -> Si
         {
             let visible = without_bindings(
                 &signals,
-                params.iter().chain(using_params).map(|param| param.name.as_str()),
+                params
+                    .iter()
+                    .chain(using_params)
+                    .map(|param| param.name.as_str()),
             );
             scan_expr(body, &mut Vec::new(), false, &visible, &mut graph, checker);
         }
@@ -316,7 +319,7 @@ fn scan_expr(
         Expr::Lambda { params, body, .. } => {
             let visible = without_bindings(signals, params.iter().map(|p| p.name.as_str()));
             scan_expr(body, path, in_html, &visible, graph, checker);
-        },
+        }
         Expr::App { func, args, .. } => {
             scan_expr(func, path, in_html, signals, graph, checker);
             for arg in args {
@@ -330,10 +333,7 @@ fn scan_expr(
         }
         Expr::LetRec { name, params, value, body, .. } => {
             let visible = without_bindings(signals, std::iter::once(name.as_str()));
-            let recursive = without_bindings(
-                &visible,
-                params.iter().map(|p| p.name.as_str()),
-            );
+            let recursive = without_bindings(&visible, params.iter().map(|p| p.name.as_str()));
             scan_expr(value, path, in_html, &recursive, graph, checker);
             scan_expr(body, path, in_html, &visible, graph, checker);
         }
@@ -620,7 +620,10 @@ pub fn rewrite_module(module: &mut AstModule, checker: Option<&EffectChecker>) {
         {
             let visible = without_bindings(
                 &signals,
-                params.iter().chain(using_params).map(|param| param.name.as_str()),
+                params
+                    .iter()
+                    .chain(using_params)
+                    .map(|param| param.name.as_str()),
             );
             rewrite_expr(body, false, &visible, checker);
         }
@@ -695,7 +698,7 @@ fn rewrite_expr(
         Expr::Lambda { params, body, .. } => {
             let visible = without_bindings(signals, params.iter().map(|p| p.name.as_str()));
             rewrite_expr(body, in_html, &visible, checker);
-        },
+        }
         Expr::App { func, args, .. } => {
             rewrite_expr(func, in_html, signals, checker);
             for arg in args.iter_mut() {
@@ -709,10 +712,7 @@ fn rewrite_expr(
         }
         Expr::LetRec { name, params, value, body, .. } => {
             let visible = without_bindings(signals, std::iter::once(name.as_str()));
-            let recursive = without_bindings(
-                &visible,
-                params.iter().map(|p| p.name.as_str()),
-            );
+            let recursive = without_bindings(&visible, params.iter().map(|p| p.name.as_str()));
             rewrite_expr(value, in_html, &recursive, checker);
             rewrite_expr(body, in_html, &visible, checker);
         }
@@ -1057,13 +1057,21 @@ fn view(count: Html) -> Html {
         assert!(graph.nodes.contains(&GraphNode::Signal {
             name: "count".to_string(),
         }));
-        assert!(!graph.nodes.iter().any(|node| matches!(node,
-            GraphNode::Read { signal, .. } if signal == "count"
-        )), "a function parameter must shadow the global signal");
+        let has_shadowed_read = graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node, GraphNode::Read { signal, .. } if signal == "count"));
+        assert!(
+            !has_shadowed_read,
+            "a function parameter must shadow the global signal"
+        );
 
         rewrite_module(&mut module, None);
         let html = format!("{:?}", find_function_body(&module, "view"));
-        assert!(!html.contains("data-signal"), "shadowed reads must not hydrate");
+        assert!(
+            !html.contains("data-signal"),
+            "shadowed reads must not hydrate"
+        );
     }
 
     #[test]
@@ -1084,19 +1092,31 @@ fn view() -> Html {
         );
 
         let graph = analyze_module(&module, None);
-        let reads: Vec<_> = graph.nodes.iter().filter(|node| matches!(node,
-            GraphNode::Read { signal, .. } if signal == "count"
-        )).collect();
-        assert_eq!(reads.len(), 1, "the earlier read resolves to the global signal");
-        assert_eq!(reads[0], &GraphNode::Read {
-            signal: "count".to_string(),
-            path: "p".to_string(),
-        });
+        let reads: Vec<_> = graph
+            .nodes
+            .iter()
+            .filter(|node| matches!(node, GraphNode::Read { signal, .. } if signal == "count"))
+            .collect();
+        assert_eq!(
+            reads.len(),
+            1,
+            "the earlier read resolves to the global signal"
+        );
+        assert_eq!(
+            reads[0],
+            &GraphNode::Read {
+                signal: "count".to_string(),
+                path: "p".to_string(),
+            }
+        );
 
         rewrite_module(&mut module, None);
         let html = format!("{:?}", find_function_body(&module, "view"));
-        assert_eq!(html.matches("data-signal").count(), 1,
-            "only the unshadowed signal read should be hydrated");
+        assert_eq!(
+            html.matches("data-signal").count(),
+            1,
+            "only the unshadowed signal read should be hydrated"
+        );
     }
 
     #[test]
