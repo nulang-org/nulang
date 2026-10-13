@@ -119,6 +119,7 @@ impl From<&str> for LlmError {
         LlmError::from_string(s)
     }
 }
+
 /// Parse provider-produced tool arguments without manufacturing an empty
 /// object from malformed or non-object model output. An empty object is valid
 /// only when the provider actually supplies `{}`.
@@ -159,7 +160,8 @@ mod tests {
     fn tool_arguments_accept_valid_json_objects() {
         let object = serde_json::json!({"query": "Nulang"});
         let from_object = parse_tool_arguments(object.clone()).unwrap();
-        let from_string = parse_tool_arguments(serde_json::Value::String(object.to_string())).unwrap();
+        let from_string =
+            parse_tool_arguments(serde_json::Value::String(object.to_string())).unwrap();
         assert_eq!(from_object, from_string);
         assert_eq!(from_object["query"], "Nulang");
         assert!(parse_tool_arguments(serde_json::json!("{}")).unwrap().is_empty());
