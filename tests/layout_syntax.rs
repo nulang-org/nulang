@@ -76,3 +76,42 @@ fn ignores_blank_lines_and_comments_between_header_and_body() {
         |decl| matches!(decl, Decl::Function { name, .. } if name == "value")
     ));
 }
+
+#[test]
+fn closes_sibling_functions_at_a_dedent() {
+    let module = parse_layout(
+        "fn first() -> Int:\n    1\n\nfn second() -> Int:\n    2\n",
+    );
+    let names: Vec<&str> = module
+        .decls
+        .iter()
+        .filter_map(|decl| match decl {
+            Decl::Function { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(names.contains(&"first"));
+    assert!(names.contains(&"second"));
+}
+
+#[test]
+fn rejects_tabs_in_significant_indentation() {
+    let err = lex_layout("fn value() -> Int:\n\t42\n").unwrap_err();
+    assert!(err.to_string().contains("tabs"), "{err}");
+}
+
+#[test]
+fn layout_and_braces_both_typecheck_using_the_existing_typechecker() {
+    use nulang::typechecker::TypeChecker;
+
+    let layout = parse_layout("fn double(x: Int) -> Int:\n    x * 2\n");
+    let braces = Parser::new(
+        Lexer::new("fn double(x: Int) -> Int { x * 2 }")
+            .lex()
+            .unwrap(),
+    )
+    .parse_module()
+    .unwrap();
+    assert!(TypeChecker::new().check_module(&layout).is_ok());
+    assert!(TypeChecker::new().check_module(&braces).is_ok());
+}
