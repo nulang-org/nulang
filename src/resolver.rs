@@ -6,11 +6,20 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
+/// Declaration provenance is resolver-only metadata. Never encode filesystem
+/// paths into runtime types, bytecode, or persistent schema identities.
+#[derive(Clone)]
+struct SourcedDecl {
+    decl: Decl,
+    origin: PathBuf,
+}
+
 thread_local! {
-    /// Cache of fully resolved import declarations keyed by canonical file path.
-    /// Cleared at the start of every top-level `resolve_imports` call so that
-    /// repeated compilations in the same process do not reuse stale ASTs.
-    static IMPORT_CACHE: RefCell<BTreeMap<PathBuf, Vec<Decl>>> = const { RefCell::new(BTreeMap::new()) };
+    /// Cache *complete* resolved modules, with the original file for each
+    /// declaration. Selective imports are filtered at the use site, not cached
+    /// under a path-wide key (which would lose subsequent selected names).
+    /// Cleared at the start of each independent resolution.
+    static IMPORT_CACHE: RefCell<BTreeMap<PathBuf, Vec<SourcedDecl>>> = const { RefCell::new(BTreeMap::new()) };
 }
 
 pub fn resolve_imports(
@@ -18,6 +27,14 @@ pub fn resolve_imports(
     current_file: &Path,
     stack: &mut HashSet<PathBuf>,
 ) -> NuResult<()> {
+    resolve_imports_with_origins(module, current_file, stack).map(|_| ())
+}
+
+fn resolve_imports_with_origins(
+    module: &mut AstModule,
+    current_file: &Path,
+    stack: &mut HashSet<PathBuf>,
+) -> NuResult<Vec<SourcedDecl>> {
     if stack.is_empty() {
         IMPORT_CACHE.with(|c| c.borrow_mut().clear());
     }
@@ -46,26 +63,37 @@ pub fn resolve_imports(
         })
         .collect();
 
-    for (import_path, items) in &imports {
-        let resolved = resolve_path(&canonical_base, import_path);
-        let resolved_canonical = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
+    // Original declarations belong to this module; recursively imported
+    // declarations keep their defining module's identity, even through
+    // reexports or repeated imports.
+    let mut resolved: Vec<SourcedDecl> = module
+        .decls
+        .iter()
+        .cloned()
+        .map(|decl| SourcedDecl {
+            decl,
+            origin: canonical_file.clone(),
+        })
+        .collect();
 
-        // If the file has already been fully resolved in this compilation,
-        // reuse its cached declarations.
-        if let Some(cached) = IMPORT_CACHE.with(|c| c.borrow().get(&resolved_canonical).cloned()) {
-            merge_imported_decls(module, cached, import_path, true)?;
+    for (import_path, items) in &imports {
+        let path = resolve_path(&canonical_base, import_path);
+        let canonical_path = path.canonicalize().unwrap_or_else(|_| path.clone());
+
+        // A cached module is complete; selections are specific to each import.
+        if let Some(cached) = IMPORT_CACHE.with(|c| c.borrow().get(&canonical_path).cloned()) {
+            merge_imported_decls(&mut resolved, filter_decls(cached, items), import_path)?;
             continue;
         }
 
-        // Cycle detection: a file still on the recursion stack cannot be imported.
-        if stack.contains(&resolved_canonical) {
+        if stack.contains(&canonical_path) {
             return Err(NuError::RuntimeError {
                 msg: format!("import cycle detected at '{}'", import_path),
                 span: Span::default(),
             });
         }
 
-        let source = std::fs::read_to_string(&resolved).map_err(|e| NuError::RuntimeError {
+        let source = std::fs::read_to_string(&path).map_err(|e| NuError::RuntimeError {
             msg: format!("cannot read '{}': {}", import_path, e),
             span: Span::default(),
         })?;
@@ -83,93 +111,61 @@ pub fn resolve_imports(
                     span: Span::default(),
                 })?;
 
-        resolve_imports(&mut imported, &resolved_canonical, stack)?;
-
-        let imported_decls = if items.is_empty() {
-            imported.decls
-        } else {
-            filter_decls(imported.decls, items)
-        };
-
+        let full = resolve_imports_with_origins(&mut imported, &canonical_path, stack)?;
         IMPORT_CACHE.with(|c| {
-            c.borrow_mut()
-                .insert(resolved_canonical, imported_decls.clone())
+            c.borrow_mut().insert(canonical_path, full.clone());
         });
-        merge_imported_decls(module, imported_decls, import_path, false)?;
+        merge_imported_decls(&mut resolved, filter_decls(full, items), import_path)?;
     }
-    module.decls.retain(|d| !matches!(d, Decl::Import { .. }));
+
+    resolved.retain(|entry| !matches!(entry.decl, Decl::Import { .. }));
+    module.decls = resolved.iter().map(|entry| entry.decl.clone()).collect();
     stack.remove(&canonical_file);
-    Ok(())
+    Ok(resolved)
 }
 
 fn merge_imported_decls(
-    module: &mut AstModule,
-    imported_decls: Vec<Decl>,
+    module: &mut Vec<SourcedDecl>,
+    imported_decls: Vec<SourcedDecl>,
     import_path: &str,
-    from_cache: bool,
 ) -> NuResult<()> {
-    // Reject name collisions between what THIS import brings in and
-    // what's already present (from an earlier import or the importing
-    // file itself) up front, with a clear diagnostic pointing at the
-    // conflicting import path. Without this check, two stdlib modules
-    // that both define e.g. `empty`/`contains`/`remove` (map.nula and
-    // set.nula both do) silently produce two top-level `Decl::Function`
-    // entries with the same name; MIR's function-slot allocator isn't
-    // built to handle that and fails much later with an opaque
-    // "internal: MIR function slot 0 left unfilled" — a compiler crash
-    // for user-visible input, not a real internal invariant violation.
-    //
-    // When `from_cache` is true we are reusing a previously-resolved module
-    // (e.g., `stdlib::web::types` imported transitively by `host` after
-    // already being imported directly). Duplicates in that case are almost
-    // always shared stdlib dependencies, so we silently skip them rather than
-    // produce a collision for every shared import.
-    //
-    // Type declarations (aliases, records, variants) are also allowed to
-    // collide: they are often re-exported through multiple stdlib modules
-    // (e.g., `Html` from `stdlib::web::types` is imported by both `html`
-    // and `host`). Keeping the first occurrence is sufficient because
-    // identical nominal types from the same source are indistinguishable.
-    fn is_type_decl(decl: &Decl) -> bool {
-        matches!(
-            decl,
-            Decl::TypeAlias { .. } | Decl::RecordType { .. } | Decl::VariantType { .. }
-        )
-    }
-    let existing_names: HashSet<&str> = module.decls.iter().filter_map(decl_name).collect();
-    let existing_type_decl = |name: &str| {
-        module
-            .decls
-            .iter()
-            .find(|d| decl_name(d) == Some(name))
-            .map_or(false, is_type_decl)
-    };
+    // A repeated import/reexport is safe only if the declaration has the
+    // *same defining source*. Same short name or same underlying type is not
+    // sufficient: they may represent unrelated opaque types.
+    let mut existing: BTreeMap<String, PathBuf> = module
+        .iter()
+        .filter_map(|entry| {
+            decl_name(&entry.decl).map(|name| (name.to_string(), entry.origin.clone()))
+        })
+        .collect();
     let mut filtered = Vec::new();
-    for decl in imported_decls {
-        if let Some(name) = decl_name(&decl) {
-            if existing_names.contains(name) {
-                if from_cache || (is_type_decl(&decl) && existing_type_decl(name)) {
+    for entry in imported_decls {
+        if let Some(name) = decl_name(&entry.decl) {
+            if let Some(previous_origin) = existing.get(name) {
+                if previous_origin == &entry.origin {
                     continue;
                 }
                 return Err(NuError::RuntimeError {
                     msg: format!(
-                        "import conflict: '{}' from '{}' collides with an already-imported \
-                         or locally-declared name of the same name (qualified/aliased \
-                         imports aren't available). Fix by renaming one of the conflicting \
-                         declarations, or importing only the names you need with \
-                         `import {} {{ specific_name }}`.",
-                        name, import_path, import_path
+                        "import conflict: '{}' from '{}' is defined in '{}', but the same name \\
+                         already refers to a declaration in '{}'. Rename one declaration or \\
+                         import only the symbols you need (qualified aliases are not supported).",
+                        name,
+                        import_path,
+                        entry.origin.display(),
+                        previous_origin.display(),
                     ),
                     span: Span::default(),
                 });
             }
+            existing.insert(name.to_string(), entry.origin.clone());
         }
-        filtered.push(decl);
+        filtered.push(entry);
     }
 
     let mut merged = filtered;
-    merged.append(&mut module.decls);
-    module.decls = merged;
+    merged.append(module);
+    *module = merged;
     Ok(())
 }
 
@@ -276,14 +272,14 @@ fn decl_name(decl: &Decl) -> Option<&str> {
     }
 }
 
-fn filter_decls(decls: Vec<Decl>, items: &[String]) -> Vec<Decl> {
+fn filter_decls(decls: Vec<SourcedDecl>, items: &[String]) -> Vec<SourcedDecl> {
     if items.is_empty() {
         return decls;
     }
     let set: HashSet<&str> = items.iter().map(|s| s.as_str()).collect();
     decls
         .into_iter()
-        .filter(|d| decl_name(d).map_or(false, |n| set.contains(n)))
+        .filter(|entry| decl_name(&entry.decl).is_some_and(|name| set.contains(name)))
         .collect()
 }
 
@@ -365,15 +361,30 @@ mod tests {
 
     #[test]
     fn test_filter_empty() {
-        let decls = vec![fn_decl("f")];
+        let decls = vec![SourcedDecl {
+            decl: fn_decl("f"),
+            origin: PathBuf::from("local.nula"),
+        }];
         assert_eq!(filter_decls(decls, &[]).len(), 1);
     }
 
     #[test]
     fn test_filter_names() {
-        let r = filter_decls(vec![fn_decl("a"), fn_decl("b")], &["a".into()]);
+        let r = filter_decls(
+            vec![
+                SourcedDecl {
+                    decl: fn_decl("a"),
+                    origin: PathBuf::from("a.nula"),
+                },
+                SourcedDecl {
+                    decl: fn_decl("b"),
+                    origin: PathBuf::from("b.nula"),
+                },
+            ],
+            &["a".into()],
+        );
         assert_eq!(r.len(), 1);
-        assert_eq!(decl_name(&r[0]), Some("a"));
+        assert_eq!(decl_name(&r[0].decl), Some("a"));
     }
 
     #[test]
