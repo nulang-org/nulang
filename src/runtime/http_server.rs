@@ -1073,13 +1073,13 @@ impl WebDevServer {
                                         || {
                                             with_request_context(ctx, || {
                                                 match render_direct_request(route, &values) {
-                                            Ok(Some(rendered)) => Ok(Some(rendered)),
-                                            Ok(None) => Ok(render_route_handler(
-                                                &route.route.handler_module,
-                                                route.route.handler_func_idx,
-                                                None,
-                                            )),
-                                            Err(error) => Err(error),
+                                                    Ok(Some(rendered)) => Ok(Some(rendered)),
+                                                    Ok(None) => Ok(render_route_handler(
+                                                        &route.route.handler_module,
+                                                        route.route.handler_func_idx,
+                                                        None,
+                                                    )),
+                                                    Err(error) => Err(error),
                                                 }
                                             })
                                         },
@@ -1090,46 +1090,49 @@ impl WebDevServer {
                                     if storage_error.is_some() {
                                         HttpResponse {
                                             status: 500,
-                                            headers: vec![("Content-Type".into(), "text/plain".into())],
-                                            body: b"Internal server error".to_vec(),
-                                        }
-                                    } else {
-                                        match rendered {
-                                        Ok(Some(html)) => HttpResponse {
-                                            status: 200,
-                                            headers: vec![(
-                                                "Content-Type".into(),
-                                                "text/html; charset=utf-8".into(),
-                                            )],
-                                            body: inject_client_runtime_script(&html).into_bytes(),
-                                        },
-                                        Ok(None) => HttpResponse {
-                                            status: 500,
                                             headers: vec![(
                                                 "Content-Type".into(),
                                                 "text/plain".into(),
                                             )],
                                             body: b"Internal server error".to_vec(),
-                                        },
-                                        Err(DirectRequestRenderError::Decode(error)) => {
-                                            let problem = request_decode_problem_response(&error);
-                                            HttpResponse {
-                                                status: problem.status,
-                                                headers: problem.headers,
-                                                body: problem.body,
-                                            }
                                         }
-                                        Err(DirectRequestRenderError::Execution(error)) => {
-                                            eprintln!("typed route dispatch error: {error}");
-                                            HttpResponse {
+                                    } else {
+                                        match rendered {
+                                            Ok(Some(html)) => HttpResponse {
+                                                status: 200,
+                                                headers: vec![(
+                                                    "Content-Type".into(),
+                                                    "text/html; charset=utf-8".into(),
+                                                )],
+                                                body: inject_client_runtime_script(&html).into_bytes(),
+                                            },
+                                            Ok(None) => HttpResponse {
                                                 status: 500,
                                                 headers: vec![(
                                                     "Content-Type".into(),
                                                     "text/plain".into(),
                                                 )],
                                                 body: b"Internal server error".to_vec(),
+                                            },
+                                            Err(DirectRequestRenderError::Decode(error)) => {
+                                                let problem = request_decode_problem_response(&error);
+                                                HttpResponse {
+                                                    status: problem.status,
+                                                    headers: problem.headers,
+                                                    body: problem.body,
+                                                }
                                             }
-                                        }
+                                            Err(DirectRequestRenderError::Execution(error)) => {
+                                                eprintln!("typed route dispatch error: {error}");
+                                                HttpResponse {
+                                                    status: 500,
+                                                    headers: vec![(
+                                                        "Content-Type".into(),
+                                                        "text/plain".into(),
+                                                    )],
+                                                    body: b"Internal server error".to_vec(),
+                                                }
+                                            }
                                         }
                                     }
                                 }
