@@ -9,7 +9,7 @@ fn fresh_path(label: &str) -> PathBuf {
         "nulang_web_sqlite_{}_{}_{}.db",
         label,
         std::process::id(),
-        std::thread::current().name().unwrap_or("test").replace([':', '/'], "_")
+        std::thread::current().name().unwrap_or("test").replace(':', "_").replace('/', "_")
     ))
 }
 
