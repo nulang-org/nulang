@@ -1,0 +1,40 @@
+name: Embedded Compiler API
+
+on:
+  pull_request:
+    paths:
+      - "src/compiler_api.rs"
+      - "src/lib.rs"
+      - ".github/workflows/compiler-api.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/compiler_api.rs"
+      - "src/lib.rs"
+      - ".github/workflows/compiler-api.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  compiler-api:
+    name: Source-only MIR to core WASM
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.95.0'
+          components: rustfmt
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check library with only wasm-backend
+        run: cargo check --locked --lib --no-default-features --features wasm-backend
+
+      - name: Run embedded compiler API regressions
+        run: cargo test --locked --lib --no-default-features --features wasm-backend compiler_api::tests
