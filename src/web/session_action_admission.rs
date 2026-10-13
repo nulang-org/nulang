@@ -47,6 +47,7 @@ pub(crate) enum AdmissionError {
     ReplayConflict,
     Binding(UiActionDispatchError),
     InternalStateUnavailable,
+    CapacityExceeded,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -91,9 +92,45 @@ struct SessionState {
 /// actions until persistence/fencing and session lifecycle integration exist.
 ///
 /// A mutex keeps check + reserve atomic across concurrently arriving requests.
-#[derive(Default)]
+/// Conservative fail-closed admission limits. Capacity exhaustion must never
+/// evict an idempotency key: that could re-authorize a previously admitted
+/// external mutation. These defaults limit process growth, not per-document
+/// payload size; a production host still needs bounded transport input.
+#[derive(Debug, Clone, Copy)]
+struct AdmissionLimits {
+    max_sessions: usize,
+    max_documents_per_session: usize,
+    max_admissions_per_session: usize,
+}
+
+impl Default for AdmissionLimits {
+    fn default() -> Self {
+        Self {
+            max_sessions: 1024,
+            max_documents_per_session: 16,
+            max_admissions_per_session: 2048,
+        }
+    }
+}
+
 pub(crate) struct SessionActionAdmission {
     sessions: Mutex<HashMap<String, SessionState>>,
+    limits: AdmissionLimits,
+}
+
+impl Default for SessionActionAdmission {
+    fn default() -> Self {
+        Self::with_limits(AdmissionLimits::default())
+    }
+}
+
+impl SessionActionAdmission {
+    fn with_limits(limits: AdmissionLimits) -> Self {
+        Self {
+            sessions: Mutex::new(HashMap::new()),
+            limits,
+        }
+    }
 }
 
 impl SessionActionAdmission {
@@ -122,8 +159,18 @@ impl SessionActionAdmission {
                     return Err(AdmissionError::NonIncreasingRevision);
                 }
             }
+            if !session.documents.contains_key(&document.document_id)
+                && session.documents.len() >= self.limits.max_documents_per_session
+            {
+                return Err(AdmissionError::CapacityExceeded);
+            }
             session.documents.insert(document.document_id.clone(), document);
         } else {
+            if sessions.len() >= self.limits.max_sessions
+                || self.limits.max_documents_per_session == 0
+            {
+                return Err(AdmissionError::CapacityExceeded);
+            }
             let mut documents = BTreeMap::new();
             documents.insert(document.document_id.clone(), document);
             sessions.insert(
@@ -183,6 +230,9 @@ impl SessionActionAdmission {
             .ok_or(AdmissionError::UnknownDocument)?;
         let bound = bind_document_action_payload(module, document, message, compiler_params)
             .map_err(AdmissionError::Binding)?;
+        if session.admitted.len() >= self.limits.max_admissions_per_session {
+            return Err(AdmissionError::CapacityExceeded);
+        }
         session
             .admitted
             .insert(request.idempotency_key.clone(), InvocationSignature::from(request));
