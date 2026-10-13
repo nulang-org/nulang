@@ -431,6 +431,12 @@ impl LanguageServer for NulangLanguageServer {
         };
         let source = doc.source.clone();
         let type_map = doc.type_map.clone();
+        // An in-progress diagnostic update invalidates inferred rows.
+        let function_rows = if doc.diagnostics_pending {
+            None
+        } else {
+            doc.function_rows.clone()
+        };
         drop(docs);
 
         // Check type_map first for inferred/explicit types
@@ -453,9 +459,10 @@ impl LanguageServer for NulangLanguageServer {
             }
         }
 
-        Ok(Self::hover_at(
+        Ok(Self::hover_at_with_rows(
             &source,
             params.text_document_position_params.position,
+            function_rows.as_ref(),
         ))
     }
 
@@ -783,6 +790,17 @@ impl NulangLanguageServer {
     /// first fatal error in a stage is reported. Effect and capability checks
     /// also report accumulated warnings from their internal diagnostic lists.
     fn hover_at(source: &str, position: Position) -> Option<Hover> {
+        Self::hover_at_with_rows(source, position, None)
+    }
+
+    /// Render the function's checked effect row when one is already cached.
+    /// The effect checker owns this information; we do not infer semantics
+    /// from text or grant any new external authority.
+    fn hover_at_with_rows(
+        source: &str,
+        position: Position,
+        function_rows: Option<&FxHashMap<String, crate::types::EffectRow>>,
+    ) -> Option<Hover> {
         let line = position.line as usize;
         let col = position.character as usize;
         let target_line = source.lines().nth(line)?;
@@ -820,10 +838,25 @@ impl NulangLanguageServer {
                         .map(|ty| format!("{:?}", ty))
                         .unwrap_or_else(|| "?".into());
                     let mut hover_text = format!("fn {}({}) -> {}", name, p, r);
-                    // Append effects if present
+                    // Distinguish the declared contract from the checked
+                    // inferred effect row. The latter is informational and
+                    // does not authorize filesystem or network access.
                     if let Some(ref eff) = effect {
                         use std::fmt::Write;
                         let _ = write!(hover_text, "\n\neffects: {}", eff);
+                    } else if let Some(row) = function_rows.and_then(|rows| rows.get(name)) {
+                        let nonempty = match row {
+                            crate::types::EffectRow::Closed(effects) => !effects.is_empty(),
+                            crate::types::EffectRow::Open(effects, _) => !effects.is_empty(),
+                        };
+                        if nonempty {
+                            use std::fmt::Write;
+                            let _ = write!(
+                                hover_text,
+                                "\n\neffects (inferred): {}\nEffect rows describe requested operations; they do not grant external authority.",
+                                row
+                            );
+                        }
                     }
                     // Append doc comment if present
                     let decl_line = span.line().saturating_sub(1);
