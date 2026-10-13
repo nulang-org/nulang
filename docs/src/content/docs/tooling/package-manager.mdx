@@ -236,13 +236,23 @@ publisher-authenticated archive before reusing the cache. Archives without
 a signature, or signed by an unpinned key, are rejected (older unsigned
 packages need authenticated republishing or migration).
 
-**Offline limitation:** The current `--offline` path verifies cached registry
-source IDs against the committed `Nulang.lock`, but it does not independently
-replay publisher signatures from cached signed archives. Use an online signed
-build to establish the cache first. Offline cryptographic provenance receipts
-and signature/key-revocation policy for previously cached artifacts remain
-separate hardening work. No rollback or transparency-log guarantees are
-provided by this v1 protocol.
+**Authenticated offline mode:** A successful online publisher-verified
+download now retains the original compressed archive plus its detached
+signature in `.nula/registry-provenance/<name>-<version>/`. `--offline` does not
+trust this receipt alone: it verifies the signature against the project's
+**current** `Nulang.trust.toml` keys, revalidates the archive's full source
+tree in memory without extraction or filesystem writes, and requires that
+tree's `SourceId` to match both the extracted cache and committed
+`Nulang.lock`. A missing receipt, removed trusted key, modified archive,
+or mismatched cached file fails closed. This intentionally adds local
+hashing/decompression work to offline resolution.
+
+Perform an online signed build to establish authenticated receipts. Older
+registry caches without receipts must be revalidated online before offline
+use. Commit `Nulang.lock` and `Nulang.trust.toml`, but do not commit cache
+data or signing seeds. Removing a key from the trust file immediately rejects
+receipts signed only by that key. Key recovery, trusted rollback protection,
+transparency logs, and automatic revocation distribution remain future work.
 
 ### Safe registry archive downloads
 
