@@ -1443,6 +1443,46 @@ impl<'c> FnLowerer<'c> {
                         }
                     }
                 }
+                // Experimental application SQL: use the same VM suspension
+                // path as LLM.ask, but a separate bounded query executor.
+                // Durable actors are rejected by the runtime until SQL effect
+                // receipts/replay are defined.
+                if effect == "DB" && op == "query_checked_async" {
+                    // The VM passes a full register frame to PerformAsync,
+                    // not a variable-length argument slice. Stage the exact
+                    // number of SQL parameters as a compiler-owned Int in r1.
+                    // Layout: r0=SQL, r1=param_count, r2..=parameters.
+                    if args.len() > 11 {
+                        return Err(compile_err(
+                            "DB.query_checked_async supports at most 10 parameters".to_string(),
+                            Span::default(),
+                        ));
+                    }
+                    let mut sql_args = Vec::with_capacity(args.len() + 1);
+                    if let Some(sql) = args.first() {
+                        sql_args.push(self.lower_operand(sql)?);
+                    } else {
+                        sql_args.push(self.unit_temp());
+                    }
+                    let count = self.b.add_temp(Type::int());
+                    self.b.assign(
+                        count,
+                        mir::RValue::Const(Constant::Int(args.len().saturating_sub(1) as i64)),
+                    );
+                    sql_args.push(count);
+                    for arg in args.iter().skip(1) {
+                        sql_args.push(self.lower_operand(arg)?);
+                    }
+                    self.b.assign(
+                        dst,
+                        mir::RValue::PerformAsync {
+                            effect_op: "DB.query_checked_async".to_string(),
+                            args: sql_args,
+                            resolved_handler: None,
+                        },
+                    );
+                    return Ok(());
+                }
                 // 1-arg Timer.sleep(ms) routes through PerformAsync for suspension.
                 // 2-arg Timer.sleep(name, ms) stays as Perform for workflow timers.
                 if effect == "Timer" && op == "sleep" && args.len() == 1 {
@@ -3002,6 +3042,39 @@ fn walk_hir_rvalue(rv: &hir::RValue, acc: &mut HashSet<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checked_async_sql_lowers_to_perform_async_with_explicit_parameter_count() {
+        let module = lower_source(r#"perform DB.query_checked_async("SELECT $1", 42)"#)
+            .expect("DB.query_checked_async should be lowerable");
+        let main = find_fn(&module, "__main");
+        let mut site = None;
+        for block in &main.blocks {
+            for stmt in &block.stmts {
+                if let mir::Stmt::Assign {
+                    op: mir::RValue::PerformAsync { effect_op, args, .. },
+                    ..
+                } = stmt
+                {
+                    if effect_op == "DB.query_checked_async" {
+                        site = Some(args.clone());
+                    }
+                }
+            }
+        }
+        let args = site.expect("async SQL must use PerformAsync");
+        assert_eq!(args.len(), 3, "SQL + compiler-owned arity + one parameter");
+        let arity_is_one = main.blocks.iter().flat_map(|b| &b.stmts).any(|stmt| {
+            matches!(
+                stmt,
+                mir::Stmt::Assign {
+                    dst,
+                    op: mir::RValue::Const(Constant::Int(1)),
+                } if *dst == args[1]
+            )
+        });
+        assert!(arity_is_one, "the second staged operand must carry exact parameter arity");
+    }
 
     #[test]
     fn test_lower_empty_module() {

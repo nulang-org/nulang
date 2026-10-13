@@ -158,7 +158,7 @@ fn required_host_authority(
             }
             other("System", "Arg", Some(index.to_string()))
         }
-        ("DB", Some("query" | "query_checked")) => other("DB", "Query", None),
+        ("DB", Some("query" | "query_checked" | "query_checked_async")) => other("DB", "Query", None),
         ("Python", Some(op)) if !op.is_empty() => other("Python", op, None),
         ("Provider", Some("ask")) => other("Provider", "Ask", Some(string_arg(0)?)),
         // Inference/LLM asks are runtime-mediated: the node already holds the
@@ -1145,6 +1145,20 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
         args: &[crate::vm::Value],
     ) -> crate::vm::PerformAsyncResult {
         match effect_op {
+            "DB.query_checked_async" => {
+                let mut rt = self.runtime.borrow_mut();
+                let actor_id = rt.current_actor.unwrap_or(0);
+                if authorize_actor_host_effect(
+                    &rt, rt.current_actor, "DB", Some("query_checked_async"), constants, args,
+                ).is_err() {
+                    return crate::vm::PerformAsyncResult::Ready(Some(
+                        crate::runtime::DbQueryOutcome::from_legacy_rows(Err(
+                            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                        )).to_json(),
+                    ));
+                }
+                rt.start_or_resume_db_query(actor_id, constants, args)
+            }
             #[cfg(feature = "ai-runtime")]
             "Inference.ask" | "LLM.ask" => {
                 let prompt = resolve_first_string(constants, args);
@@ -2142,6 +2156,19 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
     ) -> crate::vm::PerformAsyncResult {
         use crate::vm::PerformAsyncResult;
         match effect_op {
+            "DB.query_checked_async" => unsafe {
+                let rt = &mut *self.runtime;
+                if authorize_actor_host_effect(
+                    rt, Some(self.actor_id), "DB", Some("query_checked_async"), constants, args,
+                ).is_err() {
+                    return PerformAsyncResult::Ready(Some(
+                        crate::runtime::DbQueryOutcome::from_legacy_rows(Err(
+                            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                        )).to_json(),
+                    ));
+                }
+                rt.start_or_resume_db_query(self.actor_id, constants, args)
+            },
             #[cfg(feature = "ai-runtime")]
             "Inference.ask" | "LLM.ask" => {
                 let prompt = resolve_first_string(constants, args);
@@ -3141,8 +3168,10 @@ mod checked_query_effect_tests {
     fn checked_queries_require_the_same_host_authority_as_legacy_queries() {
         let legacy = required_host_authority("DB", Some("query"), &[], &[]).unwrap();
         let checked = required_host_authority("DB", Some("query_checked"), &[], &[]).unwrap();
+        let async_checked = required_host_authority("DB", Some("query_checked_async"), &[], &[]).unwrap();
         assert!(legacy.is_some(), "DB.query requires explicit actor authority");
         assert_eq!(legacy, checked, "a checked query cannot bypass DB authority");
+        assert_eq!(legacy, async_checked, "async SQL cannot bypass DB authority");
     }
 
     #[cfg(any(feature = "sqlite", feature = "postgres"))]

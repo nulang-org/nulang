@@ -18,6 +18,7 @@ pub enum DbQueryErrorCode {
     InvalidInput,
     DecodeFailure,
     QueryFailed,
+    PermissionDenied,
 }
 
 /// Intentionally sanitized: internal SQL errors can contain sensitive values.
@@ -50,6 +51,7 @@ impl DbQueryOutcome {
             DbQueryErrorCode::InvalidInput => "Invalid database query parameters.",
             DbQueryErrorCode::DecodeFailure => "Database returned an invalid row.",
             DbQueryErrorCode::QueryFailed => "Database query failed; check server logs.",
+            DbQueryErrorCode::PermissionDenied => "Database query permission denied.",
         };
         Self::Error {
             error: DbQueryError { code, message },
@@ -75,6 +77,7 @@ impl DbQueryOutcome {
                     io::ErrorKind::Unsupported => DbQueryErrorCode::Unsupported,
                     io::ErrorKind::InvalidInput => DbQueryErrorCode::InvalidInput,
                     io::ErrorKind::InvalidData => DbQueryErrorCode::DecodeFailure,
+                    io::ErrorKind::PermissionDenied => DbQueryErrorCode::PermissionDenied,
                     _ => DbQueryErrorCode::QueryFailed,
                 };
                 Self::error(code)

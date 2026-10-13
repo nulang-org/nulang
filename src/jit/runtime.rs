@@ -1932,6 +1932,16 @@ define_aot_call_closure!(nulang_aot_call_closure_8, a0, a1, a2, a3, a4, a5, a6, 
 // (LLM.ask, Timer.sleep with a positive delay) degrade to nil — the native
 // backend has no VM suspension, so the actor cannot be parked mid-behavior.
 
+// AOT/JIT host helpers have no VM continuation capture for Pending effects.
+// Refuse application SQL *before* invoking callbacks, otherwise a write could
+// execute after the native caller has already received Nil.
+fn aot_checked_db_unavailable_result() -> String {
+    crate::runtime::DbQueryOutcome::from_legacy_rows(Err(
+        std::io::Error::from(std::io::ErrorKind::Unsupported),
+    ))
+    .to_json()
+}
+
 macro_rules! define_aot_perform_async {
     ($name:ident, $($arg:ident),*) => {
         /// Dispatch an async effect from AOT-compiled code.
@@ -1939,6 +1949,16 @@ macro_rules! define_aot_perform_async {
         pub unsafe extern "C" fn $name(effect_raw: u64 $(, $arg: u64)*) -> u64 {
             let args = [$($arg),*];
             let effect_op = resolve_string_coerce(effect_raw).unwrap_or_default();
+            if effect_op == "DB.query_checked_async" {
+                let content = aot_checked_db_unavailable_result();
+                let bytes = content.as_bytes();
+                if let Some(ptr) = alloc_obj(bytes.len() + 1, HeapTypeTag::String) {
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+                    *ptr.add(bytes.len()) = 0;
+                    return Value::ptr(ptr).as_raw();
+                }
+                return Value::nil().as_raw();
+            }
             let constants = crate::aot::aot_module_constants();
             let vals: Vec<Value> = args.iter().map(|a| unsafe { Value::from_bits(*a) }).collect();
             match try_with_callbacks(|cb| cb.perform_async(&effect_op, constants, &vals)) {
@@ -1959,6 +1979,18 @@ macro_rules! define_aot_perform_async {
             }
         }
     };
+}
+
+#[cfg(test)]
+mod db_async_aot_tests {
+    #[test]
+    fn native_backend_refuses_async_sql_with_a_checked_error() {
+        let response = super::aot_checked_db_unavailable_result();
+        assert_eq!(
+            response,
+            r#"{"status":"error","error":{"code":"unsupported","message":"Database queries are unavailable on this backend."}}"#
+        );
+    }
 }
 
 define_aot_perform_async!(nulang_aot_perform_async_0,);
