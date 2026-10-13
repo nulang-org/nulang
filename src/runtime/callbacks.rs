@@ -158,7 +158,7 @@ fn required_host_authority(
             }
             other("System", "Arg", Some(index.to_string()))
         }
-        ("DB", Some("query")) => other("DB", "Query", None),
+        ("DB", Some("query" | "query_checked")) => other("DB", "Query", None),
         ("Python", Some(op)) if !op.is_empty() => other("Python", op, None),
         ("Provider", Some("ask")) => other("Provider", "Ask", Some(string_arg(0)?)),
         // Inference/LLM asks are runtime-mediated: the node already holds the
@@ -820,6 +820,29 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
             };
             let mut rt = self.runtime.borrow_mut();
             return rt.query_workflow(workflow_id, &query_name);
+        }
+        #[cfg(any(feature = "sqlite", feature = "postgres"))]
+        if effect_name == "DB" && op_name == Some("query_checked") {
+            let sql = regs
+                .first()
+                .and_then(|value| value.as_string_id())
+                .and_then(|id| constants.get(id as usize))
+                .and_then(|constant| match constant {
+                    crate::bytecode::Constant::String(sql) => Some(sql.as_str()),
+                    _ => None,
+                });
+            let outcome = match sql {
+                Some(sql) => {
+                    let rt = self.runtime.borrow();
+                    let result = rt.persistence.query(sql, &regs[1..]);
+                    if let Err(error) = &result {
+                        tracing::warn!(%error, "DB.query_checked failed");
+                    }
+                    crate::runtime::DbQueryOutcome::from_legacy_rows(result)
+                }
+                None => crate::runtime::DbQueryOutcome::invalid_query_argument(),
+            };
+            return Some(self.alloc_string(&outcome.to_json()));
         }
         #[cfg(any(feature = "sqlite", feature = "postgres"))]
         if effect_name == "DB" && op_name == Some("query") {
@@ -1648,6 +1671,32 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
                     _ => return None,
                 };
                 return (*self.runtime).query_workflow(workflow_id, &query_name);
+            }
+            #[cfg(any(feature = "sqlite", feature = "postgres"))]
+            if effect_name == "DB" && op_name == Some("query_checked") {
+                let sql = regs
+                    .first()
+                    .and_then(|value| value.as_string_id())
+                    .and_then(|id| constants.get(id as usize))
+                    .and_then(|constant| match constant {
+                        crate::bytecode::Constant::String(sql) => Some(sql.as_str()),
+                        _ => None,
+                    });
+                let outcome = match sql {
+                    Some(sql) => {
+                        let result = (*self.runtime).persistence.query(sql, &regs[1..]);
+                        if let Err(error) = &result {
+                            tracing::warn!(%error, "DB.query_checked failed");
+                        }
+                        crate::runtime::DbQueryOutcome::from_legacy_rows(result)
+                    }
+                    None => crate::runtime::DbQueryOutcome::invalid_query_argument(),
+                };
+                let json = outcome.to_json();
+                return Some(match &mut (*self.runtime).vm {
+                    Some(vm) => vm.allocate_string(&json),
+                    None => crate::vm::Value::nil(),
+                });
             }
             #[cfg(any(feature = "sqlite", feature = "postgres"))]
             if effect_name == "DB" && op_name == Some("query") {
