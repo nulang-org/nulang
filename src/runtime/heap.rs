@@ -239,21 +239,6 @@ impl OrcaHeader {
 // ActorHeap
 // ---------------------------------------------------------------------------
 
-/// Per-actor heap allocator with ORCA-compatible object headers.
-///
-/// `ActorHeap` combines a fast bump allocator with size-class free lists.
-/// All allocations are 8-byte aligned and carry an [`OrcaHeader`].  The
-/// allocator maintains an intrusive doubly-linked list of *live* objects so
-/// that the GC can walk all reachable objects in O(live) time.
-///
-/// # Thread safety
-///
-/// `ActorHeap` is **not** `Sync` — it is designed to be owned by a single
-/// actor and accessed only while that actor is running.  It **is** `Send`
-/// so that an actor (and its heap) can be migrated between scheduler threads.
-/// In practice the runtime is a single-threaded synchronous coordinator, so
-/// all heap access happens on the one scheduler thread; header refcounts are
-/// therefore plain integers, not atomics (see [`OrcaHeader`]).
 /// Runtime-observed operations on one ActorHeap since its last reset.
 ///
 /// `requested_payload_bytes` sums successful requested payload sizes,
@@ -270,6 +255,22 @@ pub struct HeapAllocationSnapshot {
     pub peak_committed_bump_bytes: usize,
 }
 
+
+/// Per-actor heap allocator with ORCA-compatible object headers.
+///
+/// `ActorHeap` combines a fast bump allocator with size-class free lists.
+/// All allocations are 8-byte aligned and carry an [`OrcaHeader`].  The
+/// allocator maintains an intrusive doubly-linked list of *live* objects so
+/// that the GC can walk all reachable objects in O(live) time.
+///
+/// # Thread safety
+///
+/// `ActorHeap` is **not** `Sync` — it is designed to be owned by a single
+/// actor and accessed only while that actor is running.  It **is** `Send`
+/// so that an actor (and its heap) can be migrated between scheduler threads.
+/// In practice the runtime is a single-threaded synchronous coordinator, so
+/// all heap access happens on the one scheduler thread; header refcounts are
+/// therefore plain integers, not atomics (see [`OrcaHeader`]).
 #[derive(Debug)]
 pub struct ActorHeap {
     /// Owning actor ID (0 until `set_actor_id` is called).
