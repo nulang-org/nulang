@@ -297,7 +297,7 @@ jobs:
             tar czf dist/nulang-freebsd-x86_64.tar.gz -C dist nulang-freebsd-x86_64
             (
               cd dist
-              printf '%s  %s\\n' "$(sha256 -q nulang-freebsd-x86_64.tar.gz)" "nulang-freebsd-x86_64.tar.gz" > nulang-freebsd-x86_64.tar.gz.sha256
+              printf '%s  %s\n' "$(sha256 -q nulang-freebsd-x86_64.tar.gz)" "nulang-freebsd-x86_64.tar.gz" > nulang-freebsd-x86_64.tar.gz.sha256
               test "$(sha256 -q nulang-freebsd-x86_64.tar.gz)" = "$(awk '{print $1}' nulang-freebsd-x86_64.tar.gz.sha256)"
             )
             mkdir -p release-smoke
