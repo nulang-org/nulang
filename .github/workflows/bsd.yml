@@ -12,6 +12,7 @@ on:
       - 'src/**'
       - 'crates/**'
       - 'examples/01_hello.nula'
+      - 'examples/08_actors.nula'
   push:
     branches: [main]
     paths:
@@ -22,6 +23,7 @@ on:
       - 'src/**'
       - 'crates/**'
       - 'examples/01_hello.nula'
+      - 'examples/08_actors.nula'
 
 permissions:
   contents: read
@@ -42,11 +44,14 @@ jobs:
           run: |
             set -eu
             export CARGO_TARGET_DIR=target/bsd-openbsd
+            rustc --version
+            cargo --version
             cargo build --locked --no-default-features --bin nulang
             bin="target/bsd-openbsd/debug/nulang"
             "$bin" --version
             test "$("$bin" --eval 'perform IO.print("bsd-smoke")')" = "bsd-smoke"
             "$bin" examples/01_hello.nula
+            "$bin" examples/08_actors.nula
 
   netbsd:
     name: NetBSD x86_64 (portable CLI)
@@ -65,15 +70,18 @@ jobs:
               /usr/pkg/bin/pkgin update
               /usr/pkg/bin/pkgin -y install rust
             else
-              export PKG_PATH="https://cdn.NetBSD.org/pub/pkgsrc/packages/NetBSD/amd64/10.1/All"
+              export PKG_PATH="https://cdn.NetBSD.org/pub/pkgsrc/packages/NetBSD/x86_64/10.1/All"
               /usr/sbin/pkg_add rust
             fi
           run: |
             set -eu
             export PATH="/usr/pkg/sbin:/usr/pkg/bin:/usr/sbin:/usr/bin:$PATH"
             export CARGO_TARGET_DIR=target/bsd-netbsd
+            rustc --version
+            cargo --version
             cargo build --locked --no-default-features --bin nulang
             bin="target/bsd-netbsd/debug/nulang"
             "$bin" --version
             test "$("$bin" --eval 'perform IO.print("bsd-smoke")')" = "bsd-smoke"
             "$bin" examples/01_hello.nula
+            "$bin" examples/08_actors.nula
