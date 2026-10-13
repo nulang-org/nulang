@@ -12,7 +12,8 @@ fn test_dir() -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let path = std::env::temp_dir().join(format!("nulang-native-tiny-{}-{nonce}", std::process::id()));
+    let path =
+        std::env::temp_dir().join(format!("nulang-native-tiny-{}-{nonce}", std::process::id()));
     fs::create_dir(&path).unwrap();
     path
 }
@@ -53,8 +54,11 @@ fn hello_world_is_a_real_executable_without_the_nulang_runtime() {
 #[test]
 fn unsupported_string_expression_fails_closed_without_an_executable() {
     let dir = test_dir();
-    let built = build(&dir, "let name = \"Nulang\" + \"!\";
-perform IO.print(name)");
+    let built = build(
+        &dir,
+        "let name = \"Nulang\" + \"!\";
+perform IO.print(name)",
+    );
     assert!(!built.status.success());
     assert!(String::from_utf8_lossy(&built.stderr).contains("unsupported"));
     assert!(!dir.join("hello").exists());
@@ -209,8 +213,14 @@ fn standalone_print_matches_bytecode_output() {
         .expect("run linked executable");
     assert!(bytecode.status.success());
     assert!(native.status.success());
-    assert_eq!(native.stdout, bytecode.stdout, "bytecode/native stdout mismatch");
-    assert_eq!(native.stderr, bytecode.stderr, "bytecode/native stderr mismatch");
+    assert_eq!(
+        native.stdout, bytecode.stdout,
+        "bytecode/native stdout mismatch"
+    );
+    assert_eq!(
+        native.stderr, bytecode.stderr,
+        "bytecode/native stderr mismatch"
+    );
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -263,7 +273,10 @@ fn emit_exe_rejects_eval_instead_of_executing_it() {
         .arg(&artifact)
         .output()
         .unwrap();
-    assert!(!output.status.success(), "--emit-exe --eval must fail closed");
+    assert!(
+        !output.status.success(),
+        "--emit-exe --eval must fail closed"
+    );
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("--emit-exe requires"),
         "stderr: {}",
@@ -286,7 +299,10 @@ fn emit_exe_rejects_check_instead_of_silently_typechecking() {
         .arg(&artifact)
         .output()
         .unwrap();
-    assert!(!output.status.success(), "--emit-exe --check must fail closed");
+    assert!(
+        !output.status.success(),
+        "--emit-exe --check must fail closed"
+    );
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("--emit-exe requires"),
         "stderr: {}",
@@ -326,7 +342,11 @@ fn dash_prefixed_output_directory_does_not_turn_linker_input_into_option() {
     let dir = test_dir();
     let output_dir = dir.join("-native-output");
     fs::create_dir(&output_dir).unwrap();
-    fs::write(dir.join("main.nula"), "perform IO.print(\"safe linker path\")").unwrap();
+    fs::write(
+        dir.join("main.nula"),
+        "perform IO.print(\"safe linker path\")",
+    )
+    .unwrap();
     let built = Command::new(env!("CARGO_BIN_EXE_nulang"))
         .current_dir(&dir)
         .args(["--emit-exe", "--out", "-native-output/hello", "main.nula"])

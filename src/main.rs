@@ -605,7 +605,10 @@ fn main() {
             std::process::exit(1);
         }
         if opts.backend != "bytecode" && opts.backend != "native" {
-            eprintln!("Error: --emit-exe is incompatible with --backend {}", opts.backend);
+            eprintln!(
+                "Error: --emit-exe is incompatible with --backend {}",
+                opts.backend
+            );
             std::process::exit(1);
         }
     }
@@ -980,8 +983,11 @@ fn main() {
                 }
                 let outcome = (|| -> NuResult<()> {
                     let (ast, checked) = run_frontend(
-                        &source, Some(path), opts.verbose,
-                        &opts.with_capabilities, opts.deny_warnings,
+                        &source,
+                        Some(path),
+                        opts.verbose,
+                        &opts.with_capabilities,
+                        opts.deny_warnings,
                     )?;
                     let hir = nulang::hir_lower::lower_module(&ast, &checked.inferred_decl_types);
                     let mir = nulang::mir_lower::lower_module(&hir)?;
@@ -993,10 +999,9 @@ fn main() {
                     // A source file must never become the linker destination.
                     // Canonicalize existing paths so --out aliases and symlinks
                     // to the input are rejected before invoking the linker.
-                    if let (Ok(source), Ok(destination)) = (
-                        std::fs::canonicalize(path),
-                        std::fs::canonicalize(&output),
-                    ) {
+                    if let (Ok(source), Ok(destination)) =
+                        (std::fs::canonicalize(path), std::fs::canonicalize(&output))
+                    {
                         if source == destination {
                             return Err(NuError::VMError {
                                 msg: "native executable output cannot overwrite its source file"
@@ -1005,7 +1010,10 @@ fn main() {
                             });
                         }
                     }
-                    nulang::native_executable::emit_executable(&mir, std::path::Path::new(&output))?;
+                    nulang::native_executable::emit_executable(
+                        &mir,
+                        std::path::Path::new(&output),
+                    )?;
                     println!("Wrote native executable to {}", output);
                     Ok(())
                 })();

@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 
-use cranelift::prelude::*;
 use cranelift::prelude::settings::Configurable;
+use cranelift::prelude::*;
 use cranelift_module::{DataDescription, Linkage, Module as _};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 
@@ -71,11 +71,15 @@ fn compile_object(mir: &mir::Module) -> NuResult<Vec<u8>> {
         .find(|f| f.name == "__main")
         .or_else(|| mir.functions.iter().find(|f| f.name == "main"))
         .ok_or_else(|| error("no __main or main entry point"))?;
-    if !entry.params.is_empty() || !entry.captures.is_empty()
-        || !entry.handler_tables.is_empty() || entry.blocks.len() != 1
+    if !entry.params.is_empty()
+        || !entry.captures.is_empty()
+        || !entry.handler_tables.is_empty()
+        || entry.blocks.len() != 1
         || entry.blocks[0].id != entry.entry
     {
-        return Err(error("entry must be a parameterless, straight-line function"));
+        return Err(error(
+            "entry must be a parameterless, straight-line function",
+        ));
     }
     let block = &entry.blocks[0];
     if !matches!(block.terminator, Terminator::Return(_)) {
@@ -83,14 +87,19 @@ fn compile_object(mir: &mir::Module) -> NuResult<Vec<u8>> {
     }
 
     let mut flags = settings::builder();
-    flags.set("opt_level", "speed_and_size")
+    flags
+        .set("opt_level", "speed_and_size")
         .map_err(|e| error(format!("Cranelift flags: {e}")))?;
     let isa = cranelift_native::builder()
         .map_err(|e| error(format!("native ISA: {e}")))?
         .finish(settings::Flags::new(flags))
         .map_err(|e| error(format!("native ISA: {e}")))?;
-    let builder = ObjectBuilder::new(isa, "nulang_tiny", cranelift_module::default_libcall_names())
-        .map_err(|e| error(format!("object builder: {e}")))?;
+    let builder = ObjectBuilder::new(
+        isa,
+        "nulang_tiny",
+        cranelift_module::default_libcall_names(),
+    )
+    .map_err(|e| error(format!("object builder: {e}")))?;
     let mut module = ObjectModule::new(builder);
     let ptr_ty = module.target_config().pointer_type();
 
@@ -98,19 +107,25 @@ fn compile_object(mir: &mir::Module) -> NuResult<Vec<u8>> {
     // Reject NUL rather than silently changing IO.print's semantics via puts.
     let mut strings = HashMap::new();
     for stmt in &block.stmts {
-        if let Stmt::Assign { op: RValue::Const(Constant::String(value)), .. } = stmt {
+        if let Stmt::Assign {
+            op: RValue::Const(Constant::String(value)),
+            ..
+        } = stmt
+        {
             if value.as_bytes().contains(&0) {
                 return Err(error("embedded NUL in string literal"));
             }
             if !strings.contains_key(value) {
                 let name = format!("nulang_string_{}", strings.len());
-                let id = module.declare_data(&name, Linkage::Local, false, false)
+                let id = module
+                    .declare_data(&name, Linkage::Local, false, false)
                     .map_err(|e| error(format!("declare data: {e}")))?;
                 let mut data = DataDescription::new();
                 let mut bytes = value.as_bytes().to_vec();
                 bytes.push(0);
                 data.define(bytes.into_boxed_slice());
-                module.define_data(id, &data)
+                module
+                    .define_data(id, &data)
                     .map_err(|e| error(format!("define data: {e}")))?;
                 strings.insert(value.clone(), id);
             }
@@ -120,12 +135,14 @@ fn compile_object(mir: &mir::Module) -> NuResult<Vec<u8>> {
     let mut puts_sig = module.make_signature();
     puts_sig.params.push(AbiParam::new(ptr_ty));
     puts_sig.returns.push(AbiParam::new(types::I32));
-    let puts = module.declare_function("puts", Linkage::Import, &puts_sig)
+    let puts = module
+        .declare_function("puts", Linkage::Import, &puts_sig)
         .map_err(|e| error(format!("declare puts: {e}")))?;
 
     let mut signature = module.make_signature();
     signature.returns.push(AbiParam::new(types::I32));
-    let main_id = module.declare_function("main", Linkage::Export, &signature)
+    let main_id = module
+        .declare_function("main", Linkage::Export, &signature)
         .map_err(|e| error(format!("declare main: {e}")))?;
     let mut ctx = module.make_context();
     ctx.func.signature = signature;
@@ -146,7 +163,11 @@ fn compile_object(mir: &mir::Module) -> NuResult<Vec<u8>> {
                 RValue::Const(Constant::String(s)) => {
                     let data_id = strings.get(s).ok_or_else(|| error("missing string data"))?;
                     let global = module.declare_data_in_func(*data_id, fb.func);
-                    Slot { value: fb.ins().symbol_value(ptr_ty, global), kind: Kind::String, constant_int: None }
+                    Slot {
+                        value: fb.ins().symbol_value(ptr_ty, global),
+                        kind: Kind::String,
+                        constant_int: None,
+                    }
                 }
                 RValue::Const(Constant::Int(n)) => {
                     let value = wrap_int(*n);
@@ -155,7 +176,7 @@ fn compile_object(mir: &mir::Module) -> NuResult<Vec<u8>> {
                         kind: Kind::Int,
                         constant_int: Some(value),
                     }
-                },
+                }
                 RValue::Const(Constant::Unit) => Slot {
                     value: fb.ins().iconst(types::I64, 0),
                     kind: Kind::Unit,
@@ -167,7 +188,9 @@ fn compile_object(mir: &mir::Module) -> NuResult<Vec<u8>> {
                     if x.kind != Kind::Int {
                         return Err(error("unary negation of non-Int"));
                     }
-                    let raw = x.constant_int.ok_or_else(|| error("unknown integer value"))?;
+                    let raw = x
+                        .constant_int
+                        .ok_or_else(|| error("unknown integer value"))?;
                     let result = wrap_int(raw.wrapping_neg());
                     Slot {
                         value: fb.ins().iconst(types::I64, result),
@@ -181,8 +204,12 @@ fn compile_object(mir: &mir::Module) -> NuResult<Vec<u8>> {
                     if a.kind != Kind::Int || b.kind != Kind::Int {
                         return Err(error("binary operation on non-Int"));
                     }
-                    let lhs = a.constant_int.ok_or_else(|| error("unknown integer value"))?;
-                    let rhs = b.constant_int.ok_or_else(|| error("unknown integer value"))?;
+                    let lhs = a
+                        .constant_int
+                        .ok_or_else(|| error("unknown integer value"))?;
+                    let rhs = b
+                        .constant_int
+                        .ok_or_else(|| error("unknown integer value"))?;
                     let result = wrap_int(match operator {
                         BinOp::Add => lhs.wrapping_add(rhs),
                         BinOp::Sub => lhs.wrapping_sub(rhs),
@@ -195,19 +222,27 @@ fn compile_object(mir: &mir::Module) -> NuResult<Vec<u8>> {
                         constant_int: Some(result),
                     }
                 }
-                RValue::Perform { effect, op, args, resolved_handler: None }
-                    if effect == "IO" && (op == "print" || op == "println") && args.len() == 1 =>
-                {
+                RValue::Perform {
+                    effect,
+                    op,
+                    args,
+                    resolved_handler: None,
+                } if effect == "IO" && (op == "print" || op == "println") && args.len() == 1 => {
                     let arg = lookup(&slots, args[0])?;
                     if arg.kind != Kind::String {
                         return Err(error("IO.print argument must be a String"));
                     }
                     fb.ins().call(puts_ref, &[arg.value]);
-                    Slot { value: fb.ins().iconst(types::I64, 0), kind: Kind::Unit, constant_int: None }
+                    Slot {
+                        value: fb.ins().iconst(types::I64, 0),
+                        kind: Kind::Unit,
+                        constant_int: None,
+                    }
                 }
                 other => return Err(error(format!("MIR operation {other:?}"))),
             };
-            let destination = slots.get_mut(dst.0 as usize)
+            let destination = slots
+                .get_mut(dst.0 as usize)
                 .ok_or_else(|| error(format!("invalid MIR destination {}", dst.0)))?;
             *destination = Some(next);
         }
@@ -221,10 +256,13 @@ fn compile_object(mir: &mir::Module) -> NuResult<Vec<u8>> {
         fb.ins().return_(&[zero]);
         fb.finalize();
     }
-    module.define_function(main_id, &mut ctx)
+    module
+        .define_function(main_id, &mut ctx)
         .map_err(|e| error(format!("define main: {e}")))?;
     module.clear_context(&mut ctx);
-    module.finish().emit()
+    module
+        .finish()
+        .emit()
         .map_err(|e| error(format!("emit object: {e}")))
 }
 
@@ -235,7 +273,8 @@ fn compile_object(mir: &mir::Module) -> NuResult<Vec<u8>> {
 #[cfg(target_os = "linux")]
 pub fn emit_executable(mir: &mir::Module, output: &Path) -> NuResult<()> {
     let bytes = compile_object(mir)?;
-    let parent = output.parent()
+    let parent = output
+        .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     // Resolve the parent before forming linker arguments. A relative output
@@ -245,13 +284,13 @@ pub fn emit_executable(mir: &mir::Module, output: &Path) -> NuResult<()> {
         .map_err(|e| error(format!("resolve output directory: {e}")))?;
     // A private, exclusive directory avoids predictable .o/.tmp names and
     // symlink-following writes in attacker-controlled directories.
-    let staging = tempfile::Builder::new().prefix(".nulang-link-")
+    let staging = tempfile::Builder::new()
+        .prefix(".nulang-link-")
         .tempdir_in(&parent)
         .map_err(|e| error(format!("create staging directory: {e}")))?;
     let object_path = staging.path().join("main.o");
     let temporary_exe = staging.path().join("main");
-    std::fs::write(&object_path, bytes)
-        .map_err(|e| error(format!("write object: {e}")))?;
+    std::fs::write(&object_path, bytes).map_err(|e| error(format!("write object: {e}")))?;
 
     let result = Command::new("cc")
         .arg(&object_path)
@@ -263,13 +302,13 @@ pub fn emit_executable(mir: &mir::Module, output: &Path) -> NuResult<()> {
         .map_err(|e| error(format!("invoke cc: {e}")))?;
     if !result.status.success() {
         return Err(error(format!(
-            "host linker failed: {}", String::from_utf8_lossy(&result.stderr)
+            "host linker failed: {}",
+            String::from_utf8_lossy(&result.stderr)
         )));
     }
     // Same-directory rename installs only a fully linked artifact. TempDir
     // removes both the object and failed linker outputs on every exit path.
-    std::fs::rename(&temporary_exe, output)
-        .map_err(|e| error(format!("install executable: {e}")))
+    std::fs::rename(&temporary_exe, output).map_err(|e| error(format!("install executable: {e}")))
 }
 
 #[cfg(not(target_os = "linux"))]
