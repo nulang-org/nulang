@@ -11633,6 +11633,164 @@ match { a: 2, b: 9 } with {
         );
     }
 
+    /// An actual JIT preemption is not a completed durable workflow turn.
+    /// Keep this as a separate regression from the standalone actor liveness
+    /// test: terminal-event ordering and step identity are durability contracts.
+    #[cfg(feature = "native-codegen")]
+    #[test]
+    fn test_workflow_jit_preemption_retains_activation_without_terminal_receipt() {
+        let source = r#"
+            fn bump(n: Int) -> Int {
+                let a = n + 1
+                let b = a + 2
+                b - 2
+            }
+            workflow JitFence {
+                step first { self.step_index = self.step_index + 1 }
+                step hot {
+                    var i = 0
+                    while i < 50000 {
+                        i = bump(i)
+                    }
+                    self.step_index = self.step_index + 1
+                }
+            }
+            let w = spawn JitFence {} in { w }
+        "#;
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        let (value, _) = run_source_with_runtime(source, rt.clone()).unwrap();
+        let actor_id = value.as_actor_id().expect("spawned workflow reference");
+
+        // One real scheduler dispatch, not a synthetic call to the JIT
+        // resume helper. Repeated hot function entries exhaust the native
+        // safepoint budget after tier-up.
+        rt.borrow_mut().send_message_by_id(actor_id, 1, &[]);
+        rt.borrow_mut().step_actor(actor_id);
+
+        let runtime = rt.borrow();
+        let actor = runtime.actors.get(&actor_id).expect("workflow actor");
+        assert!(
+            actor.jit_yield_pending,
+            concat!(
+                "fixture must reach a genuine JIT safepoint; ",
+                "bytecode-only completion is not a valid terminal test"
+            )
+        );
+        let suspended = actor.suspended_execution.as_ref().expect("JIT suspension");
+        assert_eq!(suspended.behavior_idx, 1, "second workflow step identity");
+        assert_eq!(suspended.step_name, "hot", "canonical workflow step name");
+        assert_eq!(suspended.activation, actor.current_workflow_activation);
+        let events = runtime.persistence.read_workflow_events(actor_id);
+        assert!(
+            !events.iter().any(|event| {
+                matches!(
+                    event,
+                    WorkflowEvent::StepCompleted { step_name, .. } if step_name == "hot"
+                )
+            }),
+            "a JIT preemption must not commit StepCompleted: {events:?}"
+        );
+        drop(runtime);
+
+        // The same activation must be requeued even if its mailbox is empty;
+        // JIT yielding is CPU preemption, not a request for another message.
+        // The original send has already enqueued the actor on the scheduler.
+        rt.borrow_mut().run_scheduler();
+
+        let runtime = rt.borrow();
+        let actor = runtime.actors.get(&actor_id).expect("resumed workflow");
+        assert!(!actor.jit_yield_pending, "the JIT continuation must finish");
+        assert!(actor.suspended_execution.is_none());
+        assert_eq!(
+            actor.get_state_field("step_index").and_then(|v| v.as_int()),
+            Some(1),
+            "compiled hot step must advance durable progress exactly once"
+        );
+        let terminal_events: Vec<_> = runtime
+            .persistence
+            .read_workflow_events(actor_id)
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    WorkflowEvent::StepCompleted { step_name, .. } if step_name == "hot"
+                )
+            })
+            .collect();
+        assert_eq!(
+            terminal_events.len(),
+            1,
+            "preemption and resume must write one terminal receipt"
+        );
+        assert_eq!(
+            runtime
+                .persistence
+                .load_snapshot(actor_id)
+                .and_then(|snapshot| snapshot.state.get("step_index").cloned()),
+            Some(crate::runtime::PersistedValue::Int(1)),
+            "terminal receipt must have a matching durable checkpoint"
+        );
+    }
+
+    /// A failed terminal write after a real JIT yield cannot publish an
+    /// advanced durable snapshot or leave the speculative actor dispatchable.
+    #[cfg(feature = "native-codegen")]
+    #[test]
+    fn test_workflow_jit_terminal_append_rejection_quarantines_safe_state() {
+        let source = r#"
+            fn bump(n: Int) -> Int {
+                let a = n + 1
+                let b = a + 2
+                b - 2
+            }
+            workflow JitReject {
+                step hot {
+                    var i = 0
+                    while i < 50000 {
+                        i = bump(i)
+                    }
+                    self.step_index = self.step_index + 1
+                }
+            }
+            let w = spawn JitReject {} in { w }
+        "#;
+        let store = SharedMemoryStore::new();
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        rt.borrow_mut().persistence = Box::new(RejectStepCompletedStore(store.clone()));
+        let (value, _) = run_source_with_runtime(source, rt.clone()).unwrap();
+        let actor_id = value.as_actor_id().expect("workflow actor");
+
+        rt.borrow_mut().send_message_by_id(actor_id, 0, &[]);
+        rt.borrow_mut().step_actor(actor_id);
+        assert!(
+            rt.borrow()
+                .actors
+                .get(&actor_id)
+                .expect("preempted actor still live")
+                .jit_yield_pending,
+            "fixture must exercise JIT preemption before terminal write failure"
+        );
+
+        rt.borrow_mut().run_scheduler();
+
+        assert!(
+            !rt.borrow().actors.contains_key(&actor_id),
+            "failed terminal append must quarantine the speculative JIT actor"
+        );
+        let snapshot = store.load_snapshot(actor_id).expect("last safe checkpoint");
+        assert_eq!(
+            snapshot.state.get("step_index"),
+            Some(&crate::runtime::PersistedValue::Int(0)),
+            "failed terminal write cannot checkpoint a speculative step index"
+        );
+        assert!(
+            !store.read_workflow_events(actor_id).iter().any(|event| {
+                matches!(event, WorkflowEvent::StepCompleted { .. })
+            }),
+            "rejected terminal append must not produce a completion receipt"
+        );
+    }
+
     /// Verify the JIT safepoint infrastructure does not cause hangs or
     /// crashes when an actor with a tight loop yields to the scheduler.
     /// The busy-loop actor is given a minimal safepoint budget so the
