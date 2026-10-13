@@ -3082,3 +3082,54 @@ fn postgres_only_build_dispatches_db_query() {
         "DB.query must be handled even when SQLite is disabled"
     );
 }
+
+
+#[cfg(test)]
+mod checked_query_effect_tests {
+    use super::required_host_authority;
+
+    #[test]
+    fn checked_queries_require_the_same_host_authority_as_legacy_queries() {
+        let legacy = required_host_authority("DB", Some("query"), &[], &[]).unwrap();
+        let checked = required_host_authority("DB", Some("query_checked"), &[], &[]).unwrap();
+        assert!(legacy.is_some(), "DB.query requires explicit actor authority");
+        assert_eq!(legacy, checked, "a checked query cannot bypass DB authority");
+    }
+
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[test]
+    fn checked_query_effect_returns_explicit_error_instead_of_nil() {
+        use super::RuntimeVmCallbacks;
+        use crate::runtime::Runtime;
+        use crate::vm::ActorVmCallbacks;
+        use std::cell::RefCell;
+        use std::ffi::CStr;
+        use std::rc::Rc;
+
+        let runtime = Rc::new(RefCell::new(Runtime::new()));
+        let mut callbacks = RuntimeVmCallbacks::new(runtime);
+
+        let missing_sql = callbacks
+            .perform_builtin_effect("DB", Some("query_checked"), &[], &[])
+            .expect("checked DB effect must be handled");
+        let ptr = missing_sql.as_ptr().expect("checked effect returns a heap string");
+        // The callback owns the live allocation until the runtime is dropped.
+        let encoded = unsafe { CStr::from_ptr(ptr.cast()).to_str().unwrap() };
+        assert!(encoded.contains(r#""status":"error""#));
+        assert!(encoded.contains(r#""code":"invalid_input""#));
+
+        let sql = [crate::bytecode::Constant::String("SELECT 1".into())];
+        let result = callbacks
+            .perform_builtin_effect(
+                "DB",
+                Some("query_checked"),
+                &sql,
+                &[crate::vm::Value::string(0)],
+            )
+            .expect("checked query is handled on supported builds");
+        let ptr = result.as_ptr().expect("checked query returns a heap string");
+        let encoded = unsafe { CStr::from_ptr(ptr.cast()).to_str().unwrap() };
+        assert!(encoded.contains(r#""status":"error""#));
+        assert!(encoded.contains(r#""code":"unsupported""#));
+    }
+}
