@@ -2259,17 +2259,18 @@ impl CapabilityAnalyzer {
                     if *remote {
                         if !arg_cap.is_remote_sendable() {
                             let span = expr_span(arg);
+                            let source = capability_source(ctx, arg, arg_cap);
                             let msg = format!(
-                                "remote send argument with capability {} is not network-sendable\nwhy: remote messages cross a serialization boundary, so actor-local aliases and transferable local ownership cannot be reconstructed safely on another node\nhelp: send deeply immutable `val` data, an opaque `tag`, or a serializable `linear` value; for `iso`, first project the data into an immutable value",
-                                arg_cap
+                                "remote send argument with capability {} is not network-sendable\n{}\nwhy: remote messages cross a serialization boundary, so actor-local aliases and transferable local ownership cannot be reconstructed safely on another node\nhelp: send deeply immutable `val` data, an opaque `tag`, or a serializable `linear` value; for `iso`, first project the data into an immutable value",
+                                arg_cap, source
                             );
                             self.diagnostics.push(msg.clone());
                             return Err(NuError::cap_error_explained(
                                 msg,
                                 span,
                                 format!(
-                                    "`{}` does not satisfy the remote-send contract; remote sends accept only val, tag, or linear values",
-                                    arg_cap
+                                    "`{}` does not satisfy the remote-send contract; remote sends accept only val, tag, or linear values. {}",
+                                    arg_cap, source
                                 ),
                             ));
                         }
@@ -2285,17 +2286,18 @@ impl CapabilityAnalyzer {
                                 }
                                 _ => "this capability does not satisfy Nulang's actor-isolation send contract",
                             };
+                            let source = capability_source(ctx, arg, arg_cap);
                             let msg = format!(
-                                "send argument with capability {} is not sendable\nwhy: {}\nhelp: use `val` for immutable shared data, or transfer a uniquely owned `iso`/linear value exactly once",
-                                arg_cap, reason
+                                "send argument with capability {} is not sendable\n{}\nwhy: {}\nhelp: use `val` for immutable shared data, or transfer a uniquely owned `iso`/linear value exactly once",
+                                arg_cap, source, reason
                             );
                             self.diagnostics.push(msg.clone());
                             return Err(NuError::cap_error_explained(
                                 msg,
                                 span,
                                 format!(
-                                    "only lineariso, iso, linear, val, and tag may cross an actor boundary; `{}` cannot because {}",
-                                    arg_cap, reason
+                                    "only lineariso, iso, linear, val, and tag may cross an actor boundary; `{}` cannot because {}. {}",
+                                    arg_cap, reason, source
                                 ),
                             ));
                         }
@@ -2682,6 +2684,44 @@ impl Default for CapabilityAnalyzer {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Explain the *source* of an actor-send argument's checked capability.
+///
+/// This is diagnostic-only. It must never change inferred capabilities,
+/// ownership transfers or the set of accepted local/remote messages.
+/// Binding annotations and inferred let-bound capabilities share CapContext,
+/// so describe the lexical lookup rather than claiming either is explicit.
+fn capability_source(ctx: &CapContext, arg: &Expr, inferred: Capability) -> String {
+    match arg {
+        Expr::Var(name, _) => {
+            if let Some((_, bound_cap)) = ctx.bindings.iter().rev().find(|(n, _)| n == name) {
+                format!(
+                    "source: variable `{}` resolves to `{}` through its nearest lexical binding",
+                    name, bound_cap
+                )
+            } else {
+                format!(
+                    "source: variable `{}` has no capability-specific lexical binding; the analyzer uses its default `{}`",
+                    name, ctx.default_cap
+                )
+            }
+        }
+        Expr::Unary {
+            op: UnOp::Ref(cap), ..
+        } => format!(
+            "source: reference constructor `&{}` produces capability `{}`",
+            cap, inferred
+        ),
+        Expr::CapAnnotate { cap, .. } => format!(
+            "source: capability annotation `{}` yields capability `{}`",
+            cap, inferred
+        ),
+        _ => format!(
+            "source: this expression evaluates to inferred capability `{}`; no single binding origin is available",
+            inferred
+        ),
+    }
+}
 
 /// Extract the source span from any expression node.
 fn expr_span(expr: &Expr) -> Span {
@@ -3557,6 +3597,134 @@ mod tests {
             diagnostic.contains("help:"),
             "diagnostic should provide an actionable fix"
         );
+    }
+
+    #[test]
+    fn test_local_send_failure_traces_nearest_capability_binding() {
+        let ctx = CapContext::new()
+            .with_binding("target", Capability::Val)
+            .with_binding("payload", Capability::Trn)
+            .with_binding("payload", Capability::Ref);
+        let send = Expr::Send {
+            actor: Box::new(Expr::Var("target".to_string(), s())),
+            behavior: "push".to_string(),
+            args: vec![Expr::Var("payload".to_string(), s())],
+            remote: false,
+            span: s(),
+        };
+        let err = CapabilityAnalyzer::new().infer_cap(&ctx, &send).unwrap_err();
+        match err {
+            NuError::CapError { msg, explanation: Some(why), .. } => {
+                assert!(msg.contains("source: variable `payload`"), "{msg}");
+                assert!(msg.contains("nearest lexical binding"), "{msg}");
+                assert!(msg.contains("`ref`"), "{msg}");
+                assert!(why.contains("`payload`"), "{why}");
+                assert!(why.contains("`ref`"), "{why}");
+            }
+            other => panic!("expected explained capability error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_remote_send_failure_traces_iso_binding_without_weakening_policy() {
+        let ctx = CapContext::new()
+            .with_binding("target", Capability::Val)
+            .with_binding("payload", Capability::Iso);
+        let send = Expr::Send {
+            actor: Box::new(Expr::Var("target".to_string(), s())),
+            behavior: "push".to_string(),
+            args: vec![Expr::Var("payload".to_string(), s())],
+            remote: true,
+            span: s(),
+        };
+        let err = CapabilityAnalyzer::new().infer_cap(&ctx, &send).unwrap_err();
+        match err {
+            NuError::CapError { msg, explanation: Some(why), .. } => {
+                assert!(msg.contains("remote send argument with capability iso"), "{msg}");
+                assert!(msg.contains("source: variable `payload`"), "{msg}");
+                assert!(msg.contains("`iso`"), "{msg}");
+                assert!(msg.contains("serialization boundary"), "{msg}");
+                assert!(why.contains("payload"), "{why}");
+            }
+            other => panic!("expected explained remote send error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_send_failure_traces_explicit_reference_constructor() {
+        let ctx = CapContext::new().with_binding("target", Capability::Val);
+        let send = Expr::Send {
+            actor: Box::new(Expr::Var("target".to_string(), s())),
+            behavior: "push".to_string(),
+            args: vec![Expr::Unary {
+                op: UnOp::Ref(Capability::Ref),
+                expr: Box::new(Expr::Literal(Literal::Int(1), s())),
+                span: s(),
+            }],
+            remote: false,
+            span: s(),
+        };
+        let err = CapabilityAnalyzer::new().infer_cap(&ctx, &send).unwrap_err();
+        match err {
+            NuError::CapError { msg, .. } => {
+                assert!(msg.contains("source: reference constructor `&ref`"), "{msg}");
+                assert!(msg.contains("not sendable"), "{msg}");
+            }
+            other => panic!("expected non-sendable reference error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_send_failure_traces_explicit_capability_annotation() {
+        let ctx = CapContext::new().with_binding("target", Capability::Val);
+        let send = Expr::Send {
+            actor: Box::new(Expr::Var("target".to_string(), s())),
+            behavior: "push".to_string(),
+            args: vec![Expr::CapAnnotate {
+                expr: Box::new(Expr::Literal(Literal::Int(1), s())),
+                cap: Capability::Box,
+                span: s(),
+            }],
+            remote: false,
+            span: s(),
+        };
+        let err = CapabilityAnalyzer::new().infer_cap(&ctx, &send).unwrap_err();
+        match err {
+            NuError::CapError { msg, .. } => {
+                assert!(msg.contains("source: capability annotation `box`"), "{msg}");
+                assert!(!msg.contains("nearest lexical binding"), "{msg}");
+            }
+            other => panic!("expected annotated capability error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_send_failure_on_composite_value_does_not_invent_binding_provenance() {
+        let ctx = CapContext::new()
+            .with_binding("target", Capability::Val)
+            .with_binding("payload", Capability::Ref);
+        let send = Expr::Send {
+            actor: Box::new(Expr::Var("target".to_string(), s())),
+            behavior: "push".to_string(),
+            args: vec![Expr::Tuple(
+                vec![Expr::Var("payload".to_string(), s())],
+                s(),
+            )],
+            remote: false,
+            span: s(),
+        };
+        let err = CapabilityAnalyzer::new().infer_cap(&ctx, &send).unwrap_err();
+        match err {
+            NuError::CapError { msg, .. } => {
+                assert!(
+                    msg.contains("source: this expression evaluates to inferred capability `box`"),
+                    "{msg}"
+                );
+                assert!(msg.contains("no single binding origin is available"), "{msg}");
+                assert!(!msg.contains("nearest lexical binding"), "{msg}");
+            }
+            other => panic!("expected composite capability rejection, got {other:?}"),
+        }
     }
 
     #[test]

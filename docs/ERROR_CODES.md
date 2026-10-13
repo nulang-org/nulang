@@ -110,6 +110,30 @@ by `render_warning`/`format_warning` (src/diagnostic.rs) with a
 
 See `docs/MIGRATION_RFC_0015.md` for the `catch`/`fail` migration guide.
 
+
+## Why an actor-send capability was inferred
+
+When a local or remote actor-send argument fails the capability check, the
+diagnostic now includes a `source:` line alongside the existing `why:` and
+`help:` explanations.
+
+- A variable reports the **nearest lexical capability binding**, respecting
+  shadowing. The binding can come from a parameter annotation or from
+  capability propagation through a `let` binding; the compiler does not
+  falsely label one as the other.
+- A direct reference constructor (`&ref`, `&trn`, etc.) reports that
+  constructor as the source.
+- A capability-annotated expression reports its annotation.
+- Other expressions report their inferred result capability but **do not
+  invent an origin** that the analyzer cannot prove.
+
+This is diagnostic metadata only. Local messages still use their existing
+actor-isolation/sendability contract; remote messages additionally require
+network-serializable capabilities (`val`, `tag` or `linear`). An `iso` value
+may be transferable locally without being legal to serialize remotely.
+Changing the diagnostic neither freezes values nor transfers ownership nor
+grants external capabilities.
+
 ## Output modes
 
 - **tty**: ariadne report — `[Exxxx] Error: msg` header, `╭─[file:line:col]`
