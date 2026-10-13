@@ -11598,7 +11598,10 @@ match { a: 2, b: 9 } with {
         let actor = runtime.actors.get(&actor_id).expect("workflow actor");
         assert!(
             actor.jit_yield_pending,
-            "fixture must reach a genuine JIT safepoint; do not interpret a              bytecode-only run as evidence of terminal correctness"
+            concat!(
+                "fixture must reach a genuine JIT safepoint; ",
+                "bytecode-only completion is not a valid terminal test"
+            )
         );
         let suspended = actor.suspended_execution.as_ref().expect("JIT suspension");
         assert_eq!(suspended.behavior_idx, 1, "second workflow step identity");
