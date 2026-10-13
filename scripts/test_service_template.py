@@ -7,6 +7,7 @@ Requires an already-built Nulang executable and no remote services.
 """
 import os
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -123,7 +124,36 @@ def main() -> int:
                 else:
                     raise RuntimeError("restart did not serve persisted web state")
 
-                print("service template smoke: HTTP routes + acknowledged SQLite write survives SIGKILL")
+                # Force a SQL error on the *real* web request path. It must
+                # become HTTP 500, not a successful response backed by memory.
+                with sqlite3.connect(db_file) as db:
+                    db.execute(
+                        "CREATE TRIGGER web_reject_update "
+                        "BEFORE UPDATE ON nulang_web_kv "
+                        "BEGIN SELECT RAISE(ABORT, 'forced web storage failure'); END"
+                    )
+
+                failed_write = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/state",
+                    data=b"value=must-not-commit",
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    method="POST",
+                )
+                try:
+                    urllib.request.urlopen(failed_write, timeout=3)
+                except urllib.error.HTTPError as error:
+                    assert error.code == 500, f"expected fail-closed HTTP 500, got {error.code}"
+                else:
+                    raise AssertionError("SQLite failure was incorrectly acknowledged")
+
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/state", timeout=3
+                ) as response:
+                    body = response.read().decode("utf-8")
+                    assert "committed-after-restart" in body
+                    assert "must-not-commit" not in body
+
+                print("service template smoke: HTTP + SQLite SIGKILL recovery + fail-closed SQL error")
                 return 0
             except Exception:
                 log.flush()
