@@ -125,12 +125,14 @@ cargo build --release --all-features
 
 ## Verify a source build
 
+Run these commands from the cloned `nulang` repository directory:
+
 ```bash
 # Run the test suite
 cargo test
 
 # Start the REPL
-cargo run -- --repl
+cargo run --release -- --repl
 
 # Run a Nulang program
 cargo run -- examples/01_hello.nula

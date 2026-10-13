@@ -24,6 +24,8 @@ The second argument is the strategy:
 
 ## Adding Children
 
+The short API calls below are **fragments**, not standalone programs. Their actor references, supervisor IDs, or current-actor context must be supplied by a running native example. The complete example later on this page is checked as a module.
+
 Place an existing actor under supervision:
 
 ```nulang
@@ -53,6 +55,7 @@ Child restart policies:
 For `simple_one_for_one` supervisors, set a child template:
 
 ```nulang
+// fragment: requires actor/runtime context
 let sup = perform Otp.create_supervisor("pool", 3)  // simple_one_for_one
 
 // Register a spawnable behavior
@@ -95,12 +98,14 @@ fn main() {
 When `trap_exit` is enabled, linked peer exits arrive as system messages instead of killing the actor. Exit signals are delivered as messages; the actor handles them in its normal message loop.
 
 ```nulang
+// fragment: requires actor/runtime context
 perform Actor.trap_exit(true)
 ```
 
 ## Actor Exit Reasons
 
 ```nulang
+// fragment: requires actor/runtime context
 perform Actor.exit(0)   // Normal
 perform Actor.exit(1)   // Error
 perform Actor.exit(2)   // Kill (cannot be trapped by trap_exit)
@@ -160,6 +165,7 @@ actor Main {
 Register actors by name for discovery:
 
 ```nulang
+// fragment: requires actor/runtime context
 perform Actor.register("logger")
 // ... elsewhere ...
 let logger = perform Actor.whereis("logger")
@@ -168,6 +174,7 @@ let logger = perform Actor.whereis("logger")
 Unregister when done:
 
 ```nulang
+// fragment: requires actor/runtime context
 perform Actor.unregister("logger")
 ```
 
@@ -176,6 +183,7 @@ perform Actor.unregister("logger")
 Control an actor's scheduling priority:
 
 ```nulang
+// fragment: requires actor/runtime context
 perform Actor.set_priority(0)  // High
 perform Actor.set_priority(1)  // Normal (default)
 perform Actor.set_priority(2)  // Low

@@ -1,0 +1,93 @@
+<section class="nu-section nu-fit" aria-labelledby="nulang-fit-heading">
+  <div class="nu-container">
+    <div class="nu-section-header">
+      <h2 id="nulang-fit-heading">Is Nulang right for your project?</h2>
+      <p class="nu-section-subhead">Nulang is an alpha language for exploring typed actors, supervised failures, and opt-in durable state. Its design is promising, but its ecosystem and operational maturity are still developing.</p>
+    </div>
+    <div class="fit-grid">
+      <div class="fit-card">
+        <h3>Good reasons to experiment</h3>
+        <ul>
+          <li>Prototype concurrent services with actor isolation and supervision.</li>
+          <li>Explore static types, row-polymorphic effects, and reference capabilities in one language.</li>
+          <li>Evaluate persistent actors and restart recovery using your own failure tests.</li>
+        </ul>
+      </div>
+      <div class="fit-card fit-caution">
+        <h3>Choose a mature stack when</h3>
+        <ul>
+          <li>You need production SLAs, established tooling, or a large package ecosystem today.</li>
+          <li>You need proven multi-node failover: clustering and distribution remain experimental.</li>
+          <li>You are building a conventional web frontend or a simple CLI application.</li>
+        </ul>
+      </div>
+    </div>
+    <p class="fit-followup">
+      <a href="/blog/">Compare Nulang with Erlang/Elixir, Rust, Go, and TypeScript</a>
+      <span aria-hidden="true">→</span>
+    </p>
+  </div>
+</section>
+
+<style>
+  .nu-fit {
+    padding-top: 0;
+  }
+
+  .fit-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 1rem;
+  }
+
+  .fit-card {
+    padding: clamp(1.25rem, 2vw, 1.75rem);
+    border: 1px solid var(--nu-border);
+    border-radius: 0.85rem;
+    background: var(--nu-surface);
+  }
+
+  .fit-card h3 {
+    margin: 0 0 0.9rem;
+    font-size: 1.03rem;
+    color: var(--nu-text);
+    letter-spacing: -0.01em;
+  }
+
+  .fit-card ul {
+    margin: 0;
+    padding-left: 1.2rem;
+    color: var(--nu-text-secondary);
+    font-size: 0.9rem;
+    line-height: 1.7;
+  }
+
+  .fit-card li + li {
+    margin-top: 0.65rem;
+  }
+
+  .fit-caution {
+    border-color: var(--nu-border-subtle);
+  }
+
+  .fit-followup {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    margin-top: 1.25rem;
+    font-size: 0.88rem;
+    font-weight: 650;
+  }
+
+  .fit-followup a {
+    color: var(--nu-accent-high);
+    text-decoration: underline;
+    text-underline-offset: 0.18rem;
+  }
+
+  @media (max-width: 44rem) {
+    .fit-grid {
+      grid-template-columns: 1fr;
+    }
+  }
+</style>

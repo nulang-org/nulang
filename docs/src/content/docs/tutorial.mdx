@@ -15,16 +15,18 @@ cd nulang
 cargo build --release
 ```
 
-Verify your installation:
+From the cloned repository root, run the version check and release-mode REPL:
 
 ```bash
-cargo run -- --version
-cargo run -- --repl
+cargo run --release -- --version
+cargo run --release -- --repl
 ```
 
 For detailed platform-specific instructions, see the [Installation](/getting-started/installation/) page.
 
 ## 2. Hello, World!
+
+The browser [playground](/playground/) runs the Core language subset. Actor examples later in this tutorial require the native binary built above.
 
 Nulang uses **algebraic effects** for I/O. Print to the console with `perform IO.print`:
 
@@ -35,13 +37,13 @@ perform IO.print("Hello, Nulang!")
 Run it:
 
 ```bash
-cargo run -- --eval 'perform IO.print("Hello, Nulang!")'
+cargo run --release -- --eval 'perform IO.print("Hello, Nulang!")'
 ```
 
 Or start the REPL and type interactively:
 
 ```bash
-cargo run -- --repl
+cargo run --release -- --repl
 nulang> perform IO.print("Hello, Nulang!")
 ```
 
