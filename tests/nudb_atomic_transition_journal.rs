@@ -86,11 +86,11 @@ fn full_transition_round_trips_after_checkpoint_and_restart() {
             EffectBoundary::External,
             DeliverySemantics::AtLeastOnce,
         );
-        record.durable_effects.push(
-            DurableEffectPersistenceRecord::from_effect(DurableEffectRecord::prepare(
-                spec, b"prompt",
-            )),
-        );
+        record
+            .durable_effects
+            .push(DurableEffectPersistenceRecord::from_effect(
+                DurableEffectRecord::prepare(spec, b"prompt"),
+            ));
         record
     };
     let digest = original.digest().unwrap();
@@ -137,11 +137,17 @@ fn retries_are_idempotent_and_conflicts_or_stale_epochs_do_not_advance_wal() {
             std::io::ErrorKind::AlreadyExists
         );
         assert_eq!(
-            journal.commit_transition(transition(99, 2, 3)).unwrap_err().kind(),
+            journal
+                .commit_transition(transition(99, 2, 3))
+                .unwrap_err()
+                .kind(),
             std::io::ErrorKind::PermissionDenied
         );
         assert_eq!(
-            journal.commit_transition(transition(99, 3, 4)).unwrap_err().kind(),
+            journal
+                .commit_transition(transition(99, 3, 4))
+                .unwrap_err()
+                .kind(),
             std::io::ErrorKind::InvalidData
         );
         assert_eq!(journal.tablet_sequence(), 1);
@@ -154,8 +160,22 @@ fn retries_are_idempotent_and_conflicts_or_stale_epochs_do_not_advance_wal() {
 
     let journal = NuDbTransitionJournal::open(&path).unwrap();
     assert_eq!(journal.load_tail_position(99).unwrap().unwrap().sequence, 2);
-    assert_eq!(journal.load_transition(99, 1).unwrap().unwrap().activation_epoch, 4);
-    assert_eq!(journal.load_transition(99, 2).unwrap().unwrap().activation_epoch, 5);
+    assert_eq!(
+        journal
+            .load_transition(99, 1)
+            .unwrap()
+            .unwrap()
+            .activation_epoch,
+        4
+    );
+    assert_eq!(
+        journal
+            .load_transition(99, 2)
+            .unwrap()
+            .unwrap()
+            .activation_epoch,
+        5
+    );
     drop(journal);
     cleanup(&path);
 }
