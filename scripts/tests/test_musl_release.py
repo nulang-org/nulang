@@ -48,6 +48,22 @@ class MuslReleaseTests(unittest.TestCase):
         self.assertIn("--backend native", job)
         self.assertIn("nulang-linux-x86_64-musl", job)
 
+    def test_musl_profile_runs_real_tcp_and_mutual_tls_regressions(self):
+        """Existing transport tests should execute against musl, not just compile."""
+        workflow = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        job = workflow.split("  musl-verify:\n", 1)[1].split("  publish:\n", 1)[0]
+        self.assertIn("cargo test --locked --release --target x86_64-unknown-linux-musl", job)
+        self.assertIn("--no-default-features --features release-musl --lib test_mutual_tls_", job)
+        self.assertIn("--no-default-features --features release-musl --lib test_transport_send_receive", job)
+        runtime = (ROOT / "src/runtime/tests.rs").read_text(encoding="utf-8")
+        for test_name in (
+            "test_mutual_tls_connect_and_verify",
+            "test_mutual_tls_cluster_converges",
+            "test_mutual_tls_rejects_cert_identity_mismatch",
+            "test_mutual_tls_rejects_plaintext_peer",
+        ):
+            self.assertIn("fn " + test_name + "(", runtime)
+
     @unittest.skipUnless(
         sys.platform.startswith('linux') and shutil.which('gcc') and shutil.which('readelf'),
         'requires Linux, gcc, and binutils',

@@ -298,6 +298,12 @@ jobs:
       - name: Verify no ELF dynamic loader or shared libraries
         run: bash scripts/check_release_linux_static.sh target/x86_64-unknown-linux-musl/release/nulang
 
+      - name: Test TCP transport under musl (existing integration test)
+        run: cargo test --locked --release --target x86_64-unknown-linux-musl --no-default-features --features release-musl --lib test_transport_send_receive -- --test-threads=1
+
+      - name: Test mutual TLS under musl (connect, converge, reject)
+        run: cargo test --locked --release --target x86_64-unknown-linux-musl --no-default-features --features release-musl --lib test_mutual_tls_ -- --test-threads=1
+
       - name: Smoke musl CLI on Linux
         shell: bash
         run: |
