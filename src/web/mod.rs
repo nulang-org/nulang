@@ -15,5 +15,8 @@ pub mod reactivity;
 pub mod request_bindings;
 pub mod route_check;
 pub mod runtime_bindings;
-pub mod session_action_admission;
+// This non-executing admission seam is staged for an authenticated HTTP
+// integration; do not expose it as production authority until that exists.
+#[allow(dead_code)]
+pub(crate) mod session_action_admission;
 pub mod validation;
