@@ -1443,6 +1443,25 @@ impl<'c> FnLowerer<'c> {
                         }
                     }
                 }
+                // Experimental application SQL: use the same VM suspension
+                // path as LLM.ask, but a separate bounded query executor.
+                // Durable actors are rejected by the runtime until SQL effect
+                // receipts/replay are defined.
+                if effect == "DB" && op == "query_checked_async" {
+                    let mut sql_args = Vec::with_capacity(args.len());
+                    for arg in args {
+                        sql_args.push(self.lower_operand(arg)?);
+                    }
+                    self.b.assign(
+                        dst,
+                        mir::RValue::PerformAsync {
+                            effect_op: "DB.query_checked_async".to_string(),
+                            args: sql_args,
+                            resolved_handler: None,
+                        },
+                    );
+                    return Ok(());
+                }
                 // 1-arg Timer.sleep(ms) routes through PerformAsync for suspension.
                 // 2-arg Timer.sleep(name, ms) stays as Perform for workflow timers.
                 if effect == "Timer" && op == "sleep" && args.len() == 1 {
