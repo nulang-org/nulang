@@ -8,6 +8,12 @@ on:
       - '.github/workflows/remote-rtt-stage-profile-pr.yml'
       - 'src/runtime/**'
 
+# Superseding commits should invalidate earlier profiling runs on the same PR.
+# Keep independent pull requests isolated by their PR number.
+concurrency:
+  group: remote-rtt-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
