@@ -734,16 +734,12 @@ impl Resolver {
 
         let dest = registry_cache_dir(&self.root_dir, dep_name, best)?;
 
-        // Reuse cached extraction.
-        if dest.join(MANIFEST_FILE).exists() {
-            let dir = std::fs::canonicalize(&dest).map_err(|e| NuError::PackageError {
-                msg: format!("cannot resolve {}: {}", dest.display(), e),
-                span: Span::default(),
-            })?;
-            return Ok((dir, best.clone()));
-        }
+        // Even an existing cache must be checked against publisher-authenticated
+        // bytes. A cache from before signing cannot bypass publisher trust.
+        // Offline cache-only resolution remains separately pinned by Nulang.lock.
+        let existed = dest.exists();
 
-        // Download and extract.
+        // Download and authenticate before using any registry source.
         let tarball = client
             .fetch_verified(dep_name, best, &self.root_dir)
             .map_err(|e| NuError::PackageError {
@@ -753,6 +749,59 @@ impl Resolver {
                 ),
                 span: Span::default(),
             })?;
+
+        if existed {
+            // Extract authenticated bytes only into a distinct verification
+            // directory. Compare the *entire* extracted tree; never overwrite
+            // a potentially locally modified existing cache.
+            let parent = dest.parent().expect("registry cache has parent");
+            let mut verified = None;
+            for nonce in 0..128u32 {
+                let check_dir = parent.join(format!(
+                    ".{}-{}.verify-{}-{}",
+                    dep_name, best, std::process::id(), nonce
+                ));
+                if check_dir.exists() {
+                    continue;
+                }
+                let fresh = crate::package::registry_archive::extract_registry_archive(
+                    &tarball, &check_dir, dep_name, best
+                )?;
+                verified = Some(fresh);
+                break;
+            }
+            let fresh = verified.ok_or_else(|| NuError::PackageError {
+                msg: "cannot allocate unique registry verification directory".to_string(),
+                span: Span::default(),
+            })?;
+            let cached_id = crate::package::identity::registry_tree_id_for_package_dir(&dest);
+            let signed_id = crate::package::identity::registry_tree_id_for_package_dir(&fresh);
+            let cleanup = std::fs::remove_dir_all(&fresh);
+            if let Err(error) = cleanup {
+                return Err(NuError::PackageError {
+                    msg: format!("cannot remove registry verification directory: {}", error),
+                    span: Span::default(),
+                });
+            }
+            let cached_id = cached_id.map_err(|e| NuError::PackageError {
+                msg: format!("invalid registry cache for '{}': {}", dep_name, e),
+                span: Span::default(),
+            })?;
+            let signed_id = signed_id.map_err(|e| NuError::PackageError {
+                msg: format!("invalid authenticated registry archive for '{}': {}", dep_name, e),
+                span: Span::default(),
+            })?;
+            if cached_id != signed_id {
+                return Err(NuError::PackageError {
+                    msg: format!(
+                        "registry cache for '{}' differs from publisher-authenticated archive; inspect before clearing it",
+                        dep_name
+                    ),
+                    span: Span::default(),
+                });
+            }
+            return Ok((dest, best.clone()));
+        }
 
         let dir = crate::package::registry_archive::extract_registry_archive(
             &tarball, &dest, dep_name, best
