@@ -14,6 +14,7 @@ on:
       - 'scripts/check_release_linux.sh'
       - 'scripts/tests/test_release_cli_profile.py'
       - 'scripts/tests/test_bsd_distribution.py'
+      - 'examples/08_actors.nula'
 
 env:
   CARGO_TERM_COLOR: always
@@ -291,6 +292,7 @@ jobs:
             "$bin" --version
             test "$("$bin" --eval 'perform IO.print("release-smoke")')" = "release-smoke"
             "$bin" examples/01_hello.nula
+            "$bin" examples/08_actors.nula
 
             mkdir -p dist
             install -m 0755 "$bin" dist/nulang-freebsd-x86_64
