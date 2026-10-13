@@ -181,7 +181,14 @@ fn collect(
                     } else {
                         PublicKind::TypeAlias
                     },
-                    body.clone(),
+                    if *opaque {
+                        Type::Nominal {
+                            name: qualified(scope, name),
+                            underlying: Box::new(Type::unit()),
+                        }
+                    } else {
+                        body.clone()
+                    },
                     type_params.len(),
                     &[],
                     0,
@@ -429,6 +436,36 @@ mod tests {
             interface_for_hir(&alias(true)).unwrap().api_digest,
             interface_for_hir(&alias(false)).unwrap().api_digest
         );
+    }
+
+    #[test]
+    fn opaque_private_representation_does_not_affect_source_api_digest() {
+        let alias = |body| module(vec![Decl::TypeAlias {
+            name: "Token".to_string(),
+            type_params: vec![],
+            body,
+            opaque: true,
+            public: true,
+            span: Span::default(),
+        }]);
+        let first = interface_for_hir(&alias(primitive(PrimitiveType::Int))).unwrap();
+        let second = interface_for_hir(&alias(primitive(PrimitiveType::String))).unwrap();
+        assert_eq!(first.api_digest, second.api_digest);
+        assert_eq!(first.exports, second.exports);
+    }
+
+    #[test]
+    fn opaque_parameters_hash_by_identity_not_private_representation() {
+        let nominal = |underlying| Type::Nominal {
+            name: "test::Token".to_string(),
+            underlying: Box::new(underlying),
+        };
+        let make = |underlying| module(vec![function(
+            "accept", true, nominal(underlying), Type::unit(), vec![],
+        )]);
+        let first = interface_for_hir(&make(primitive(PrimitiveType::Int))).unwrap();
+        let second = interface_for_hir(&make(primitive(PrimitiveType::String))).unwrap();
+        assert_eq!(first.api_digest, second.api_digest);
     }
 
     #[test]
