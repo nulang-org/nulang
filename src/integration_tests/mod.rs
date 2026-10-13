@@ -11560,6 +11560,62 @@ match { a: 2, b: 9 } with {
         );
     }
 
+    /// An actual JIT preemption is not a completed durable workflow turn.
+    /// Keep this as a separate regression from the standalone actor liveness
+    /// test: terminal-event ordering and step identity are durability contracts.
+    #[cfg(feature = "native-codegen")]
+    #[test]
+    fn test_workflow_jit_preemption_retains_activation_without_terminal_receipt() {
+        let source = r#"
+            fn bump(n: Int) -> Int {
+                let a = n + 1
+                let b = a + 2
+                b - 2
+            }
+            workflow JitFence {
+                step first { self.step_index = self.step_index + 1 }
+                step hot {
+                    var i = 0
+                    while i < 50000 {
+                        i = bump(i)
+                    }
+                    self.step_index = self.step_index + 1
+                }
+            }
+            let w = spawn JitFence {} in { w }
+        "#;
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        let (value, _) = run_source_with_runtime(source, rt.clone()).unwrap();
+        let actor_id = value.as_actor_id().expect("spawned workflow reference");
+
+        // One real scheduler dispatch, not a synthetic call to the JIT
+        // resume helper. Repeated hot function entries exhaust the native
+        // safepoint budget after tier-up.
+        rt.borrow_mut().send_message_by_id(actor_id, 1, &[]);
+        rt.borrow_mut().step_actor(actor_id);
+
+        let runtime = rt.borrow();
+        let actor = runtime.actors.get(&actor_id).expect("workflow actor");
+        assert!(
+            actor.jit_yield_pending,
+            "fixture must reach a genuine JIT safepoint; do not interpret a              bytecode-only run as evidence of terminal correctness"
+        );
+        let suspended = actor.suspended_execution.as_ref().expect("JIT suspension");
+        assert_eq!(suspended.behavior_idx, 1, "second workflow step identity");
+        assert_eq!(suspended.step_name, "hot", "canonical workflow step name");
+        assert_eq!(suspended.activation, actor.current_workflow_activation);
+        let events = runtime.persistence.read_workflow_events(actor_id);
+        assert!(
+            !events.iter().any(|event| {
+                matches!(
+                    event,
+                    WorkflowEvent::StepCompleted { step_name, .. } if step_name == "hot"
+                )
+            }),
+            "a JIT preemption must not commit StepCompleted: {events:?}"
+        );
+    }
+
     /// Verify the JIT safepoint infrastructure does not cause hangs or
     /// crashes when an actor with a tight loop yields to the scheduler.
     /// The busy-loop actor is given a minimal safepoint budget so the
