@@ -188,7 +188,7 @@ fn apply_candidates(
             continue;
         }
 
-        if c.callee.has_handlers || c.callee.is_recursive || c.callee.blocks.len() != 1 {
+        if c.callee.has_handlers || c.callee.is_recursive || !callee_is_small_and_pure(c) {
             continue;
         }
 
@@ -274,6 +274,95 @@ fn apply_candidates(
 // Eligibility analysis
 // ---------------------------------------------------------------------------
 
+/// Keep the inlining budget small until call-site specialization and code-size
+/// accounting are available. Large functions and repeated call sites retain
+/// their normal compiled function call.
+const MAX_INLINE_BODY_STMTS: usize = 12;
+const MAX_INLINE_BODY_LOCALS: usize = 24;
+const MAX_INLINE_CALL_SITES: usize = 4;
+
+/// This pass runs before the normal MIR optimizer. Only a small, single-block,
+/// side-effect-free subset is eligible: effect sites carry replay and source
+/// identities which cannot safely be copied into the caller by this pass.
+/// Parameter/capture assignments must also be rejected because the inliner
+/// currently maps those locals directly to the caller's live registers.
+fn callee_is_small_and_pure(candidate: &Candidate) -> bool {
+    let callee = &candidate.callee;
+    if callee.blocks.len() != 1
+        || callee.blocks[0].stmts.len() > MAX_INLINE_BODY_STMTS
+        || callee.locals.len() > MAX_INLINE_BODY_LOCALS
+        || candidate.call_sites.len() > MAX_INLINE_CALL_SITES
+        || callee.captures.len() != candidate.captures.len()
+        || !matches!(&callee.blocks[0].terminator, Terminator::Return(Some(_)))
+        || candidate
+            .call_sites
+            .iter()
+            .any(|site| site.args.len() != callee.params.len())
+    {
+        return false;
+    }
+    callee.blocks[0].stmts.iter().all(|stmt| match stmt {
+        Stmt::Assign { dst, op } => {
+            !callee.params.contains(dst)
+                && !callee.captures.contains(dst)
+                && matches!(
+                    op,
+                    RValue::Const(_)
+                        | RValue::Load(_)
+                        | RValue::Unary(..)
+                        | RValue::Binary(..)
+                        | RValue::StringEq(..)
+                )
+        }
+        _ => false,
+    })
+}
+
+/// Require a single definition that dominates *every* call and an unchanged
+/// capture snapshot. A broader dataflow proof can replace this conservative
+/// same-basic-block restriction in a future optimization.
+fn call_sites_have_stable_definition(
+    caller: &Function,
+    closure: LocalId,
+    definition_block: usize,
+    definition_stmt: usize,
+    captures: &[LocalId],
+    calls: &[CallSite],
+) -> bool {
+    if calls.is_empty()
+        || calls.len() > MAX_INLINE_CALL_SITES
+        || caller.params.contains(&closure)
+        || caller.captures.contains(&closure)
+    {
+        return false;
+    }
+    let definitions = caller
+        .blocks
+        .iter()
+        .flat_map(|block| block.stmts.iter())
+        .filter(|stmt| matches!(stmt, Stmt::Assign { dst, .. } if *dst == closure))
+        .count();
+    if definitions != 1 {
+        return false;
+    }
+    let Some(block) = caller.blocks.get(definition_block) else {
+        return false;
+    };
+    let mut last_call = definition_stmt;
+    for call in calls {
+        if call.block != block.id || call.stmt_idx <= definition_stmt || call.dst == closure {
+            return false;
+        }
+        last_call = last_call.max(call.stmt_idx);
+    }
+    // Captures are values taken at closure construction, not live reads of the
+    // caller's variables. Until we snapshot them explicitly, any later write
+    // invalidates inlining.
+    !block.stmts[definition_stmt + 1..=last_call]
+        .iter()
+        .any(|stmt| matches!(stmt, Stmt::Assign { dst, .. } if captures.contains(dst)))
+}
+
 /// A discovered call site for an eligible closure.
 struct CallSite {
     block: BlockId,
@@ -298,8 +387,8 @@ fn find_eligible_closures(
     };
     let mut result = Vec::new();
 
-    for (_block_idx, block) in caller.blocks.iter().enumerate() {
-        for (_si, stmt) in block.stmts.iter().enumerate() {
+    for (block_idx, block) in caller.blocks.iter().enumerate() {
+        for (stmt_idx, stmt) in block.stmts.iter().enumerate() {
             let (clos_local, callee_idx, captures) = match stmt {
                 Stmt::Assign {
                     dst,
@@ -309,7 +398,16 @@ fn find_eligible_closures(
             };
 
             let mut calls = Vec::new();
-            if !all_uses_are_calls(caller, clos_local, &mut calls) {
+            if !all_uses_are_calls(caller, clos_local, &mut calls)
+                || !call_sites_have_stable_definition(
+                    caller,
+                    clos_local,
+                    block_idx,
+                    stmt_idx,
+                    &captures,
+                    &calls,
+                )
+            {
                 continue;
             }
 
@@ -371,11 +469,9 @@ fn stmt_uses_local(stmt: &Stmt, local: LocalId) -> bool {
         Stmt::Assign { dst, op } => *dst == local || rvalue_uses_local(op, local),
         Stmt::StoreFieldNamed { obj, src, .. } => *obj == local || *src == local,
         Stmt::ArrayStore { arr, idx, src } => *arr == local || *idx == local || *src == local,
-        Stmt::EnterHandle { .. }
-        | Stmt::PopHandler
-        | Stmt::StateSet { .. }
-        | Stmt::Emit { .. }
-        | Stmt::ParallelMarker { .. } => false,
+        Stmt::StateSet { src, .. } => *src == local,
+        Stmt::Emit { args, .. } => args.contains(&local),
+        Stmt::EnterHandle { .. } | Stmt::PopHandler | Stmt::ParallelMarker { .. } => false,
     }
 }
 
@@ -598,15 +694,42 @@ fn inline_one_call(
 /// allocated the now-dead closure.
 fn remove_closure_allocation(func: &mut Function, clos: LocalId) {
     for block in &mut func.blocks {
-        block.stmts.retain(|stmt| {
-            !matches!(
-                stmt,
-                Stmt::Assign {
-                    dst,
-                    op: RValue::Closure { .. }
-                } if *dst == clos
-            )
+        let removed: Vec<usize> = block
+            .stmts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, stmt)| {
+                matches!(
+                    stmt,
+                    Stmt::Assign {
+                        dst,
+                        op: RValue::Closure { .. }
+                    } if *dst == clos
+                )
+                .then_some(index)
+            })
+            .collect();
+        if removed.is_empty() {
+            continue;
+        }
+        let block_id = block.id;
+        block.stmts = std::mem::take(&mut block.stmts)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, stmt)| (!removed.contains(&index)).then_some(stmt))
+            .collect();
+
+        // Source lines are keyed by statement index. Removing an allocation
+        // must discard its line and shift later indices in that basic block.
+        func.line_table.retain(|((bid, index), _)| {
+            *bid != block_id || !removed.contains(index)
         });
+        for ((bid, index), _) in &mut func.line_table {
+            if *bid == block_id {
+                let shift = removed.iter().filter(|&&old| old < *index).count();
+                *index -= shift;
+            }
+        }
     }
 }
 
@@ -1003,6 +1126,192 @@ mod tests {
 
         let count = inline_local_closures(&mut m);
         assert_eq!(count, 1, "closure with captures should be inlined");
+    }
+
+    #[test]
+    fn test_inlining_removes_stale_closure_source_lines() {
+        let mut m = build_inlinable_program();
+        let caller = &mut m.functions[1];
+        caller.line_table = vec![
+            ((BlockId(0), 0), 10),
+            ((BlockId(0), 1), 20),
+            ((BlockId(0), 2), 30),
+        ];
+
+        assert_eq!(inline_local_closures(&mut m), 1);
+
+        let caller = &m.functions[1];
+        assert_eq!(caller.blocks[0].stmts.len(), 1);
+        assert!(
+            caller.line_table.iter().all(|((bid, si), _)| {
+                caller.blocks.get(bid.0 as usize)
+                    .is_some_and(|block| *si < block.stmts.len())
+            }),
+            "all debugger line indices must refer to surviving statements"
+        );
+        assert!(caller.line_table.contains(&((BlockId(0), 0), 10)));
+        assert!(!caller.line_table.iter().any(|(_, line)| *line == 20));
+    }
+
+    #[test]
+    fn test_closure_used_in_state_write_is_not_removed() {
+        let mut m = build_inlinable_program();
+        let closure = match &m.functions[1].blocks[0].stmts[1] {
+            Stmt::Assign { dst, .. } => *dst,
+            _ => panic!("expected closure allocation"),
+        };
+        m.functions[1].blocks[0].stmts.insert(
+            2,
+            Stmt::StateSet { field: "fn".into(), src: closure },
+        );
+        assert_eq!(inline_local_closures(&mut m), 0, "actor state must retain the closure");
+    }
+
+    #[test]
+    fn test_closure_used_in_emitted_event_is_not_removed() {
+        let mut m = build_inlinable_program();
+        let closure = match &m.functions[1].blocks[0].stmts[1] {
+            Stmt::Assign { dst, .. } => *dst,
+            _ => panic!("expected closure allocation"),
+        };
+        m.functions[1].blocks[0].stmts.insert(
+            2,
+            Stmt::Emit { event: "stored".into(), args: vec![closure] },
+        );
+        assert_eq!(inline_local_closures(&mut m), 0, "event payload must retain the closure");
+    }
+
+    #[test]
+    fn test_no_inline_reassigned_closure_local() {
+        let mut m = make_module();
+        for value in [1, 2] {
+            let mut callee = crate::mir::FunctionBuilder::new("constant", None);
+            let ret = callee.add_temp(crate::types::Type::int());
+            callee.assign(ret, RValue::Const(Constant::Int(value)));
+            callee.terminate(Terminator::Return(Some(ret)));
+            m.functions.push(callee.build());
+        }
+        let mut caller = crate::mir::FunctionBuilder::new("caller", None);
+        let clos = caller.add_temp(crate::types::Type::unit());
+        let dst = caller.add_temp(crate::types::Type::int());
+        caller.assign(clos, RValue::Closure { func: 0, captures: vec![] });
+        caller.assign(clos, RValue::Closure { func: 1, captures: vec![] });
+        caller.assign(dst, RValue::Call { func: FuncRef::Local(clos), args: vec![] });
+        caller.terminate(Terminator::Return(Some(dst)));
+        m.functions.push(caller.build());
+
+        assert_eq!(inline_local_closures(&mut m), 0, "reassigned closure identity is not invariant");
+        assert!(m.functions[2].blocks[0].stmts.iter().any(|stmt|
+            matches!(stmt, Stmt::Assign { op: RValue::Call { func: FuncRef::Local(_), .. }, .. })
+        ));
+    }
+
+    #[test]
+    fn test_no_inline_when_call_precedes_closure_definition() {
+        let mut m = build_inlinable_program();
+        let caller = &mut m.functions[1];
+        caller.blocks[0].stmts.swap(1, 2);
+        assert_eq!(inline_local_closures(&mut m), 0, "definition must dominate the call");
+    }
+
+    #[test]
+    fn test_no_inline_after_capture_reassignment() {
+        let mut m = make_module();
+        let mut callee = crate::mir::FunctionBuilder::new("capture", None);
+        let capture = callee.add_capture("captured", crate::types::Type::int());
+        callee.terminate(Terminator::Return(Some(capture)));
+        m.functions.push(callee.build());
+
+        let mut caller = crate::mir::FunctionBuilder::new("caller", None);
+        let captured = caller.add_temp(crate::types::Type::int());
+        let clos = caller.add_temp(crate::types::Type::unit());
+        let result = caller.add_temp(crate::types::Type::int());
+        caller.assign(captured, RValue::Const(Constant::Int(4)));
+        caller.assign(clos, RValue::Closure { func: 0, captures: vec![captured] });
+        caller.assign(captured, RValue::Const(Constant::Int(9)));
+        caller.assign(result, RValue::Call { func: FuncRef::Local(clos), args: vec![] });
+        caller.terminate(Terminator::Return(Some(result)));
+        m.functions.push(caller.build());
+
+        assert_eq!(inline_local_closures(&mut m), 0, "closures capture values at construction");
+    }
+
+    #[test]
+    fn test_no_inline_when_callee_reassigns_parameter() {
+        let mut m = make_module();
+        let mut callee = crate::mir::FunctionBuilder::new("assign_param", None);
+        let param = callee.add_param("p", crate::types::Type::int());
+        callee.assign(param, RValue::Const(Constant::Int(99)));
+        callee.terminate(Terminator::Return(Some(param)));
+        m.functions.push(callee.build());
+
+        let mut caller = crate::mir::FunctionBuilder::new("caller", None);
+        let arg = caller.add_temp(crate::types::Type::int());
+        let clos = caller.add_temp(crate::types::Type::unit());
+        let dst = caller.add_temp(crate::types::Type::int());
+        caller.assign(arg, RValue::Const(Constant::Int(3)));
+        caller.assign(clos, RValue::Closure { func: 0, captures: vec![] });
+        caller.assign(dst, RValue::Call { func: FuncRef::Local(clos), args: vec![arg] });
+        caller.terminate(Terminator::Return(Some(dst)));
+        m.functions.push(caller.build());
+
+        assert_eq!(inline_local_closures(&mut m), 0, "callee param writes must not clobber caller locals");
+    }
+
+    #[test]
+    fn test_no_inline_wrong_call_arity() {
+        let mut m = build_inlinable_program();
+        if let Stmt::Assign { op: RValue::Call { args, .. }, .. } =
+            &mut m.functions[1].blocks[0].stmts[2] {
+            args.clear();
+        } else {
+            panic!("expected call");
+        }
+        assert_eq!(inline_local_closures(&mut m), 0, "arity mismatch must retain runtime error");
+    }
+
+    #[test]
+    fn test_no_inline_effectful_body() {
+        let mut m = make_module();
+        let mut callee = crate::mir::FunctionBuilder::new("effectful", None);
+        let result = callee.add_temp(crate::types::Type::int());
+        callee.assign(result, RValue::Panic("reachable failure".into()));
+        callee.terminate(Terminator::Return(Some(result)));
+        m.functions.push(callee.build());
+
+        let mut caller = crate::mir::FunctionBuilder::new("caller", None);
+        let clos = caller.add_temp(crate::types::Type::unit());
+        let dst = caller.add_temp(crate::types::Type::int());
+        caller.assign(clos, RValue::Closure { func: 0, captures: vec![] });
+        caller.assign(dst, RValue::Call { func: FuncRef::Local(clos), args: vec![] });
+        caller.terminate(Terminator::Return(Some(dst)));
+        m.functions.push(caller.build());
+
+        assert_eq!(inline_local_closures(&mut m), 0, "diverging operations must not be copied into caller");
+    }
+
+    #[test]
+    fn test_no_inline_oversized_body() {
+        let mut m = make_module();
+        let mut callee = crate::mir::FunctionBuilder::new("oversized", None);
+        let mut values = Vec::new();
+        for i in 0..20 {
+            let local = callee.add_temp(crate::types::Type::int());
+            callee.assign(local, RValue::Const(Constant::Int(i)));
+            values.push(local);
+        }
+        callee.terminate(Terminator::Return(values.last().copied()));
+        m.functions.push(callee.build());
+
+        let mut caller = crate::mir::FunctionBuilder::new("caller", None);
+        let clos = caller.add_temp(crate::types::Type::unit());
+        let dst = caller.add_temp(crate::types::Type::int());
+        caller.assign(clos, RValue::Closure { func: 0, captures: vec![] });
+        caller.assign(dst, RValue::Call { func: FuncRef::Local(clos), args: vec![] });
+        caller.terminate(Terminator::Return(Some(dst)));
+        m.functions.push(caller.build());
+
+        assert_eq!(inline_local_closures(&mut m), 0, "large bodies should remain out of line");
     }
 
     #[test]
