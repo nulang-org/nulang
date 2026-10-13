@@ -31,49 +31,79 @@ fn bind_owned_param(
     let invalid = || {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("parameter is incompatible with PostgreSQL type {}", expected.name()),
+            format!(
+                "parameter is incompatible with PostgreSQL type {}",
+                expected.name()
+            ),
         )
     };
-    match (param, expected) {
-        (OwnedDbParam::Int(value), &Type::INT2) => Ok(Box::new(
-            i16::try_from(*value).map_err(|_| invalid())?,
-        )),
-        (OwnedDbParam::Int(value), &Type::INT4) => Ok(Box::new(
-            i32::try_from(*value).map_err(|_| invalid())?,
-        )),
-        (OwnedDbParam::Int(value), &Type::INT8) => Ok(Box::new(*value)),
-        (OwnedDbParam::Float(value), &Type::FLOAT4) => {
-            let narrowed = *value as f32;
-            if !value.is_finite() || !narrowed.is_finite() {
+    match param {
+        OwnedDbParam::Int(value) => {
+            if expected == &Type::INT2 {
+                Ok(Box::new(i16::try_from(*value).map_err(|_| invalid())?))
+            } else if expected == &Type::INT4 {
+                Ok(Box::new(i32::try_from(*value).map_err(|_| invalid())?))
+            } else if expected == &Type::INT8 {
+                Ok(Box::new(*value))
+            } else {
+                Err(invalid())
+            }
+        }
+        OwnedDbParam::Float(value) => {
+            if !value.is_finite() {
                 return Err(invalid());
             }
-            Ok(Box::new(narrowed))
+            if expected == &Type::FLOAT4 {
+                let narrowed = *value as f32;
+                if !narrowed.is_finite() {
+                    return Err(invalid());
+                }
+                Ok(Box::new(narrowed))
+            } else if expected == &Type::FLOAT8 {
+                Ok(Box::new(*value))
+            } else {
+                Err(invalid())
+            }
         }
-        (OwnedDbParam::Float(value), &Type::FLOAT8) if value.is_finite() => {
-            Ok(Box::new(*value))
+        OwnedDbParam::Bool(value) if expected == &Type::BOOL => Ok(Box::new(*value)),
+        OwnedDbParam::Text(value)
+            if expected == &Type::TEXT
+                || expected == &Type::VARCHAR
+                || expected == &Type::BPCHAR
+                || expected == &Type::NAME
+                || expected == &Type::UNKNOWN =>
+        {
+            Ok(Box::new(value.clone()))
         }
-        (OwnedDbParam::Bool(value), &Type::BOOL) => Ok(Box::new(*value)),
-        (OwnedDbParam::Text(value), &Type::TEXT)
-        | (OwnedDbParam::Text(value), &Type::VARCHAR)
-        | (OwnedDbParam::Text(value), &Type::BPCHAR)
-        | (OwnedDbParam::Text(value), &Type::NAME)
-        | (OwnedDbParam::Text(value), &Type::UNKNOWN) => Ok(Box::new(value.clone())),
-        (OwnedDbParam::Json(value), &Type::JSON)
-        | (OwnedDbParam::Json(value), &Type::JSONB) => Ok(Box::new(value.clone())),
-        (OwnedDbParam::Null, &Type::INT2) => Ok(Box::new(None::<i16>)),
-        (OwnedDbParam::Null, &Type::INT4) => Ok(Box::new(None::<i32>)),
-        (OwnedDbParam::Null, &Type::INT8) => Ok(Box::new(None::<i64>)),
-        (OwnedDbParam::Null, &Type::FLOAT4) => Ok(Box::new(None::<f32>)),
-        (OwnedDbParam::Null, &Type::FLOAT8) => Ok(Box::new(None::<f64>)),
-        (OwnedDbParam::Null, &Type::BOOL) => Ok(Box::new(None::<bool>)),
-        (OwnedDbParam::Null, &Type::JSON) | (OwnedDbParam::Null, &Type::JSONB) => {
-            Ok(Box::new(None::<serde_json::Value>))
+        OwnedDbParam::Json(value) if expected == &Type::JSON || expected == &Type::JSONB => {
+            Ok(Box::new(value.clone()))
         }
-        (OwnedDbParam::Null, &Type::TEXT)
-        | (OwnedDbParam::Null, &Type::VARCHAR)
-        | (OwnedDbParam::Null, &Type::BPCHAR)
-        | (OwnedDbParam::Null, &Type::NAME)
-        | (OwnedDbParam::Null, &Type::UNKNOWN) => Ok(Box::new(None::<String>)),
+        OwnedDbParam::Null => {
+            if expected == &Type::INT2 {
+                Ok(Box::new(None::<i16>))
+            } else if expected == &Type::INT4 {
+                Ok(Box::new(None::<i32>))
+            } else if expected == &Type::INT8 {
+                Ok(Box::new(None::<i64>))
+            } else if expected == &Type::FLOAT4 {
+                Ok(Box::new(None::<f32>))
+            } else if expected == &Type::FLOAT8 {
+                Ok(Box::new(None::<f64>))
+            } else if expected == &Type::BOOL {
+                Ok(Box::new(None::<bool>))
+            } else if expected == &Type::JSON || expected == &Type::JSONB {
+                Ok(Box::new(None::<serde_json::Value>))
+            } else if expected == &Type::TEXT
+                || expected == &Type::VARCHAR
+                || expected == &Type::BPCHAR
+                || expected == &Type::NAME
+                || expected == &Type::UNKNOWN
+            {
+                Ok(Box::new(None::<String>))
+            } else {
+                Err(invalid())
+            }
+        }
         _ => Err(invalid()),
     }
 }
