@@ -6,6 +6,11 @@ min_version = { hard = "2026.9.0", soft = "2026.9.11" }
 idiomatic_version_file_enable_tools = ["rust"]
 
 [tools]
+# Pin the CLI tools used by the canonical Justfile so a fresh checkout can run
+# devx/just verification without separate global installs.
+just = "1.58.0"
+"aqua:nextest-rs/nextest/cargo-nextest" = "0.9.145"
+
 # Shared Cargo action cache + scheduler across linked worktrees and parallel
 # coding agents. Cargo remains the command developers invoke.
 mr-boxington = "1.12.0"
@@ -13,6 +18,16 @@ mr-boxington = "1.12.0"
 [wrappers.cargo]
 command = "mbx"
 env = { MBX_CARGO_SHIM_MODE = "1" }
+
+[tasks.doctor]
+description = "Check the core Nulang development toolchain"
+run = """
+rustc --version
+cargo --version
+just --version
+cargo nextest --version
+python3 --version
+"""
 
 [tasks.setup]
 description = "Prepare a checkout/worktree for development"
