@@ -4861,6 +4861,34 @@ mod lsp_tests {
     }
 
     #[test]
+    fn test_typo_quickfix_from_real_frontend_diagnostic() {
+        let source = "fn main() {\n    let counter = 5\n    perform IO.print(perform Int.to_string(countr + 1))\n}\n";
+        let uri = Url::parse("file:///real-typo.nula").unwrap();
+        let result = NulangLanguageServer::compute_diagnostics(source);
+        let typo = result
+            .diagnostics
+            .iter()
+            .find(|diag| {
+                diag.code == Some(NumberOrString::String("E0202".to_string()))
+                    && diag.message.contains("countr")
+            })
+            .expect("the compiler must report an unbound-variable diagnostic");
+        let cursor = Range::new(typo.range.start, typo.range.start);
+        let actions = NulangLanguageServer::typo_quickfix_actions(
+            source, &cursor, &uri, &result.diagnostics,
+        );
+        assert!(
+            actions.iter().any(|action| match action {
+                CodeActionOrCommand::CodeAction(action) => {
+                    action.title == "Replace 'countr' with 'counter'"
+                }
+                _ => false,
+            }),
+            "a real compiler-produced typo must produce the guarded editor fix"
+        );
+    }
+
+    #[test]
     fn test_typo_quickfix_rejects_stale_and_unrelated_diagnostics() {
         let source = "fn main() {\n    let counter = 5\n    otherx\n}\n";
         let uri = Url::parse("file:///typo.nula").unwrap();
