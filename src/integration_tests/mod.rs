@@ -11659,6 +11659,65 @@ match { a: 2, b: 9 } with {
         );
     }
 
+    /// A failed terminal write after a real JIT yield cannot publish an
+    /// advanced durable snapshot or leave the speculative actor dispatchable.
+    #[cfg(feature = "native-codegen")]
+    #[test]
+    fn test_workflow_jit_terminal_append_rejection_quarantines_safe_state() {
+        let source = r#"
+            fn bump(n: Int) -> Int {
+                let a = n + 1
+                let b = a + 2
+                b - 2
+            }
+            workflow JitReject {
+                step hot {
+                    var i = 0
+                    while i < 50000 {
+                        i = bump(i)
+                    }
+                    self.step_index = self.step_index + 1
+                }
+            }
+            let w = spawn JitReject {} in { w }
+        "#;
+        let store = SharedMemoryStore::new();
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        rt.borrow_mut().persistence = Box::new(RejectStepCompletedStore(store.clone()));
+        let (value, _) = run_source_with_runtime(source, rt.clone()).unwrap();
+        let actor_id = value.as_actor_id().expect("workflow actor");
+
+        rt.borrow_mut().send_message_by_id(actor_id, 0, &[]);
+        rt.borrow_mut().step_actor(actor_id);
+        assert!(
+            rt.borrow()
+                .actors
+                .get(&actor_id)
+                .expect("preempted actor still live")
+                .jit_yield_pending,
+            "fixture must exercise JIT preemption before terminal write failure"
+        );
+
+        rt.borrow_mut().run_scheduler();
+
+        assert!(
+            !rt.borrow().actors.contains_key(&actor_id),
+            "failed terminal append must quarantine the speculative JIT actor"
+        );
+        let snapshot = store.load_snapshot(actor_id).expect("last safe checkpoint");
+        assert_eq!(
+            snapshot.state.get("step_index"),
+            Some(&crate::runtime::PersistedValue::Int(0)),
+            "failed terminal write cannot checkpoint a speculative step index"
+        );
+        assert!(
+            !store.read_workflow_events(actor_id).iter().any(|event| {
+                matches!(event, WorkflowEvent::StepCompleted { .. })
+            }),
+            "rejected terminal append must not produce a completion receipt"
+        );
+    }
+
     /// Verify the JIT safepoint infrastructure does not cause hangs or
     /// crashes when an actor with a tight loop yields to the scheduler.
     /// The busy-loop actor is given a minimal safepoint budget so the
