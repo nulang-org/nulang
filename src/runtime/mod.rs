@@ -3126,8 +3126,11 @@ impl Runtime {
             .actors
             .get(&actor_id)
             .map(|actor| {
-                !actor.mailbox.is_empty()
-                    && actor.suspended_execution.is_none()
+                // A JIT safepoint is cooperative preemption, not a mailbox
+                // suspension. The continuation must be scheduled even when
+                // there are no new messages.
+                (actor.jit_yield_pending
+                    || (!actor.mailbox.is_empty() && actor.suspended_execution.is_none()))
                     && matches!(
                         actor.state,
                         ActorState::Running | ActorState::Created | ActorState::Waiting
@@ -5366,7 +5369,12 @@ impl Runtime {
                     }
                     crate::jit::runtime::clear_jit_safepoint_ptr();
                     (*self_ptr).vm_exec_end();
-                    return Ok(Value::nil());
+                    // A JIT safepoint is not terminal success. Propagate a
+                    // distinct suspension so the normal workflow dispatcher
+                    // does not checkpoint or append StepCompleted.
+                    return Err(crate::types::NuError::Suspended(
+                        crate::types::VmSuspension::JitSafepoint,
+                    ));
                 }
             }
             // Capture VM state for a workflow signal wait, a non-blocking
