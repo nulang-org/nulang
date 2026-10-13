@@ -3083,6 +3083,44 @@ mod tests {
     }
 
     #[test]
+    fn test_devirtualize_does_not_assume_cross_block_dominance() {
+        let mut builder = mir::FunctionBuilder::new("separate_blocks", Some(Type::int()));
+        let closure = builder.add_temp(Type::unit());
+        let result = builder.add_temp(Type::int());
+        builder.assign(
+            closure,
+            mir::RValue::Closure {
+                func: 5,
+                captures: vec![],
+            },
+        );
+        let following = builder.create_block();
+        builder.terminate(mir::Terminator::Jump(following));
+        builder.switch_to(following);
+        builder.assign(
+            result,
+            mir::RValue::Call {
+                func: mir::FuncRef::Local(closure),
+                args: vec![],
+            },
+        );
+        builder.terminate(mir::Terminator::Return(Some(result)));
+
+        let mut function = builder.build();
+        assert!(!devirtualize_captureless_calls(&mut function));
+        assert!(matches!(
+            &function.blocks[1].stmts[0],
+            mir::Stmt::Assign {
+                op: mir::RValue::Call {
+                    func: mir::FuncRef::Local(_),
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn test_devirtualize_respects_callee_reassignment() {
         let mut builder = mir::FunctionBuilder::new("reassigned", Some(Type::int()));
         let closure = builder.add_temp(Type::unit());
