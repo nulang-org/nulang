@@ -69,7 +69,9 @@ fn workload_source(name: &str) -> String {
         "literal" => "42".to_string(),
         "functions_10" => functions_source(10),
         "functions_100" => functions_source(100),
-        "branch_loop" => "var sum = 0; var i = 0; while i < 100000 { if i < 50000 then { sum = sum + i } else { sum = sum - 1 }; i = i + 1; }; sum".to_string(),
+        "branch_loop" => {
+            "var sum = 0; var i = 0; while i < 100000 { if i < 50000 then { sum = sum + i } else { sum = sum - 1 }; i = i + 1; }; sum".to_string()
+        }
         _ => unreachable!("workload names are validated before use"),
     }
 }
@@ -165,7 +167,13 @@ fn json_record(workload: &str, iteration: u32, source_bytes: usize, times: &Timi
     })
 }
 
-fn emit(workload: &str, iteration: u32, source_bytes: usize, times: &Timings, format: OutputFormat) {
+fn emit(
+    workload: &str,
+    iteration: u32,
+    source_bytes: usize,
+    times: &Timings,
+    format: OutputFormat,
+) {
     match format {
         OutputFormat::Jsonl => {
             println!("{}", json_record(workload, iteration, source_bytes, times));
@@ -319,7 +327,13 @@ mod tests {
 
     #[test]
     fn identical_fixture_inputs_are_deterministic() {
-        assert_eq!(workload_source("functions_100"), workload_source("functions_100"));
-        assert_ne!(workload_source("functions_10"), workload_source("functions_100"));
+        assert_eq!(
+            workload_source("functions_100"),
+            workload_source("functions_100")
+        );
+        assert_ne!(
+            workload_source("functions_10"),
+            workload_source("functions_100")
+        );
     }
 }
