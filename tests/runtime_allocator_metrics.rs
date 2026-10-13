@@ -53,7 +53,7 @@ fn exported_allocator_metrics_are_gauges_and_allow_actor_churn() {
         "nulang_allocator_arena_epoch_allocations",
     ] {
         assert!(
-            prometheus.contains(&format!("# TYPE {name} gauge\\n")),
+            prometheus.contains(&format!("# TYPE {name} gauge\n")),
             "{name} must be a gauge, not a counter"
         );
     }
