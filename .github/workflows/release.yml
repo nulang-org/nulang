@@ -305,6 +305,12 @@ jobs:
           "$bin" --version
           test "$("$bin" --eval 'perform IO.print("musl-smoke")')" = "musl-smoke"
 
+      - name: Smoke native codegen on musl host
+        shell: bash
+        run: |
+          bin=target/x86_64-unknown-linux-musl/release/nulang
+          test "$("$bin" --backend native --eval '1 + 2 * 3')" = "7"
+
       - name: Package experimental musl archive
         shell: bash
         run: |
@@ -313,6 +319,21 @@ jobs:
           tar czf dist/nulang-linux-x86_64-musl.tar.gz -C dist nulang-linux-x86_64-musl
           (cd dist && sha256sum nulang-linux-x86_64-musl.tar.gz > nulang-linux-x86_64-musl.tar.gz.sha256)
           (cd dist && sha256sum -c nulang-linux-x86_64-musl.tar.gz.sha256)
+
+      - name: Smoke extracted artifact on clean Alpine
+        shell: bash
+        run: |
+          mkdir -p musl-clean-smoke
+          tar xzf dist/nulang-linux-x86_64-musl.tar.gz -C musl-clean-smoke
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges \
+            -v "$PWD/musl-clean-smoke:/opt/nulang:ro" alpine:3.22 \
+            sh -ec '
+              bin=/opt/nulang/nulang-linux-x86_64-musl
+              "$bin" --version
+              test "$("$bin" --eval "1 + 2 * 3")" = "7"
+              test "$("$bin" --backend native --eval "1 + 2 * 3")" = "7"
+            '
 
       - name: Upload isolated preview
         uses: actions/upload-artifact@v7

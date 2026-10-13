@@ -37,6 +37,17 @@ class MuslReleaseTests(unittest.TestCase):
         self.assertIn('needs: release', publish)
         self.assertNotIn('needs: [release, musl-verify]', publish)
 
+    def test_musl_archive_runs_in_isolated_alpine(self):
+        """Validate the extracted artifact rather than only the build-tree binary."""
+        workflow = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        job = workflow.split("  musl-verify:\n", 1)[1].split("  publish:\n", 1)[0]
+        self.assertIn("tar xzf dist/nulang-linux-x86_64-musl.tar.gz", job)
+        self.assertIn("docker run --rm --network none --read-only --cap-drop ALL", job)
+        self.assertIn("--security-opt no-new-privileges", job)
+        self.assertIn("alpine:3.22", job)
+        self.assertIn("--backend native", job)
+        self.assertIn("nulang-linux-x86_64-musl", job)
+
     @unittest.skipUnless(
         sys.platform.startswith('linux') and shutil.which('gcc') and shutil.which('readelf'),
         'requires Linux, gcc, and binutils',
