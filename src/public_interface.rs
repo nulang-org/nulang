@@ -350,6 +350,32 @@ mod tests {
     }
 
     #[test]
+    fn order_of_multiple_public_declarations_is_not_part_of_the_interface() {
+        let int = primitive(PrimitiveType::Int);
+        let a = function("a", true, int.clone(), int.clone(), vec![]);
+        let z = function("z", true, int.clone(), int, vec![]);
+        let first = interface_for_hir(&module(vec![a.clone(), z.clone()])).unwrap();
+        let second = interface_for_hir(&module(vec![z, a])).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.exports[0].path, "test::a");
+        assert_eq!(first.exports[1].path, "test::z");
+    }
+
+    #[test]
+    fn public_parameter_name_changes_signature_digest() {
+        let int = primitive(PrimitiveType::Int);
+        let before = function("lookup", true, int.clone(), int, vec![]);
+        let mut after = before.clone();
+        if let Decl::Function(ref mut f) = after {
+            f.params[0].0 = "id".to_string();
+        }
+        assert_ne!(
+            interface_for_hir(&module(vec![before])).unwrap().api_digest,
+            interface_for_hir(&module(vec![after])).unwrap().api_digest
+        );
+    }
+
+    #[test]
     fn changed_public_return_type_or_effect_changes_digest() {
         let int = primitive(PrimitiveType::Int);
         let plain = interface_for_hir(&module(vec![function(
