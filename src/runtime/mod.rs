@@ -1412,13 +1412,19 @@ impl Runtime {
                     };
                     // This checked append + checkpoint must precede any
                     // mailbox dispatch or deferred receive-wake.
-                    let _ = workflow::finish_jit_resumed_workflow_step(
+                    if workflow::finish_jit_resumed_workflow_step(
                         self,
                         actor_id,
                         suspended.activation,
                         step_name,
                         advance,
-                    );
+                    ) {
+                        // Terminal success consumes this activation. A later
+                        // command must start from its own canonical identity.
+                        if let Some(actor) = self.actors.get_mut(&actor_id) {
+                            actor.current_workflow_activation = None;
+                        }
+                    }
                 }
             }
             Err(crate::types::NuError::Suspended(_)) => {
@@ -1468,6 +1474,9 @@ impl Runtime {
                         // Only compensate after the safe failure receipt
                         // commits and the actor remains non-speculative.
                         self.run_saga_compensation(actor_id, suspended.behavior_idx);
+                        if let Some(actor) = self.actors.get_mut(&actor_id) {
+                            actor.current_workflow_activation = None;
+                        }
                     }
                 } else {
                     tracing::warn!(actor_id, %error, "nulang-jit: actor VM resume failed");
