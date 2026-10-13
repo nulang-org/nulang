@@ -125,6 +125,14 @@ SHA rather than a moving branch name. This makes stacked performance PRs
 incremental by construction: a child PR is measured against its parent stack
 layer, while a root performance PR is measured against `main`.
 
+The paired runner fails closed on malformed or duplicate benchmark records,
+non-positive timing or operation counts, and changed message counts for the four
+matched Savina-style workloads. Other Nulang-only controls (including Skynet and
+`ab/*` probes) remain eligible for base/candidate pairing or candidate-only
+diagnostics. If a required workload is missing, no speedup report is emitted.
+This prevents partial or ambiguous test output from silently replacing the
+measurement used for PR promotion.
+
 PR runs use `--no-default-features --features native-codegen` to isolate the
 core VM/JIT/AOT/actor runtime from unrelated optional integrations. Longer
 manual runs can use the default feature set when production-profile validation
