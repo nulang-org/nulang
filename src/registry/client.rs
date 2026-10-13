@@ -59,11 +59,18 @@ impl RegistryClient {
             let url = format!("{}/api/v1/packages/{}/{}", self.base_url(), name, version);
             match ureq::get(&url).call() {
                 Ok(response) => {
+                    // The registry response is untrusted. Bound the compressed
+                    // payload before attempting to decompress or extract it.
+                    let limit = crate::package::registry_archive::MAX_REGISTRY_ARCHIVE_BYTES;
+                    let mut reader = response.into_reader().take(limit as u64 + 1);
                     let mut bytes = Vec::new();
-                    response
-                        .into_reader()
-                        .read_to_end(&mut bytes)
-                        .map_err(|e| e.to_string())?;
+                    reader.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+                    if bytes.len() > limit {
+                        return Err(format!(
+                            "registry archive exceeds maximum download size of {} bytes",
+                            limit
+                        ));
+                    }
                     Ok(bytes)
                 }
                 Err(err) => Err(Self::describe_error(err)),
