@@ -239,6 +239,21 @@ pub fn run(args: &[String]) -> NuResult<()> {
             let open = args.get(1).map(String::as_str) == Some("--open");
             cmd_doc(open)
         }
+        Some("publisher-key") => {
+            if args.len() != 1 {
+                return Err(NuError::PackageError {
+                    msg: "nula publisher-key takes no arguments".to_string(),
+                    span: Span::default(),
+                });
+            }
+            let seed = crate::registry::trust::signing_seed_from_env()
+                .map_err(|msg| NuError::PackageError {
+                    msg,
+                    span: Span::default(),
+                })?;
+            println!("{}", crate::registry::trust::signing_public_key(&seed));
+            Ok(())
+        }
         Some("publish") => {
             let mut registry_url: Option<String> = None;
             let mut token: Option<String> = None;
@@ -304,7 +319,7 @@ pub fn run(args: &[String]) -> NuResult<()> {
 
         Some(other) => Err(NuError::PackageError {
             msg: format!(
-                "unknown nula subcommand '{}' (expected new, init, build, build-wasm, test, run, add, remove, publish, deploy, watch, doc, list, or clean)",
+                "unknown nula subcommand '{}' (expected new, init, build, build-wasm, test, run, add, remove, publish, publisher-key, deploy, watch, doc, list, or clean)",
                 other
             ),
             span: Span::default(),
@@ -337,7 +352,8 @@ fn print_usage() {
     println!("  watch         Alias for 'run --watch'");
     println!("  add   <name>  Add a dependency to Nulang.toml");
     println!("  remove <name> Remove a dependency from Nulang.toml");
-    println!("  publish       Publish the package to a registry");
+    println!("  publish       Sign and publish the package (NULA_SIGNING_KEY_HEX required)");
+    println!("  publisher-key Print the matching public key for Nulang.trust.toml");
     println!("                --registry <url>  Registry URL (or set in Nulang.toml)");
     println!("                --token <token>   Auth token (or set NULA_TOKEN)");
     println!("  deploy        Build and deploy the package to Nulang Cloud");
