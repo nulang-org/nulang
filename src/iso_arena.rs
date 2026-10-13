@@ -91,11 +91,6 @@ use std::collections::HashSet;
 /// retained across epochs, so a steady-state handler reuses the same memory.
 const BLOCK_SIZE: usize = 64 * 1024;
 
-/// Per-actor (per-activation) bump arena for message-scoped allocations.
-///
-/// Objects are bump-allocated with a standard [`OrcaHeader`] prefix (so
-/// `array_len` and tag inspection work) but are *not* linked into any heap
-/// live list.  [`IsoArena::reset`] reclaims the whole epoch in O(1).
 /// Actual successful requests served by one IsoArena over its lifetime.
 ///
 /// A reset starts another allocation epoch without clearing lifetime counters.
@@ -109,6 +104,12 @@ pub struct ArenaAllocationSnapshot {
     pub resets: usize,
 }
 
+
+/// Per-actor (per-activation) bump arena for message-scoped allocations.
+///
+/// Objects are bump-allocated with a standard [`OrcaHeader`] prefix (so
+/// `array_len` and tag inspection work) but are *not* linked into any heap
+/// live list.  [`IsoArena::reset`] reclaims the whole epoch in O(1).
 #[derive(Debug)]
 pub struct IsoArena {
     /// Backing blocks.  `Box<[u64]>` guarantees 8-byte alignment for the
