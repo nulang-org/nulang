@@ -173,12 +173,37 @@ impl Resolution {
 
 /// Resolve the full dependency graph of `manifest`, rooted at `root_dir`.
 pub fn resolve(root_dir: &Path, manifest: &Manifest) -> NuResult<Resolution> {
+    resolve_with_lock(root_dir, manifest, None)
+}
+
+/// Cache-only resolution. Never fetches, clones, or changes a Git checkout.
+/// Rejects unsupported registry dependencies rather than silently going online.
+pub fn resolve_offline(
+    root_dir: &Path,
+    manifest: &Manifest,
+    lockfile: &Lockfile,
+) -> NuResult<Resolution> {
+    let resolution = resolve_with_lock(root_dir, manifest, Some(lockfile.clone()))?;
+    if resolution.to_lockfile().package != lockfile.package {
+        return Err(NuError::PackageError {
+            msg: "offline dependency pins differ from Nulang.lock".to_string(),
+            span: Span::default(),
+        });
+    }
+    Ok(resolution)
+}
+
+fn resolve_with_lock(
+    root_dir: &Path,
+    manifest: &Manifest,
+    offline_lock: Option<Lockfile>,
+) -> NuResult<Resolution> {
     let root_dir = std::fs::canonicalize(root_dir).map_err(|e| NuError::PackageError {
         msg: format!("cannot resolve {}: {}", root_dir.display(), e),
         span: Span::default(),
     })?;
     let registry = manifest.package.registry.clone();
-    let mut resolver = Resolver::new(root_dir.clone(), registry);
+    let mut resolver = Resolver::new(root_dir.clone(), registry, offline_lock);
     resolver.resolve_package(&root_dir, manifest, PackageSource::Root)?;
     Ok(Resolution {
         packages: resolver.order,
@@ -237,6 +262,8 @@ pub fn version_satisfies(requirement: &str, version: &str) -> NuResult<bool> {
 
 struct Resolver {
     root_dir: PathBuf,
+    /// If present, require exact cached sources without remote access.
+    offline_lock: Option<Lockfile>,
     /// Default registry URL (from root manifest's `[package] registry`).
     default_registry: Option<String>,
     /// Canonical package dir -> name, to deduplicate shared dependencies.
@@ -250,9 +277,14 @@ struct Resolver {
 }
 
 impl Resolver {
-    fn new(root_dir: PathBuf, default_registry: Option<String>) -> Self {
+    fn new(
+        root_dir: PathBuf,
+        default_registry: Option<String>,
+        offline_lock: Option<Lockfile>,
+    ) -> Self {
         Resolver {
             root_dir,
+            offline_lock,
             default_registry,
             by_dir: BTreeMap::new(),
             by_name: BTreeMap::new(),
@@ -296,6 +328,15 @@ impl Resolver {
     ) -> NuResult<()> {
         let (dep_dir, source) = match dep {
             Dependency::Version(req) => {
+                if self.offline_lock.is_some() {
+                    return Err(NuError::PackageError {
+                        msg: format!(
+                            "offline registry dependency '{}' is unsupported until cached artifact integrity is verified",
+                            dep_name
+                        ),
+                        span: Span::default(),
+                    });
+                }
                 let registry_url = self.resolve_dependency_registry(parent_dir)?;
                 let (dir, _ver) = self.fetch_registry(dep_name, req, &registry_url)?;
                 (dir, PackageSource::Registry(registry_url))
@@ -387,6 +428,9 @@ impl Resolver {
     /// cache, while a pinned rev is compared locally. A stale checkout is
     /// wiped and re-cloned. Requires `git` on PATH.
     fn fetch_git(&self, dep_name: &str, detail: &DependencyDetail) -> NuResult<(PathBuf, String)> {
+        if let Some(lockfile) = &self.offline_lock {
+            return self.fetch_git_offline(dep_name, detail, lockfile);
+        }
         let url = detail.git.as_ref().expect("checked by caller");
         let cache = self.root_dir.join(".nula").join("git");
         std::fs::create_dir_all(&cache).map_err(|e| NuError::PackageError {
@@ -484,6 +528,87 @@ impl Resolver {
             span: Span::default(),
         })?;
         Ok((dir, commit.expect("both branches record a commit")))
+    }
+
+    /// Return an existing, clean checkout at exactly the locked Git commit.
+    /// Never fetch, clone, reset, or delete cached source in this path.
+    fn fetch_git_offline(
+        &self,
+        dep_name: &str,
+        detail: &DependencyDetail,
+        lockfile: &Lockfile,
+    ) -> NuResult<(PathBuf, String)> {
+        let url = detail.git.as_ref().expect("checked by caller");
+        let requested = detail
+            .rev
+            .as_ref()
+            .or(detail.branch.as_ref())
+            .or(detail.tag.as_ref());
+        let source = match requested {
+            Some(selector) => format!("git+{}#{}", url, selector),
+            None => format!("git+{}", url),
+        };
+        let pinned = lockfile
+            .package
+            .iter()
+            .find(|package| package.name == dep_name && package.source == source)
+            .ok_or_else(|| NuError::PackageError {
+                msg: format!("offline Git dependency '{}' is not pinned to source '{}' in Nulang.lock", dep_name, source),
+                span: Span::default(),
+            })?;
+        if pinned.commit.is_empty() {
+            return Err(NuError::PackageError {
+                msg: format!("offline Git dependency '{}' has no pinned commit", dep_name),
+                span: Span::default(),
+            });
+        }
+
+        let cache = self.root_dir.join(".nula").join("git");
+        let dest = cache.join(dep_name);
+        if !dest.join(MANIFEST_FILE).is_file() {
+            return Err(NuError::PackageError {
+                msg: format!("offline Git checkout for '{}' is missing at {}; fetch it with a normal build first", dep_name, dest.display()),
+                span: Span::default(),
+            });
+        }
+
+        let head = git_rev_parse(&dest, "HEAD")?;
+        let recorded = std::fs::read_to_string(cache.join(format!("{}.commit", dep_name)))
+            .map_err(|e| NuError::PackageError {
+                msg: format!("offline Git commit cache marker for '{}' missing: {}", dep_name, e),
+                span: Span::default(),
+            })?;
+        if head != pinned.commit || recorded.trim() != pinned.commit {
+            return Err(NuError::PackageError {
+                msg: format!(
+                    "offline Git checkout for '{}' is at {} but lockfile requires {}",
+                    dep_name, head, pinned.commit
+                ),
+                span: Span::default(),
+            });
+        }
+
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&dest)
+            .args(["status", "--porcelain", "--untracked-files=all"])
+            .output()
+            .map_err(|e| NuError::PackageError {
+                msg: format!("cannot inspect offline Git cache for '{}': {}", dep_name, e),
+                span: Span::default(),
+            })?;
+        if !status.status.success() || !status.stdout.is_empty() {
+            return Err(NuError::PackageError {
+                msg: format!("offline Git checkout for '{}' has uncommitted or untracked changes", dep_name),
+                span: Span::default(),
+            });
+        }
+
+        let dir = std::fs::canonicalize(&dest).map_err(|e| NuError::PackageError {
+            msg: format!("cannot resolve offline Git checkout for '{}': {}", dep_name, e),
+            span: Span::default(),
+        })?;
+        Ok((dir, pinned.commit.clone()))
     }
 
     /// Resolve a path or git dependency. Returns the directory and optional git commit.
