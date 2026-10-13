@@ -805,6 +805,22 @@ mod tests {
     }
 
     #[test]
+    fn compiler_checked_public_function_signature_has_stable_digest() {
+        let src = "pub fn identity(x: Int) -> Int ! {} { x }\n";
+        let tokens = crate::lexer::Lexer::new(src).lex().unwrap();
+        let ast = crate::parser::Parser::new(tokens).parse_module().unwrap();
+        let mut checker = crate::typechecker::TypeChecker::new();
+        checker.check_module(&ast).unwrap();
+
+        let first = interface_for_checked_ast(&ast, &checker.inferred_decl_types).unwrap();
+        let second = interface_for_checked_ast(&ast, &checker.inferred_decl_types).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.exports.len(), 1);
+        assert_eq!(first.exports[0].path, format!("{}::identity", ast.name));
+        assert!(first.exports[0].signature.contains("Int"));
+    }
+
+    #[test]
     fn checked_interface_rejects_unverified_effect_rows() {
         let source = crate::ast::AstModule {
             name: "api".to_string(),
