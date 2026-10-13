@@ -71,6 +71,38 @@ jobs:
           test -s docs/dist/playground/nulang_playground.wasm
 
   # -----------------------------------------------------------------------
+  # Registry Worker — test and typecheck all untrusted package upload paths.
+  # A stable job name is suitable for future required-check enforcement.
+  # -----------------------------------------------------------------------
+  registry-worker:
+    name: Registry Worker tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: registry-worker
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: registry-worker/package-lock.json
+
+      - name: Install exact locked dependencies
+        run: npm ci
+
+      - name: Registry Worker security and SemVer tests
+        run: npm test
+
+      - name: Typecheck Registry Worker
+        run: npx tsc --noEmit
+
+  # -----------------------------------------------------------------------
   # Primary build & test (default features)
   # -----------------------------------------------------------------------
   test:

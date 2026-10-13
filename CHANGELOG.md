@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Registry SemVer precision and CI coverage — 2026-10-13
+- **Registry version ordering now compares arbitrarily large decimal numeric identifiers without JavaScript Number rounding.** Handles both core and prerelease numeric identifiers while retaining lenient invalid-key listing behavior; adds regressions for values beyond 2^53 and leading zeros.
+- **Registry Worker Vitest and TypeScript checks now run on every pull request and push to main.** The dedicated CI job has read-only repository permissions and uses the committed npm lockfile. This makes package-registry regression coverage part of the merge-validation signal.
+
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.

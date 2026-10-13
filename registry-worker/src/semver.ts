@@ -17,12 +17,25 @@
  * where possible and otherwise fall back to 0 components.
  */
 
+// SemVer numeric identifiers have no fixed-width limit. Comparing their
+// decimal strings avoids Number.MAX_SAFE_INTEGER rounding and BigInt parsing
+// costs on untrusted registry version keys.
+function compareNumeric(a: string, b: string): number {
+  // Preserve existing lenient behavior for malformed version keys by using
+  // any leading decimal digits, falling back to zero when there are none.
+  const left = (a.match(/^\d+/)?.[0] ?? '0').replace(/^0+(?=\d)/, '');
+  const right = (b.match(/^\d+/)?.[0] ?? '0').replace(/^0+(?=\d)/, '');
+  if (left.length !== right.length) return left.length < right.length ? -1 : 1;
+  if (left === right) return 0;
+  return left < right ? -1 : 1;
+}
+
 function parseSemver(v: string) {
   const [versionCore, ...prereleaseParts] = v.split('+')[0].split('-');
   const prerelease = prereleaseParts.join('-');
-  const parts = versionCore.split('.').map((num) => parseInt(num, 10) || 0);
+  const parts = versionCore.split('.');
   while (parts.length < 3) {
-    parts.push(0);
+    parts.push('0');
   }
   return {
     major: parts[0],
@@ -47,9 +60,8 @@ function comparePrerelease(a: string, b: string): number {
     const xn = /^\d+$/.test(x);
     const yn = /^\d+$/.test(y);
     if (xn && yn) {
-      const nx = parseInt(x, 10);
-      const ny = parseInt(y, 10);
-      if (nx !== ny) return nx - ny;
+      const numericOrder = compareNumeric(x, y);
+      if (numericOrder !== 0) return numericOrder;
     } else if (xn !== yn) {
       return xn ? -1 : 1; // numeric identifiers have lower precedence
     } else if (x !== y) {
@@ -67,9 +79,12 @@ export function compareSemver(a: string, b: string): number {
   const pa = parseSemver(a);
   const pb = parseSemver(b);
 
-  if (pa.major !== pb.major) return pa.major - pb.major;
-  if (pa.minor !== pb.minor) return pa.minor - pb.minor;
-  if (pa.patch !== pb.patch) return pa.patch - pb.patch;
+  const major = compareNumeric(pa.major, pb.major);
+  if (major !== 0) return major;
+  const minor = compareNumeric(pa.minor, pb.minor);
+  if (minor !== 0) return minor;
+  const patch = compareNumeric(pa.patch, pb.patch);
+  if (patch !== 0) return patch;
 
   // Versions without pre-release have higher precedence than versions with pre-release
   if (!pa.prerelease && pb.prerelease) return 1;
