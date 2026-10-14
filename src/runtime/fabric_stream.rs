@@ -250,9 +250,15 @@ struct StreamState {
 /// Stream metadata and cursor files use atomic temp-file + rename replacement.
 /// On open, a truncated final record is repaired back to the last complete
 /// frame; checksum or sequence corruption fails closed.
+///
+/// Exclusive OS-level root ownership prevents concurrent stream-sequence
+/// allocation and deletion from separate processes. This is not distributed
+/// leader fencing.
 #[derive(Debug)]
 pub struct FileFabricStreamStore {
     root: PathBuf,
+    // Retain the descriptor for the lifetime of this store.
+    _root_lock: File,
     states: HashMap<String, StreamState>,
 }
 
@@ -260,8 +266,17 @@ impl FileFabricStreamStore {
     pub fn open(root: impl AsRef<Path>) -> io::Result<Self> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
+        // Never unlink or replace the lockfile: locks attach to file identity.
+        let root_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(root.join(".fabric-store.lock"))?;
+        root_lock.try_lock()?;
         Ok(Self {
             root,
+            _root_lock: root_lock,
             states: HashMap::new(),
         })
     }
@@ -2811,6 +2826,8 @@ mod tests {
             .fabric_stream_commit_cursor("audit", "consumer-a", 1)
             .unwrap();
 
+        // A restart requires the previous runtime to release root ownership.
+        drop(runtime);
         let mut restarted = Runtime::new();
         restarted.fabric_stream_open(&root).unwrap();
         assert_eq!(
