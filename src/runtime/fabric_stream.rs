@@ -1983,6 +1983,108 @@ mod tests {
     }
 
     #[test]
+    fn retention_preview_only_plans_complete_segments_with_consumers_caught_up() {
+        let root = test_dir("retention-preview");
+        let mut store = FileFabricStreamStore::open(&root).unwrap();
+        store
+            .create_stream(
+                "events",
+                FabricStreamConfig {
+                    segment_max_bytes: 96,
+                },
+            )
+            .unwrap();
+        for payload in [b'a', b'b', b'c', b'd'] {
+            store.append("events", &[payload; 48]).unwrap();
+        }
+        store.commit_cursor("events", "worker", 3).unwrap();
+        let before = store.read_from("events", 1, 10).unwrap();
+        let plan = store.preview_retention("events", 4).unwrap();
+        assert_eq!(plan.stream, "events");
+        assert_eq!(plan.requested_keep_from_sequence, 4);
+        assert_eq!(plan.first_retained_sequence, Some(4));
+        assert_eq!(plan.eligible_segment_count, 3);
+        assert!(plan.eligible_bytes > 0);
+        assert_eq!(plan.minimum_consumer_cursor, Some(3));
+        assert_eq!(store.read_from("events", 1, 10).unwrap(), before);
+        assert_eq!(store.preview_retention("events", 1).unwrap().eligible_segment_count, 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retention_preview_fails_closed_when_consumer_or_replication_is_unsafe() {
+        let root = test_dir("retention-unsafe");
+        let mut store = FileFabricStreamStore::open(&root).unwrap();
+        store
+            .create_stream(
+                "events",
+                FabricStreamConfig {
+                    segment_max_bytes: 96,
+                },
+            )
+            .unwrap();
+        for _ in 0..3 {
+            store.append("events", &[1; 48]).unwrap();
+        }
+        store.commit_cursor("events", "worker", 1).unwrap();
+        assert_eq!(
+            store.preview_retention("events", 3).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            store.preview_retention("events", 0).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            store.preview_retention("events", 5).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        store
+            .establish_replication_policy(
+                "events",
+                FabricStreamReplicationPolicy {
+                    partition: 0,
+                    epoch: FABRIC_STREAM_INITIAL_EPOCH,
+                    leader: 10,
+                    membership_fingerprint: 44,
+                    replication_factor: 2,
+                    replicas: vec![10, 11],
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.preview_retention("events", 1).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retention_preview_never_approves_partial_last_segment_or_producer_state() {
+        let root = test_dir("retention-partial");
+        let mut store = FileFabricStreamStore::open(&root).unwrap();
+        store
+            .create_stream("events", FabricStreamConfig::default())
+            .unwrap();
+        for _ in 0..3 {
+            store.append("events", b"x").unwrap();
+        }
+        store.commit_cursor("events", "worker", 3).unwrap();
+        let plan = store.preview_retention("events", 4).unwrap();
+        assert_eq!(plan.eligible_segment_count, 0);
+        assert_eq!(plan.first_retained_sequence, Some(1));
+
+        // Retention must not destroy records protected by producer checkpoints
+        // introduced on a separate draft branch.
+        fs::write(root.join("events").join("producer_state.json"), b"{}").unwrap();
+        assert_eq!(
+            store.preview_retention("events", 3).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn epoch_promise_is_durable_and_single_proposal_per_epoch() {
         let root = test_dir("epoch-promise");
         let policy = FabricStreamReplicationPolicy {
