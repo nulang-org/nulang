@@ -347,3 +347,22 @@ fn later_workflow_started_event_cannot_be_accepted_as_one_execution() {
         ErrorKind::InvalidData,
     );
 }
+
+#[test]
+fn identical_initialization_is_not_a_second_successful_creation() {
+    let bytes = b"stable-workflow";
+    let behavior = manifest(bytes);
+    let mut store = MemoryStore::new();
+    commit_pinned_workflow_start(
+        &mut store, 400, "payments/400", "Order", &behavior, bytes,
+        snapshot(400), vec![],
+    ).unwrap();
+    assert_eq!(
+        commit_pinned_workflow_start(
+            &mut store, 400, "payments/400", "Order", &behavior, bytes,
+            snapshot(400), vec![],
+        ).unwrap_err().kind(),
+        ErrorKind::AlreadyExists,
+    );
+    assert_eq!(store.read_workflow_events(400).len(), 2);
+}
