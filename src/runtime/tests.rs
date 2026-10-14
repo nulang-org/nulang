@@ -8710,3 +8710,35 @@ fn confirmed_node_removal_forgets_crdt_receiver_knowledge() {
         "a peer that rejoins after confirmed removal must receive full state"
     );
 }
+
+#[test]
+fn pending_atomic_mailbox_admission_pauses_scheduler_requeue() {
+    let mut runtime = Runtime::new();
+    let actor_id = runtime.spawn_actor(Box::new(Vec::new));
+    {
+        let actor = runtime.actors.get_mut(&actor_id).expect("actor exists");
+        actor.state = ActorState::Running;
+        actor.run_state = ActorRunState::Running;
+        actor
+            .mailbox
+            .push_local(Message {
+                behavior_id: 0,
+                payload: MessagePayload::from_slice(&[Value::int(42)]),
+                sender: 0,
+                priority: MessagePriority::Normal,
+                trace_id: None,
+            })
+            .unwrap();
+        assert!(actor.mailbox.begin_durable_admission().is_some());
+        assert_eq!(actor.mailbox.len(), 1);
+    }
+
+    runtime.finish_actor_turn(actor_id);
+    let actor = &runtime.actors[&actor_id];
+    assert_eq!(
+        actor.run_state,
+        ActorRunState::Idle,
+        "a pending durable commit must not hot-loop through scheduler requeue"
+    );
+    assert_eq!(actor.mailbox.len(), 1, "uncommitted message remains owned");
+}
