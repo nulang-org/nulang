@@ -334,7 +334,13 @@ fn compiled_inference_provider_commit_receipt_loss_deduplicates_on_recovery() {
             actor
                 .get_state_field("step_index")
                 .and_then(|value| value.as_int()),
-            Some(1)
+            Some(1),
+            "accepted step remained incomplete: provider calls={}, new mutations={}, suspended={}, llm_inflight={}, mailbox depth={}",
+            provider.calls.load(Ordering::SeqCst),
+            provider.new_mutations.load(Ordering::SeqCst),
+            actor.suspended_execution.is_some(),
+            actor.llm_inflight,
+            actor.mailbox.len(),
         );
         assert_eq!(
             recovered.actor_state_string(actor_id, "answer").as_deref(),
@@ -439,9 +445,22 @@ fn compiled_inference_after_terminal_checkpoint_does_not_redispatch() {
                 .and_then(|value| value.as_int()),
             Some(1)
         );
+        // This workflow has no declared persistent state for `self.answer`.
+        // The implicit Local value is not part of the durable snapshot.
+        // The committed step index/event and provider deduplication are the
+        // recovery guarantees this terminal-checkpoint test can assert.
+        let snapshot = recovered
+            .persistence
+            .load_snapshot(actor_id)
+            .expect("terminal checkpoint after recovery");
         assert_eq!(
-            recovered.actor_state_string(actor_id, "answer").as_deref(),
-            Some(RESULT)
+            snapshot.state.get("step_index"),
+            Some(&crate::runtime::PersistedValue::Int(1)),
+            "completed step index must survive the hard kill"
+        );
+        assert!(
+            !snapshot.state.contains_key("answer"),
+            "implicit Local state must not be misrepresented as durable"
         );
         assert_eq!(
             recovered
