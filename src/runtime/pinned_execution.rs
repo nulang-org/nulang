@@ -92,6 +92,19 @@ pub fn commit_pinned_workflow_start(
             "pinned workflow requires the exact initial actor snapshot at sequence 1",
         ));
     }
+    // This API creates a new logical execution, never an idempotent replay of
+    // an existing start. Reject existing history before issuing the atomic
+    // commit. A cross-process identical-payload race still needs a backend
+    // create-only primitive (the generic transition API deduplicates retries).
+    if store.latest_sequence(actor_id) != 0
+        || store.load_snapshot(actor_id).is_some()
+        || store.load_durable_tail_position(actor_id)?.is_some()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "durable actor history already exists; use pinned recovery",
+        ));
+    }
     let pin = DurableExecutionPin::create(execution_id, manifest, executable_bytes)
         .map_err(invalid_data)?;
     let serialized_pin = String::from_utf8(pin.to_json().map_err(invalid_data)?)
