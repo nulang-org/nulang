@@ -2,8 +2,12 @@
  * Nulang stable C embedding API.
  *
  * This header exposes the same ABI as `src/ffi/c_api.rs`. Include it and link
- * against `libnulang.so` (or the static `nulang` rlib) to compile and run
+ * against `libnulang.so` (or a compatible static library) to compile and run
  * Nulang source from C/C++.
+ *
+ * The runtime pointer must be live for all calls other than runtime creation.
+ * Calls must not race on one runtime. Callers retain ownership of input
+ * pointers and must keep them valid throughout each call.
  */
 
 #ifndef NULANG_H
@@ -62,6 +66,7 @@ int64_t nulang_compile(NulangRuntime *runtime, const char *source);
  * Run the top-level expression of a compiled module.
  *
  * On error the result is nil and `nulang_last_error` contains the message.
+ * An invalid module handle also sets the runtime's last error.
  */
 NulangValue nulang_run(NulangRuntime *runtime, int64_t module_handle);
 
@@ -70,7 +75,9 @@ NulangValue nulang_run(NulangRuntime *runtime, int64_t module_handle);
  *
  * `args` is an array of `NulangValue` of length `arg_count`; arguments are
  * passed in r0, r1, etc. The function's return value (register 0) is
- * returned. On error the result is nil.
+ * returned. On error the result is nil and `nulang_last_error` contains
+ * the diagnostic, including invalid handles, names, and argument arrays.
+ * `args` may be NULL only when `arg_count` is zero.
  */
 NulangValue nulang_call_function(NulangRuntime *runtime,
                                  int64_t module_handle,
@@ -82,7 +89,11 @@ NulangValue nulang_call_function(NulangRuntime *runtime,
 /* Error handling                                                              */
 /* -------------------------------------------------------------------------- */
 
-/** Return the last error message, or NULL if there is none. */
+/**
+ * Return the last error message, or NULL if there is none.
+ * The pointer is owned by the runtime and remains valid until a call
+ * modifies error state, `nulang_clear_error`, or runtime destruction.
+ */
 const char *nulang_last_error(NulangRuntime *runtime);
 
 /** Clear the runtime's last error state. */
@@ -100,7 +111,8 @@ NulangValue nulang_value_unit(void);
 
 /**
  * Create a Nulang string value by interning `s` into `module_handle`'s
- * constant pool. Returns nil on error.
+ * constant pool. Returns nil on error, with the diagnostic available via
+ * `nulang_last_error`.
  */
 NulangValue nulang_module_string(NulangRuntime *runtime,
                                  int64_t module_handle,
