@@ -79,11 +79,9 @@ fn successful_atomic_admission_returns_exact_message_without_running_handler() {
     let queued = runtime.actors[&actor_id].mailbox.len();
     assert_eq!(queued, 1);
 
+    let proposed = command(&runtime, actor_id, behavior, predecessor, 5);
     let (message, committed) = runtime
-        .admit_next_typed_actor_command(
-            actor_id,
-            command(&runtime, actor_id, behavior, predecessor, 5),
-        )
+        .admit_next_typed_actor_command(actor_id, proposed)
         .expect("atomic command accepted")
         .expect("one message admitted");
     assert_eq!(message.behavior_id, behavior);
@@ -116,11 +114,9 @@ fn failed_commit_keeps_original_message_and_retry_preserves_fifo() {
     assert_eq!(runtime.actors[&actor_id].mailbox.len(), 1);
 
     runtime.send_message_by_id(actor_id, behavior, &[Value::int(6)]);
+    let retry = command(&runtime, actor_id, behavior, predecessor, 5);
     let (message, _) = runtime
-        .admit_next_typed_actor_command(
-            actor_id,
-            command(&runtime, actor_id, behavior, predecessor, 5),
-        )
+        .admit_next_typed_actor_command(actor_id, retry)
         .expect("retry")
         .expect("original message");
     assert_eq!(message.payload[0].as_int(), Some(5));
@@ -167,12 +163,10 @@ fn admission_rejects_transient_actors_without_touching_durable_store() {
     let predecessor = runtime.persistence.latest_sequence(actor_id);
     runtime.send_message_by_id(actor_id, unrelated, &[Value::int(3)]);
 
+    let proposed = command(&runtime, actor_id, unrelated, predecessor, 3);
     assert_eq!(
         runtime
-            .admit_next_typed_actor_command(
-                actor_id,
-                command(&runtime, actor_id, unrelated, predecessor, 3),
-            )
+            .admit_next_typed_actor_command(actor_id, proposed)
             .unwrap_err()
             .kind(),
         std::io::ErrorKind::InvalidInput
