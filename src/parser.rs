@@ -4281,9 +4281,9 @@ impl Parser {
         self.advance(); // consume 'perform'
         let effect = self.expect_ident("effect name")?;
         self.expect(TokenKind::Dot)?;
-        // `ask`, `link`, `monitor`, `exit` and `ref` are reserved keywords,
-        // so they lex as keyword tokens rather than identifiers; accept them
-        // as operation names (`perform Actor.link(t)`, `perform Grain.ref(...)`).
+        // Some built-in effect operation names are also reserved keywords.
+        // Accept them after the effect qualifier without relaxing keyword
+        // handling elsewhere (e.g. Python.import and Actor.link).
         let op = match self.peek_kind() {
             TokenKind::Ask => {
                 self.advance();
