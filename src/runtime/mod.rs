@@ -5502,12 +5502,12 @@ impl Runtime {
         self.recover_actor_inner(actor_id)
     }
 
-    /// Resolve the originally pinned immutable executable, check the complete
-    /// sidecar and stored identity, then hydrate and schedule the workflow.
+    /// Resolve the originally pinned immutable executable, verify the exact
+    /// sidecar and durable identity, and decode bytecode from those same bytes
+    /// before making a recovered workflow runnable.
     ///
-    /// Bytecode-backed workflows additionally need a verified module loader,
-    /// so this initial native-workflow API rejects separately registered
-    /// recovery modules rather than trusting mutable in-memory code.
+    /// A schema-backed workflow can only dispatch the just-verified NBC
+    /// module; an independently registered module is never accepted.
     pub fn recover_pinned_workflow_actor(
         &mut self,
         actor_id: u64,
@@ -5548,10 +5548,43 @@ impl Runtime {
             &artifact.manifest,
             &artifact.executable,
         )?;
-        self.recover_actor_inner(actor_id).ok_or_else(|| Error::new(
-            ErrorKind::InvalidData,
-            "verified pinned workflow could not be hydrated from durable state",
-        ))
+
+        // The persisted schema determines whether bytecode must be installed.
+        // Native workflows deliberately have no schema-owned executable and
+        // continue on the existing native recovery path.
+        let snapshot = self.persistence.load_snapshot(actor_id).ok_or_else(|| {
+            Error::new(ErrorKind::InvalidData, "verified workflow has no snapshot")
+        })?;
+        let verified_module = match snapshot.schema_name.as_deref() {
+            Some(schema_name) => Some(
+                pinned_execution::decode_verified_pinned_workflow_module(
+                    &artifact,
+                    schema_name,
+                )?,
+            ),
+            None => None,
+        };
+        if let Some((module, offsets, compensations)) = verified_module {
+            self.recovery_modules.insert(
+                actor_id,
+                (module, offsets, compensations),
+            );
+        }
+
+        match self.recover_actor_inner(actor_id) {
+            Some(id) => Ok(id),
+            None => {
+                // Failed hydration must not preserve a verified module
+                // registration that a later unverified caller could reuse.
+                self.recovery_modules.remove(&actor_id);
+                self.recovery_schema_names.remove(&actor_id);
+                self.actors.remove(&actor_id);
+                Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "verified pinned workflow could not be hydrated from durable state",
+                ))
+            }
+        }
     }
 
     fn recover_actor_inner(&mut self, actor_id: u64) -> Option<u64> {
