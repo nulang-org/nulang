@@ -311,3 +311,101 @@ fn command_admission_rejects_outbox_and_external_effect_dispatch() {
     assert_eq!(runtime.actors[&actor_id].mailbox.len(), 1);
     assert_eq!(runtime.persistence.latest_sequence(actor_id), predecessor);
 }
+
+#[test]
+fn admitted_command_blocks_next_user_message_until_durable_completion() {
+    let (mut runtime, actor_id, behavior, _) = spawned();
+    let previous = runtime.persistence.latest_sequence(actor_id);
+    runtime.send_message_by_id(actor_id, behavior, &[Value::int(5)]);
+    let admitted = command(&runtime, actor_id, behavior, previous, 5);
+    let (_, receipt) = runtime
+        .admit_next_typed_actor_command(actor_id, admitted)
+        .unwrap()
+        .expect("admitted message");
+
+    runtime.send_message_by_id(actor_id, behavior, &[Value::int(6)]);
+    assert!(
+        runtime.actors.get_mut(&actor_id).unwrap().mailbox.pop().is_none(),
+        "legacy scheduler must not steal the next user command before completion"
+    );
+    let next = command(&runtime, actor_id, behavior, receipt.sequence, 6);
+    assert_eq!(
+        runtime
+            .admit_next_typed_actor_command(actor_id, next)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        runtime
+            .finish_admitted_typed_actor_command(actor_id, receipt.sequence)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::WouldBlock,
+        "an admitted journal entry without a durable completion must not unlock dispatch"
+    );
+
+    // The host commits resulting state separately. No user bytecode or
+    // external provider runs in this test; this is a completion barrier proof.
+    let mut completed_snapshot = runtime.persistence.load_snapshot(actor_id).unwrap_or_default();
+    completed_snapshot.actor_id = actor_id;
+    completed_snapshot.sequence = receipt.sequence + 1;
+    completed_snapshot.activation_epoch = receipt.activation_epoch;
+    completed_snapshot
+        .state
+        .insert("total".to_string(), PersistedValue::Int(5));
+    runtime
+        .persistence
+        .commit_transition(DurableTransition {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id,
+            activation_epoch: receipt.activation_epoch,
+            sequence: receipt.sequence + 1,
+            expected_previous_sequence: receipt.sequence,
+            command: None,
+            snapshot: Some(completed_snapshot),
+            workflow_events: vec![],
+            domain_events: vec![],
+            durable_effects: vec![],
+            outbox: vec![],
+        })
+        .expect("commit completion snapshot");
+    runtime
+        .finish_admitted_typed_actor_command(actor_id, receipt.sequence)
+        .expect("completion safely releases next user command");
+    let next_message = runtime.actors.get_mut(&actor_id).unwrap().mailbox.pop().unwrap();
+    assert_eq!(next_message.payload[0].as_int(), Some(6));
+}
+
+#[test]
+fn supervisor_notices_still_bypass_admitted_inflight_user_command() {
+    use nulang::runtime::{Message, MessagePayload, MessagePriority};
+
+    let (mut runtime, actor_id, behavior, _) = spawned();
+    let previous = runtime.persistence.latest_sequence(actor_id);
+    runtime.send_message_by_id(actor_id, behavior, &[Value::int(5)]);
+    let first = command(&runtime, actor_id, behavior, previous, 5);
+    runtime
+        .admit_next_typed_actor_command(actor_id, first)
+        .unwrap()
+        .expect("admitted");
+    runtime.send_message_by_id(actor_id, behavior, &[Value::int(6)]);
+    runtime
+        .actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .mailbox
+        .push_local(Message {
+            behavior_id: 0,
+            payload: MessagePayload::from_slice(&[Value::int(99)]),
+            sender: 99,
+            priority: MessagePriority::System,
+            trace_id: None,
+        })
+        .unwrap();
+
+    let mailbox = &mut runtime.actors.get_mut(&actor_id).unwrap().mailbox;
+    assert_eq!(mailbox.pop().unwrap().sender, 99);
+    assert!(mailbox.pop().is_none());
+    assert_eq!(mailbox.len(), 1);
+}
