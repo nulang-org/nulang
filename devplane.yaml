@@ -1,9 +1,12 @@
 version: 1
 
 commands:
-  doctor: cargo --version && rustc --version && python3 --version
+  doctor: bash scripts/dev-doctor.sh
 
 verification:
+  first_run:
+    command: cargo build --locked --bin nulang && python3 scripts/smoke_first_run.py --bin target/debug/nulang
+    timeout_seconds: 1200
   fast:
     command: cargo fmt --all -- --check && cargo clippy --locked --all-targets -- -D clippy::correctness && cargo check --locked --tests
     timeout_seconds: 1200
