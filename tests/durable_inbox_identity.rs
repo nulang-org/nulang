@@ -54,7 +54,11 @@ fn identity_is_independent_of_receiver_activation_or_commit_sequence() {
     assert_ne!(first.id(), inbox(42, "request-10", 3).id());
     assert_ne!(first.id(), inbox(43, "request-9", 3).id());
     let other_tenant = DurableInboxCommand::new(
-        "tenant-b", "sender-stable-id", "request-9", 42, 7,
+        "tenant-b",
+        "sender-stable-id",
+        "request-9",
+        42,
+        7,
         &[PersistedValue::Int(3)],
     )
     .unwrap();
@@ -65,18 +69,42 @@ fn identity_is_independent_of_receiver_activation_or_commit_sequence() {
 fn malformed_sender_identity_and_nonfinite_float_fail_closed() {
     for component in ["", "  "] {
         assert!(DurableInboxCommand::new(
-            component, "sender", "key", 42, 7, &[PersistedValue::Int(1)],
-        ).is_err());
+            component,
+            "sender",
+            "key",
+            42,
+            7,
+            &[PersistedValue::Int(1)],
+        )
+        .is_err());
         assert!(DurableInboxCommand::new(
-            "tenant", component, "key", 42, 7, &[PersistedValue::Int(1)],
-        ).is_err());
+            "tenant",
+            component,
+            "key",
+            42,
+            7,
+            &[PersistedValue::Int(1)],
+        )
+        .is_err());
         assert!(DurableInboxCommand::new(
-            "tenant", "sender", component, 42, 7, &[PersistedValue::Int(1)],
-        ).is_err());
+            "tenant",
+            "sender",
+            component,
+            42,
+            7,
+            &[PersistedValue::Int(1)],
+        )
+        .is_err());
     }
     assert!(DurableInboxCommand::new(
-        "tenant", "sender", "key", 42, 7, &[PersistedValue::Float(f64::NAN)],
-    ).is_err());
+        "tenant",
+        "sender",
+        "key",
+        42,
+        7,
+        &[PersistedValue::Float(f64::NAN)],
+    )
+    .is_err());
 }
 
 #[test]
@@ -161,7 +189,10 @@ fn untrusted_metadata_mismatch_never_mutates_persistence() {
         std::io::ErrorKind::InvalidInput
     );
     assert!(store.read_journal(42).is_empty());
-    assert!(store.load_durable_inbox_receipt(request.id()).unwrap().is_none());
+    assert!(store
+        .load_durable_inbox_receipt(request.id())
+        .unwrap()
+        .is_none());
 }
 
 #[test]
@@ -191,8 +222,46 @@ fn libsql_must_report_unsupported_until_transactional_inbox_is_implemented() {
         std::io::ErrorKind::Unsupported
     );
     assert_eq!(
-        store.load_durable_inbox_receipt(request.id()).unwrap_err().kind(),
+        store
+            .load_durable_inbox_receipt(request.id())
+            .unwrap_err()
+            .kind(),
         std::io::ErrorKind::Unsupported
     );
     assert!(store.read_journal(42).is_empty());
+}
+
+#[test]
+fn distinct_message_keys_do_not_conflate_identical_business_commands() {
+    let mut store = MemoryStore::new();
+    let first = inbox(42, "order-100", 3);
+    let second = inbox(42, "order-101", 3);
+    assert_ne!(first.id(), second.id());
+    assert_eq!(first.request_digest(), second.request_digest());
+
+    store
+        .commit_inbox_transition(first, transition(42, 0, 3))
+        .unwrap();
+    store
+        .commit_inbox_transition(second, transition(42, 1, 3))
+        .unwrap();
+    assert_eq!(store.read_journal(42).len(), 2);
+}
+
+#[test]
+fn tagged_request_digest_distinguishes_values_and_float_bits() {
+    let key = |value: PersistedValue| {
+        DurableInboxCommand::new("tenant", "sender", "same", 42, 7, &[value])
+            .unwrap()
+            .request_digest()
+    };
+    assert_ne!(key(PersistedValue::Int(1)), key(PersistedValue::Bool(true)));
+    assert_ne!(
+        key(PersistedValue::Float(0.0)),
+        key(PersistedValue::Float(-0.0))
+    );
+    assert_ne!(
+        key(PersistedValue::String("1".to_string())),
+        key(PersistedValue::Int(1))
+    );
 }
