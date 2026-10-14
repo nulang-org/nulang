@@ -293,6 +293,8 @@ pub struct Mailbox {
     pending_durable_admission: Option<Message>,
     /// An admitted user command whose durable completion is pending.
     admitted_command_sequence: Option<u64>,
+    /// Host opt-in: legacy receives are restricted to system messages.
+    strict_durable_admission: bool,
 }
 
 impl Mailbox {
@@ -314,6 +316,7 @@ impl Mailbox {
             active_match: None,
             pending_durable_admission: None,
             admitted_command_sequence: None,
+            strict_durable_admission: false,
         }
     }
 
@@ -332,6 +335,8 @@ impl Mailbox {
         self.active_match = None;
         self.pending_durable_admission = None;
         self.admitted_command_sequence = None;
+        // A pooled mailbox cannot inherit another actor's strict policy.
+        self.strict_durable_admission = false;
     }
 
     /// Reserve one logical mailbox slot.
@@ -452,6 +457,17 @@ impl Mailbox {
         self.admitted_command_sequence
     }
 
+    /// Process-local irreversible opt-in; a reused mailbox resets this flag.
+    pub(crate) fn require_strict_durable_admission(&mut self) {
+        self.strict_durable_admission = true;
+        self.active_match = None;
+        self.invalidate_receive_indexes();
+    }
+
+    pub fn requires_strict_durable_admission(&self) -> bool {
+        self.strict_durable_admission
+    }
+
     /// Fence all later user commands while the host commits completion.
     pub fn fence_admitted_command(&mut self, sequence: u64) {
         debug_assert!(self.pending_durable_admission.is_none());
@@ -531,7 +547,8 @@ impl Mailbox {
     /// Legacy nontransactional receive remains unavailable while a durable
     /// candidate is pending. No caller may bypass persistence admission.
     pub fn pop(&mut self) -> Option<Message> {
-        let result = if self.pending_durable_admission.is_some()
+        let result = if self.strict_durable_admission
+            || self.pending_durable_admission.is_some()
             || self.admitted_command_sequence.is_some()
         {
             self.pop_ready_system()
@@ -603,7 +620,8 @@ impl Mailbox {
     /// guard actually succeeded.
     pub fn receive_match(&mut self, behavior_ids: &[u16]) -> Option<(usize, Arc<Vec<Value>>)> {
         // A candidate awaiting persistence cannot be consumed by selective receive.
-        if self.pending_durable_admission.is_some()
+        if self.strict_durable_admission
+            || self.pending_durable_admission.is_some()
             || self.admitted_command_sequence.is_some()
         {
             return None;
@@ -728,6 +746,10 @@ impl Mailbox {
     /// payload so the runtime can establish receiver-side ORCA ownership only
     /// after the pattern+guard succeeds.
     pub fn commit_receive_match(&mut self) -> Option<Arc<Vec<Value>>> {
+        if self.strict_durable_admission {
+            self.active_match = None;
+            return None;
+        }
         let (lane, idx, payload) = self.active_match.take()?;
         let _removed = match lane {
             MatchLane::System => self.system_skip_buffer.remove(idx),
