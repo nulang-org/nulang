@@ -158,10 +158,10 @@ is testable from the start.
   ```
 
 :::caution
-Discovery is a simple textual scan for `fn test_`. A comment containing
-that literal (e.g. `` `fn test_*` ``) is picked up as a test name too, and
-the resulting wrapper fails to compile. Avoid writing `fn test_` in test
-file comments.
+Test discovery parses top-level function declarations rather than scanning
+comments or string literals. Only zero-argument `fn test_*` functions are
+selected as individual test cases; files with no matching declarations are
+run as whole-file tests. Invalid source is diagnosed by normal compilation.
 :::
 
 ### Flags
