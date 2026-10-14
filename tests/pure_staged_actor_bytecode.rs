@@ -36,6 +36,9 @@ fn spawned(module: &CodeModule) -> (Runtime, u64, u16) {
         .spawn_from_module(module, behavior as usize, vec![])
         .as_actor_id()
         .expect("typed persistent actor");
+    runtime
+        .enable_strict_typed_actor_admission(actor_id)
+        .expect("pure execution requires strict admission");
     (runtime, actor_id, behavior)
 }
 
