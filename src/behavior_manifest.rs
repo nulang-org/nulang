@@ -1151,6 +1151,39 @@ mod tests {
     }
 
     #[test]
+    fn unattended_preflight_blocks_semantic_identity_drift_with_identical_bytes() {
+        let previous = base_manifest(actor(1, b"schema-v1"));
+        let mut incoming = previous.clone();
+        let changed_semantics = SemanticId::from_canonical_bytes(b"changed-program", []);
+        incoming.artifact.semantic_id = changed_semantics.to_string();
+        incoming.artifact.artifact_id = ArtifactId::from_semantic(
+            changed_semantics,
+            &incoming.artifact.compiler_version,
+            &incoming.artifact.target,
+            &incoming.artifact.abi,
+            &incoming.artifact.backend,
+            incoming.artifact.flags.iter(),
+        )
+        .to_string();
+
+        assert!(incoming.validate_upgrade_from(&previous).is_ok());
+        assert_eq!(
+            incoming.upgrade_preflight_from(&previous).unwrap().unverified,
+            vec![UpgradeEvidenceGap::DurableExecutableChanged {
+                actor: "payments::Account".to_string(),
+            }]
+        );
+        assert!(matches!(
+            incoming.validate_unattended_upgrade_from(
+                &previous,
+                b"artifact-bytes",
+                b"artifact-bytes",
+            ),
+            Err(BehaviorAdmissionError::UnverifiedDurableUpgrade { .. })
+        ));
+    }
+
+    #[test]
     fn unattended_preflight_identifies_every_unverified_migration_transition() {
         let previous = base_manifest(actor(1, b"schema-v1"));
         let incoming = base_manifest(actor(3, b"schema-v3"));
@@ -1187,7 +1220,11 @@ mod tests {
         previous.actors[0].persistence = BehaviorPersistence::Ephemeral;
         let mut incoming = previous.clone();
         incoming.artifact.digest = artifact_digest(b"changed-ephemeral-binary");
-        assert!(incoming.upgrade_preflight_from(&previous).unwrap().unverified.is_empty());
+        assert!(incoming
+            .upgrade_preflight_from(&previous)
+            .unwrap()
+            .unverified
+            .is_empty());
         incoming
             .validate_unattended_upgrade_from(
                 &previous,
@@ -1209,6 +1246,17 @@ mod tests {
                 b"tampered",
             ),
             Err(BehaviorAdmissionError::InvalidIncomingManifest(
+                BehaviorManifestError::ArtifactDigestMismatch { .. }
+            ))
+        ));
+
+        assert!(matches!(
+            incoming.validate_unattended_upgrade_from(
+                &previous,
+                b"wrong-previous-bytes",
+                b"artifact-bytes",
+            ),
+            Err(BehaviorAdmissionError::InvalidPreviousManifest(
                 BehaviorManifestError::ArtifactDigestMismatch { .. }
             ))
         ));
