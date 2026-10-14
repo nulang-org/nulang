@@ -395,6 +395,17 @@ mod tests {
     }
 
     #[test]
+    fn test_unresolved_vm_string_never_becomes_a_python_placeholder() {
+        let error = nulang_to_python(Value::string(42))
+            .err()
+            .expect("unresolved Nulang string must fail closed");
+        assert!(
+            error.contains("string pool"),
+            "expected a string-pool diagnostic, got: {error}"
+        );
+    }
+
+    #[test]
     fn test_owned_foreign_string_roundtrip() {
         ensure_python();
         let source = crate::runtime::OwnedForeignValue::String("owned text".to_string());
