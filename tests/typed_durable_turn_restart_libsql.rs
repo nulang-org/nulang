@@ -159,6 +159,23 @@ fn compiled_actor_state_command_effect_and_outbox_share_atomic_disk_commit() {
             Some(5)
         );
         assert_eq!(recovered.persistence.read_journal(ACTOR_ID).len(), 1);
+        let outbox_rows = recovered
+            .persistence
+            .query(
+                "SELECT destination_actor_id, behavior_id, payload FROM durable_outbox
+                 WHERE actor_id = 7401 ORDER BY sequence, ordinal",
+                &[],
+            )
+            .expect("recover committed outbox rows");
+        assert_eq!(outbox_rows.len(), 1, "exactly one committed outbox send");
+        let row: serde_json::Value =
+            serde_json::from_str(&outbox_rows[0]).expect("decode outbox SQL row");
+        assert_eq!(row[0].as_u64(), Some(ACTOR_ID + 1));
+        assert_eq!(row[1].as_u64(), Some(0));
+        let payload: Vec<PersistedValue> =
+            serde_json::from_str(row[2].as_str().expect("outbox payload JSON"))
+                .expect("decode typed outbox payload");
+        assert_eq!(payload, vec![PersistedValue::Int(5)]);
 
         let restored = recovered
             .persistence
