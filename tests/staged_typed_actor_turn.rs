@@ -166,3 +166,30 @@ fn transient_actors_cannot_be_upgraded_by_a_staged_durable_call() {
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     assert_eq!(runtime.actors[&actor_id].get_state_field("count").and_then(|v| v.as_int()), Some(0));
 }
+
+#[test]
+fn duplicate_external_effect_identity_is_rejected_without_commit() {
+    let (mut runtime, actor_id, behavior, _) = spawn();
+    let previous = runtime.persistence.latest_sequence(actor_id);
+    let prepared = effect(actor_id);
+    let error = runtime
+        .commit_staged_typed_actor_turn(
+            actor_id,
+            previous,
+            behavior,
+            vec![PersistedValue::Int(5)],
+            HashMap::from([("count".to_string(), PersistedValue::Int(5))]),
+            vec![prepared.clone(), prepared],
+            outbox(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("duplicate"));
+    assert_eq!(runtime.persistence.latest_sequence(actor_id), previous);
+    assert_eq!(
+        runtime.actors[&actor_id]
+            .get_state_field("count")
+            .and_then(|v| v.as_int()),
+        Some(0)
+    );
+}
