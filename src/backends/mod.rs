@@ -648,11 +648,11 @@ impl ForeignInterop for DefaultForeignInterop {
         temporary.track(func_id);
         let mut py_args = Vec::with_capacity(args.len());
         for value in args {
+            // The compatibility converter always registers a fresh wrapper,
+            // even for an existing TAG_PYTHON object. Retain the source VM
+            // handle, but release each new wrapper when this call completes.
             let id = crate::python::value_to_python_object_id(*value)?;
-            // VM-owned Python handles are borrowed, not temporary allocations.
-            if value.as_raw() & crate::value_layout::TAG_MASK != crate::python::TAG_PYTHON {
-                temporary.track(id);
-            }
+            temporary.track(id);
             py_args.push(id);
         }
         let result_id = self.bridge.call(func_id, py_args)?;
