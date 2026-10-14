@@ -2,7 +2,10 @@
 //! Durable inbox receipts must commit atomically with actor command history.
 //! Tests exercise the actual file-backed libSQL store, including reopen.
 
+use nulang::durable_effect::{DurableEffectId, DurableEffectRecord, DurableEffectSpec};
+use nulang::durable_effect_persistence::DurableEffectPersistenceRecord;
 use nulang::durable_inbox::DurableInboxCommand;
+use nulang::primitives::{DeliverySemantics, EffectBoundary};
 use nulang::runtime::{
     ActorSnapshot, DurableOutboxMessage, DurableTransition, EventEntry, JournalEntry, LibsqlStore,
     PersistedValue, PersistenceStore, WorkflowEvent, DURABLE_TRANSITION_VERSION,
@@ -350,6 +353,15 @@ fn receipt_insert_failure_rolls_back_previously_written_transition_records() {
         behavior_id: 12,
         payload: vec![PersistedValue::Int(9)],
     });
+    let effect_spec = DurableEffectSpec::new(
+        DurableEffectId::derive(51, "failure-at-receipt", 0, "Provider.ask"),
+        "Provider.ask",
+        EffectBoundary::External,
+        DeliverySemantics::AtLeastOnce,
+    );
+    transition.durable_effects.push(DurableEffectPersistenceRecord::from_effect(
+        DurableEffectRecord::prepare(effect_spec, b"request"),
+    ));
 
     assert!(
         store.commit_inbox_transition(request.clone(), transition).is_err(),
@@ -360,6 +372,7 @@ fn receipt_insert_failure_rolls_back_previously_written_transition_records() {
         "journal",
         "durable_workflow_events",
         "durable_domain_events",
+        "durable_effect_records",
         "durable_outbox",
         "durable_transitions",
         "durable_tails",
