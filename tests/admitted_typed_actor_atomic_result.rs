@@ -195,3 +195,72 @@ fn result_commit_requires_an_actual_admitted_command() {
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     assert_eq!(runtime.persistence.latest_sequence(actor_id), 0);
 }
+
+#[test]
+fn exact_actor_grant_allows_prepared_intent_but_never_dispatches_a_provider() {
+    use nulang::authority::{AuthorityGrant, AuthorityManifest};
+
+    let (mut runtime, actor_id, behavior) = spawned_counter();
+    let grant = "Audit::Write"
+        .parse::<AuthorityGrant>()
+        .expect("canonical typed tool grant");
+    runtime
+        .actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .install_authority_manifest(&AuthorityManifest::from_grants([grant]));
+    let admitted = admit(&mut runtime, actor_id, behavior, 5);
+    let intent = prepared_effect(actor_id);
+    let effect_id = intent.effect().spec().id;
+
+    runtime
+        .commit_admitted_typed_actor_result(
+            actor_id,
+            admitted,
+            HashMap::from([("total".to_string(), PersistedValue::Int(5))]),
+            vec![intent],
+            vec![],
+        )
+        .expect("preauthorized Prepared intent may be committed");
+
+    let recovered = runtime
+        .persistence
+        .load_durable_effect(actor_id, effect_id)
+        .unwrap()
+        .expect("committed intent");
+    assert!(matches!(
+        recovered.effect(),
+        DurableEffectRecord::Prepared { .. }
+    ));
+    assert_eq!(runtime.persistence.latest_sequence(actor_id), admitted + 1);
+}
+
+#[test]
+fn repeated_external_effect_id_is_rejected_before_result_commit() {
+    use nulang::authority::{AuthorityGrant, AuthorityManifest};
+
+    let (mut runtime, actor_id, behavior) = spawned_counter();
+    let grant = "Audit::Write".parse::<AuthorityGrant>().unwrap();
+    runtime
+        .actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .install_authority_manifest(&AuthorityManifest::from_grants([grant]));
+    let admitted = admit(&mut runtime, actor_id, behavior, 5);
+    let intent = prepared_effect(actor_id);
+    let error = runtime
+        .commit_admitted_typed_actor_result(
+            actor_id,
+            admitted,
+            HashMap::from([("total".to_string(), PersistedValue::Int(5))]),
+            vec![intent.clone(), intent],
+            vec![],
+        )
+        .expect_err("one logical external effect cannot have two records");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(runtime.persistence.latest_sequence(actor_id), admitted);
+    assert_eq!(
+        runtime.actors[&actor_id].mailbox.admitted_command_sequence(),
+        Some(admitted)
+    );
+}
