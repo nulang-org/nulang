@@ -200,19 +200,19 @@ fn mismatched_predecessor_rolls_back_receipt_and_journal() {
 #[test]
 fn two_connections_competing_for_same_sequence_never_both_commit() {
     let file = TestDatabase::new();
-    let first_store = file.store();
-    let second_store = file.store();
+    let path_a = file.0.clone();
+    let path_b = file.0.clone();
     let barrier = Arc::new(Barrier::new(2));
     let (left, right) = std::thread::scope(|scope| {
         let barrier_a = Arc::clone(&barrier);
         let barrier_b = Arc::clone(&barrier);
         let left = scope.spawn(move || {
-            let mut store = first_store;
+            let mut store = LibsqlStore::new(path_a).unwrap();
             barrier_a.wait();
             store.commit_inbox_transition(identity(51, "first", 7), command(51, 0, 7))
         });
         let right = scope.spawn(move || {
-            let mut store = second_store;
+            let mut store = LibsqlStore::new(path_b).unwrap();
             barrier_b.wait();
             store.commit_inbox_transition(identity(51, "second", 8), command(51, 0, 8))
         });
