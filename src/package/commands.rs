@@ -1934,34 +1934,100 @@ fn discover_test_functions(source: &str) -> Vec<String> {
         .collect()
 }
 
-/// Strip the `fn main() { ... }` block from source, keeping everything else.
+/// Remove a parsed top-level block-bodied `main` from a per-function test
+/// wrapper without misidentifying comments, string literals or nested braces.
+///
+/// Only a real top-level declaration is eligible. The AST identifies `main`;
+/// lexer spans then locate the exact source range, preserving every other
+/// declaration byte-for-byte. An unparseable source is left intact so the
+/// normal test compiler can report the original syntax error.
 fn strip_main_function(source: &str) -> String {
-    if let Some(pos) = source.find("fn main") {
-        // Find the opening brace after "fn main"
-        if let Some(brace_start) = source[pos..].find('{') {
-            let abs_brace = pos + brace_start;
-            // Count braces to find matching close
-            let mut depth = 0;
-            let mut end = abs_brace;
-            for (i, ch) in source[abs_brace..].char_indices() {
-                match ch {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = abs_brace + i + 1;
-                            break;
-                        }
-                    }
-                    _ => {}
+    use crate::lexer::TokenKind;
+
+    let Ok(tokens) = crate::lexer::Lexer::new(source).lex() else {
+        return source.to_string();
+    };
+    let Ok(parsed) = crate::parser::Parser::new(tokens.clone()).parse_module() else {
+        return source.to_string();
+    };
+
+    let Some((fn_start, body_end)) = parsed.decls.iter().find_map(|decl| match decl {
+        crate::ast::Decl::Function {
+            name,
+            span,
+            body: crate::ast::Expr::Block { .. },
+            ..
+        } if name == "main" => {
+            // The current block parser sets its span to the token immediately
+            // following the closing brace, rather than to the opening brace.
+            let body_end = match decl {
+                crate::ast::Decl::Function { body, .. } => body.span().start,
+                _ => unreachable!(),
+            };
+            Some((span.start, body_end))
+        }
+        _ => None,
+    }) else {
+        return source.to_string();
+    };
+
+    let Some(fn_index) = tokens.iter().position(|token| {
+        matches!(token.kind, TokenKind::Fn) && token.span.start == fn_start
+    }) else {
+        return source.to_string();
+    };
+
+    // The nearest closing brace preceding the AST's post-body token is
+    // the closing brace of the function's block. Braces inside strings
+    // and comments have no brace tokens.
+    let Some(close_index) = tokens
+        .iter()
+        .enumerate()
+        .skip(fn_index)
+        .take_while(|(_, token)| token.span.end <= body_end)
+        .filter(|(_, token)| matches!(token.kind, TokenKind::RBrace))
+        .map(|(index, _)| index)
+        .last()
+    else {
+        return source.to_string();
+    };
+
+    let mut brace_depth = 0usize;
+    let mut open_index = None;
+    for index in (fn_index..=close_index).rev() {
+        match tokens[index].kind {
+            TokenKind::RBrace => brace_depth += 1,
+            TokenKind::LBrace => {
+                brace_depth -= 1;
+                if brace_depth == 0 {
+                    open_index = Some(index);
+                    break;
                 }
             }
-            let before = &source[..pos];
-            let after = &source[end..];
-            return format!("{}{}", before, after);
+            _ => {}
         }
     }
-    source.to_string()
+    if open_index.is_none() {
+        return source.to_string();
+    }
+
+    // Include the visibility keyword if the function was declared `pub`.
+    let mut first_index = fn_index;
+    let mut previous = fn_index;
+    while previous > 0 && matches!(tokens[previous - 1].kind, TokenKind::Newline) {
+        previous -= 1;
+    }
+    if previous > 0 && matches!(tokens[previous - 1].kind, TokenKind::Pub) {
+        first_index = previous - 1;
+    }
+
+    let start = tokens[first_index].span.start as usize;
+    let end = tokens[close_index].span.end as usize;
+    if start >= end || end > source.len() {
+        return source.to_string();
+    }
+
+    format!("{}{}", &source[..start], &source[end..])
 }
 /// Run a test file via `nulang`, capturing stderr so error messages appear
 /// after the test name (avoiding interleaved output).
