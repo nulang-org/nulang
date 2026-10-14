@@ -35,6 +35,61 @@ install -m 0755 nulang-linux-x86_64 "$HOME/.local/bin/nulang"
 
 Add `$HOME/.local/bin` to `PATH` if it is not already there. For Linux aarch64, replace `linux-x86_64` with `linux-aarch64` in the commands.
 
+### Linux distro packages (new releases)
+
+Releases published **after the distro packaging workflow is merged** also
+include native packages for each Linux architecture. Earlier tagged releases
+retain their existing generic archives.
+
+| Distro family | x86_64 / amd64 | ARM64 / aarch64 |
+| --- | --- | --- |
+| Ubuntu, Debian, Linux Mint, Pop!_OS | `nulang_<version>_amd64.deb` | `nulang_<version>_arm64.deb` |
+| Fedora, RHEL-compatible, openSUSE | `nulang-<version>-1.x86_64.rpm` | `nulang-<version>-1.aarch64.rpm` |
+| Arch, Manjaro, EndeavourOS and other glibc-based Linux | `nulang-linux-x86_64.tar.gz` | `nulang-linux-aarch64.tar.gz` |
+
+Select an existing release tag from [GitHub Releases](https://github.com/nulang-org/nulang/releases),
+then substitute it for `vX.Y.Z` below. Install from a package only after
+verifying its adjacent checksum.
+
+**Ubuntu / Debian (x86_64):**
+
+```bash
+TAG=vX.Y.Z
+BASE="https://github.com/nulang-org/nulang/releases/download/$TAG"
+curl -fLO "$BASE/nulang_${TAG#v}_amd64.deb"
+curl -fLO "$BASE/nulang_${TAG#v}_amd64.deb.sha256"
+sha256sum -c "nulang_${TAG#v}_amd64.deb.sha256"
+sudo apt install "./nulang_${TAG#v}_amd64.deb"
+nulang --version
+```
+
+**Fedora (x86_64):**
+
+```bash
+TAG=vX.Y.Z
+BASE="https://github.com/nulang-org/nulang/releases/download/$TAG"
+curl -fLO "$BASE/nulang-${TAG#v}-1.x86_64.rpm"
+curl -fLO "$BASE/nulang-${TAG#v}-1.x86_64.rpm.sha256"
+sha256sum -c "nulang-${TAG#v}-1.x86_64.rpm.sha256"
+sudo dnf install "./nulang-${TAG#v}-1.x86_64.rpm"
+nulang --version
+```
+
+Substitute `arm64` for Debian filenames or `aarch64` for RPM filenames
+on ARM64. To uninstall, use `sudo apt remove nulang` or
+`sudo dnf remove nulang`. For Arch/Manjaro use the checksummed tarball
+instructions above; no official `pacman`/AUR package is published.
+
+**Linux compatibility boundary:** Release binaries are compiled on
+Ubuntu 22.04 to target glibc 2.35 and OpenSSL 3. Debian 12, Ubuntu 22.04
+and newer compatible environments are candidates for verification, **not**
+an across-the-board support guarantee. RHEL/Rocky/AlmaLinux 9 ship glibc
+2.34 and are not compatible with this build baseline. Alpine uses musl,
+so these glibc binaries do not support native Alpine installation.
+Check `ldd /usr/bin/nulang` for missing libraries and use a local source
+build when the ABI is unsuitable. Do not work around an ABI mismatch with
+fake symlinks.
+
 ### macOS (Apple Silicon)
 
 After downloading both release files:
@@ -61,15 +116,15 @@ Rename-Item .\nulang-windows-x86_64 nulang.exe
 
 The release archive contains a platform-qualified executable that must be renamed `nulang.exe`. Move it to a dedicated folder on your `PATH` if you want to invoke `nulang` from other directories.
 
-**Platform library requirements:** The prebuilt archives contain an executable, not an isolated runtime with every shared library bundled. In an actual October 11, 2026 Linux x86_64 release-build artifact, `readelf -d nulang` identified dependencies on `libpython3.12.so.1.0`, `libssl.so.3`, and `libcrypto.so.3`. On a Linux installation with only Python 3.13, the executable failed to start with `libpython3.12.so.1.0: cannot open shared object file`. Check dependencies before assuming a downloaded binary is portable:
+**Prebuilt CLI feature profile:** The current release workflow uses the
+`release-cli` feature set (standard compiler/runtime tooling excluding Python
+interop). It rejects dynamic `libpython` requirements in Linux binaries. Existing
+published release assets may predate that protection; verify each downloaded
+binary and its runtime dependencies rather than assuming a prior release was
+rebuilt. macOS and Windows shared-library requirements vary by host.
 
-```bash
-ldd "$HOME/.local/bin/nulang" | grep -E 'python|ssl|crypto|not found'
-```
-
-For a missing dependency, install the matching **system-provided, ABI-compatible** shared library where available, or build Nulang from source for your distribution. **Do not** symlink an incompatible Python library version (for example, Python 3.13 to a Python 3.12 SONAME). For a compiler/runtime build without the Python integration and its linkage, use `cargo build --locked --release --no-default-features`, recognizing that optional features will be unavailable. The specific shared-library dependencies of macOS and Windows archives may differ; test those binaries on clean supported machines before considering their portability verified.
-
-**Support boundary:** Releases are CI-built for the listed platforms, not guaranteed to start on every distribution or OS revision. Nulang is alpha software, not yet a production compatibility guarantee.
+**Support boundary:** CI builds and package-integrity checks are not a promise
+of portability to every distribution. Nulang remains alpha software.
 
 ## Build from source (contributors and custom profiles)
 
