@@ -57,6 +57,30 @@ Tagged releases publish checksummed archives from the release CI matrix:
 - **macOS (Apple Silicon / aarch64)**: `nulang-macos-aarch64.tar.gz`
 - **Windows (x86_64)**: `nulang-windows-x86_64.tar.gz`
 
+On **newly tagged releases after the Linux packaging workflow is merged**,
+the same tested Linux binaries are also available as native packages:
+
+| Distribution family | x86_64 / amd64 | aarch64 / ARM64 |
+| --- | --- | --- |
+| Ubuntu / Debian / Mint / Pop!_OS | `nulang_<version>_amd64.deb` | `nulang_<version>_arm64.deb` |
+| Fedora / compatible RPM-based systems | `nulang-<version>-1.x86_64.rpm` | `nulang-<version>-1.aarch64.rpm` |
+| Arch / Manjaro / other compatible glibc systems | `nulang-linux-x86_64.tar.gz` | `nulang-linux-aarch64.tar.gz` |
+
+Download packages and their matching `.sha256` files from
+[GitHub Releases](https://github.com/nulang-org/nulang/releases).
+Before installation, run `sha256sum -c <downloaded-file>.sha256`.
+Then use `sudo apt install ./nulang_<version>_amd64.deb` on Debian-family
+systems or `sudo dnf install ./nulang-<version>-1.x86_64.rpm` on Fedora-family
+systems (substitute the ARM64 filename as needed). Packages install
+`/usr/bin/nulang`; the package manager can also uninstall them.
+
+**Compatibility:** Linux release binaries are built against Ubuntu 22.04
+(glibc 2.35 and OpenSSL 3 baseline). Packaging does not make them portable
+to all distributions: RHEL/Rocky/AlmaLinux 9 have an older glibc; Alpine
+uses musl. Those targets require a separately tested build. See the
+[installation guide](https://nulang.org/getting-started/installation/)
+for verification and the generic archive path.
+
 Download the latest archive and its matching `.sha256` file from
 [GitHub Releases](https://github.com/nulang-org/nulang/releases), verify the
 checksum, then put the extracted executable on your PATH.

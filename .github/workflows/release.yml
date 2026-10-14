@@ -13,6 +13,8 @@ on:
       - 'src/main.rs'
       - 'scripts/check_release_linux.sh'
       - 'scripts/tests/test_release_cli_profile.py'
+      - 'scripts/package_linux.sh'
+      - 'scripts/tests/test_linux_packages.py'
 
 env:
   CARGO_TERM_COLOR: always
@@ -30,8 +32,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Verify public CLI feature-profile parity
-        run: python3 -m unittest discover -s scripts/tests -p test_release_cli_profile.py
+      - name: Verify release packaging contracts
+        run: |
+          python3 -m unittest discover -s scripts/tests -p test_release_cli_profile.py
+          python3 -m unittest discover -s scripts/tests -p test_linux_packages.py
 
       - name: Verify tag matches crate and CLI versions
         if: github.event_name == 'push'
@@ -70,14 +74,21 @@ jobs:
     needs: preflight
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # Build against Ubuntu 22.04's glibc 2.35 / OpenSSL 3 baseline,
+          # instead of silently increasing minimum requirements with -latest.
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             artifact: nulang-linux-x86_64
-          - os: ubuntu-latest
+            package_arch: x86_64
+            deb_arch: amd64
+          - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             artifact: nulang-linux-aarch64
+            package_arch: aarch64
+            deb_arch: arm64
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: nulang-macos-aarch64
@@ -89,31 +100,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install cross-compilation toolchain (Linux aarch64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+      # Build both GNU/Linux architectures natively to avoid Ubuntu multiarch
+      # apt mirror failures and exercise actual ARM64 code before release.
+      - name: Install native Linux build dependencies
+        if: runner.os == 'Linux'
         run: |
-          sudo dpkg --add-architecture arm64
-          # Restrict the runner's amd64 sources and add arm64 via
-          # ports.ubuntu.com (archive/security mirrors 404 on arm64).
-          sudo sed -i '/^Types: deb$/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources
-          CODENAME=$(lsb_release -cs)
-          # printf (not an indented heredoc) so the deb822 stanza has no
-          # leading whitespace — indented continuation lines would merge
-          # into the previous field and break the source.
-          printf 'Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports/\nSuites: %s %s-updates %s-backports %s-security\nComponents: main restricted universe multiverse\nArchitectures: arm64\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n' "$CODENAME" "$CODENAME" "$CODENAME" "$CODENAME" | sudo tee /etc/apt/sources.list.d/arm64.sources
           sudo apt-get update
-          # The public CLI does not require cross-target Python headers or
-          # shared libraries. Keep the cross toolchain and OpenSSL only.
-          # --no-install-recommends omits the target glibc development sysroot
-          # on some Ubuntu images. Without it, ring's C build may resolve
-          # /usr/include/stdint.h and fail on bits/libc-header-start.h.
-          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross libssl-dev:arm64 pkg-config
-          # Fail early if the compiler cannot find target libc headers.
-          printf '#include <stdint.h>\nint main(void) { return (int)sizeof(uint64_t); }\n' \
-            | aarch64-linux-gnu-gcc -x c -c - -o "$RUNNER_TEMP/nulang-arm64-libc-smoke.o"
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
-          echo "PKG_CONFIG_ALLOW_CROSS=1" >> $GITHUB_ENV
-          echo "PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig" >> $GITHUB_ENV
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+          test "$(uname -m)" = "${{ matrix.package_arch }}"
 
       - name: Install macOS system dependencies
         if: runner.os == 'macOS'
@@ -146,14 +140,14 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          # readelf understands both native x86_64 and cross-built aarch64 ELF.
+          # Keep public artifacts independent of the runner's Python ABI.
           if readelf -d target/${{ matrix.target }}/release/nulang | grep -Eq 'Shared library: \[libpython'; then
             echo "::error::Public release CLI unexpectedly depends on libpython"
             exit 1
           fi
 
       - name: Smoke native Linux release CLI
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        if: runner.os == 'Linux'
         shell: bash
         run: bash scripts/check_release_linux.sh target/${{ matrix.target }}/release/nulang
 
@@ -185,18 +179,9 @@ jobs:
         run: cargo test --locked --release --target ${{ matrix.target }} --no-default-features --features release-cli
 
       - name: Strip binary
-        # No strip on Windows: the MSVC toolchain has no equivalent
-        # single-step strip, and the binary is already release-sized.
+        # Native strip handles both Linux architectures and macOS.
         if: runner.os != 'Windows'
-        run: |
-          # The host strip cannot process a cross-compiled aarch64 ELF;
-          # use the cross binutils strip (from gcc-aarch64-linux-gnu).
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-            STRIP=aarch64-linux-gnu-strip
-          else
-            STRIP=strip
-          fi
-          $STRIP target/${{ matrix.target }}/release/nulang
+        run: strip target/${{ matrix.target }}/release/nulang
 
       - name: Package binary
         # bash shell: the default pwsh on Windows runners cannot run the
@@ -230,7 +215,6 @@ jobs:
           test "$(tar tzf dist/${{ matrix.artifact }}.tar.gz)" = "${{ matrix.artifact }}"
 
       - name: Smoke extracted native release archive
-        if: matrix.target != 'aarch64-unknown-linux-gnu'
         shell: bash
         run: |
           mkdir -p release-smoke
@@ -248,6 +232,39 @@ jobs:
             test "$output" = "release-smoke"
           fi
 
+      - name: Install Linux package build tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends rpm cpio
+
+      - name: Build Debian and RPM packages
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          version="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "nulang"))')"
+          bash scripts/package_linux.sh "target/${{ matrix.target }}/release/nulang" "$version" "${{ matrix.package_arch }}" dist
+
+      - name: Verify Linux packages, architectures, payloads, and checksums
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "nulang"))')"
+          arch="${{ matrix.package_arch }}"
+          deb="dist/nulang_${version}_${{ matrix.deb_arch }}.deb"
+          rpm="dist/nulang-${version}-1.${arch}.rpm"
+          test "$(dpkg-deb --field "$deb" Architecture)" = "${{ matrix.deb_arch }}"
+          test "$(rpm -qp --qf '%{ARCH}' "$rpm")" = "$arch"
+          dpkg-deb --contents "$deb" | grep -E '/usr/bin/nulang$'
+          rpm -qpl "$rpm" | grep -Fx '/usr/bin/nulang'
+          (cd dist && sha256sum -c "$(basename "$deb").sha256" && sha256sum -c "$(basename "$rpm").sha256")
+          mkdir -p package-smoke/deb package-smoke/rpm
+          dpkg-deb -x "$deb" package-smoke/deb
+          rpm2cpio "$rpm" | (cd package-smoke/rpm && cpio -id --quiet)
+          cmp package-smoke/deb/usr/bin/nulang "target/${{ matrix.target }}/release/nulang"
+          cmp package-smoke/rpm/usr/bin/nulang "target/${{ matrix.target }}/release/nulang"
+          bash scripts/check_release_linux.sh package-smoke/deb/usr/bin/nulang
+          bash scripts/check_release_linux.sh package-smoke/rpm/usr/bin/nulang
+
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
@@ -255,12 +272,101 @@ jobs:
           path: |
             dist/${{ matrix.artifact }}.tar.gz
             dist/${{ matrix.artifact }}.tar.gz.sha256
+            dist/*.deb
+            dist/*.deb.sha256
+            dist/*.rpm
+            dist/*.rpm.sha256
+
+  # Download release-format packages and exercise installation on clean
+  # distro images. This includes actual native ARM64 execution, not QEMU.
+  linux-install-smoke:
+    name: Linux install (${{ matrix.label }})
+    needs: release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Ubuntu 22.04 x86_64
+            os: ubuntu-22.04
+            artifact: nulang-linux-x86_64
+            kind: deb
+            image: ubuntu:22.04
+          - label: Ubuntu 22.04 arm64
+            os: ubuntu-22.04-arm
+            artifact: nulang-linux-aarch64
+            kind: deb
+            image: ubuntu:22.04
+          - label: Debian 12 x86_64
+            os: ubuntu-22.04
+            artifact: nulang-linux-x86_64
+            kind: deb
+            image: debian:12
+          - label: Debian 12 arm64
+            os: ubuntu-22.04-arm
+            artifact: nulang-linux-aarch64
+            kind: deb
+            image: debian:12
+          - label: Fedora 44 x86_64
+            os: ubuntu-22.04
+            artifact: nulang-linux-x86_64
+            kind: rpm
+            image: fedora:44
+          - label: Fedora 44 arm64
+            os: ubuntu-22.04-arm
+            artifact: nulang-linux-aarch64
+            kind: rpm
+            image: fedora:44
+    permissions:
+      contents: read
+    steps:
+      - name: Download release package artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ matrix.artifact }}
+          path: pkg
+
+      - name: Verify downloaded package checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd pkg
+          case "${{ matrix.kind }}" in
+            deb) sha256sum -c nulang_*.deb.sha256 ;;
+            rpm) sha256sum -c nulang-*.rpm.sha256 ;;
+            *) exit 2 ;;
+          esac
+
+      - name: Install, execute and uninstall package on native host architecture
+        shell: bash
+        run: |
+          docker run --rm \
+            -e NULANG_PACKAGE_KIND="${{ matrix.kind }}" \
+            -e NULANG_EVAL='perform IO.print("linux-package-smoke")' \
+            -v "$PWD/pkg:/packages:ro" \
+            "${{ matrix.image }}" sh -euc '
+              cd /packages
+              if [ "$NULANG_PACKAGE_KIND" = deb ]; then
+                apt-get update
+                apt-get install -y --no-install-recommends ./nulang_*.deb
+              else
+                dnf -y install ./nulang-*.rpm
+              fi
+              nulang --version
+              test "$(nulang --eval "$NULANG_EVAL")" = linux-package-smoke
+              if [ "$NULANG_PACKAGE_KIND" = deb ]; then
+                apt-get remove -y nulang
+              else
+                dnf remove -y nulang
+              fi
+              test ! -e /usr/bin/nulang
+            '
 
   publish:
     name: Publish Release
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    needs: release
+    needs: [release, linux-install-smoke]
     permissions:
       contents: write
     steps:

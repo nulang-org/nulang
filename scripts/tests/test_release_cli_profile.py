@@ -49,21 +49,19 @@ class ReleaseCliProfileTests(unittest.TestCase):
         )
 
 
-    def test_linux_arm64_release_installs_libc_headers_and_probes_cross_compiler(self):
-        """Cross GCC must find target stdint.h before the costly Rust build."""
+    def test_linux_arm64_release_runs_natively_before_publication(self):
+        """Native ARM64 avoids multiarch apt mirrors and validates the real CPU."""
         workflow = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
-        setup = workflow.split(
-            "      - name: Install cross-compilation toolchain (Linux aarch64)\n", 1
-        )[1].split("      - name: Install macOS system dependencies\n", 1)[0]
-        self.assertIn("libc6-dev-arm64-cross", setup)
-        self.assertIn("aarch64-linux-gnu-gcc -x c -c -", setup)
-        self.assertIn("#include <stdint.h>", setup)
-        smoke_line = next(
-            line for line in setup.splitlines() if "printf '#include <stdint.h>" in line
+        self.assertIn(
+            "os: ubuntu-22.04-arm\n            target: aarch64-unknown-linux-gnu",
+            workflow,
         )
-        self.assertIn(r"\n", smoke_line)
-        self.assertNotIn(r"\\n", smoke_line)
-        self.assertEqual(len(smoke_line) - len(smoke_line.rstrip("\\")), 1)
+        self.assertIn("      - name: Install native Linux build dependencies", workflow)
+        self.assertIn("test \"$(uname -m)\" = \"${{ matrix.package_arch }}\"", workflow)
+        self.assertNotIn("sudo dpkg --add-architecture arm64", workflow)
+        self.assertNotIn("aarch64-linux-gnu-gcc", workflow)
+        self.assertIn("  linux-install-smoke:\n", workflow)
+        self.assertIn("    needs: [release, linux-install-smoke]", workflow)
 
 
 if __name__ == "__main__":
