@@ -56,8 +56,18 @@ fn duplicate_key_mutations_use_last_write_and_survive_checkpoint_reopen() {
         let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
         commit(
             &mut tablet,
-            vec![put(b"k", b"old"), put(b"other", b"value"), put(b"k", b"winner")],
+            vec![
+                put(b"k", b"old"),
+                put(b"other", b"value"),
+                put(b"k", b"winner"),
+            ],
         );
+        assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"winner"[..]));
+    }
+
+    // Recover directly from the WAL before a checkpoint has been published.
+    {
+        let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
         assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"winner"[..]));
         tablet.checkpoint().unwrap();
     }
@@ -95,7 +105,10 @@ fn retention_keeps_snapshot_floor_and_rejects_expired_snapshots_after_restart() 
         assert_eq!(tablet.read_at(b"deleted", 2).unwrap(), None);
         assert!(matches!(
             tablet.read_at(b"k", 1),
-            Err(TabletError::SnapshotExpired { requested: 1, oldest_retained: 2 })
+            Err(TabletError::SnapshotExpired {
+                requested: 1,
+                oldest_retained: 2
+            })
         ));
     }
 
@@ -105,7 +118,10 @@ fn retention_keeps_snapshot_floor_and_rejects_expired_snapshots_after_restart() 
         assert_eq!(tablet.read_at(b"k", 2).unwrap(), Some(&b"v2"[..]));
         assert!(matches!(
             tablet.read_at(b"k", 1),
-            Err(TabletError::SnapshotExpired { requested: 1, oldest_retained: 2 })
+            Err(TabletError::SnapshotExpired {
+                requested: 1,
+                oldest_retained: 2
+            })
         ));
         commit(&mut tablet, vec![put(b"k", b"v4")]);
         tablet.checkpoint().unwrap();
@@ -116,7 +132,10 @@ fn retention_keeps_snapshot_floor_and_rejects_expired_snapshots_after_restart() 
     assert_eq!(reopened.read_at(b"k", 4).unwrap(), Some(&b"v4"[..]));
     assert!(matches!(
         reopened.read_at(b"k", 0),
-        Err(TabletError::SnapshotExpired { requested: 0, oldest_retained: 2 })
+        Err(TabletError::SnapshotExpired {
+            requested: 0,
+            oldest_retained: 2
+        })
     ));
     cleanup(&path);
 }
@@ -128,10 +147,7 @@ fn retention_rejects_future_watermark_without_changing_state() {
 
     let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
     commit(&mut tablet, vec![put(b"k", b"v1")]);
-    assert!(matches!(
-        tablet.reclaim_history_before(2),
-        Err(_)
-    ));
+    assert!(tablet.reclaim_history_before(2).is_err());
     assert_eq!(tablet.oldest_retained_snapshot(), 0);
     assert_eq!(tablet.read_at(b"k", 0).unwrap(), None);
     assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"v1"[..]));
@@ -148,10 +164,7 @@ fn retention_floor_cannot_move_backward() {
     commit(&mut tablet, vec![put(b"k", b"v1")]);
     commit(&mut tablet, vec![put(b"k", b"v2")]);
     tablet.reclaim_history_before(2).unwrap();
-    assert!(matches!(
-        tablet.reclaim_history_before(1),
-        Err(_)
-    ));
+    assert!(tablet.reclaim_history_before(1).is_err());
     assert_eq!(tablet.oldest_retained_snapshot(), 2);
     cleanup(&path);
 }
