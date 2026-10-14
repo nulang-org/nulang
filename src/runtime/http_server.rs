@@ -2,7 +2,8 @@
 //!
 //! Phase 1: each request dispatches to a standalone VM on the listener thread.
 //! Handlers are non-capturing `fn(String) -> String` — no closures with env.
-//! Status is always 200; Content-Type is always text/plain.
+//! Responses use standard HTTP status codes; bodies are text/plain unless the
+//! response carries another Content-Type.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -17,6 +18,7 @@ use std::time::Duration;
 use crate::bytecode::CodeModule;
 use crate::value_layout::PAYLOAD_MASK;
 use crate::vm::{resolve_value_string, Value, CLOSURE_ENV_FLAG, VM};
+use crate::web::csrf::validate_mutation_origin;
 use crate::web::dispatch::{render_direct_request, DirectRequestRenderError};
 use crate::web::http_problem::request_decode_problem_response;
 use crate::web::http_request::HttpRequestBindingInputs;
@@ -76,6 +78,14 @@ pub struct HttpResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+}
+
+fn not_implemented_response() -> HttpResponse {
+    HttpResponse {
+        status: 501,
+        headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
+        body: b"Not Implemented".to_vec(),
+    }
 }
 
 /// Manages the background HTTP listener thread.
@@ -180,8 +190,14 @@ impl HttpServerState {
                     let mut req = httparse::Request::new(&mut headers);
                     match req.parse(&buf[..n]) {
                         Ok(httparse::Status::Complete(body_offset)) => {
-                            let method = HttpMethod::from_str(req.method.unwrap_or("GET"))
-                                .unwrap_or(HttpMethod::Get);
+                            let Some(method) = HttpMethod::from_str(req.method.unwrap_or(""))
+                            else {
+                                HttpServerState::write_response(
+                                    &mut stream,
+                                    &not_implemented_response(),
+                                );
+                                break;
+                            };
                             let path = req.path.unwrap_or("/").to_string();
 
                             let headers: Vec<(String, String)> = req
@@ -273,6 +289,7 @@ impl HttpServerState {
             403 => "Forbidden",
             404 => "Not Found",
             405 => "Method Not Allowed",
+            501 => "Not Implemented",
             413 => "Payload Too Large",
             422 => "Unprocessable Entity",
             429 => "Too Many Requests",
@@ -709,6 +726,32 @@ pub fn render_route_handler(
     }
 }
 
+/// Reject unsafe browser requests before invoking any route. A trusted
+/// reverse proxy must configure NULANG_WEB_PUBLIC_ORIGIN to its external origin.
+/// This is CSRF provenance validation, not authentication or authorization.
+fn unsafe_origin_response(
+    request: &HttpRequest,
+    local_addr: Option<std::net::SocketAddr>,
+    public_origin: Option<&str>,
+) -> Option<HttpResponse> {
+    let failure = validate_mutation_origin(
+        request.method.as_str(),
+        &request.headers,
+        local_addr,
+        public_origin,
+    )
+    .err()?;
+    eprintln!("Nulang Web denied state-changing request: {failure:?}");
+    Some(HttpResponse {
+        status: 403,
+        headers: vec![
+            ("Content-Type".into(), "text/plain; charset=utf-8".into()),
+            ("Cache-Control".into(), "no-store".into()),
+        ],
+        body: b"Forbidden: invalid request origin".to_vec(),
+    })
+}
+
 fn invalid_ui_action_response(captured: &HttpRequestBindingInputs) -> Option<HttpResponse> {
     captured
         .ui_message_error
@@ -840,8 +883,14 @@ impl WebDevServer {
                     let mut req = httparse::Request::new(&mut headers);
                     match req.parse(&buf[..n]) {
                         Ok(httparse::Status::Complete(body_offset)) => {
-                            let method = HttpMethod::from_str(req.method.unwrap_or("GET"))
-                                .unwrap_or(HttpMethod::Get);
+                            let Some(method) = HttpMethod::from_str(req.method.unwrap_or(""))
+                            else {
+                                HttpServerState::write_response(
+                                    &mut stream,
+                                    &not_implemented_response(),
+                                );
+                                break;
+                            };
                             let path = req.path.unwrap_or("/").to_string();
 
                             let headers: Vec<(String, String)> = req
@@ -893,7 +942,16 @@ impl WebDevServer {
                                 body,
                             };
 
-                            let mut response = if path.starts_with(Self::SSE_PATH_PREFIX) {
+                            // Verify browser provenance before route dispatch,
+                            // including legacy ambient-context handlers.
+                            let public_origin = std::env::var("NULANG_WEB_PUBLIC_ORIGIN").ok();
+                            let mut response = if let Some(forbidden) = unsafe_origin_response(
+                                &request,
+                                stream.local_addr().ok(),
+                                public_origin.as_deref(),
+                            ) {
+                                forbidden
+                            } else if path.starts_with(Self::SSE_PATH_PREFIX) {
                                 let room = &path[Self::SSE_PATH_PREFIX.len()..];
                                 Self::serve_sse(room, &mut stream, shutdown.clone());
                                 break;
@@ -1184,6 +1242,96 @@ mod tests {
         assert!(String::from_utf8(response.body)
             .unwrap()
             .contains("Invalid UI action envelope"));
+    }
+
+    #[test]
+    fn web_dev_server_rejects_foreign_posts_and_unknown_http_methods_over_tcp() {
+        fn send(port: u16, raw: &str) -> String {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream.write_all(raw.as_bytes()).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        }
+
+        let server = WebDevServer::bind(0, None, None, vec![]).unwrap();
+        let host = format!("localhost:{}", server.port);
+        let foreign = format!(
+            "POST /sign HTTP/1.1\r\nHost: {host}\r\nOrigin: https://attacker.example\r\nContent-Length: 0\r\n\r\n"
+        );
+        assert!(send(server.port, &foreign).starts_with("HTTP/1.1 403 Forbidden"));
+
+        let missing = format!("POST /sign HTTP/1.1\r\nHost: {host}\r\nContent-Length: 0\r\n\r\n");
+        assert!(send(server.port, &missing).starts_with("HTTP/1.1 403 Forbidden"));
+
+        let trusted = format!(
+            "POST /sign HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nContent-Length: 0\r\n\r\n"
+        );
+        assert!(
+            send(server.port, &trusted).starts_with("HTTP/1.1 404 Not Found"),
+            "trusted provenance must reach routing instead of being rejected"
+        );
+
+        let unknown = format!("TRACE / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        let response = send(server.port, &unknown);
+        assert!(response.starts_with("HTTP/1.1 501 Not Implemented\r\n"));
+        assert!(
+            !response.contains("\r\nAllow:"),
+            "501 responses must not advertise a resource-specific Allow header"
+        );
+    }
+
+    #[test]
+    fn http_server_returns_501_for_unimplemented_methods_over_tcp() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_thread = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            HttpServerState::handle_connection(stream, &CodeModule::new("test"), 0);
+        });
+
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .write_all(b"TRACE / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        server_thread.join().unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 501 Not Implemented\r\n"));
+        assert!(
+            !response.contains("\r\nAllow:"),
+            "501 responses must not advertise a resource-specific Allow header"
+        );
+    }
+
+    #[test]
+    fn mutation_provenance_is_checked_before_route_execution() {
+        let mut request = HttpRequest {
+            method: HttpMethod::Post,
+            path: "/sign".to_string(),
+            headers: vec![("Host".into(), "localhost:8080".into())],
+            body: b"msg=untrusted".to_vec(),
+        };
+        let local = Some("127.0.0.1:8080".parse().unwrap());
+        let rejected = unsafe_origin_response(&request, local, None)
+            .expect("missing browser provenance must stop route execution");
+        assert_eq!(rejected.status, 403);
+        assert!(String::from_utf8_lossy(&rejected.body).contains("invalid request origin"));
+
+        request
+            .headers
+            .push(("Origin".into(), "http://localhost:8080".into()));
+        assert!(unsafe_origin_response(&request, local, None).is_none());
+        request.method = HttpMethod::Get;
+        request.headers.clear();
+        assert!(unsafe_origin_response(&request, local, None).is_none());
     }
 
     #[test]
