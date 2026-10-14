@@ -122,7 +122,9 @@ mod tests {
     #[test]
     fn actor_info_is_a_detached_payload_free_snapshot() {
         let mut runtime = Runtime::new();
-        let id = runtime.spawn_actor(Box::new(|| vec![("api_token".into(), Value::int(9876))]));
+        let id = runtime.spawn_actor(Box::new(|| {
+            vec![("api_token".into(), Value::int(9876))]
+        }));
         let actor = runtime.actors.get_mut(&id).unwrap();
         actor.name = "worker".into();
         actor.state = ActorState::Waiting;
@@ -132,13 +134,14 @@ mod tests {
         actor.monitors.push(23);
         actor.persistent = true;
         actor.reduction_count = 12;
-        actor.mailbox.push(Message {
+        let message = Message {
             behavior_id: 0,
             payload: MessagePayload::from_slice(&[Value::int(42)]),
             sender: 0,
             priority: MessagePriority::Normal,
             trace_id: None,
-        }).unwrap();
+        };
+        assert!(actor.mailbox.push(message).is_ok());
 
         let info = runtime.actor_info(id).expect("living actor");
         assert_eq!(info.id, id);
