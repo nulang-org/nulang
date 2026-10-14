@@ -1105,12 +1105,12 @@ mod transactional_receive_tests {
     #[test]
     fn durable_admission_keeps_message_and_capacity_until_commit() {
         let mut mailbox = Mailbox::new(1);
-        mailbox.push_local(make_msg(7, 17)).unwrap();
+        mailbox.push_local(msg(7, 17, MessagePriority::Normal)).unwrap();
 
         assert_eq!(mailbox.begin_durable_admission().unwrap().sender, 17);
         assert_eq!(mailbox.len(), 1, "a staged message still owns its mailbox slot");
         assert!(
-            mailbox.push_local(make_msg(8, 18)).is_err(),
+            mailbox.push_local(msg(8, 18, MessagePriority::Normal)).is_err(),
             "concurrent producers cannot use the uncommitted slot"
         );
 
@@ -1119,17 +1119,17 @@ mod transactional_receive_tests {
         assert_eq!(mailbox.commit_durable_admission().unwrap().sender, 17);
         assert_eq!(mailbox.len(), 0);
 
-        mailbox.push_local(make_msg(8, 18)).unwrap();
+        mailbox.push_local(msg(8, 18, MessagePriority::Normal)).unwrap();
         assert_eq!(mailbox.pop().unwrap().sender, 18);
     }
 
     #[test]
     fn durable_admission_retry_preserves_head_order_after_new_arrivals() {
         let mut mailbox = Mailbox::new(0);
-        mailbox.push_local(make_msg(3, 10)).unwrap();
+        mailbox.push_local(msg(3, 10, MessagePriority::Normal)).unwrap();
 
         assert_eq!(mailbox.begin_durable_admission().unwrap().sender, 10);
-        mailbox.push_local(make_msg(3, 11)).unwrap();
+        mailbox.push_local(msg(3, 11, MessagePriority::Normal)).unwrap();
         assert!(mailbox.abort_durable_admission());
 
         assert_eq!(mailbox.begin_durable_admission().unwrap().sender, 10);
@@ -1141,8 +1141,8 @@ mod transactional_receive_tests {
     #[test]
     fn durable_admission_respects_system_priority_and_reset_discards_pending() {
         let mut mailbox = Mailbox::new(1);
-        mailbox.push_local(make_msg(3, 10)).unwrap();
-        let mut system = make_msg(0, 99);
+        mailbox.push_local(msg(3, 10, MessagePriority::Normal)).unwrap();
+        let mut system = msg(0, 99, MessagePriority::Normal);
         system.priority = MessagePriority::System;
         mailbox.push(system).unwrap();
 
@@ -1157,9 +1157,9 @@ mod transactional_receive_tests {
     #[test]
     fn ordinary_pop_cannot_overtake_an_uncommitted_durable_candidate() {
         let mut mailbox = Mailbox::new(0);
-        mailbox.push_local(make_msg(3, 5)).unwrap();
+        mailbox.push_local(msg(3, 5, MessagePriority::Normal)).unwrap();
         assert_eq!(mailbox.begin_durable_admission().unwrap().sender, 5);
-        mailbox.push_local(make_msg(3, 6)).unwrap();
+        mailbox.push_local(msg(3, 6, MessagePriority::Normal)).unwrap();
 
         assert!(
             mailbox.pop().is_none(),
@@ -1174,7 +1174,7 @@ mod transactional_receive_tests {
     #[test]
     fn durable_admission_closure_exposes_envelope_only_after_successful_commit() {
         let mut mailbox = Mailbox::new(1);
-        mailbox.push_local(make_msg(7, 51)).unwrap();
+        mailbox.push_local(msg(7, 51, MessagePriority::Normal)).unwrap();
 
         let failure = mailbox.admit_durable_with(|message| {
             assert_eq!(message.sender, 51);
@@ -1182,7 +1182,7 @@ mod transactional_receive_tests {
         });
         assert_eq!(failure, Err("store unavailable"));
         assert_eq!(mailbox.len(), 1);
-        assert!(mailbox.push_local(make_msg(7, 52)).is_err());
+        assert!(mailbox.push_local(msg(7, 52, MessagePriority::Normal)).is_err());
 
         let accepted = mailbox
             .admit_durable_with(|message| {
@@ -1205,7 +1205,7 @@ mod transactional_receive_tests {
         };
 
         let mut mailbox = Mailbox::new(1);
-        mailbox.push_local(make_msg(7, 19)).unwrap();
+        mailbox.push_local(msg(7, 19, MessagePriority::Normal)).unwrap();
         let mut store = MemoryStore::new();
         let transition = DurableTransition {
             version: DURABLE_TRANSITION_VERSION,
@@ -1252,10 +1252,10 @@ mod transactional_receive_tests {
     #[test]
     fn supervisor_notification_bypasses_pending_durable_user_message() {
         let mut mailbox = Mailbox::new(1);
-        mailbox.push_local(make_msg(7, 10)).unwrap();
+        mailbox.push_local(msg(7, 10, MessagePriority::Normal)).unwrap();
         assert_eq!(mailbox.begin_durable_admission().unwrap().sender, 10);
 
-        let mut system = make_msg(0, 99);
+        let mut system = msg(0, 99, MessagePriority::Normal);
         system.priority = MessagePriority::System;
         mailbox.push(system).unwrap();
         assert!(mailbox.has_ready_system_message());
@@ -1269,7 +1269,7 @@ mod transactional_receive_tests {
     #[test]
     fn ordinary_durable_admission_does_not_capture_system_notification() {
         let mut mailbox = Mailbox::new(1);
-        let mut notice = make_msg(0, 99);
+        let mut notice = msg(0, 99, MessagePriority::Normal);
         notice.priority = MessagePriority::System;
         mailbox.push_local(notice).unwrap();
 
