@@ -1,4 +1,7 @@
 # Nulang Changelog
+### DAP scripted test completion gate — 2026-10-13
+- **Test-only DAP sessions that expect normal completion now wait for the actual `terminated` protocol event before closing their scripted input stream.** The focused reader/writer regressions distinguish genuine terminal completion from premature EOF. Real debugger-disconnect handling and its existing quiescence window remain unchanged.
+
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.

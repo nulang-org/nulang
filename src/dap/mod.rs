@@ -1226,6 +1226,91 @@ pub(crate) mod tests {
         sink.extend_from_slice(frame(msg).as_bytes());
     }
 
+    /// Scripted clients keep their input half open until the debuggee reports
+    /// completion. Real DAP clients still use ordinary EOF/disconnect behavior.
+    struct TerminalGatedReader {
+        script: std::io::Cursor<Vec<u8>>,
+        terminal: Receiver<()>,
+        released: bool,
+    }
+
+    impl TerminalGatedReader {
+        fn new(script: std::io::Cursor<Vec<u8>>, terminal: Receiver<()>) -> Self {
+            Self {
+                script,
+                terminal,
+                released: false,
+            }
+        }
+    }
+
+    impl std::io::Read for TerminalGatedReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let read = std::io::Read::read(&mut self.script, buf)?;
+            if read != 0 || self.released {
+                return Ok(read);
+            }
+            // Only a terminal event permits clean EOF. The timeout is a
+            // deadlock guard, not a production quiescence heuristic.
+            match self
+                .terminal
+                .recv_timeout(std::time::Duration::from_secs(10))
+            {
+                Ok(()) => {
+                    self.released = true;
+                    Ok(0)
+                }
+                Err(crossbeam::channel::RecvTimeoutError::Timeout) => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "scripted DAP session never emitted terminated",
+                )),
+                Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "terminal event writer closed without completion",
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Signals the scripted input reader on an actual framed DAP terminal
+    /// event, not on an arbitrary elapsed wall-clock quiescence window.
+    struct TerminalEventWriter<'a> {
+        output: &'a mut Vec<u8>,
+        signal: Sender<()>,
+        signaled: bool,
+    }
+
+    impl<'a> TerminalEventWriter<'a> {
+        fn new(output: &'a mut Vec<u8>, signal: Sender<()>) -> Self {
+            Self {
+                output,
+                signal,
+                signaled: false,
+            }
+        }
+    }
+
+    impl Write for TerminalEventWriter<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.output.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if !self.signaled
+                && parse_output(&self.output[..])
+                    .iter()
+                    .any(|msg| msg["event"] == "terminated")
+            {
+                self.signaled = true;
+                let _ = self.signal.send(());
+            }
+            Ok(())
+        }
+    }
+
     fn parse_output(output: &[u8]) -> Vec<Json> {
         let mut msgs = Vec::new();
         let mut cursor = std::io::Cursor::new(output.to_vec());
@@ -1255,6 +1340,18 @@ pub(crate) mod tests {
     /// Drive a scripted DAP session against `source` and return the framed
     /// output (responses + events) as parsed JSON messages.
     fn run_session(source: &str, script: &[Json]) -> Vec<Json> {
+        run_session_with_completion(source, script, false)
+    }
+
+    fn run_session_until_terminated(source: &str, script: &[Json]) -> Vec<Json> {
+        run_session_with_completion(source, script, true)
+    }
+
+    fn run_session_with_completion(
+        source: &str,
+        script: &[Json],
+        wait_for_termination: bool,
+    ) -> Vec<Json> {
         let path = write_prog(source);
         let prog = path.to_string_lossy().to_string();
         // Substitute the real temp path for the "<prog>" placeholder in any
@@ -1285,8 +1382,15 @@ pub(crate) mod tests {
             send(&mut input, m);
         }
         let mut output = Vec::new();
-        let reader = std::io::Cursor::new(input);
-        run_dap_server_io(std::io::BufReader::new(reader), &mut output);
+        if wait_for_termination {
+            let (terminal_tx, terminal_rx) = crossbeam::channel::bounded(1);
+            let reader = TerminalGatedReader::new(std::io::Cursor::new(input), terminal_rx);
+            let writer = TerminalEventWriter::new(&mut output, terminal_tx);
+            run_dap_server_io(std::io::BufReader::new(reader), writer);
+        } else {
+            let reader = std::io::Cursor::new(input);
+            run_dap_server_io(std::io::BufReader::new(reader), &mut output);
+        }
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
         parse_output(&output)
     }
@@ -1328,6 +1432,57 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_terminal_gated_reader_rejects_eof_without_completion() {
+        let (release_tx, release_rx) = crossbeam::channel::bounded(1);
+        let mut reader = TerminalGatedReader::new(std::io::Cursor::new(vec![42]), release_rx);
+        let mut byte = [0u8; 1];
+        assert_eq!(std::io::Read::read(&mut reader, &mut byte).unwrap(), 1);
+        assert_eq!(byte[0], 42);
+
+        // A closed completion channel must never look like a clean client EOF.
+        drop(release_tx);
+        assert_eq!(
+            std::io::Read::read(&mut reader, &mut byte)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[test]
+    fn test_terminal_gated_reader_allows_eof_after_completion() {
+        let (release_tx, release_rx) = crossbeam::channel::bounded(1);
+        let mut reader = TerminalGatedReader::new(std::io::Cursor::new(vec![42]), release_rx);
+        let mut byte = [0u8; 1];
+        assert_eq!(std::io::Read::read(&mut reader, &mut byte).unwrap(), 1);
+
+        release_tx.send(()).unwrap();
+        assert_eq!(std::io::Read::read(&mut reader, &mut byte).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_terminal_event_writer_signals_only_after_terminated() {
+        let (release_tx, release_rx) = crossbeam::channel::bounded(1);
+        let mut output = Vec::new();
+        {
+            let mut writer = TerminalEventWriter::new(&mut output, release_tx);
+            write_message(&mut writer, &json!({ "type": "event", "event": "stopped" }));
+            assert!(matches!(
+                release_rx.try_recv(),
+                Err(crossbeam::channel::TryRecvError::Empty)
+            ));
+            write_message(
+                &mut writer,
+                &json!({ "type": "event", "event": "terminated" }),
+            );
+        }
+        assert!(
+            release_rx.try_recv().is_ok(),
+            "terminal event did not release reader"
+        );
+    }
+
+    #[test]
     fn test_continue_reaches_exit() {
         let source = "let a = 1 in a + 1";
         let script = vec![
@@ -1340,7 +1495,8 @@ pub(crate) mod tests {
             ),
             req(4, "configurationDone", json!({})),
         ];
-        let msgs = run_session(source, &script);
+        // Do not disconnect the scripted input before the terminal DAP event.
+        let msgs = run_session_until_terminated(source, &script);
 
         // No breakpoints set -> the program runs to completion.
         assert!(
