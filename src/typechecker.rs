@@ -2226,9 +2226,21 @@ impl TypeChecker {
                 let final_subst = compose_subst(&s3, &compose_subst(&s2, &s1));
                 Ok((final_subst, Type::unit()))
             }
-            // Defer — just typecheck the deferred expression; the defer
-            // itself has unit type.
-            Expr::Defer { expr, .. } => {
+            // Ordinary defer is lowered for deterministic local exits.
+            // Error-only cleanup currently has no reliable error-unwind
+            // mechanism in the VM/actor runtime: accepting it would silently
+            // skip cleanup on precisely the path where it is required.
+            Expr::Defer {
+                expr,
+                error_only,
+                span,
+            } => {
+                if *error_only {
+                    return Err(NuError::NotYetImplemented {
+                        feature: "errdefer requires error-unwind cleanup semantics".to_string(),
+                        span: *span,
+                    });
+                }
                 let _ = self.infer_expr(ctx, expr)?;
                 Ok((vec![], Type::unit()))
             }
