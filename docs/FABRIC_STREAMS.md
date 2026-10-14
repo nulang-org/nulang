@@ -58,12 +58,23 @@ record larger than the target is allowed to occupy its own segment.
 ### Consumer cursors and replay
 
 A cursor is the last fully processed stream sequence for a named consumer.
-Cursor commits are monotonic and cannot advance beyond the current stream tail.
+Cursor commits are monotonic.
 
-`read_consumer(stream, consumer, limit)` replays from `cursor + 1`.
+- **Standalone streams without a replication policy** retain local-tail semantics:
+  `read_consumer(stream, consumer, limit)` replays from `cursor + 1`, and
+  cursor commits may advance through the local stream tail.
+- **Streams with an installed replication policy** use the durable, local
+  quorum-committed index as the consumer-visibility boundary. Consumer reads
+  exclude uncommitted records, and cursor commits beyond that index are rejected.
+  A cursor already past the committed boundary (for example, persisted by an
+  earlier build) fails closed instead of silently skipping records.
+- Explicit raw-log reads remain available for replication and recovery; they
+  can include uncommitted local records.
 
-This establishes the persistence primitive needed for later ACK/NACK semantics
-without pretending that ACK redelivery already exists.
+This is a **visibility and local cursor safety rule**, not durable consumer
+consensus or failover-safe ACK delivery. Consumer progress is still local to each
+stream store; cluster-wide ACK/NACK, ownership leases, consumer metadata
+replication, and safe promoted-leader replay need separate protocols.
 
 ## Runtime APIs
 
