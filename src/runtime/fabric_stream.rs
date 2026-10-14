@@ -1102,7 +1102,9 @@ impl FileFabricStreamStore {
         if sequence > upper_bound {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("Fabric cursor {sequence} is beyond consumer-visible boundary {upper_bound}"),
+                format!(
+                    "Fabric cursor {sequence} is beyond consumer-visible boundary {upper_bound}"
+                ),
             ));
         }
         if sequence < current {
