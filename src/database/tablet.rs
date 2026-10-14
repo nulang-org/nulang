@@ -6,6 +6,8 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::num::NonZeroUsize;
+use std::ops::Bound;
 
 /// Stable identifier for one logical tablet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -278,6 +280,65 @@ pub struct MemoryTablet {
     current_sequence: u64,
     oldest_retained_snapshot: u64,
     rows: BTreeMap<Vec<u8>, Vec<VersionedValue>>,
+}
+
+/// One visible row borrowed from the tablet's committed MVCC history.
+/// Its lifetime is tied to the immutable tablet borrow held by the scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TabletScanRow<'a> {
+    pub key: &'a [u8],
+    pub value: &'a [u8],
+}
+
+/// A bounded group of visible rows in ascending key order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabletScanBatch<'a> {
+    pub rows: Vec<TabletScanRow<'a>>,
+}
+
+/// Snapshot-pinned, key-ordered batch scan over an in-memory MVCC tablet.
+///
+/// Uses the existing B-tree storage; no columnar layout or WAL change.
+/// Skips deleted and not-yet-visible values without emitting empty batches.
+/// Immutable borrowing prevents the underlying tablet from changing while
+/// this iterator (or borrowed output rows) remains live.
+#[derive(Debug)]
+pub struct TabletBatchScan<'a> {
+    entries: std::collections::btree_map::Range<'a, Vec<u8>, Vec<VersionedValue>>,
+    snapshot: u64,
+    target_rows: NonZeroUsize,
+}
+
+impl<'a> Iterator for TabletBatchScan<'a> {
+    type Item = TabletScanBatch<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // A scan caller cannot force an unbounded allocation in one batch.
+        const MAX_ROWS_PER_BATCH: usize = 4096;
+        let limit = self.target_rows.get().min(MAX_ROWS_PER_BATCH);
+        let mut rows = Vec::with_capacity(limit);
+
+        while rows.len() < limit {
+            let (key, versions) = match self.entries.next() {
+                Some(entry) => entry,
+                None => break,
+            };
+            // Invariant: committed version sequences are non-decreasing.
+            // The last version <= snapshot wins, including a tombstone.
+            let visible = versions.partition_point(|version| version.sequence <= self.snapshot);
+            if let Some(value) = visible
+                .checked_sub(1)
+                .and_then(|index| versions[index].value.as_deref())
+            {
+                rows.push(TabletScanRow {
+                    key: key.as_slice(),
+                    value,
+                });
+            }
+        }
+
+        (!rows.is_empty()).then_some(TabletScanBatch { rows })
+    }
 }
 
 impl MemoryTablet {
@@ -558,6 +619,44 @@ impl MemoryTablet {
         self.rows.retain(|_, versions| !versions.is_empty());
         self.oldest_retained_snapshot = floor;
         Ok(())
+    }
+
+    /// Scan a caller-specified subrange at a committed snapshot, returning
+    /// nonempty batches with borrowed values. The lower key bound is inclusive
+    /// and the upper key bound is exclusive. Every key must belong to this
+    /// tablet; callers should route cross-tablet scans above this layer.
+    ///
+    /// Batch sizing is advisory: each batch contains at most 4096 visible rows
+    /// even when a larger target is supplied. Tombstones and future versions
+    /// do not consume the visible-row budget.
+    pub fn scan_range_at(
+        &self,
+        range: &KeyRange,
+        snapshot: u64,
+        target_rows: NonZeroUsize,
+    ) -> Result<TabletBatchScan<'_>, TabletError> {
+        // Use the same snapshot admission check as scalar reads. This also
+        // preserves retention-floor errors when MVCC reclamation is enabled.
+        self.read_at(range.start(), snapshot)?;
+        let owned_range = self.descriptor.range();
+        let end_within = match (range.end(), owned_range.end()) {
+            (_, None) => true,
+            (Some(candidate), Some(limit)) => candidate <= limit,
+            (None, Some(_)) => false,
+        };
+        if !owned_range.contains(range.start()) || !end_within {
+            return Err(TabletError::KeyOutsideTabletRange);
+        }
+
+        let entries = self.rows.range((
+            Bound::Included(range.start().to_vec()),
+            range.end().map_or(Bound::Unbounded, |end| Bound::Excluded(end.to_vec())),
+        ));
+        Ok(TabletBatchScan {
+            entries,
+            snapshot,
+            target_rows,
+        })
     }
 
     /// Read one key at an already committed snapshot sequence.

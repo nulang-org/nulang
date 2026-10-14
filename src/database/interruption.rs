@@ -64,6 +64,7 @@ pub(crate) fn hit(point: StorageInterruptionPoint) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroUsize;
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(1);
 
@@ -287,6 +288,13 @@ mod tests {
                 Err(TabletError::RecoveryRequired),
                 "{point:?} must invalidate snapshot reads on the live handle"
             );
+
+            let scan = KeyRange::new(b"k".to_vec(), Some(b"l".to_vec())).unwrap();
+            assert_eq!(
+                tablet.scan_range_at(&scan, 1, NonZeroUsize::new(4).unwrap()).unwrap_err(),
+                TabletError::RecoveryRequired,
+                "{point:?} must also reject batch historical scans on a poisoned handle",
+            );
             assert_eq!(
                 tablet.prepare_write(
                     7,
@@ -309,16 +317,33 @@ mod tests {
             assert_eq!(reopened.oldest_retained_snapshot(), persisted_floor);
             assert_eq!(reopened.read_latest(b"k"), Some(&b"v2"[..]));
             if persisted_floor == 2 {
+                let expired = TabletError::SnapshotExpired {
+                    requested: 1,
+                    oldest_retained: 2,
+                };
+                assert_eq!(reopened.read_at(b"k", 1), Err(expired.clone()));
                 assert_eq!(
-                    reopened.read_at(b"k", 1),
-                    Err(TabletError::SnapshotExpired {
-                        requested: 1,
-                        oldest_retained: 2,
-                    })
+                    reopened
+                        .scan_range_at(&scan, 1, NonZeroUsize::new(4).unwrap())
+                        .unwrap_err(),
+                    expired,
+                    "{point:?} must preserve expired-snapshot errors after reopen",
                 );
             } else {
                 assert_eq!(reopened.read_at(b"k", 1).unwrap(), Some(&b"v1"[..]));
+                let rows: Vec<_> = reopened
+                    .scan_range_at(&scan, 1, NonZeroUsize::new(4).unwrap())
+                    .unwrap()
+                    .flat_map(|batch| batch.rows.into_iter().map(|row| row.value.to_vec()))
+                    .collect();
+                assert_eq!(rows, vec![b"v1".to_vec()], "{point:?} snapshot 1 parity");
             }
+            let current: Vec<_> = reopened
+                .scan_range_at(&scan, 2, NonZeroUsize::new(4).unwrap())
+                .unwrap()
+                .flat_map(|batch| batch.rows.into_iter().map(|row| row.value.to_vec()))
+                .collect();
+            assert_eq!(current, vec![b"v2".to_vec()], "{point:?} snapshot 2 parity");
             commit_put(&mut reopened, b"v3");
             assert_eq!(reopened.read_latest(b"k"), Some(&b"v3"[..]));
             cleanup(&wal_path);
@@ -342,6 +367,12 @@ mod tests {
             assert!(with_interruption(point, || tablet.reclaim_history_before(2)).is_err());
 
             assert_eq!(tablet.read_at(b"k", 1), Err(TabletError::RecoveryRequired));
+            let scan = KeyRange::new(b"k".to_vec(), Some(b"l".to_vec())).unwrap();
+            assert_eq!(
+                tablet.scan_range_at(&scan, 1, NonZeroUsize::new(4).unwrap()).unwrap_err(),
+                TabletError::RecoveryRequired,
+                "{point:?} must also reject batch historical scans on a poisoned handle",
+            );
             assert!(tablet.publish_checkpoint().is_err());
             drop(tablet);
 
@@ -355,7 +386,23 @@ mod tests {
                     oldest_retained: 2,
                 })
             );
+            assert_eq!(
+                reopened
+                    .scan_range_at(&scan, 1, NonZeroUsize::new(4).unwrap())
+                    .unwrap_err(),
+                TabletError::SnapshotExpired {
+                    requested: 1,
+                    oldest_retained: 2,
+                },
+                "{point:?} must preserve expired-snapshot errors after WAL reopen",
+            );
             assert_eq!(reopened.read_at(b"k", 2).unwrap(), Some(&b"v2"[..]));
+            let current: Vec<_> = reopened
+                .scan_range_at(&scan, 2, NonZeroUsize::new(4).unwrap())
+                .unwrap()
+                .flat_map(|batch| batch.rows.into_iter().map(|row| row.value.to_vec()))
+                .collect();
+            assert_eq!(current, vec![b"v2".to_vec()], "{point:?} snapshot 2 parity");
             commit_put(&mut reopened, b"v3");
             assert_eq!(reopened.current_sequence(), 3);
             cleanup(&wal_path);
