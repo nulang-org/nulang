@@ -4131,7 +4131,17 @@ impl Parser {
                 let grant_span = self.current_span();
                 let namespace = self.expect_ident("authority namespace")?;
                 self.expect(TokenKind::DoubleColon)?;
-                let operation = self.expect_ident("authority operation")?;
+                // Python's built-in `import` effect is a reserved language
+                // keyword, but an explicitly granted `Python::import` must
+                // still be expressible. Do not permit it in other namespaces.
+                let operation = if namespace == "Python"
+                    && self.match_token(&TokenKind::Import)
+                {
+                    self.advance();
+                    "import".to_string()
+                } else {
+                    self.expect_ident("authority operation")?
+                };
                 let argument = if self.consume_if(&TokenKind::LParen) {
                     let argument = self.expect_string("authority argument")?;
                     self.expect(TokenKind::RParen)?;
