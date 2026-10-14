@@ -134,7 +134,10 @@ fn unknown_schema_cannot_recover_strict_actor_without_compiler_metadata() {
     // Reconstruct a runtime with the persisted store but without the
     // compiler-owned recovery module. Public APIs must fail closed.
     let mut fresh = Runtime::new();
-    fresh.persistence = runtime.persistence;
+    fresh.persistence = std::mem::replace(
+        &mut runtime.persistence,
+        Box::new(nulang::runtime::MemoryStore::new()),
+    );
     assert_eq!(fresh.recover_actor(actor_id), None);
     assert!(!fresh.actors.contains_key(&actor_id));
 }
