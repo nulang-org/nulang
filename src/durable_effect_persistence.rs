@@ -66,8 +66,35 @@ impl DurableEffectPersistenceRecord {
         }
     }
 
+    /// Validate an in-memory record before it crosses a durable boundary.
+    ///
+    /// Decoding already checks compensation identity, but the public enum can
+    /// also be constructed directly by a runtime adapter. Validate both paths
+    /// so neither a transition digest nor a persisted receipt can authorize
+    /// a forged original-effect/ordinal association.
+    pub fn validate(&self) -> Result<(), DurableEffectPersistenceError> {
+        if let Self::Compensation {
+            original_effect_id,
+            compensation_ordinal,
+            effect,
+        } = self
+        {
+            let actual = effect.spec().id;
+            let expected = original_effect_id
+                .derive_compensation(*compensation_ordinal, &effect.spec().effect_operation);
+            if actual != expected {
+                return Err(DurableEffectPersistenceError::CompensationIdentityMismatch {
+                    expected,
+                    actual,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Encode the stable versioned JSON representation.
     pub fn to_json(&self) -> Result<Vec<u8>, DurableEffectPersistenceError> {
+        self.validate()?;
         let envelope = PersistedEnvelopeV1 {
             version: DURABLE_EFFECT_PERSISTENCE_VERSION,
             record: PersistedRecordKindV1::from_runtime(self),
