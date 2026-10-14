@@ -189,12 +189,12 @@ rejection, and verified restart on a fresh Runtime.
 
 The pinned initial-start marker is reserved in the persistence contract as
 `PINNED_WORKFLOW_START_EVENT`. A first transition containing this marker is
-**create-only**: in `MemoryStore` and local/remote `LibsqlStore`, replaying
-the same exact first transition now returns `AlreadyExists` instead of
-reporting an idempotent success. In libSQL this decision happens **inside**
-the `IMMEDIATE` database write transaction after reading the current
-durable tail, so independent concurrent starters cannot both acknowledge
-the same execution. All other transition retries retain their existing
+**create-only**: in `MemoryStore` and `LibsqlStore`, replaying the
+same exact first transition returns `AlreadyExists` instead of reporting
+an idempotent success. For local SQLite, this decision happens **inside**
+the `IMMEDIATE` database write transaction after reading the current durable
+tail, so independent concurrent starters cannot both acknowledge the same
+execution. Remote libSQL contention still requires backend-specific testing. All other transition retries retain their existing
 idempotent semantics. Backends without atomic transition support remain
 unsupported for pinned creation.
 
