@@ -1106,6 +1106,13 @@ mod tests {
         }));
         assert_last_error_contains(rt, "null argument array");
 
+        // Never construct an oversized slice from a hostile ABI length.
+        let one_arg = [nulang_value_int_new(7)];
+        assert!(nulang_value_is_nil(unsafe {
+            nulang_call_function(rt, handle, name.as_ptr(), one_arg.as_ptr(), usize::MAX)
+        }));
+        assert_last_error_contains(rt, "argument array exceeds");
+
         let missing = CString::new("missing").unwrap();
         assert!(nulang_value_is_nil(unsafe {
             nulang_call_function(rt, handle, missing.as_ptr(), std::ptr::null(), 0)
