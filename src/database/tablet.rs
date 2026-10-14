@@ -557,12 +557,9 @@ impl MemoryTablet {
         snapshot: u64,
         target_rows: NonZeroUsize,
     ) -> Result<TabletBatchScan<'_>, TabletError> {
-        if snapshot > self.current_sequence {
-            return Err(TabletError::SnapshotAhead {
-                committed: self.current_sequence,
-                requested: snapshot,
-            });
-        }
+        // Use the same snapshot admission check as scalar reads. This also
+        // preserves retention-floor errors when MVCC reclamation is enabled.
+        self.read_at(range.start(), snapshot)?;
         let owned_range = self.descriptor.range();
         let end_within = match (range.end(), owned_range.end()) {
             (_, None) => true,
