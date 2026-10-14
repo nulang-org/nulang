@@ -13,6 +13,8 @@ on:
       - 'src/main.rs'
       - 'scripts/check_release_linux.sh'
       - 'scripts/tests/test_release_cli_profile.py'
+      - 'scripts/package_linux.sh'
+      - 'scripts/tests/test_linux_packages.py'
 
 env:
   CARGO_TERM_COLOR: always
@@ -30,8 +32,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Verify public CLI feature-profile parity
-        run: python3 -m unittest discover -s scripts/tests -p test_release_cli_profile.py
+      - name: Verify release packaging contracts
+        run: |
+          python3 -m unittest discover -s scripts/tests -p test_release_cli_profile.py
+          python3 -m unittest discover -s scripts/tests -p test_linux_packages.py
 
       - name: Verify tag matches crate and CLI versions
         if: github.event_name == 'push'
@@ -72,12 +76,18 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
+          # Build against Ubuntu 22.04's glibc 2.35 / OpenSSL 3 baseline,
+          # instead of silently increasing minimum requirements with -latest.
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             artifact: nulang-linux-x86_64
-          - os: ubuntu-latest
+            package_arch: x86_64
+            deb_arch: amd64
+          - os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
             artifact: nulang-linux-aarch64
+            package_arch: aarch64
+            deb_arch: arm64
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: nulang-macos-aarch64
@@ -95,7 +105,12 @@ jobs:
           sudo dpkg --add-architecture arm64
           # Restrict the runner's amd64 sources and add arm64 via
           # ports.ubuntu.com (archive/security mirrors 404 on arm64).
-          sudo sed -i '/^Types: deb$/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources
+          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+            sudo sed -i '/^Types: deb$/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources
+          else
+            # Ubuntu 22.04 still uses traditional sources.list entries.
+            sudo sed -i -E 's|^(deb(-src)?)[[:space:]]+(http[^[:space:]]+)|\1 [arch=amd64] \3|' /etc/apt/sources.list
+          fi
           CODENAME=$(lsb_release -cs)
           # printf (not an indented heredoc) so the deb822 stanza has no
           # leading whitespace — indented continuation lines would merge
@@ -248,6 +263,68 @@ jobs:
             test "$output" = "release-smoke"
           fi
 
+      - name: Install Linux package build tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends rpm cpio
+
+      - name: Build Debian and RPM packages
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+          bash scripts/package_linux.sh "target/${{ matrix.target }}/release/nulang" "$version" "${{ matrix.package_arch }}" dist
+
+      - name: Verify Linux packages, architectures, payloads, and checksums
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+          arch="${{ matrix.package_arch }}"
+          deb="dist/nulang_${version}_${{ matrix.deb_arch }}.deb"
+          rpm="dist/nulang-${version}-1.${arch}.rpm"
+          test "$(dpkg-deb --field "$deb" Architecture)" = "${{ matrix.deb_arch }}"
+          test "$(rpm -qp --qf '%{ARCH}' "$rpm")" = "$arch"
+          dpkg-deb --contents "$deb" | grep -E '/usr/bin/nulang
+  publish:
+    name: Publish Release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    needs: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: nulang-*
+          path: dist
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p dist-flat
+          for d in dist/nulang-*/; do
+            cp "$d"* dist-flat/
+          done
+          ls -la dist-flat/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist-flat/*
+          generate_release_notes: true
+
+          rpm -qpl "$rpm" | grep -Fx '/usr/bin/nulang'
+          (cd dist && sha256sum -c "$(basename "$deb").sha256" && sha256sum -c "$(basename "$rpm").sha256")
+          mkdir -p package-smoke/deb package-smoke/rpm
+          dpkg-deb -x "$deb" package-smoke/deb
+          rpm2cpio "$rpm" | (cd package-smoke/rpm && cpio -id --quiet)
+          cmp package-smoke/deb/usr/bin/nulang "target/${{ matrix.target }}/release/nulang"
+          cmp package-smoke/rpm/usr/bin/nulang "target/${{ matrix.target }}/release/nulang"
+          if [ "$arch" = x86_64 ]; then
+            bash scripts/check_release_linux.sh package-smoke/deb/usr/bin/nulang
+            bash scripts/check_release_linux.sh package-smoke/rpm/usr/bin/nulang
+          fi
+
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
@@ -255,6 +332,10 @@ jobs:
           path: |
             dist/${{ matrix.artifact }}.tar.gz
             dist/${{ matrix.artifact }}.tar.gz.sha256
+            dist/*.deb
+            dist/*.deb.sha256
+            dist/*.rpm
+            dist/*.rpm.sha256
 
   publish:
     name: Publish Release
