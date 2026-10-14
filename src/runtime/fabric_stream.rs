@@ -21,6 +21,7 @@ const SEGMENT_HEADER_LEN: usize = 4 + 2 + 8;
 const RECORD_HEADER_LEN: usize = 8 + 4 + 16;
 const MIN_SEGMENT_BYTES: u64 = (SEGMENT_HEADER_LEN + RECORD_HEADER_LEN + 1) as u64;
 const DEFAULT_SEGMENT_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_PRODUCER_IDENTITIES: usize = 4096;
 
 pub(crate) const FABRIC_STREAM_INITIAL_EPOCH: u64 = 1;
 
@@ -102,6 +103,43 @@ pub(crate) struct FabricStreamReplicationPolicy {
     pub membership_fingerprint: u64,
     pub replication_factor: usize,
     pub replicas: Vec<u64>,
+}
+
+/// Last durably accepted producer sequence for one producer identity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProducerCheckpoint {
+    epoch: u64,
+    producer_sequence: u64,
+    stream_sequence: u64,
+    digest: String,
+}
+
+/// Persisted before the corresponding log record, so a crash can be retried
+/// without allocating a second stream sequence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ProducerIntent {
+    producer: String,
+    epoch: u64,
+    producer_sequence: u64,
+    stream_sequence: u64,
+    digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProducerStateFile {
+    version: u16,
+    checkpoints: BTreeMap<String, ProducerCheckpoint>,
+    pending: Option<ProducerIntent>,
+}
+
+impl Default for ProducerStateFile {
+    fn default() -> Self {
+        Self {
+            version: STREAM_FORMAT_VERSION,
+            checkpoints: BTreeMap::new(),
+            pending: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -337,6 +375,7 @@ impl FileFabricStreamStore {
 
     pub fn append(&mut self, name: &str, payload: &[u8]) -> io::Result<u64> {
         self.ensure_state(name)?;
+        self.reject_unfinished_producer_intent(name)?;
         let sequence = self
             .states
             .get(name)
@@ -358,6 +397,7 @@ impl FileFabricStreamStore {
         payload: &[u8],
     ) -> io::Result<bool> {
         self.ensure_state(name)?;
+        self.reject_unfinished_producer_intent(name)?;
         let next_sequence = self
             .states
             .get(name)
@@ -391,6 +431,186 @@ impl FileFabricStreamStore {
 
         self.append_exact(name, sequence, payload)?;
         Ok(true)
+    }
+
+    /// A single-writer, standalone-stream idempotency boundary.
+    ///
+    /// The durable intent is written before the log record; the checkpoint is
+    /// written after its fsync. Retrying the exact identity and payload after a
+    /// crash repairs either intermediate state without duplicating the record.
+    /// This API deliberately does NOT support replicated streams: producer
+    /// metadata is not quorum-replicated or leader-fenced across nodes.
+    pub fn append_idempotent(
+        &mut self,
+        name: &str,
+        producer: &str,
+        epoch: u64,
+        producer_sequence: u64,
+        payload: &[u8],
+    ) -> io::Result<u64> {
+        validate_name("producer", producer)?;
+        if epoch == 0 || producer_sequence == 0 || payload.len() > u32::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Fabric producer epoch/sequence must be nonzero and payload fit in u32",
+            ));
+        }
+        self.ensure_state(name)?;
+        if self.replication_policy(name)?.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "replicated Fabric producer idempotency requires quorum-replicated producer state",
+            ));
+        }
+        let path = self.stream_dir(name).join("producer_state.json");
+        let mut producers = read_producer_state(&path)?;
+        let digest = producer_digest(payload);
+
+        if let Some(pending) = producers.pending.clone() {
+            if pending.producer != producer
+                || pending.epoch != epoch
+                || pending.producer_sequence != producer_sequence
+                || pending.digest != digest
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "Fabric has an unfinished producer append; retry the exact pending token",
+                ));
+            }
+
+            let next_sequence = self
+                .states
+                .get(name)
+                .expect("stream state recovered")
+                .next_sequence;
+            if next_sequence == pending.stream_sequence {
+                // Crash before the record reached the log, or torn tail repair.
+                self.append_exact(name, pending.stream_sequence, payload)?;
+            } else if next_sequence == pending.stream_sequence.saturating_add(1) {
+                self.verify_producer_record(name, pending.stream_sequence, &digest)?;
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Fabric pending producer sequence conflicts with stream tail",
+                ));
+            }
+            producers.checkpoints.insert(
+                producer.to_string(),
+                ProducerCheckpoint {
+                    epoch,
+                    producer_sequence,
+                    stream_sequence: pending.stream_sequence,
+                    digest,
+                },
+            );
+            producers.pending = None;
+            write_json_atomic(&path, &producers)?;
+            return Ok(pending.stream_sequence);
+        }
+
+        if let Some(prior) = producers.checkpoints.get(producer) {
+            if epoch < prior.epoch {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Fabric producer epoch is fenced by a newer durable epoch",
+                ));
+            }
+            if epoch == prior.epoch && producer_sequence == prior.producer_sequence {
+                if digest != prior.digest {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "Fabric producer sequence already has a different payload",
+                    ));
+                }
+                self.verify_producer_record(name, prior.stream_sequence, &digest)?;
+                return Ok(prior.stream_sequence);
+            }
+            let valid_next = if epoch == prior.epoch {
+                prior.producer_sequence.checked_add(1) == Some(producer_sequence)
+            } else {
+                producer_sequence == 1
+            };
+            if !valid_next {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Fabric producer sequence must advance by one or restart at one in a newer epoch",
+                ));
+            }
+        } else {
+            if producer_sequence != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Fabric new producer sequence must begin at one",
+                ));
+            }
+            if producers.checkpoints.len() >= MAX_PRODUCER_IDENTITIES {
+                return Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "Fabric stream producer identity limit reached",
+                ));
+            }
+        }
+
+        let stream_sequence = self
+            .states
+            .get(name)
+            .expect("stream state recovered")
+            .next_sequence;
+        producers.pending = Some(ProducerIntent {
+            producer: producer.to_string(),
+            epoch,
+            producer_sequence,
+            stream_sequence,
+            digest: digest.clone(),
+        });
+        // Order is mandatory: fsync intent, fsync stream frame, fsync checkpoint.
+        write_json_atomic(&path, &producers)?;
+        self.append_exact(name, stream_sequence, payload)?;
+        producers.checkpoints.insert(
+            producer.to_string(),
+            ProducerCheckpoint {
+                epoch,
+                producer_sequence,
+                stream_sequence,
+                digest,
+            },
+        );
+        producers.pending = None;
+        write_json_atomic(&path, &producers)?;
+        Ok(stream_sequence)
+    }
+
+    fn reject_unfinished_producer_intent(&self, name: &str) -> io::Result<()> {
+        if read_producer_state(&self.stream_dir(name).join("producer_state.json"))?
+            .pending
+            .is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Fabric has an unfinished producer append; retry the pending token first",
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_producer_record(
+        &mut self,
+        name: &str,
+        stream_sequence: u64,
+        digest: &str,
+    ) -> io::Result<()> {
+        let record = self.read_from(name, stream_sequence, 1)?;
+        if !matches!(
+            record.first(),
+            Some(record)
+                if record.sequence == stream_sequence && producer_digest(&record.payload) == digest
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric producer checkpoint does not match durable stream record",
+            ));
+        }
+        Ok(())
     }
 
     pub fn stream_config(&mut self, name: &str) -> io::Result<FabricStreamConfig> {
@@ -599,6 +819,13 @@ impl FileFabricStreamStore {
             ));
         }
 
+        let producers = read_producer_state(&self.stream_dir(name).join("producer_state.json"))?;
+        if producers.pending.is_some() || !producers.checkpoints.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Fabric local producer checkpoints require migration before enabling replication",
+            ));
+        }
         let path = self.stream_dir(name).join("replication_policy.json");
         if let Some(existing) = read_replication_policy(&path)? {
             if existing == policy {
@@ -1148,6 +1375,20 @@ impl Runtime {
 
     pub fn fabric_stream_append(&mut self, name: &str, payload: &[u8]) -> io::Result<u64> {
         self.fabric_stream_store_mut()?.append(name, payload)
+    }
+
+    /// Standalone, single-writer producer append with durable deduplication.
+    /// This is not a replicated producer ACK or exactly-once external effect.
+    pub fn fabric_stream_append_idempotent(
+        &mut self,
+        name: &str,
+        producer: &str,
+        epoch: u64,
+        producer_sequence: u64,
+        payload: &[u8],
+    ) -> io::Result<u64> {
+        self.fabric_stream_store_mut()?
+            .append_idempotent(name, producer, epoch, producer_sequence, payload)
     }
 
     pub fn fabric_stream_read(
@@ -1757,6 +1998,51 @@ fn read_commit(path: &Path) -> io::Result<CommitFile> {
         ));
     }
     Ok(commit)
+}
+
+fn producer_digest(payload: &[u8]) -> String {
+    blake3::hash(payload).to_hex().to_string()
+}
+
+fn read_producer_state(path: &Path) -> io::Result<ProducerStateFile> {
+    if !path.exists() {
+        return Ok(ProducerStateFile::default());
+    }
+    let bytes = fs::read(path)?;
+    let file: ProducerStateFile = serde_json::from_slice(&bytes).map_err(json_error)?;
+    if file.version != STREAM_FORMAT_VERSION || file.checkpoints.len() > MAX_PRODUCER_IDENTITIES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid Fabric producer metadata version or identity count",
+        ));
+    }
+    for (name, checkpoint) in &file.checkpoints {
+        if validate_name("producer", name).is_err()
+            || checkpoint.epoch == 0
+            || checkpoint.producer_sequence == 0
+            || checkpoint.stream_sequence == 0
+            || checkpoint.digest.len() != 64
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid Fabric producer checkpoint",
+            ));
+        }
+    }
+    if let Some(pending) = &file.pending {
+        if validate_name("producer", &pending.producer).is_err()
+            || pending.epoch == 0
+            || pending.producer_sequence == 0
+            || pending.stream_sequence == 0
+            || pending.digest.len() != 64
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid Fabric producer pending intent",
+            ));
+        }
+    }
+    Ok(file)
 }
 
 fn read_cursors(path: &Path) -> io::Result<CursorFile> {
