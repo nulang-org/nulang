@@ -171,3 +171,53 @@ fn legacy_unidentified_writes_still_recover_alongside_idempotent_commits() {
     drop(tablet);
     cleanup(&path);
 }
+
+#[test]
+fn torn_wal_frame_does_not_claim_transaction_id() {
+    let path = wal_path();
+    cleanup(&path);
+    let id = TransactionId::new([8; 16]);
+    let mutation = put(b"k", b"retry-after-torn-frame");
+    let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
+
+    assert!(with_interruption(StorageInterruptionPoint::WalAfterPayload, || {
+        tablet.commit_idempotent(id, mutation.clone())
+    })
+    .is_err());
+    drop(tablet);
+
+    // Reopen discards the incomplete frame; the same logical transaction can
+    // now commit exactly once, with its original ID and payload.
+    let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
+    assert_eq!(tablet.current_sequence(), 0);
+    let receipt = tablet.commit_idempotent(id, mutation.clone()).unwrap();
+    assert_eq!(receipt.sequence(), 1);
+    assert_eq!(tablet.commit_idempotent(id, mutation).unwrap(), receipt);
+    assert_eq!(tablet.current_sequence(), 1);
+    drop(tablet);
+    cleanup(&path);
+}
+
+#[test]
+fn published_checkpoint_preserves_receipt_after_interrupted_publication() {
+    let path = wal_path();
+    cleanup(&path);
+    let id = TransactionId::new([9; 16]);
+    let mutation = put(b"k", b"checkpoint");
+    let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
+    let receipt = tablet.commit_idempotent(id, mutation.clone()).unwrap();
+
+    // The checkpoint rename completed before the injected error. Both the
+    // checkpoint and original WAL must remain individually safe to reopen.
+    assert!(with_interruption(StorageInterruptionPoint::CheckpointAfterRename, || {
+        tablet.publish_checkpoint()
+    })
+    .is_err());
+    drop(tablet);
+
+    let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
+    assert_eq!(tablet.commit_idempotent(id, mutation).unwrap(), receipt);
+    assert_eq!(tablet.current_sequence(), 1);
+    drop(tablet);
+    cleanup(&path);
+}
