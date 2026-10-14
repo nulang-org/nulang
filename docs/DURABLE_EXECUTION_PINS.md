@@ -155,11 +155,10 @@ Plain `Runtime::recover_actor` rejects an execution pin or the recognizable
 atomic-start fingerprint. This prevents a legacy bypass when a decoded pin
 is missing from otherwise recognizable pinned start history.
 
-These APIs are currently an **opt-in native-workflow path**, not blanket
-enforcement for every workflow. An already registered bytecode recovery module
-is rejected by the pinned API, because digest verification of separate bytes
-does not establish that the executable module actually dispatched was loaded
-from them. A verified immutable bytecode-module loader is required first.
+These APIs remain **opt-in**. Schema-backed workflow recovery now installs
+a verified decoded NBC module, but it still rejects a separately registered
+module. Automatic compiler-backed pinned creation and Cloud admission remain
+separate work.
 
 ```bash
 cargo test --locked --test pinned_workflow_runtime
@@ -222,6 +221,48 @@ history/transition chain and complete trusted-history scan should precede
 production claims about tamper resistance. Bytecode-backed pinned execution
 also still requires a verified immutable module loader. Cloud artifact retention
 and deployment admission remain separate work.
+
+## Verified immutable bytecode loader (stacked increment)
+
+Pinned **schema-backed bytecode workflow recovery** now resolves the originally
+recorded executable digest, checks the complete behavior manifest, and decodes
+the **actual verified `.nbc` bytes** with `CodeModule::from_nbc`. The decoded
+module is not supplied by the caller as a pre-existing in-memory
+`CodeModule`: recovery validates the persisted actor schema, checks that it
+is a durable workflow in both the compiler module and sidecar, and rejects
+missing, duplicate or out-of-range behavior references/bytecode offsets.
+
+The resulting verified module, step offsets, and compensation offsets are
+installed into `Runtime::recovery_modules` **before** actor hydration and
+scheduling. Any independently registered recovery module for the same actor
+continues to be rejected rather than silently reused. A failed hydration
+cleans up the newly registered module instead of leaving unverified fallback
+state. Native workflows without compiler-owned snapshot schemas retain the
+existing pinned native workflow path.
+
+This makes one narrow guarantee: **the recovered bytecode module comes from
+the exact bytes checked against the durable execution pin**, not a parallel,
+mutable module registration.
+
+```bash
+cargo test --locked --test pinned_bytecode_loader
+cargo test --locked --features sqlite --test pinned_bytecode_loader
+```
+
+The tests cover exact verified module dispatch metadata, substitution with
+another valid NBC, malformed NBC matching its own sidecar, persisted schema
+mismatch, out-of-range behavior indexes, pre-registered unverified modules,
+and separate-process SQLite restart and substitute rejection.
+
+**Remaining:** a natural end-to-end *creation* API for pinned compiled
+workflows that binds compiler metadata before initial actor publication;
+current compiled-workflow recovery tests stage a schema-named initial
+`DurableTransition` directly. Artifact retention, cryptographic
+provenance, authenticated history verification, cross-node placement/
+activation fencing, and Cloud deployment policy are also outside this slice.
+The pin and event history must be read under a coherent fenced recovery
+boundary in a later increment to rule out concurrent modification between
+verification and hydration.
 
 ## Next increment / non-goals of v1
 
