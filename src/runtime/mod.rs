@@ -1382,6 +1382,12 @@ impl Runtime {
                 ));
             }
             let spec = record.effect().spec();
+            if spec.boundary != crate::primitives::EffectBoundary::External {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "runtime-owned or backend-owned state is not an external effect intent",
+                ));
+            }
             if !effect_ids.insert(spec.id) {
                 return Err(Error::new(
                     ErrorKind::InvalidInput,
