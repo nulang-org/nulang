@@ -2785,6 +2785,13 @@ impl Runtime {
                 actor.idle_ms = 0;
                 MessageAdmission::Accepted
             } else {
+                // The message was rejected by the bounded local mailbox.
+                // Capture metadata only; never record rejected payload contents.
+                actor.flight_recorder.record_backpressure(
+                    self.current_actor.unwrap_or(0),
+                    behavior_id,
+                    args,
+                );
                 // Mailbox is full (capacity > 0). Route to DLQ with a simple notification.
                 self.route_to_dlq(
                     &Message {
