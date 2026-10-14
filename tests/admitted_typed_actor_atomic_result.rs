@@ -42,6 +42,7 @@ fn spawned_counter() -> (Runtime, u64, u16) {
 
 fn admit(runtime: &mut Runtime, actor_id: u64, behavior: u16, amount: i64) -> u64 {
     let predecessor = runtime.persistence.latest_sequence(actor_id);
+    let epoch = runtime.actors[&actor_id].activation_epoch;
     runtime.send_message_by_id(actor_id, behavior, &[Value::int(amount)]);
     let commit = runtime
         .admit_next_typed_actor_command(
@@ -49,7 +50,7 @@ fn admit(runtime: &mut Runtime, actor_id: u64, behavior: u16, amount: i64) -> u6
             DurableTransition {
                 version: DURABLE_TRANSITION_VERSION,
                 actor_id,
-                activation_epoch: runtime.actors[&actor_id].activation_epoch,
+                activation_epoch: epoch,
                 sequence: predecessor + 1,
                 expected_previous_sequence: predecessor,
                 command: Some(JournalEntry {
