@@ -21,6 +21,64 @@ use ariadne::{Color, Config, Label, Report, ReportKind, Source};
 
 use crate::types::{current_source_text, source_map_file, ErrorCode, NuError, NuWarning, Span};
 
+/// Whether a suggested edit can be applied mechanically without a semantic
+/// decision. Typo candidates are always suggestions, never automatic repairs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditApplicability {
+    MachineApplicable,
+    MaybeIncorrect,
+}
+
+/// Compiler-owned source edit shared by JSON diagnostics and LSP code actions.
+///
+/// Offsets are UTF-8 bytes in the original source, not line/column indices.
+/// Consumers must verify `expected` still matches before offering the edit.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DiagnosticSourceEdit {
+    pub start: u32,
+    pub end: u32,
+    pub expected: String,
+    pub replacement: String,
+    pub applicability: EditApplicability,
+}
+
+/// Suggest a replacement only when the compiler identified exactly one
+/// candidate and the recorded span still covers a valid identifier.
+/// This deliberately does not mark name guesses as machine-applicable.
+pub fn suggested_source_edit(err: &NuError, source: &str) -> Option<DiagnosticSourceEdit> {
+    if err.error_code() != Some(ErrorCode::E002UnboundVariable) {
+        return None;
+    }
+    let NuError::TypeError {
+        similar_names: Some(names),
+        span,
+        ..
+    } = err
+    else {
+        return None;
+    };
+    let [replacement] = names.as_slice() else {
+        return None;
+    };
+    let original = source.get(span.start as usize..span.end as usize)?;
+    let valid_identifier = |name: &str| {
+        let mut chars = name.chars();
+        matches!(chars.next(), Some(c) if c.is_alphabetic() || c == '_')
+            && chars.all(|c| c.is_alphanumeric() || c == '_')
+    };
+    if !valid_identifier(original) || !valid_identifier(replacement) || original == replacement {
+        return None;
+    }
+    Some(DiagnosticSourceEdit {
+        start: span.start,
+        end: span.end,
+        expected: original.to_owned(),
+        replacement: replacement.clone(),
+        applicability: EditApplicability::MaybeIncorrect,
+    })
+}
+
 impl NuError {
     /// Return the stable, category-scoped diagnostic code for this error.
     ///
