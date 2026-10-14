@@ -91,7 +91,7 @@ fn apply_document_changes(
 ) -> Option<String> {
     let mut updated = source.to_string();
     for change in changes {
-        if let Some(range) = change.range {
+        if let Some(range) = &change.range {
             let start = edit_position_to_byte_offset(&updated, range.start)?;
             let end = edit_position_to_byte_offset(&updated, range.end)?;
             if start > end {
@@ -3738,7 +3738,7 @@ mod lsp_tests {
         )];
         assert_eq!(
             apply_document_changes(before, &changes),
-            Some("firX\Yird\n".to_string())
+            Some("firX\nYird\n".to_string())
         );
     }
 
