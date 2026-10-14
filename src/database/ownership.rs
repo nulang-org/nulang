@@ -89,6 +89,7 @@ pub struct OwnershipStateMachine {
     applied_index: u64,
     applied_term: u64,
     last_entry: Option<CommittedOwnershipEntry>,
+    last_result: Option<Result<OwnershipGrant, OwnershipError>>,
     owners: BTreeMap<TabletId, OwnershipGrant>,
 }
 
@@ -110,21 +111,22 @@ impl OwnershipStateMachine {
     }
 
     /// Apply the next *already committed* entry atomically to the state
-    /// machine. Invalid entries do not consume an index or mutate any grant.
+    /// machine. Commands rejected for semantic reasons still consume their
+    /// already-committed index, but leave the grant unchanged. Invalid log
+    /// ordering or term regression does not consume an index.
     ///
-    /// The exact latest entry is idempotent to support replay after a lost
-    /// apply acknowledgement. Earlier indexes and same-index conflicts fail.
+    /// The exact latest entry (including its error) is idempotent to support
+    /// replay after a lost apply acknowledgement. Older indexes and conflicts fail.
     pub fn apply_committed(
         &mut self,
         entry: CommittedOwnershipEntry,
     ) -> Result<OwnershipGrant, OwnershipError> {
         if entry.index == self.applied_index && self.applied_index != 0 {
             if self.last_entry.as_ref() == Some(&entry) {
-                return self.grant(entry.command.tablet()).ok_or(
-                    OwnershipError::UnknownTablet {
-                        tablet: entry.command.tablet(),
-                    },
-                );
+                return self
+                    .last_result
+                    .clone()
+                    .expect("last entry must have a recorded apply outcome");
             }
             return Err(OwnershipError::ConflictingCommittedEntry {
                 index: entry.index,
@@ -156,8 +158,10 @@ impl OwnershipStateMachine {
             });
         }
 
-        // Fully validate against the last committed state before mutation.
-        let grant = match entry.command {
+        // Fully evaluate against the last committed state before mutation.
+        // A rejected *committed* command still advances the apply cursor.
+        let result: Result<OwnershipGrant, OwnershipError> = (|| {
+            let grant = match entry.command {
             OwnershipCommand::Bootstrap {
                 tablet,
                 owner,
@@ -221,11 +225,16 @@ impl OwnershipStateMachine {
             }
         };
 
-        self.owners.insert(grant.tablet, grant);
+            Ok(grant)
+        })();
+        if let Ok(grant) = result {
+            self.owners.insert(grant.tablet, grant);
+        }
         self.applied_index = entry.index;
         self.applied_term = entry.term;
         self.last_entry = Some(entry);
-        Ok(grant)
+        self.last_result = Some(result.clone());
+        result
     }
 
     /// Check a caller's current write-fencing token, *including* owner.
