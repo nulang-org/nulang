@@ -2262,6 +2262,10 @@ impl Runtime {
                         "nulang-actor: refusing wrong-arity queued message"
                     );
                     self.route_to_dlq(&msg, "actor behavior argument count mismatch");
+                    depth += 1;
+                    if depth >= MAX_FLUSH_DEPTH {
+                        break;
+                    }
                     continue;
                 }
             }
