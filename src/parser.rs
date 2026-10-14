@@ -6933,6 +6933,20 @@ mod tests {
     }
 
     #[test]
+    fn test_perform_accepts_keyword_named_python_import() {
+        let expr = parse_expr("perform Python.import(\"math\")")
+            .expect("effect operation named import must parse");
+        match expr {
+            Expr::Perform { effect, op, args, .. } => {
+                assert_eq!(effect, "Python");
+                assert_eq!(op, "import");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected Python import effect, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_prelude_cache_build_preserves_active_source_map() {
         let source = "let t = ((1, 2), 3) in t.0.1";
         crate::types::set_source_map_with_file(source, Some("caller.nula"));
