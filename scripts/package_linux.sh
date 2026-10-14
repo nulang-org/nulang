@@ -76,7 +76,7 @@ deb="nulang_${version}_${deb_arch}.deb"
 dpkg-deb --root-owner-group --build "$tmp/deb" "$output/$deb"
 
 # No source rebuild: RPM gets the same stripped binary as the Debian archive.
-# --target plus explicit BuildArch supports cross-packaging arm64 from amd64.
+# --target plus explicit BuildArch keeps the RPM architecture deterministic.
 mkdir -p "$tmp/rpm"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
 install -m 0755 "$binary" "$tmp/rpm/SOURCES/nulang"
 cat > "$tmp/rpm/SPECS/nulang.spec" <<SPEC
@@ -87,6 +87,12 @@ Summary: Nulang programming language compiler and runtime
 License: Apache-2.0
 URL: https://nulang.org
 BuildArch: $arch
+
+# This package is an exact copy of the binary already stripped and verified
+# by release CI. Default RPM buildroot policy (brp-strip and friends) can
+# rewrite ELF bytes, breaking our Debian/RPM/archive payload identity check.
+# Do not post-process the binary: our CI inspects and executes the payload.
+%global __os_install_post %{nil}
 
 %description
 Typed concurrent, durable, and distributed programming language CLI.
