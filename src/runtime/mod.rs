@@ -6819,8 +6819,7 @@ impl Runtime {
             Some("get_attr") => {
                 let module = string_arg(0)?;
                 let attr = string_arg(1)?;
-                let args: Vec<Value> = vec![];
-                match fi.call(&module, &attr, &args) {
+                match fi.get_attr(&module, &attr) {
                     Ok(result) => Some(result),
                     Err(e) => {
                         eprintln!("Python get_attr error: {}", e);
