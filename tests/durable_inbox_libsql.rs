@@ -207,13 +207,15 @@ fn two_connections_competing_for_same_sequence_never_both_commit() {
         let barrier_a = Arc::clone(&barrier);
         let barrier_b = Arc::clone(&barrier);
         let left = scope.spawn(move || {
-            let mut store = LibsqlStore::new(path_a).unwrap();
+            let store = LibsqlStore::new(path_a);
             barrier_a.wait();
+            let mut store = store.expect("first libSQL connection");
             store.commit_inbox_transition(identity(51, "first", 7), command(51, 0, 7))
         });
         let right = scope.spawn(move || {
-            let mut store = LibsqlStore::new(path_b).unwrap();
+            let store = LibsqlStore::new(path_b);
             barrier_b.wait();
+            let mut store = store.expect("second libSQL connection");
             store.commit_inbox_transition(identity(51, "second", 8), command(51, 0, 8))
         });
         (left.join().unwrap(), right.join().unwrap())
