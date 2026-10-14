@@ -2902,6 +2902,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(store_dir);
     }
 
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn test_node_rejects_missing_or_partial_tls_material() {
+        let loopback = "127.0.0.1:9000".parse().unwrap();
+        assert!(validate_node_security_mode(false, false, false, false, loopback).is_err());
+        assert!(validate_node_security_mode(false, true, true, false, loopback).is_err());
+        assert!(validate_node_security_mode(false, true, true, true, loopback).is_ok());
+    }
+
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn test_node_plaintext_requires_explicit_loopback_only_opt_in() {
+        let loopback = "127.0.0.1:9000".parse().unwrap();
+        let wildcard = "0.0.0.0:9000".parse().unwrap();
+        assert!(validate_node_security_mode(true, false, false, false, loopback).is_ok());
+        assert!(validate_node_security_mode(true, false, false, false, wildcard).is_err());
+        assert!(validate_node_security_mode(true, true, true, true, loopback).is_err());
+    }
+
     #[test]
     fn test_run_source_actor_program_schedules_and_delivers() {
         let source = r#"
