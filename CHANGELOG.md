@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### First-run developer workflow contract — 2026-10-14
+- **Dev Plane's `doctor` command now runs the same portable environment checks documented for contributors**, instead of only printing version strings. The optional accelerated mode remains available as `bash scripts/dev-doctor.sh --accelerated`.
+- **A hermetic first-run smoke driver exercises the native CLI from a temporary scaffold**: version, eval, package new/check/build/run/test, and an explicitly supported formatter subset with check-mode idempotence. Dev Plane exposes a non-publishing `first_run` gate that builds the binary first. Unit tests use a fake CLI to cover orchestration/fail-closed behavior; real-binary validation remains a separate gate.
+
 ### Portable contributor doctor profiles — 2026-10-14
 - **Developer environment checks no longer require optional `mise` or `mbx` for ordinary Cargo builds.** The default doctor warns about these accelerators without blocking a correctly configured toolchain; `--accelerated` enforces both tools and `mise doctor` for shared-cache worktrees. Required build tools, Rust pinning, Cargo lockfile checks, filesystem checks, and disk safeguards remain blocking.
 - **Hermetic subprocess regressions cover both profiles**, missing required tools, unhealthy optional tooling, and invalid arguments. Contributor instructions document the two supported paths.
