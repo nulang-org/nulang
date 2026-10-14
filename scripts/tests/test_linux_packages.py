@@ -61,6 +61,15 @@ class LinuxPackageContractTests(unittest.TestCase):
         self.assertIn("sha256sum", script)
         self.assertIn("readelf -h", script)
 
+    def test_rpm_preserves_exact_already_stripped_release_binary(self):
+        # RPM's buildroot policy can run brp-strip even on stripped binaries,
+        # changing ELF bytes after the release artifact was verified.
+        script = PACKAGER.read_text(encoding="utf-8")
+        self.assertIn("%global __os_install_post %{nil}", script)
+        self.assertIn("install -D -m 0755 %{_sourcedir}/nulang %{buildroot}/usr/bin/nulang", script)
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn('cmp package-smoke/rpm/usr/bin/nulang "target/', workflow)
+
     def test_untrusted_version_is_rejected_before_packaging(self):
         for version in ("1.0.0\nMaintainer: attacker", "1.0.0-rc1", "../1.0.0"):
             result = subprocess.run(
