@@ -15,7 +15,7 @@ The host first calls `admit_next_typed_actor_command` with the exact canonical c
 
 ## Accepted surface
 
-Only scalar `Int`, `Float`, `Bool`, `Nil`, `Unit` values and compiler-owned **durable** fields are eligible. The first version supports straight-line scalar literal loads, local register moves/loads/stores, integer and float comparisons, elementary integer arithmetic and boolean operations, `StateGet`, `StateSet`, and direct returns. The instruction scan ends at the first return/halt, may not cross into another function/behavior region and enforces a 4096-instruction bound. There is no control-flow jump or function call.
+Only scalar `Int`, `Float`, `Bool`, `Nil`, `Unit` values and compiler-owned **durable** fields are eligible. The first version supports straight-line scalar literal loads, local register moves/loads/stores, integer and float comparisons, elementary integer arithmetic and boolean operations, `StateGet`, `StateSet`, and direct returns. The instruction scan requires an explicit `Ret` or `RetVal`, may not cross into another function/behavior region, and enforces a 4096-instruction bound. `Halt` is rejected rather than treated as a completed durable turn. There is no control-flow jump or function call.
 
 Everything else — including sends/asks, actor spawn, closures, file/network IO, Python/FFI, effects, external providers, `Emit`, native calls, allocations, string/object/CRDT state, branches, and suspension — **fails closed before any user bytecode is executed**. Primitive state writes must retain the original compiled scalar type.
 
