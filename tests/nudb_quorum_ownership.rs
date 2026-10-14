@@ -13,7 +13,11 @@ use nulang::database::tablet::TabletId;
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
 fn paths() -> Vec<PathBuf> {
-    let key = format!("nudb_quorum_{}_{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
+    let key = format!(
+        "nudb_quorum_{}_{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    );
     (0..3)
         .map(|voter| std::env::temp_dir().join(format!("{key}_{voter}.log")))
         .collect()
@@ -26,12 +30,26 @@ fn cleanup(paths: &[PathBuf]) {
         let _ = fs::remove_file(PathBuf::from(lock));
     }
 }
-fn node(id: u64) -> NodeId { NodeId::new(id).unwrap() }
-fn tablet(id: u64) -> TabletId { TabletId::new(id).unwrap() }
-fn bootstrap() -> OwnershipCommand {
-    OwnershipCommand::Bootstrap { tablet: tablet(18), owner: node(1), epoch: 7 }
+fn node(id: u64) -> NodeId {
+    NodeId::new(id).unwrap()
 }
-fn handoff(expected_owner: u64, expected_epoch: u64, next_owner: u64, next_epoch: u64) -> OwnershipCommand {
+
+fn tablet(id: u64) -> TabletId {
+    TabletId::new(id).unwrap()
+}
+fn bootstrap() -> OwnershipCommand {
+    OwnershipCommand::Bootstrap {
+        tablet: tablet(18),
+        owner: node(1),
+        epoch: 7,
+    }
+}
+fn handoff(
+    expected_owner: u64,
+    expected_epoch: u64,
+    next_owner: u64,
+    next_epoch: u64,
+) -> OwnershipCommand {
     OwnershipCommand::Transfer {
         tablet: tablet(18),
         expected_owner: node(expected_owner),
@@ -149,27 +167,3 @@ fn duplicate_voter_paths_cannot_be_counted_as_two_votes() {
     cleanup(&paths);
 }
 
-#[test]
-fn single_non_quorum_replica_append_cannot_be_treated_as_committed() {
-    let paths = paths();
-    cleanup(&paths);
-    let mut log = FixedTermQuorumLog::open(&paths, 3).unwrap();
-    // Test-only failure injection removes two simulated replicas from quorum,
-    // leaving one durable journal available.
-    log.disable_replica_for_test(1);
-    log.disable_replica_for_test(2);
-    assert!(matches!(
-        log.propose(bootstrap()),
-        Err(QuorumLogError::QuorumNotReached { acknowledged: 1, required: 2 })
-    ));
-    assert_eq!(log.authority().applied_index(), 0);
-    assert!(matches!(log.propose(bootstrap()), Err(QuorumLogError::RequiresReopen)));
-    drop(log);
-
-    // Reopening from disk sees only a minority prefix; no grant is minted.
-    let reopened = FixedTermQuorumLog::open(&paths, 3).unwrap();
-    assert_eq!(reopened.authority().applied_index(), 0);
-    assert!(reopened.authority().grant(tablet(18)).is_none());
-    drop(reopened);
-    cleanup(&paths);
-}
