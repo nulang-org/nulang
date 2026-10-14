@@ -431,13 +431,13 @@ impl Mailbox {
         Some(message)
     }
 
-    /// Existing nontransactional receive, preserving a prior pending candidate
-    /// ahead of newer traffic if an adapter changes dispatch strategy.
+    /// Legacy nontransactional receive remains unavailable while a durable
+    /// candidate is pending. No caller may bypass persistence admission.
     pub fn pop(&mut self) -> Option<Message> {
-        let result = self
-            .pending_durable_admission
-            .take()
-            .or_else(|| self.pop_uncommitted());
+        if self.pending_durable_admission.is_some() {
+            return None;
+        }
+        let result = self.pop_uncommitted();
         if result.is_some() {
             self.active_match = None;
             self.invalidate_receive_indexes();
