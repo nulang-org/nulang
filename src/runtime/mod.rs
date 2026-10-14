@@ -2193,14 +2193,23 @@ impl Runtime {
             if self.actor_is_persistent(actor_id) {
                 let seq = self.next_sequence(actor_id);
                 let payload = self.persist_journal_payload(actor_id, journal_source_actor, args);
-                let _ = self.persistence.append_journal(
+                if let Err(error) = self.persistence.append_journal(
                     actor_id,
                     JournalEntry {
                         sequence: seq,
                         behavior_id,
                         payload,
                     },
-                );
+                ) {
+                    self.current_actor = None;
+                    return Err(NuError::RuntimeError {
+                        msg: format!(
+                            "actor {} refused synchronous execution after durable journal admission failed: {}",
+                            actor_id, error
+                        ),
+                        span: Span::default(),
+                    });
+                }
             }
             let _ = self.dispatch_native_handler(actor_id, behavior_idx, args);
             self.checkpoint_actor(actor_id);
@@ -3956,16 +3965,15 @@ impl Runtime {
                                 }
                             }
                         }
-                        Err(error) if self.actor_is_workflow(actor_id) => {
+                        Err(error) => {
                             tracing::error!(
                                 actor_id,
                                 %error,
-                                "nulang-workflow: refusing command execution after durable admission failed"
+                                "nulang-actor: refusing persistent message after durable journal admission failed"
                             );
                             self.current_actor = None;
                             return;
                         }
-                        Err(_) => {}
                     }
                 }
                 let content = msg
@@ -4013,16 +4021,15 @@ impl Runtime {
                                 }
                             }
                         }
-                        Err(error) if self.actor_is_workflow(actor_id) => {
+                        Err(error) => {
                             tracing::error!(
                                 actor_id,
                                 %error,
-                                "nulang-workflow: refusing command execution after durable admission failed"
+                                "nulang-actor: refusing persistent message after durable journal admission failed"
                             );
                             self.current_actor = None;
                             return;
                         }
-                        Err(_) => {}
                     }
                 }
                 match behavior_name.as_str() {
@@ -4216,16 +4223,15 @@ impl Runtime {
                                     }
                                 }
                             }
-                            Err(error) if self.actor_is_workflow(actor_id) => {
+                            Err(error) => {
                                 tracing::error!(
                                     actor_id,
                                     %error,
-                                    "nulang-workflow: refusing command execution after durable admission failed"
+                                    "nulang-actor: refusing persistent message after durable journal admission failed"
                                 );
                                 self.current_actor = None;
                                 return;
                             }
-                            Err(_) => {}
                         }
                     }
                 }
@@ -4259,16 +4265,15 @@ impl Runtime {
                                 }
                             }
                         }
-                        Err(error) if self.actor_is_workflow(actor_id) => {
+                        Err(error) => {
                             tracing::error!(
                                 actor_id,
                                 %error,
-                                "nulang-workflow: refusing command execution after durable admission failed"
+                                "nulang-actor: refusing persistent message after durable journal admission failed"
                             );
                             self.current_actor = None;
                             return;
                         }
-                        Err(_) => {}
                     }
                 }
                 let payload = msg.payload.clone();
