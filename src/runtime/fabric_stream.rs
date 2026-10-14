@@ -2296,6 +2296,37 @@ mod tests {
     }
 
     #[test]
+    fn producer_checkpoint_rejects_repaired_tail_below_durable_highwater() {
+        let root = test_dir("producer-missing-committed-tail");
+        {
+            let mut store = FileFabricStreamStore::open(&root).unwrap();
+            store
+                .create_stream("events", FabricStreamConfig::default())
+                .unwrap();
+            store.append_idempotent("events", "writer", 1, 1, b"one").unwrap();
+        }
+        // Simulate a storage recovery that lost the record but retained the
+        // acknowledged producer checkpoint. It must never reuse sequence 1.
+        for (_, path) in list_segments(&root.join("events")).unwrap() {
+            fs::remove_file(path).unwrap();
+        }
+        let mut reopened = FileFabricStreamStore::open(&root).unwrap();
+        assert_eq!(
+            reopened.append("events", b"replacement").unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            reopened
+                .append_idempotent("events", "writer", 2, 1, b"replacement")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(reopened.read_from("events", 1, 10).unwrap().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn producer_pending_record_conflict_never_reassigns_sequence() {
         let root = test_dir("producer-payload-corruption");
         {
