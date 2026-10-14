@@ -105,6 +105,33 @@ impl WalBackedTablet {
             .prepare_write(presented_epoch, expected_previous_sequence, mutations)
     }
 
+    /// Commit an identified transaction only if the caller holds the current
+    /// tablet ownership epoch. Remote APIs must use this path instead of
+    /// commit_idempotent to reject requests carrying stale fencing tokens.
+    pub fn commit_idempotent_at_epoch(
+        &mut self,
+        presented_epoch: u64,
+        id: TransactionId,
+        mutations: Vec<TabletMutation>,
+    ) -> Result<TransactionReceipt, WalBackedError> {
+        let current = self.tablet.descriptor().ownership_epoch();
+        if presented_epoch < current {
+            return Err(TabletError::StaleEpoch {
+                current,
+                presented: presented_epoch,
+            }
+            .into());
+        }
+        if presented_epoch > current {
+            return Err(TabletError::UnknownEpoch {
+                current,
+                presented: presented_epoch,
+            }
+            .into());
+        }
+        self.commit_idempotent(id, mutations)
+    }
+
     /// Commit an identified transaction, or return its original receipt if
     /// the same ordered mutations already committed on this tablet.
     ///
@@ -114,7 +141,9 @@ impl WalBackedTablet {
     /// committed; reopen the tablet and retry with the exact same ID/payload.
     ///
     /// Only one writer may hold the local WAL lock at a time. Identifiers are
-    /// scoped to one tablet; this API does not coordinate distributed writers.
+    /// scoped to one tablet. This local convenience method has no client epoch
+    /// argument and must not be exposed directly as a remote write endpoint;
+    /// use commit_idempotent_at_epoch for caller-presented fencing tokens.
     pub fn commit_idempotent(
         &mut self,
         id: TransactionId,
