@@ -69,6 +69,81 @@ fn invalid_data(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 
+/// Decode the actual NBC bytes that passed pinned identity verification and
+/// resolve exactly the actor schema recorded in the durable snapshot.
+///
+/// The caller MUST first run `verify_pinned_workflow_resume` on this exact
+/// artifact bundle. An independently registered/unverified module is never
+/// substituted for the decoded module returned by this function.
+pub(crate) fn decode_verified_pinned_workflow_module(
+    bundle: &PinnedArtifactBundle,
+    schema_name: &str,
+) -> io::Result<(crate::bytecode::CodeModule, Vec<usize>, Vec<Option<usize>>)> {
+    use crate::primitives::ActorRole;
+
+    if schema_name.trim().is_empty() {
+        return Err(invalid_data("pinned bytecode workflow has an empty schema name"));
+    }
+    let declared_schema = bundle
+        .manifest
+        .actors
+        .iter()
+        .find(|actor| actor.name == schema_name && actor.persistence.is_durable())
+        .ok_or_else(|| {
+            invalid_data(
+                "pinned behavior manifest does not declare the snapshot's durable actor schema",
+            )
+        })?;
+
+    let module = crate::bytecode::CodeModule::from_nbc(&bundle.executable)
+        .map_err(|error| invalid_data(format!("invalid pinned NBC artifact: {error}")))?
+        .module;
+    let meta = super::schema_identity::resolve_snapshot_actor_meta(
+        &module,
+        Some(schema_name),
+    )
+    .map_err(invalid_data)?;
+    if meta.version != declared_schema.schema_version {
+        return Err(invalid_data(
+            "pinned NBC state schema version does not match its behavior manifest",
+        ));
+    }
+    let role = meta.role().map_err(invalid_data)?;
+    if role != ActorRole::Workflow || !meta.persistent {
+        return Err(invalid_data(
+            "the pinned actor schema must be a persistent bytecode workflow",
+        ));
+    }
+
+    if meta.behavior_indices.is_empty() {
+        return Err(invalid_data("pinned workflow has no compiled behavior entries"));
+    }
+    let instruction_count = module.instructions.len();
+    let mut offsets = Vec::with_capacity(meta.behavior_indices.len());
+    let mut compensation_offsets = Vec::with_capacity(meta.behavior_indices.len());
+    let mut seen = std::collections::BTreeSet::new();
+    for &index in &meta.behavior_indices {
+        if !seen.insert(index) {
+            return Err(invalid_data("duplicate pinned workflow behavior index"));
+        }
+        let behavior = module.behaviors.get(index).ok_or_else(|| {
+            invalid_data("pinned workflow behavior index is outside the NBC behavior table")
+        })?;
+        if behavior.code_offset >= instruction_count
+            || behavior
+                .compensate_offset
+                .is_some_and(|offset| offset >= instruction_count)
+        {
+            return Err(invalid_data(
+                "pinned workflow contains an out-of-bounds bytecode offset",
+            ));
+        }
+        offsets.push(behavior.code_offset);
+        compensation_offsets.push(behavior.compensate_offset);
+    }
+    Ok((module, offsets, compensation_offsets))
+}
+
 /// Commit the first workflow checkpoint, WorkflowStarted event and immutable
 /// executable pin together. No actor should become observable before this
 /// function commits successfully.
