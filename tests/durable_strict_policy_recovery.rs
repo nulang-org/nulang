@@ -133,3 +133,105 @@ fn libsql_policy_survives_new_database_connection() {
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[derive(Default)]
+struct FailPolicyStore {
+    inner: nulang::runtime::MemoryStore,
+    reject: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PersistenceStore for FailPolicyStore {
+    fn commit_transition(
+        &mut self,
+        transition: nulang::runtime::DurableTransition,
+    ) -> std::io::Result<nulang::runtime::DurableCommit> {
+        if self.reject.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(std::io::Error::other("injected policy commit failure"));
+        }
+        self.inner.commit_transition(transition)
+    }
+
+    fn load_durable_tail_position(
+        &self,
+        actor_id: u64,
+    ) -> std::io::Result<Option<nulang::runtime::DurableTailPosition>> {
+        self.inner.load_durable_tail_position(actor_id)
+    }
+
+    fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> std::io::Result<()> {
+        self.inner.save_snapshot(snapshot)
+    }
+
+    fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+        self.inner.load_snapshot(actor_id)
+    }
+
+    fn append_journal(
+        &mut self,
+        actor_id: u64,
+        entry: nulang::runtime::JournalEntry,
+    ) -> std::io::Result<()> {
+        self.inner.append_journal(actor_id, entry)
+    }
+
+    fn read_journal(&self, actor_id: u64) -> Vec<nulang::runtime::JournalEntry> {
+        self.inner.read_journal(actor_id)
+    }
+
+    fn append_workflow_event(
+        &mut self,
+        actor_id: u64,
+        event: nulang::runtime::WorkflowEvent,
+    ) -> std::io::Result<()> {
+        self.inner.append_workflow_event(actor_id, event)
+    }
+
+    fn read_workflow_events(&self, actor_id: u64) -> Vec<nulang::runtime::WorkflowEvent> {
+        self.inner.read_workflow_events(actor_id)
+    }
+
+    fn append_event(
+        &mut self,
+        actor_id: u64,
+        event: nulang::runtime::EventEntry,
+    ) -> std::io::Result<()> {
+        self.inner.append_event(actor_id, event)
+    }
+
+    fn read_events(&self, actor_id: u64) -> Vec<nulang::runtime::EventEntry> {
+        self.inner.read_events(actor_id)
+    }
+
+    fn latest_sequence(&self, actor_id: u64) -> u64 {
+        self.inner.latest_sequence(actor_id)
+    }
+
+    fn clear(&mut self, actor_id: u64) -> std::io::Result<()> {
+        self.inner.clear(actor_id)
+    }
+}
+
+#[test]
+fn rejected_policy_commit_never_enables_legacy_bypass_gate() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let module = module();
+    let mut rt = Runtime::new();
+    let id = typed_actor(&mut rt, &module);
+    let reject = Arc::new(AtomicBool::new(true));
+    rt.persistence = Box::new(FailPolicyStore {
+        inner: nulang::runtime::MemoryStore::new(),
+        reject: Arc::clone(&reject),
+    });
+    assert!(rt.enable_strict_typed_actor_admission(id).is_err());
+    assert!(!rt.actors[&id].mailbox.requires_strict_durable_admission());
+    assert_eq!(rt.persistence.latest_sequence(id), 0);
+    assert!(rt.persistence.load_snapshot(id).is_none());
+
+    reject.store(false, Ordering::SeqCst);
+    rt.enable_strict_typed_actor_admission(id)
+        .expect("same host may safely enable strict mode once storage succeeds");
+    assert!(rt.actors[&id].mailbox.requires_strict_durable_admission());
+    assert_eq!(rt.persistence.latest_sequence(id), 1);
+}
