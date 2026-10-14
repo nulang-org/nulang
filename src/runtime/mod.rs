@@ -1444,6 +1444,218 @@ impl Runtime {
         Ok(())
     }
 
+    /// Atomically persist a trusted host's result for an already-admitted
+    /// typed durable command and then publish its state to the live actor.
+    ///
+    /// The host must stage a pure state delta and Prepared effect intents
+    /// without invoking user bytecode or contacting providers. External effect
+    /// intents require an exact live actor authority grant. This API neither
+    /// executes a handler nor delivers the committed outbox.
+    pub fn commit_admitted_typed_actor_result(
+        &mut self,
+        actor_id: u64,
+        admitted_sequence: u64,
+        state_updates: HashMap<String, PersistedValue>,
+        durable_effects: Vec<crate::durable_effect_persistence::DurableEffectPersistenceRecord>,
+        outbox: Vec<DurableOutboxMessage>,
+    ) -> std::io::Result<DurableCommit> {
+        use std::io::{Error, ErrorKind};
+
+        let actor = self
+            .actors
+            .get(&actor_id)
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "actor does not exist"))?;
+        if actor.mailbox.admitted_command_sequence() != Some(admitted_sequence) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "actor has no admitted command awaiting a durable result",
+            ));
+        }
+        if !actor.mailbox.requires_strict_durable_admission() {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "staged result completion requires strict typed actor admission",
+            ));
+        }
+        // A transient in-memory flag is not sufficient authority to claim
+        // crash-safe execution. The monotonic store policy must be present.
+        if !self
+            .persistence
+            .load_strict_typed_actor_admission(actor_id)?
+        {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "strict actor admission policy is not durably enabled",
+            ));
+        }
+        if !actor.persistent || actor.is_workflow || actor.is_agent {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "atomic typed result requires a persistent ordinary actor",
+            ));
+        }
+        if actor.state_models.values().any(|model| {
+            !matches!(model, StateModel::Local | StateModel::Durable)
+        }) {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "this typed result adapter does not support CRDT or event-sourced state",
+            ));
+        }
+        let metadata = actor
+            .bytecode_module
+            .as_ref()
+            .and_then(|module| {
+                behavior_ownership::actor_meta_for_runtime_name(module, &actor.name)
+            })
+            .ok_or_else(|| {
+                Error::new(ErrorKind::InvalidInput, "actor lacks compiled state schema")
+            })?;
+        let grants = actor
+            .authority_manifest()
+            .map_err(|error| Error::new(ErrorKind::InvalidData, error.to_string()))?;
+        let authority_tokens = grants.canonical_token_set();
+
+        // Validate every state field *before* even attempting a durable
+        // commit. The current compiler metadata only gives us literal
+        // primitive defaults, not structural state type descriptors.
+        let mut state = HashMap::new();
+        for (name, model) in &actor.state_models {
+            if *model != StateModel::Durable {
+                continue;
+            }
+            let value = match state_updates.get(name) {
+                Some(value) => value.clone(),
+                None => {
+                    let value = actor.state_data.get(name).ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::InvalidData,
+                            format!("durable state field '{name}' has no live value"),
+                        )
+                    })?;
+                    actor.persist_value(value)
+                }
+            };
+            let matches_default = metadata
+                .state_defaults
+                .iter()
+                .find(|(field, _)| field == name)
+                .is_some_and(|(_, default)| {
+                    matches!(
+                        (default, &value),
+                        (crate::bytecode::Constant::Int(_), PersistedValue::Int(_))
+                            | (crate::bytecode::Constant::Float(_), PersistedValue::Float(_))
+                            | (crate::bytecode::Constant::Bool(_), PersistedValue::Bool(_))
+                            | (crate::bytecode::Constant::String(_), PersistedValue::String(_))
+                            | (crate::bytecode::Constant::Nil, PersistedValue::Nil)
+                            | (crate::bytecode::Constant::Unit, PersistedValue::Unit)
+                    )
+                });
+            if !matches_default {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("staged field '{name}' has incompatible or unsupported type"),
+                ));
+            }
+            state.insert(name.clone(), value);
+        }
+        if state_updates.keys().any(|name| !state.contains_key(name)) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "staged update is not a declared durable field",
+            ));
+        }
+
+        let mut effect_ids = HashSet::new();
+        for record in &durable_effects {
+            if !matches!(
+                record.effect(),
+                crate::durable_effect::DurableEffectRecord::Prepared { .. }
+            ) {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "atomic result may stage only undispatched Prepared effects",
+                ));
+            }
+            let spec = record.effect().spec();
+            if spec.boundary != crate::primitives::EffectBoundary::External {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "runtime-owned or backend-owned state is not an external effect intent",
+                ));
+            }
+            if !effect_ids.insert(spec.id) {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "duplicate logical external effect identity in result",
+                ));
+            }
+            // A retry must never mint a second Prepared record for an
+            // already recorded logical external operation.
+            if self
+                .persistence
+                .load_durable_effect(actor_id, spec.id)?
+                .is_some()
+            {
+                return Err(Error::new(
+                    ErrorKind::AlreadyExists,
+                    "logical external effect identity already exists in durable history",
+                ));
+            }
+            // An effect's requested operation is not itself authorization.
+            // Require an exact typed grant on the currently running actor.
+            let required = spec
+                .effect_operation
+                .parse::<crate::authority::AuthorityGrant>()
+                .map_err(|_| {
+                    Error::new(
+                        ErrorKind::PermissionDenied,
+                        "effect operation is not a canonical authority grant",
+                    )
+                })?;
+            if !grants.allows(&required) {
+                return Err(Error::new(
+                    ErrorKind::PermissionDenied,
+                    "actor lacks live authority to stage the external effect",
+                ));
+            }
+        }
+
+        let completion_sequence = admitted_sequence.checked_add(1).ok_or_else(|| {
+            Error::new(ErrorKind::InvalidInput, "admitted sequence overflow")
+        })?;
+        let snapshot = ActorSnapshot {
+            actor_id,
+            sequence: completion_sequence,
+            activation_epoch: actor.activation_epoch,
+            state,
+            schema_name: Some(actor.name.clone()),
+            authority_tokens,
+            ..ActorSnapshot::default()
+        };
+        let transition = DurableTransition {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id,
+            activation_epoch: actor.activation_epoch,
+            sequence: completion_sequence,
+            expected_previous_sequence: admitted_sequence,
+            command: None,
+            snapshot: Some(snapshot),
+            workflow_events: vec![],
+            domain_events: vec![],
+            durable_effects,
+            outbox,
+        };
+
+        // Atomic storage commit first. If it fails, leave the actor's live
+        // state untouched and its in-flight mailbox fence in place.
+        let committed = self.persistence.commit_transition(transition)?;
+        // This separately verifies exact tail/epoch/schema, authority and
+        // state types, hydrates live state, then unlocks the next user turn.
+        self.finish_admitted_typed_actor_command(actor_id, admitted_sequence)?;
+        Ok(committed)
+    }
+
     /// Register all `virtual entity` types declared in `module` with the
     /// grain registry so they can be hydrated on demand.  Safe to call
     /// multiple times for the same module (later calls are no-ops).
