@@ -386,7 +386,7 @@ mod tests {
                 ))
             })
             .collect();
-        let mut log = FixedTermQuorumLog::open(&paths, 3).unwrap();
+        let mut log = FixedTermQuorumLog::bootstrap(&paths, 3).unwrap();
 
         // Shut down two voting replicas before attempting a proposal.
         log.replicas[1] = None;
@@ -437,7 +437,7 @@ mod tests {
                 ))
             })
             .collect();
-        let mut log = FixedTermQuorumLog::open(&paths, 3).unwrap();
+        let mut log = FixedTermQuorumLog::bootstrap(&paths, 3).unwrap();
         log.replicas[0].as_mut().unwrap().poisoned = true;
         let command = OwnershipCommand::Bootstrap {
             tablet: TabletId::new(18).unwrap(),
