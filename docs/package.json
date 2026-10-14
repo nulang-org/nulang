@@ -11,7 +11,7 @@
     "prebuild": "pnpm run sync-playground && pnpm run generate-og",
     "generate-og": "node scripts/generate-og-image.mjs",
     "preview": "astro preview",
-    "check": "astro check",
+    "check": "astro check && node --test scripts/responsive-navigation.test.mjs",
     "sync-playground": "node scripts/sync-playground.mjs"
   },
   "dependencies": {

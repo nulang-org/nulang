@@ -1873,3 +1873,15 @@ html[data-has-hero] .hero-source:focus-visible {
     transition: none;
   }
 }
+
+/* At phone widths the GitHub header icon duplicates the accessible menu
+   link and consumes space needed by search, theme, and navigation controls. */
+@media (max-width: 40rem) {
+  header .social-icons {
+    display: none;
+  }
+
+  header .right-group {
+    gap: 0.25rem;
+  }
+}
