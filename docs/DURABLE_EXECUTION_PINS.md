@@ -171,21 +171,57 @@ rejection, and verified restart on a fresh Runtime.
 
 ### Remaining safety constraints
 
-- The generic atomic persistence contract treats identical committed
-  transitions as idempotent retries. A preflight existing-history check
-  prevents ordinary repeated starts, but it is not a cross-process atomic
-  **create-only** operation. A storage-level conditional creation primitive
-  is still required for concurrent identical starters.
+- Pinned first transitions are create-only in the Memory and libSQL atomic
+  backends. Other transition retries continue to be idempotent. Concurrent
+  creation on unsupported persistence engines is not available.
 - Legacy unpinned workflow creation still uses its original separate writes.
   There is no automatic provenance check for old unpinned histories.
-- Persisted event readers that silently omit every corrupt start record can
-  defeat the atomic-start fingerprint. Strong recovery requires checked,
-  corruption-reporting history reads.
+- Pinned resume uses checked history reads in Memory and libSQL. This
+  detects unreadable/corrupt rows but not coherent malicious deletion of all
+  start records; authenticated history integrity remains a future requirement.
 - No immutable artifact retention/garbage-collection controller, signed
   provenance attestation, cross-node epoch test, or automatic Cloud admission
   integration has been implemented.
 - Promotion requires exact-head Rust build, Clippy, all relevant feature tests,
   crash/fault-injection coverage and independently reviewed concurrency tests.
+
+## Create-only storage and strict history validation
+
+The pinned initial-start marker is reserved in the persistence contract as
+`PINNED_WORKFLOW_START_EVENT`. A first transition containing this marker is
+**create-only**: in `MemoryStore` and `LibsqlStore`, replaying the
+same exact first transition returns `AlreadyExists` instead of reporting
+an idempotent success. For local SQLite, this decision happens **inside**
+the `IMMEDIATE` database write transaction after reading the current durable
+tail, so independent concurrent starters cannot both acknowledge the same
+execution. Remote libSQL contention still requires backend-specific testing. All other transition retries retain their existing
+idempotent semantics. Backends without atomic transition support remain
+unsupported for pinned creation.
+
+`PersistenceStore::read_workflow_events_checked` is a separate, fallible
+history read. `MemoryStore` returns the complete in-memory history and
+`LibsqlStore` reports query, row-decoding, and JSON-corruption errors
+rather than silently omitting the offending event. Pinned resume and the
+legacy recovery guard use strict reads where supported. An unreadable row
+is **not** equivalent to no recorded pin.
+
+Relevant focused tests:
+
+```bash
+cargo test --locked --test pinned_workflow_atomic_start
+cargo test --locked --test pinned_workflow_runtime
+cargo test --locked --features sqlite --test pinned_workflow_atomic_start
+cargo test --locked --features sqlite --test pinned_workflow_runtime
+```
+
+**Remaining limits:** a valid-looking but maliciously edited/deleted history
+can evade simple row-decode checks if no independently authenticated history
+commitments are verified. The current transition digest does not prove that
+every expected event is still physically present. An immutable authenticated
+history/transition chain and complete trusted-history scan should precede
+production claims about tamper resistance. Bytecode-backed pinned execution
+also still requires a verified immutable module loader. Cloud artifact retention
+and deployment admission remain separate work.
 
 ## Next increment / non-goals of v1
 
