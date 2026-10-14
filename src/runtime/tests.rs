@@ -6021,7 +6021,37 @@ fn test_five_node_cluster_split_brain_detects_and_heals() {
     };
     assert!(
         delivered,
-        "remote delivery across the healed 5-node split-brain boundary failed"
+        "remote delivery across healed 5-node boundary failed: E_sees_A={:?}, A_sees_E={:?}, E_cluster_addr_for_A={:?}, A_cluster_addr_for_E={:?}, E_connection_to_A={:?}, A_connection_to_E={:?}, actor_mailbox_depth={:?}, actor_received={:?}",
+        cluster_status(&nodes[4], ids[0]),
+        cluster_status(&nodes[0], ids[4]),
+        nodes[4]
+            .distributed
+            .cluster
+            .as_ref()
+            .and_then(|cluster| cluster.get_node(ids[0]))
+            .map(|member| member.address),
+        nodes[0]
+            .distributed
+            .cluster
+            .as_ref()
+            .and_then(|cluster| cluster.get_node(ids[4]))
+            .map(|member| member.address),
+        nodes[4]
+            .distributed
+            .transport
+            .as_ref()
+            .and_then(|transport| transport.connection_addr(ids[0])),
+        nodes[0]
+            .distributed
+            .transport
+            .as_ref()
+            .and_then(|transport| transport.connection_addr(ids[4])),
+        nodes[0].actors.get(&actor_id).map(|actor| actor.mailbox.len()),
+        nodes[0]
+            .actors
+            .get(&actor_id)
+            .and_then(|actor| actor.get_state_field("received"))
+            .and_then(|value| value.as_int()),
     );
 
     shutdown_nodes(&mut nodes.iter_mut().collect::<Vec<_>>());
