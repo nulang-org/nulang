@@ -2151,6 +2151,20 @@ mod tests {
             store.preview_retention("events", 5).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
+        // A corrupted cursor beyond the local tail must not be treated as
+        // proof that discarded records were fully processed.
+        write_json_atomic(
+            &root.join("events").join("cursors.json"),
+            &CursorFile {
+                version: STREAM_FORMAT_VERSION,
+                cursors: BTreeMap::from([("worker".to_string(), 99)]),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            store.preview_retention("events", 2).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
         store
             .establish_replication_policy(
                 "events",
