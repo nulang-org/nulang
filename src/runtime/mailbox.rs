@@ -1121,4 +1121,56 @@ mod transactional_receive_tests {
         assert_eq!(mailbox.len(), 0);
         assert!(mailbox.pop().is_none());
     }
+
+    #[test]
+    fn mailbox_acknowledgment_follows_real_atomic_memory_store_commit() {
+        use crate::runtime::{
+            DurableTransition, JournalEntry, MemoryStore, PersistedValue, PersistenceStore,
+            DURABLE_TRANSITION_VERSION,
+        };
+
+        let mut mailbox = Mailbox::new(1);
+        mailbox.push_local(make_msg(7, 19)).unwrap();
+        let mut store = MemoryStore::new();
+        let transition = DurableTransition {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id: 42,
+            activation_epoch: 1,
+            sequence: 1,
+            expected_previous_sequence: 0,
+            command: Some(JournalEntry {
+                sequence: 1,
+                behavior_id: 7,
+                payload: vec![PersistedValue::Int(42)],
+            }),
+            snapshot: None,
+            workflow_events: vec![],
+            domain_events: vec![],
+            durable_effects: vec![],
+            outbox: vec![],
+        };
+
+        let failed = mailbox.admit_durable_with(|_| {
+            let mut invalid = transition.clone();
+            invalid.sequence = 2;
+            invalid.expected_previous_sequence = 1;
+            invalid.command.as_mut().unwrap().sequence = 2;
+            store.commit_transition(invalid)
+        });
+        assert!(failed.is_err());
+        assert_eq!(mailbox.len(), 1);
+        assert!(store.read_journal(42).is_empty());
+
+        let accepted = mailbox
+            .admit_durable_with(|message| {
+                assert_eq!(message.sender, 19);
+                store.commit_transition(transition)
+            })
+            .unwrap()
+            .expect("valid transaction commits before acknowledgment");
+        assert_eq!(accepted.0.sender, 19);
+        assert_eq!(accepted.1.sequence, 1);
+        assert!(mailbox.is_empty());
+        assert_eq!(store.read_journal(42).len(), 1);
+    }
 }
