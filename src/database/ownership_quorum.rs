@@ -63,6 +63,12 @@ impl FileReplica {
             }
             file.write_all(JOURNAL_MAGIC)?;
             file.sync_all()?;
+            // Creating the file is not crash-durable until its directory
+            // entry has also reached stable storage on Unix filesystems.
+            #[cfg(unix)]
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                File::open(parent)?.sync_all()?;
+            }
         }
         file.seek(SeekFrom::Start(0))?;
         let mut magic = [0_u8; 8];
@@ -186,6 +192,30 @@ impl FixedTermQuorumLog {
                 Err(_) => replicas.push(None),
             }
         }
+        // Different path spellings (or hardlinks) must not allow a single
+        // physical journal inode to contribute multiple quorum votes.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let mut inodes = BTreeSet::new();
+            for replica in replicas.iter().flatten() {
+                let metadata = replica.file.metadata()?;
+                if !inodes.insert((metadata.dev(), metadata.ino())) {
+                    return Err(QuorumLogError::DuplicateReplicaPath);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let mut canonical = BTreeSet::new();
+            for path in paths.iter().filter(|p| p.exists()) {
+                let normalized = fs::canonicalize(path)?;
+                if !canonical.insert(normalized) {
+                    return Err(QuorumLogError::DuplicateReplicaPath);
+                }
+            }
+        }
+
         let available = replicas.iter().filter(|replica| replica.is_some()).count();
         if available < quorum {
             return Err(QuorumLogError::NotEnoughReplicas {
@@ -267,13 +297,6 @@ impl FixedTermQuorumLog {
         self.authority.apply_committed(entry).map_err(QuorumLogError::CommandRejected)
     }
 
-    /// Fault-injection hook for tests; not for building a real cluster.
-    #[doc(hidden)]
-    pub fn disable_replica_for_test(&mut self, index: usize) {
-        if let Some(slot) = self.replicas.get_mut(index) {
-            *slot = None;
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -306,3 +329,58 @@ impl fmt::Display for QuorumLogError {
 }
 
 impl std::error::Error for QuorumLogError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::ownership::{NodeId, OwnershipCommand};
+    use super::super::tablet::TabletId;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn minority_durable_append_never_materializes_an_owner() {
+        let key = NEXT.fetch_add(1, Ordering::Relaxed);
+        let paths: Vec<PathBuf> = (0..3)
+            .map(|i| {
+                std::env::temp_dir().join(format!(
+                    "nudb_quorum_minority_{}_{}_{}.log",
+                    std::process::id(), key, i
+                ))
+            })
+            .collect();
+        let mut log = FixedTermQuorumLog::open(&paths, 3).unwrap();
+
+        // Shut down two voting replicas before attempting a proposal.
+        log.replicas[1] = None;
+        log.replicas[2] = None;
+        let command = OwnershipCommand::Bootstrap {
+            tablet: TabletId::new(18).unwrap(),
+            owner: NodeId::new(1).unwrap(),
+            epoch: 7,
+        };
+        assert_eq!(
+            log.propose(command),
+            Err(QuorumLogError::QuorumNotReached {
+                acknowledged: 1,
+                required: 2,
+            })
+        );
+        assert_eq!(log.authority().applied_index(), 0);
+        assert_eq!(log.propose(command), Err(QuorumLogError::RequiresReopen));
+        drop(log);
+
+        // The one fsynced minority suffix is not recovered as committed.
+        let restored = FixedTermQuorumLog::open(&paths, 3).unwrap();
+        assert_eq!(restored.authority().applied_index(), 0);
+        assert!(restored.authority().grant(TabletId::new(18).unwrap()).is_none());
+        drop(restored);
+        for path in paths {
+            let _ = fs::remove_file(&path);
+            let mut lock = path.as_os_str().to_os_string();
+            lock.push(".lock");
+            let _ = fs::remove_file(PathBuf::from(lock));
+        }
+    }
+}
