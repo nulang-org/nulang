@@ -289,6 +289,8 @@ pub struct Mailbox {
     /// means the previous candidate's guard rejected it; only this active
     /// candidate may be consumed by `commit_receive_match`.
     active_match: Option<(MatchLane, usize, Arc<Vec<Value>>)>,
+    /// Candidate awaiting persistence admission, retaining its mailbox slot.
+    pending_durable_admission: Option<Message>,
 }
 
 impl Mailbox {
@@ -308,6 +310,7 @@ impl Mailbox {
             skip_buffer: VecDeque::new(),
             receive_indexes: None,
             active_match: None,
+            pending_durable_admission: None,
         }
     }
 
@@ -324,6 +327,7 @@ impl Mailbox {
         self.skip_buffer.clear();
         self.receive_indexes = None;
         self.active_match = None;
+        self.pending_durable_admission = None;
     }
 
     /// Reserve one logical mailbox slot.
@@ -388,20 +392,52 @@ impl Mailbox {
         Ok(())
     }
 
-    /// Pop the highest-priority queued message.
-    pub fn pop(&mut self) -> Option<Message> {
-        // Staged messages predate newly-arrived messages in the same lane, so
-        // they must remain ahead of the concurrent queue after a rejected
-        // selective receive.
-        let result = self
-            .system_skip_buffer
+    /// Pop a candidate from the priority lanes without releasing its slot.
+    fn pop_uncommitted(&mut self) -> Option<Message> {
+        self.system_skip_buffer
             .pop_front()
-            .map(|(m, _)| m)
+            .map(|(message, _)| message)
             .or_else(|| self.system_queue.pop())
-            .or_else(|| self.local_skip_buffer.pop_front().map(|(m, _)| m))
+            .or_else(|| self.local_skip_buffer.pop_front().map(|(message, _)| message))
             .or_else(|| self.local_queue.pop_front())
-            .or_else(|| self.skip_buffer.pop_front().map(|(m, _)| m))
-            .or_else(|| self.normal_queue.pop());
+            .or_else(|| self.skip_buffer.pop_front().map(|(message, _)| message))
+            .or_else(|| self.normal_queue.pop())
+    }
+
+    /// Return the original message while preserving its logical capacity
+    /// reservation until persistence accepts it. Aborted retries return the
+    /// exact same message, even after newly arriving messages. This is an
+    /// in-memory primitive; it is not a persisted or crash-proof inbox.
+    pub fn begin_durable_admission(&mut self) -> Option<&Message> {
+        if self.pending_durable_admission.is_none() {
+            self.pending_durable_admission = self.pop_uncommitted();
+            if self.pending_durable_admission.is_some() {
+                self.active_match = None;
+                self.invalidate_receive_indexes();
+            }
+        }
+        self.pending_durable_admission.as_ref()
+    }
+
+    /// Abort admission without losing the message or freeing capacity.
+    pub fn abort_durable_admission(&mut self) -> bool {
+        self.pending_durable_admission.is_some()
+    }
+
+    /// Commit admission and only then release its mailbox slot.
+    pub fn commit_durable_admission(&mut self) -> Option<Message> {
+        let message = self.pending_durable_admission.take()?;
+        self.release_slot();
+        Some(message)
+    }
+
+    /// Existing nontransactional receive, preserving a prior pending candidate
+    /// ahead of newer traffic if an adapter changes dispatch strategy.
+    pub fn pop(&mut self) -> Option<Message> {
+        let result = self
+            .pending_durable_admission
+            .take()
+            .or_else(|| self.pop_uncommitted());
         if result.is_some() {
             self.active_match = None;
             self.invalidate_receive_indexes();
@@ -466,6 +502,10 @@ impl Mailbox {
     /// until `commit_receive_match` consumes the candidate whose pattern and
     /// guard actually succeeded.
     pub fn receive_match(&mut self, behavior_ids: &[u16]) -> Option<(usize, Arc<Vec<Value>>)> {
+        // A candidate awaiting persistence cannot be consumed by selective receive.
+        if self.pending_durable_admission.is_some() {
+            return None;
+        }
         // If the VM asks for another candidate before commit, the previous
         // candidate was rejected by its pattern/guard. It remains `tried` for
         // this receive expression but is no longer the commit target.
@@ -515,6 +555,9 @@ impl Mailbox {
     /// Snapshot the mailbox without changing logical ownership/counting.
     pub fn drain(&mut self) -> Vec<Message> {
         let mut snapshot = Vec::with_capacity(self.len());
+        if let Some(message) = &self.pending_durable_admission {
+            snapshot.push(message.clone());
+        }
 
         snapshot.extend(self.system_skip_buffer.iter().map(|(m, _)| m.clone()));
         let mut system_live = Vec::new();
