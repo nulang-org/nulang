@@ -940,6 +940,24 @@ impl Runtime {
         )
     }
 
+    /// Create an artifact-pinned compiled workflow from the exact NBC bytes.
+    /// Its compiler-owned schema, defaults and dispatch table are installed
+    /// before the first atomic snapshot; it is scheduled only after commit.
+    ///
+    /// No independent `CodeModule` or mutable module registry entry is
+    /// accepted as the source of executable code.
+    pub fn try_spawn_pinned_compiled_workflow(
+        &mut self,
+        execution_id: &str,
+        schema_name: &str,
+        manifest: &crate::behavior_manifest::BehaviorManifest,
+        executable: &[u8],
+    ) -> std::io::Result<u64> {
+        spawn::try_spawn_pinned_compiled_workflow(
+            self, execution_id, schema_name, manifest, executable,
+        )
+    }
+
     /// Spawn an actor for `module`'s behavior `behavior_idx`, seeded with
     /// the `init` state fields, and wire up its bytecode handlers. Shared
     /// body of both VM-callback `spawn_actor` impls: `RuntimeVmCallbacks`
