@@ -263,3 +263,91 @@ fn unverified_atomic_start_without_decodable_pin_is_not_treated_as_legacy() {
     );
     assert!(!runtime.actors.contains_key(&123));
 }
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn pinned_runtime_process_recovery_helper() {
+    use nulang::runtime::LibsqlStore;
+    let Ok(mode) = std::env::var("NULANG_PIN_RUNTIME_TEST_MODE") else {
+        return;
+    };
+    let db = std::path::PathBuf::from(
+        std::env::var_os("NULANG_PIN_RUNTIME_TEST_DB").expect("test db path"),
+    );
+    let id_path = db.with_extension("actor-id");
+    let bytes = b"runtime-process-immutable-v1";
+    let behavior = manifest(bytes);
+    let mut runtime = Runtime::new();
+    runtime.persistence = Box::new(LibsqlStore::new(&db).unwrap());
+
+    match mode.as_str() {
+        "create" => {
+            let actor_id = runtime.try_spawn_pinned_workflow_actor(
+                "Payment", "payment/process-restart", init(), workflow_state(), &behavior, bytes,
+            ).unwrap();
+            std::fs::write(id_path, actor_id.to_string()).unwrap();
+        }
+        "resume" | "changed" => {
+            let actor_id = std::fs::read_to_string(id_path)
+                .unwrap().parse::<u64>().unwrap();
+            assert_eq!(runtime.recover_actor(actor_id), None);
+            let selected = if mode == "changed" {
+                b"runtime-process-immutable-v2".as_slice()
+            } else {
+                bytes.as_slice()
+            };
+            let resolver = FixtureResolver {
+                expected_digest: behavior.artifact.digest.clone(),
+                artifact: Some(PinnedArtifactBundle {
+                    manifest: manifest(selected),
+                    executable: selected.to_vec(),
+                }),
+            };
+            let result = runtime.recover_pinned_workflow_actor(
+                actor_id, "payment/process-restart", &resolver,
+            );
+            if mode == "changed" {
+                assert_eq!(result.unwrap_err().kind(), ErrorKind::InvalidData);
+                assert!(!runtime.actors.contains_key(&actor_id));
+            } else {
+                assert_eq!(result.unwrap(), actor_id);
+                assert!(runtime.actors.contains_key(&actor_id));
+            }
+        }
+        unexpected => panic!("invalid child mode: {unexpected}"),
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn pinned_runtime_recovers_across_real_process_boundaries() {
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "nulang-runtime-pinned-process-{}-{nonce}", std::process::id()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let db = directory.join("workflow.db");
+
+    for mode in ["create", "changed", "resume"] {
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "pinned_runtime_process_recovery_helper"])
+            .env("NULANG_PIN_RUNTIME_TEST_MODE", mode)
+            .env("NULANG_PIN_RUNTIME_TEST_DB", &db)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "{mode}: stdout={} stderr={}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr),
+        );
+        assert!(
+            String::from_utf8_lossy(&child.stdout).contains("1 passed"),
+            "{mode} child did not execute: {}",
+            String::from_utf8_lossy(&child.stdout),
+        );
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}
