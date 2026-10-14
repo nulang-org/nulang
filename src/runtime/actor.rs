@@ -942,7 +942,8 @@ mod tests {
         assert!(recorder.entries.capacity() > 0);
         assert_eq!(recorder.entries()[0].sender, 7);
         assert_eq!(recorder.entries()[0].behavior_id, 3);
-        assert_eq!(recorder.entries()[0].payload_summary, "42");
+        assert_eq!(recorder.entries()[0].payload_summary, "[redacted]");
+        assert_eq!(recorder.entries()[0].kind, FlightEventKind::MessageAdmitted);
     }
 
     #[test]
@@ -951,6 +952,49 @@ mod tests {
         recorder.record(7, 3, &[Value::int(42)]);
 
         assert!(recorder.is_empty());
+        assert_eq!(recorder.entries.capacity(), 0);
+        assert_eq!(recorder.next_seq, 0);
+    }
+    #[test]
+    fn flight_recorder_keeps_bounded_typed_events_in_arrival_order() {
+        let mut recorder = FlightRecorder::new(2);
+        recorder.record(1, 3, &[Value::int(41)]);
+        recorder.record_backpressure(2, 4, &[Value::int(999)]);
+        recorder.record(3, 5, &[]);
+
+        let events = recorder.ordered_entries();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].seq, 1);
+        assert_eq!(events[0].kind, FlightEventKind::MailboxBackpressure);
+        assert_eq!(events[0].payload_summary, "[redacted]");
+        assert_eq!(events[1].seq, 2);
+        assert_eq!(events[1].kind, FlightEventKind::MessageAdmitted);
+        assert_eq!(events[1].payload_len, 0);
+        assert_eq!(events[1].payload_summary, "");
+    }
+
+    #[test]
+    fn runtime_reports_local_mailbox_backpressure_without_payload_values() {
+        let mut runtime = Runtime::new();
+        let actor_id = runtime.spawn_actor(Box::new(Vec::new));
+        runtime.actors.get_mut(&actor_id).unwrap().mailbox.reset(1);
+
+        runtime.send_message_by_id(actor_id, 0, &[Value::int(424242)]);
+        runtime.send_message_by_id(actor_id, 0, &[Value::int(999999)]);
+
+        let actor = runtime.actors.get(&actor_id).unwrap();
+        let events = actor.flight_recorder.ordered_entries();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, FlightEventKind::MessageAdmitted);
+        assert_eq!(events[1].kind, FlightEventKind::MailboxBackpressure);
+        assert_eq!(events[1].payload_summary, "[redacted]");
+        assert_eq!(events[1].payload_len, 1);
+    }
+
+    #[test]
+    fn disabled_recorder_ignores_backpressure_without_allocation() {
+        let mut recorder = FlightRecorder::new(0);
+        recorder.record_backpressure(1, 2, &[Value::int(12)]);
         assert_eq!(recorder.entries.capacity(), 0);
         assert_eq!(recorder.next_seq, 0);
     }
