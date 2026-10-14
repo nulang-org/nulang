@@ -131,7 +131,10 @@ fn assert_matches_reference(
     // lost versions, replayed transactions and delete/reinsert mistakes.
     for key in KEYS {
         for sequence in 0..=reference.sequence {
-            let actual = tablet.read_at(&[key], sequence).unwrap().map(|value| value.to_vec());
+            let actual = tablet
+                .read_at(&[key], sequence)
+                .unwrap()
+                .map(|value| value.to_vec());
             let expected = reference.read_at(&[key], sequence);
             assert_eq!(
                 actual,
