@@ -1265,9 +1265,6 @@ fn emit_stdlib_docs(dir: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Run a distributed Nulang node: parse arguments, create a Runtime,
-/// enable distribution, join a seed cluster if requested, and run forever.
-#[cfg(feature = "tcp")]
 /// Require an explicit, local-only plaintext opt-in; never infer plaintext
 /// from missing TLS files. The caller must still validate and load each file.
 #[cfg(feature = "tcp")]
@@ -1293,6 +1290,9 @@ fn validate_node_security_mode(
     Ok(())
 }
 
+/// Run a distributed Nulang node: parse arguments, create a Runtime,
+/// enable distribution, join a seed cluster if requested, and run forever.
+#[cfg(feature = "tcp")]
 fn run_node_cmd(args: &[String]) -> NuResult<()> {
     let mut listen_addr = "127.0.0.1:9000".to_string();
     let mut seed_addr: Option<String> = None;
@@ -1369,7 +1369,7 @@ fn run_node_cmd(args: &[String]) -> NuResult<()> {
                 println!("  --tls-cert <PATH>     Server certificate (PEM)");
                 println!("  --tls-key <PATH>      Server private key (PEM)");
                 println!("  --tls-ca <PATH>       CA certificate for mutual TLS");
-                println!("  --plaintext           Disable TLS (insecure, dev only)");
+                println!("  --plaintext           Disable TLS (loopback-only development)");
                 println!("  -h, --help            Show this help message");
                 return Ok(());
             }
