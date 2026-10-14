@@ -121,7 +121,10 @@ pub use network::*;
 pub use object_store::*;
 pub use orca_cycle::*;
 pub use persistence::*;
-pub use pinned_execution::{commit_pinned_workflow_start, verify_pinned_workflow_resume};
+pub use pinned_execution::{
+    commit_pinned_workflow_start, read_pinned_workflow_pin,
+    verify_pinned_workflow_resume, ImmutablePinnedArtifactResolver, PinnedArtifactBundle,
+};
 pub use process_groups::*;
 pub use registry::*;
 pub use resp_cache::*;
@@ -918,6 +921,23 @@ impl Runtime {
         state_models: HashMap<String, StateModel>,
     ) -> std::io::Result<u64> {
         spawn::try_spawn_actor_with_models(self, init, state_models, true, Some(name), None)
+    }
+
+    /// Create an explicitly artifact-pinned native workflow. The initial
+    /// snapshot, start event, and pin commit atomically before the actor is
+    /// scheduled. Legacy creation remains available for unpinned workflows.
+    pub fn try_spawn_pinned_workflow_actor(
+        &mut self,
+        name: &str,
+        execution_id: &str,
+        init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
+        state_models: HashMap<String, StateModel>,
+        manifest: &crate::behavior_manifest::BehaviorManifest,
+        executable: &[u8],
+    ) -> std::io::Result<u64> {
+        spawn::try_spawn_pinned_workflow_actor(
+            self, name, execution_id, init, state_models, manifest, executable,
+        )
     }
 
     /// Spawn an actor for `module`'s behavior `behavior_idx`, seeded with
@@ -5470,6 +5490,71 @@ impl Runtime {
     /// instead of the message journal, restoring the current step index and
     /// any other state captured in workflow events.
     pub fn recover_actor(&mut self, actor_id: u64) -> Option<u64> {
+        // A decoded immutable pin is an explicit opt-in to strict recovery.
+        // Never let the legacy loader bypass artifact identity verification.
+        if pinned_execution::has_execution_pin_marker(self.persistence.as_ref(), actor_id) {
+            warn!(
+                "nulang-recover: refusing unverified pinned workflow actor {}; use recover_pinned_workflow_actor",
+                actor_id
+            );
+            return None;
+        }
+        self.recover_actor_inner(actor_id)
+    }
+
+    /// Resolve the originally pinned immutable executable, check the complete
+    /// sidecar and stored identity, then hydrate and schedule the workflow.
+    ///
+    /// Bytecode-backed workflows additionally need a verified module loader,
+    /// so this initial native-workflow API rejects separately registered
+    /// recovery modules rather than trusting mutable in-memory code.
+    pub fn recover_pinned_workflow_actor(
+        &mut self,
+        actor_id: u64,
+        execution_id: &str,
+        resolver: &dyn ImmutablePinnedArtifactResolver,
+    ) -> std::io::Result<u64> {
+        use std::io::{Error, ErrorKind};
+        if self.actors.contains_key(&actor_id) {
+            return Err(Error::new(
+                ErrorKind::AlreadyExists,
+                "actor is already resident; cannot recover a second activation",
+            ));
+        }
+        let pin = pinned_execution::read_pinned_workflow_pin(
+            self.persistence.as_ref(), actor_id,
+        )?;
+        if pin.execution_id() != execution_id {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "requested execution ID does not match its durable artifact pin",
+            ));
+        }
+        if self.recovery_modules.contains_key(&actor_id) {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "module-backed pinned recovery requires a verified immutable bytecode loader",
+            ));
+        }
+        let artifact = resolver
+            .resolve(pin.executable_digest())?
+            .ok_or_else(|| Error::new(
+                ErrorKind::NotFound, "pinned immutable executable is unavailable",
+            ))?;
+        pinned_execution::verify_pinned_workflow_resume(
+            self.persistence.as_ref(),
+            actor_id,
+            execution_id,
+            &artifact.manifest,
+            &artifact.executable,
+        )?;
+        self.recover_actor_inner(actor_id).ok_or_else(|| Error::new(
+            ErrorKind::InvalidData,
+            "verified pinned workflow could not be hydrated from durable state",
+        ))
+    }
+
+    fn recover_actor_inner(&mut self, actor_id: u64) -> Option<u64> {
         let snapshot = self.persistence.load_snapshot(actor_id)?;
         if snapshot.activation_epoch == 0 {
             warn!(
