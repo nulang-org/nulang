@@ -1319,7 +1319,11 @@ impl Runtime {
         let Some(suspended) = suspended else { return };
 
         if self.vm.is_none() {
+            // A missing VM cannot make progress. Park rather than repeatedly
+            // requeueing this actor and spinning an entire scheduler shard.
+            warn!(actor_id, "cooperative continuation has no runtime VM");
             if let Some(actor) = self.actors.get_mut(&actor_id) {
+                actor.jit_yield_pending = false;
                 actor.suspended_execution = Some(suspended);
             }
             return;
@@ -1340,8 +1344,9 @@ impl Runtime {
             let instruction_budget = (*self_ptr)
                 .actors
                 .get(&actor_id)
-                .and_then(|actor| (!actor.persistent && !actor.is_workflow)
-                    .then_some(actor.max_reductions));
+                .and_then(|actor| {
+                    (!actor.persistent && !actor.is_workflow).then_some(actor.max_reductions)
+                });
             vm.set_cooperative_instruction_budget(instruction_budget);
             // JIT regions have their own safe-point budget in addition to
             // the interpreter's per-dispatch quantum.
@@ -5297,8 +5302,9 @@ impl Runtime {
             let instruction_budget = (*self_ptr)
                 .actors
                 .get(&actor_id)
-                .and_then(|actor| (!actor.persistent && !actor.is_workflow)
-                    .then_some(actor.max_reductions));
+                .and_then(|actor| {
+                    (!actor.persistent && !actor.is_workflow).then_some(actor.max_reductions)
+                });
             vm.set_cooperative_instruction_budget(instruction_budget);
             let result = vm.run_from(module_idx, code_offset);
             vm.set_cooperative_instruction_budget(None);
@@ -5306,22 +5312,21 @@ impl Runtime {
             // Cooperative yield: capture the continuation before another
             // actor can use the shared VM.
             if vm.yield_pending {
-                    if let Some(vm_state) = vm.take_suspended_state() {
-                        if let Some(actor) = self.actors.get_mut(&actor_id) {
-                            actor.suspended_execution =
-                                Some(crate::runtime::actor::SuspendedExecution {
-                                    vm_state,
-                                    behavior_idx: 0,
-                                    activation: actor.current_workflow_activation,
-                                    step_name: String::new(),
-                                });
-                            actor.jit_yield_pending = true;
-                        }
+                if let Some(vm_state) = vm.take_suspended_state() {
+                    if let Some(actor) = self.actors.get_mut(&actor_id) {
+                        actor.suspended_execution = Some(crate::runtime::actor::SuspendedExecution {
+                            vm_state,
+                            behavior_idx: 0,
+                            activation: actor.current_workflow_activation,
+                            step_name: String::new(),
+                        });
+                        actor.jit_yield_pending = true;
                     }
-                    #[cfg(feature = "native-codegen")]
-                    crate::jit::runtime::clear_jit_safepoint_ptr();
-                    (*self_ptr).vm_exec_end();
-                    return Ok(Value::nil());
+                }
+                #[cfg(feature = "native-codegen")]
+                crate::jit::runtime::clear_jit_safepoint_ptr();
+                (*self_ptr).vm_exec_end();
+                return Ok(Value::nil());
             }
             // Capture VM state for a workflow signal wait, a non-blocking
             // LLM call, or a timed selective receive. Doing this here avoids
