@@ -2366,7 +2366,14 @@ fn nu_error_to_diagnostic(err: NuError) -> Vec<Diagnostic> {
 
 /// Build a single LSP Diagnostic from a non-Multiple NuError.
 fn single_diagnostic(err: NuError) -> Diagnostic {
-    let (message, start_line, start_col, end_line, end_col) = match err {
+    // Preserve the same structured compiler facts exposed by the CLI and
+    // --json output. Compute them before destructuring the owned error.
+    let code = err
+        .stable_code()
+        .map(|code| NumberOrString::String(code.to_string()));
+    let notes = crate::diagnostic::diagnostic_notes(&err);
+    let help = err.suggestion().map(|suggestion| suggestion.to_string());
+    let (mut message, start_line, start_col, end_line, end_col) = match err {
         NuError::LexError { msg, span }
         | NuError::ParseError { msg, span, .. }
         | NuError::TypeError { msg, span, .. }
@@ -2394,6 +2401,17 @@ fn single_diagnostic(err: NuError) -> Diagnostic {
         NuError::Multiple(_) => unreachable!("Multiple handled by caller"),
     };
 
+    // Keep the headline intact and append detailed notes and actionable
+    // help. These details otherwise disappear in standard LSP diagnostics.
+    for note in notes {
+        message.push('\n');
+        message.push_str(&note);
+    }
+    if let Some(help) = help {
+        message.push_str("\nhelp: ");
+        message.push_str(&help);
+    }
+
     let start = Position::new(
         start_line.saturating_sub(1) as u32,
         start_col.saturating_sub(1) as u32,
@@ -2406,7 +2424,7 @@ fn single_diagnostic(err: NuError) -> Diagnostic {
     Diagnostic {
         range: Range::new(start, end),
         severity: Some(DiagnosticSeverity::ERROR),
-        code: None,
+        code,
         code_description: None,
         source: Some("nulang".to_string()),
         message,
