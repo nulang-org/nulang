@@ -164,9 +164,9 @@ pub fn python_to_nulang(obj: &pyo3::Bound<'_, pyo3::PyAny>) -> Result<Value, Str
 
     // Check for int
     if let Ok(i) = obj.cast::<PyInt>() {
-        let val: i64 = i.extract().map_err(|e| format!(
-            "Python integer cannot be represented as signed 64-bit value: {e}"
-        ))?;
+        let val: i64 = i.extract().map_err(|e| {
+            format!("Python integer cannot be represented as signed 64-bit value: {e}")
+        })?;
         return vm_int_checked(val);
     }
 
@@ -337,9 +337,9 @@ pub fn python_object_id_to_owned_foreign(
             return Ok(OwnedForeignValue::Bool(value));
         }
         if let Ok(value) = obj.cast::<PyInt>() {
-            let value = value.extract::<i64>().map_err(|e| format!(
-                "Python integer cannot be represented as signed 64-bit value: {e}"
-            ))?;
+            let value = value.extract::<i64>().map_err(|e| {
+                format!("Python integer cannot be represented as signed 64-bit value: {e}")
+            })?;
             return Ok(OwnedForeignValue::Int(value));
         }
         if let Ok(value) = obj.cast::<PyFloat>() {
@@ -428,9 +428,8 @@ mod tests {
         let error = vm_int_checked(1_i64 << 47).unwrap_err();
         assert!(error.contains("48-bit"), "{error}");
         assert!(vm_int_checked(-(1_i64 << 47) - 1).is_err());
-        let error = owned_foreign_to_vm_value(
-            &crate::runtime::OwnedForeignValue::Int(i64::MAX),
-        ).unwrap_err();
+        let error = owned_foreign_to_vm_value(&crate::runtime::OwnedForeignValue::Int(i64::MAX))
+            .unwrap_err();
         assert!(error.contains("48-bit"), "{error}");
     }
 
@@ -438,7 +437,9 @@ mod tests {
     fn test_python_integer_conversion_rejects_unbounded_bigints() {
         let value = Python::attach(|py| {
             let builtins = py.import("builtins").unwrap();
-            let large = builtins.call_method1("int", ("999999999999999999999999999999",)).unwrap();
+            let large = builtins
+                .call_method1("int", ("999999999999999999999999999999",))
+                .unwrap();
             python_to_nulang(&large)
         });
         assert!(value.unwrap_err().contains("64-bit"));
