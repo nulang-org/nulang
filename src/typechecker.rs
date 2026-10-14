@@ -5055,6 +5055,79 @@ mod tests {
     }
 
     #[test]
+    fn test_match_closed_variant_accepts_irrefutable_tuple_payload() {
+        let ctx = ctx_with(
+            "tree",
+            Type::Variant(vec![
+                ("Leaf".to_string(), None),
+                (
+                    "Node".to_string(),
+                    Some(Type::Tuple(vec![Type::int(), Type::int()])),
+                ),
+            ]),
+        );
+        let mut tc = TypeChecker::new();
+        let expr = Expr::Match {
+            scrutinee: Box::new(var("tree")),
+            arms: vec![
+                (Pattern::Variant("Leaf".to_string(), None), None, int_lit(0)),
+                (
+                    Pattern::Variant(
+                        "Node".to_string(),
+                        Some(Box::new(Pattern::Tuple(vec![
+                            Pattern::Var("a".to_string()),
+                            Pattern::Var("b".to_string()),
+                        ]))),
+                    ),
+                    None,
+                    var("a"),
+                ),
+            ],
+            span: sp(),
+        };
+
+        let (subst, ty) = tc.infer_expr(&ctx, &expr).unwrap();
+        assert_eq!(apply_subst(&ty, &subst), Type::int());
+    }
+
+    #[test]
+    fn test_match_closed_variant_rejects_refutable_tuple_payload() {
+        let ctx = ctx_with(
+            "tree",
+            Type::Variant(vec![
+                ("Leaf".to_string(), None),
+                (
+                    "Node".to_string(),
+                    Some(Type::Tuple(vec![Type::int(), Type::int()])),
+                ),
+            ]),
+        );
+        let mut tc = TypeChecker::new();
+        let expr = Expr::Match {
+            scrutinee: Box::new(var("tree")),
+            arms: vec![
+                (Pattern::Variant("Leaf".to_string(), None), None, int_lit(0)),
+                (
+                    Pattern::Variant(
+                        "Node".to_string(),
+                        Some(Box::new(Pattern::Tuple(vec![
+                            Pattern::Lit(Literal::Int(1)),
+                            Pattern::Wild,
+                        ]))),
+                    ),
+                    None,
+                    int_lit(1),
+                ),
+            ],
+            span: sp(),
+        };
+
+        let err = tc.infer_expr(&ctx, &expr).unwrap_err();
+        assert!(format!("{err}").contains("non-exhaustive match"));
+        assert!(format!("{err}").contains("Node"));
+    }
+
+    #[test]
     fn test_match_closed_variant_accepts_unguarded_constructors() {
         let choice_type = Type::Variant(vec![
             ("Some".to_string(), Some(Type::int())),
