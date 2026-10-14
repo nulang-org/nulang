@@ -52,15 +52,6 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.DOCS_SYNC_TOKEN || github.token }}
 
-      - name: Require a PR-capable automation token
-        env:
-          GH_TOKEN: ${{ secrets.DOCS_SYNC_TOKEN }}
-        run: |
-          if [ -z "$GH_TOKEN" ]; then
-            echo "::error::Set DOCS_SYNC_TOKEN to a PAT or GitHub App token with contents and pull-request write permissions. GITHUB_TOKEN-created PRs do not trigger required pull_request checks."
-            exit 1
-          fi
-
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
@@ -71,7 +62,9 @@ jobs:
 
       - name: Refresh and propose README roadmap
         env:
-          GH_TOKEN: ${{ secrets.DOCS_SYNC_TOKEN }}
+          # GITHUB_TOKEN-created PR checks require maintainer approval; a PAT/App token
+          # avoids that gate, matching the existing docs-sync workflow.
+          GH_TOKEN: ${{ secrets.DOCS_SYNC_TOKEN || github.token }}
         shell: bash
         run: |
           set -euo pipefail
