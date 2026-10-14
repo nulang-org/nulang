@@ -90,20 +90,14 @@ pub fn nulang_to_python(value: Value) -> Result<Py<PyAny>, String> {
 
     let tag = value.as_raw() & TAG_MASK;
     if tag == TAG_STRING {
-        // TAG_STRING → Python str
-        // Nulang strings are interned; the payload is a u32 string pool ID.
-        // Since we don't have the string pool here, we represent it as a
-        // descriptive string. A future optimization will resolve the ID
-        // through the string interner.
-        let string_id = (value.as_raw() & 0x0000_FFFF_FFFF_FFFF) as u32;
-        let repr = format!("<nulang_string:{}>", string_id);
-        Python::attach(|py| -> Result<Py<PyAny>, String> {
-            Ok(repr
-                .into_pyobject(py)
-                .map_err(|e| e.to_string())?
-                .unbind()
-                .into_any())
-        })
+        // A Value stores a string-pool ID, not the string contents. This API
+        // has no module/VM pool; fabricating a placeholder would silently send
+        // incorrect data to Python. Use the owned foreign-call boundary, which
+        // resolves strings before they leave their source module.
+        let string_id = value.as_string_id().expect("TAG_STRING contains string ID");
+        Err(format!(
+            "Nulang string pool entry {string_id} cannot be marshalled without its source module; use the owned foreign-call boundary"
+        ))
     } else if tag == TAG_PYTHON {
         // TAG_PYTHON → look up in registry and return the Py<PyAny>
         let obj_id = (value.as_raw() & 0x0000_FFFF_FFFF_FFFF) as u64;
