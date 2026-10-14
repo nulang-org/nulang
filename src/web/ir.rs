@@ -319,6 +319,72 @@ mod tests {
     use super::*;
 
     #[test]
+    fn deployment_ir_and_runtime_use_the_same_validated_contract() {
+        // The source root intentionally has no Nulang files. Deployment
+        // metadata must come from the validated compilation, not a reparse.
+        let missing_source = std::env::temp_dir().join(format!(
+            "nulang_web_ir_missing_sources_{}",
+            std::process::id()
+        ));
+        let contract = RouteContract {
+            method: "GET".into(),
+            path: "/users/{id: Int}".into(),
+            handler: Some("show_user".into()),
+            params: vec![RouteParamContract {
+                name: "id".into(),
+                ty: Some("Int".into()),
+            }],
+            handler_params: vec![HandlerParamContract {
+                name: "id".into(),
+                ty: Some("Int".into()),
+                capability: None,
+                request: None,
+            }],
+            response_type: Some("Html".into()),
+            placement: Some("server".into()),
+            ..RouteContract::default()
+        };
+        let validated = crate::web::validation::validate_compilation(
+            crate::web::contracts::ContractCompilation {
+                routes: vec![contract],
+                diagnostics: Vec::new(),
+            },
+        )
+        .expect("fixture must be a valid compiler-owned contract");
+        let route = WebRoute {
+            method: crate::runtime::HttpMethod::Get,
+            path: "/users/{id: Int}".into(),
+            handler_module: crate::bytecode::CodeModule::new("ir-test"),
+            handler_func_idx: 0,
+        };
+        let attached = crate::web::dispatch::compile_runtime_routes_from_contracts(
+            vec![route.clone()],
+            &validated,
+        )
+        .expect("runtime should accept the validated contract");
+
+        let ir = generate_deployment_ir(
+            &[route],
+            None,
+            &missing_source,
+            &BudgetsSection::default(),
+            &validated,
+        );
+
+        assert_eq!(ir.routes.len(), 1);
+        assert_eq!(ir.routes[0].handler.as_deref(), Some("show_user"));
+        assert_eq!(ir.routes[0].response_type.as_deref(), Some("Html"));
+        assert_eq!(ir.routes[0].placement, "server");
+        assert_eq!(
+            ir.routes[0].bindings,
+            attached[0].plan.as_ref().unwrap().bindings
+        );
+        assert_eq!(ir.routes[0].bindings.len(), 1);
+        assert_eq!(ir.routes[0].bindings[0].handler_index, 0);
+        assert_eq!(ir.routes[0].bindings[0].ty.as_deref(), Some("Int"));
+    }
+
+    #[test]
     fn test_route_path_to_artifact() {
         assert_eq!(route_path_to_artifact("/"), "index.html");
         assert_eq!(route_path_to_artifact("/about"), "about/index.html");
