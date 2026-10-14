@@ -13,6 +13,73 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 #[test]
+fn bytecode_actor_preempts_and_completes_without_a_followup_message() {
+    use crate::bytecode::{BehaviorTableEntry, Instruction, OpCode};
+
+    let mut module = CodeModule::new("preemption");
+    let field_idx = module.add_constant(Constant::String("done".to_string()));
+    let one_idx = module.add_constant(Constant::Int(1));
+    module.add_behavior(BehaviorTableEntry {
+        name: "Busy.run".to_string(),
+        param_count: 0,
+        code_offset: 0,
+        local_count: 4,
+        effect_mask: 0,
+        compensate_offset: None,
+        content_hash: None,
+        source_location: None,
+        parallel_branches: None,
+    });
+    for _ in 0..24 {
+        module.emit(Instruction::new0(OpCode::Nop));
+    }
+    module.emit(Instruction::new3(
+        OpCode::ConstU,
+        ((one_idx >> 8) & 0xFF) as u8,
+        (one_idx & 0xFF) as u8,
+        1,
+    ));
+    module.emit(Instruction::new3(OpCode::StateSet, 0, 0, 1));
+    module.emit(Instruction::new1(OpCode::RetVal, 1));
+
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![("done".to_string(), Value::int(0))]));
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.max_reductions = 4;
+        actor.bytecode_module = Some(Box::new(module.clone()));
+        actor.bytecode_offsets = vec![0];
+        actor.compensation_offsets = vec![None];
+    }
+    rt.register_recovery_module(actor_id, module, vec![0], vec![None]);
+    rt.send_message_by_id(actor_id, 0, &[]);
+
+    assert_eq!(rt.claim_next_ready_actor(), Some(actor_id));
+    rt.step_actor(actor_id);
+    let actor = &rt.actors[&actor_id];
+    assert!(actor.jit_yield_pending, "interpreter should pause the behavior");
+    assert!(actor.mailbox.is_empty(), "original message was consumed");
+    assert_eq!(actor.get_state_field("done"), Some(Value::int(0)));
+    rt.finish_actor_turn(actor_id);
+
+    let mut continuations = 0;
+    while rt.actors[&actor_id].jit_yield_pending && continuations < 16 {
+        assert_eq!(
+            rt.claim_next_ready_actor(),
+            Some(actor_id),
+            "the continuation must be runnable without any new message"
+        );
+        rt.step_actor(actor_id);
+        rt.finish_actor_turn(actor_id);
+        continuations += 1;
+    }
+    assert!(continuations >= 2, "multiple quantum boundaries should be exercised");
+    assert!(!rt.actors[&actor_id].jit_yield_pending, "behavior should complete");
+    assert_eq!(rt.actors[&actor_id].get_state_field("done"), Some(Value::int(1)));
+    assert_eq!(rt.claim_next_ready_actor(), None, "no duplicate ready token");
+}
+
+#[test]
 fn cooperative_yield_is_requeued_even_without_mail() {
     let mut rt = Runtime::new();
     let actor_id = 42_000_001;
