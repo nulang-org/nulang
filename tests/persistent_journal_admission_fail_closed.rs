@@ -175,7 +175,9 @@ fn synchronous_native_ask_returns_admission_failure_without_executing_handler() 
         .ask_actor_sync(actor_id, 0, &[])
         .expect_err("durable journal failure must propagate to synchronous caller");
 
-    assert!(error.to_string().contains("durable journal admission failed"));
+    assert!(error
+        .to_string()
+        .contains("durable journal admission failed"));
     assert_eq!(
         runtime.actors[&actor_id]
             .get_state_field("count")
