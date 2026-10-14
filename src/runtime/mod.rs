@@ -13,6 +13,7 @@ use tracing::warn;
 mod actor;
 mod behavior_ownership;
 mod blocking_executor;
+mod cancellation;
 pub mod cache;
 pub mod cache_cluster;
 pub mod cache_dispatch;
@@ -94,6 +95,7 @@ mod tests;
 
 pub use actor::*;
 pub use blocking_executor::*;
+pub use cancellation::{CancellationReason, CancellationToken};
 pub use cache::*;
 pub use cache_cluster::*;
 pub use cache_dispatch::*;
