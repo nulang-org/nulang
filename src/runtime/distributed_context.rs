@@ -1142,6 +1142,45 @@ mod tests {
     }
 
     #[test]
+    fn fabric_group_placement_uses_live_mailbox_depth_across_publishes() {
+        let mut rt = Runtime::new();
+        // Unsubscribed actors must not affect which worker gets a job.
+        for id in 200..300 {
+            let actor = Actor::new(id, "unsubscribed", 1);
+            rt.actors.insert(id, actor);
+        }
+
+        for id in [120, 122] {
+            let mut worker = Actor::new(id, "worker", 1);
+            worker.state = ActorState::Running;
+            worker.register_behavior("work", noop);
+            rt.actors.insert(id, worker);
+            rt.fabric_subscribe_group("jobs.*", "workers", id, "work")
+                .unwrap();
+        }
+
+        let first = rt
+            .fabric_publish_report("jobs.run", &[Value::int(1)])
+            .unwrap();
+        assert_eq!(first.admitted, 1);
+        assert_eq!(rt.actors.get(&120).unwrap().mailbox.len(), 1);
+        assert_eq!(rt.actors.get(&122).unwrap().mailbox.len(), 0);
+
+        let second = rt
+            .fabric_publish_report("jobs.run", &[Value::int(2)])
+            .unwrap();
+        assert_eq!(second.admitted, 1);
+        assert_eq!(rt.actors.get(&122).unwrap().mailbox.len(), 1);
+
+        // Once both bounded mailboxes are full, no worker is eligible.
+        let saturated = rt
+            .fabric_publish_report("jobs.run", &[Value::int(3)])
+            .unwrap();
+        assert_eq!(saturated.selected, 0);
+        assert_eq!(saturated.admitted, 0);
+    }
+
+    #[test]
     fn fabric_publish_report_exposes_bounded_mailbox_backpressure() {
         let mut rt = Runtime::new();
         let actor_id = 9000_u64;
