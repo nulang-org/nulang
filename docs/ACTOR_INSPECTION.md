@@ -40,8 +40,11 @@ do not concurrently access/mutate `Runtime` outside its ownership model.
   can investigate recovery fencing. A snapshot is never proof of cluster-wide
   exclusive ownership.
 
-Snapshots deliberately **exclude** user state, message bodies, pending tool
-arguments, authority manifests, secrets and flight recorder contents.
+Snapshots deliberately **exclude** user state values, message bodies, pending
+arguments, authority manifests, and flight recorder contents. However, **actor
+names are caller-assigned strings** and might themselves contain sensitive
+identifiers; this local API does not redact actor names. Do not forward raw
+snapshots to untrusted consumers.
 Adding a remotely accessible inspection endpoint requires authentication,
 tenant/capability authorization, rate limits, and redaction. No such endpoint
 is introduced here.
