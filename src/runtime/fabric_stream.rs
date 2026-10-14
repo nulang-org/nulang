@@ -2346,6 +2346,37 @@ mod tests {
     }
 
     #[test]
+    fn physical_retention_requires_exclusive_store_root_ownership() {
+        let root = test_dir("retention-single-writer");
+        let mut first = FileFabricStreamStore::open(&root).unwrap();
+        first
+            .create_stream(
+                "events",
+                FabricStreamConfig {
+                    segment_max_bytes: 96,
+                },
+            )
+            .unwrap();
+        for _ in 0..3 {
+            first.append("events", &[1; 48]).unwrap();
+        }
+        first.commit_cursor("events", "worker", 2).unwrap();
+
+        // A second runtime must not be able to append while the first one
+        // is preparing or applying a physical segment trim.
+        let concurrent = FileFabricStreamStore::open(&root).unwrap_err();
+        assert_eq!(concurrent.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(first.apply_retention("events", 3).unwrap().eligible_segment_count, 2);
+        drop(first);
+
+        let mut restarted = FileFabricStreamStore::open(&root).unwrap();
+        assert_eq!(restarted.read_from("events", 3, 10).unwrap().len(), 1);
+        assert_eq!(restarted.append("events", b"after-trim").unwrap(), 4);
+        drop(restarted);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn retention_preserves_legacy_zero_start_on_untrimmed_streams() {
         let root = test_dir("retention-zero-start");
         let mut store = FileFabricStreamStore::open(&root).unwrap();
