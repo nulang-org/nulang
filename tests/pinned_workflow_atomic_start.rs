@@ -9,7 +9,7 @@ use nulang::behavior_manifest::{
 use nulang::content_identity::SemanticId;
 use nulang::runtime::{
     commit_pinned_workflow_start, verify_pinned_workflow_resume, ActorSnapshot,
-    MemoryStore, PersistenceStore, WorkflowEvent,
+    DurableTransition, MemoryStore, PersistenceStore, WorkflowEvent, DURABLE_TRANSITION_VERSION,
 };
 use std::io::ErrorKind;
 
@@ -246,4 +246,69 @@ fn pinned_workflow_real_process_restart_verifies_exact_artifact() {
         );
     }
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn atomic_history_without_execution_pin_cannot_be_resumed_as_pinned() {
+    let mut store = MemoryStore::new();
+    store.commit_transition(DurableTransition {
+        version: DURABLE_TRANSITION_VERSION,
+        actor_id: 54,
+        activation_epoch: 1,
+        sequence: 1,
+        expected_previous_sequence: 0,
+        command: None,
+        snapshot: Some(snapshot(54)),
+        workflow_events: vec![WorkflowEvent::WorkflowStarted {
+            sequence: 1,
+            name: "Order".into(),
+            state: vec![],
+        }],
+        domain_events: vec![],
+        durable_effects: vec![],
+        outbox: vec![],
+    }).unwrap();
+    let bytes = b"workflow-v1";
+    assert_eq!(
+        verify_pinned_workflow_resume(&store, 54, "payments/54", &manifest(bytes), bytes)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidData,
+    );
+}
+
+#[test]
+fn appended_fake_execution_pin_is_rejected_on_recovery() {
+    let mut store = MemoryStore::new();
+    let bytes = b"workflow-v1";
+    commit_pinned_workflow_start(
+        &mut store, 55, "payments/55", "Order", &manifest(bytes), bytes,
+        snapshot(55), vec![],
+    ).unwrap();
+
+    store.commit_transition(DurableTransition {
+        version: DURABLE_TRANSITION_VERSION,
+        actor_id: 55,
+        activation_epoch: 1,
+        sequence: 2,
+        expected_previous_sequence: 1,
+        command: None,
+        snapshot: None,
+        workflow_events: vec![WorkflowEvent::Custom {
+            sequence: 2,
+            replay_id: None,
+            name: "__nulang.execution_pin/v1".into(),
+            args: vec![],
+        }],
+        domain_events: vec![],
+        durable_effects: vec![],
+        outbox: vec![],
+    }).unwrap();
+
+    assert_eq!(
+        verify_pinned_workflow_resume(&store, 55, "payments/55", &manifest(bytes), bytes)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidData,
+    );
 }
