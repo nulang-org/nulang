@@ -1198,18 +1198,18 @@ impl Runtime {
 
         // Persistence and mailbox are disjoint fields. Do not release the
         // reserved slot or return the message on storage errors.
-        let persistence = &mut self.persistence;
-        let mailbox = &mut self
-            .actors
-            .get_mut(&actor_id)
-            .expect("actor remains present during exclusive runtime access")
-            .mailbox;
         let expected_schema = self
             .actors
             .get(&actor_id)
             .expect("actor validated before admission")
             .name
             .clone();
+        let persistence = &mut self.persistence;
+        let mailbox = &mut self
+            .actors
+            .get_mut(&actor_id)
+            .expect("actor remains present during exclusive runtime access")
+            .mailbox;
         let committed = mailbox.admit_durable_with(|_| match request {
             Some(request) => {
                 let outcome =
