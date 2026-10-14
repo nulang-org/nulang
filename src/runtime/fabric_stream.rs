@@ -533,7 +533,7 @@ impl FileFabricStreamStore {
             if !valid_next {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "Fabric producer sequence must advance by one or restart at one in a newer epoch",
+                    "Fabric producer sequence must advance by one or restart in a newer epoch",
                 ));
             }
         } else {
@@ -2240,7 +2240,12 @@ mod tests {
         assert!(reopened.append_idempotent("events", "writer", 1, 2, b"changed").is_err());
         assert!(reopened.append_idempotent("events", "writer", 1, 1, b"one").is_err());
         assert!(reopened.append_idempotent("events", "writer", 1, 4, b"gap").is_err());
-        assert_eq!(reopened.append_idempotent("events", "writer", 2, 1, b"new-term").unwrap(), 3);
+        assert_eq!(
+            reopened
+                .append_idempotent("events", "writer", 2, 1, b"new-term")
+                .unwrap(),
+            3
+        );
         assert!(reopened.append_idempotent("events", "writer", 1, 3, b"old-term").is_err());
         assert_eq!(reopened.read_from("events", 1, 10).unwrap().len(), 3);
         let _ = fs::remove_dir_all(root);
@@ -2288,6 +2293,42 @@ mod tests {
             assert_eq!(reopened.append("events", b"next").unwrap(), 2);
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn producer_pending_record_conflict_never_reassigns_sequence() {
+        let root = test_dir("producer-payload-corruption");
+        {
+            let mut store = FileFabricStreamStore::open(&root).unwrap();
+            store
+                .create_stream("events", FabricStreamConfig::default())
+                .unwrap();
+            write_json_atomic(
+                &root.join("events").join("producer_state.json"),
+                &ProducerStateFile {
+                    version: STREAM_FORMAT_VERSION,
+                    checkpoints: BTreeMap::new(),
+                    pending: Some(ProducerIntent {
+                        producer: "writer".to_string(),
+                        epoch: 1,
+                        producer_sequence: 1,
+                        stream_sequence: 1,
+                        digest: producer_digest(b"intended"),
+                    }),
+                },
+            )
+            .unwrap();
+            // Deliberately simulate a conflicting record after an intent fsync.
+            store.append_exact("events", 1, b"unexpected").unwrap();
+        }
+        let mut reopened = FileFabricStreamStore::open(&root).unwrap();
+        let error = reopened
+            .append_idempotent("events", "writer", 1, 1, b"intended")
+            .expect_err("the durable tail cannot silently adopt conflicting bytes");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(reopened.read_from("events", 1, 10).unwrap().len(), 1);
+        assert!(reopened.append("events", b"unrelated").is_err());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
