@@ -64,6 +64,7 @@ pub(crate) fn hit(point: StorageInterruptionPoint) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroUsize;
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(1);
 
@@ -287,6 +288,13 @@ mod tests {
                 Err(TabletError::RecoveryRequired),
                 "{point:?} must invalidate snapshot reads on the live handle"
             );
+
+            let scan = KeyRange::new(b"k".to_vec(), Some(b"l".to_vec())).unwrap();
+            assert_eq!(
+                tablet.scan_range_at(&scan, 1, NonZeroUsize::new(4).unwrap()).unwrap_err(),
+                TabletError::RecoveryRequired,
+                "{point:?} must also reject batch historical scans on a poisoned handle",
+            );
             assert_eq!(
                 tablet.prepare_write(
                     7,
@@ -342,6 +350,12 @@ mod tests {
             assert!(with_interruption(point, || tablet.reclaim_history_before(2)).is_err());
 
             assert_eq!(tablet.read_at(b"k", 1), Err(TabletError::RecoveryRequired));
+            let scan = KeyRange::new(b"k".to_vec(), Some(b"l".to_vec())).unwrap();
+            assert_eq!(
+                tablet.scan_range_at(&scan, 1, NonZeroUsize::new(4).unwrap()).unwrap_err(),
+                TabletError::RecoveryRequired,
+                "{point:?} must also reject batch historical scans on a poisoned handle",
+            );
             assert!(tablet.publish_checkpoint().is_err());
             drop(tablet);
 
