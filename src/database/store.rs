@@ -53,6 +53,11 @@ impl WalBackedTablet {
         self.tablet.current_sequence()
     }
 
+    /// Earliest snapshot that can be read after durable MVCC reclamation.
+    pub fn oldest_retained_snapshot(&self) -> u64 {
+        self.tablet.oldest_retained_snapshot()
+    }
+
     pub fn prepare_write(
         &self,
         presented_epoch: u64,
@@ -93,6 +98,24 @@ impl WalBackedTablet {
     /// recovery state.
     pub fn checkpoint(&mut self) -> Result<(), WalBackedError> {
         self.publish_checkpoint()?;
+        self.wal.reclaim_through(self.tablet.current_sequence())?;
+        Ok(())
+    }
+
+    /// Durably advance the oldest supported MVCC snapshot and reclaim old
+    /// versions. The caller MUST ensure no active snapshot reader, backup, or
+    /// replication consumer still depends on snapshots below `floor`: a
+    /// distributed snapshot registry has not been implemented yet.
+    ///
+    /// The pruned state is checkpointed before it becomes visible in memory,
+    /// and the old WAL is reclaimed only after that checkpoint is durable.
+    /// If the WAL rewrite fails, the checkpoint is still valid, but the
+    /// handle may require reopening before accepting further writes.
+    pub fn reclaim_history_before(&mut self, floor: u64) -> Result<(), WalBackedError> {
+        let mut candidate = self.tablet.clone();
+        candidate.prune_history_before(floor)?;
+        checkpoint::write_checkpoint(&self.checkpoint_path, &candidate)?;
+        self.tablet = candidate;
         self.wal.reclaim_through(self.tablet.current_sequence())?;
         Ok(())
     }
