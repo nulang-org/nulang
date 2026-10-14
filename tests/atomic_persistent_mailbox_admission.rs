@@ -352,6 +352,7 @@ fn admitted_command_blocks_next_user_message_until_durable_completion() {
     completed_snapshot.actor_id = actor_id;
     completed_snapshot.sequence = receipt.sequence + 1;
     completed_snapshot.activation_epoch = receipt.activation_epoch;
+    completed_snapshot.schema_name = Some("Counter".to_string());
     completed_snapshot
         .state
         .insert("total".to_string(), PersistedValue::Int(5));
