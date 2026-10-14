@@ -83,10 +83,12 @@ impl DurableEffectPersistenceRecord {
             let expected = original_effect_id
                 .derive_compensation(*compensation_ordinal, &effect.spec().effect_operation);
             if actual != expected {
-                return Err(DurableEffectPersistenceError::CompensationIdentityMismatch {
-                    expected,
-                    actual,
-                });
+                return Err(
+                    DurableEffectPersistenceError::CompensationIdentityMismatch {
+                        expected,
+                        actual,
+                    },
+                );
             }
         }
         Ok(())
