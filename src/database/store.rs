@@ -11,10 +11,11 @@
 //! No fallible validation is performed after the WAL acknowledges durability.
 
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use super::checkpoint::{self, CheckpointError};
-use super::tablet::{MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletWrite};
+use super::tablet::{KeyRange, MemoryTablet, TabletBatchScan, TabletDescriptor, TabletError, TabletMutation, TabletWrite};
 use super::wal::{FileWal, WalError};
 
 #[derive(Debug)]
@@ -68,6 +69,17 @@ impl WalBackedTablet {
         self.tablet.validate_write(&write)?;
         self.wal.append_write(&write)?;
         Ok(self.tablet.publish_validated(write))
+    }
+
+    /// Read-only, bounded MVCC range scan over the committed tablet state.
+    /// No additional WAL, checkpoint, or ownership transitions are performed.
+    pub fn scan_range_at(
+        &self,
+        range: &KeyRange,
+        snapshot: u64,
+        target_rows: NonZeroUsize,
+    ) -> Result<TabletBatchScan<'_>, TabletError> {
+        self.tablet.scan_range_at(range, snapshot, target_rows)
     }
 
     pub fn read_at(&self, key: &[u8], snapshot: u64) -> Result<Option<&[u8]>, TabletError> {
