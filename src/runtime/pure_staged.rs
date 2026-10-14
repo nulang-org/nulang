@@ -52,14 +52,25 @@ fn validate_pure_body(
         .get(behavior_idx)
         .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "compiled behavior missing"))?
         .code_offset;
-    let mut terminated = false;
-    for instr in module
-        .instructions
-        .get(offset..)
-        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "compiled behavior offset is invalid"))?
+    let next_boundary = module
+        .behaviors
         .iter()
-        .take(MAX_PURE_INSTRUCTIONS)
-    {
+        .map(|behavior| behavior.code_offset)
+        .chain(module.function_table.iter().copied())
+        .filter(|pc| *pc > offset)
+        .min()
+        .unwrap_or(module.instructions.len());
+    let body = module.instructions.get(offset..next_boundary).ok_or_else(|| {
+        Error::new(ErrorKind::InvalidData, "compiled behavior region is invalid")
+    })?;
+    if body.len() > MAX_PURE_INSTRUCTIONS {
+        return Err(Error::new(
+            ErrorKind::Unsupported,
+            "pure handler exceeds the bounded straight-line execution limit",
+        ));
+    }
+    let mut terminated = false;
+    for instr in body {
         match instr.opcode {
             OpCode::Nop
             | OpCode::Const0
@@ -357,7 +368,11 @@ impl Runtime {
                     | (Some(Constant::Nil), PersistedValue::Nil)
                     | (Some(Constant::Unit), PersistedValue::Unit)
             );
-            if !compatible || pure_scalar_value(&persisted).is_none() {
+            // Legacy persistence conversion normalizes unsupported heap
+            // pointers to Nil. A staged handler must never treat that lossy
+            // conversion as a real primitive snapshot.
+            let lossless = preserve_scalar_type(&persisted, *live).as_ref() == Some(&persisted);
+            if !compatible || pure_scalar_value(&persisted).is_none() || !lossless {
                 return Err(Error::new(
                     ErrorKind::Unsupported,
                     format!("durable field '{field}' cannot be staged as a scalar"),
