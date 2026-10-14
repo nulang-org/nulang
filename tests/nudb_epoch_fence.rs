@@ -166,8 +166,37 @@ fn ownership_epoch_must_advance_and_expected_epoch_must_match() {
     drop(tablet);
 
     assert!(WalBackedTablet::open(descriptor(5), &path).is_err());
+    {
+        let wal = FileWal::open(&path).unwrap();
+        assert_eq!(wal.last_sequence(), 1);
+        assert_eq!(wal.latest_ownership_epoch(), Some(6));
+        assert_eq!(wal.records().len(), 1);
+        assert!(wal.records()[0].is_epoch_fence());
+        assert!(wal.records()[0].mutations().is_empty());
+    }
     let reopened = WalBackedTablet::open(descriptor(6), &path).unwrap();
     assert_eq!(reopened.current_sequence(), 1);
+    drop(reopened);
+    cleanup(&path);
+}
+
+#[test]
+fn fence_after_checkpoint_replays_without_losing_existing_receipts() {
+    let path = path();
+    cleanup(&path);
+    let id = TransactionId::new([53; 16]);
+    let mut tablet = WalBackedTablet::open(descriptor(11), &path).unwrap();
+    let receipt = tablet.commit_idempotent(id, put(b"r", b"receipt")).unwrap();
+    tablet.checkpoint().unwrap();
+    assert_eq!(tablet.advance_ownership_epoch(11, 12).unwrap(), 2);
+    drop(tablet);
+
+    assert!(WalBackedTablet::open(descriptor(11), &path).is_err());
+    let mut reopened = WalBackedTablet::open(descriptor(12), &path).unwrap();
+    assert_eq!(reopened.current_sequence(), 2);
+    assert_eq!(reopened.commit_idempotent(id, put(b"r", b"receipt")).unwrap(), receipt);
+    assert_eq!(reopened.current_sequence(), 2);
+    assert_eq!(reopened.read_latest(b"r"), Some(&b"receipt"[..]));
     drop(reopened);
     cleanup(&path);
 }
