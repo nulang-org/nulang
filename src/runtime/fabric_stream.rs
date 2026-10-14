@@ -1888,6 +1888,100 @@ mod tests {
     }
 
     #[test]
+    fn replicated_consumer_only_reads_and_commits_quorum_visible_prefix() {
+        let root = test_dir("replicated-consumer-visibility");
+        {
+            let mut store = FileFabricStreamStore::open(&root).unwrap();
+            store
+                .create_stream("events", FabricStreamConfig::default())
+                .unwrap();
+            store
+                .establish_replication_policy(
+                    "events",
+                    FabricStreamReplicationPolicy {
+                        partition: 0,
+                        epoch: FABRIC_STREAM_INITIAL_EPOCH,
+                        leader: 10,
+                        membership_fingerprint: 44,
+                        replication_factor: 2,
+                        replicas: vec![10, 11],
+                    },
+                )
+                .unwrap();
+            store.append_replica("events", 1, b"committed").unwrap();
+            store.append_replica("events", 2, b"pending").unwrap();
+            store.commit_through("events", 1).unwrap();
+
+            // The second record is fsynced locally but has not reached quorum.
+            assert_eq!(store.read_from("events", 1, 10).unwrap().len(), 2);
+            let visible = store.read_consumer("events", "worker", 10).unwrap();
+            assert_eq!(visible.len(), 1);
+            assert_eq!(visible[0].payload, b"committed");
+
+            let error = store
+                .commit_cursor("events", "worker", 2)
+                .expect_err("consumer must not acknowledge an uncommitted record");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(store.cursor("events", "worker").unwrap(), 0);
+
+            store.commit_cursor("events", "worker", 1).unwrap();
+            assert!(store.read_consumer("events", "worker", 10).unwrap().is_empty());
+        }
+
+        // Restart must not expose the pending tail or skip it with the cursor.
+        let mut reopened = FileFabricStreamStore::open(&root).unwrap();
+        assert_eq!(reopened.cursor("events", "worker").unwrap(), 1);
+        assert!(reopened.read_consumer("events", "worker", 10).unwrap().is_empty());
+        reopened.commit_through("events", 2).unwrap();
+        let visible = reopened.read_consumer("events", "worker", 10).unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].payload, b"pending");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn replicated_consumer_rejects_cursor_past_committed_index_on_recovery() {
+        let root = test_dir("consumer-cursor-ahead");
+        let mut store = FileFabricStreamStore::open(&root).unwrap();
+        store
+            .create_stream("events", FabricStreamConfig::default())
+            .unwrap();
+        store
+            .establish_replication_policy(
+                "events",
+                FabricStreamReplicationPolicy {
+                    partition: 0,
+                    epoch: FABRIC_STREAM_INITIAL_EPOCH,
+                    leader: 10,
+                    membership_fingerprint: 44,
+                    replication_factor: 2,
+                    replicas: vec![10, 11],
+                },
+            )
+            .unwrap();
+        store.append_replica("events", 1, b"not-committed").unwrap();
+
+        // Simulate a cursor written by an older build before enforcing quorum.
+        write_json_atomic(
+            &root.join("events").join("cursors.json"),
+            &CursorFile {
+                version: STREAM_FORMAT_VERSION,
+                cursors: BTreeMap::from([("worker".to_string(), 1)]),
+            },
+        )
+        .unwrap();
+        let read_error = store
+            .read_consumer("events", "worker", 10)
+            .expect_err("a cursor beyond committed history must fail closed");
+        assert_eq!(read_error.kind(), io::ErrorKind::InvalidData);
+        let commit_error = store
+            .commit_cursor("events", "worker", 1)
+            .expect_err("an invalid cursor must not be silently retained");
+        assert_eq!(commit_error.kind(), io::ErrorKind::InvalidData);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn recovery_truncates_only_incomplete_final_record() {
         let root = test_dir("tail-repair");
         let mut store = FileFabricStreamStore::open(&root).unwrap();
