@@ -983,6 +983,121 @@ mod tests {
         unsafe { nulang_runtime_free(rt) };
     }
 
+    fn assert_last_error_contains(rt: *mut NulangRuntime, expected: &str) {
+        // SAFETY: every caller passes a live runtime.
+        let ptr = unsafe { nulang_last_error(rt) };
+        assert!(!ptr.is_null(), "expected C API error containing {expected:?}");
+        // SAFETY: nulang_last_error returns a runtime-owned NUL-terminated string.
+        let actual = unsafe { CStr::from_ptr(ptr) }.to_string_lossy();
+        assert!(
+            actual.contains(expected),
+            "expected {expected:?} in C API error, got {actual:?}"
+        );
+    }
+
+    #[test]
+    fn test_c_api_compile_reports_invalid_source_inputs() {
+        let rt = nulang_runtime_new();
+        assert_eq!(unsafe { nulang_compile(rt, std::ptr::null()) }, -1);
+        assert_last_error_contains(rt, "null source");
+
+        let invalid_utf8 = CString::new(vec![0xff]).unwrap();
+        assert_eq!(unsafe { nulang_compile(rt, invalid_utf8.as_ptr()) }, -1);
+        assert_last_error_contains(rt, "UTF-8");
+
+        let valid = CString::new("42").unwrap();
+        assert!(unsafe { nulang_compile(rt, valid.as_ptr()) } >= 0);
+        assert!(unsafe { nulang_last_error(rt) }.is_null());
+
+        unsafe { nulang_runtime_free(rt) };
+    }
+
+    #[test]
+    fn test_c_api_run_reports_invalid_module_handles() {
+        let rt = nulang_runtime_new();
+        assert!(nulang_value_is_nil(unsafe { nulang_run(rt, -1) }));
+        assert_last_error_contains(rt, "invalid module handle");
+
+        assert!(nulang_value_is_nil(unsafe { nulang_run(rt, 1000) }));
+        assert_last_error_contains(rt, "invalid module handle");
+
+        unsafe { nulang_runtime_free(rt) };
+    }
+
+    #[test]
+    fn test_c_api_call_reports_invalid_inputs_and_missing_functions() {
+        let rt = nulang_runtime_new();
+        let source = CString::new("fn answer() -> Int { 42 } answer()").unwrap();
+        let handle = unsafe { nulang_compile(rt, source.as_ptr()) };
+        assert!(handle >= 0);
+
+        let name = CString::new("answer").unwrap();
+        assert!(nulang_value_is_nil(unsafe {
+            nulang_call_function(rt, -1, name.as_ptr(), std::ptr::null(), 0)
+        }));
+        assert_last_error_contains(rt, "invalid module handle");
+
+        assert!(nulang_value_is_nil(unsafe {
+            nulang_call_function(rt, handle, std::ptr::null(), std::ptr::null(), 0)
+        }));
+        assert_last_error_contains(rt, "null function name");
+
+        let invalid_utf8 = CString::new(vec![0xff]).unwrap();
+        assert!(nulang_value_is_nil(unsafe {
+            nulang_call_function(rt, handle, invalid_utf8.as_ptr(), std::ptr::null(), 0)
+        }));
+        assert_last_error_contains(rt, "UTF-8");
+
+        assert!(nulang_value_is_nil(unsafe {
+            nulang_call_function(rt, handle, name.as_ptr(), std::ptr::null(), 1)
+        }));
+        assert_last_error_contains(rt, "null argument array");
+
+        let missing = CString::new("missing").unwrap();
+        assert!(nulang_value_is_nil(unsafe {
+            nulang_call_function(rt, handle, missing.as_ptr(), std::ptr::null(), 0)
+        }));
+        assert_last_error_contains(rt, "unknown function");
+
+        let result = unsafe { nulang_call_function(rt, handle, name.as_ptr(), std::ptr::null(), 0) };
+        assert_eq!(nulang_value_int(result), 42);
+        assert!(unsafe { nulang_last_error(rt) }.is_null());
+
+        unsafe { nulang_runtime_free(rt) };
+    }
+
+    #[test]
+    fn test_c_api_module_string_reports_invalid_inputs() {
+        let rt = nulang_runtime_new();
+        let source = CString::new("42").unwrap();
+        let handle = unsafe { nulang_compile(rt, source.as_ptr()) };
+        assert!(handle >= 0);
+        let value = CString::new("hello").unwrap();
+
+        assert!(nulang_value_is_nil(unsafe {
+            nulang_module_string(rt, -1, value.as_ptr())
+        }));
+        assert_last_error_contains(rt, "invalid module handle");
+
+        assert!(nulang_value_is_nil(unsafe {
+            nulang_module_string(rt, handle, std::ptr::null())
+        }));
+        assert_last_error_contains(rt, "null string");
+
+        let invalid_utf8 = CString::new(vec![0xff]).unwrap();
+        assert!(nulang_value_is_nil(unsafe {
+            nulang_module_string(rt, handle, invalid_utf8.as_ptr())
+        }));
+        assert_last_error_contains(rt, "UTF-8");
+
+        assert!(!nulang_value_is_nil(unsafe {
+            nulang_module_string(rt, handle, value.as_ptr())
+        }));
+        assert!(unsafe { nulang_last_error(rt) }.is_null());
+
+        unsafe { nulang_runtime_free(rt) };
+    }
+
     #[test]
     fn test_c_api_free_string() {
         let rt = nulang_runtime_new();
