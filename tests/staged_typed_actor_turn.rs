@@ -226,3 +226,32 @@ fn rejected_atomic_store_predecessor_never_publishes_staged_state_or_effect() {
         Some(0)
     );
 }
+
+#[test]
+fn incompatible_primitive_state_value_cannot_be_persisted_under_compiled_schema() {
+    let (mut runtime, actor_id, behavior, _) = spawn();
+    let previous = runtime.persistence.latest_sequence(actor_id);
+    let error = runtime
+        .commit_staged_typed_actor_turn(
+            actor_id,
+            previous,
+            behavior,
+            vec![PersistedValue::Int(5)],
+            HashMap::from([(
+                "count".to_string(),
+                PersistedValue::String("not an Int".to_string()),
+            )]),
+            vec![],
+            vec![],
+        )
+        .expect_err("compiler-declared integer state must reject string bytes");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("incompatible"));
+    assert_eq!(runtime.persistence.latest_sequence(actor_id), previous);
+    assert_eq!(
+        runtime.actors[&actor_id]
+            .get_state_field("count")
+            .and_then(|value| value.as_int()),
+        Some(0)
+    );
+}
