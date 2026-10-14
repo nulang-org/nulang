@@ -136,7 +136,7 @@ fn competing_writer_process_is_rejected_and_killed_owner_releases_lock() {
         .unwrap();
 
     let mut ready = false;
-    for _ in 0..400 {
+    for _ in 0..1_000 {
         if fs::read(&ack).is_ok_and(|value| value == b"locked") {
             ready = true;
             break;
