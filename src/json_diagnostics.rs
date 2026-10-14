@@ -34,6 +34,8 @@
 
 use serde::Serialize;
 
+use crate::diagnostic::{suggested_source_edit, DiagnosticSourceEdit};
+
 use crate::types::{current_source_text, source_map_file, NuError, Span};
 
 /// Current JSON diagnostics schema version.
@@ -105,6 +107,9 @@ pub struct JsonSpan {
 pub struct JsonSuggestion {
     pub message: String,
     pub replacement: Option<String>,
+    /// Exact byte-offset edit. Omitted for diagnostics without a safe source span.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edit: Option<DiagnosticSourceEdit>,
 }
 
 /// Per-test result for `nula test --json`.
@@ -133,16 +138,30 @@ pub fn diagnostics_from_error(err: &NuError) -> Vec<JsonDiagnostic> {
 }
 
 fn diagnostic_from_single(err: &NuError) -> JsonDiagnostic {
+    let edit = current_source_text()
+        .and_then(|source| suggested_source_edit(err, &source));
+    let suggestion = if let Some(edit) = edit {
+        Some(JsonSuggestion {
+            message: format!("Consider replacing `{}` with `{}`", edit.expected, edit.replacement),
+            // A compiler guess is not guaranteed correct. Only automatic edits
+            // may use the legacy shorthand replacement field.
+            replacement: None,
+            edit: Some(edit),
+        })
+    } else {
+        err.suggestion().map(|msg| JsonSuggestion {
+            message: msg.to_string(),
+            replacement: None,
+            edit: None,
+        })
+    };
     JsonDiagnostic {
         code: err.stable_code().map(|s| s.to_string()),
         severity: "error".to_string(),
         message: json_message(err),
         span: err.primary_span().and_then(json_span),
         notes: crate::diagnostic::diagnostic_notes(err),
-        suggestion: err.suggestion().map(|msg| JsonSuggestion {
-            message: msg.to_string(),
-            replacement: None,
-        }),
+        suggestion,
     }
 }
 
