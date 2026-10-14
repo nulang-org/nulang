@@ -948,32 +948,85 @@ impl Runtime {
         spawn::register_recovery_module(self, actor_id, module, offsets, compensation_offsets)
     }
 
-    /// Opt a compiler-owned ordinary persistent actor into strict admission.
-    /// Legacy mailbox receive and synchronous ask will not execute user
-    /// messages. This is process-local and must be re-enabled after recovery.
+    /// Persist a versioned strict-admission policy before any user command can
+    /// execute in this activation. The policy is committed as an epoch-fenced,
+    /// snapshot-bearing transition; a write failure does not enable the live
+    /// mailbox gate. A previously committed policy can be re-applied after an
+    /// ambiguous acknowledgment without writing a second policy transition.
     pub fn enable_strict_typed_actor_admission(&mut self, actor_id: u64) -> std::io::Result<()> {
         use std::io::{Error, ErrorKind};
-        let actor = self
-            .actors
-            .get_mut(&actor_id)
+        let actor = self.actors.get(&actor_id)
             .ok_or_else(|| Error::new(ErrorKind::NotFound, "actor does not exist"))?;
         if !actor.persistent || actor.is_workflow || actor.is_agent {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "strict durable admission requires a persistent non-workflow, non-agent actor",
-            ));
+            return Err(Error::new(ErrorKind::InvalidInput,
+                "strict durable admission requires a persistent ordinary actor"));
         }
-        let module = actor.bytecode_module.as_ref().ok_or_else(|| {
-            Error::new(ErrorKind::InvalidInput, "actor has no compiler-owned metadata")
-        })?;
+        let module = actor.bytecode_module.as_ref()
+            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "actor has no compiled schema"))?;
         let meta = behavior_ownership::actor_meta_for_runtime_name(module, &actor.name)
             .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "unknown actor schema"))?;
         if !meta.persistent {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "compiler schema does not declare persistent execution",
-            ));
+            return Err(Error::new(ErrorKind::InvalidInput, "compiler schema is not persistent"));
         }
+        if actor.mailbox.requires_strict_durable_admission() {
+            return Ok(());
+        }
+        if actor.mailbox.has_pending_durable_admission()
+            || actor.mailbox.admitted_command_sequence().is_some()
+        {
+            return Err(Error::new(ErrorKind::WouldBlock,
+                "cannot change durable dispatch policy during a pending actor command"));
+        }
+        let epoch = actor.activation_epoch;
+        let latest = self.persistence.latest_sequence(actor_id);
+        if let Some(snapshot) = self.persistence.load_snapshot(actor_id) {
+            if snapshot.strict_admission_policy_version > 1 {
+                return Err(Error::new(ErrorKind::InvalidData,
+                    "unknown persisted strict admission policy version"));
+            }
+            if snapshot.strict_admission_policy_version == 1 {
+                let tail = self.persistence.load_durable_tail_position(actor_id)?
+                    .ok_or_else(|| Error::new(ErrorKind::InvalidData,
+                        "strict admission marker lacks committed atomic tail"))?;
+                if tail.activation_epoch != epoch || tail.sequence != snapshot.sequence
+                    || latest != snapshot.sequence
+                {
+                    return Err(Error::new(ErrorKind::WouldBlock,
+                        "strict admission marker does not match committed actor tail"));
+                }
+                self.actors.get_mut(&actor_id).unwrap().mailbox.require_strict_durable_admission();
+                return Ok(());
+            }
+            if snapshot.sequence != latest || snapshot.activation_epoch != epoch {
+                return Err(Error::new(ErrorKind::WouldBlock,
+                    "cannot establish strict policy over uncheckpointed actor history"));
+            }
+        } else if latest != 0 {
+            return Err(Error::new(ErrorKind::WouldBlock,
+                "cannot establish strict policy without a safe baseline snapshot"));
+        }
+
+        let sequence = latest.checked_add(1)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "durable policy sequence overflow"))?;
+        let mut snapshot = workflow::build_actor_snapshot_at_sequence(self, actor_id, sequence)?
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "persistent actor vanished"))?;
+        snapshot.strict_admission_policy_version = 1;
+        self.persistence.commit_transition(DurableTransition {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id,
+            activation_epoch: epoch,
+            sequence,
+            expected_previous_sequence: latest,
+            command: None,
+            snapshot: Some(snapshot),
+            workflow_events: vec![],
+            domain_events: vec![],
+            durable_effects: vec![],
+            outbox: vec![],
+        })?;
+        let actor = self.actors.get_mut(&actor_id).unwrap();
+        actor.sequence = sequence;
+        actor.dirty_fields.clear();
         actor.mailbox.require_strict_durable_admission();
         Ok(())
     }
