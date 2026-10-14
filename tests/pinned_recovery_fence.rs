@@ -326,3 +326,102 @@ fn runtime_recovers_with_claimed_epoch_from_original_pinned_artifact() {
     drop(runtime);
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn memory_checked_snapshot_and_journal_reads_are_lossless() {
+    use nulang::runtime::JournalEntry;
+
+    let mut store = MemoryStore::new();
+    start(&mut store, 61);
+    store.append_journal(
+        61,
+        JournalEntry {
+            sequence: 1,
+            behavior_id: 0,
+            payload: vec![],
+        },
+    ).unwrap();
+
+    let snapshot = store.load_snapshot_checked(61).unwrap().unwrap();
+    assert_eq!(snapshot.actor_id, 61);
+    assert_eq!(snapshot.sequence, 1);
+    assert_eq!(store.read_journal_checked(61).unwrap().len(), 1);
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn corrupt_libsql_snapshot_is_not_interpreted_as_missing_durable_state() {
+    use nulang::runtime::LibsqlStore;
+
+    let mut store = LibsqlStore::in_memory().unwrap();
+    start(&mut store, 62);
+    store.query(
+        "UPDATE snapshots SET state = 'broken-json' WHERE actor_id = 62",
+        &[],
+    ).unwrap();
+
+    assert_eq!(
+        store.load_snapshot_checked(62).unwrap_err().kind(),
+        ErrorKind::InvalidData,
+    );
+    let tail = store.load_durable_tail_position(62).unwrap().unwrap();
+    assert_eq!(
+        claim_pinned_workflow_recovery(&mut store, 62, tail)
+            .unwrap_err().kind(),
+        ErrorKind::InvalidData,
+    );
+    assert_eq!(store.load_durable_tail_position(62).unwrap().unwrap(), tail);
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn corrupt_libsql_command_journal_prevents_fenced_recovery() {
+    use nulang::runtime::{JournalEntry, LibsqlStore};
+
+    let mut store = LibsqlStore::in_memory().unwrap();
+    start(&mut store, 63);
+    store.append_journal(63, JournalEntry {
+        sequence: 1,
+        behavior_id: 0,
+        payload: vec![],
+    }).unwrap();
+    store.query(
+        "UPDATE journal SET payload = 'broken-json' WHERE actor_id = 63",
+        &[],
+    ).unwrap();
+
+    assert_eq!(
+        store.read_journal_checked(63).unwrap_err().kind(),
+        ErrorKind::InvalidData,
+    );
+    let tail = store.load_durable_tail_position(63).unwrap().unwrap();
+    assert_eq!(
+        claim_pinned_workflow_recovery(&mut store, 63, tail)
+            .unwrap_err().kind(),
+        ErrorKind::InvalidData,
+    );
+    assert_eq!(store.load_durable_tail_position(63).unwrap().unwrap(), tail);
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn malformed_libsql_command_sequence_or_behavior_id_is_rejected() {
+    use nulang::runtime::{JournalEntry, LibsqlStore};
+
+    let mut store = LibsqlStore::in_memory().unwrap();
+    start(&mut store, 64);
+    store.append_journal(64, JournalEntry {
+        sequence: 1,
+        behavior_id: 0,
+        payload: vec![],
+    }).unwrap();
+    store.query(
+        "UPDATE journal SET behavior_id = 65536 WHERE actor_id = 64",
+        &[],
+    ).unwrap();
+
+    assert_eq!(
+        store.read_journal_checked(64).unwrap_err().kind(),
+        ErrorKind::InvalidData,
+    );
+}
