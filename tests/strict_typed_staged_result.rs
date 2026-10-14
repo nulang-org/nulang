@@ -353,3 +353,47 @@ fn a_quarantined_command_accepts_trusted_staged_result_without_bytecode_replay()
     );
     assert_eq!(runtime.persistence.read_journal(actor_id).len(), 1);
 }
+
+#[test]
+fn previously_persisted_external_effect_id_cannot_be_staged_again() {
+    use nulang::authority::{AuthorityGrant, AuthorityManifest};
+
+    let (mut runtime, actor_id, behavior) = spawned_counter();
+    let grant = "Audit::Write".parse::<AuthorityGrant>().unwrap();
+    runtime.actors.get_mut(&actor_id).unwrap()
+        .install_authority_manifest(&AuthorityManifest::from_grants([grant]));
+    let prior = prepared_effect(actor_id);
+    let spec_id = prior.effect().spec().id;
+    let epoch = runtime.actors[&actor_id].activation_epoch;
+
+    runtime.persistence.commit_transition(DurableTransition {
+        version: DURABLE_TRANSITION_VERSION,
+        actor_id,
+        activation_epoch: epoch,
+        sequence: 1,
+        expected_previous_sequence: 0,
+        command: None,
+        snapshot: None,
+        workflow_events: vec![],
+        domain_events: vec![],
+        durable_effects: vec![prior.clone()],
+        outbox: vec![],
+    }).expect("persist previous logical effect");
+
+    let admitted = admit(&mut runtime, actor_id, behavior, 5);
+    let error = runtime.commit_admitted_typed_actor_result(
+        actor_id,
+        admitted,
+        HashMap::from([("total".to_string(), PersistedValue::Int(5))]),
+        vec![prior],
+        vec![],
+    ).expect_err("historical effect ID must not be minted twice");
+    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    assert!(runtime.persistence.load_durable_effect(actor_id, spec_id)
+        .unwrap().is_some());
+    assert_eq!(runtime.persistence.latest_sequence(actor_id), admitted);
+    assert_eq!(
+        runtime.actors[&actor_id].mailbox.admitted_command_sequence(),
+        Some(admitted)
+    );
+}
