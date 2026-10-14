@@ -75,6 +75,18 @@ pub struct FabricStreamInfo {
     pub committed_sequence: u64,
 }
 
+/// A read-only estimate of whole log segments that *could* be trimmed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FabricStreamRetentionPreview {
+    pub stream: String,
+    pub requested_keep_from_sequence: u64,
+    pub first_retained_sequence: Option<u64>,
+    pub eligible_segment_count: usize,
+    pub eligible_bytes: u64,
+    /// Lowest named consumer cursor, if any.
+    pub minimum_consumer_cursor: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StreamMetadata {
     version: u16,
@@ -315,6 +327,96 @@ impl FileFabricStreamStore {
             next_sequence: state.next_sequence,
             last_sequence: state.next_sequence.checked_sub(1).filter(|&seq| seq > 0),
             committed_sequence,
+        })
+    }
+
+    /// Preview whole-segment retention eligibility without deleting anything.
+    ///
+    /// Deliberately standalone-only: replicated retention needs quorum and
+    /// follower catch-up proofs. Existing consumer cursors and producer state
+    /// must not be silently invalidated by physical segment removal.
+    pub fn preview_retention(
+        &mut self,
+        name: &str,
+        keep_from_sequence: u64,
+    ) -> io::Result<FabricStreamRetentionPreview> {
+        self.ensure_state(name)?;
+        let next_sequence = self
+            .states
+            .get(name)
+            .expect("state recovered")
+            .next_sequence;
+        if keep_from_sequence == 0 || keep_from_sequence > next_sequence {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Fabric keep-from sequence must be in 1..={next_sequence}"
+                ),
+            ));
+        }
+        if self.replication_policy(name)?.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "replicated Fabric retention needs a quorum-safe trim frontier",
+            ));
+        }
+        let dir = self.stream_dir(name);
+        // Local idempotent producer checkpoints refer to exact log records.
+        // Do not claim an eligibility proof until their migration/expiry
+        // semantics have been implemented alongside retention.
+        if dir.join("producer_state.json").exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Fabric retention cannot discard local producer checkpoint history",
+            ));
+        }
+
+        let cursors = read_cursors(&dir.join("cursors.json"))?;
+        let minimum_consumer_cursor = cursors.cursors.values().copied().min();
+        if let Some(minimum) = minimum_consumer_cursor {
+            if keep_from_sequence.saturating_sub(1) > minimum {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "Fabric retention would pass consumer cursor {minimum}"
+                    ),
+                ));
+            }
+        }
+
+        let segments = list_segments(&dir)?;
+        let mut eligible_segment_count = 0;
+        let mut eligible_bytes = 0u64;
+        // Always retain the last segment. The current append state may still
+        // reference it even if all of its records precede the requested floor.
+        for index in 0..segments.len().saturating_sub(1) {
+            let (base, path) = &segments[index];
+            let next_base = segments[index + 1].0;
+            if next_base > keep_from_sequence {
+                break;
+            }
+            let records = decode_segment(path, *base, false)?;
+            if records.last().map(|record| record.sequence) != next_base.checked_sub(1) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Fabric retention preview found an invalid segment boundary",
+                ));
+            }
+            let bytes = fs::metadata(path)?.len();
+            eligible_bytes = eligible_bytes.checked_add(bytes).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "Fabric retention byte count overflow")
+            })?;
+            eligible_segment_count += 1;
+        }
+        Ok(FabricStreamRetentionPreview {
+            stream: name.to_string(),
+            requested_keep_from_sequence: keep_from_sequence,
+            first_retained_sequence: segments
+                .get(eligible_segment_count)
+                .map(|(base, _)| *base),
+            eligible_segment_count,
+            eligible_bytes,
+            minimum_consumer_cursor,
         })
     }
 
@@ -1169,6 +1271,16 @@ impl Runtime {
 
     pub fn fabric_stream_info(&mut self, name: &str) -> io::Result<FabricStreamInfo> {
         self.fabric_stream_store_mut()?.stream_info(name)
+    }
+
+    /// Read-only standalone stream retention estimate; never deletes records.
+    pub fn fabric_stream_preview_retention(
+        &mut self,
+        name: &str,
+        keep_from_sequence: u64,
+    ) -> io::Result<FabricStreamRetentionPreview> {
+        self.fabric_stream_store_mut()?
+            .preview_retention(name, keep_from_sequence)
     }
 
     pub fn fabric_stream_names(&mut self) -> io::Result<Vec<String>> {
