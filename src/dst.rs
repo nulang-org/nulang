@@ -403,6 +403,74 @@ mod tests {
     }
 
     #[test]
+    fn test_dst_checked_run_quiesces_at_exact_message_budget() {
+        let mut sim = Simulator::new(42).with_max_steps(1);
+        sim.register_actor(1, "worker");
+        sim.send(0, 1, "work", vec![]);
+
+        assert_eq!(
+            sim.run_until_quiescence_checked(),
+            SimulationRunResult::Quiescent { steps: 1 },
+            "finishing the last allowed message is not a step-limit failure"
+        );
+        assert_eq!(sim.step_count(), 1);
+    }
+
+    #[test]
+    fn test_dst_checked_run_reports_seed_when_work_remains() {
+        let mut sim = Simulator::new(123).with_max_steps(1);
+        sim.register_actor(1, "worker");
+        sim.send(0, 1, "first", vec![]);
+        sim.send(0, 1, "second", vec![]);
+
+        assert_eq!(
+            sim.run_until_quiescence_checked(),
+            SimulationRunResult::StepLimitExceeded {
+                seed: 123,
+                steps: 1,
+                max_steps: 1,
+            }
+        );
+        assert!(sim.has_pending_work());
+    }
+
+    #[test]
+    fn test_dst_zero_budget_rejects_pending_timer_without_advancing_time() {
+        let mut sim = Simulator::new(9).with_max_steps(0);
+        sim.register_actor(1, "timer-worker");
+        sim.timers.push((
+            100,
+            1,
+            SimMessage {
+                sender: 0,
+                target: 1,
+                behavior: "wake".to_string(),
+                payload: vec![],
+            },
+        ));
+
+        assert_eq!(
+            sim.run_until_quiescence_checked(),
+            SimulationRunResult::StepLimitExceeded {
+                seed: 9,
+                steps: 0,
+                max_steps: 0,
+            }
+        );
+        assert_eq!(sim.clock_ms(), 0);
+        assert_eq!(sim.timers.len(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "seed=77")]
+    fn test_dst_legacy_runner_fails_closed_at_budget_limit() {
+        let mut sim = Simulator::new(77).with_max_steps(0);
+        sim.register_actor(1, "worker");
+        sim.send(0, 1, "queued", vec![]);
+        sim.run_until_quiescence();
+    }
+
+    #[test]
     fn test_quiescence_detection() {
         let mut sim = Simulator::new(0).with_max_steps(100);
         sim.register_actor(1, "worker");
