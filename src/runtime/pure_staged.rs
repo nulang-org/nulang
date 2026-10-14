@@ -130,9 +130,15 @@ fn validate_pure_body(
                     ));
                 }
             }
-            OpCode::Ret | OpCode::RetVal | OpCode::Halt => {
+            OpCode::Ret | OpCode::RetVal => {
                 terminated = true;
                 break;
+            }
+            OpCode::Halt => {
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "pure durable handler must return explicitly; Halt is not completion",
+                ));
             }
             other => {
                 return Err(Error::new(
