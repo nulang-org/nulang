@@ -189,10 +189,8 @@ pub(crate) fn transaction_digest(mutations: &[TabletMutation]) -> [u8; 32] {
 
 /// Caller-provided, stable transaction identifier within a single tablet.
 /// Generate a distinct ID for each logical transaction, and reuse it on retry.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash,
-    serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct TransactionId([u8; 16]);
 
 impl TransactionId {
