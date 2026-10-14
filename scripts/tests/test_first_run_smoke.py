@@ -38,7 +38,7 @@ elif args == ["nula", "build"]:
 elif args == ["nula", "run"]:
     print("Library package ready.")
 elif args == ["nula", "test"]:
-    print("test result: 2 passed; 0 failed")
+    print(os.environ.get("SMOKE_TEST_RESULT", "test result: 2 passed; 0 failed"))
 elif args == ["fmt", "stripped.nula"]:
     (Path.cwd() / "stripped.nula").write_text("type SmokeColor = Red | Green\\n")
 elif args == ["fmt", "--check", "stripped.nula"]:
@@ -85,6 +85,16 @@ class FirstRunSmokeTests(unittest.TestCase):
         self.assertIn("nula test", proc.stderr)
         self.assertIn("synthetic failure", proc.stderr)
         self.assertNotIn("fmt stripped.nula", self.log.read_text())
+
+    def test_zero_discovered_tests_is_not_a_success(self):
+        proc = self.invoke(SMOKE_TEST_RESULT="test result: 0 passed; 0 failed")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("nula test", proc.stderr)
+
+    def test_failed_test_summary_is_not_a_success_even_with_zero_exit(self):
+        proc = self.invoke(SMOKE_TEST_RESULT="test result: 1 passed; 1 failed")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("nula test", proc.stderr)
 
     def test_missing_binary_fails_before_any_command(self):
         self.fake.unlink()
