@@ -79,17 +79,11 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
 }
 
-fn method_not_allowed_response() -> HttpResponse {
+fn not_implemented_response() -> HttpResponse {
     HttpResponse {
-        status: 405,
-        headers: vec![
-            (
-                "Allow".into(),
-                "GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS".into(),
-            ),
-            ("Content-Type".into(), "text/plain; charset=utf-8".into()),
-        ],
-        body: b"Method not allowed".to_vec(),
+        status: 501,
+        headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
+        body: b"Not Implemented".to_vec(),
     }
 }
 
@@ -199,7 +193,7 @@ impl HttpServerState {
                             else {
                                 HttpServerState::write_response(
                                     &mut stream,
-                                    &method_not_allowed_response(),
+                                    &not_implemented_response(),
                                 );
                                 break;
                             };
@@ -294,6 +288,7 @@ impl HttpServerState {
             403 => "Forbidden",
             404 => "Not Found",
             405 => "Method Not Allowed",
+            501 => "Not Implemented",
             413 => "Payload Too Large",
             422 => "Unprocessable Entity",
             429 => "Too Many Requests",
@@ -891,7 +886,7 @@ impl WebDevServer {
                             else {
                                 HttpServerState::write_response(
                                     &mut stream,
-                                    &method_not_allowed_response(),
+                                    &not_implemented_response(),
                                 );
                                 break;
                             };
@@ -1281,10 +1276,37 @@ mod tests {
 
         let unknown = format!("TRACE / HTTP/1.1\r\nHost: {host}\r\n\r\n");
         let response = send(server.port, &unknown);
-        assert!(response.starts_with("HTTP/1.1 405 Method Not Allowed"));
+        assert!(response.starts_with("HTTP/1.1 501 Not Implemented\r\n"));
         assert!(
-            response.contains("Allow: GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS\r\n"),
-            "405 responses must advertise the supported methods"
+            !response.contains("\r\nAllow:"),
+            "501 responses must not advertise a resource-specific Allow header"
+        );
+    }
+
+    #[test]
+    fn http_server_returns_501_for_unimplemented_methods_over_tcp() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_thread = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            HttpServerState::handle_connection(stream, &CodeModule::new("test"), 0);
+        });
+
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .write_all(b"TRACE / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        server_thread.join().unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 501 Not Implemented\r\n"));
+        assert!(
+            !response.contains("\r\nAllow:"),
+            "501 responses must not advertise a resource-specific Allow header"
         );
     }
 

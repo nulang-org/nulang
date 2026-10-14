@@ -1,7 +1,7 @@
 # Nulang Changelog
 
 ### Experimental Web mutation provenance and method safety — 2026-10-12
-- **Experimental Web routes now reject state-changing requests without a matching Origin or trusted Referer.** Unknown HTTP methods return HTTP 405 instead of silently falling back to GET; unsafe routes are denied before handler execution. Trusted reverse proxies must explicitly configure `NULANG_WEB_PUBLIC_ORIGIN`, and non-browser API clients must provide same-origin provenance.
+- **Experimental Web routes now reject state-changing requests without a matching Origin or trusted Referer.** Methods the server does not recognize or implement return HTTP 501 instead of silently falling back to GET; unsafe routes are denied before handler execution. Trusted reverse proxies must explicitly configure `NULANG_WEB_PUBLIC_ORIGIN`, and non-browser API clients must provide same-origin provenance.
 - **This is a request-provenance gate, not authentication.** User/tenant authorization, session-bound CSRF tokens, and independent low-level HTTP handler security remain separate application responsibilities.
 
 ### WASM dynamic string-add parity — 2026-09-25
