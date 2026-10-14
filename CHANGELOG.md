@@ -1,4 +1,9 @@
 # Nulang Changelog
+### NuDB checkpoint-safe MVCC retention and duplicate-key recovery — 2026-10-14
+- **Repeated mutations of the same key within one tablet commit now resolve to the final mutation.** WAL replay follows the same rule, and older checkpoints containing multiple versions at the same sequence are normalized on restore rather than becoming unreadable.
+- **Single-node tablets can explicitly advance a persisted oldest-supported snapshot.** History reclamation retains the anchor value needed by supported snapshots, discards obsolete tombstones, checksums and atomically publishes the pruned checkpoint, and only then reclaims WAL. Reads below the floor return an explicit expiration error after restart.
+- **Reclamation remains caller-controlled.** NuDB does not yet track long-lived snapshot leases, backup pinning, or distributed readers; callers must prove an older snapshot is not needed before advancing the floor. Focused tests cover duplicate mutations, legacy checkpoints, snapshot expiry, and restart.
+
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
