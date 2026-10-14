@@ -421,7 +421,10 @@ impl Mailbox {
         if result.is_some() {
             self.active_match = None;
             self.invalidate_receive_indexes();
-            self.release_slot(result.as_ref().is_some_and(|m| m.priority == MessagePriority::System));
+            let system = result
+                .as_ref()
+                .is_some_and(|message| message.priority == MessagePriority::System);
+            self.release_slot(system);
         }
         result
     }
@@ -1094,7 +1097,8 @@ mod bounded_admission_conformance_tests {
         let admitted: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
         assert_eq!(admitted, 32, "normal capacity must be exactly bounded");
         assert_eq!(mailbox.len(), 256 + 32);
-        let mut mailbox = Arc::try_unwrap(mailbox).unwrap_or_else(|_| panic!("all producers finished"));
+        let mut mailbox =
+            Arc::try_unwrap(mailbox).unwrap_or_else(|_| panic!("all producers finished"));
         for _ in 0..256 {
             assert_eq!(mailbox.pop().unwrap().priority, MessagePriority::System);
         }
