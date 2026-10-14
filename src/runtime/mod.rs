@@ -3257,7 +3257,8 @@ impl Runtime {
             .get(&actor_id)
             .map(|actor| {
                 !actor.mailbox.is_empty()
-                    && !actor.mailbox.has_pending_durable_admission()
+                    && (!actor.mailbox.has_pending_durable_admission()
+                        || actor.mailbox.has_ready_system_message())
                     && actor.suspended_execution.is_none()
                     && matches!(
                         actor.state,
