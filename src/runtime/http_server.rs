@@ -1106,6 +1106,106 @@ fn guess_content_type(path: &Path) -> &'static str {
 mod tests {
     use super::*;
 
+    // A deterministic reader forces TCP-like fragmentation without sleeps.
+    struct FixedChunkReader<'a> {
+        remaining: &'a [u8],
+        max_chunk: usize,
+    }
+
+    impl std::io::Read for FixedChunkReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.remaining.len().min(buf.len()).min(self.max_chunk);
+            buf[..n].copy_from_slice(&self.remaining[..n]);
+            self.remaining = &self.remaining[n..];
+            Ok(n)
+        }
+    }
+
+    fn chunks(input: &[u8], max_chunk: usize) -> FixedChunkReader<'_> {
+        FixedChunkReader { remaining: input, max_chunk }
+    }
+
+    #[test]
+    fn http_request_reassembles_fragmented_headers_and_exact_body() {
+        let raw = b"POST /submit HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello";
+        let request = read_http_request(&mut chunks(raw, 3)).unwrap().unwrap();
+        assert_eq!(request.method, HttpMethod::Post);
+        assert_eq!(request.path, "/submit");
+        assert_eq!(request.body, b"hello");
+    }
+
+    #[test]
+    fn http_request_rejects_truncated_body_instead_of_dispatching() {
+        let raw = b"POST /submit HTTP/1.1\r\nContent-Length: 9\r\n\r\nhello";
+        assert_eq!(
+            read_http_request(&mut chunks(raw, 2)).unwrap_err(),
+            HttpReadError::BadRequest
+        );
+    }
+
+    #[test]
+    fn http_request_rejects_ambiguous_or_invalid_lengths() {
+        for raw in [
+            &b"POST / HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\nok"[..],
+            &b"POST / HTTP/1.1\r\nContent-Length: nope\r\n\r\n"[..],
+            &b"POST / HTTP/1.1\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\nok"[..],
+        ] {
+            assert_eq!(read_http_request(&mut chunks(raw, 7)).unwrap_err(), HttpReadError::BadRequest);
+        }
+    }
+
+    #[test]
+    fn http_request_rejects_unknown_methods_instead_of_treating_as_get() {
+        assert_eq!(
+            read_http_request(&mut chunks(b"BREW / HTTP/1.1\r\n\r\n", 32)).unwrap_err(),
+            HttpReadError::NotImplemented
+        );
+    }
+
+    #[test]
+    fn http_request_rejects_unsupported_transfer_encoding() {
+        let raw = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+        assert_eq!(
+            read_http_request(&mut chunks(raw, 8)).unwrap_err(),
+            HttpReadError::NotImplemented
+        );
+    }
+
+    #[test]
+    fn http_request_rejects_oversized_payload_from_declared_length() {
+        let raw = b"POST / HTTP/1.1\r\nContent-Length: 1048577\r\n\r\n";
+        assert_eq!(
+            read_http_request(&mut chunks(raw, 32)).unwrap_err(),
+            HttpReadError::PayloadTooLarge
+        );
+    }
+
+    #[test]
+    fn http_request_bounds_headers_even_without_terminator() {
+        let mut raw = b"GET / HTTP/1.1\r\nX-Padding: ".to_vec();
+        raw.extend(vec![b'a'; 17000]);
+        assert_eq!(
+            read_http_request(&mut chunks(&raw, 900)).unwrap_err(),
+            HttpReadError::HeadersTooLarge
+        );
+    }
+
+    #[test]
+    fn http_request_rejects_expect_continue_without_blocking_on_body() {
+        let raw = b"POST / HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 4\r\n\r\n";
+        assert_eq!(
+            read_http_request(&mut chunks(raw, 8)).unwrap_err(),
+            HttpReadError::ExpectationFailed
+        );
+    }
+
+    #[test]
+    fn http_request_does_not_consume_pipelined_bytes_as_body() {
+        let raw = b"POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\nokGET / HTTP/1.1\r\n\r\n";
+        let request = read_http_request(&mut chunks(raw, 128)).unwrap().unwrap();
+        assert_eq!(request.body, b"ok");
+    }
+
     #[test]
     fn test_match_route_exact() {
         let params = match_route("/", "/").unwrap();
