@@ -209,6 +209,22 @@ fn invalid_compiled_behavior_index_is_rejected_without_panicking() {
 }
 
 #[test]
+fn pinned_manifest_and_compiled_module_must_agree_on_schema_version() {
+    let mut module = fixture_module("Payment");
+    module.actor_metadata[0].version = 2;
+    let bytes = module.to_nbc(None).unwrap();
+    let mut runtime = stored_execution(&bytes);
+    assert_eq!(
+        runtime
+            .recover_pinned_workflow_actor(501, "payments/501", &resolver(&bytes))
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidData,
+    );
+    assert!(!runtime.actors.contains_key(&501));
+}
+
+#[test]
 fn externally_registered_module_cannot_override_verified_bytecode_loader() {
     let bytes = fixture_module("Payment").to_nbc(None).unwrap();
     let mut runtime = stored_execution(&bytes);
