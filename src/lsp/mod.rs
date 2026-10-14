@@ -3927,6 +3927,44 @@ mod lsp_tests {
         assert!(hints.is_empty());
     }
 
+    /// CLI and JSON diagnostics already publish stable codes and structured
+    /// explanations.  The LSP must preserve them for editor users too.
+    #[test]
+    fn test_lsp_type_mismatch_diagnostic_preserves_code_notes_and_help() {
+        let err = NuError::type_mismatch("Int", "String", crate::types::Span::default());
+        let diagnostic = single_diagnostic(err);
+
+        assert_eq!(
+            diagnostic.code,
+            Some(NumberOrString::String("E0201".to_string()))
+        );
+        assert!(diagnostic.message.contains("expected type: Int"));
+        assert!(diagnostic.message.contains("found type: String"));
+        assert!(diagnostic.message.contains("help: "));
+    }
+
+    #[test]
+    fn test_lsp_multiple_diagnostics_preserve_individual_codes_and_effect_notes() {
+        let span = crate::types::Span::default();
+        let errors = NuError::Multiple(vec![
+            NuError::unbound_variable("missing", span, None),
+            NuError::missing_effects(vec!["IO".to_string()], "{}", span),
+        ]);
+        let diagnostics = nu_error_to_diagnostic(errors);
+
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(
+            diagnostics[0].code,
+            Some(NumberOrString::String("E0202".to_string()))
+        );
+        assert_eq!(
+            diagnostics[1].code,
+            Some(NumberOrString::String("E0301".to_string()))
+        );
+        assert!(diagnostics[1].message.contains("missing effects: IO"));
+        assert!(diagnostics[1].message.contains("allowed effects: {}"));
+    }
+
     #[test]
     fn test_diagnostics_frontend_returns_parsed_ast() {
         let source = "fn main() -> Int { 42 }";
