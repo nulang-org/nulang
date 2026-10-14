@@ -1058,7 +1058,13 @@ mod transactional_receive_tests {
         mailbox.push_local(make_msg(3, 5)).unwrap();
         assert_eq!(mailbox.begin_durable_admission().unwrap().sender, 5);
         mailbox.push_local(make_msg(3, 6)).unwrap();
-        assert_eq!(mailbox.pop().unwrap().sender, 5);
+
+        assert!(
+            mailbox.pop().is_none(),
+            "legacy receive must not bypass persistence admission"
+        );
+        assert_eq!(mailbox.len(), 2);
+        assert_eq!(mailbox.commit_durable_admission().unwrap().sender, 5);
         assert_eq!(mailbox.pop().unwrap().sender, 6);
         assert_eq!(mailbox.len(), 0);
     }
