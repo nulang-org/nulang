@@ -2788,6 +2788,51 @@ mod tests {
     }
 
     #[test]
+    fn test_block_value_is_captured_before_deferred_cleanup() {
+        let span = Span::default();
+        let expr = Expr::Block {
+            exprs: vec![
+                Expr::Defer {
+                    expr: Box::new(Expr::Panic("cleanup".to_string(), span)),
+                    error_only: false,
+                    span,
+                },
+                Expr::Var("x".to_string(), span),
+            ],
+            span,
+        };
+        let body = with_fresh_defer_stack(|| lower_body(&expr));
+        let result = match &body.terminator {
+            hir::Terminator::Yield(hir::Operand::Var(name, _)) => name,
+            other => panic!("expected block to yield a captured value, got {other:?}"),
+        };
+        let capture_pos = body
+            .stmts
+            .iter()
+            .position(|stmt| matches!(
+                stmt,
+                hir::Stmt::Let {
+                    name,
+                    value: hir::RValue::Use(hir::Operand::Var(source, _)),
+                    ..
+                } if name == result && source == "x"
+            ))
+            .expect("block value must be copied before deferred cleanup");
+        let cleanup_pos = body
+            .stmts
+            .iter()
+            .position(|stmt| matches!(
+                stmt,
+                hir::Stmt::Let {
+                    value: hir::RValue::Panic(message),
+                    ..
+                } if message == "cleanup"
+            ))
+            .expect("deferred cleanup missing");
+        assert!(capture_pos < cleanup_pos, "block value captured too late");
+    }
+
+    #[test]
     fn test_return_evaluates_and_captures_value_before_defer() {
         let span = Span::default();
         let expr = Expr::Block {
