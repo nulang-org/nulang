@@ -8,6 +8,7 @@
 
 ## Pre-flight
 
+- [ ] The release commit has a completed successful **main-push** GitHub Actions `CI` run at the exact SHA, with all eight mandatory jobs actually successful (not queued, skipped, or zero-job). The tag release workflow enforces this with `scripts/check_release_ci_proof.py`; a passing PR on another commit does not qualify.
 - [ ] `cargo test --lib` — all tests pass (1541+)
 - [ ] `cargo check --tests` — zero warnings
 - [ ] `./conformance/run.py` — conformance suite passes
