@@ -151,6 +151,70 @@ fn unfinished_atomic_command_refuses_recovery_instead_of_replaying_handler() {
 }
 
 #[test]
+fn trusted_host_can_finish_quarantined_command_without_reexecuting_handler() {
+    let (mut runtime, actor_id, behavior) = recovered_fixture();
+    runtime.enable_strict_typed_actor_admission(actor_id).unwrap();
+    let saved = runtime.persistence.load_snapshot(actor_id).unwrap();
+    let admitted_sequence = saved.sequence + 1;
+    runtime.persistence.commit_transition(DurableTransition {
+        version: DURABLE_TRANSITION_VERSION,
+        actor_id,
+        activation_epoch: saved.activation_epoch,
+        sequence: admitted_sequence,
+        expected_previous_sequence: saved.sequence,
+        command: Some(JournalEntry {
+            sequence: admitted_sequence,
+            behavior_id: behavior,
+            payload: vec![PersistedValue::Int(5)],
+        }),
+        snapshot: None,
+        workflow_events: vec![],
+        domain_events: vec![],
+        durable_effects: vec![],
+        outbox: vec![],
+    }).unwrap();
+    runtime.actors.remove(&actor_id);
+    assert_eq!(runtime.recover_actor(actor_id), Some(actor_id));
+    assert_eq!(
+        runtime.actors[&actor_id].mailbox.admitted_command_sequence(),
+        Some(admitted_sequence)
+    );
+
+    // The host supplies an already-authorized, replay-safe staged result.
+    // The runtime must not infer this result by replaying the bytecode.
+    let mut result_snapshot = saved;
+    result_snapshot.sequence = admitted_sequence + 1;
+    result_snapshot
+        .state
+        .insert("total".to_owned(), PersistedValue::Int(5));
+    runtime.persistence.commit_transition(DurableTransition {
+        version: DURABLE_TRANSITION_VERSION,
+        actor_id,
+        activation_epoch: result_snapshot.activation_epoch,
+        sequence: admitted_sequence + 1,
+        expected_previous_sequence: admitted_sequence,
+        command: None,
+        snapshot: Some(result_snapshot),
+        workflow_events: vec![],
+        domain_events: vec![],
+        durable_effects: vec![],
+        outbox: vec![],
+    }).unwrap();
+
+    runtime.finish_admitted_typed_actor_command(actor_id, admitted_sequence)
+        .expect("verified committed staged result can hydrate state and clear fence");
+    assert_eq!(
+        runtime.actors[&actor_id].mailbox.admitted_command_sequence(),
+        None
+    );
+    assert_eq!(
+        runtime.actors[&actor_id].get_state_field("total").and_then(|v| v.as_int()),
+        Some(5)
+    );
+    assert_eq!(runtime.persistence.read_journal(actor_id).len(), 1);
+}
+
+#[test]
 fn strict_recovery_rejects_ambiguous_unfinished_history() {
     let (mut runtime, actor_id, behavior) = recovered_fixture();
     runtime.enable_strict_typed_actor_admission(actor_id).unwrap();
