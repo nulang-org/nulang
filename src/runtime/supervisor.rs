@@ -126,8 +126,9 @@ impl ChildSpec {
 /// alive or retired.
 #[derive(Debug, Clone)]
 pub struct RestartTemplate {
-    /// Initial state fields captured at registration.
-    pub state_data: Vec<(String, Value)>,
+    /// Independently owned initial state captured at registration.
+    /// Heap pointers and constant-pool IDs are never copied between incarnations.
+    pub state_data: Vec<(String, persistence::PersistedValue)>,
     /// Persistence model per state field.
     pub state_models: HashMap<String, StateModel>,
     /// Native behavior handlers (name, handler).
@@ -337,20 +338,37 @@ impl Supervisor {
         if let Some(ref snap) = snapshot {
             for (name, value) in &snap.state {
                 let v = value.to_value_on_heap(&mut new_actor);
-                new_actor.set_state_field(name.clone(), v);
-            }
-            for (name, value) in &template.state_data {
-                if !snap.state.contains_key(name) {
-                    new_actor.set_state_field(name.clone(), *value);
+                if matches!(value, persistence::PersistedValue::String(_)) && v.is_nil() {
+                    warn!(
+                        "supervisor '{}': cannot restore persisted string field '{}' for child '{}'",
+                        self.name, name, spec.id
+                    );
+                    return None;
                 }
+                new_actor.set_state_field(name.clone(), v);
             }
             new_actor.sequence = snap.sequence;
             new_actor.activation_epoch = snap.activation_epoch;
             new_actor.waiting_signal = snap.waiting_signal.clone();
-        } else {
-            for (name, value) in &template.state_data {
-                new_actor.set_state_field(name.clone(), *value);
+        }
+        // Restore fields absent from a durable snapshot (or all initial
+        // fields for transient actors) into the NEW incarnation's heap.
+        for (name, value) in &template.state_data {
+            if snapshot
+                .as_ref()
+                .map_or(false, |snap| snap.state.contains_key(name))
+            {
+                continue;
             }
+            let restored = value.to_value_on_heap(&mut new_actor);
+            if matches!(value, persistence::PersistedValue::String(_)) && restored.is_nil() {
+                warn!(
+                    "supervisor '{}': cannot restore initial string field '{}' for child '{}'",
+                    self.name, name, spec.id
+                );
+                return None;
+            }
+            new_actor.set_state_field(name.clone(), restored);
         }
 
         new_actor.state_models = template.state_models.clone();
