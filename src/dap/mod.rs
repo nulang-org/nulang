@@ -1252,7 +1252,10 @@ pub(crate) mod tests {
             }
             // Only a terminal event permits clean EOF. The timeout is a
             // deadlock guard, not a production quiescence heuristic.
-            match self.terminal.recv_timeout(std::time::Duration::from_secs(10)) {
+            match self
+                .terminal
+                .recv_timeout(std::time::Duration::from_secs(10))
+            {
                 Ok(()) => {
                     self.released = true;
                     Ok(0)
@@ -1468,9 +1471,15 @@ pub(crate) mod tests {
                 release_rx.try_recv(),
                 Err(crossbeam::channel::TryRecvError::Empty)
             ));
-            write_message(&mut writer, &json!({ "type": "event", "event": "terminated" }));
+            write_message(
+                &mut writer,
+                &json!({ "type": "event", "event": "terminated" }),
+            );
         }
-        assert!(release_rx.try_recv().is_ok(), "terminal event did not release reader");
+        assert!(
+            release_rx.try_recv().is_ok(),
+            "terminal event did not release reader"
+        );
     }
 
     #[test]
