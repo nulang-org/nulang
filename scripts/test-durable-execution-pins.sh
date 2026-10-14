@@ -10,3 +10,5 @@ cargo test --locked --features sqlite --test pinned_workflow_atomic_start
 cargo test --locked --features sqlite --test pinned_workflow_runtime
 cargo test --locked --test pinned_bytecode_loader
 cargo test --locked --features sqlite --test pinned_bytecode_loader
+cargo test --locked --test pinned_compiled_workflow_start
+cargo test --locked --features sqlite --test pinned_compiled_workflow_start

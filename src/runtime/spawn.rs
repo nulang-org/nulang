@@ -138,6 +138,16 @@ struct PinnedStart<'a> {
     execution_id: &'a str,
     manifest: &'a BehaviorManifest,
     executable: &'a [u8],
+    compiled: Option<VerifiedCompiledWorkflow>,
+}
+
+/// Compiler-owned metadata accepted only after validating the exact
+/// executable and sidecar, before creating any durable actor.
+struct VerifiedCompiledWorkflow {
+    schema_name: String,
+    module: crate::bytecode::CodeModule,
+    offsets: Vec<usize>,
+    compensation_offsets: Vec<Option<usize>>,
 }
 
 /// Use the same spawn and rollback lifecycle as ordinary workflows, but stage
@@ -164,6 +174,94 @@ pub(crate) fn try_spawn_pinned_workflow_actor(
             execution_id,
             manifest,
             executable,
+            compiled: None,
+        }),
+    )
+}
+
+/// Spawn a compiled durable workflow only from verified immutable NBC
+/// bytes. All compiler defaults, workflow dispatch metadata, and schema
+/// identity are staged before the first atomic snapshot is committed.
+pub(crate) fn try_spawn_pinned_compiled_workflow(
+    rt: &mut Runtime,
+    execution_id: &str,
+    schema_name: &str,
+    manifest: &BehaviorManifest,
+    executable: &[u8],
+) -> std::io::Result<u64> {
+    // Validate the entire manifest and exact executable before allocating
+    // an actor ID or changing any runtime-owned state.
+    crate::execution_compatibility::DurableExecutionPin::create(
+        execution_id,
+        manifest,
+        executable,
+    )
+    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let bundle = crate::runtime::pinned_execution::PinnedArtifactBundle {
+        manifest: manifest.clone(),
+        executable: executable.to_vec(),
+    };
+    let (module, offsets, compensation_offsets) =
+        crate::runtime::pinned_execution::decode_verified_pinned_workflow_module(
+            &bundle,
+            schema_name,
+        )?;
+    let meta = module
+        .actor_metadata
+        .iter()
+        .find(|meta| meta.name == schema_name)
+        .ok_or_else(|| std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "compiled pinned workflow schema is missing",
+        ))?;
+    let mut default_names = std::collections::HashSet::new();
+    for (name, constant) in &meta.state_defaults {
+        if !default_names.insert(name.as_str()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "compiled pinned workflow has duplicate state default fields",
+            ));
+        }
+        if !matches!(
+            constant,
+            crate::bytecode::Constant::Int(_)
+                | crate::bytecode::Constant::Float(_)
+                | crate::bytecode::Constant::Bool(_)
+                | crate::bytecode::Constant::String(_)
+                | crate::bytecode::Constant::Nil
+                | crate::bytecode::Constant::Unit
+        ) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "compiled pinned workflow contains an unsupported state default constant",
+            ));
+        }
+    }
+    let state_models: HashMap<String, StateModel> = meta
+        .state_models
+        .iter()
+        .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
+        .collect();
+
+    try_spawn_actor_with_id_pinned(
+        rt,
+        fresh_actor_id(),
+        Box::new(Vec::new),
+        state_models,
+        true,
+        Some(schema_name),
+        None,
+        None,
+        Some(PinnedStart {
+            execution_id,
+            manifest,
+            executable,
+            compiled: Some(VerifiedCompiledWorkflow {
+                schema_name: schema_name.to_string(),
+                module,
+                offsets,
+                compensation_offsets,
+            }),
         }),
     )
 }
@@ -222,6 +320,38 @@ fn try_spawn_actor_with_id_pinned(
     }
     actor.state_models = state_models;
     actor.persistent = persistent;
+    if let Some(compiled) = pinned.as_ref().and_then(|pin| pin.compiled.as_ref()) {
+        // Executed handlers and snapshot strings must be owned by the actor
+        // before the first durable commit. In particular, allocating a
+        // compiler default string after commit would silently lose it on
+        // the first restart.
+        actor.name = compiled.schema_name.clone();
+        actor.bytecode_module = Some(Box::new(compiled.module.clone()));
+        actor.bytecode_offsets = compiled.offsets.clone();
+        actor.compensation_offsets = compiled.compensation_offsets.clone();
+        let meta = compiled
+            .module
+            .actor_metadata
+            .iter()
+            .find(|meta| meta.name == compiled.schema_name)
+            .expect("schema was validated before actor allocation");
+        for (name, constant) in &meta.state_defaults {
+            let value = match constant {
+                crate::bytecode::Constant::String(string) => {
+                    let value = actor.allocate_string(string);
+                    if value.is_nil() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::OutOfMemory,
+                            "failed to allocate compiler default string for pinned workflow",
+                        ));
+                    }
+                    value
+                }
+                other => crate::vm::constant_to_value(other),
+            };
+            actor.set_state_field(name, value);
+        }
+    }
     let workflow_name = workflow.map(|n| n.to_string());
     if let Some(name) = workflow {
         // Legacy storage field retained until the versioned ActorRole format
@@ -265,10 +395,9 @@ fn try_spawn_actor_with_id_pinned(
                     .copied()
                     .unwrap_or(StateModel::Local);
                 if model.is_persistent() {
-                    state.push(PersistedValue::from_value_resolved(
-                        value,
-                        actor.bytecode_module.as_deref(),
-                    ));
+                    // Resolve actor-owned heap strings before the initial
+                    // durable event is committed, not only in the snapshot.
+                    state.push(actor.persist_value(value));
                 }
             }
             state
@@ -337,6 +466,18 @@ fn try_spawn_actor_with_id_pinned(
             }
             return Err(error);
         }
+    }
+    if let Some(compiled) = pinned.as_ref().and_then(|pin| pin.compiled.as_ref()) {
+        // Do not register executable metadata until the atomic start is
+        // committed. Only the validated module can be dispatched.
+        layout_workflow_behavior_table(rt, id);
+        register_recovery_module(
+            rt,
+            id,
+            compiled.module.clone(),
+            compiled.offsets.clone(),
+            compiled.compensation_offsets.clone(),
+        );
     }
     rt.enqueue_actor(id);
     Ok(id)

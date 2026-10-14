@@ -255,15 +255,55 @@ another valid NBC, malformed NBC matching its own sidecar, persisted schema
 mismatch, out-of-range behavior indexes, pre-registered unverified modules,
 and separate-process SQLite restart and substitute rejection.
 
-**Remaining:** a natural end-to-end *creation* API for pinned compiled
-workflows that binds compiler metadata before initial actor publication;
-current compiled-workflow recovery tests stage a schema-named initial
-`DurableTransition` directly. Artifact retention, cryptographic
-provenance, authenticated history verification, cross-node placement/
-activation fencing, and Cloud deployment policy are also outside this slice.
+**Remaining:** the verified loader is an opt-in runtime path; it
+does not automatically pin every workflow started by the general VM spawn
+callback. Artifact retention, cryptographic provenance, authenticated
+history verification, cross-node placement/activation fencing, and Cloud
+deployment policy are also outside this slice.
 The pin and event history must be read under a coherent fenced recovery
 boundary in a later increment to rule out concurrent modification between
 verification and hydration.
+
+## Compiler-aware pinned workflow creation
+
+`Runtime::try_spawn_pinned_compiled_workflow(execution_id, schema_name,
+manifest, executable)` now provides an opt-in start path that uses a single
+verified NBC artifact as the source of both executable code and compiler
+state metadata. It performs the manifest/executable identity check, decodes
+and validates the exact `CodeModule`, confirms the durable workflow schema,
+and checks state defaults **before allocating an actor ID**.
+
+Creation uses the existing pinned actor lifecycle, but stages compiler
+defaults, actor-owned strings, bytecode handler offsets, compensation offsets,
+and compiler-owned schema identity **before the initial snapshot**.
+`WorkflowStarted`, the snapshot, and the immutable execution pin are
+committed together using the existing atomic transition contract. The
+module's recovery registration and scheduler enqueue happen only after a
+successful durable commit. An unsupported backend or failed validation
+leaves no published actor; ambiguous commit failures do not erase
+potentially committed history.
+
+The API intentionally accepts **no separate unverified `CodeModule`** and
+does not infer executable identity from a mutable module registry. The
+general `Runtime::spawn_from_module` compatibility path is unchanged.
+
+```bash
+cargo test --locked --test pinned_compiled_workflow_start
+cargo test --locked --features sqlite --test pinned_compiled_workflow_start
+```
+
+Tests check durable compiler defaults (including heap-backed strings),
+schema identity and dispatch offsets, malformed NBC, mismatched sidecars,
+out-of-range behavior indexes, duplicate/unsupported compiler defaults,
+unsupported storage, and database-backed restart with the same pinned
+artifact.
+
+**Important limit:** a newly created actor is staged in the private
+`Runtime::actors` map while the synchronous initial transaction executes;
+it is not enqueued for scheduling or returned to its caller until commit.
+An external embedding host must not expose the mutable runtime midway
+through this call. Cross-process starter fencing and coherent verification
+and recovery snapshots still need separate crash/concurrency validation.
 
 ## Next increment / non-goals of v1
 
