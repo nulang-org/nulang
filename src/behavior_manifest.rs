@@ -106,6 +106,26 @@ pub struct BehaviorMigrationEvent {
     pub arity: usize,
 }
 
+/// Evidence the v0alpha1 manifest cannot supply for an unattended durable
+/// upgrade. These are not compatibility errors: they are proof obligations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpgradeEvidenceGap {
+    /// A different executable or compiler-owned artifact identity could
+    /// reinterpret the durable actor's existing snapshots/effect history.
+    DurableExecutableChanged { actor: String },
+    /// Migration topology is known, but the migration body has no verified
+    /// semantic identity or execution proof in this manifest revision.
+    MigrationExecutionUnverified { actor: String, from: u32, to: u32 },
+}
+
+/// Result of structural preflight. Empty `unverified` means there are no
+/// manifest-visible durable replay/migration proof obligations, NOT that
+/// artifact bytes have been checked or a deployed history has been replayed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpgradePreflight {
+    pub unverified: Vec<UpgradeEvidenceGap>,
+}
+
 impl BehaviorManifest {
     /// Build the RFC 0020 durability subset from typed HIR plus the compiler's
     /// already-derived artifact identity.
@@ -313,6 +333,83 @@ impl BehaviorManifest {
         }
 
         Ok(())
+    }
+
+    /// Classify proof obligations after the existing structural checks.
+    ///
+    /// v0alpha1 does not contain canonical migration-body hashes, historical
+    /// executable receipts, or replay evidence. A changed executable with
+    /// any preexisting durable owner must therefore be treated as unverified
+    /// even when its state schema has not changed.
+    pub fn upgrade_preflight_from(
+        &self,
+        previous: &BehaviorManifest,
+    ) -> Result<UpgradePreflight, BehaviorAdmissionError> {
+        self.validate_upgrade_from(previous)?;
+
+        let mut old_durable: Vec<_> = previous
+            .actors
+            .iter()
+            .filter(|actor| actor.persistence.is_durable())
+            .collect();
+        old_durable.sort_by(|left, right| left.name.cmp(&right.name));
+
+        let changed_executable = self.artifact != previous.artifact;
+        let mut unverified = Vec::new();
+        for old in old_durable {
+            // Structural admission already requires every old durable actor
+            // to exist in the incoming package at an equal/newer version.
+            let new = self
+                .actors
+                .iter()
+                .find(|actor| actor.name == old.name)
+                .expect("structurally checked durable owner");
+
+            if new.schema_version > old.schema_version {
+                for from in old.schema_version..new.schema_version {
+                    unverified.push(UpgradeEvidenceGap::MigrationExecutionUnverified {
+                        actor: old.name.clone(),
+                        from,
+                        to: from + 1,
+                    });
+                }
+            }
+            if changed_executable {
+                unverified.push(UpgradeEvidenceGap::DurableExecutableChanged {
+                    actor: old.name.clone(),
+                });
+            }
+        }
+        Ok(UpgradePreflight { unverified })
+    }
+
+    /// Strict admission for unattended replacement without replay evidence.
+    ///
+    /// Both sidecars must first match their exact bytecode bytes. Then the
+    /// structural checks must pass, and there must be no unresolved durable
+    /// migration or executable-change evidence requirements. Operators must
+    /// use a separate, explicitly verified recovery/migration process for
+    /// changes rejected here; there is no "trust me" bypass in this API.
+    pub fn validate_unattended_upgrade_from(
+        &self,
+        previous: &BehaviorManifest,
+        previous_artifact_bytes: &[u8],
+        incoming_artifact_bytes: &[u8],
+    ) -> Result<(), BehaviorAdmissionError> {
+        previous
+            .verify_artifact_bytes(previous_artifact_bytes)
+            .map_err(BehaviorAdmissionError::InvalidPreviousManifest)?;
+        self.verify_artifact_bytes(incoming_artifact_bytes)
+            .map_err(BehaviorAdmissionError::InvalidIncomingManifest)?;
+
+        let report = self.upgrade_preflight_from(previous)?;
+        if report.unverified.is_empty() {
+            Ok(())
+        } else {
+            Err(BehaviorAdmissionError::UnverifiedDurableUpgrade {
+                requirements: report.unverified,
+            })
+        }
     }
 
     fn normalize(&mut self) {
@@ -685,6 +782,10 @@ pub enum BehaviorAdmissionError {
     ExistingMigrationTopologyChanged {
         actor: String,
     },
+    /// Manifest-only preflight cannot prove these runtime obligations.
+    UnverifiedDurableUpgrade {
+        requirements: Vec<UpgradeEvidenceGap>,
+    },
 }
 
 impl fmt::Display for BehaviorAdmissionError {
@@ -739,6 +840,11 @@ impl fmt::Display for BehaviorAdmissionError {
             Self::ExistingMigrationTopologyChanged { actor } => write!(
                 f,
                 "incoming deployment changes an existing migration topology for durable actor '{actor}'"
+            ),
+            Self::UnverifiedDurableUpgrade { requirements } => write!(
+                f,
+                "unattended durable upgrade refused: {} migration/replay proof obligation(s) require verified execution",
+                requirements.len()
             ),
         }
     }
