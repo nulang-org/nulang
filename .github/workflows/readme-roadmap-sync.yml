@@ -6,6 +6,12 @@ on:
   schedule:
     - cron: '17 08 * * 1'
   workflow_dispatch:
+  pull_request:
+    paths:
+      - 'README.md'
+      - 'scripts/sync_readme_roadmap.py'
+      - 'scripts/tests/test_sync_readme_roadmap.py'
+      - '.github/workflows/readme-roadmap-sync.yml'
 
 concurrency:
   group: readme-roadmap-sync
@@ -15,11 +21,24 @@ permissions:
   contents: read
 
 jobs:
+  test-roadmap:
+    name: Validate README roadmap generator
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python3 -m unittest discover -s scripts/tests -p 'test_sync_readme_roadmap.py' -v
+
   roadmap:
     name: Propose current README roadmap
     # An on-demand run must use the protected main workflow, not arbitrary code
     # on a user-selected feature branch.
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write
