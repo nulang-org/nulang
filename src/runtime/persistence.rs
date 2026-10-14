@@ -172,6 +172,11 @@ pub struct ActorSnapshot {
     /// typed manifest before any recovered actor becomes observable.
     #[serde(default)]
     pub authority_tokens: BTreeSet<String>,
+    /// Versioned runtime-owned dispatch policy. 0 is legacy, 1 requires
+    /// atomic host admission; unknown values fail closed during recovery.
+    /// Old serialized snapshots default to legacy only for compatibility.
+    #[serde(default)]
+    pub strict_admission_policy_version: u16,
 }
 
 impl Default for ActorSnapshot {
@@ -186,6 +191,7 @@ impl Default for ActorSnapshot {
             crdt_field_map: None,
             schema_name: None,
             authority_tokens: BTreeSet::new(),
+            strict_admission_policy_version: 0,
         }
     }
 }
@@ -2181,6 +2187,7 @@ impl PersistenceStore for LibsqlStore {
                 crdt_field_map,
                 schema_name,
                 authority_tokens,
+                strict_admission_policy_version: 0,
             })
         })
     }
@@ -2951,6 +2958,7 @@ impl PersistenceStore for PostgresStore {
             crdt_field_map,
             schema_name,
             authority_tokens,
+            strict_admission_policy_version: 0,
         })
     }
 
@@ -3245,7 +3253,8 @@ mod json_file_store_tests {
                 crdt_snapshot: None,
                 crdt_field_map: None,
                 schema_name: None,
-                authority_tokens: Default::default(),
+                authority_tokens,
+                strict_admission_policy_version: 0,
             })
             .unwrap();
 
@@ -3309,7 +3318,8 @@ mod json_file_store_tests {
                 crdt_snapshot: None,
                 crdt_field_map: None,
                 schema_name: None,
-                authority_tokens: Default::default(),
+                authority_tokens,
+                strict_admission_policy_version: 0,
             })
             .unwrap();
         store
@@ -3340,7 +3350,8 @@ mod json_file_store_tests {
                 crdt_snapshot: None,
                 crdt_field_map: None,
                 schema_name: None,
-                authority_tokens: Default::default(),
+                authority_tokens,
+                strict_admission_policy_version: 0,
             })
             .unwrap();
         store
@@ -3378,7 +3389,8 @@ mod json_file_store_tests {
                     crdt_snapshot: None,
                     crdt_field_map: None,
                     schema_name: None,
-                    authority_tokens: Default::default(),
+                    authority_tokens,
+                    strict_admission_policy_version: 0,
                 })
                 .unwrap();
             store
@@ -3419,7 +3431,8 @@ mod json_file_store_tests {
                 crdt_snapshot: None,
                 crdt_field_map: None,
                 schema_name: None,
-                authority_tokens: Default::default(),
+                authority_tokens,
+                strict_admission_policy_version: 0,
             })
             .unwrap();
 
@@ -3542,7 +3555,8 @@ mod rocksdb_store_tests {
                 crdt_snapshot: None,
                 crdt_field_map: None,
                 schema_name: None,
-                authority_tokens: Default::default(),
+                authority_tokens,
+                strict_admission_policy_version: 0,
             })
             .unwrap();
 
@@ -3600,7 +3614,8 @@ mod rocksdb_store_tests {
                 crdt_snapshot: None,
                 crdt_field_map: None,
                 schema_name: None,
-                authority_tokens: Default::default(),
+                authority_tokens,
+                strict_admission_policy_version: 0,
             })
             .unwrap();
         store
@@ -3631,7 +3646,8 @@ mod rocksdb_store_tests {
                 crdt_snapshot: None,
                 crdt_field_map: None,
                 schema_name: None,
-                authority_tokens: Default::default(),
+                authority_tokens,
+                strict_admission_policy_version: 0,
             })
             .unwrap();
         store
@@ -3669,7 +3685,8 @@ mod rocksdb_store_tests {
                     crdt_snapshot: None,
                     crdt_field_map: None,
                     schema_name: None,
-                    authority_tokens: Default::default(),
+                    authority_tokens,
+                    strict_admission_policy_version: 0,
                 })
                 .unwrap();
             store
@@ -3742,7 +3759,8 @@ mod postgres_store_tests {
                 crdt_snapshot: None,
                 crdt_field_map: None,
                 schema_name: None,
-                authority_tokens: Default::default(),
+                authority_tokens,
+                strict_admission_policy_version: 0,
             })
             .unwrap();
 
@@ -3809,7 +3827,8 @@ mod postgres_store_tests {
                 crdt_snapshot: None,
                 crdt_field_map: None,
                 schema_name: None,
-                authority_tokens: Default::default(),
+                authority_tokens,
+                strict_admission_policy_version: 0,
             })
             .unwrap();
         store
@@ -3844,7 +3863,8 @@ mod postgres_store_tests {
                 crdt_snapshot: None,
                 crdt_field_map: None,
                 schema_name: None,
-                authority_tokens: Default::default(),
+                authority_tokens,
+                strict_admission_policy_version: 0,
             })
             .unwrap();
         store
