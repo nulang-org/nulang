@@ -565,8 +565,8 @@ fn grain_hydration_rejects_wrong_arity_before_publication() {
         }
         "#,
     );
-    let behavior = u16::try_from(module.actor_metadata[0].behavior_indices[0])
-        .expect("behavior id");
+    let behavior =
+        u16::try_from(module.actor_metadata[0].behavior_indices[0]).expect("behavior id");
     let grain = GrainId::new("Counter", "replay-wrong-arity");
     let mut rt = Runtime::new();
     rt.register_module_grains(&module);
