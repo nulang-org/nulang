@@ -1401,6 +1401,16 @@ impl FileFabricStreamStore {
         let path = self.stream_dir(name).join("cursors.json");
         let mut cursors = read_cursors(&path)?;
         let current = cursors.cursors.get(consumer).copied().unwrap_or(0);
+        // A legacy build may have acknowledged an uncommitted replica tail.
+        // Reject its persisted cursor as corrupt before evaluating mutations.
+        if replicated && current > last_sequence {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Fabric consumer cursor {current} exceeds quorum-committed sequence {last_sequence}"
+                ),
+            ));
+        }
         if sequence < current {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2502,6 +2512,55 @@ mod tests {
         store.commit_cursor("events", "worker", 2).unwrap();
         assert!(store.commit_cursor("events", "worker", 1).is_err());
         assert!(store.commit_cursor("events", "worker", 3).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn replicated_legacy_cursor_past_committed_index_rejects_mutation_as_corruption() {
+        let root = test_dir("replicated-legacy-cursor");
+        let mut store = FileFabricStreamStore::open(&root).unwrap();
+        store
+            .create_stream("events", FabricStreamConfig::default())
+            .unwrap();
+        store
+            .establish_replication_policy(
+                "events",
+                FabricStreamReplicationPolicy {
+                    partition: 0,
+                    epoch: FABRIC_STREAM_INITIAL_EPOCH,
+                    leader: 10,
+                    membership_fingerprint: 44,
+                    replication_factor: 2,
+                    replicas: vec![10, 11],
+                },
+            )
+            .unwrap();
+        store.append_replica("events", 1, b"committed").unwrap();
+        store.append_replica("events", 2, b"uncommitted").unwrap();
+        store.commit_through("events", 1).unwrap();
+
+        // Simulate an older build persisting an ACK for a locally durable but
+        // not quorum-committed record. Never silently repair or accept it.
+        let path = root.join("events").join("cursors.json");
+        write_json_atomic(
+            &path,
+            &CursorFile {
+                version: STREAM_FORMAT_VERSION,
+                cursors: BTreeMap::from([("worker".to_string(), 2)]),
+            },
+        )
+        .unwrap();
+
+        let error = store
+            .commit_cursor("events", "worker", 1)
+            .expect_err("legacy cursor beyond committed history must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(store.cursor("events", "worker").unwrap(), 2);
+
+        let error = store
+            .read_consumer("events", "worker", 1)
+            .expect_err("legacy cursor must not silently skip committed history");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         let _ = fs::remove_dir_all(root);
     }
 
