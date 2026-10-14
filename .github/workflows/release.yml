@@ -15,8 +15,6 @@ on:
       - 'scripts/tests/test_release_cli_profile.py'
       - 'scripts/package_linux.sh'
       - 'scripts/tests/test_linux_packages.py'
-      - 'scripts/configure_ubuntu_arm64_sources.py'
-      - 'scripts/tests/test_arm64_apt_sources.py'
 
 env:
   CARGO_TERM_COLOR: always
@@ -38,7 +36,6 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts/tests -p test_release_cli_profile.py
           python3 -m unittest discover -s scripts/tests -p test_linux_packages.py
-          python3 -m unittest discover -s scripts/tests -p test_arm64_apt_sources.py
 
       - name: Verify tag matches crate and CLI versions
         if: github.event_name == 'push'
