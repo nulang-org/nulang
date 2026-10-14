@@ -124,6 +124,7 @@ fn strict_gate_allows_explicit_atomic_host_admission_only() {
     let (mut rt, actor_id, _, behavior) = actors();
     rt.enable_strict_typed_actor_admission(actor_id).unwrap();
     let predecessor = rt.persistence.latest_sequence(actor_id);
+    let initial_journal_len = rt.persistence.read_journal(actor_id).len();
     rt.send_message_by_id(actor_id, behavior, &[Value::int(5)]);
 
     let proposal = command(&rt, actor_id, behavior, predecessor, 5);
@@ -133,7 +134,7 @@ fn strict_gate_allows_explicit_atomic_host_admission_only() {
         .expect("original message");
     assert_eq!(admitted.payload[0].as_int(), Some(5));
     assert_eq!(receipt.sequence, predecessor + 1);
-    assert_eq!(rt.persistence.read_journal(actor_id).len(), 1);
+    assert_eq!(rt.persistence.read_journal(actor_id).len(), initial_journal_len + 1);
     assert_eq!(
         rt.actors[&actor_id]
             .get_state_field("total")
