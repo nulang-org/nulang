@@ -475,3 +475,41 @@ fn corrupt_command_journal_blocks_runtime_pinned_recovery_before_epoch_claim() {
         initial,
     );
 }
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn process_crash_after_claim_before_hydration_can_be_safely_reclaimed() {
+    use nulang::runtime::LibsqlStore;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "nulang-pinned-abandoned-claim-{}-{nonce}", std::process::id(),
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("workflow.db");
+
+    let abandoned_claim = {
+        let mut store = LibsqlStore::new(&path).unwrap();
+        start(&mut store, 66);
+        let predecessor = store.load_durable_tail_position(66).unwrap().unwrap();
+        claim_pinned_workflow_recovery(&mut store, 66, predecessor).unwrap()
+    };
+
+    let mut new_process = LibsqlStore::new(&path).unwrap();
+    let after_crash = new_process.load_durable_tail_position(66).unwrap().unwrap();
+    assert_eq!(after_crash.sequence, abandoned_claim.sequence);
+    assert_eq!(after_crash.activation_epoch, abandoned_claim.activation_epoch);
+    let successor = claim_pinned_workflow_recovery(&mut new_process, 66, after_crash).unwrap();
+    assert_eq!(successor.sequence, abandoned_claim.sequence + 1);
+    assert_eq!(successor.activation_epoch, abandoned_claim.activation_epoch + 1);
+    assert_eq!(
+        new_process.load_snapshot_checked(66).unwrap().unwrap().activation_epoch,
+        successor.activation_epoch,
+    );
+    assert!(claim_pinned_workflow_recovery(
+        &mut new_process, 66, after_crash,
+    ).is_err());
+    drop(new_process);
+    std::fs::remove_dir_all(directory).unwrap();
+}
