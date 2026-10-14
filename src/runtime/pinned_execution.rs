@@ -117,7 +117,12 @@ pub fn verify_pinned_workflow_resume(
     let mut serialized_pin = None;
     for event in store.read_workflow_events(actor_id) {
         match event {
-            WorkflowEvent::WorkflowStarted { sequence: 1, .. } => {
+            WorkflowEvent::WorkflowStarted { sequence, .. } => {
+                if sequence != 1 {
+                    return Err(invalid_data(
+                        "pinned workflow has a WorkflowStarted event after its initial transaction",
+                    ));
+                }
                 start_count += 1;
             }
             WorkflowEvent::Custom { sequence, name, args, replay_id }
