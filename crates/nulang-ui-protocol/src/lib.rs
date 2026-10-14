@@ -821,8 +821,7 @@ mod tests {
         assert!(decode_host_message(&missing_action.to_string()).is_err());
 
         let mut missing_idempotency = serde_json::to_value(&valid).unwrap();
-        missing_idempotency["request"]["idempotency_key"] =
-            serde_json::Value::String(" ".into());
+        missing_idempotency["request"]["idempotency_key"] = serde_json::Value::String(" ".into());
         assert!(decode_host_message(&missing_idempotency.to_string()).is_err());
     }
 
