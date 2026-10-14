@@ -2904,8 +2904,8 @@ impl PersistenceStore for PostgresStore {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let mut conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO snapshots (actor_id, sequence, activation_epoch, state, waiting_signal, crdt_snapshot, crdt_field_map, schema_name, authority_tokens)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            "INSERT INTO snapshots (actor_id, sequence, activation_epoch, state, waiting_signal, crdt_snapshot, crdt_field_map, schema_name, authority_tokens, strict_admission_policy_version)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
              ON CONFLICT (actor_id) DO UPDATE SET
                sequence = EXCLUDED.sequence,
                activation_epoch = EXCLUDED.activation_epoch,
@@ -2914,7 +2914,8 @@ impl PersistenceStore for PostgresStore {
                crdt_snapshot = EXCLUDED.crdt_snapshot,
                crdt_field_map = EXCLUDED.crdt_field_map,
                schema_name = EXCLUDED.schema_name,
-               authority_tokens = EXCLUDED.authority_tokens",
+               authority_tokens = EXCLUDED.authority_tokens,
+               strict_admission_policy_version = EXCLUDED.strict_admission_policy_version",
             &[
                 &(snapshot.actor_id as i64),
                 &(snapshot.sequence as i64),
@@ -2925,6 +2926,7 @@ impl PersistenceStore for PostgresStore {
                 &crdt_field_map_json.as_str(),
                 &snapshot.schema_name.as_deref(),
                 &authority_json.as_str(),
+                &(snapshot.strict_admission_policy_version as i64),
             ],
         )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -2935,7 +2937,7 @@ impl PersistenceStore for PostgresStore {
         let mut conn = self.conn.lock().unwrap();
         let row = conn
             .query_one(
-                "SELECT sequence, activation_epoch, state, waiting_signal, crdt_snapshot, crdt_field_map, schema_name, authority_tokens
+                "SELECT sequence, activation_epoch, state, waiting_signal, crdt_snapshot, crdt_field_map, schema_name, authority_tokens, strict_admission_policy_version
                  FROM snapshots WHERE actor_id = $1",
                 &[&(actor_id as i64)],
             )
@@ -2948,6 +2950,8 @@ impl PersistenceStore for PostgresStore {
         let crdt_field_map_json: Option<String> = row.get(5);
         let schema_name: Option<String> = row.get(6);
         let authority_json: Option<String> = row.get(7);
+        let policy_version: i64 = row.get(8);
+        let policy_version = u16::try_from(policy_version).ok()?;
         let crdt_snapshot: Option<Vec<(u64, u8, Vec<u8>)>> =
             crdt_json.and_then(|j| serde_json::from_str(&j).ok());
         let crdt_field_map: Option<HashMap<String, u64>> =
@@ -2976,7 +2980,7 @@ impl PersistenceStore for PostgresStore {
             crdt_field_map,
             schema_name,
             authority_tokens,
-            strict_admission_policy_version: 0,
+            strict_admission_policy_version: policy_version,
         })
     }
 
