@@ -640,6 +640,9 @@ pub enum TabletError {
         oldest_retained: u64,
     },
     InvalidSnapshotHistory,
+    /// A prior storage operation could have published a newer checkpoint.
+    /// Reopen the tablet to reconcile its durable state before continuing.
+    RecoveryRequired,
     KeyOutsideTabletRange,
 }
 
@@ -712,6 +715,9 @@ impl fmt::Display for TabletError {
             ),
             Self::InvalidSnapshotHistory => {
                 f.write_str("tablet snapshot contains invalid MVCC version history")
+            }
+            Self::RecoveryRequired => {
+                f.write_str("tablet recovery required before further snapshot reads or writes")
             }
             Self::KeyOutsideTabletRange => {
                 f.write_str("tablet mutation key falls outside the owned key range")
