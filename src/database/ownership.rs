@@ -16,6 +16,7 @@ use super::tablet::TabletId;
 
 /// Nonzero identity of a NuDB storage node; never reuse for a different node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct NodeId(u64);
 
 impl NodeId {
@@ -33,6 +34,7 @@ impl NodeId {
 
 /// Command selected by the external consensus control plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum OwnershipCommand {
     Bootstrap {
         tablet: TabletId,
@@ -53,6 +55,7 @@ pub enum OwnershipCommand {
 /// Merely constructing this value does NOT constitute quorum commitment.
 /// This type exists to isolate the deterministic *apply* boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct CommittedOwnershipEntry {
     pub index: u64,
     pub term: u64,
