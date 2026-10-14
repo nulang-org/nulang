@@ -120,10 +120,46 @@ fn replayed_receipt_discards_duplicate_mailbox_envelope_without_running_bytecode
         .expect("simulated committed admission with lost acknowledgment");
 
     rt.send_message_by_id(id, behavior, &[Value::int(5)]);
+    let blocked = rt
+        .admit_next_typed_actor_command_with_inbox(
+            id,
+            receipt_key.clone(),
+            proposal.clone(),
+        )
+        .expect_err("old admitted command must finish before ACK replay");
+    assert_eq!(blocked.kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(rt.actors[&id].mailbox.len(), 1);
+
+    // Simulate the trusted host committing the original actor result.
+    // An inbox receipt alone does not mean the handler has completed.
+    let mut snapshot = rt.persistence.load_snapshot(id).unwrap_or_default();
+    snapshot.actor_id = id;
+    snapshot.sequence = expected.sequence + 1;
+    snapshot.activation_epoch = expected.activation_epoch;
+    snapshot.schema_name = Some(rt.actors[&id].name.clone());
+    snapshot
+        .state
+        .insert("total".to_owned(), PersistedValue::Int(5));
+    rt.persistence
+        .commit_transition(DurableTransition {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id: id,
+            activation_epoch: expected.activation_epoch,
+            sequence: expected.sequence + 1,
+            expected_previous_sequence: expected.sequence,
+            command: None,
+            snapshot: Some(snapshot),
+            workflow_events: vec![],
+            domain_events: vec![],
+            durable_effects: vec![],
+            outbox: vec![],
+        })
+        .expect("atomic completion record");
+
     let outcome = rt
         .admit_next_typed_actor_command_with_inbox(id, receipt_key, proposal)
         .unwrap()
-        .expect("duplicate found");
+        .expect("completed command duplicate ACK");
     match outcome {
         TypedInboxAdmission::Duplicate { commit } => assert_eq!(commit, expected),
         TypedInboxAdmission::New { .. } => panic!("duplicate cannot be returned to handler"),
@@ -145,11 +181,8 @@ fn failed_or_conflicting_inbox_admission_preserves_mailbox_and_predecessor() {
     let previous = rt.persistence.latest_sequence(id);
     rt.send_message_by_id(id, behavior, &[Value::int(5)]);
     let mismatched_key = request(id, behavior, "bad", 99);
-    let result = rt.admit_next_typed_actor_command_with_inbox(
-        id,
-        mismatched_key,
-        transition(&rt, id, behavior, 5),
-    );
+    let proposed = transition(&rt, id, behavior, 5);
+    let result = rt.admit_next_typed_actor_command_with_inbox(id, mismatched_key, proposed);
     assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
     assert_eq!(rt.actors[&id].mailbox.len(), 1);
     assert_eq!(rt.persistence.latest_sequence(id), previous);
