@@ -236,6 +236,8 @@ fn libsql_reopens_only_valid_atomic_effect_history_after_rejected_turn() {
         "nulang_transition_identity_integrity_{}",
         std::process::id()
     ));
+    // Repeated runs must not recover a stale fixture left by a crashed test process.
+    let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     let path = root.join("actor.sqlite3");
 
