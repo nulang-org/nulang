@@ -40,7 +40,7 @@ run cargo check --locked --tests
 # Default feature matrix.
 run cargo build --locked --all-targets
 run cargo test --locked
-run python3 scripts/verify_implementation.py
+run python3 scripts/verify_implementation.py --skip-tests
 
 # Minimal feature matrix. This is intentionally run without adding any Python
 # system dependency here; CI uses the same property to prove optional features

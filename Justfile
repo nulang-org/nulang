@@ -27,13 +27,14 @@ fast-check: check-nextest
     cargo check --locked --tests
     cargo nextest run --locked
 
-# Full default-feature pre-merge gate. Feature-matrix, release, WASM, formal,
-# audit, and benchmark coverage remain CI-owned.
-check: check-nextest
-    cargo fmt --check
-    cargo clippy --locked --all-targets -- -D clippy::correctness
-    cargo nextest run --locked
-    cargo test --locked --doc
-    python3 scripts/verify_implementation.py --skip-tests
+# Canonical local pre-merge gate. Same implementation as mise run check.
+# Includes compiler/runtime feature matrices; hosted platform gates stay in CI.
+check:
+    bash scripts/ci-local.sh
+
+# Extended local validation (release, rustdoc, audit, doc snippets, Lean).
+# This does not substitute for hosted cross-platform packaging/bench/fuzz jobs.
+check-full:
+    bash scripts/ci-local.sh --full
 
 ci: check
