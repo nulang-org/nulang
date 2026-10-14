@@ -15,7 +15,7 @@ use nulang::runtime::{
 use nulang::typechecker::TypeChecker;
 use std::collections::HashMap;
 use std::os::unix::process::ExitStatusExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -146,6 +146,19 @@ fn durable_process_kill_worker() {
     }
 }
 
+/// Ensure a failed/timeout assertion does not leave the crash child running
+/// and holding an open WAL writer on the developer's machine.
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
 struct CrashFixture {
     directory: PathBuf,
 }
@@ -179,30 +192,32 @@ fn kill_at(stage: &str) -> CrashFixture {
     let fixture = CrashFixture { directory };
     let marker = fixture.directory.join("ready");
 
-    let mut child = Command::new(std::env::current_exe().expect("test binary path"))
-        .arg("--exact")
-        .arg("durable_process_kill_worker")
-        .arg("--nocapture")
-        .env("NULANG_TEST_CRASH_WINDOW", stage)
-        .env("NULANG_TEST_DB", fixture.database())
-        .env("NULANG_TEST_READY", &marker)
-        .spawn()
-        .expect("launch separate durable writer");
+    let mut child = KillOnDrop(
+        Command::new(std::env::current_exe().expect("test binary path"))
+            .arg("--exact")
+            .arg("durable_process_kill_worker")
+            .arg("--nocapture")
+            .env("NULANG_TEST_CRASH_WINDOW", stage)
+            .env("NULANG_TEST_DB", fixture.database())
+            .env("NULANG_TEST_READY", &marker)
+            .spawn()
+            .expect("launch separate durable writer"),
+    );
 
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if marker.exists() {
             break;
         }
-        if let Some(status) = child.try_wait().expect("poll child") {
+        if let Some(status) = child.0.try_wait().expect("poll child") {
             panic!("crash worker exited before the {stage} boundary: {status}");
         }
         assert!(Instant::now() < deadline, "crash worker never reached {stage}");
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert!(child.try_wait().unwrap().is_none(), "worker must still be alive");
-    child.kill().expect("SIGKILL worker at durable boundary");
-    let killed = child.wait().expect("reap worker");
+    assert!(child.0.try_wait().unwrap().is_none(), "worker must still be alive");
+    child.0.kill().expect("SIGKILL worker at durable boundary");
+    let killed = child.0.wait().expect("reap worker");
     assert_eq!(killed.signal(), Some(9), "must use a real SIGKILL");
     fixture
 }
