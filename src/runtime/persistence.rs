@@ -1405,6 +1405,24 @@ pub enum SqliteSyncMode {
     Full,
 }
 
+/// Decode a persisted 32-byte digest from the canonical lower-case hex
+/// representation. Corrupt receipts must never be treated as new messages.
+#[cfg(feature = "sqlite")]
+fn decode_inbox_digest(value: &str) -> io::Result<[u8; 32]> {
+    if value.len() != 64 || !value.is_ascii() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid durable inbox receipt digest length",
+        ));
+    }
+    let mut decoded = [0u8; 32];
+    for (index, byte) in decoded.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid inbox hex digest"))?;
+    }
+    Ok(decoded)
+}
+
 #[cfg(feature = "sqlite")]
 pub struct LibsqlStore {
     conn: std::sync::Mutex<libsql::Connection>,
@@ -1627,6 +1645,26 @@ impl LibsqlStore {
                     activation_epoch INTEGER NOT NULL,
                     sequence INTEGER NOT NULL,
                     digest TEXT NOT NULL
+                )",
+                (),
+            )
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            // Versioned v1 durable-inbox dedup receipts. This table must be
+            // written in the same transaction as durable_tails and journal.
+            // The primary key serializes competing host attempts for the
+            // *logical* sender message independently of receiver sequence.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS durable_inbox_receipts (
+                    message_id TEXT PRIMARY KEY NOT NULL,
+                    request_digest TEXT NOT NULL,
+                    actor_id INTEGER NOT NULL,
+                    activation_epoch INTEGER NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    transition_digest TEXT NOT NULL,
+                    CHECK(length(message_id) = 64),
+                    CHECK(length(request_digest) = 64),
+                    CHECK(length(transition_digest) = 64)
                 )",
                 (),
             )
@@ -2258,6 +2296,79 @@ impl LibsqlStore {
 
 #[cfg(feature = "sqlite")]
 impl PersistenceStore for LibsqlStore {
+    fn commit_inbox_transition(
+        &mut self,
+        request: DurableInboxCommand,
+        transition: DurableTransition,
+    ) -> io::Result<DurableCommit> {
+        self.commit_transition_with_inbox(transition, Some(request))
+    }
+
+    fn load_durable_inbox_receipt(
+        &self,
+        id: DurableInboxId,
+    ) -> io::Result<Option<DurableInboxReceipt>> {
+        let id_hex = id.to_string();
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let mut rows = conn
+                .query(
+                    "SELECT request_digest, actor_id, activation_epoch, sequence, transition_digest
+                     FROM durable_inbox_receipts WHERE message_id = ?1",
+                    libsql::params![id_hex.as_str()],
+                )
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+            else {
+                return Ok(None);
+            };
+            let request_hex: String = row
+                .get(0)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            let actor: i64 = row
+                .get(1)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            let epoch: i64 = row
+                .get(2)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            let sequence: i64 = row
+                .get(3)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            let transition_hex: String = row
+                .get(4)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            let actor = u64::try_from(actor).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "negative durable inbox actor")
+            })?;
+            let epoch = u64::try_from(epoch).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "negative durable inbox epoch")
+            })?;
+            let sequence = u64::try_from(sequence).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "negative durable inbox sequence")
+            })?;
+            if actor == 0 || epoch == 0 || sequence == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid durable inbox receipt position",
+                ));
+            }
+            Ok(Some(DurableInboxReceipt {
+                id,
+                request_digest: decode_inbox_digest(&request_hex)?,
+                commit: DurableCommit {
+                    actor_id: actor,
+                    activation_epoch: epoch,
+                    sequence,
+                    digest: decode_inbox_digest(&transition_hex)?,
+                },
+            }))
+        })
+    }
+
     fn load_durable_tail_position(&self, actor_id: u64) -> io::Result<Option<DurableTailPosition>> {
         let conn = self.conn();
         self.rt.block_on(async {
