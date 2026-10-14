@@ -178,7 +178,7 @@ impl fmt::Display for ExecutionPinError {
             Self::Manifest(error) => write!(f, "invalid execution artifact: {error}"),
             Self::UnsupportedVersion { version } => write!(
                 f,
-                "unsupported durable execution pin version {version}; expected {DURABLE_EXECUTION_PIN_VERSION}"
+                "unsupported pin version {version}; expected {DURABLE_EXECUTION_PIN_VERSION}"
             ),
             Self::InvalidExecutionId => write!(f, "durable execution pin has empty execution ID"),
             Self::InvalidPackage => write!(f, "durable execution pin has empty package name"),
@@ -198,11 +198,11 @@ impl fmt::Display for ExecutionPinError {
             ),
             Self::ExecutableDigestMismatch { pinned, incoming } => write!(
                 f,
-                "durable execution executable digest mismatch: pinned '{pinned}', incoming '{incoming}'"
+                "executable digest mismatch: pinned '{pinned}', incoming '{incoming}'"
             ),
             Self::BehaviorDigestMismatch { pinned, incoming } => write!(
                 f,
-                "durable execution behavior digest mismatch: pinned '{pinned}', incoming '{incoming}'"
+                "behavior digest mismatch: pinned '{pinned}', incoming '{incoming}'"
             ),
         }
     }
