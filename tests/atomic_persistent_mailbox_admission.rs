@@ -557,3 +557,54 @@ fn completion_cannot_install_forged_external_authority_from_snapshot() {
         "untrusted completion must not publish state"
     );
 }
+
+#[test]
+fn synchronous_ask_cannot_bypass_committed_but_unfinished_durable_command() {
+    let (mut runtime, actor_id, behavior, _) = spawned();
+    let previous = runtime.persistence.latest_sequence(actor_id);
+    runtime.send_message_by_id(actor_id, behavior, &[Value::int(5)]);
+    let first = command(&runtime, actor_id, behavior, previous, 5);
+    let (_, receipt) = runtime
+        .admit_next_typed_actor_command(actor_id, first)
+        .unwrap()
+        .expect("admitted message");
+
+    let error = runtime
+        .ask_actor_sync(actor_id, behavior, &[Value::int(99)])
+        .expect_err("sync ask cannot bypass admitted completion fence");
+    assert!(error.to_string().contains("durable admission"));
+    assert_eq!(
+        runtime.actors[&actor_id]
+            .get_state_field("total")
+            .and_then(|value| value.as_int()),
+        Some(0),
+        "sync ask must not execute while a durable command is unfinished"
+    );
+    assert_eq!(runtime.persistence.latest_sequence(actor_id), receipt.sequence);
+    assert_eq!(
+        runtime.actors[&actor_id].mailbox.admitted_command_sequence(),
+        Some(receipt.sequence)
+    );
+}
+
+#[test]
+fn synchronous_ask_cannot_bypass_failed_durable_admission() {
+    let (mut runtime, actor_id, behavior, _) = spawned();
+    let previous = runtime.persistence.latest_sequence(actor_id);
+    runtime.send_message_by_id(actor_id, behavior, &[Value::int(5)]);
+    let invalid = command(&runtime, actor_id, behavior, previous + 1, 5);
+    assert!(runtime.admit_next_typed_actor_command(actor_id, invalid).is_err());
+
+    let error = runtime
+        .ask_actor_sync(actor_id, behavior, &[Value::int(7)])
+        .expect_err("sync ask cannot jump ahead of uncommitted mailbox candidate");
+    assert!(error.to_string().contains("durable admission"));
+    assert_eq!(runtime.persistence.latest_sequence(actor_id), previous);
+    assert_eq!(runtime.actors[&actor_id].mailbox.len(), 1);
+    assert_eq!(
+        runtime.actors[&actor_id]
+            .get_state_field("total")
+            .and_then(|value| value.as_int()),
+        Some(0)
+    );
+}
