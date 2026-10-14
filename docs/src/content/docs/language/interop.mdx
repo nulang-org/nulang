@@ -91,20 +91,21 @@ Runtime-host `Python.call` now resolves Nulang string arguments by content throu
 // Requires a host Python 3 runtime.
 actor PyCaller {
     behavior run() {
+        perform Python.import("math")
         let root = perform Python.call("math", "sqrt", 16)
         perform IO.println("sqrt(16) = " + perform Int.to_string(root))
     }
 }
 
 fn main() {
-    let worker = spawn PyCaller {} with [Python::call]
+    let worker = spawn PyCaller {} with [Python::import, Python::call]
     worker ! run()
     0
 }
 ```
 
 :::note
-The parser now accepts `perform Python.import("math")`; the runtime-host `Python.call` resolves owned string arguments and `Python.get_attr` reads attributes without attempting to invoke them. The actor-runtime host and a binary built with the `python` feature are still required, along with the appropriate OS and actor authority grants. Import the Python module explicitly before accessing its exports. Import/call/get-attribute failures currently emit diagnostics and return `nil`; Python strings returned to the VM remain opaque handles. Source-to-actor execution requires separate Python-enabled integration validation before production use.
+The parser now accepts both `perform Python.import("math")` and its explicit actor-grant counterpart `Python::import`. The runtime-host `Python.call` resolves owned string arguments and `Python.get_attr` reads attributes without attempting to invoke them. The actor-runtime host and a binary built with the `python` feature are still required, along with the appropriate OS and actor authority grants. Import the Python module explicitly before accessing its exports. Import/call/get-attribute failures currently emit diagnostics and return `nil`; Python strings returned to the VM remain opaque handles. Source-to-actor execution requires separate Python-enabled integration validation before production use.
 :::
 
 ## The C FFI
