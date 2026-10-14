@@ -143,3 +143,61 @@ fn absent_corrupt_and_future_pins_fail_closed() {
         Err(ExecutionPinError::InvalidDigest { .. })
     ));
 }
+
+#[test]
+fn cli_preflight_roundtrip_rejects_modified_artifact() {
+    use std::fs;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
+    let directory = std::env::temp_dir().join(format!(
+        "nulang-durable-execution-pin-{}-{}",
+        std::process::id(),
+        NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&directory).unwrap();
+    let manifest_path = directory.join("payment.behavior.json");
+    let artifact_path = directory.join("payment.nbc");
+    let pin_path = directory.join("payment.pin.json");
+    let bytes = b"executable-1";
+    fs::write(&manifest_path, manifest(bytes).to_json().unwrap()).unwrap();
+    fs::write(&artifact_path, bytes).unwrap();
+
+    let executable = env!("CARGO_BIN_EXE_nulang-execution-preflight");
+    let pin = Command::new(executable)
+        .args([
+            "pin",
+            "payments/99",
+            manifest_path.to_str().unwrap(),
+            artifact_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(pin.status.success(), "{}", String::from_utf8_lossy(&pin.stderr));
+    fs::write(&pin_path, pin.stdout).unwrap();
+
+    let verify = || {
+        Command::new(executable)
+            .args([
+                "verify",
+                "payments/99",
+                pin_path.to_str().unwrap(),
+                manifest_path.to_str().unwrap(),
+                artifact_path.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+    };
+    let success = verify();
+    assert!(
+        success.status.success(),
+        "{}",
+        String::from_utf8_lossy(&success.stderr)
+    );
+
+    fs::write(&artifact_path, b"modified-binary").unwrap();
+    let rejected = verify();
+    assert!(!rejected.status.success());
+    fs::remove_dir_all(directory).unwrap();
+}
