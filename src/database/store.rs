@@ -22,6 +22,9 @@ pub struct WalBackedTablet {
     tablet: MemoryTablet,
     wal: FileWal,
     checkpoint_path: PathBuf,
+    // An interrupted retention checkpoint can already be published on disk.
+    // Never allow this handle to overwrite it or commit until reopened.
+    recovery_required: bool,
 }
 
 impl WalBackedTablet {
@@ -42,6 +45,7 @@ impl WalBackedTablet {
             tablet,
             wal,
             checkpoint_path,
+            recovery_required: false,
         })
     }
 
@@ -64,21 +68,30 @@ impl WalBackedTablet {
         expected_previous_sequence: u64,
         mutations: Vec<TabletMutation>,
     ) -> Result<TabletWrite, TabletError> {
+        if self.recovery_required {
+            return Err(TabletError::RecoveryRequired);
+        }
         self.tablet
             .prepare_write(presented_epoch, expected_previous_sequence, mutations)
     }
 
     /// Durably commit one write before making it visible to readers.
     pub fn commit(&mut self, write: TabletWrite) -> Result<u64, WalBackedError> {
+        self.require_recovered()?;
         self.tablet.validate_write(&write)?;
         self.wal.append_write(&write)?;
         Ok(self.tablet.publish_validated(write))
     }
 
     pub fn read_at(&self, key: &[u8], snapshot: u64) -> Result<Option<&[u8]>, TabletError> {
+        if self.recovery_required {
+            return Err(TabletError::RecoveryRequired);
+        }
         self.tablet.read_at(key, snapshot)
     }
 
+    /// The latest committed value is unaffected by MVCC pruning. On a
+    /// recovery-required handle, historical reads and writes remain blocked.
     pub fn read_latest(&self, key: &[u8]) -> Option<&[u8]> {
         self.tablet.read_latest(key)
     }
@@ -88,6 +101,7 @@ impl WalBackedTablet {
     /// This is a valid crash state and is intentionally public so operators can
     /// separate checkpoint publication from later space reclamation.
     pub fn publish_checkpoint(&self) -> Result<(), WalBackedError> {
+        self.require_recovered()?;
         checkpoint::write_checkpoint(&self.checkpoint_path, &self.tablet)?;
         Ok(())
     }
@@ -97,6 +111,7 @@ impl WalBackedTablet {
     /// fails, the already-published checkpoint plus the full WAL remain a valid
     /// recovery state.
     pub fn checkpoint(&mut self) -> Result<(), WalBackedError> {
+        self.require_recovered()?;
         self.publish_checkpoint()?;
         self.wal.reclaim_through(self.tablet.current_sequence())?;
         Ok(())
@@ -112,12 +127,31 @@ impl WalBackedTablet {
     /// If the WAL rewrite fails, the checkpoint is still valid, but the
     /// handle may require reopening before accepting further writes.
     pub fn reclaim_history_before(&mut self, floor: u64) -> Result<(), WalBackedError> {
+        self.require_recovered()?;
         let mut candidate = self.tablet.clone();
         candidate.prune_history_before(floor)?;
-        checkpoint::write_checkpoint(&self.checkpoint_path, &candidate)?;
+
+        // After any publication error, including one reported after rename,
+        // disk may have a newer retention floor than the live tablet. Poison
+        // this handle to avoid accidentally rewriting the durable checkpoint.
+        if let Err(error) = checkpoint::write_checkpoint(&self.checkpoint_path, &candidate) {
+            self.recovery_required = true;
+            return Err(error.into());
+        }
         self.tablet = candidate;
-        self.wal.reclaim_through(self.tablet.current_sequence())?;
+        if let Err(error) = self.wal.reclaim_through(self.tablet.current_sequence()) {
+            self.recovery_required = true;
+            return Err(error.into());
+        }
         Ok(())
+    }
+
+    fn require_recovered(&self) -> Result<(), WalBackedError> {
+        if self.recovery_required {
+            Err(WalBackedError::Tablet(TabletError::RecoveryRequired))
+        } else {
+            Ok(())
+        }
     }
 }
 
