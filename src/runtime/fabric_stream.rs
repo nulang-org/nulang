@@ -1935,6 +1935,115 @@ mod tests {
     }
 
     #[test]
+    fn producer_idempotent_append_survives_restart_and_fences_epochs() {
+        let root = test_dir("producer-dedup-restart");
+        {
+            let mut store = FileFabricStreamStore::open(&root).unwrap();
+            store.create_stream("events", FabricStreamConfig::default()).unwrap();
+            assert_eq!(store.append_idempotent("events", "writer", 1, 1, b"one").unwrap(), 1);
+            assert_eq!(store.append_idempotent("events", "writer", 1, 1, b"one").unwrap(), 1);
+            assert_eq!(store.append_idempotent("events", "writer", 1, 2, b"two").unwrap(), 2);
+            assert_eq!(store.read_from("events", 1, 10).unwrap().len(), 2);
+        }
+
+        let mut reopened = FileFabricStreamStore::open(&root).unwrap();
+        assert_eq!(
+            reopened.append_idempotent("events", "writer", 1, 2, b"two").unwrap(),
+            2
+        );
+        assert!(reopened.append_idempotent("events", "writer", 1, 2, b"changed").is_err());
+        assert!(reopened.append_idempotent("events", "writer", 1, 1, b"one").is_err());
+        assert!(reopened.append_idempotent("events", "writer", 1, 4, b"gap").is_err());
+        assert_eq!(reopened.append_idempotent("events", "writer", 2, 1, b"new-term").unwrap(), 3);
+        assert!(reopened.append_idempotent("events", "writer", 1, 3, b"old-term").is_err());
+        assert_eq!(reopened.read_from("events", 1, 10).unwrap().len(), 3);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn producer_intent_recovers_before_and_after_local_append() {
+        for record_written in [false, true] {
+            let root = test_dir(if record_written { "intent-after" } else { "intent-before" });
+            {
+                let mut store = FileFabricStreamStore::open(&root).unwrap();
+                store.create_stream("events", FabricStreamConfig::default()).unwrap();
+                let intent = ProducerIntent {
+                    producer: "worker".to_string(),
+                    epoch: 1,
+                    producer_sequence: 1,
+                    stream_sequence: 1,
+                    digest: producer_digest(b"durable"),
+                };
+                write_json_atomic(
+                    &root.join("events").join("producer_state.json"),
+                    &ProducerStateFile {
+                        version: STREAM_FORMAT_VERSION,
+                        checkpoints: BTreeMap::new(),
+                        pending: Some(intent),
+                    },
+                )
+                .unwrap();
+                if record_written {
+                    // Simulate a crash after segment fsync but before checkpoint commit.
+                    store.append_exact("events", 1, b"durable").unwrap();
+                }
+            }
+            let mut reopened = FileFabricStreamStore::open(&root).unwrap();
+            assert!(reopened.append("events", b"other").is_err());
+            assert!(reopened.append_replica("events", 1, b"other").is_err());
+            assert!(reopened
+                .append_idempotent("events", "other", 1, 1, b"other")
+                .is_err());
+            assert_eq!(
+                reopened.append_idempotent("events", "worker", 1, 1, b"durable").unwrap(),
+                1
+            );
+            assert_eq!(reopened.read_from("events", 1, 10).unwrap().len(), 1);
+            assert_eq!(reopened.append("events", b"next").unwrap(), 2);
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn producer_pending_conflict_fails_closed_and_replication_is_not_supported() {
+        let root = test_dir("producer-conflict");
+        let mut store = FileFabricStreamStore::open(&root).unwrap();
+        store.create_stream("events", FabricStreamConfig::default()).unwrap();
+        write_json_atomic(
+            &root.join("events").join("producer_state.json"),
+            &ProducerStateFile {
+                version: STREAM_FORMAT_VERSION,
+                checkpoints: BTreeMap::new(),
+                pending: Some(ProducerIntent {
+                    producer: "writer".to_string(),
+                    epoch: 1,
+                    producer_sequence: 1,
+                    stream_sequence: 1,
+                    digest: producer_digest(b"original"),
+                }),
+            },
+        )
+        .unwrap();
+        assert!(store.append_idempotent("events", "writer", 1, 1, b"different").is_err());
+        assert!(store.read_from("events", 1, 10).unwrap().is_empty());
+        store.append_idempotent("events", "writer", 1, 1, b"original").unwrap();
+        assert!(store
+            .establish_replication_policy(
+                "events",
+                FabricStreamReplicationPolicy {
+                    partition: 0,
+                    epoch: FABRIC_STREAM_INITIAL_EPOCH,
+                    leader: 10,
+                    membership_fingerprint: 44,
+                    replication_factor: 2,
+                    replicas: vec![10, 11],
+                }
+            )
+            .is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn recovery_truncates_only_incomplete_final_record() {
         let root = test_dir("tail-repair");
         let mut store = FileFabricStreamStore::open(&root).unwrap();
