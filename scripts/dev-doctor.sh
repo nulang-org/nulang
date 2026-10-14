@@ -1,6 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+usage() {
+  printf 'Usage: bash scripts/dev-doctor.sh [--accelerated]\n'
+  printf '  (default)      Validate the portable Cargo contributor toolchain.\n'
+  printf '  --accelerated  Also require mise + mbx for shared agent/worktree caching.\n'
+}
+
+profile=portable
+if (( $# > 1 )); then
+  usage >&2
+  exit 2
+fi
+case "${1:-}" in
+  "") ;;
+  --accelerated) profile=accelerated ;;
+  -h|--help) usage; exit 0 ;;
+  *) usage >&2; exit 2 ;;
+esac
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
@@ -20,20 +38,31 @@ need() {
   fi
 }
 
-printf 'Nulang development environment doctor\n\n'
+printf 'Nulang development environment doctor (%s profile)\n\n' "$profile"
 
-for cmd in git rustup rustc cargo python3 cc pkg-config mbx; do
+for cmd in git rustup rustc cargo python3 cc pkg-config; do
   need "$cmd"
 done
+
+# The basic source build and conformance suite do not depend on mise or mbx.
+# They are a supported optional accelerator for linked worktrees/agent builds.
+if [[ "$profile" == accelerated ]]; then
+  need mbx
+  need mise
+elif ! command -v mbx >/dev/null 2>&1; then
+  warn "optional mbx not installed (required only for --accelerated)"
+fi
 
 if command -v mise >/dev/null 2>&1; then
   if mise doctor >/dev/null 2>&1; then
     ok "mise doctor"
-  else
+  elif [[ "$profile" == accelerated ]]; then
     fail "mise doctor reported a problem (run: mise doctor)"
+  else
+    warn "mise doctor reported a problem (run: mise doctor); portable Cargo builds do not require mise"
   fi
-else
-  fail "missing required command: mise"
+elif [[ "$profile" == portable ]]; then
+  warn "optional mise not installed (required only for --accelerated)"
 fi
 
 if command -v rustc >/dev/null 2>&1; then
