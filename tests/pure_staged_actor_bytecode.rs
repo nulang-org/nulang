@@ -4,7 +4,8 @@ use nulang::bytecode::{CodeModule, Instruction, OpCode};
 use nulang::lexer::Lexer;
 use nulang::parser::Parser;
 use nulang::runtime::{
-    DurableTransition, JournalEntry, PersistedValue, Runtime, DURABLE_TRANSITION_VERSION,
+    DurableTransition, JournalEntry, PersistedValue, PersistenceStore, Runtime,
+    DURABLE_TRANSITION_VERSION,
 };
 use nulang::typechecker::TypeChecker;
 use nulang::vm::Value;
@@ -315,7 +316,6 @@ impl nulang::runtime::PersistenceStore for RejectResultStore {
 
 #[test]
 fn failed_atomic_result_commit_keeps_live_state_fenced_until_retry_succeeds() {
-    use nulang::runtime::PersistenceStore;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
