@@ -7,8 +7,9 @@ use nulang::behavior_manifest::{
 };
 use nulang::content_identity::SemanticId;
 use nulang::runtime::{
-    ImmutablePinnedArtifactResolver, PinnedArtifactBundle, Runtime, StateModel,
-    WorkflowEvent,
+    ActorSnapshot, DurableTransition, ImmutablePinnedArtifactResolver, MemoryStore,
+    PersistenceStore, PinnedArtifactBundle, Runtime, StateModel, WorkflowEvent,
+    DURABLE_TRANSITION_VERSION,
 };
 use nulang::vm::Value;
 use std::collections::HashMap;
@@ -215,4 +216,50 @@ fn runtime_reopen_requires_exact_pinned_artifact_before_actor_publication() {
     );
     drop(next);
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn unverified_atomic_start_without_decodable_pin_is_not_treated_as_legacy() {
+    let mut store = MemoryStore::new();
+    store.commit_transition(DurableTransition {
+        version: DURABLE_TRANSITION_VERSION,
+        actor_id: 123,
+        activation_epoch: 1,
+        sequence: 1,
+        expected_previous_sequence: 0,
+        command: None,
+        snapshot: Some(ActorSnapshot {
+            actor_id: 123,
+            sequence: 1,
+            activation_epoch: 1,
+            ..ActorSnapshot::default()
+        }),
+        workflow_events: vec![WorkflowEvent::WorkflowStarted {
+            sequence: 1,
+            name: "Payment".into(),
+            state: Vec::new(),
+        }],
+        domain_events: Vec::new(),
+        durable_effects: Vec::new(),
+        outbox: Vec::new(),
+    }).unwrap();
+
+    let mut runtime = Runtime::new();
+    runtime.persistence = Box::new(store);
+    assert_eq!(runtime.recover_actor(123), None);
+    assert!(!runtime.actors.contains_key(&123));
+    let bytes = b"payment-workflow-v1";
+    let resolver = FixtureResolver {
+        expected_digest: manifest(bytes).artifact.digest.clone(),
+        artifact: Some(PinnedArtifactBundle {
+            manifest: manifest(bytes),
+            executable: bytes.to_vec(),
+        }),
+    };
+    assert_eq!(
+        runtime.recover_pinned_workflow_actor(123, "payment/123", &resolver)
+            .unwrap_err().kind(),
+        ErrorKind::InvalidData,
+    );
+    assert!(!runtime.actors.contains_key(&123));
 }
