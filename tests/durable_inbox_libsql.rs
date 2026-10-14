@@ -236,3 +236,23 @@ fn two_connections_competing_for_same_sequence_never_both_commit() {
         1
     );
 }
+
+#[test]
+fn detailed_libsql_disposition_survives_reopen_and_returns_existing_ack() {
+    let file = TestDatabase::new();
+    let input = identity(51, "detailed", 7);
+    let first = {
+        let mut store = file.store();
+        store
+            .commit_inbox_transition_detailed(input.clone(), command(51, 0, 7))
+            .expect("new receipt")
+    };
+    assert!(first.newly_accepted);
+    let mut reopened = file.store();
+    let retry = reopened
+        .commit_inbox_transition_detailed(input, command(51, 0, 7))
+        .expect("replayed receipt");
+    assert!(!retry.newly_accepted);
+    assert_eq!(first.commit, retry.commit);
+    assert_eq!(reopened.read_journal(51).len(), 1);
+}
