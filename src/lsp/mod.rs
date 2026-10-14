@@ -58,6 +58,54 @@ fn utf16_col_to_byte(line: &str, col: usize) -> usize {
     line.len()
 }
 
+/// Convert a range's LSP UTF-16 position into a byte offset. Unlike
+/// completion-position lookup, document edits must reject out-of-bounds
+/// columns and positions inside surrogate pairs rather than clamping.
+fn edit_position_to_byte_offset(source: &str, position: Position) -> Option<usize> {
+    let mut line_offset = 0usize;
+    for (line_index, line) in source.split('\n').enumerate() {
+        if line_index == position.line as usize {
+            let target = position.character as usize;
+            let mut utf16_col = 0usize;
+            for (byte_offset, ch) in line.char_indices() {
+                if utf16_col == target {
+                    return Some(line_offset + byte_offset);
+                }
+                utf16_col += ch.len_utf16();
+                if utf16_col > target {
+                    return None;
+                }
+            }
+            return (utf16_col == target).then_some(line_offset + line.len());
+        }
+        line_offset += line.len() + 1;
+    }
+    None
+}
+
+/// Apply each LSP change in order to a copy of the source. A batch with
+/// an invalid range fails atomically, leaving DocumentState unchanged.
+fn apply_document_changes(
+    source: &str,
+    changes: &[TextDocumentContentChangeEvent],
+) -> Option<String> {
+    let mut updated = source.to_string();
+    for change in changes {
+        if let Some(range) = change.range {
+            let start = edit_position_to_byte_offset(&updated, range.start)?;
+            let end = edit_position_to_byte_offset(&updated, range.end)?;
+            if start > end {
+                return None;
+            }
+            updated.replace_range(start..end, &change.text);
+        } else {
+            // LSP still permits full-document replacement events.
+            updated = change.text.clone();
+        }
+    }
+    Some(updated)
+}
+
 // ---------------------------------------------------------------------------
 // LSP Server
 // ---------------------------------------------------------------------------
@@ -264,7 +312,7 @@ impl LanguageServer for NulangLanguageServer {
                 text_document_sync: Some(TextDocumentSyncCapability::Options(
                     TextDocumentSyncOptions {
                         open_close: Some(true),
-                        change: Some(TextDocumentSyncKind::FULL),
+                        change: Some(TextDocumentSyncKind::INCREMENTAL),
                         will_save: None,
                         will_save_wait_until: None,
                         save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
@@ -328,16 +376,18 @@ impl LanguageServer for NulangLanguageServer {
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri.clone();
         let version = params.text_document.version;
-        let source = params
-            .content_changes
-            .into_iter()
-            .next()
-            .map(|c| c.text)
-            .unwrap_or_default();
 
-        {
+        // Apply the entire ordered edit batch against the previous document.
+        // A malformed range cannot corrupt the cached source or AST.
+        let source = {
             let mut docs = self.documents.lock().unwrap();
-            if let Some(doc) = docs.get_mut(&uri) {
+            let Some(doc) = docs.get_mut(&uri) else {
+                return;
+            };
+            if version <= doc.version || params.content_changes.is_empty() {
+                return;
+            }
+            if let Some(source) = apply_document_changes(&doc.source, &params.content_changes) {
                 doc.version = version;
                 doc.source = source.clone();
                 doc.type_map = None;
@@ -346,10 +396,22 @@ impl LanguageServer for NulangLanguageServer {
                 doc.diagnostics_pending = true;
                 doc.inferred_decl_types = None;
                 doc.function_rows = None;
+                Some(source)
+            } else {
+                None
             }
-        }
+        };
 
-        self.schedule_diagnostics(uri, version, source);
+        if let Some(source) = source {
+            self.schedule_diagnostics(uri, version, source);
+        } else {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    "Ignored invalid incremental document edit; reopen the file to resynchronize.",
+                )
+                .await;
+        }
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
