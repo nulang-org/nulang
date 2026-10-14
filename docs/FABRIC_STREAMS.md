@@ -140,7 +140,7 @@ must add:
 3. ACK/NACK and timed redelivery,
 4. retention by age/bytes/sequence,
 5. dead-letter streams,
-6. producer deduplication/idempotency keys,
+6. replicated producer deduplication/idempotency keys (standalone storage-only support is described above),
 7. consumer groups and partition assignment,
 8. sequence/time seek indexes,
 9. typed language-level stream declarations,
