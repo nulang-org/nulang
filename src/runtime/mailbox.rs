@@ -273,7 +273,11 @@ pub struct Mailbox {
     /// access it; concurrent producers never touch it.
     local_queue: VecDeque<Message>,
     capacity: usize,
+    /// Total logical messages, including supervisor/system traffic.
     queued_count: AtomicUsize,
+    /// Normal/Bulk messages that hold a bounded-capacity credit. System
+    /// signals must never consume these credits, even while staged by receive.
+    normal_count: AtomicUsize,
     /// System messages already observed by a selective receive. They remain
     /// logically queued until a successful pattern+guard commits exactly one.
     system_skip_buffer: VecDeque<(Message, bool)>,
@@ -294,8 +298,8 @@ pub struct Mailbox {
 impl Mailbox {
     /// Create a new mailbox.
     ///
-    /// `capacity`: maximum total messages allowed. `0` = unbounded.
-    /// `System` messages always bypass the limit.
+    /// `capacity`: maximum queued `Normal`/`Bulk` messages. `0` = unbounded.
+    /// `System` messages bypass admission and do not consume this capacity.
     pub fn new(capacity: usize) -> Self {
         Mailbox {
             system_queue: SegQueue::new(),
@@ -303,6 +307,7 @@ impl Mailbox {
             local_queue: VecDeque::new(),
             capacity,
             queued_count: AtomicUsize::new(0),
+            normal_count: AtomicUsize::new(0),
             system_skip_buffer: VecDeque::new(),
             local_skip_buffer: VecDeque::new(),
             skip_buffer: VecDeque::new(),
@@ -319,6 +324,8 @@ impl Mailbox {
         self.capacity = capacity;
         self.queued_count
             .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.normal_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         self.system_skip_buffer.clear();
         self.local_skip_buffer.clear();
         self.skip_buffer.clear();
@@ -328,40 +335,49 @@ impl Mailbox {
 
     /// Reserve one logical mailbox slot.
     ///
-    /// System messages and unbounded mailboxes always reserve successfully.
-    /// Bounded normal/bulk traffic uses CAS so concurrent producers cannot all
-    /// observe the same free slot and overfill the mailbox.
+    /// System traffic is unbounded and does not reduce normal/bulk capacity.
+    /// Bounded application traffic reserves a separate normal credit using
+    /// CAS, so concurrent producers cannot overfill the application lane.
+    /// The total logical count includes both lanes and stays accurate across
+    /// selective-receive staging and commits.
     fn reserve_slot(&self, system: bool) -> bool {
-        // queued_count is capacity/accounting state only; SegQueue owns
-        // publication and synchronization for the message itself. Atomic
-        // modification order is sufficient to keep bounded producers from
-        // over-reserving slots, so acquire/release fences add no ordering
-        // guarantee that the mailbox relies on.
-        if system || self.capacity == 0 {
+        if system {
             self.queued_count.fetch_add(1, Ordering::Relaxed);
             return true;
         }
 
-        let mut current = self.queued_count.load(Ordering::Relaxed);
+        if self.capacity == 0 {
+            self.normal_count.fetch_add(1, Ordering::Relaxed);
+            self.queued_count.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+
+        let mut current = self.normal_count.load(Ordering::Relaxed);
         loop {
             if current >= self.capacity {
                 return false;
             }
-            match self.queued_count.compare_exchange_weak(
+            match self.normal_count.compare_exchange_weak(
                 current,
                 current + 1,
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return true,
+                Ok(_) => break,
                 Err(observed) => current = observed,
             }
         }
+        self.queued_count.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
-    fn release_slot(&self) {
+    fn release_slot(&self, system: bool) {
         let previous = self.queued_count.fetch_sub(1, Ordering::Relaxed);
         debug_assert!(previous > 0, "mailbox logical count underflow");
+        if !system {
+            let previous_normal = self.normal_count.fetch_sub(1, Ordering::Relaxed);
+            debug_assert!(previous_normal > 0, "mailbox normal credit underflow");
+        }
     }
 
     /// Push a message from a concurrent producer.
@@ -405,7 +421,7 @@ impl Mailbox {
         if result.is_some() {
             self.active_match = None;
             self.invalidate_receive_indexes();
-            self.release_slot();
+            self.release_slot(result.as_ref().is_some_and(|m| m.priority == MessagePriority::System));
         }
         result
     }
@@ -589,7 +605,7 @@ impl Mailbox {
             MatchLane::Local => self.local_skip_buffer.remove(idx),
             MatchLane::Normal => self.skip_buffer.remove(idx),
         }?;
-        self.release_slot();
+        self.release_slot(_removed.0.priority == MessagePriority::System);
         self.invalidate_receive_indexes();
         self.clear_tried_flags();
         Some(payload)
@@ -1078,7 +1094,7 @@ mod bounded_admission_conformance_tests {
         let admitted: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
         assert_eq!(admitted, 32, "normal capacity must be exactly bounded");
         assert_eq!(mailbox.len(), 256 + 32);
-        let mut mailbox = Arc::try_unwrap(mailbox).expect("all producers finished");
+        let mut mailbox = Arc::try_unwrap(mailbox).unwrap_or_else(|_| panic!("all producers finished"));
         for _ in 0..256 {
             assert_eq!(mailbox.pop().unwrap().priority, MessagePriority::System);
         }
