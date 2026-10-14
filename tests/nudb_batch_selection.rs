@@ -84,6 +84,14 @@ fn selections_reject_cross_batch_length_mismatch() {
     let other_one = SelectionBitmap::from_predicate(&another_small, |_| true);
     assert_eq!(one.and(&other_one), Err(SelectionError::DifferentBatch));
     assert_eq!(other_one.or(&one), Err(SelectionError::DifferentBatch));
+
+    // Different batches with identical contents must not compare equal.
+    let identical_small = TabletScanBatch {
+        rows: vec![TabletScanRow { key: b"a", value: b"1" }],
+    };
+    let identical_selection = SelectionBitmap::from_predicate(&identical_small, |_| true);
+    assert_ne!(one, identical_selection);
+    assert_eq!(one, SelectionBitmap::from_predicate(&small, |_| true));
 }
 
 #[test]
