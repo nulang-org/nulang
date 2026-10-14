@@ -122,8 +122,9 @@ pub use object_store::*;
 pub use orca_cycle::*;
 pub use persistence::*;
 pub use pinned_execution::{
-    commit_pinned_workflow_start, read_pinned_workflow_pin,
-    verify_pinned_workflow_resume, ImmutablePinnedArtifactResolver, PinnedArtifactBundle,
+    claim_pinned_workflow_recovery, commit_pinned_workflow_start,
+    read_pinned_workflow_pin, verify_pinned_workflow_resume,
+    ImmutablePinnedArtifactResolver, PinnedArtifactBundle,
 };
 pub use process_groups::*;
 pub use registry::*;
@@ -5539,6 +5540,15 @@ impl Runtime {
                 "actor is already resident; cannot recover a second activation",
             ));
         }
+        // Capture the committed predecessor before calling the external
+        // artifact resolver, which may take time or race another recovery.
+        // A later claim must atomically prove this exact tail is still owned.
+        let observed_tail = self.persistence
+            .load_durable_tail_position(actor_id)?
+            .ok_or_else(|| Error::new(
+                ErrorKind::NotFound,
+                "pinned workflow has no durable predecessor",
+            ))?;
         let pin = pinned_execution::read_pinned_workflow_pin(
             self.persistence.as_ref(), actor_id,
         )?;
@@ -5582,25 +5592,50 @@ impl Runtime {
             ),
             None => None,
         };
+        // Claim the next epoch and sequence atomically only after the
+        // executable and selected schema have passed validation. A different
+        // worker advancing history during artifact resolution wins the race,
+        // and this worker refuses to activate.
+        let claim = pinned_execution::claim_pinned_workflow_recovery(
+            self.persistence.as_mut(),
+            actor_id,
+            observed_tail,
+        )?;
         if let Some((module, offsets, compensations)) = verified_module {
-            self.recovery_modules.insert(
-                actor_id,
-                (module, offsets, compensations),
-            );
+            self.recovery_modules.insert(actor_id, (module, offsets, compensations));
         }
 
-        match self.recover_actor_inner(actor_id) {
-            Some(id) => Ok(id),
-            None => {
-                // Failed hydration must not preserve a verified module
-                // registration that a later unverified caller could reuse.
+        let hydrated = self.recover_actor_inner(actor_id);
+        let still_owned = self.persistence
+            .load_durable_tail_position(actor_id)
+            .map(|tail| {
+                tail.is_some_and(|tail|
+                    tail.activation_epoch == claim.activation_epoch
+                        && tail.sequence == claim.sequence
+                )
+            });
+        match (hydrated, still_owned) {
+            (Some(id), Ok(true)) => Ok(id),
+            (_, owner_check) => {
+                // Even a verified artifact cannot be activated if the epoch
+                // moved during hydration. Do not preserve recovery metadata.
                 self.recovery_modules.remove(&actor_id);
                 self.recovery_schema_names.remove(&actor_id);
                 self.actors.remove(&actor_id);
-                Err(Error::new(
-                    ErrorKind::InvalidData,
-                    "verified pinned workflow could not be hydrated from durable state",
-                ))
+                if let Some(ref mut mgr) = self.crdt_manager {
+                    mgr.unregister_actor_fields(actor_id);
+                }
+                match owner_check {
+                    Err(error) => Err(error),
+                    Ok(false) => Err(Error::new(
+                        ErrorKind::PermissionDenied,
+                        "pinned workflow ownership changed during hydration",
+                    )),
+                    Ok(true) => Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "verified pinned workflow could not be hydrated from durable state",
+                    )),
+                }
             }
         }
     }
