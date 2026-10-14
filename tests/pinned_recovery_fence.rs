@@ -124,6 +124,46 @@ fn incomplete_snapshot_cannot_be_claimed_for_recovery() {
 }
 
 #[test]
+fn former_owner_cannot_commit_durable_work_after_a_new_epoch_is_claimed() {
+    let mut store = MemoryStore::new();
+    start(&mut store, 51);
+    let observed = store.load_durable_tail_position(51).unwrap().unwrap();
+    let claim = claim_pinned_workflow_recovery(&mut store, 51, observed).unwrap();
+
+    let stale = store.commit_transition(DurableTransition {
+        version: DURABLE_TRANSITION_VERSION,
+        actor_id: 51,
+        activation_epoch: observed.activation_epoch,
+        sequence: claim.sequence + 1,
+        expected_previous_sequence: claim.sequence,
+        command: None,
+        snapshot: None,
+        workflow_events: vec![],
+        domain_events: vec![],
+        durable_effects: vec![],
+        outbox: vec![],
+    }).unwrap_err();
+    assert_eq!(stale.kind(), ErrorKind::PermissionDenied);
+    assert_eq!(
+        store.load_durable_tail_position(51).unwrap().unwrap().activation_epoch,
+        claim.activation_epoch,
+    );
+}
+
+#[test]
+fn later_claim_replaces_previous_epoch_and_fences_the_previous_claimant() {
+    let mut store = MemoryStore::new();
+    start(&mut store, 52);
+    let original = store.load_durable_tail_position(52).unwrap().unwrap();
+    let first = claim_pinned_workflow_recovery(&mut store, 52, original).unwrap();
+    let new_tail = store.load_durable_tail_position(52).unwrap().unwrap();
+    let second = claim_pinned_workflow_recovery(&mut store, 52, new_tail).unwrap();
+    assert_eq!(second.activation_epoch, first.activation_epoch + 1);
+    assert_eq!(second.sequence, first.sequence + 1);
+    assert!(claim_pinned_workflow_recovery(&mut store, 52, new_tail).is_err());
+}
+
+#[test]
 fn bogus_zero_or_maximum_epoch_is_rejected() {
     let mut store = MemoryStore::new();
     start(&mut store, 46);
