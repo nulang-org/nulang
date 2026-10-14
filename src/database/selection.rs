@@ -10,23 +10,23 @@ use std::fmt;
 
 use super::tablet::{TabletScanBatch, TabletScanRow};
 
-/// Positions selected inside *one* visible scan batch.
+/// Positions selected inside one visible scan batch.
 ///
-/// All bits above `len` are zero. Bitmaps may be combined only when they
-/// describe the same number of rows, and callers must not mix bitmaps from
-/// different batches even when lengths happen to match.
+/// The bitmap borrows its source batch: callers cannot outlive it, and
+/// combining equal-sized selections from different batches is rejected.
+/// Bits above the visible row count are always zero.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SelectionBitmap {
-    len: usize,
+pub struct SelectionBitmap<'batch, 'row> {
+    batch: &'batch TabletScanBatch<'row>,
     words: Vec<u64>,
 }
 
-impl SelectionBitmap {
+impl<'batch, 'row> SelectionBitmap<'batch, 'row> {
     /// Evaluate a predicate over borrowed, snapshot-visible rows.
     /// Evaluation is row-wise; selection output is packed into 64-bit words.
-    pub fn from_predicate<'a, F>(batch: &TabletScanBatch<'a>, mut predicate: F) -> Self
+    pub fn from_predicate<F>(batch: &'batch TabletScanBatch<'row>, mut predicate: F) -> Self
     where
-        F: FnMut(TabletScanRow<'a>) -> bool,
+        F: FnMut(TabletScanRow<'row>) -> bool,
     {
         let len = batch.rows.len();
         let mut words = vec![0_u64; len / 64 + usize::from(len % 64 != 0)];
@@ -37,20 +37,20 @@ impl SelectionBitmap {
             }
         }
 
-        Self { len, words }
+        Self { batch, words }
     }
 
     pub fn len(&self) -> usize {
-        self.len
+        self.batch.rows.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.batch.rows.is_empty()
     }
 
     /// Returns `None` for positions outside this batch.
     pub fn get(&self, index: usize) -> Option<bool> {
-        (index < self.len).then(|| (self.words[index / 64] & (1_u64 << (index % 64))) != 0)
+        (index < self.len()).then(|| (self.words[index / 64] & (1_u64 << (index % 64))) != 0)
     }
 
     pub fn count_ones(&self) -> usize {
@@ -72,14 +72,17 @@ impl SelectionBitmap {
         other: &Self,
         op: impl Fn(u64, u64) -> u64,
     ) -> Result<Self, SelectionError> {
-        if self.len != other.len {
+        if self.len() != other.len() {
             return Err(SelectionError::LengthMismatch {
-                left: self.len,
-                right: other.len,
+                left: self.len(),
+                right: other.len(),
             });
         }
+        if !std::ptr::eq(self.batch, other.batch) {
+            return Err(SelectionError::DifferentBatch);
+        }
         Ok(Self {
-            len: self.len,
+            batch: self.batch,
             words: self
                 .words
                 .iter()
@@ -128,6 +131,7 @@ impl std::iter::FusedIterator for SelectedIndices<'_> {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectionError {
     LengthMismatch { left: usize, right: usize },
+    DifferentBatch,
 }
 
 impl fmt::Display for SelectionError {
@@ -137,6 +141,7 @@ impl fmt::Display for SelectionError {
                 f,
                 "batch selection length mismatch: left={left}, right={right}"
             ),
+            Self::DifferentBatch => f.write_str("cannot combine selections from different batches"),
         }
     }
 }
