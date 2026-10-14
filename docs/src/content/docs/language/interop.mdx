@@ -72,7 +72,7 @@ Marshalling (`src/python/marshal.rs`) converts primitives directly and keeps eve
 |---------------|--------------|
 | `None` | `()` |
 | `bool` | `Bool` |
-| `int` | `Int` (clamped to i64) |
+| `int` | `Int` (signed 48-bit range; overflow is rejected) |
 | `float` | `Float` |
 | `str`, `list`, `tuple`, `dict`, anything else | opaque Python object handle |
 
