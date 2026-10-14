@@ -21,6 +21,18 @@ class LinuxPackageContractTests(unittest.TestCase):
         self.assertIn("scripts/tests/test_linux_packages.py", workflow)
         self.assertIn("ubuntu-22.04", workflow, "pin the Linux release glibc baseline")
 
+    def test_native_arm64_and_clean_distro_installations_gate_publication(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("  linux-install-smoke:\n", workflow)
+        self.assertIn("ubuntu-22.04-arm", workflow)
+        self.assertIn("debian:12", workflow)
+        self.assertIn("fedora:44", workflow)
+        self.assertIn("    needs: [release, linux-install-smoke]", workflow)
+        self.assertIn("sudo apt install", (ROOT / "docs/src/content/docs/getting-started/installation.mdx").read_text(encoding="utf-8"))
+        self.assertIn("docker run --rm", workflow)
+        self.assertIn("apt-get remove -y nulang", workflow)
+        self.assertIn("dnf remove -y nulang", workflow)
+
     def test_architecture_metadata_and_package_contents(self):
         script = PACKAGER.read_text(encoding="utf-8")
         self.assertIn("deb_arch=amd64", script)
