@@ -183,7 +183,10 @@ fn try_spawn_actor_with_id(
         {
             for (field, constant) in &metadata.state_defaults {
                 if let crate::bytecode::Constant::String(value) = constant {
-                    if actor.get_state_field(field).is_some_and(|current| current.is_nil()) {
+                    if actor
+                        .get_state_field(field)
+                        .is_some_and(|current| current.is_nil())
+                    {
                         let allocated = actor.allocate_string(value);
                         if allocated.is_nil() {
                             return Err(std::io::Error::other(

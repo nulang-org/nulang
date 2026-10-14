@@ -12373,7 +12373,9 @@ match { a: 2, b: 9 } with {
             vm.run().expect("spawn compiled workflow")
         };
         let actor_id = reference.as_actor_id().expect("workflow actor id");
-        let initial = backing.load_snapshot(actor_id).expect("initial durable checkpoint");
+        let initial = backing
+            .load_snapshot(actor_id)
+            .expect("initial durable checkpoint");
         assert_eq!(
             initial.state.get("answer"),
             Some(&crate::runtime::PersistedValue::String(String::new())),
@@ -12381,16 +12383,71 @@ match { a: 2, b: 9 } with {
         );
         rt.borrow_mut().send_message_by_id(actor_id, 0, &[]);
         rt.borrow_mut().run_scheduler();
-        let saved = backing.load_snapshot(actor_id).expect("durable step checkpoint");
+        let saved = backing
+            .load_snapshot(actor_id)
+            .expect("durable step checkpoint");
         assert_eq!(
             saved.state.get("answer"),
-            Some(&crate::runtime::PersistedValue::String("persisted-answer".to_string()))
+            Some(&crate::runtime::PersistedValue::String(
+                "persisted-answer".to_string()
+            ))
         );
-        assert!(!saved.state.contains_key("temporary"), "local state must not be checkpointed");
+        assert!(
+            !saved.state.contains_key("temporary"),
+            "local state must not be checkpointed"
+        );
         assert_eq!(
             saved.state.get("step_index"),
             Some(&crate::runtime::PersistedValue::Int(1))
         );
+    }
+
+    /// Two successful synchronous workflow steps each advance progress once.
+    /// A completed-step checkpoint must agree with the terminal event history.
+    #[test]
+    fn test_workflow_synchronous_steps_advance_progress_once_each() {
+        let source = r#"
+            workflow TwoStepProgress {
+                state durable count: Int = 0
+                step first { self.count = 1 }
+                step second { self.count = 2 }
+            }
+            let w = spawn TwoStepProgress {} in { w }
+        "#;
+        let (module, _) = compile_source(source).expect("compile two-step workflow");
+        let store = SharedMemoryStore::new();
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        rt.borrow_mut().persistence = Box::new(store.clone());
+        let reference = {
+            let mut vm = VM::new();
+            vm.load_module(module);
+            vm.set_actor_callbacks(Box::new(RuntimeVmCallbacks::new(rt.clone())));
+            vm.run().expect("spawn compiled workflow")
+        };
+        let actor_id = reference.as_actor_id().expect("workflow actor id");
+
+        for (behavior_id, expected_step) in [(0, 1), (1, 2)] {
+            rt.borrow_mut().send_message_by_id(actor_id, behavior_id, &[]);
+            rt.borrow_mut().run_scheduler();
+            let saved = store.load_snapshot(actor_id).expect("completed step checkpoint");
+            assert_eq!(
+                saved.state.get("step_index"),
+                Some(&crate::runtime::PersistedValue::Int(expected_step))
+            );
+            assert_eq!(
+                saved.state.get("count"),
+                Some(&crate::runtime::PersistedValue::Int(expected_step))
+            );
+            assert_eq!(
+                store
+                    .read_workflow_events(actor_id)
+                    .iter()
+                    .filter(|event| matches!(event, WorkflowEvent::StepCompleted { .. }))
+                    .count(),
+                expected_step as usize,
+                "each successful step must append exactly one terminal event"
+            );
+        }
     }
 
     /// Restore declared user state in an entirely new runtime, independently
@@ -12463,11 +12520,15 @@ match { a: 2, b: 9 } with {
             ))
         );
         assert_eq!(
-            actor.get_state_field("step_index").and_then(|value| value.as_int()),
+            actor
+                .get_state_field("step_index")
+                .and_then(|value| value.as_int()),
             Some(1)
         );
         assert_ne!(
-            actor.get_state_field("scratch").and_then(|value| value.as_int()),
+            actor
+                .get_state_field("scratch")
+                .and_then(|value| value.as_int()),
             Some(77),
             "process-local state must not be restored from a durable snapshot"
         );

@@ -4323,14 +4323,17 @@ impl Runtime {
                 && self.actor_is_workflow(actor_id)
                 && !self.is_internal_behavior(actor_id, behavior_idx)
             {
-                // Synthetic parallel steps do not increment step_index in their
-                // bytecode (so signal-waiting branches do not double-increment);
-                // advance it before the terminal checkpoint/transition.
-                if self.is_parallel_step(actor_id, behavior_idx) {
-                    if let Some(actor) = self.actors.get_mut(&actor_id) {
-                        if let Some(n) =
-                            actor.get_state_field("step_index").and_then(|v| v.as_int())
-                        {
+                // The terminal checkpoint must include the completed step's
+                // progress. HIR-lowered synchronous steps do not advance
+                // step_index in bytecode; the suspended resume paths do so
+                // separately. Only advance if the counter still identifies
+                // this step, to avoid double-counting an already-advanced
+                // legacy step. Synthetic parallel steps are advanced here too.
+                if let Some(actor) = self.actors.get_mut(&actor_id) {
+                    if let Some(n) =
+                        actor.get_state_field("step_index").and_then(|v| v.as_int())
+                    {
+                        if n == behavior_idx as i64 {
                             actor.set_state_field("step_index", Value::int(n + 1));
                         }
                     }

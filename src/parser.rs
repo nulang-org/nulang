@@ -8369,7 +8369,9 @@ mod tests {
         .unwrap();
         match &ast.decls[0] {
             Decl::Workflow {
-                state_fields, items, ..
+                state_fields,
+                items,
+                ..
             } => {
                 assert_eq!(state_fields.len(), 2);
                 assert_eq!(state_fields[0].0, "answer");
@@ -8385,10 +8387,9 @@ mod tests {
     #[test]
     fn test_parse_workflow_rejects_implicit_or_duplicate_state_models() {
         assert!(parse("workflow W { state answer: String = \"\" step write { 1 } }").is_err());
-        assert!(parse(
-            "workflow W { state durable step_index: Int = 0 step write { 1 } }"
-        )
-        .is_err());
+        assert!(
+            parse("workflow W { state durable step_index: Int = 0 step write { 1 } }").is_err()
+        );
         assert!(parse(
             "workflow W { state durable answer: Int = 0 state local answer: Int = 0 step write { 1 } }"
         )
