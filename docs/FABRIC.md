@@ -217,7 +217,8 @@ semantics that later cluster and stream layers can reuse.
 - [ ] Seek by time.
 - [ ] Retention policies.
 - [ ] Dead-letter streams.
-- [ ] Deduplication/idempotency keys.
+- [x] Single-writer standalone-stream producer deduplication, with durable intent and epoch checks (experimental).
+- [ ] Replicated, quorum-safe producer deduplication and epoch fencing.
 - [x] Per-record checksums and torn-tail recovery.
 
 ### Phase 4 — distributed state and coordination
