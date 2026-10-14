@@ -3606,6 +3606,80 @@ pub async fn run_lsp_server() {
 mod lsp_tests {
     use super::*;
 
+    fn range_change(start: Position, end: Position, text: &str) -> TextDocumentContentChangeEvent {
+        TextDocumentContentChangeEvent {
+            range: Some(Range::new(start, end)),
+            range_length: None,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_incremental_sync_applies_ordered_utf16_range_changes() {
+        let before = "let 😀 = 1\nlet name = 2\n";
+        let changes = vec![
+            range_change(Position::new(0, 4), Position::new(0, 6), "x"),
+            range_change(Position::new(1, 4), Position::new(1, 8), "total"),
+        ];
+        assert_eq!(
+            apply_document_changes(before, &changes),
+            Some("let x = 1\nlet total = 2\n".to_string())
+        );
+    }
+
+    #[test]
+    fn test_incremental_sync_full_replacement_compatible() {
+        let changes = vec![TextDocumentContentChangeEvent {
+            range: None,
+            range_length: None,
+            text: "fn main() { 42 }".to_string(),
+        }];
+        assert_eq!(
+            apply_document_changes("fn broken(", &changes),
+            Some("fn main() { 42 }".to_string())
+        );
+    }
+
+    #[test]
+    fn test_incremental_sync_rejects_invalid_ranges_without_partial_commit() {
+        let before = "let 😀 = 1\n";
+        let edits = vec![
+            range_change(Position::new(0, 4), Position::new(0, 6), "x"),
+            range_change(Position::new(0, 100), Position::new(0, 100), "invalid"),
+        ];
+        assert_eq!(apply_document_changes(before, &edits), None);
+
+        // UTF-16 column 5 splits a surrogate pair.
+        assert_eq!(
+            apply_document_changes(
+                before,
+                &[range_change(Position::new(0, 5), Position::new(0, 6), "y")],
+            ),
+            None
+        );
+        assert_eq!(
+            apply_document_changes(
+                before,
+                &[range_change(Position::new(0, 6), Position::new(0, 4), "z")],
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_incremental_sync_multiline_replacement_and_terminal_newline() {
+        let before = "first\nsecond\nthird\n";
+        let changes = vec![range_change(
+            Position::new(0, 3),
+            Position::new(2, 2),
+            "X\nY",
+        )];
+        assert_eq!(
+            apply_document_changes(before, &changes),
+            Some("firX\Yird\n".to_string())
+        );
+    }
+
     /// Function parameter without type annotation gets an inlay hint.
     #[test]
     fn test_type_inlay_for_fn_param() {
