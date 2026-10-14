@@ -1146,8 +1146,13 @@ mod transactional_receive_tests {
         system.priority = MessagePriority::System;
         mailbox.push(system).unwrap();
 
-        assert_eq!(mailbox.begin_durable_admission().unwrap().sender, 99);
+        assert!(
+            mailbox.begin_durable_admission().is_none(),
+            "supervisor notices must stay outside typed user-command admission"
+        );
         assert_eq!(mailbox.len(), 2);
+        assert_eq!(mailbox.pop().unwrap().sender, 99);
+        assert_eq!(mailbox.len(), 1);
         mailbox.reset(1);
         assert!(mailbox.commit_durable_admission().is_none());
         assert_eq!(mailbox.len(), 0);
