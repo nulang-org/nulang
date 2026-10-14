@@ -1223,14 +1223,31 @@ fn lower_let_chain(first_body: &Expr, body: &mut hir::Body) -> hir::Operand {
     }
 }
 
-/// Emit all active deferred expressions from all scopes in LIFO order.
-/// Snapshots the defer stack to avoid RefCell double-borrow when deferred
-/// expressions themselves contain blocks/if/match (which re-enter the stack).
+/// Capture a value before lowering scope-exit cleanup. A variable operand
+/// alone still refers to mutable storage; keeping it live through a deferred
+/// assignment would incorrectly change the value returned by `return` or
+/// `break`.
+fn capture_exit_value(value: hir::Operand, span: Span, body: &mut hir::Body) -> hir::Operand {
+    let ty = value.ty();
+    let name = fresh_temp_name();
+    body.push(hir::Stmt::Let {
+        name: name.clone(),
+        ty: ty.clone(),
+        value: hir::RValue::Use(value),
+        span,
+    });
+    hir::Operand::Var(name, ty)
+}
+
+/// Emit ordinary (non-error-only) defers in LIFO order on a successful return.
+/// Snapshots avoid RefCell double-borrow when deferred expressions re-enter lowering.
 fn emit_all_defers(body: &mut hir::Body) {
     let snapshot = DEFER_SCOPES.with(|s| s.borrow().clone());
     for scope in snapshot.iter().rev() {
-        for (expr, _error_only) in scope.iter().rev() {
-            let _ = lower_expr(expr, body);
+        for (expr, error_only) in scope.iter().rev() {
+            if !error_only {
+                let _ = lower_expr(expr, body);
+            }
         }
     }
 }
@@ -1242,8 +1259,10 @@ fn emit_defers_for_break(body: &mut hir::Body) {
     });
     for scope_idx in (boundary..snapshot.len()).rev() {
         if let Some(scope) = snapshot.get(scope_idx) {
-            for (expr, _error_only) in scope.iter().rev() {
-                let _ = lower_expr(expr, body);
+            for (expr, error_only) in scope.iter().rev() {
+                if !error_only {
+                    let _ = lower_expr(expr, body);
+                }
             }
         }
     }
@@ -1677,11 +1696,13 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
             }
             if !body.is_terminated() {
                 let scope = pop_defer_scope();
-                for (expr, _error_only) in scope.into_iter().rev() {
+                for (expr, error_only) in scope.into_iter().rev() {
                     if body.is_terminated() {
                         break;
                     }
-                    let _ = lower_expr(&expr, body);
+                    if !error_only {
+                        let _ = lower_expr(&expr, body);
+                    }
                 }
             } else {
                 let _ = pop_defer_scope();
@@ -1718,11 +1739,13 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
             }
             if !body.is_terminated() {
                 let scope = pop_defer_scope();
-                for (expr, _error_only) in scope.into_iter().rev() {
+                for (expr, error_only) in scope.into_iter().rev() {
                     if body.is_terminated() {
                         break;
                     }
-                    let _ = lower_expr(&expr, body);
+                    if !error_only {
+                        let _ = lower_expr(&expr, body);
+                    }
                 }
                 body.push(hir::Stmt::ParallelMarker {
                     marker: crate::parallel_marker::ParallelRegionMarker::End,
@@ -2218,16 +2241,19 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
             };
             lower_expr(&app, body)
         }
-        Expr::Return(val, _span) => {
-            // Emit all active defers before return (all scopes, LIFO).
-            emit_all_defers(body);
+        Expr::Return(val, span) => {
+            // Evaluate and freeze the return operand before deferred expressions
+            // can mutate variables referenced by the operand.
             let op = val.as_ref().map(|e| lower_expr(e, body));
+            let op = op.map(|value| capture_exit_value(value, *span, body));
+            emit_all_defers(body);
             body.set_terminator(hir::Terminator::FnReturn(op));
             hir::Operand::Unit
         }
-        Expr::Break(val, _span) => {
-            emit_defers_for_break(body);
+        Expr::Break(val, span) => {
             let op = val.as_ref().map(|e| lower_expr(e, body));
+            let op = op.map(|value| capture_exit_value(value, *span, body));
+            emit_defers_for_break(body);
             body.set_terminator(hir::Terminator::Break(op));
             hir::Operand::Unit
         }
