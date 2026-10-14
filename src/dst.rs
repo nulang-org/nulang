@@ -320,9 +320,7 @@ impl Simulator {
             max_steps,
         } = self.run_until_quiescence_checked()
         {
-            panic!(
-                "DST step limit exceeded: seed={seed}, steps={steps}, max_steps={max_steps}"
-            );
+            panic!("DST step limit exceeded: seed={seed}, steps={steps}, max_steps={max_steps}");
         }
     }
 
