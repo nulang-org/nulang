@@ -131,10 +131,12 @@ fn unfinished_atomic_command_refuses_recovery_instead_of_replaying_handler() {
 fn unknown_schema_cannot_recover_strict_actor_without_compiler_metadata() {
     let (mut runtime, actor_id, _) = recovered_fixture();
     runtime.enable_strict_typed_actor_admission(actor_id).unwrap();
-    runtime.actors.remove(&actor_id);
-    runtime.recovery_modules.remove(&actor_id);
-    assert_eq!(runtime.recover_actor(actor_id), None);
-    assert!(!runtime.actors.contains_key(&actor_id));
+    // Reconstruct a runtime with the persisted store but without the
+    // compiler-owned recovery module. Public APIs must fail closed.
+    let mut fresh = Runtime::new();
+    fresh.persistence = runtime.persistence;
+    assert_eq!(fresh.recover_actor(actor_id), None);
+    assert!(!fresh.actors.contains_key(&actor_id));
 }
 
 #[cfg(feature = "sqlite")]
