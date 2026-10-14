@@ -76,6 +76,11 @@ fn legacy_snapshot_without_policy_is_backward_compatible() {
     });
     let snapshot: ActorSnapshot = serde_json::from_value(encoded).expect("legacy snapshot");
     assert_eq!(snapshot.strict_admission_policy_version, 0);
+    let reencoded = serde_json::to_value(&snapshot).expect("reserialize legacy");
+    assert!(
+        reencoded.get("strict_admission_policy_version").is_none(),
+        "legacy policy version 0 must not change historical snapshot digests"
+    );
 }
 
 #[test]
