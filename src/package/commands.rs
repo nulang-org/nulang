@@ -3061,6 +3061,55 @@ mod tests {
     }
 
     #[test]
+    fn test_cmd_build_web_does_not_render_server_routes_as_static_artifacts() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_build_web_static_placement_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        scaffold_package(&dir, "mixed-routes", "web").expect("web scaffold should succeed");
+        std::fs::write(
+            dir.join("src/main.nula"),
+            r#"import stdlib::web::html
+import stdlib::web::types
+
+fn home() -> Html { text("Static homepage") }
+fn submit() -> Html { text("Server response") }
+
+app "mixed-routes" {
+    route "GET" "/" -> home
+    route "POST" "/submit" -> submit
+}
+"#,
+        )
+        .unwrap();
+
+        let _guard = ChangeDir::new(&dir);
+        cmd_build_web().expect("mixed static/server Web build should succeed");
+
+        assert!(dir.join("dist/index.html").is_file());
+        assert!(
+            !dir.join("dist/submit/index.html").exists(),
+            "POST server routes must not be prerendered as public static pages"
+        );
+
+        let ir: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("dist/nulang-app.ir.json")).unwrap(),
+        )
+        .unwrap();
+        let routes = ir["routes"].as_array().unwrap();
+        let server = routes
+            .iter()
+            .find(|route| route["method"] == "POST" && route["path"] == "/submit")
+            .expect("server route metadata must still be emitted");
+        assert_eq!(server["placement"], "server");
+        assert!(server["artifact"].is_null());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_cmd_build_web_signal_hydration() {
         let dir =
             std::env::temp_dir().join(format!("nulang_build_web_signal_{}", std::process::id()));
