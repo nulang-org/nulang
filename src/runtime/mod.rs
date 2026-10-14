@@ -161,10 +161,14 @@ const MAIN_HEAP_ACTOR_ID: u64 = 0;
 /// running a second handler. Neither variant performs bytecode execution.
 #[derive(Debug)]
 pub enum TypedInboxAdmission {
-    New { message: Message, commit: DurableCommit },
-    Duplicate { commit: DurableCommit },
+    New {
+        message: Message,
+        commit: DurableCommit,
+    },
+    Duplicate {
+        commit: DurableCommit,
+    },
 }
-
 
 /// Maximum number of membership entries carried by a single gossip packet.
 const GOSSIP_PAYLOAD_MAX_ENTRIES: usize = 256;
