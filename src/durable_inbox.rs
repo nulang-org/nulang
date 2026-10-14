@@ -146,8 +146,8 @@ fn digest_request(
     behavior_id: u16,
     payload: &[PersistedValue],
 ) -> io::Result<[u8; 32]> {
-    // serde_json represents non-finite floats as null. Reject these inputs
-    // rather than hashing two distinct invalid payloads to the same value.
+    // Non-finite floats have no portable cross-runtime canonical meaning.
+    // Refuse them rather than collapsing distinct values into an identity.
     if payload
         .iter()
         .any(|value| matches!(value, PersistedValue::Float(number) if !number.is_finite()))
@@ -157,12 +157,42 @@ fn digest_request(
             "non-finite float is not a canonical durable inbox value",
         ));
     }
-    let bytes = serde_json::to_vec(payload)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    // Stable versioned binary encoding: do not derive persistent identity
+    // from serde_json's evolving float formatting or fallback null encoding.
+    // Tag each variant explicitly and length-prefix variable-width fields.
     let mut hasher = Hasher::new();
     hasher.update(INBOX_REQUEST_DOMAIN);
     hasher.update(&actor_id.to_le_bytes());
     hasher.update(&behavior_id.to_le_bytes());
-    hash_part(&mut hasher, &bytes);
+    hasher.update(&(payload.len() as u64).to_le_bytes());
+    for value in payload {
+        match value {
+            PersistedValue::Int(number) => {
+                hasher.update(&[1]);
+                hasher.update(&number.to_le_bytes());
+            }
+            PersistedValue::Float(number) => {
+                hasher.update(&[2]);
+                hasher.update(&number.to_bits().to_le_bytes());
+            }
+            PersistedValue::Bool(value) => {
+                hasher.update(&[3, u8::from(*value)]);
+            }
+            PersistedValue::String(value) => {
+                hasher.update(&[4]);
+                hash_part(&mut hasher, value.as_bytes());
+            }
+            PersistedValue::Nil => {
+                hasher.update(&[5]);
+            }
+            PersistedValue::Unit => {
+                hasher.update(&[6]);
+            }
+            PersistedValue::Actor(id) => {
+                hasher.update(&[7]);
+                hasher.update(&id.to_le_bytes());
+            }
+        }
+    }
     Ok(*hasher.finalize().as_bytes())
 }
