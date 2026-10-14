@@ -295,6 +295,12 @@ impl Runtime {
             .actors
             .get(&actor_id)
             .ok_or_else(|| Error::new(ErrorKind::NotFound, "actor does not exist"))?;
+        if !actor.mailbox.requires_strict_durable_admission() {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "isolated pure durable execution requires strict typed actor admission",
+            ));
+        }
         if actor.mailbox.admitted_command_sequence() != Some(admitted_sequence)
             || !actor.persistent
             || actor.is_workflow
