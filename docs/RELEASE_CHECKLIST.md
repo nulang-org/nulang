@@ -51,6 +51,8 @@
 - [ ] `README.md` links are valid (GitHub, website, docs)
 - [ ] `examples/README.md` is up to date with the current example count
 - [ ] README's platform list matches `.github/workflows/release.yml`
+- [ ] Linux package-build test suite and PR release rehearsal pass on both Linux targets
+- [ ] Linux release ABI floor remains glibc 2.35 / OpenSSL 3; supported distro smoke tests recorded
 
 ## Post-publish artifact verification
 
@@ -60,7 +62,10 @@ After the tag workflow publishes the release:
 - [ ] Linux aarch64 archive + `.sha256` are present
 - [ ] macOS aarch64 archive + `.sha256` are present
 - [ ] Windows x86_64 archive + `.sha256` are present
-- [ ] Every published checksum verifies against its archive
+- [ ] Linux Debian amd64 and arm64 `.deb` packages + matching `.sha256` are present
+- [ ] Linux RPM x86_64 and aarch64 `.rpm` packages + matching `.sha256` are present
+- [ ] Distro package metadata and `/usr/bin/nulang` payload match the target architecture
+- [ ] Every published checksum verifies against its artifact
 - [ ] Extract each native-host archive and run `nulang --version`
 - [ ] Follow the README install commands from a clean environment rather than
       relying on a maintainer checkout
