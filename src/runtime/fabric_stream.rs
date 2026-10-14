@@ -2189,6 +2189,32 @@ mod tests {
     }
 
     #[test]
+    fn runtime_retention_preview_does_not_mutate_replay_or_cursors() {
+        let root = test_dir("runtime-retention-preview");
+        let mut runtime = Runtime::new();
+        runtime.fabric_stream_open(&root).unwrap();
+        runtime
+            .fabric_stream_create(
+                "audit",
+                FabricStreamConfig {
+                    segment_max_bytes: 96,
+                },
+            )
+            .unwrap();
+        runtime.fabric_stream_append("audit", &[1; 48]).unwrap();
+        runtime.fabric_stream_append("audit", &[2; 48]).unwrap();
+        runtime.fabric_stream_commit_cursor("audit", "consumer", 1).unwrap();
+
+        let before = runtime.fabric_stream_read("audit", 1, 10).unwrap();
+        let preview = runtime.fabric_stream_preview_retention("audit", 2).unwrap();
+        assert_eq!(preview.eligible_segment_count, 1);
+        assert_eq!(runtime.fabric_stream_read("audit", 1, 10).unwrap(), before);
+        assert_eq!(runtime.fabric_stream_cursor("audit", "consumer").unwrap(), 1);
+        drop(runtime);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn retention_preview_never_approves_partial_last_segment_or_producer_state() {
         let root = test_dir("retention-partial");
         let mut store = FileFabricStreamStore::open(&root).unwrap();
