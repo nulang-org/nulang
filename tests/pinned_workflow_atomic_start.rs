@@ -9,7 +9,7 @@ use nulang::behavior_manifest::{
 use nulang::content_identity::SemanticId;
 use nulang::runtime::{
     commit_pinned_workflow_start, verify_pinned_workflow_resume, ActorSnapshot,
-    DurableTransition, MemoryStore, PersistenceStore, WorkflowEvent, DURABLE_TRANSITION_VERSION,
+    MemoryStore, PersistenceStore, WorkflowEvent,
 };
 use std::io::ErrorKind;
 
@@ -169,6 +169,79 @@ fn pin_survives_reopening_libsql_and_rejects_replaced_executable() {
             &store, 77, "payments/77", &manifest(replacement), replacement,
         ).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidData);
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn pinned_workflow_process_restart_helper() {
+    use nulang::runtime::LibsqlStore;
+
+    let Ok(mode) = std::env::var("NULANG_PIN_TEST_CHILD_MODE") else {
+        return;
+    };
+    let path = std::env::var_os("NULANG_PIN_TEST_CHILD_DATABASE").expect("test database path");
+    let bytes = b"workflow-v1";
+    match mode.as_str() {
+        "create" => {
+            let mut store = LibsqlStore::new(&path).unwrap();
+            commit_pinned_workflow_start(
+                &mut store, 88, "payments/88", "Order", &manifest(bytes), bytes,
+                snapshot(88), vec![],
+            ).unwrap();
+        }
+        "resume" => {
+            let store = LibsqlStore::new(&path).unwrap();
+            verify_pinned_workflow_resume(
+                &store, 88, "payments/88", &manifest(bytes), bytes,
+            ).unwrap();
+        }
+        "changed" => {
+            let store = LibsqlStore::new(&path).unwrap();
+            let different = b"workflow-v2";
+            assert_eq!(
+                verify_pinned_workflow_resume(
+                    &store, 88, "payments/88", &manifest(different), different,
+                ).unwrap_err().kind(),
+                ErrorKind::InvalidData
+            );
+        }
+        unexpected => panic!("unexpected test child mode: {unexpected}"),
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn pinned_workflow_real_process_restart_verifies_exact_artifact() {
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "nulang-pin-process-restart-{}-{nonce}", std::process::id()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("workflow.db");
+
+    for mode in ["create", "resume", "changed"] {
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "pinned_workflow_process_restart_helper"])
+            .env("NULANG_PIN_TEST_CHILD_MODE", mode)
+            .env("NULANG_PIN_TEST_CHILD_DATABASE", &path)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "child {mode} failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr),
+        );
+        assert!(
+            String::from_utf8_lossy(&child.stdout).contains("1 passed"),
+            "child {mode} was not actually exercised: {}",
+            String::from_utf8_lossy(&child.stdout),
+        );
     }
     std::fs::remove_dir_all(directory).unwrap();
 }
