@@ -1335,12 +1335,14 @@ impl Runtime {
             }));
             vm.restore_suspended_state(suspended.vm_state);
 
+            // Until durable completion is coupled to resumptions, keep
+            // interpreter-quantum suspension limited to transient actors.
             let instruction_budget = (*self_ptr)
                 .actors
                 .get(&actor_id)
-                .map(|actor| actor.max_reductions)
-                .unwrap_or(1000);
-            vm.set_cooperative_instruction_budget(Some(instruction_budget));
+                .and_then(|actor| (!actor.persistent && !actor.is_workflow)
+                    .then_some(actor.max_reductions));
+            vm.set_cooperative_instruction_budget(instruction_budget);
             // JIT regions have their own safe-point budget in addition to
             // the interpreter's per-dispatch quantum.
             #[cfg(feature = "native-codegen")]
@@ -4282,6 +4284,15 @@ impl Runtime {
                 let result = self.run_bytecode_behavior(actor_id, behavior_idx, &payload);
                 self.suspend_enabled = saved_suspend;
                 match result {
+                    Ok(_) if self
+                        .actors
+                        .get(&actor_id)
+                        .is_some_and(|actor| actor.jit_yield_pending) => {
+                        // A scheduling yield is not a completed behavior or
+                        // a durable checkpoint boundary. The continuation
+                        // retains exclusive ownership until it finishes.
+                        processed = false;
+                    }
                     Ok(_) => {
                         self.checkpoint_actor(actor_id);
                         processed = true;
@@ -5281,12 +5292,14 @@ impl Runtime {
 
             // Bound interpreted actor work between scheduler turns. JIT
             // regions also honor their existing independent safepoint budget.
+            // Until durable completion is coupled to resumptions, keep
+            // interpreter-quantum suspension limited to transient actors.
             let instruction_budget = (*self_ptr)
                 .actors
                 .get(&actor_id)
-                .map(|actor| actor.max_reductions)
-                .unwrap_or(1000);
-            vm.set_cooperative_instruction_budget(Some(instruction_budget));
+                .and_then(|actor| (!actor.persistent && !actor.is_workflow)
+                    .then_some(actor.max_reductions));
+            vm.set_cooperative_instruction_budget(instruction_budget);
             let result = vm.run_from(module_idx, code_offset);
             vm.set_cooperative_instruction_budget(None);
 
