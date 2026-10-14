@@ -30,7 +30,7 @@ Nulang's capability system (inspired by Pony) prevents data races and use-after-
 
 - **Hindley-Milner inference** (Algorithm W): full type inference with polymorphism. The compiler infers types globally — you write annotations only for public APIs.
 - **No `any` / `dynamic`**: every expression has a known type. There are no implicit coercions or runtime type checks.
-- **Pattern matching**: variants, tuples, records, nested patterns, and guards are type-checked, but compile-time exhaustiveness analysis is not complete yet. A non-exhaustive `match` can still reach the runtime `non-exhaustive match` error path. Compile-time exhaustiveness is tracked as P0 correctness work in issue #332.
+- **Pattern matching**: variants, tuples, records, nested patterns, and guards are type-checked, and the compiler rejects provably incomplete matches for `Bool` and known closed variants. General exhaustiveness analysis remains incomplete: matches over other domains can still reach the runtime `non-exhaustive match` error path. Compile-time exhaustiveness is tracked as P0 correctness work in issue #332.
 - **No null**: `nil` is an explicit tagged value with its own type (`Nil`). You cannot dereference nil — the type system tracks where `nil` may flow.
 - **Row polymorphism**: records are structurally typed. A function accepting `{ x: Int, y: Int }` works with any record containing those fields (and any others) — no type-level casting needed.
 
@@ -96,7 +96,7 @@ Nulang inherits BEAM/OTP fault-tolerance patterns:
 |---|---|---|
 | **Type safety** | Static types catch bugs at compile time | Dynamic types — errors surface at runtime |
 | **Effect documentation** | Effect rows in type signatures | No effect tracking — any function can do I/O |
-| **Pattern matching** | Typed; compile-time exhaustiveness analysis is still incomplete | Non-exhaustive by default |
+| **Pattern matching** | Typed; finite-type coverage checks for `Bool` and closed variants, general analysis incomplete | Non-exhaustive by default |
 | **Fault tolerance** | Same OTP supervision primitives | Same OTP supervision primitives |
 
 ### vs C/C++
