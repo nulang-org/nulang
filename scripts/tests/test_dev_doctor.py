@@ -22,6 +22,9 @@ class DeveloperDoctorTests(unittest.TestCase):
         self.bin.mkdir()
         for command in ('git', 'rustup', 'rustc', 'cargo', 'python3', 'cc', 'pkg-config'):
             self.stub(command)
+        # Do not depend on the CI runner's filesystem or remaining disk space.
+        self.stub('findmnt', 'printf "ext4\\n"')
+        self.stub('df', 'printf "Filesystem Blocks Used Available Capacity Mount\\nfake 104857600 0 52428800 0%% /\\n"')
 
     def stub(self, name, body='exit 0'):
         path = self.bin / name
@@ -74,6 +77,18 @@ class DeveloperDoctorTests(unittest.TestCase):
         accelerated = self.run_doctor('--accelerated')
         self.assertNotEqual(accelerated.returncode, 0)
         self.assertIn('mise doctor reported a problem', accelerated.stderr)
+
+    def test_rust_version_mismatch_stays_blocking(self):
+        self.stub('rustc', 'printf "rustc 1.94.0 (test)\\n"')
+        result = self.run_doctor()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Rust version mismatch', result.stderr)
+
+    def test_low_disk_space_stays_blocking(self):
+        self.stub('df', 'printf "Filesystem Blocks Used Available Capacity Mount\\nfake 10000 8000 1024 80%% /\\n"')
+        result = self.run_doctor()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('low free disk space', result.stderr)
 
     def test_unknown_arguments_fail_with_usage(self):
         result = self.run_doctor('--not-a-profile')
