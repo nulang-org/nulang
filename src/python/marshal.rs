@@ -128,13 +128,26 @@ pub fn nulang_to_python(value: Value) -> Result<Py<PyAny>, String> {
 /// |-------------|-------------|-------|
 /// | `None` | `Value::unit()` | |
 /// | `bool` | `Value::bool()` | |
-/// | `int` | `Value::int()` | Clamped to i64 range |
+/// | `int` | `Value::int()` | Checked against Nulang's signed 48-bit range |
 /// | `float` | `Value::float()` | |
 /// | `str` | `TAG_PYTHON` | Stored as opaque Python object |
 /// | `list` | `TAG_PYTHON` | Stored as opaque Python object |
 /// | `tuple` | `TAG_PYTHON` | Stored as opaque Python object |
 /// | `dict` | `TAG_PYTHON` | Stored as opaque Python object |
 /// | Other | `TAG_PYTHON` | Stored as opaque Python object |
+/// Nulang's tagged `Int` retains only 48 signed bits. Reject values that
+/// would silently wrap rather than changing their numerical meaning.
+fn vm_int_checked(value: i64) -> Result<Value, String> {
+    const MIN: i64 = -(1_i64 << 47);
+    const MAX: i64 = (1_i64 << 47) - 1;
+    if !(MIN..=MAX).contains(&value) {
+        return Err(format!(
+            "Python integer {value} is outside Nulang's signed 48-bit Int range"
+        ));
+    }
+    Ok(Value::int(value))
+}
+
 pub fn python_to_nulang(obj: &pyo3::Bound<'_, pyo3::PyAny>) -> Result<Value, String> {
     // Check for None first
     if obj.is_none() {
@@ -151,14 +164,10 @@ pub fn python_to_nulang(obj: &pyo3::Bound<'_, pyo3::PyAny>) -> Result<Value, Str
 
     // Check for int
     if let Ok(i) = obj.cast::<PyInt>() {
-        let val: i64 = i.extract().unwrap_or_else(|_| {
-            // Big int — try to extract and clamp
-            Python::attach(|_py| {
-                let big_int_str = i.str().map(|s| s.to_string()).unwrap_or_default();
-                big_int_str.parse::<i64>().unwrap_or(i64::MAX)
-            })
-        });
-        return Ok(Value::int(val));
+        let val: i64 = i.extract().map_err(|e| format!(
+            "Python integer cannot be represented as signed 64-bit value: {e}"
+        ))?;
+        return vm_int_checked(val);
     }
 
     // Check for float
@@ -328,14 +337,9 @@ pub fn python_object_id_to_owned_foreign(
             return Ok(OwnedForeignValue::Bool(value));
         }
         if let Ok(value) = obj.cast::<PyInt>() {
-            let value = value.extract::<i64>().unwrap_or_else(|_| {
-                let text = value.str().map(|s| s.to_string()).unwrap_or_default();
-                if text.starts_with('-') {
-                    i64::MIN
-                } else {
-                    i64::MAX
-                }
-            });
+            let value = value.extract::<i64>().map_err(|e| format!(
+                "Python integer cannot be represented as signed 64-bit value: {e}"
+            ))?;
             return Ok(OwnedForeignValue::Int(value));
         }
         if let Ok(value) = obj.cast::<PyFloat>() {
@@ -365,7 +369,7 @@ pub fn owned_foreign_to_vm_value(
 ) -> Result<Value, String> {
     use crate::runtime::OwnedForeignValue;
     match value {
-        OwnedForeignValue::Int(value) => Ok(Value::int(*value)),
+        OwnedForeignValue::Int(value) => vm_int_checked(*value),
         OwnedForeignValue::Float(value) => Ok(Value::float(*value)),
         OwnedForeignValue::Bool(value) => Ok(Value::bool(*value)),
         OwnedForeignValue::Unit => Ok(Value::unit()),
