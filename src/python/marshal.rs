@@ -354,6 +354,29 @@ pub fn python_object_id_to_owned_foreign(
     })
 }
 
+/// Materialize an owned Python call result into a Nulang VM value.
+///
+/// Primitive values do not need a Python handle. A Python `str` result is
+/// deliberately kept as an opaque Python object: allocating a native Nulang
+/// string requires an active module's string pool, which this function does
+/// not own. Such handles remain valid inputs to subsequent Python calls.
+pub fn owned_foreign_to_vm_value(
+    value: &crate::runtime::OwnedForeignValue,
+) -> Result<Value, String> {
+    use crate::runtime::OwnedForeignValue;
+    match value {
+        OwnedForeignValue::Int(value) => Ok(Value::int(*value)),
+        OwnedForeignValue::Float(value) => Ok(Value::float(*value)),
+        OwnedForeignValue::Bool(value) => Ok(Value::bool(*value)),
+        OwnedForeignValue::Unit => Ok(Value::unit()),
+        OwnedForeignValue::Nil => Ok(Value::nil()),
+        OwnedForeignValue::String(_) | OwnedForeignValue::OpaqueHandle { .. } => {
+            let id = owned_foreign_to_python_object_id(value)?;
+            Ok(unsafe { Value::from_raw(TAG_PYTHON | id.0) })
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Compatibility wrappers (bridge parameter ignored — uses global registry)
 // ---------------------------------------------------------------------------
