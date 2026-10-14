@@ -416,18 +416,33 @@ thread_local! {
     static RESPONSE_COOKIES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Set the request context for the current thread, run `f`, then clear it.
+/// Reset thread-local request state even if a handler unwinds. Cookies
+/// intentionally remain available after successful dispatch until
+/// the response writer calls `take_response_cookies`.
+struct RequestContextReset;
+
+impl Drop for RequestContextReset {
+    fn drop(&mut self) {
+        CURRENT_REQUEST.with(|current| *current.borrow_mut() = None);
+        if std::thread::panicking() {
+            // Prevent partial state from a failed handler escaping into
+            // an error handler or a subsequent request on this thread.
+            RESPONSE_COOKIES.with(|cookies| cookies.borrow_mut().clear());
+        }
+    }
+}
+
+/// Set request state for the handler's dynamic extent. On unwind the guard
+/// also discards pending cookies, while successful responses retain them.
 pub fn with_request_context<F, R>(ctx: RequestContext, f: F) -> R
 where
     F: FnOnce() -> R,
 {
-    CURRENT_REQUEST.with(|c| *c.borrow_mut() = Some(ctx));
-    RESPONSE_COOKIES.with(|c| c.borrow_mut().clear());
-    let result = f();
-    CURRENT_REQUEST.with(|c| *c.borrow_mut() = None);
-    result
+    CURRENT_REQUEST.with(|current| *current.borrow_mut() = Some(ctx));
+    RESPONSE_COOKIES.with(|cookies| cookies.borrow_mut().clear());
+    let _reset = RequestContextReset;
+    f()
 }
-
 /// Add a `Set-Cookie` header for the current response.
 pub fn set_cookie(name: &str, value: &str) {
     let cookie = format!("{}={}; Path=/; HttpOnly; SameSite=Lax", name, value);
