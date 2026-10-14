@@ -3400,7 +3400,107 @@ impl TypeChecker {
             final_subst = compose_subst(&s, &final_subst);
         }
 
+        // Only reject uncovered matches when the scrutinee has a known,
+        // finite set of cases. This is a conservative safety check: it never
+        // treats a guarded pattern as total, and leaves open-ended scalar
+        // domains alone until general usefulness analysis is available.
+        let resolved_scrutinee = apply_subst(&scrut_ty, &final_subst);
+        Self::check_finite_match_coverage(&resolved_scrutinee, arms, span)?;
+
         Ok((final_subst.clone(), apply_subst(&first_arm, &final_subst)))
+    }
+
+    /// A wildcard or variable always matches; an alias matches exactly the
+    /// values matched by its underlying pattern.
+    fn pattern_is_catchall(pattern: &Pattern) -> bool {
+        match pattern {
+            Pattern::Wild | Pattern::Var(_) => true,
+            Pattern::Alias(_, inner) => Self::pattern_is_catchall(inner),
+            _ => false,
+        }
+    }
+
+    /// Prove that a pattern covers every value of this variant constructor.
+    /// Nested patterns with literals or variants cannot establish coverage
+    /// without recursively checking the payload's actual type.
+    fn pattern_covers_constructor(
+        pattern: &Pattern,
+        constructor: &str,
+        payload: &Option<Type>,
+    ) -> bool {
+        match pattern {
+            Pattern::Alias(_, inner) => {
+                Self::pattern_covers_constructor(inner, constructor, payload)
+            }
+            Pattern::Variant(name, nested) if name == constructor => {
+                match (nested.as_deref(), payload) {
+                    (None, None) => true,
+                    (Some(inner), Some(_)) => Self::pattern_is_catchall(inner),
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Reject provably incomplete matches of Bool and closed variants.
+    ///
+    /// We do not claim exhaustiveness for Int, String, tuples, records, open
+    /// or unresolved types: accepting them here is not a proof of coverage.
+    fn check_finite_match_coverage(
+        scrutinee_type: &Type,
+        arms: &[(Pattern, Option<Expr>, Expr)],
+        span: Span,
+    ) -> NuResult<()> {
+        let unguarded: Vec<&Pattern> = arms
+            .iter()
+            .filter_map(|(pattern, guard, _)| guard.is_none().then_some(pattern))
+            .collect();
+
+        if unguarded.iter().any(|pattern| Self::pattern_is_catchall(pattern)) {
+            return Ok(());
+        }
+
+        let missing: Vec<String> = match scrutinee_type {
+            Type::Primitive(PrimitiveType::Bool) => [false, true]
+                .into_iter()
+                .filter(|value| {
+                    !unguarded.iter().any(|pattern| {
+                        fn matches_boolean(pattern: &Pattern, value: bool) -> bool {
+                            match pattern {
+                                Pattern::Lit(Literal::Bool(found)) => *found == value,
+                                Pattern::Alias(_, inner) => matches_boolean(inner, value),
+                                _ => false,
+                            }
+                        }
+                        matches_boolean(pattern, *value)
+                    })
+                })
+                .map(|value| value.to_string())
+                .collect(),
+            Type::Variant(constructors) => constructors
+                .iter()
+                .filter(|(name, payload)| {
+                    !unguarded.iter().any(|pattern| {
+                        Self::pattern_covers_constructor(pattern, name, payload)
+                    })
+                })
+                .map(|(name, _)| name.clone())
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        Err(NuError::TypeError {
+            msg: format!("non-exhaustive match: missing {}", missing.join(", ")),
+            span,
+            expected_type: Some("all cases or an unguarded catch-all".to_string()),
+            found_type: Some(scrutinee_type.to_string()),
+            similar_names: None,
+        })
     }
 
     /// Bind pattern variables into a new context.
