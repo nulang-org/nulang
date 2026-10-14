@@ -34,6 +34,61 @@ fn test_python_builtin_get_attr_returns_constant_without_invoking_it() {
     assert!((float - std::f64::consts::PI).abs() < f64::EPSILON);
 }
 
+#[cfg(feature = "python")]
+#[test]
+fn test_python_builtin_call_resolves_unicode_argument_by_content() {
+    let mut rt = Runtime::new();
+    let constants = vec![
+        Constant::String("builtins".to_string()),
+        Constant::String("len".to_string()),
+        Constant::String("olá 🐍".to_string()),
+    ];
+    let imported = rt.perform_python_builtin(
+        Some("import"),
+        &constants,
+        &[Value::string(0)],
+    );
+    assert!(matches!(imported, Some(value) if value.is_unit()));
+
+    let result = rt.perform_python_builtin(
+        Some("call"),
+        &constants,
+        &[Value::string(0), Value::string(1), Value::string(2)],
+    );
+    assert_eq!(result.and_then(|value| value.as_int()), Some(5));
+}
+
+#[cfg(feature = "python")]
+#[test]
+fn test_python_builtin_string_result_can_be_passed_to_next_python_call() {
+    let mut rt = Runtime::new();
+    let constants = vec![
+        Constant::String("builtins".to_string()),
+        Constant::String("str".to_string()),
+        Constant::String("len".to_string()),
+    ];
+    let imported = rt.perform_python_builtin(
+        Some("import"),
+        &constants,
+        &[Value::string(0)],
+    );
+    assert!(matches!(imported, Some(value) if value.is_unit()));
+
+    let py_string = rt
+        .perform_python_builtin(
+            Some("call"),
+            &constants,
+            &[Value::string(0), Value::string(1), Value::int(423)],
+        )
+        .expect("str(423) should produce a Python string handle");
+    let length = rt.perform_python_builtin(
+        Some("call"),
+        &constants,
+        &[Value::string(0), Value::string(2), py_string],
+    );
+    assert_eq!(length.and_then(|value| value.as_int()), Some(3));
+}
+
 fn noop_test_behavior(_actor: &mut Actor, _args: &[Value]) {}
 
 fn declare_test_behavior(rt: &mut Runtime, actor_id: u64, name: &str) {
