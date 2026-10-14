@@ -256,8 +256,17 @@ fn kill_after_admission_retains_receipt_but_refuses_unsafe_handler_replay() {
     assert_eq!(store.read_journal(ACTOR_ID).len(), 1);
 
     let mut rt = runtime_for_recovery(store);
-    assert_eq!(rt.recover_actor(ACTOR_ID), None);
-    assert!(!rt.actors.contains_key(&ACTOR_ID));
+    assert_eq!(rt.recover_actor(ACTOR_ID), Some(ACTOR_ID));
+    let actor = &rt.actors[&ACTOR_ID];
+    assert!(actor.mailbox.requires_strict_durable_admission());
+    assert_eq!(actor.mailbox.admitted_command_sequence(), Some(1));
+    assert_eq!(actor.get_state_field("total").and_then(|v| v.as_int()), Some(0));
+    assert_eq!(
+        rt.finish_admitted_typed_actor_command(ACTOR_ID, 1)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
 }
 
 #[test]

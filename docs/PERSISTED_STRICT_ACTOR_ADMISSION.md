@@ -31,26 +31,32 @@ Before publishing or enqueuing a recovered actor:
    that backend cannot opt in via the strict policy API.
 2. Require registered compiler-owned metadata for a persistent, non-agent,
    non-workflow actor whenever strict policy was persisted.
-3. Reject an atomic tail with an epoch different from the safe snapshot, or
-   a sequence ahead of that snapshot. Such history can represent a
-   committed-but-unfinished command; legacy journal replay is unsafe.
-4. Reject any journal entries after the safe snapshot rather than executing
-   the normal non-workflow bytecode replay loop.
-5. Install the strict mailbox receive gate before actor publication. Ordinary
-   user messages remain queued for explicit receipt-backed admission, while
-   system-priority supervisor messages retain their existing path.
+3. Reject a mismatched activation epoch or multiple atomic commands ahead of
+   the safe snapshot. If the atomic tail is **exactly one sequence** ahead,
+   require exactly one journaled command at that sequence and reject orphaned
+   or ambiguous journal history or post-snapshot domain events.
+4. For that single admitted-but-unfinished command, restore the actor with an
+   **admission fence at its committed command sequence**, without invoking its
+   bytecode or native handler. No user work can pass the fence until completion.
+5. Install the strict mailbox receive gate and (if necessary) the admitted
+   command fence **before actor publication**. System-priority supervisor
+   messages retain their existing path.
 
-This is deliberately **fail closed rather than automatically replaying**
-an admitted but incomplete command. Recovering it requires a separate
-compiler-verified staged handler/receipt reconstruction protocol. Existing
+Recovery of a proven pending command now returns a **quarantined, fenced
+actor**, not a runnable handler. The trusted host may durably commit an
+already-authorized staged result and call `finish_admitted_typed_actor_command`
+to validate the completion snapshot, hydrate memory and release the fence.
+This does not produce the staged result or execute compiled bytecode. Existing
 ordinary actor recovery behavior is unchanged unless strict policy has been
 persistently enabled.
 
 ## Boundaries still needing proof
 
-- **No automatic replay or recovery of incomplete strict turns yet.** A
-  committed admission with no final snapshot is refused, not silently
-  rerun. Host operators must investigate and recover using a safe protocol.
+- **No automatic execution of incomplete strict turns.** Exactly one
+  proven unfinished admission can be restored in a quarantined state, but
+  ambiguous history is refused. Host operators must supply an independently
+  replay-safe, already-authorized staged completion; the runtime never
+  invents state or re-runs unrestricted bytecode.
 - Actor migration, placement reassignment, alternative recovery constructors,
   and external provider dispatch must enforce the same persisted policy.
   This patch covers `Runtime::recover_actor`; it is not a complete

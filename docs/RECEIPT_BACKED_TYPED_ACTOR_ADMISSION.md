@@ -57,11 +57,12 @@ For a replayed receipt:
 
 ## Remaining limits
 
-**This is not an end-to-end durable execution guarantee.** The strict flag is
-process-local; recovery must explicitly enable it before accepting traffic.
-The current `Runtime::recover_actor` path does not persist or automatically
-restore that policy. Hosts must ensure this ordering externally until a
-versioned persisted activation policy is integrated.
+**This is not an end-to-end durable execution guarantee.** PR #1722 added
+persisted strict admission policy to the MemoryStore and libSQL backends and
+restores it before actor publication. A single provable unfinished command
+can be recovered with an in-flight completion fence, without bytecode replay.
+Other persistence backends and distributed activation routes still require
+equivalent fail-closed policy enforcement.
 
 The host also still controls compiled handler execution; there is no
 automatic bytecode staging, effect interception, provider-dispatch
@@ -88,7 +89,7 @@ cargo test --locked
 cargo clippy --all-targets -- -D warnings
 ```
 
-Next P0: persist and automatically enforce strict activation policy before
-mailbox traffic on restart; integrate isolated compiled handler staging; then
-run actual process-kill tests across admission/commit/dispatch/receipt
-windows. No exactly-once claims against external systems.
+Next P0: implement compiler-checked replay-safe staged-result construction,
+validate real process-kill recovery for quarantined commands, and enforce
+provider/outbox dispatch authority and idempotency. No exactly-once claims
+against external systems.
