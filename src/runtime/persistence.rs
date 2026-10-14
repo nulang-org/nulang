@@ -585,9 +585,9 @@ impl DurableTransition {
         // effect receipt publication ambiguous. Reject before any store write.
         let mut effect_ids = BTreeSet::new();
         for record in &self.durable_effects {
-            record.validate().map_err(|error| {
-                io::Error::new(io::ErrorKind::InvalidInput, error)
-            })?;
+            record
+                .validate()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
             if !effect_ids.insert(record.effect().spec().id) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
