@@ -4,6 +4,7 @@
 - **Stronger promotion checks without changing the v0alpha1 manifest schema.** `BehaviorManifest::upgrade_preflight_from` reports unresolved proof requirements when an existing durable actor changes executable identity or schema version; the existing structural-only `validate_upgrade_from` remains unchanged.
 - **Fail closed before unattended promotion.** `validate_unattended_upgrade_from` verifies both exact bytecode digests, rejects structural incompatibility, and blocks unverified migration execution/replay-sensitive code changes. Same-artifact package relabels and ephemeral-only replacements can pass this narrow preflight; Nulang Cloud admission still requires explicit integration.
 - **Regression coverage.** Added tests for unchanged durable artifacts, code drift without schema drift, semantic identity drift with identical bytes, complete but unexecuted migration chains, ephemeral updates, and mismatched old/new artifact bytes.
+- **Untrusted version hardening.** Manifest migration validation now checks sorted declared origins instead of scanning every integer up to an arbitrary `schema_version`, and rejects overflow/saturating non-advancing transitions. Added extreme-version regression cases.
 
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
