@@ -163,3 +163,49 @@ fn execution_without_an_admitted_command_is_rejected() {
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     assert_eq!(runtime.persistence.latest_sequence(actor_id), 0);
 }
+
+#[test]
+fn rejected_scalar_type_change_never_commits_or_updates_live_state() {
+    let mut module = compiled_counter();
+    let index = module.actor_metadata[0].behavior_indices[0];
+    let offset = module.behaviors[index].code_offset;
+    assert!(module.instructions.len() >= offset + 3);
+
+    let bool_index = module.constants.len();
+    module.constants.push(nulang::bytecode::Constant::Bool(true));
+    let field_index = module.constants.len();
+    module.constants.push(nulang::bytecode::Constant::String(
+        "total".to_string(),
+    ));
+    module.instructions[offset] = Instruction::new3(
+        OpCode::ConstU,
+        (bool_index >> 8) as u8,
+        bool_index as u8,
+        0,
+    );
+    module.instructions[offset + 1] = Instruction::new3(
+        OpCode::StateSet,
+        (field_index >> 8) as u8,
+        field_index as u8,
+        0,
+    );
+    module.instructions[offset + 2] = Instruction::new0(OpCode::Ret);
+
+    let (mut runtime, actor_id, behavior) = spawned(&module);
+    let sequence = admit(&mut runtime, actor_id, behavior, 5);
+    let error = runtime
+        .execute_and_commit_admitted_pure_typed_actor_turn(actor_id, sequence)
+        .expect_err("pure staged state must retain its compiler-owned scalar type");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(runtime.persistence.latest_sequence(actor_id), sequence);
+    assert_eq!(
+        runtime.actors[&actor_id].mailbox.admitted_command_sequence(),
+        Some(sequence)
+    );
+    assert_eq!(
+        runtime.actors[&actor_id]
+            .get_state_field("total")
+            .and_then(|value| value.as_int()),
+        Some(0)
+    );
+}
