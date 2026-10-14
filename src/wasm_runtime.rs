@@ -1179,14 +1179,14 @@ mod tests {
     #[test]
     fn test_run_traps_when_guest_exhausts_fuel() {
         let wasm = br#"(module
-            (import \"env\" \"memory\" (memory 1))
+            (import "env" "memory" (memory 1))
             (func $start (result i64)
                 (loop $spin
                     br $spin
                 )
                 i64.const 0
             )
-            (export \"nulang_init\" (func $start))
+            (export "nulang_init" (func $start))
         )"#;
         let mut runtime = WasmRuntime::new(wasm, None).expect("instantiate");
         let err = runtime.run().expect_err("infinite guest must exhaust fuel");
