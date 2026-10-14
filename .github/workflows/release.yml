@@ -12,6 +12,8 @@ on:
       - 'Cargo.lock'
       - 'src/main.rs'
       - 'scripts/check_release_linux.sh'
+      - 'scripts/check_release_ci_proof.py'
+      - 'scripts/tests/test_release_ci_proof.py'
       - 'scripts/tests/test_release_cli_profile.py'
 
 env:
@@ -27,8 +29,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v7
+
+      - name: Verify release CI proof policy tests
+        run: python3 -m unittest discover -s scripts/tests -p test_release_ci_proof.py
 
       - name: Verify public CLI feature-profile parity
         run: python3 -m unittest discover -s scripts/tests -p test_release_cli_profile.py
@@ -64,6 +70,18 @@ jobs:
               )
           print(f"release version verified: {tag}")
           PY
+
+      # Tag builds must be gated on executable CI for the exact commit on main.
+      # A green status badge, zero-job workflow, or passing PR on another SHA
+      # does not authorize publishing a release.
+      - name: Verify exact-head main CI for tag
+        if: github.event_name == 'push'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/check_release_ci_proof.py \
+            --repo "$GITHUB_REPOSITORY" \
+            --sha "$(git rev-parse HEAD)"
 
   release:
     name: Build (${{ matrix.target }})
