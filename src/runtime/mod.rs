@@ -1263,9 +1263,18 @@ impl Runtime {
         })?;
         if let Some((message, outcome)) = committed {
             if !outcome.newly_accepted {
-                // Receipt lookups and acceptance are one atomic storage
-                // operation. A duplicate must never enter the bytecode
-                // handler or acquire a fresh in-flight completion fence.
+                // A replayed receipt must never enter the handler. However,
+                // the live actor might still have stale in-memory state after
+                // a host restart/lost ACK. Fence subsequent user commands
+                // until a trusted host revalidates and hydrates the committed
+                // state via finish_admitted_typed_actor_command, or restores
+                // a verified activation. A later tail can make the direct
+                // finish adapter reject; in that case fail closed and recover.
+                self.actors
+                    .get_mut(&actor_id)
+                    .expect("actor remains present after durable inbox replay")
+                    .mailbox
+                    .fence_admitted_command(outcome.commit.sequence);
                 return Ok(Some(TypedInboxAdmission::Duplicate {
                     commit: outcome.commit,
                 }));
