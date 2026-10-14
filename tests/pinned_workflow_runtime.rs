@@ -351,3 +351,58 @@ fn pinned_runtime_recovers_across_real_process_boundaries() {
     }
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn corrupt_workflow_start_event_blocks_unverified_runtime_recovery() {
+    use nulang::runtime::LibsqlStore;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "nulang-runtime-corrupt-history-{}-{nonce}", std::process::id(),
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("workflow.db");
+    let bytes = b"runtime-corrupt-history-v1";
+    let behavior = manifest(bytes);
+    let actor_id = {
+        let mut runtime = Runtime::new();
+        runtime.persistence = Box::new(LibsqlStore::new(&path).unwrap());
+        runtime.try_spawn_pinned_workflow_actor(
+            "Payment", "payment/corrupt", init(), workflow_state(), &behavior, bytes,
+        ).unwrap()
+    };
+    {
+        let store = LibsqlStore::new(&path).unwrap();
+        store.query(
+            &format!(
+                "UPDATE durable_workflow_events SET event = 'not-json'
+                 WHERE actor_id = {actor_id} AND ordinal = 1"
+            ),
+            &[],
+        ).unwrap();
+    }
+
+    let mut recovered = Runtime::new();
+    recovered.persistence = Box::new(LibsqlStore::new(&path).unwrap());
+    assert_eq!(recovered.recover_actor(actor_id), None);
+    assert!(!recovered.actors.contains_key(&actor_id));
+
+    let resolver = FixtureResolver {
+        expected_digest: behavior.artifact.digest.clone(),
+        artifact: Some(PinnedArtifactBundle {
+            manifest: behavior,
+            executable: bytes.to_vec(),
+        }),
+    };
+    assert_eq!(
+        recovered.recover_pinned_workflow_actor(
+            actor_id, "payment/corrupt", &resolver,
+        ).unwrap_err().kind(),
+        ErrorKind::InvalidData,
+    );
+    assert!(!recovered.actors.contains_key(&actor_id));
+    drop(recovered);
+    std::fs::remove_dir_all(directory).unwrap();
+}
