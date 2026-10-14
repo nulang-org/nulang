@@ -84,14 +84,16 @@ pub(crate) fn decode_verified_pinned_workflow_module(
     if schema_name.trim().is_empty() {
         return Err(invalid_data("pinned bytecode workflow has an empty schema name"));
     }
-    if !bundle.manifest.actors.iter().any(|actor| {
-        actor.name == schema_name
-            && actor.persistence.is_durable()
-    }) {
-        return Err(invalid_data(
-            "pinned behavior manifest does not declare the snapshot's durable actor schema",
-        ));
-    }
+    let declared_schema = bundle
+        .manifest
+        .actors
+        .iter()
+        .find(|actor| actor.name == schema_name && actor.persistence.is_durable())
+        .ok_or_else(|| {
+            invalid_data(
+                "pinned behavior manifest does not declare the snapshot's durable actor schema",
+            )
+        })?;
 
     let module = crate::bytecode::CodeModule::from_nbc(&bundle.executable)
         .map_err(|error| invalid_data(format!("invalid pinned NBC artifact: {error}")))?
@@ -101,6 +103,11 @@ pub(crate) fn decode_verified_pinned_workflow_module(
         Some(schema_name),
     )
     .map_err(invalid_data)?;
+    if meta.version != declared_schema.schema_version {
+        return Err(invalid_data(
+            "pinned NBC state schema version does not match its behavior manifest",
+        ));
+    }
     let role = meta.role().map_err(invalid_data)?;
     if role != ActorRole::Workflow || !meta.persistent {
         return Err(invalid_data(
