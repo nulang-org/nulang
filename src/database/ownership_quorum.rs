@@ -309,7 +309,9 @@ impl FixedTermQuorumLog {
         if self.needs_reopen {
             return Err(QuorumLogError::RequiresReopen);
         }
-        let next = self.authority.applied_index()
+        let next = self
+            .authority
+            .applied_index()
             .checked_add(1)
             .ok_or(QuorumLogError::InvalidJournal)?;
         let entry = CommittedOwnershipEntry {
