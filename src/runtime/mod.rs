@@ -154,6 +154,18 @@ pub fn fresh_actor_id() -> u64 {
 /// real `fresh_actor_id()` result.
 const MAIN_HEAP_ACTOR_ID: u64 = 0;
 
+/// Outcome of receipt-backed typed actor command admission.
+///
+/// Only New may be executed by a trusted host. Duplicate is the already
+/// committed acknowledgment; the mailbox envelope was consumed without
+/// running a second handler. Neither variant performs bytecode execution.
+#[derive(Debug)]
+pub enum TypedInboxAdmission {
+    New { message: Message, commit: DurableCommit },
+    Duplicate { commit: DurableCommit },
+}
+
+
 /// Maximum number of membership entries carried by a single gossip packet.
 const GOSSIP_PAYLOAD_MAX_ENTRIES: usize = 256;
 
@@ -1003,6 +1015,50 @@ impl Runtime {
         actor_id: u64,
         transition: DurableTransition,
     ) -> std::io::Result<Option<(Message, DurableCommit)>> {
+        match self.admit_typed_actor_command_internal(actor_id, transition, None)? {
+            None => Ok(None),
+            Some(TypedInboxAdmission::New { message, commit }) => Ok(Some((message, commit))),
+            Some(TypedInboxAdmission::Duplicate { .. }) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unreceipted admission unexpectedly returned a duplicate",
+            )),
+        }
+    }
+
+    /// Admit one compiler-typed mailbox command with a stable, sender-scoped
+    /// inbox identity. Strict admission must be enabled first; this method
+    /// will fail closed if the persistence backend cannot atomically report
+    /// whether the durable receipt is new or merely a duplicate.
+    ///
+    /// Duplicate never returns a message for execution. The trusted host
+    /// must acknowledge it to the sender and independently coordinate
+    /// recovery of any earlier committed but unfinished actor turn.
+    pub fn admit_next_typed_actor_command_with_inbox(
+        &mut self,
+        actor_id: u64,
+        request: crate::durable_inbox::DurableInboxCommand,
+        transition: DurableTransition,
+    ) -> std::io::Result<Option<TypedInboxAdmission>> {
+        use std::io::{Error, ErrorKind};
+        let actor = self
+            .actors
+            .get(&actor_id)
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "actor does not exist"))?;
+        if !actor.mailbox.requires_strict_durable_admission() {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "receipt-backed admission requires strict typed actor admission",
+            ));
+        }
+        self.admit_typed_actor_command_internal(actor_id, transition, Some(request))
+    }
+
+    fn admit_typed_actor_command_internal(
+        &mut self,
+        actor_id: u64,
+        transition: DurableTransition,
+        request: Option<crate::durable_inbox::DurableInboxCommand>,
+    ) -> std::io::Result<Option<TypedInboxAdmission>> {
         use std::io::{Error, ErrorKind};
 
         let actor = self
@@ -1148,18 +1204,36 @@ impl Runtime {
             .get_mut(&actor_id)
             .expect("actor remains present during exclusive runtime access")
             .mailbox;
-        let committed = mailbox.admit_durable_with(|_| persistence.commit_transition(transition))?;
-        if let Some((message, commit)) = committed {
-            // Fence ordinary mailbox dispatch before returning the message
-            // to the trusted host. The host must durably finalize this turn.
+        let committed = mailbox.admit_durable_with(|_| match request {
+            Some(request) => persistence.commit_inbox_transition_detailed(request, transition),
+            None => persistence
+                .commit_transition(transition)
+                .map(|commit| crate::durable_inbox::DurableInboxCommitOutcome {
+                    commit,
+                    newly_accepted: true,
+                }),
+        })?;
+        if let Some((message, outcome)) = committed {
+            if !outcome.newly_accepted {
+                // Receipt lookups and acceptance are one atomic storage
+                // operation. A duplicate must never enter the bytecode
+                // handler or acquire a fresh in-flight completion fence.
+                return Ok(Some(TypedInboxAdmission::Duplicate {
+                    commit: outcome.commit,
+                }));
+            }
+            // Fence ordinary mailbox dispatch before returning new work
+            // to the trusted host. It must durably finalize this turn.
             self.actors
                 .get_mut(&actor_id)
                 .expect("actor remains present during admission")
                 .mailbox
-                .fence_admitted_command(commit.sequence);
-            // Mirror the existing step_actor receiver ownership handoff.
+                .fence_admitted_command(outcome.commit.sequence);
             self.hold_payload_refs(actor_id, &message.payload);
-            Ok(Some((message, commit)))
+            Ok(Some(TypedInboxAdmission::New {
+                message,
+                commit: outcome.commit,
+            }))
         } else {
             Ok(None)
         }
