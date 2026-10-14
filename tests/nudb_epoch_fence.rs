@@ -65,10 +65,27 @@ fn epoch_handoff_rejects_prepared_writes_and_survives_checkpoint() {
         })
     );
     assert_eq!(tablet.current_sequence(), 2);
-    assert_eq!(tablet.commit_idempotent(id, put(b"k", b"v1")).unwrap(), receipt);
+    assert!(matches!(
+        tablet.commit_idempotent_at_epoch(7, id, put(b"k", b"v1")),
+        Err(WalBackedError::Tablet(TabletError::StaleEpoch {
+            current: 9,
+            presented: 7,
+        }))
+    ));
+    assert!(matches!(
+        tablet.commit_idempotent_at_epoch(10, id, put(b"k", b"v1")),
+        Err(WalBackedError::Tablet(TabletError::UnknownEpoch {
+            current: 9,
+            presented: 10,
+        }))
+    ));
+    assert_eq!(
+        tablet.commit_idempotent_at_epoch(9, id, put(b"k", b"v1")).unwrap(),
+        receipt
+    );
 
     let new_receipt = tablet
-        .commit_idempotent(TransactionId::new([52; 16]), put(b"n", b"new"))
+        .commit_idempotent_at_epoch(9, TransactionId::new([52; 16]), put(b"n", b"new"))
         .unwrap();
     assert_eq!(new_receipt.sequence(), 3);
     tablet.checkpoint().unwrap();
