@@ -90,6 +90,46 @@ Available APIs:
 - `fabric_stream_cursor`
 - `fabric_stream_info`
 
+## Standalone producer idempotency (experimental)
+
+A local single-writer stream can opt into `append_idempotent` or
+`Runtime::fabric_stream_append_idempotent` with a stable `producer` identifier,
+a positive `epoch`, and a positive `producer_sequence`. Producer sequences
+start at 1, advance contiguously, and restart at 1 when a higher epoch fences
+the previous producer generation. The latest exact token/payload retry returns
+the original stream sequence; conflicting payloads, stale epochs, and gaps are
+rejected. Earlier-than-latest producer retries fail closed rather than claiming
+an untracked deduplication window.
+
+Each stream persists `producer_state.json` with a bounded set of producer
+checkpoints and at most one unfinished append intent. The write order is:
+
+1. fsync an exact producer intent and payload digest;
+2. append and fsync the stream record at its assigned sequence;
+3. fsync the new producer checkpoint while clearing the intent.
+
+A retry with the same token and payload reconciles either crash window: if
+the record is missing it writes it at the reserved sequence; if the record is
+already present it verifies the digest before advancing the checkpoint.
+Conflicting or unrelated append attempts are blocked until the pending token
+has been retried; the original intent must not be discarded as an automatic
+recovery shortcut. The same stream-root must have exactly one active writer,
+enforced by the single-writer lock from the separate Fabric store safety work.
+
+**Scope and limits:** producer metadata is not quorum replicated. This API
+rejects streams with an installed replication policy; a stream already using
+local producer checkpoints must undergo an explicit migration before switching
+to replication. Producer identity state is limited to 4096 entries per stream,
+rewritten with each append, and only the latest token per producer is replayable.
+Regular non-idempotent appends may still interleave after a fully completed
+producer append, but they cannot pass an unfinished producer intent.
+
+This is *local stream append deduplication*, not Kafka-style cluster producer
+idempotence, not consumer acknowledgment durability, and not exactly-once
+external side effects. Preserve `producer_state.json` with stream data during
+backups and restore. This first correctness slice makes no throughput claim:
+full-file metadata fsync and record verification are intentionally conservative.
+
 ## Explicitly not implemented yet
 
 This storage PR does **not** claim distributed stream semantics. Follow-up work
