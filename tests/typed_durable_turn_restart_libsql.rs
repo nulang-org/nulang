@@ -159,8 +159,8 @@ fn compiled_actor_state_command_effect_and_outbox_share_atomic_disk_commit() {
             Some(5)
         );
         assert_eq!(recovered.persistence.read_journal(ACTOR_ID).len(), 1);
-        let outbox_rows = recovered
-            .persistence
+        let outbox_rows = LibsqlStore::new(&db_path)
+            .expect("reopen concrete store for outbox verification")
             .query(
                 "SELECT destination_actor_id, behavior_id, payload FROM durable_outbox
                  WHERE actor_id = 7401 ORDER BY sequence, ordinal",
