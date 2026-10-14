@@ -17,7 +17,7 @@ The same four-target `.github/workflows/release.yml` matrix runs as a
 **non-publishing rehearsal** when a pull request changes the release workflow,
 `Cargo.toml`, `Cargo.lock`, `src/main.rs`, or release verification scripts.
 Confirm the `Release` PR workflow reaches terminal success for all targets,
-including artifact packaging, checksums, and native-on-runner smoke tests.
+including artifact packaging, checksums, and native-on-runner smoke tests. Linux jobs also assemble and inspect distro packages using `scripts/package_linux.sh`.
 On pull requests, the version-tag check is skipped (there is no tag) and the
 `Publish Release` job is explicitly disabled. A queued/skipped build is not
 positive execution evidence. This does **not** replace clean-machine checks,
@@ -52,6 +52,9 @@ creates a GitHub Release with:
   `nulang-linux-x86_64`). Rename the extracted executable to `nulang`
   on Unix, or `nulang.exe` on Windows, before using normal CLI commands.
 - a `.sha256` checksum per tarball
+- Linux packages built from the same stripped CLI binary: `nulang_<version>_amd64.deb`,
+  `nulang_<version>_arm64.deb`, `nulang-<version>-1.x86_64.rpm`, and
+  `nulang-<version>-1.aarch64.rpm`, each with its own `.sha256`
 - auto-generated release notes
 
 > Compatibility profile: `Cargo.toml` retains `full` as the source-build
@@ -70,8 +73,9 @@ creates a GitHub Release with:
 
 ## 5. Verify the release
 
-- Open https://github.com/nulang-org/nulang/releases and confirm all 8 files
-  (4 tarballs + 4 checksums) are attached.
+- Open https://github.com/nulang-org/nulang/releases and confirm all **16** files
+  (4 tarballs + 4 checksums + 4 Linux packages + 4 package checksums)
+  are attached. Previous releases do not retroactively acquire packages.
 - Smoke-test one artifact:
 
   ```bash
@@ -93,7 +97,14 @@ creates a GitHub Release with:
   bash scripts/check_release_linux.sh ./nulang
   ```
   This rejects `libpython*.so` ELF dependencies and missing shared libraries.
-  It does not certify portability to every Linux distribution or CPU.
+  The Linux binary is built on Ubuntu 22.04 for a stable glibc 2.35 /
+  OpenSSL 3 compatibility baseline. It does not certify portability to every
+  Linux distribution or CPU (notably not RHEL/Rocky/AlmaLinux 9 or Alpine).
+- Verify distro artifacts: run `sha256sum -c` on each package, inspect
+  `dpkg-deb --field` / `rpm -qpi`, and test installation/removal in
+  throwaway Debian 12, Ubuntu 22.04, and supported Fedora environments.
+  The release workflow checks metadata and extracted payloads, but its
+  RPM and Debian checks are not a substitute for clean-machine installs.
 - Verify the extracted executables on clean supported Linux, macOS and Windows
   machines, **not only on their build runners**. In particular, require a
   Python-3.13-only or Python-absent Linux environment so the old Python-3.12
