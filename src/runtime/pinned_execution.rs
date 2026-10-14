@@ -86,7 +86,7 @@ pub(crate) fn decode_verified_pinned_workflow_module(
     }
     if !bundle.manifest.actors.iter().any(|actor| {
         actor.name == schema_name
-            && actor.persistence == crate::behavior_manifest::BehaviorPersistence::Durable
+            && actor.persistence.is_durable()
     }) {
         return Err(invalid_data(
             "pinned behavior manifest does not declare the snapshot's durable actor schema",
@@ -108,6 +108,9 @@ pub(crate) fn decode_verified_pinned_workflow_module(
         ));
     }
 
+    if meta.behavior_indices.is_empty() {
+        return Err(invalid_data("pinned workflow has no compiled behavior entries"));
+    }
     let instruction_count = module.instructions.len();
     let mut offsets = Vec::with_capacity(meta.behavior_indices.len());
     let mut compensation_offsets = Vec::with_capacity(meta.behavior_indices.len());
