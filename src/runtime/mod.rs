@@ -947,6 +947,129 @@ impl Runtime {
         spawn::register_recovery_module(self, actor_id, module, offsets, compensation_offsets)
     }
 
+    /// Atomically commit a trusted host-staged turn for a typed persistent
+    /// actor, then publish its durable state to the live actor.
+    ///
+    /// This is deliberately opt-in. It does *not* invoke a bytecode handler,
+    /// authorize external tool use, send the outbox, or dispatch a provider.
+    /// Hosts must prepare intents without performing external effects first.
+    /// Unchanged transient actors never enter this persistence boundary.
+    pub fn commit_staged_typed_actor_turn(
+        &mut self,
+        actor_id: u64,
+        expected_previous_sequence: u64,
+        behavior_id: u16,
+        command_payload: Vec<PersistedValue>,
+        state_updates: HashMap<String, PersistedValue>,
+        durable_effects: Vec<crate::durable_effect_persistence::DurableEffectPersistenceRecord>,
+        outbox: Vec<DurableOutboxMessage>,
+    ) -> std::io::Result<DurableCommit> {
+        use std::io::{Error, ErrorKind};
+
+        let actor = self
+            .actors
+            .get(&actor_id)
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "staged actor does not exist"))?;
+        if !actor.persistent || actor.is_workflow {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "staged typed turns require a persistent non-workflow actor",
+            ));
+        }
+        let module = actor.bytecode_module.as_ref().ok_or_else(|| {
+            Error::new(ErrorKind::InvalidInput, "typed turn has no compiled actor module")
+        })?;
+        let metadata =
+            behavior_ownership::actor_meta_for_runtime_name(module, &actor.name).ok_or_else(
+                || Error::new(ErrorKind::InvalidInput, "typed turn has no actor schema metadata"),
+            )?;
+        if !metadata.persistent {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "compiled schema does not declare persistent execution",
+            ));
+        }
+        let module_behavior_idx = behavior_ownership::module_behavior_index_for_actor(
+            module,
+            &actor.name,
+            behavior_id as usize,
+        )
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "behavior is not owned by actor"))?;
+        let expected_arity = module.behaviors[module_behavior_idx].param_count;
+        if command_payload.len() != expected_arity {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "typed actor behavior expects {} arguments, received {}",
+                    expected_arity,
+                    command_payload.len()
+                ),
+            ));
+        }
+        for field_name in state_updates.keys() {
+            if !matches!(
+                actor.state_models.get(field_name),
+                Some(StateModel::Durable)
+            ) {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("staged state field '{field_name}' is not declared durable"),
+                ));
+            }
+        }
+        if durable_effects.iter().any(|record| {
+            !matches!(
+                record.effect(),
+                crate::durable_effect::DurableEffectRecord::Prepared { .. }
+            )
+        }) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "staged turn may contain only prepared, undispatched effect intents",
+            ));
+        }
+
+        let sequence = expected_previous_sequence.checked_add(1).ok_or_else(|| {
+            Error::new(ErrorKind::InvalidInput, "staged typed turn sequence overflow")
+        })?;
+        let mut snapshot = workflow::build_actor_snapshot_at_sequence(self, actor_id, sequence)?
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "persistent actor snapshot missing"))?;
+        for (name, value) in &state_updates {
+            snapshot.state.insert(name.clone(), value.clone());
+        }
+
+        let transition = DurableTransition {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id,
+            activation_epoch: actor.activation_epoch,
+            sequence,
+            expected_previous_sequence,
+            command: Some(JournalEntry {
+                sequence,
+                behavior_id,
+                payload: command_payload,
+            }),
+            snapshot: Some(snapshot.clone()),
+            workflow_events: vec![],
+            domain_events: vec![],
+            durable_effects,
+            outbox,
+        };
+        // No in-memory state is touched until the persistence backend
+        // acknowledges one atomic, epoch-fenced durable commit.
+        let commit = self.persistence.commit_transition(transition)?;
+        if let Some(actor) = self.actors.get_mut(&actor_id) {
+            for (name, value) in state_updates {
+                let runtime_value = value.to_value_on_heap(actor);
+                actor.set_state_field(name, runtime_value);
+            }
+            actor.sequence = sequence;
+            actor.dirty_fields.clear();
+        }
+        self.maybe_shadow_replicate(actor_id, &snapshot);
+        Ok(commit)
+    }
+
     /// Register all `virtual entity` types declared in `module` with the
     /// grain registry so they can be hydrated on demand.  Safe to call
     /// multiple times for the same module (later calls are no-ops).
