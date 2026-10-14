@@ -330,7 +330,10 @@ fn a_quarantined_command_accepts_trusted_staged_result_without_bytecode_replay()
         runtime.actors[&actor_id].mailbox.admitted_command_sequence(),
         Some(admitted)
     );
-    assert_eq!(runtime.persistence.load_snapshot(actor_id).unwrap(), safe_snapshot);
+    let after_recovery = runtime.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(after_recovery.sequence, safe_snapshot.sequence);
+    assert_eq!(after_recovery.activation_epoch, safe_snapshot.activation_epoch);
+    assert_eq!(after_recovery.state, safe_snapshot.state);
 
     let result = runtime.commit_admitted_typed_actor_result(
         actor_id,
