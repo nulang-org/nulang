@@ -1,4 +1,8 @@
 # Nulang Changelog
+
+### Portable contributor doctor profiles — 2026-10-14
+- **Developer environment checks no longer require optional `mise` or `mbx` for ordinary Cargo builds.** The default doctor warns about these accelerators without blocking a correctly configured toolchain; `--accelerated` enforces both tools and `mise doctor` for shared-cache worktrees. Required build tools, Rust pinning, Cargo lockfile checks, filesystem checks, and disk safeguards remain blocking.
+- **Hermetic subprocess regressions cover both profiles**, missing required tools, unhealthy optional tooling, and invalid arguments. Contributor instructions document the two supported paths.
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
