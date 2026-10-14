@@ -1167,6 +1167,26 @@ impl Runtime {
         // This conservative adapter accepts only complete durable-field
         // snapshots from this actor's compiler-owned state declaration.
         let actor = &self.actors[&actor_id];
+        // A storage record cannot mint or silently replace external effect
+        // authority. The currently installed actor manifest remains the
+        // trusted ceiling; only an explicit control-plane authority operation
+        // may change it. Do not publish state or unblock future commands if
+        // the snapshot attempts to cross that boundary.
+        let effective_authority = actor
+            .authority_manifest()
+            .map_err(|err| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    format!("actor has invalid live authority manifest: {err}"),
+                )
+            })?
+            .canonical_token_set();
+        if snapshot.authority_tokens != effective_authority {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "completion snapshot authority differs from live actor grants",
+            ));
+        }
         if snapshot.state.keys().any(|name| {
             !matches!(actor.state_models.get(name), Some(StateModel::Durable))
         }) || actor.state_models.iter().any(|(name, model)| {
