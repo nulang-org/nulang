@@ -224,7 +224,10 @@ mod tests {
         let token = CancellationToken::with_deadline(deadline);
         assert_eq!(token.check_at(now + Duration::from_secs(6)), Ok(()));
         assert_eq!(token.check_at(deadline), Err(CancellationReason::DeadlineExceeded));
-        assert_eq!(token.check_at(now + Duration::from_secs(8)), Err(CancellationReason::DeadlineExceeded));
+        assert_eq!(
+            token.check_at(now + Duration::from_secs(8)),
+            Err(CancellationReason::DeadlineExceeded)
+        );
     }
 
     #[test]
