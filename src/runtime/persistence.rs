@@ -10,8 +10,10 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use crate::durable_effect::DurableEffectId;
-use crate::durable_inbox::{DurableInboxCommand, DurableInboxCommitOutcome, DurableInboxId, DurableInboxReceipt};
 use crate::durable_effect_persistence::DurableEffectPersistenceRecord;
+use crate::durable_inbox::{
+    DurableInboxCommand, DurableInboxCommitOutcome, DurableInboxId, DurableInboxReceipt,
+};
 use crate::vm::Value;
 
 use tracing::warn;
