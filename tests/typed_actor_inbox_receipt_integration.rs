@@ -164,13 +164,28 @@ fn replayed_receipt_discards_duplicate_mailbox_envelope_without_running_bytecode
         TypedInboxAdmission::Duplicate { commit } => assert_eq!(commit, expected),
         TypedInboxAdmission::New { .. } => panic!("duplicate cannot be returned to handler"),
     }
-    assert_eq!(rt.actors[&id].mailbox.admitted_command_sequence(), None);
+    assert_eq!(
+        rt.actors[&id].mailbox.admitted_command_sequence(),
+        Some(expected.sequence),
+        "replayed ACK must not unlock the next command against stale memory"
+    );
     assert_eq!(rt.actors[&id].mailbox.len(), 0);
     assert_eq!(
         rt.actors[&id]
             .get_state_field("total")
             .and_then(|v| v.as_int()),
-        Some(0)
+        Some(0),
+        "storage completion is not equivalent to live hydration"
+    );
+
+    rt.finish_admitted_typed_actor_command(id, expected.sequence)
+        .expect("trusted completion revalidates and hydrates committed state");
+    assert_eq!(rt.actors[&id].mailbox.admitted_command_sequence(), None);
+    assert_eq!(
+        rt.actors[&id]
+            .get_state_field("total")
+            .and_then(|v| v.as_int()),
+        Some(5)
     );
 }
 
