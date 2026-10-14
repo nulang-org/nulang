@@ -1832,6 +1832,59 @@ mod tests {
     }
 
     #[test]
+    fn segment_seek_starts_at_last_base_not_after_requested_sequence() {
+        let segments: Vec<_> = [1_u64, 4, 9]
+            .into_iter()
+            .map(|base| (base, PathBuf::from(format!("{base}.seg"))))
+            .collect();
+        assert_eq!(segment_start_index(&[], 8), 0);
+        assert_eq!(segment_start_index(&segments, 0), 0);
+        assert_eq!(segment_start_index(&segments, 1), 0);
+        assert_eq!(segment_start_index(&segments, 3), 0);
+        assert_eq!(segment_start_index(&segments, 4), 1);
+        assert_eq!(segment_start_index(&segments, 8), 1);
+        assert_eq!(segment_start_index(&segments, 9), 2);
+        assert_eq!(segment_start_index(&segments, 100), 2);
+    }
+
+    #[test]
+    fn segmented_replay_seeks_across_boundaries_and_reopen() {
+        let root = test_dir("seek-read");
+        {
+            let mut store = FileFabricStreamStore::open(&root).unwrap();
+            store
+                .create_stream(
+                    "events",
+                    FabricStreamConfig {
+                        segment_max_bytes: 64,
+                    },
+                )
+                .unwrap();
+
+            for seq in 1..=24 {
+                store
+                    .append("events", format!("message-{seq}").as_bytes())
+                    .unwrap();
+            }
+            assert!(store.stream_info("events").unwrap().segment_count > 10);
+            let records = store.read_from("events", 19, 3).unwrap();
+            assert_eq!(
+                records.iter().map(|r| r.sequence).collect::<Vec<_>>(),
+                vec![19, 20, 21]
+            );
+            assert!(store.read_from("events", 25, 3).unwrap().is_empty());
+        }
+
+        let mut reopened = FileFabricStreamStore::open(&root).unwrap();
+        let records = reopened.read_from("events", 19, 3).unwrap();
+        assert_eq!(
+            records.iter().map(|r| r.sequence).collect::<Vec<_>>(),
+            vec![19, 20, 21]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn segmented_append_replay_and_rotation() {
         let root = test_dir("rotation");
         let mut store = FileFabricStreamStore::open(&root).unwrap();
