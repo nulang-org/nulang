@@ -79,7 +79,7 @@ Marshalling (`src/python/marshal.rs`) converts primitives directly and keeps eve
 Complex Python values arrive as opaque handles tagged `TAG_PYTHON` — cheap `Copy` ids into the registry, not ORCA-managed heap objects. There are no `iso`/linear capability requirements on values crossing the boundary; the gates are the compile-time `os` capability and, for code running inside an actor behavior, an explicit authority grant (e.g. `spawn Worker {} with [Python::call]`).
 
 :::caution
-String marshalling depends on the execution boundary. The owned foreign-call boundary converts Nulang strings to Python `str` by content and converts Python `str` results back to owned strings. The direct VM-value converter cannot access module-local string pools and now rejects unresolved string IDs rather than silently substituting placeholder text. Python `str` results on the legacy direct-value path still return opaque handles that are not ordinary Nulang strings.
+Runtime-host `Python.call` now resolves Nulang string arguments by content through the owned foreign-call boundary. Returned Python `str` values cross the worker-safe bridge as owned strings, then become **opaque Python object handles** in the VM: they can be passed to another `Python.call`, but cannot yet be concatenated or used as native Nulang `String` values. The legacy direct VM-value converter still requires a source-module string pool and rejects unresolved string IDs rather than silently substituting placeholder text.
 :::
 
 ### Where Python effects run
@@ -104,7 +104,7 @@ fn main() {
 ```
 
 :::note
-The parser now accepts the keyword-named operation `perform Python.import("math")`. This removes a source-syntax blocker but does not imply that every Python effect runs successfully end-to-end. The actor-runtime host and a binary built with the `python` feature are still required; the legacy direct-value call path cannot round-trip ordinary Nulang strings, and Python import/call failures currently emit a diagnostic and a `nil` result. Prefer the explicitly owned foreign-call boundary for correct string conversion, and validate real source-to-runtime execution in a Python-enabled environment before relying on it in production.
+The parser now accepts `perform Python.import("math")`; the runtime-host `Python.call` resolves owned string arguments and `Python.get_attr` reads attributes without attempting to invoke them. The actor-runtime host and a binary built with the `python` feature are still required, along with the appropriate OS and actor authority grants. Import the Python module explicitly before accessing its exports. Import/call/get-attribute failures currently emit diagnostics and return `nil`; Python strings returned to the VM remain opaque handles. Source-to-actor execution requires separate Python-enabled integration validation before production use.
 :::
 
 ## The C FFI
