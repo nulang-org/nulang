@@ -11,7 +11,7 @@
 //! | Float (non-NaN) | `float` | IEEE 754 double |
 //! | `TAG_SPECIAL` (true/false) | `bool` | Direct mapping |
 //! | `TAG_SPECIAL` (unit) | `None` | Nulang `()` → Python `None` |
-//! | `TAG_STRING` | `str` | Interned string (ID → string lookup) |
+//! | `TAG_STRING` | error | Direct conversion lacks the module-local string pool; owned calls resolve it |
 //! | `TAG_PYTHON` | opaque Py<PyAny> | Direct registry lookup |
 //! | `TAG_PTR` | `None` | Heap pointers are opaque |
 //! | Python `str` | `TAG_PYTHON` | Stored as opaque Python object |
@@ -54,7 +54,7 @@ use crate::value_layout::{TAG_ACTOR, TAG_MASK, TAG_PTR, TAG_STRING};
 /// | Float | `float` |
 /// | `TAG_SPECIAL` (true/false) | `bool` |
 /// | `TAG_SPECIAL` (unit/nil) | `None` |
-/// | `TAG_STRING` | `str` (via interned string ID) |
+/// | `TAG_STRING` | error (requires source module's string pool) |
 /// | `TAG_PYTHON` | opaque `Py<PyAny>` (registry lookup) |
 /// | `TAG_PTR` | `None` (opaque heap pointer) |
 /// | `TAG_ACTOR` | `None` (opaque actor reference) |
