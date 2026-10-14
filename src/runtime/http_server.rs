@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -826,6 +826,55 @@ fn invalid_ui_action_response(captured: &HttpRequestBindingInputs) -> Option<Htt
         })
 }
 
+/// Limits concurrently active development-server connections, including
+/// long-lived SSE streams. Lease release is automatic on worker exit or panic.
+/// This is capacity control, not an isolation boundary for untrusted code.
+struct ConnectionSlots {
+    active: AtomicUsize,
+    limit: usize,
+}
+
+impl ConnectionSlots {
+    fn new(limit: usize) -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+            limit,
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<ConnectionLease> {
+        let mut current = self.active.load(Ordering::Acquire);
+        loop {
+            if current >= self.limit {
+                return None;
+            }
+            match self.active.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(ConnectionLease {
+                        slots: Arc::clone(self),
+                    });
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+struct ConnectionLease {
+    slots: Arc<ConnectionSlots>,
+}
+
+impl Drop for ConnectionLease {
+    fn drop(&mut self) {
+        self.slots.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Dev server that dispatches registered `Web.route` handlers and falls back
 /// to static files for unmatched paths.
 #[derive(Debug)]
@@ -845,7 +894,7 @@ impl Drop for WebDevServer {
 }
 
 impl WebDevServer {
-    const MAX_BODY_SIZE: usize = 1_048_576; // 1 MB
+    const MAX_CONCURRENT_CONNECTIONS: usize = 64;
     const SSE_PATH_PREFIX: &'static str = "/__nulang/sse/";
 
     pub fn bind(
@@ -876,7 +925,7 @@ impl WebDevServer {
         let actual_port = listener.local_addr()?.port();
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
-        let routes_clone = routes.clone();
+        let routes_clone = routes;
         let static_dir_clone = static_dir.clone();
         let output_dir_clone = output_dir.clone();
 
@@ -907,20 +956,52 @@ impl WebDevServer {
         shutdown: Arc<AtomicBool>,
     ) {
         listener.set_nonblocking(true).ok();
+        let slots = Arc::new(ConnectionSlots::new(Self::MAX_CONCURRENT_CONNECTIONS));
+        // Route tables contain compiled modules; share them rather than
+        // cloning the full vector for every incoming connection.
+        let routes = Arc::new(routes);
         loop {
             if shutdown.load(Ordering::Relaxed) {
                 break;
             }
             match listener.accept() {
-                Ok((stream, _)) => {
+                Ok((mut stream, _)) => {
+                    let Some(lease) = slots.try_acquire() else {
+                        let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+                        HttpServerState::write_response(
+                            &mut stream,
+                            &HttpResponse {
+                                status: 503,
+                                headers: vec![
+                                    ("Content-Type".into(), "text/plain".into()),
+                                    ("Retry-After".into(), "1".into()),
+                                ],
+                                body: b"Server at connection capacity".to_vec(),
+                            },
+                        );
+                        continue;
+                    };
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
                     let static_dir = static_dir.clone();
                     let output_dir = output_dir.clone();
-                    let routes = routes.clone();
-                    let shutdown = shutdown.clone();
-                    std::thread::spawn(move || {
-                        Self::handle_connection(stream, static_dir, output_dir, routes, shutdown);
-                    });
+                    let routes = Arc::clone(&routes);
+                    let shutdown = Arc::clone(&shutdown);
+                    // A failed spawn drops the closure and lease, returning capacity.
+                    if let Err(error) = std::thread::Builder::new()
+                        .name("nulang-web-dev-connection".into())
+                        .spawn(move || {
+                            let _lease = lease;
+                            Self::handle_connection(
+                                stream,
+                                static_dir,
+                                output_dir,
+                                routes,
+                                shutdown,
+                            );
+                        })
+                    {
+                        eprintln!("failed to spawn web connection worker: {error}");
+                    }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(10));
@@ -934,7 +1015,7 @@ impl WebDevServer {
         mut stream: TcpStream,
         static_dir: Option<PathBuf>,
         output_dir: Option<PathBuf>,
-        routes: Vec<RuntimeWebRoute>,
+        routes: Arc<Vec<RuntimeWebRoute>>,
         shutdown: Arc<AtomicBool>,
     ) {
         let request = match read_http_request(&mut stream) {
