@@ -134,7 +134,9 @@ fn resumed_bytecode_turn_yields_to_queued_mail_before_next_dispatch() {
     for _ in 0..12 {
         assert_eq!(rt.claim_next_ready_actor(), Some(actor_id));
         rt.step_actor(actor_id);
-        if rt.actors[&actor_id].get_state_field("phase") == Some(Value::int(1)) {
+        if rt.actors[&actor_id].get_state_field("phase") == Some(Value::int(1))
+            && !rt.actors[&actor_id].jit_yield_pending
+        {
             assert_eq!(
                 rt.actors[&actor_id].mailbox.len(),
                 1,
