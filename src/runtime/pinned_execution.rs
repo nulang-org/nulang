@@ -6,8 +6,9 @@
 use crate::behavior_manifest::BehaviorManifest;
 use crate::execution_compatibility::DurableExecutionPin;
 use crate::runtime::persistence::{
-    ActorSnapshot, DurableCommit, DurableTransition, PersistedValue, PersistenceStore,
-    WorkflowEvent, PINNED_WORKFLOW_START_EVENT, DURABLE_TRANSITION_VERSION,
+    ActorSnapshot, DurableCommit, DurableTailPosition, DurableTransition, PersistedValue,
+    PersistenceStore, WorkflowEvent, PINNED_RECOVERY_CLAIM_EVENT,
+    PINNED_WORKFLOW_START_EVENT, DURABLE_TRANSITION_VERSION,
 };
 use std::io;
 
@@ -215,6 +216,102 @@ pub fn commit_pinned_workflow_start(
                 args: vec![PersistedValue::String(serialized_pin)],
             },
         ],
+        domain_events: Vec::new(),
+        durable_effects: Vec::new(),
+        outbox: Vec::new(),
+    })
+}
+
+/// Acquire a new durable activation epoch before publishing a pinned actor.
+///
+/// The caller must remember the tail it observed *before* fetching and
+/// validating the immutable executable. The atomic transition compare-and-
+/// swaps this exact predecessor. This deliberately supports only fully
+/// checkpointed, quiescent histories: pending accepted commands need a
+/// separate replay handoff rather than an unsafe snapshot promotion.
+///
+/// An identical claim is never accepted as an idempotent retry. This
+/// guarantees at most one success against the same observed predecessor.
+/// It does not grant an indefinitely exclusive lease or suppress an actor
+/// already running on another node: every later durable side effect must
+/// enforce its activation epoch at the storage boundary.
+pub fn claim_pinned_workflow_recovery(
+    store: &mut dyn PersistenceStore,
+    actor_id: u64,
+    observed_tail: DurableTailPosition,
+) -> io::Result<DurableCommit> {
+    if actor_id == 0 || observed_tail.activation_epoch == 0 || observed_tail.sequence == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "recovery claim requires a nonzero actor ID and observed durable tail",
+        ));
+    }
+
+    // The pin must still exist and be parseable. Never claim a legacy or
+    // malformed workflow based on an optimistic tail alone.
+    read_pinned_workflow_pin(store, actor_id)?;
+
+    let latest = store
+        .load_durable_tail_position(actor_id)?
+        .ok_or_else(|| invalid_data("pinned workflow has no committed tail"))?;
+    if latest != observed_tail {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "pinned workflow changed after the recovery preflight",
+        ));
+    }
+
+    let mut snapshot = store
+        .load_snapshot(actor_id)
+        .ok_or_else(|| invalid_data("pinned recovery snapshot is missing"))?;
+    if snapshot.actor_id != actor_id
+        || snapshot.sequence != observed_tail.sequence
+        || snapshot.activation_epoch != observed_tail.activation_epoch
+    {
+        return Err(invalid_data(
+            "pending or mismatched durable snapshot; recovery claim requires a completed tail",
+        ));
+    }
+
+    if store
+        .read_workflow_events_checked(actor_id)?
+        .iter()
+        .any(|event| event.sequence() > observed_tail.sequence)
+    {
+        return Err(invalid_data(
+            "uncommitted post-tail workflow history blocks pinned recovery claim",
+        ));
+    }
+    if store
+        .read_journal(actor_id)
+        .iter()
+        .any(|entry| entry.sequence > observed_tail.sequence)
+    {
+        return Err(invalid_data(
+            "post-tail accepted command blocks pinned recovery claim",
+        ));
+    }
+
+    let epoch = observed_tail.activation_epoch.checked_add(1)
+        .ok_or_else(|| invalid_data("durable activation epoch overflow"))?;
+    let sequence = observed_tail.sequence.checked_add(1)
+        .ok_or_else(|| invalid_data("durable sequence overflow"))?;
+    snapshot.activation_epoch = epoch;
+    snapshot.sequence = sequence;
+    store.commit_transition(DurableTransition {
+        version: DURABLE_TRANSITION_VERSION,
+        actor_id,
+        activation_epoch: epoch,
+        sequence,
+        expected_previous_sequence: observed_tail.sequence,
+        command: None,
+        snapshot: Some(snapshot),
+        workflow_events: vec![WorkflowEvent::Custom {
+            sequence,
+            replay_id: None,
+            name: PINNED_RECOVERY_CLAIM_EVENT.to_owned(),
+            args: Vec::new(),
+        }],
         domain_events: Vec::new(),
         durable_effects: Vec::new(),
         outbox: Vec::new(),
