@@ -608,3 +608,59 @@ fn synchronous_ask_cannot_bypass_failed_durable_admission() {
         Some(0)
     );
 }
+
+#[test]
+fn completion_rejects_incompatible_compiler_declared_state_type() {
+    let (mut runtime, actor_id, behavior, _) = spawned();
+    let previous = runtime.persistence.latest_sequence(actor_id);
+    runtime.send_message_by_id(actor_id, behavior, &[Value::int(5)]);
+    let first = command(&runtime, actor_id, behavior, previous, 5);
+    let (_, admitted) = runtime
+        .admit_next_typed_actor_command(actor_id, first)
+        .unwrap()
+        .expect("persisted command");
+
+    let mut completion = runtime.persistence.load_snapshot(actor_id).unwrap_or_default();
+    completion.actor_id = actor_id;
+    completion.sequence = admitted.sequence + 1;
+    completion.activation_epoch = admitted.activation_epoch;
+    completion.schema_name = Some("Counter".to_string());
+    completion
+        .state
+        .insert("total".to_string(), PersistedValue::String("five".to_string()));
+    runtime
+        .persistence
+        .commit_transition(DurableTransition {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id,
+            activation_epoch: admitted.activation_epoch,
+            sequence: admitted.sequence + 1,
+            expected_previous_sequence: admitted.sequence,
+            command: None,
+            snapshot: Some(completion),
+            workflow_events: vec![],
+            domain_events: vec![],
+            durable_effects: vec![],
+            outbox: vec![],
+        })
+        .expect("backend stores envelope; trusted host must validate schema");
+
+    assert_eq!(
+        runtime
+            .finish_admitted_typed_actor_command(actor_id, admitted.sequence)
+            .expect_err("string state cannot satisfy compiler-declared integer field")
+            .kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    assert_eq!(
+        runtime.actors[&actor_id].mailbox.admitted_command_sequence(),
+        Some(admitted.sequence)
+    );
+    assert_eq!(
+        runtime.actors[&actor_id]
+            .get_state_field("total")
+            .and_then(|value| value.as_int()),
+        Some(0),
+        "incompatible persisted state cannot be published"
+    );
+}
