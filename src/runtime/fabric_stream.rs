@@ -1401,6 +1401,16 @@ impl FileFabricStreamStore {
         let path = self.stream_dir(name).join("cursors.json");
         let mut cursors = read_cursors(&path)?;
         let current = cursors.cursors.get(consumer).copied().unwrap_or(0);
+        // A legacy build may have acknowledged an uncommitted replica tail.
+        // Reject its persisted cursor as corrupt before evaluating mutations.
+        if replicated && current > last_sequence {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Fabric consumer cursor {current} exceeds quorum-committed sequence {last_sequence}"
+                ),
+            ));
+        }
         if sequence < current {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
