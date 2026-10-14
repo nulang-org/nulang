@@ -6,8 +6,8 @@ use crate::runtime::network::Packet;
 use crate::runtime::supervision::RemoteLink;
 use crate::runtime::NodeId;
 use crate::runtime::{
-    ActorState, ExitReason, Message, MessagePayload, MessagePriority, Runtime, Supervisor,
-    SupervisorAction,
+    ActorState, ExitReason, Message, MessagePayload, MessagePriority, MonitorRef, Runtime,
+    Supervisor, SupervisorAction,
 };
 use crate::vm::Value;
 
@@ -98,6 +98,7 @@ pub(crate) fn reap_living_actor(rt: &mut Runtime, actor_id: u64, reason: ExitRea
     for watcher_id in monitors {
         send_down_message(rt, watcher_id, actor_id, &reason);
     }
+    rt.retire_monitor_refs_on_exit(actor_id, &reason);
 
     // Notify remote watchers (cross-node links and monitors).
     let local_node = rt.distributed.node_id.unwrap_or(NodeId::LOCAL);
@@ -323,29 +324,49 @@ pub(crate) fn send_down_message(
     target_id: u64,
     reason: &ExitReason,
 ) {
-    let reason_str = reason.tag();
+    send_down_message_with_ref(rt, watcher_id, target_id, reason, None)
+}
+
+/// A reference-bearing DOWN appends one field to the legacy three-value
+/// system message: [target, watcher, reason_code, monitor_ref].
+pub(crate) fn send_down_message_with_ref(
+    rt: &mut Runtime,
+    watcher_id: u64,
+    target_id: u64,
+    reason: &ExitReason,
+    reference: Option<MonitorRef>,
+) {
+    let base = [
+        Value::int(target_id as i64),
+        Value::int(watcher_id as i64),
+        Value::int(match reason {
+            ExitReason::Normal => 0,
+            ExitReason::Error(_) => 1,
+            ExitReason::Kill => 2,
+            ExitReason::Killed => 3,
+            ExitReason::Shutdown(_) => 4,
+            ExitReason::NoConnection => 6,
+            ExitReason::Custom(_) => 5,
+        }),
+    ];
+    let payload = match reference {
+        Some(reference) => MessagePayload::from_slice(&[
+            base[0],
+            base[1],
+            base[2],
+            Value::int(reference.0 as i64),
+        ]),
+        None => MessagePayload::from_slice(&base),
+    };
     let down_msg = Message {
         behavior_id: 0,
-        payload: MessagePayload::from_slice(&[
-            Value::int(target_id as i64),
-            Value::int(watcher_id as i64),
-            Value::int(match reason {
-                ExitReason::Normal => 0,
-                ExitReason::Error(_) => 1,
-                ExitReason::Kill => 2,
-                ExitReason::Killed => 3,
-                ExitReason::Shutdown(_) => 4,
-                ExitReason::NoConnection => 6,
-                ExitReason::Custom(_) => 5,
-            }),
-        ]),
+        payload,
         sender: target_id,
         priority: MessagePriority::System,
         trace_id: None,
     };
     if let Some(watcher) = rt.actors.get_mut(&watcher_id) {
         let _ = watcher.mailbox.push_local(down_msg);
-        let _ = reason_str;
+        rt.enqueue_actor(watcher_id);
     }
-    rt.enqueue_actor(watcher_id);
 }
