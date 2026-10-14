@@ -93,7 +93,6 @@ fn method_not_allowed_response() -> HttpResponse {
     }
 }
 
-
 /// Manages the background HTTP listener thread.
 /// Stored on Runtime; `HttpServerState::bind()` spawns the thread.
 pub struct HttpServerState {
@@ -1287,7 +1286,6 @@ mod tests {
             response.contains("Allow: GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS\r\n"),
             "405 responses must advertise the supported methods"
         );
-
     }
 
     #[test]
