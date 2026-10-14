@@ -24,6 +24,8 @@
 
 **New to Nulang?** [Try Core in the browser](https://nulang.org/playground/) (no install) · [Install a checksummed release](https://nulang.org/getting-started/installation/) · [Run the quick start](https://nulang.org/getting-started/quick-start/). Native actors, networking, and durable runtime features require a local binary.
 
+**Jump to:** [Installation](#installation) · [Quick Start](#quick-start) · [Features](#feature-highlights) · [Documentation](#documentation) · [Status](#project-status--stability) · [Roadmap](#roadmap) · [Contributors](#contributors) · [Sponsors](#sponsors) · [Contact](#contact)
+
 ## What is Nulang?
 
 Nulang is a programming language for concurrent, durable, and distributed
@@ -86,20 +88,13 @@ Windows x86_64; other platform/architecture combinations are not release-tested.
 
 ## Quick Start
 
-A pre-built release binary needs no Rust toolchain. To build from source, use
-Rust 1.95.0:
+A [pre-built release](#pre-built-binaries) needs no Rust toolchain. These commands assume `nulang` is on your PATH; if you [built from source](#from-source), use `./target/release/nulang` instead. Save the example below as `hello.nula` before running the file commands.
 
 ```bash
-git clone https://github.com/nulang-org/nulang.git
-cd nulang
-cargo build --release
-```
-
-```bash
-nulang hello.nula              # compile + run
-nulang --check hello.nula      # type-check only
 nulang --eval '40 + 2'         # evaluate inline code
 nulang --repl                  # interactive REPL
+nulang --check hello.nula      # type-check the saved program
+nulang hello.nula              # compile + run the saved program
 ```
 
 A Nulang program:
@@ -229,6 +224,27 @@ WASM-backend validation. For local validation, run `cargo test --locked`; add
 
 ---
 
+## Roadmap
+
+The roadmap below refreshes weekly (and on demand) from the live GitHub [roadmap tracker](https://github.com/nulang-org/nulang/issues/331), through a reviewable [automation pull request](.github/workflows/readme-roadmap-sync.yml). Changes appear on `main` after that PR is reviewed and merged. Open issue counts are **not** proof of remaining or completed implementation.
+
+<!-- roadmap:start -->
+_Generated from the [maintained roadmap tracker](https://github.com/nulang-org/nulang/issues/331). Statuses reflect linked GitHub issues and PRs, **not verified feature completion**._
+
+| Focus | Open / tracked | Open references |
+| --- | ---: | --- |
+| Semantic correctness (P0) | 2 / 13 | [#261](https://github.com/nulang-org/nulang/issues/261), [#332](https://github.com/nulang-org/nulang/issues/332) |
+| Protocols and delivery | 2 / 2 | [#303](https://github.com/nulang-org/nulang/issues/303), [#306](https://github.com/nulang-org/nulang/issues/306) |
+| Durable external effects | 2 / 2 | [#317](https://github.com/nulang-org/nulang/issues/317), [#347](https://github.com/nulang-org/nulang/issues/347) |
+| Durable identity (P1) | 1 / 1 | [#333](https://github.com/nulang-org/nulang/issues/333) |
+| Host and WASM authority | 1 / 1 | [#334](https://github.com/nulang-org/nulang/issues/334) |
+| Tooling | 1 / 1 | [#336](https://github.com/nulang-org/nulang/issues/336) |
+
+For the full dependency ordering, rationale, and change proposals, see [roadmap issue #331](https://github.com/nulang-org/nulang/issues/331). For already implemented behavior and limitations, see [implementation status](docs/IMPLEMENTATION_STATUS.md) and [changelog](CHANGELOG.md).
+<!-- roadmap:end -->
+
+---
+
 ## Nulang Cloud
 
 **[Nulang Cloud](https://www.nulang.cloud)** is the optional managed platform
@@ -257,17 +273,29 @@ dependencies.
 
 - **Questions & discussion:** [GitHub Discussions](https://github.com/nulang-org/nulang/discussions)
 - **Bugs & feature requests:** [Issue tracker](https://github.com/nulang-org/nulang/issues/new/choose)
-- **Contributing:** see [CONTRIBUTING.md](CONTRIBUTING.md) and our [Code of Conduct](CODE_OF_CONDUCT.md)
+- **Getting involved:** [CONTRIBUTING.md](CONTRIBUTING.md), [Code of Conduct](CODE_OF_CONDUCT.md), and [governance](GOVERNANCE.md)
 - **External developer pilot:** follow [the adoption protocol](docs/ADOPTION_PILOT.md) and report anonymized findings to [issue #809](https://github.com/nulang-org/nulang/issues/809).
+- **Security issues:** use the private reporting route in [SECURITY.md](SECURITY.md); do not disclose vulnerabilities in public issues.
+
+## Contributors
+
+Thanks to everyone improving Nulang through code, documentation, testing, bug reports, and design discussions. Contributions of all sizes are welcome; see the [contribution guide](CONTRIBUTING.md) and [open issues](https://github.com/nulang-org/nulang/issues) for ways to help.
+
+[![GitHub contributors](https://contrib.rocks/image?repo=nulang-org/nulang)](https://github.com/nulang-org/nulang/graphs/contributors)
+
+The contributor image is maintained by an external service and updates as GitHub contributions change. The [GitHub contributor history](https://github.com/nulang-org/nulang/graphs/contributors) remains the canonical source.
+
+## Sponsors
+
+Support ongoing development through the funding options configured for this repository: [GitHub Sponsors](https://github.com/sponsors/dporkka), [Open Collective](https://opencollective.com/nulang-org), or [direct support](https://buy.stripe.com/cN26oM84c2oT772dQX).
+
+Sponsorship helps sustain maintenance, release engineering, compatibility testing, documentation, and developer tooling. Sponsor names and logos are not displayed without permission.
+
+## Contact
+
+For project questions, partnerships, and other general inquiries, email **[david@nulang.org](mailto:david@nulang.org)**. For bugs, use [GitHub Issues](https://github.com/nulang-org/nulang/issues/new/choose); for vulnerabilities, follow [SECURITY.md](SECURITY.md).
 
 ---
-
-## Docs & Wiki
-
-The [nulang.org](https://nulang.org) documentation site is regenerated automatically on every push to `main` via the [Docs Sync workflow](.github/workflows/docs-sync.yml). When source files, examples, or docs content change, the workflow rebuilds generated docs and the browser playground, verifies the Astro site, and proposes the generated files through the `automation/docs-sync` pull request rather than pushing directly to protected `main`.
-
----
-
 ## License
 
 Nulang is licensed under the [Apache License, Version 2.0](https://github.com/nulang-org/nulang/blob/main/LICENSE).
