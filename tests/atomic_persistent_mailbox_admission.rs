@@ -664,3 +664,58 @@ fn completion_rejects_incompatible_compiler_declared_state_type() {
         "incompatible persisted state cannot be published"
     );
 }
+
+#[test]
+fn completion_snapshot_cannot_change_compiled_integer_field_to_string() {
+    let (mut runtime, actor_id, behavior, _) = spawned();
+    let previous = runtime.persistence.latest_sequence(actor_id);
+    runtime.send_message_by_id(actor_id, behavior, &[Value::int(5)]);
+    let first = command(&runtime, actor_id, behavior, previous, 5);
+    let (_, accepted) = runtime
+        .admit_next_typed_actor_command(actor_id, first)
+        .unwrap()
+        .expect("command admitted");
+
+    let mut invalid = runtime.persistence.load_snapshot(actor_id).unwrap_or_default();
+    invalid.actor_id = actor_id;
+    invalid.sequence = accepted.sequence + 1;
+    invalid.activation_epoch = accepted.activation_epoch;
+    invalid.schema_name = Some("Counter".to_string());
+    invalid.state.insert(
+        "total".to_string(),
+        PersistedValue::String("not an Int".to_string()),
+    );
+    runtime
+        .persistence
+        .commit_transition(DurableTransition {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id,
+            activation_epoch: accepted.activation_epoch,
+            sequence: accepted.sequence + 1,
+            expected_previous_sequence: accepted.sequence,
+            command: None,
+            snapshot: Some(invalid),
+            workflow_events: vec![],
+            domain_events: vec![],
+            durable_effects: vec![],
+            outbox: vec![],
+        })
+        .expect("storage accepts an opaque snapshot");
+
+    let error = runtime
+        .finish_admitted_typed_actor_command(actor_id, accepted.sequence)
+        .expect_err("runtime must reject persisted state type mismatch");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(
+        runtime.actors[&actor_id].mailbox.admitted_command_sequence(),
+        Some(accepted.sequence),
+        "invalid state must not unlock later commands"
+    );
+    assert_eq!(
+        runtime.actors[&actor_id]
+            .get_state_field("total")
+            .and_then(|value| value.as_int()),
+        Some(0),
+        "invalid completion must not corrupt live state"
+    );
+}
