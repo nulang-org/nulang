@@ -1,5 +1,4 @@
-//! WAL writer ownership regressions. These require operating-system flock semantics.
-#![cfg(unix)]
+//! WAL writer ownership regressions using cross-process OS file locks.
 
 use std::ffi::OsString;
 use std::fs;
@@ -138,7 +137,7 @@ fn competing_writer_process_is_rejected_and_killed_owner_releases_lock() {
 
     let mut ready = false;
     for _ in 0..400 {
-        if fs::read(&ack).as_deref() == Ok(&b"locked"[..]) {
+        if fs::read(&ack).is_ok_and(|value| value == b"locked") {
             ready = true;
             break;
         }
