@@ -10,6 +10,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use crate::durable_effect::DurableEffectId;
+use crate::durable_inbox::{DurableInboxCommand, DurableInboxId, DurableInboxReceipt};
 use crate::durable_effect_persistence::DurableEffectPersistenceRecord;
 use crate::vm::Value;
 
@@ -642,6 +643,35 @@ pub trait PersistenceStore: Send + Sync {
         ))
     }
 
+    /// Atomically accept one logical inbound command and its dedup receipt
+    /// with the canonical transition. Implementations MUST NOT fake this with
+    /// `load` followed by `commit_transition`: concurrent hosts could both
+    /// dispatch a command. Disk-backed stores must fail closed until the
+    /// receipt and transition use one database transaction.
+    fn commit_inbox_transition(
+        &mut self,
+        _request: DurableInboxCommand,
+        _transition: DurableTransition,
+    ) -> io::Result<DurableCommit> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic durable inbox receipt commits are not supported by this persistence backend",
+        ))
+    }
+
+    /// Recover the original accepted receipt for a stable logical message ID.
+    /// Unknown backends return Unsupported, not Ok(None): absence cannot be
+    /// inferred from a backend that does not support inbox deduplication.
+    fn load_durable_inbox_receipt(
+        &self,
+        _id: DurableInboxId,
+    ) -> io::Result<Option<DurableInboxReceipt>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "durable inbox receipt reads are not supported by this persistence backend",
+        ))
+    }
+
     /// Load the committed atomic tail position for recovery classification.
     ///
     /// Backends that do not implement atomic durable transitions must return
@@ -835,6 +865,7 @@ pub struct MemoryStore {
     events: HashMap<u64, Vec<EventEntry>>,
     durable_tails: HashMap<u64, DurableTail>,
     committed_transitions: HashMap<u64, Vec<DurableTransition>>,
+    durable_inbox_receipts: HashMap<DurableInboxId, DurableInboxReceipt>,
 }
 
 impl MemoryStore {
@@ -877,6 +908,68 @@ impl PersistenceStore for MemoryStore {
             .flat_map(|transition| transition.durable_effects.iter().rev())
             .find(|record| record.effect().spec().id == effect_id)
             .cloned())
+    }
+
+    fn load_durable_inbox_receipt(
+        &self,
+        id: DurableInboxId,
+    ) -> io::Result<Option<DurableInboxReceipt>> {
+        Ok(self.durable_inbox_receipts.get(&id).copied())
+    }
+
+    fn commit_inbox_transition(
+        &mut self,
+        request: DurableInboxCommand,
+        transition: DurableTransition,
+    ) -> io::Result<DurableCommit> {
+        transition.validate_structure()?;
+        let command = transition.command.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "durable inbox admission requires a journal command",
+            )
+        })?;
+        request.validate_command(transition.actor_id, command)?;
+
+        // This is a logical dedup key, NOT the receiver's activation/sequence.
+        // Retrying a previously committed input after later actor turns returns
+        // the original receipt rather than allocating a second journal entry.
+        if let Some(existing) = self.durable_inbox_receipts.get(&request.id()) {
+            if existing.request_digest != request.request_digest() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "durable inbox identity already accepted with a different request",
+                ));
+            }
+            return Ok(existing.commit);
+        }
+
+        // Do not retroactively attach an inbox receipt to an ordinary atomic
+        // commit. The command and dedup record must become visible together;
+        // otherwise the caller could mistake legacy history for safe dedup.
+        if self.durable_tails.get(&transition.actor_id).is_some_and(|tail| {
+            tail.sequence == transition.sequence
+                && tail.activation_epoch == transition.activation_epoch
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "durable transition committed without an atomic inbox receipt",
+            ));
+        }
+
+        // MemoryStore is single-owner/in-memory: commit_transition validates
+        // the full envelope and performs infallible in-memory publication.
+        // There is no fallible I/O between its commit and receipt insertion.
+        let commit = self.commit_transition(transition)?;
+        self.durable_inbox_receipts.insert(
+            request.id(),
+            DurableInboxReceipt {
+                id: request.id(),
+                request_digest: request.request_digest(),
+                commit,
+            },
+        );
+        Ok(commit)
     }
 
     fn commit_transition(&mut self, transition: DurableTransition) -> io::Result<DurableCommit> {
