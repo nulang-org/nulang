@@ -14,7 +14,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DIR_ENV: &str = "NULANG_LLM_PROVIDER_COMMIT_KILL_DIR";
 const READY: &str = "NULANG_LLM_PROVIDER_COMMITTED:";
@@ -87,10 +87,12 @@ impl nulang_ai::LlmClient for LedgerProvider {
         }
 
         if self.crash_at_commit {
-            println!("{READY}{}", self.actor_id);
-            std::io::stdout()
-                .flush()
-                .expect("flush provider-commit readiness");
+            // The provider must stay parked after its independent fsynced
+            // commit, before returning the response to the runtime. Do NOT
+            // acknowledge the crash boundary here: this worker may finish
+            // first, before the workflow thread commits its suspension marker.
+            // The workflow test thread announces readiness only after BOTH
+            // durable boundaries have been checked.
             loop {
                 std::thread::park();
             }
@@ -124,11 +126,8 @@ fn child_provider_commits_while_compiled_workflow_is_suspended() {
         vm.run().expect("spawn real compiled workflow")
     };
     let actor_id = reference.as_actor_id().expect("actor id");
-    rt.borrow_mut().set_llm_client(Box::new(LedgerProvider::new(
-        directory.clone(),
-        true,
-        actor_id,
-    )));
+    let provider = LedgerProvider::new(directory.clone(), true, actor_id);
+    rt.borrow_mut().set_llm_client(Box::new(provider.clone()));
     rt.borrow_mut().send_message_by_id(actor_id, 0, &[]);
     loop {
         let next = rt.borrow_mut().scheduler.dequeue();
@@ -168,8 +167,25 @@ fn child_provider_commits_while_compiled_workflow_is_suspended() {
             "Nulang cannot have recorded a terminal workflow response yet"
         );
     }
-    // The provider worker signals READY only AFTER fsyncing the provider's
-    // independent ledger and then blocks before delivering its LLM response.
+    // The main workflow thread has now proved the suspension marker is
+    // persisted. Wait for the independent provider ledger's fsync, then
+    // signal the PARENT from here. This orders the parent's SIGKILL after
+    // BOTH durable boundaries; the worker must remain parked so no provider
+    // response can enter the runtime before the crash.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while provider.new_mutations.load(Ordering::SeqCst) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "provider failed to commit its independent ledger before the crash cutpoint"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.new_mutations.load(Ordering::SeqCst), 1);
+    println!("{READY}{actor_id}");
+    std::io::stdout()
+        .flush()
+        .expect("flush combined workflow/provider durability acknowledgment");
     loop {
         std::thread::park();
     }
