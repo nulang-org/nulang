@@ -175,8 +175,12 @@ pub struct ActorSnapshot {
     /// Versioned runtime-owned dispatch policy. 0 is legacy, 1 requires
     /// atomic host admission; unknown values fail closed during recovery.
     /// Old serialized snapshots default to legacy only for compatibility.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "strict_policy_is_legacy")]
     pub strict_admission_policy_version: u16,
+}
+
+fn strict_policy_is_legacy(version: &u16) -> bool {
+    *version == 0
 }
 
 impl Default for ActorSnapshot {
