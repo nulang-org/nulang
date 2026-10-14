@@ -1017,6 +1017,16 @@ impl Runtime {
                 ));
             }
         }
+        let mut effect_ids = HashSet::new();
+        if durable_effects
+            .iter()
+            .any(|record| !effect_ids.insert(record.effect().spec().id))
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "duplicate prepared effect identity in staged actor turn",
+            ));
+        }
         if durable_effects.iter().any(|record| {
             !matches!(
                 record.effect(),
