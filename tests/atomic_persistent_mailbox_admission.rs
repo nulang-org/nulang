@@ -374,6 +374,13 @@ fn admitted_command_blocks_next_user_message_until_durable_completion() {
     runtime
         .finish_admitted_typed_actor_command(actor_id, receipt.sequence)
         .expect("completion safely releases next user command");
+    assert_eq!(
+        runtime.actors[&actor_id]
+            .get_state_field("total")
+            .and_then(|value| value.as_int()),
+        Some(5),
+        "live actor state must match durable completion before next command starts"
+    );
     let next_message = runtime.actors.get_mut(&actor_id).unwrap().mailbox.pop().unwrap();
     assert_eq!(next_message.payload[0].as_int(), Some(6));
 }
@@ -409,4 +416,50 @@ fn supervisor_notices_still_bypass_admitted_inflight_user_command() {
     assert_eq!(mailbox.pop().unwrap().sender, 99);
     assert!(mailbox.pop().is_none());
     assert_eq!(mailbox.len(), 1);
+}
+
+#[test]
+fn mismatched_completion_schema_cannot_release_admitted_message_fence() {
+    let (mut runtime, actor_id, behavior, _) = spawned();
+    let previous = runtime.persistence.latest_sequence(actor_id);
+    runtime.send_message_by_id(actor_id, behavior, &[Value::int(4)]);
+    let first = command(&runtime, actor_id, behavior, previous, 4);
+    let (_, receipt) = runtime
+        .admit_next_typed_actor_command(actor_id, first)
+        .unwrap()
+        .unwrap();
+
+    let mut fake_snapshot = runtime.persistence.load_snapshot(actor_id).unwrap_or_default();
+    fake_snapshot.actor_id = actor_id;
+    fake_snapshot.activation_epoch = receipt.activation_epoch;
+    fake_snapshot.sequence = receipt.sequence + 1;
+    fake_snapshot.schema_name = Some("WrongSchema".to_string());
+    runtime
+        .persistence
+        .commit_transition(DurableTransition {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id,
+            activation_epoch: receipt.activation_epoch,
+            sequence: receipt.sequence + 1,
+            expected_previous_sequence: receipt.sequence,
+            command: None,
+            snapshot: Some(fake_snapshot),
+            workflow_events: vec![],
+            domain_events: vec![],
+            durable_effects: vec![],
+            outbox: vec![],
+        })
+        .unwrap();
+
+    assert_eq!(
+        runtime
+            .finish_admitted_typed_actor_command(actor_id, receipt.sequence)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        runtime.actors[&actor_id].mailbox.admitted_command_sequence(),
+        Some(receipt.sequence)
+    );
 }
