@@ -128,7 +128,7 @@ fn direct_wal_append_cannot_implicitly_advance_epoch() {
     let mut wal = FileWal::open(&path).unwrap();
     let original = TabletWrite::prepare(&descriptor(3), 3, 0, 0, put(b"k", b"value")).unwrap();
     wal.append_write(&original).unwrap();
-    let forged = TabletWrite::prepare(&descriptor(4), 4, 1, 1, put(b"z", b"future")).unwrap();
+    let forged = TabletWrite::prepare(&descriptor(4), 4, 1, 1, put(b"y", b"future")).unwrap();
     assert_eq!(
         wal.append_write(&forged).unwrap_err(),
         WalError::UnfencedEpochAdvance {
