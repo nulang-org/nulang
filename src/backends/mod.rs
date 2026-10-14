@@ -822,6 +822,24 @@ mod tests {
 
     #[cfg(feature = "python")]
     #[test]
+    fn test_foreign_interop_get_attr_reads_non_callable_constant() {
+        let mut fi = DefaultForeignInterop::new().expect("Python backend initialization failed");
+        fi.import("math").expect("math module import failed");
+        let result = fi.get_attr("math", "pi").expect("math.pi is a non-callable attribute");
+        let value = result.as_float().expect("expected Python float");
+        assert!((value - std::f64::consts::PI).abs() < f64::EPSILON);
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
+    fn test_foreign_interop_get_attr_rejects_unimported_module() {
+        let mut fi = DefaultForeignInterop::new().expect("Python backend initialization failed");
+        let err = fi.get_attr("not_imported", "anything").unwrap_err();
+        assert!(err.contains("not imported"), "unexpected error: {err}");
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
     fn test_foreign_interop_python_roundtrip() {
         // Ensure Python is initialized (auto-initialize feature handles this).
         let _ = pyo3::Python::attach(|_py| ());
