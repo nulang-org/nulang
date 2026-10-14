@@ -3253,7 +3253,7 @@ mod json_file_store_tests {
                 crdt_snapshot: None,
                 crdt_field_map: None,
                 schema_name: None,
-                authority_tokens,
+                authority_tokens: Default::default(),
                 strict_admission_policy_version: 0,
             })
             .unwrap();
@@ -3318,7 +3318,7 @@ mod json_file_store_tests {
                 crdt_snapshot: None,
                 crdt_field_map: None,
                 schema_name: None,
-                authority_tokens,
+                authority_tokens: Default::default(),
                 strict_admission_policy_version: 0,
             })
             .unwrap();
@@ -3350,7 +3350,7 @@ mod json_file_store_tests {
                 crdt_snapshot: None,
                 crdt_field_map: None,
                 schema_name: None,
-                authority_tokens,
+                authority_tokens: Default::default(),
                 strict_admission_policy_version: 0,
             })
             .unwrap();
@@ -3389,7 +3389,7 @@ mod json_file_store_tests {
                     crdt_snapshot: None,
                     crdt_field_map: None,
                     schema_name: None,
-                    authority_tokens,
+                    authority_tokens: Default::default(),
                     strict_admission_policy_version: 0,
                 })
                 .unwrap();
@@ -3431,7 +3431,7 @@ mod json_file_store_tests {
                 crdt_snapshot: None,
                 crdt_field_map: None,
                 schema_name: None,
-                authority_tokens,
+                authority_tokens: Default::default(),
                 strict_admission_policy_version: 0,
             })
             .unwrap();
@@ -3555,7 +3555,7 @@ mod rocksdb_store_tests {
                 crdt_snapshot: None,
                 crdt_field_map: None,
                 schema_name: None,
-                authority_tokens,
+                authority_tokens: Default::default(),
                 strict_admission_policy_version: 0,
             })
             .unwrap();
@@ -3614,7 +3614,7 @@ mod rocksdb_store_tests {
                 crdt_snapshot: None,
                 crdt_field_map: None,
                 schema_name: None,
-                authority_tokens,
+                authority_tokens: Default::default(),
                 strict_admission_policy_version: 0,
             })
             .unwrap();
@@ -3646,7 +3646,7 @@ mod rocksdb_store_tests {
                 crdt_snapshot: None,
                 crdt_field_map: None,
                 schema_name: None,
-                authority_tokens,
+                authority_tokens: Default::default(),
                 strict_admission_policy_version: 0,
             })
             .unwrap();
@@ -3685,7 +3685,7 @@ mod rocksdb_store_tests {
                     crdt_snapshot: None,
                     crdt_field_map: None,
                     schema_name: None,
-                    authority_tokens,
+                    authority_tokens: Default::default(),
                     strict_admission_policy_version: 0,
                 })
                 .unwrap();
@@ -3759,7 +3759,7 @@ mod postgres_store_tests {
                 crdt_snapshot: None,
                 crdt_field_map: None,
                 schema_name: None,
-                authority_tokens,
+                authority_tokens: Default::default(),
                 strict_admission_policy_version: 0,
             })
             .unwrap();
@@ -3827,7 +3827,7 @@ mod postgres_store_tests {
                 crdt_snapshot: None,
                 crdt_field_map: None,
                 schema_name: None,
-                authority_tokens,
+                authority_tokens: Default::default(),
                 strict_admission_policy_version: 0,
             })
             .unwrap();
@@ -3863,7 +3863,7 @@ mod postgres_store_tests {
                 crdt_snapshot: None,
                 crdt_field_map: None,
                 schema_name: None,
-                authority_tokens,
+                authority_tokens: Default::default(),
                 strict_admission_policy_version: 0,
             })
             .unwrap();
