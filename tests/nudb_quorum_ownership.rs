@@ -167,3 +167,47 @@ fn duplicate_voter_paths_cannot_be_counted_as_two_votes() {
     cleanup(&paths);
 }
 
+#[test]
+fn corrupted_minor_replica_does_not_override_majority() {
+    use std::io::Write;
+    let paths = paths();
+    cleanup(&paths);
+    let mut log = FixedTermQuorumLog::open(&paths, 4).unwrap();
+    let committed = log.propose(bootstrap()).unwrap();
+    drop(log);
+
+    // A torn, unchecksummed frame makes the replica unavailable. It cannot
+    // be counted as a valid acknowledgment or an alternate committed log.
+    let mut damaged = fs::OpenOptions::new()
+        .append(true)
+        .open(&paths[2])
+        .unwrap();
+    damaged.write_all(&[0xff]).unwrap();
+    damaged.sync_data().unwrap();
+    drop(damaged);
+
+    let mut reopened = FixedTermQuorumLog::open(&paths, 4).unwrap();
+    assert_eq!(reopened.authority().grant(tablet(18)), Some(committed));
+    let next = reopened.propose(handoff(1, 7, 2, 8)).unwrap();
+    assert_eq!(next.committed_index, 2);
+    drop(reopened);
+    cleanup(&paths);
+}
+
+#[cfg(unix)]
+#[test]
+fn hardlinked_journal_files_must_not_be_counted_twice() {
+    let paths = paths();
+    cleanup(&paths);
+    let log = FixedTermQuorumLog::open(&paths, 3).unwrap();
+    drop(log);
+
+    fs::remove_file(&paths[1]).unwrap();
+    fs::hard_link(&paths[0], &paths[1]).unwrap();
+    assert!(matches!(
+        FixedTermQuorumLog::open(&paths, 3),
+        Err(QuorumLogError::DuplicateReplicaPath)
+    ));
+    cleanup(&paths);
+}
+
