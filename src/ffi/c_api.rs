@@ -53,7 +53,12 @@ impl NulangRuntime {
     }
 
     fn set_error(&mut self, err: NuError) {
-        self.last_error = Some(err.to_string());
+        self.set_error_message(err.to_string());
+    }
+
+    fn set_error_message(&mut self, message: impl Into<String>) {
+        self.last_error = Some(message.into());
+        self.error_cstring = None;
     }
 
     fn clear_error(&mut self) {
@@ -107,7 +112,10 @@ impl NulangRuntime {
 
     fn run(&mut self, module_handle: usize) -> Option<Value> {
         self.clear_error();
-        let module_index = self.module_index_for_handle(module_handle)?;
+        let Some(module_index) = self.module_index_for_handle(module_handle) else {
+            self.set_error_message("invalid module handle");
+            return None;
+        };
         let module = self.modules.get(module_index)?.clone();
         let mut vm = VM::new();
         vm.load_module(module);
@@ -127,9 +135,15 @@ impl NulangRuntime {
         args: &[NulangValue],
     ) -> Option<Value> {
         self.clear_error();
-        let module_index = self.module_index_for_handle(module_handle)?;
+        let Some(module_index) = self.module_index_for_handle(module_handle) else {
+            self.set_error_message("invalid module handle");
+            return None;
+        };
         let module = self.modules.get(module_index)?.clone();
-        let offset = module.function_offset_by_name(name)?;
+        let Some(offset) = module.function_offset_by_name(name) else {
+            self.set_error_message(format!("unknown function: {name}"));
+            return None;
+        };
         let mut vm = VM::new();
         vm.load_module(module);
         let mut arg_values = Vec::with_capacity(args.len());
@@ -137,7 +151,7 @@ impl NulangRuntime {
             match value_from_c(arg) {
                 Ok(value) => arg_values.push(value),
                 Err(message) => {
-                    self.last_error = Some(message.to_string());
+                    self.set_error_message(message);
                     return None;
                 }
             }
@@ -152,7 +166,11 @@ impl NulangRuntime {
     }
 
     fn add_module_string(&mut self, module_handle: usize, s: &str) -> Option<Value> {
-        let module_index = self.module_index_for_handle(module_handle)?;
+        self.clear_error();
+        let Some(module_index) = self.module_index_for_handle(module_handle) else {
+            self.set_error_message("invalid module handle");
+            return None;
+        };
         let module = self.modules.get_mut(module_index)?;
         let idx = module.add_string_constant(s);
         Some(Value::string(idx as u32))
@@ -337,18 +355,23 @@ pub unsafe extern "C" fn nulang_runtime_free(runtime: *mut NulangRuntime) {
 /// `source` must be a valid, null-terminated UTF-8 string.
 #[no_mangle]
 pub unsafe extern "C" fn nulang_compile(runtime: *mut NulangRuntime, source: *const c_char) -> i64 {
-    if runtime.is_null() || source.is_null() {
+    if runtime.is_null() {
         return -1;
     }
-    // SAFETY: caller guarantees `source` is a valid C string.
-    let source_str = unsafe {
-        match CStr::from_ptr(source).to_str() {
-            Ok(s) => s,
-            Err(_) => return -1,
-        }
-    };
     // SAFETY: runtime is non-null and valid.
     let rt = unsafe { &mut *runtime };
+    if source.is_null() {
+        rt.set_error_message("null source pointer");
+        return -1;
+    }
+    // SAFETY: caller guarantees `source` is a valid null-terminated C string.
+    let source_str = match unsafe { CStr::from_ptr(source).to_str() } {
+        Ok(s) => s,
+        Err(_) => {
+            rt.set_error_message("source must be valid UTF-8");
+            return -1;
+        }
+    };
     match rt.compile(source_str) {
         Some(handle) => handle as i64,
         None => -1,
@@ -367,11 +390,15 @@ pub unsafe extern "C" fn nulang_run(
     runtime: *mut NulangRuntime,
     module_handle: i64,
 ) -> NulangValue {
-    if runtime.is_null() || module_handle < 0 {
+    if runtime.is_null() {
         return Value::nil().into();
     }
     // SAFETY: runtime is non-null and valid.
     let rt = unsafe { &mut *runtime };
+    if module_handle < 0 {
+        rt.set_error_message("invalid module handle");
+        return Value::nil().into();
+    }
     match rt.run(module_handle as usize) {
         Some(value) => value.into(),
         None => Value::nil().into(),
@@ -399,18 +426,33 @@ pub unsafe extern "C" fn nulang_call_function(
     args: *const NulangValue,
     arg_count: usize,
 ) -> NulangValue {
-    if runtime.is_null() || module_handle < 0 || name.is_null() {
+    if runtime.is_null() {
         return Value::nil().into();
     }
     // SAFETY: runtime is valid; caller guarantees name is a valid C string.
     let rt = unsafe { &mut *runtime };
+    if module_handle < 0 {
+        rt.set_error_message("invalid module handle");
+        return Value::nil().into();
+    }
+    if name.is_null() {
+        rt.set_error_message("null function name");
+        return Value::nil().into();
+    }
     let name_str = match unsafe { CStr::from_ptr(name).to_str() } {
         Ok(s) => s,
-        Err(_) => return Value::nil().into(),
+        Err(_) => {
+            rt.set_error_message("function name must be valid UTF-8");
+            return Value::nil().into();
+        }
     };
     let args_slice = if arg_count == 0 {
         &[]
     } else if args.is_null() {
+        rt.set_error_message("null argument array with nonzero arg_count");
+        return Value::nil().into();
+    } else if arg_count > isize::MAX as usize / std::mem::size_of::<NulangValue>() {
+        rt.set_error_message("argument array exceeds maximum representable size");
         return Value::nil().into();
     } else {
         // SAFETY: caller guarantees args points to arg_count initialized ABI values.
@@ -546,14 +588,25 @@ pub unsafe extern "C" fn nulang_module_string(
     module_handle: i64,
     s: *const c_char,
 ) -> NulangValue {
-    if runtime.is_null() || module_handle < 0 || s.is_null() {
+    if runtime.is_null() {
         return Value::nil().into();
     }
     // SAFETY: runtime is valid; caller guarantees s is a valid C string.
     let rt = unsafe { &mut *runtime };
+    if module_handle < 0 {
+        rt.set_error_message("invalid module handle");
+        return Value::nil().into();
+    }
+    if s.is_null() {
+        rt.set_error_message("null string pointer");
+        return Value::nil().into();
+    }
     let s_str = match unsafe { CStr::from_ptr(s).to_str() } {
         Ok(s) => s,
-        Err(_) => return Value::nil().into(),
+        Err(_) => {
+            rt.set_error_message("module string must be valid UTF-8");
+            return Value::nil().into();
+        }
     };
     match rt.add_module_string(module_handle as usize, s_str) {
         Some(value) => value.into(),
@@ -604,7 +657,7 @@ pub unsafe extern "C" fn nulang_value_to_string(
     match value_from_c(value) {
         Ok(value) => rt.value_to_cached_cstr(value),
         Err(message) => {
-            rt.last_error = Some(message.to_string());
+            rt.set_error_message(message);
             std::ptr::null()
         }
     }
