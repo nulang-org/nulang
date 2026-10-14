@@ -20,8 +20,10 @@ Confirm the `Release` PR workflow reaches terminal success for all targets,
 including artifact packaging, checksums, and native-on-runner smoke tests. Linux jobs also assemble and inspect distro packages using `scripts/package_linux.sh`.
 On pull requests, the version-tag check is skipped (there is no tag) and the
 `Publish Release` job is explicitly disabled. A queued/skipped build is not
-positive execution evidence. This does **not** replace clean-machine checks,
-particularly native Linux arm64 execution.
+positive execution evidence. The workflow now runs Linux ARM64 builds on a
+native runner and installs both native Linux packages on clean Ubuntu 22.04,
+Debian 12, and Fedora 44 containers. Public release assets still need a
+post-publication download and checksum check.
 
 ## 3. Tag and push
 
@@ -44,8 +46,10 @@ the standard non-Python CLI functionality (native compiler/runtime, LSP,
 SQLite-backed storage, network/TLS/AI runtime and FFI) but **not Python
 interop**, so its Linux ELF does not require the build runner's exact Python
 shared-library ABI. Native Linux CI runs the CLI smoke test and native release
-tests with the same profile. The `publish` job
-creates a GitHub Release with:
+tests with the same profile on x86_64; ARM64 builds and smoke tests run on
+a native Ubuntu 22.04 ARM64 runner. The `publish` job depends on successful
+clean installation, evaluation, and uninstallation on both architectures in
+Ubuntu 22.04, Debian 12, and Fedora 44. Only then does it create a GitHub Release with:
 
 - one `nulang-<platform>-<arch>.tar.gz` archive per supported target.
   The **member inside the tarball** is platform-qualified too (for example,
@@ -67,9 +71,9 @@ creates a GitHub Release with:
 >
 > That build may require a compatible system Python development library.
 > The prebuilt `release-cli` profile does not include Python interoperability.
-> The Linux aarch64 archive is cross-compiled without PyO3. Do **not** claim
-> that a cross-compiled binary has passed a native arm64 smoke test unless
-> such a check actually ran.
+> Linux aarch64 is now built on a native ARM64 runner without PyO3.
+> This eliminates the cross-compiler and ARM64 apt mirror dependencies; it does
+> not waive the exact-head release matrix, checksum, or clean-host gates.
 
 ## 5. Verify the release
 
@@ -103,8 +107,9 @@ creates a GitHub Release with:
 - Verify distro artifacts: run `sha256sum -c` on each package, inspect
   `dpkg-deb --field` / `rpm -qpi`, and test installation/removal in
   throwaway Debian 12, Ubuntu 22.04, and supported Fedora environments.
-  The release workflow checks metadata and extracted payloads, but its
-  RPM and Debian checks are not a substitute for clean-machine installs.
+  The release workflow also runs six native-host container smoke gates. Those
+  exercise installation, CLI execution and uninstallation; the final published
+  release assets still require a post-publish download/checksum inspection.
 - Verify the extracted executables on clean supported Linux, macOS and Windows
   machines, **not only on their build runners**. In particular, require a
   Python-3.13-only or Python-absent Linux environment so the old Python-3.12
