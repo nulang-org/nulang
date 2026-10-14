@@ -60,7 +60,10 @@ fn duplicate_effect_identity_cannot_commit_or_mutate_state() {
 
     let error = store.commit_transition(candidate).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-    assert!(error.to_string().contains("duplicate durable effect"), "{error}");
+    assert!(
+        error.to_string().contains("duplicate durable effect"),
+        "{error}"
+    );
     assert_eq!(store.latest_sequence(ACTOR_ID), 0);
     assert!(store.load_snapshot(ACTOR_ID).is_none());
     assert!(store.committed_transitions(ACTOR_ID).is_empty());
@@ -72,9 +75,16 @@ fn distinct_effect_receipts_can_commit_together() {
     candidate.durable_effects = vec![effect(0), effect(1)];
     let mut store = MemoryStore::new();
 
-    let commit = store.commit_transition(candidate).expect("valid multi-effect turn");
+    let commit = store
+        .commit_transition(candidate)
+        .expect("valid multi-effect turn");
     assert_eq!(commit.sequence, 1);
-    assert_eq!(store.committed_transitions(ACTOR_ID)[0].durable_effects.len(), 2);
+    assert_eq!(
+        store.committed_transitions(ACTOR_ID)[0]
+            .durable_effects
+            .len(),
+        2
+    );
     for ordinal in 0..2 {
         let id = effect(ordinal).effect().spec().id;
         assert!(store.load_durable_effect(ACTOR_ID, id).unwrap().is_some());
@@ -103,7 +113,10 @@ fn forged_compensation_link_is_rejected_before_commit() {
 
     let error = store.commit_transition(candidate).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-    assert!(error.to_string().contains("compensation identity mismatch"), "{error}");
+    assert!(
+        error.to_string().contains("compensation identity mismatch"),
+        "{error}"
+    );
     assert!(store.load_snapshot(ACTOR_ID).is_none());
     assert_eq!(store.latest_sequence(ACTOR_ID), 0);
 }
@@ -127,7 +140,10 @@ fn duplicate_workflow_replay_identity_cannot_commit() {
     ];
     let error = candidate.digest().unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-    assert!(error.to_string().contains("duplicate workflow replay"), "{error}");
+    assert!(
+        error.to_string().contains("duplicate workflow replay"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -144,7 +160,10 @@ fn workflow_replay_identity_cannot_claim_another_actor() {
     });
     let error = candidate.digest().unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-    assert!(error.to_string().contains("replay activation actor"), "{error}");
+    assert!(
+        error.to_string().contains("replay activation actor"),
+        "{error}"
+    );
 }
 
 #[test]
