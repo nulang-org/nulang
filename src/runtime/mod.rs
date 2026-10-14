@@ -6076,9 +6076,12 @@ impl Runtime {
             .map(|meta| meta.is_agent)
             .unwrap_or(false);
 
-        if strict_admission {
-            // The recovery policy applies only to compiler-owned persistent
-            // user actors. A missing/foreign module cannot mint safe recovery.
+        // A single proven committed-but-unfinished strict command may be
+        // reconstructed as *quarantined work*, not replayed bytecode. The
+        // admission fence survives actor reconstruction so no later user
+        // messages are dispatched until a trusted staged-result recovery
+        // protocol durably finishes the command.
+        let pending_strict_admission = if strict_admission {
             if is_workflow
                 || is_agent
                 || !selected_meta.as_ref().is_some_and(|meta| meta.persistent)
@@ -6089,19 +6092,25 @@ impl Runtime {
                 );
                 return None;
             }
-            // A journal-only admitted command must not be executed by the
-            // legacy non-workflow replay path before a completion snapshot.
             match self.persistence.load_durable_tail_position(actor_id) {
-                Ok(Some(tail))
-                    if tail.activation_epoch != snapshot.activation_epoch
-                        || tail.sequence > snapshot.sequence =>
-                {
+                Ok(Some(tail)) if tail.activation_epoch != snapshot.activation_epoch => {
                     warn!(
-                        "nulang-recover: refusing strict actor {} with incomplete or mismatched atomic tail",
+                        "nulang-recover: refusing strict actor {} with mismatched atomic tail epoch",
                         actor_id
                     );
                     return None;
                 }
+                Ok(Some(tail)) if tail.sequence > snapshot.sequence => {
+                    if snapshot.sequence.checked_add(1) != Some(tail.sequence) {
+                        warn!(
+                            "nulang-recover: refusing strict actor {} with ambiguous atomic history after snapshot {}",
+                            actor_id, snapshot.sequence
+                        );
+                        return None;
+                    }
+                    Some(tail.sequence)
+                }
+                Ok(_) => None,
                 Err(error) => {
                     warn!(
                         "nulang-recover: refusing strict actor {} after atomic tail read failed: {}",
@@ -6109,9 +6118,10 @@ impl Runtime {
                     );
                     return None;
                 }
-                _ => {}
             }
-        }
+        } else {
+            None
+        };
 
         // RFC 0022 activation recovery: durable-effect transitions can move
         // the atomic tail beyond the admitted command while the last completed
@@ -6242,12 +6252,34 @@ impl Runtime {
                 .filter(|entry| entry.sequence > snapshot.sequence)
                 .collect()
         };
-        if strict_admission && !journal_to_replay.is_empty() {
-            warn!(
-                "nulang-recover: refusing strict actor {} with uncompleted journaled command history",
-                actor_id
-            );
-            return None;
+        if strict_admission {
+            let pending_matches = match pending_strict_admission {
+                Some(sequence) => {
+                    journal_to_replay.len() == 1
+                        && journal_to_replay[0].sequence == sequence
+                }
+                None => journal_to_replay.is_empty(),
+            };
+            if !pending_matches {
+                warn!(
+                    "nulang-recover: refusing strict actor {} with ambiguous or orphaned journal history",
+                    actor_id
+                );
+                return None;
+            }
+            if pending_strict_admission.is_some()
+                && self
+                    .persistence
+                    .read_events(actor_id)
+                    .iter()
+                    .any(|event| event.sequence > snapshot.sequence)
+            {
+                warn!(
+                    "nulang-recover: refusing strict actor {} with post-snapshot domain events",
+                    actor_id
+                );
+                return None;
+            }
         }
         if let (Some(meta), Some((module, _, _))) =
             (selected_meta.as_ref(), self.recovery_modules.get(&actor_id))
@@ -6294,6 +6326,9 @@ impl Runtime {
         // Install the durable fence *before publication/enqueue/replay*.
         if strict_admission {
             actor.mailbox.require_strict_durable_admission();
+            if let Some(sequence) = pending_strict_admission {
+                actor.mailbox.fence_admitted_command(sequence);
+            }
         }
         actor.persistent = true;
         actor.is_workflow = is_workflow;
@@ -6531,8 +6566,10 @@ impl Runtime {
                     self.send_message_by_id(actor_id, current_step, &[]);
                 }
             }
-        } else {
-            // Replay entries that were schema-validated before actor publication.
+        } else if pending_strict_admission.is_none() {
+            // Strict pending work was recovered with a mailbox fence and
+            // must never pass through legacy native/bytecode replay.
+            // Only historical non-strict entries may execute here.
             for entry in journal_to_replay {
                 let behavior_idx = entry.behavior_id as usize;
                 let payload: Vec<Value> = {
