@@ -4713,13 +4713,12 @@ impl Runtime {
         let module_idx = if module.actor_metadata.is_empty() {
             behavior_idx
         } else {
-            behavior_ownership::module_behavior_index_for_actor(
-                module,
-                &actor.name,
-                behavior_idx,
-            )?
+            behavior_ownership::module_behavior_index_for_actor(module, &actor.name, behavior_idx)?
         };
-        module.behaviors.get(module_idx).map(|behavior| behavior.param_count)
+        module
+            .behaviors
+            .get(module_idx)
+            .map(|behavior| behavior.param_count)
     }
 
     fn has_bytecode_handler(&self, actor_id: u64, behavior_idx: usize) -> bool {
