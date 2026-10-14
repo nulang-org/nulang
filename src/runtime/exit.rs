@@ -311,6 +311,7 @@ pub(crate) fn shutdown_supervisor(rt: &mut Runtime, supervisor_id: u64, supervis
         rt.exit_actor(child_id, reason.clone());
     }
     rt.supervisors.remove(&supervisor_id);
+    rt.retire_monitor_refs_on_exit(supervisor_id, &reason);
     rt.registry.unregister_by_actor(supervisor_id);
     rt.fabric_unsubscribe_actor(supervisor_id);
     if let Some(actor) = rt.actors.get_mut(&supervisor_id) {
