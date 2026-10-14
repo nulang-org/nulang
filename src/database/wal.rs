@@ -169,9 +169,7 @@ fn acquire_writer_lock(wal_path: &Path) -> Result<File, WalError> {
 
     match file.try_lock() {
         Ok(()) => Ok(file),
-        Err(TryLockError::WouldBlock) => {
-            Err(WalError::WriterAlreadyActive { lock_path })
-        }
+        Err(TryLockError::WouldBlock) => Err(WalError::WriterAlreadyActive { lock_path }),
         Err(TryLockError::Error(error)) => Err(WalError::from(error)),
     }
 }
