@@ -4397,6 +4397,37 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn test_errdefer_is_rejected_until_error_unwind_is_implemented() {
+        let span = sp();
+        let expr = Expr::Defer {
+            expr: Box::new(Expr::Literal(Literal::Int(42), span)),
+            error_only: true,
+            span,
+        };
+        let mut checker = TypeChecker::new();
+        let err = checker
+            .infer_expr(&TypeContext::new(), &expr)
+            .expect_err("errdefer must not silently skip crash/error cleanup");
+        assert!(matches!(
+            err,
+            NuError::NotYetImplemented { feature, .. } if feature.contains("errdefer")
+        ));
+    }
+
+    #[test]
+    fn test_ordinary_defer_remains_well_typed() {
+        let span = sp();
+        let expr = Expr::Defer {
+            expr: Box::new(Expr::Literal(Literal::Int(42), span)),
+            error_only: false,
+            span,
+        };
+        let mut checker = TypeChecker::new();
+        let (_, ty) = checker.infer_expr(&TypeContext::new(), &expr).unwrap();
+        assert_eq!(ty, Type::unit());
+    }
+
+    #[test]
     fn test_infer_int_literal() {
         let mut tc = TypeChecker::new();
         let ctx = TypeContext::new();
