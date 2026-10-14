@@ -1309,12 +1309,8 @@ impl Runtime {
         }
     }
 
-    /// Resume an actor that yielded at a JIT safepoint.
-    ///
-    /// Mirrors the structure of `resume_suspended_llm_step` but without
-    /// LLM-specific logic: re-installs callbacks, restores VM state,
-    /// resets the safepoint counter, and resumes execution.
-    #[cfg(feature = "native-codegen")]
+    /// Resume an actor whose interpreter quantum or JIT safepoint expired.
+    /// This must run on the next scheduler turn even when its mailbox is empty.
     fn resume_suspended_jit_yield(&mut self, actor_id: u64) {
         let suspended = match self.actors.get_mut(&actor_id) {
             Some(actor) => actor.suspended_execution.take(),
@@ -1339,7 +1335,15 @@ impl Runtime {
             }));
             vm.restore_suspended_state(suspended.vm_state);
 
-            // Reset the safepoint budget and wire the pointer for JIT code.
+            let instruction_budget = (*self_ptr)
+                .actors
+                .get(&actor_id)
+                .map(|actor| actor.max_reductions)
+                .unwrap_or(1000);
+            vm.set_cooperative_instruction_budget(Some(instruction_budget));
+            // JIT regions have their own safe-point budget in addition to
+            // the interpreter's per-dispatch quantum.
+            #[cfg(feature = "native-codegen")]
             if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
                 actor.jit_safepoint_counter = crate::backends::JIT_SAFEPOINT_BUDGET;
                 crate::jit::runtime::set_jit_safepoint_ptr(&mut actor.jit_safepoint_counter);
@@ -1347,6 +1351,8 @@ impl Runtime {
 
             (*self_ptr).vm_exec_begin();
             let result = vm.resume();
+            vm.set_cooperative_instruction_budget(None);
+            #[cfg(feature = "native-codegen")]
             crate::jit::runtime::clear_jit_safepoint_ptr();
 
             match result {
@@ -1379,6 +1385,7 @@ impl Runtime {
                         let receive_timeout = vm.suspended_receive_timeout.take();
                         if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
                             let marker = suspension_marker(actor, signal_name);
+                            actor.jit_yield_pending = false;
                             actor.waiting_signal = marker;
                             actor.suspended_execution =
                                 Some(crate::runtime::actor::SuspendedExecution {
@@ -3112,14 +3119,14 @@ impl Runtime {
     }
 
     /// Close one actor turn and enqueue it exactly once when runnable mailbox
-    /// work remains.
+    /// work or a cooperative bytecode continuation remains.
     pub(crate) fn finish_actor_turn(&mut self, actor_id: u64) {
         let should_requeue = self
             .actors
             .get(&actor_id)
             .map(|actor| {
-                !actor.mailbox.is_empty()
-                    && actor.suspended_execution.is_none()
+                ((actor.jit_yield_pending && actor.suspended_execution.is_some())
+                    || (!actor.mailbox.is_empty() && actor.suspended_execution.is_none()))
                     && matches!(
                         actor.state,
                         ActorState::Running | ActorState::Created | ActorState::Waiting
@@ -3852,21 +3859,16 @@ impl Runtime {
     pub fn step_actor(&mut self, actor_id: u64) {
         self.current_actor = Some(actor_id);
 
-        // If the actor yielded at a JIT safepoint, resume it inline before
-        // attempting to receive the next message. The resume may complete the
-        // behavior (clearing suspended_execution) or re-suspend (setting it
-        // again), after which the normal suspended_execution guard below
-        // prevents processing new messages while the behavior is live.
-        #[cfg(feature = "native-codegen")]
-        {
-            let jit_yield = self
-                .actors
-                .get(&actor_id)
-                .map(|a| a.jit_yield_pending)
-                .unwrap_or(false);
-            if jit_yield {
-                self.resume_suspended_jit_yield(actor_id);
-            }
+        // A cooperative yield is a runnable continuation, not an external
+        // suspension. Resume it before receiving another message, even when
+        // the mailbox is empty, and retain non-reentrant actor execution.
+        let yielded = self
+            .actors
+            .get(&actor_id)
+            .map(|actor| actor.jit_yield_pending)
+            .unwrap_or(false);
+        if yielded {
+            self.resume_suspended_jit_yield(actor_id);
         }
 
         let msg_opt = {
@@ -5277,12 +5279,20 @@ impl Runtime {
                 }
             }
 
+            // Bound interpreted actor work between scheduler turns. JIT
+            // regions also honor their existing independent safepoint budget.
+            let instruction_budget = (*self_ptr)
+                .actors
+                .get(&actor_id)
+                .map(|actor| actor.max_reductions)
+                .unwrap_or(1000);
+            vm.set_cooperative_instruction_budget(Some(instruction_budget));
             let result = vm.run_from(module_idx, code_offset);
+            vm.set_cooperative_instruction_budget(None);
 
-            #[cfg(feature = "native-codegen")]
-            {
-                // JIT safepoint yield: capture state for inline resume.
-                if vm.yield_pending {
+            // Cooperative yield: capture the continuation before another
+            // actor can use the shared VM.
+            if vm.yield_pending {
                     if let Some(vm_state) = vm.take_suspended_state() {
                         if let Some(actor) = self.actors.get_mut(&actor_id) {
                             actor.suspended_execution =
@@ -5295,10 +5305,10 @@ impl Runtime {
                             actor.jit_yield_pending = true;
                         }
                     }
+                    #[cfg(feature = "native-codegen")]
                     crate::jit::runtime::clear_jit_safepoint_ptr();
                     (*self_ptr).vm_exec_end();
                     return Ok(Value::nil());
-                }
             }
             // Capture VM state for a workflow signal wait, a non-blocking
             // LLM call, or a timed selective receive. Doing this here avoids
