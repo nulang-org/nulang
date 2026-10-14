@@ -1859,6 +1859,11 @@ fn monitor_reference_reports_noproc_and_is_not_left_registered() {
     assert_eq!(down.payload[3].as_int(), Some(reference.0 as i64));
     assert!(!rt.demonitor_ref(watcher, reference));
     assert!(rt.monitor_ref(absent, watcher).is_none(), "dead watcher rejected");
+    rt.actors.get_mut(&watcher).unwrap().state = ActorState::Terminated;
+    assert!(
+        rt.monitor_ref(watcher, absent).is_none(),
+        "a terminating watcher cannot establish a new monitor"
+    );
 }
 
 #[test]
