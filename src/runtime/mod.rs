@@ -1507,6 +1507,11 @@ impl Runtime {
             state,
             schema_name: Some(actor.name.clone()),
             authority_tokens,
+            strict_admission_policy_version: if actor.mailbox.requires_strict_durable_admission() {
+                1
+            } else {
+                0
+            },
             ..ActorSnapshot::default()
         };
         let transition = DurableTransition {
@@ -6089,6 +6094,13 @@ impl Runtime {
     /// any other state captured in workflow events.
     pub fn recover_actor(&mut self, actor_id: u64) -> Option<u64> {
         let snapshot = self.persistence.load_snapshot(actor_id)?;
+        if snapshot.strict_admission_policy_version > 1 {
+            warn!(
+                "nulang-recover: refusing actor {} with unknown strict admission policy version {}",
+                actor_id, snapshot.strict_admission_policy_version
+            );
+            return None;
+        }
         if snapshot.activation_epoch == 0 {
             warn!(
                 "nulang-recover: refusing actor {} with invalid activation epoch 0",
@@ -6150,6 +6162,18 @@ impl Runtime {
             .map(|meta| meta.is_agent)
             .unwrap_or(false);
 
+        // Restore the persisted dispatch policy before the actor is published.
+        // Pre-policy atomic tails imply strict dispatch as well, so older
+        // successful atomic completions cannot silently fall back to legacy.
+        let mut recover_strict_admission = snapshot.strict_admission_policy_version == 1;
+        if recover_strict_admission && (is_workflow || is_agent || selected_meta.is_none()) {
+            warn!(
+                "nulang-recover: strict admission policy for actor {} has no valid ordinary compiler schema",
+                actor_id
+            );
+            return None;
+        }
+
         // An ordinary actor admitted through the atomic command adapter
         // must not fall back to legacy bytecode-journal replay after a crash.
         // Until a trusted host can resume the same logical invocation with
@@ -6160,6 +6184,9 @@ impl Runtime {
         if !is_workflow {
             match self.persistence.load_durable_tail_position(actor_id) {
                 Ok(Some(tail)) => {
+                    if selected_meta.is_some() {
+                        recover_strict_admission = true;
+                    }
                     if tail.activation_epoch != snapshot.activation_epoch
                         || tail.sequence != snapshot.sequence
                     {
@@ -6372,6 +6399,9 @@ impl Runtime {
         actor.persistent = true;
         actor.is_workflow = is_workflow;
         actor.is_agent = is_agent;
+        if recover_strict_admission {
+            actor.mailbox.require_strict_durable_admission();
+        }
         actor.sequence = snapshot.sequence;
         actor.activation_epoch = snapshot.activation_epoch;
         actor.waiting_signal = snapshot.waiting_signal.clone();
