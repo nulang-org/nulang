@@ -366,3 +366,119 @@ fn identical_initialization_is_not_a_second_successful_creation() {
     );
     assert_eq!(store.read_workflow_events(400).len(), 2);
 }
+
+#[test]
+fn replaying_the_same_pinned_creation_transition_is_not_a_second_success() {
+    let bytes = b"create-only-v1";
+    let mut store = MemoryStore::new();
+    commit_pinned_workflow_start(
+        &mut store, 999, "payments/999", "Order", &manifest(bytes), bytes,
+        snapshot(999), vec![],
+    ).unwrap();
+    let identical = store.committed_transitions(999)[0].clone();
+
+    assert_eq!(
+        store.commit_transition(identical).unwrap_err().kind(),
+        ErrorKind::AlreadyExists,
+        "the persistence engine must not allow a concurrent identical starter",
+    );
+    assert_eq!(store.read_workflow_events(999).len(), 2);
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn libsql_does_not_acknowledge_an_identical_pinned_start_twice() {
+    use nulang::runtime::LibsqlStore;
+    let bytes = b"create-only-libsql-v1";
+    let mut fixture = MemoryStore::new();
+    commit_pinned_workflow_start(
+        &mut fixture, 998, "payments/998", "Order", &manifest(bytes), bytes,
+        snapshot(998), vec![],
+    ).unwrap();
+    let transition = fixture.committed_transitions(998)[0].clone();
+    let mut store = LibsqlStore::in_memory().unwrap();
+
+    store.commit_transition(transition.clone()).unwrap();
+    assert_eq!(
+        store.commit_transition(transition).unwrap_err().kind(),
+        ErrorKind::AlreadyExists,
+    );
+    verify_pinned_workflow_resume(
+        &store, 998, "payments/998", &manifest(bytes), bytes,
+    ).unwrap();
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn libsql_corrupted_pin_event_is_not_silently_omitted() {
+    use nulang::runtime::LibsqlStore;
+    let bytes = b"corrupt-event-v1";
+    let mut store = LibsqlStore::in_memory().unwrap();
+    commit_pinned_workflow_start(
+        &mut store, 997, "payments/997", "Order", &manifest(bytes), bytes,
+        snapshot(997), vec![],
+    ).unwrap();
+
+    store.query(
+        "UPDATE durable_workflow_events SET event = 'not-json'
+         WHERE actor_id = 997 AND ordinal = 1",
+        &[],
+    ).unwrap();
+
+    assert_eq!(
+        store.read_workflow_events_checked(997).unwrap_err().kind(),
+        ErrorKind::InvalidData,
+    );
+    assert_eq!(
+        verify_pinned_workflow_resume(
+            &store, 997, "payments/997", &manifest(bytes), bytes,
+        ).unwrap_err().kind(),
+        ErrorKind::InvalidData,
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn concurrent_libsql_pinned_creators_have_at_most_one_success() {
+    use nulang::runtime::LibsqlStore;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "nulang-pin-create-race-{}-{nonce}", std::process::id(),
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("race.db");
+    let bytes = b"create-race-v1";
+    let mut fixture = MemoryStore::new();
+    commit_pinned_workflow_start(
+        &mut fixture, 996, "payments/996", "Order", &manifest(bytes), bytes,
+        snapshot(996), vec![],
+    ).unwrap();
+    let transition = fixture.committed_transitions(996)[0].clone();
+    let stores = [
+        LibsqlStore::new(&path).unwrap(),
+        LibsqlStore::new(&path).unwrap(),
+    ];
+    let barrier = Arc::new(Barrier::new(2));
+    let handles: Vec<_> = stores.into_iter().map(|mut store| {
+        let sync = Arc::clone(&barrier);
+        let candidate = transition.clone();
+        thread::spawn(move || {
+            sync.wait();
+            store.commit_transition(candidate)
+        })
+    }).collect();
+    let outcomes: Vec<_> = handles.into_iter().map(|task| task.join().unwrap()).collect();
+    assert_eq!(
+        outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1,
+        "only one concurrent creation may succeed: {outcomes:?}",
+    );
+    let store = LibsqlStore::new(&path).unwrap();
+    verify_pinned_workflow_resume(
+        &store, 996, "payments/996", &manifest(bytes), bytes,
+    ).unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
