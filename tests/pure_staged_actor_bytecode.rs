@@ -209,3 +209,29 @@ fn rejected_scalar_type_change_never_commits_or_updates_live_state() {
         Some(0)
     );
 }
+
+#[test]
+fn early_halt_is_not_a_valid_completed_durable_handler() {
+    let mut module = compiled_counter();
+    let index = module.actor_metadata[0].behavior_indices[0];
+    let offset = module.behaviors[index].code_offset;
+    module.instructions[offset] = Instruction::new0(OpCode::Halt);
+
+    let (mut runtime, actor_id, behavior) = spawned(&module);
+    let sequence = admit(&mut runtime, actor_id, behavior, 5);
+    let error = runtime
+        .execute_and_commit_admitted_pure_typed_actor_turn(actor_id, sequence)
+        .expect_err("an early halt must not count as a completed behavior");
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    assert_eq!(runtime.persistence.latest_sequence(actor_id), sequence);
+    assert_eq!(
+        runtime.actors[&actor_id].mailbox.admitted_command_sequence(),
+        Some(sequence)
+    );
+    assert_eq!(
+        runtime.actors[&actor_id]
+            .get_state_field("total")
+            .and_then(|value| value.as_int()),
+        Some(0)
+    );
+}
