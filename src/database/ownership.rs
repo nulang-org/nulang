@@ -48,14 +48,6 @@ pub enum OwnershipCommand {
     },
 }
 
-impl OwnershipCommand {
-    fn tablet(&self) -> TabletId {
-        match *self {
-            Self::Bootstrap { tablet, .. } | Self::Transfer { tablet, .. } => tablet,
-        }
-    }
-}
-
 /// A finalized, ordered log entry supplied by a trusted consensus adapter.
 ///
 /// Merely constructing this value does NOT constitute quorum commitment.
@@ -162,68 +154,68 @@ impl OwnershipStateMachine {
         // A rejected *committed* command still advances the apply cursor.
         let result: Result<OwnershipGrant, OwnershipError> = (|| {
             let grant = match entry.command {
-            OwnershipCommand::Bootstrap {
-                tablet,
-                owner,
-                epoch,
-            } => {
-                if epoch == 0 {
-                    return Err(OwnershipError::InvalidEpoch);
-                }
-                if self.owners.contains_key(&tablet) {
-                    return Err(OwnershipError::AlreadyBootstrapped { tablet });
-                }
-                OwnershipGrant {
+                OwnershipCommand::Bootstrap {
                     tablet,
                     owner,
                     epoch,
-                    committed_index: entry.index,
-                    committed_term: entry.term,
+                } => {
+                    if epoch == 0 {
+                        return Err(OwnershipError::InvalidEpoch);
+                    }
+                    if self.owners.contains_key(&tablet) {
+                        return Err(OwnershipError::AlreadyBootstrapped { tablet });
+                    }
+                    OwnershipGrant {
+                        tablet,
+                        owner,
+                        epoch,
+                        committed_index: entry.index,
+                        committed_term: entry.term,
+                    }
                 }
-            }
-            OwnershipCommand::Transfer {
-                tablet,
-                expected_owner,
-                expected_epoch,
-                next_owner,
-                next_epoch,
-            } => {
-                let current = self
-                    .grant(tablet)
-                    .ok_or(OwnershipError::UnknownTablet { tablet })?;
-                if expected_epoch < current.epoch {
-                    return Err(OwnershipError::StaleEpoch {
-                        committed: current.epoch,
-                        presented: expected_epoch,
-                    });
-                }
-                if expected_epoch > current.epoch {
-                    return Err(OwnershipError::FutureEpoch {
-                        committed: current.epoch,
-                        presented: expected_epoch,
-                    });
-                }
-                if expected_owner != current.owner {
-                    return Err(OwnershipError::WrongOwner {
-                        committed: current.owner,
-                        presented: expected_owner,
-                    });
-                }
-                if next_epoch <= current.epoch {
-                    return Err(OwnershipError::EpochNotAdvanced {
-                        committed: current.epoch,
-                        proposed: next_epoch,
-                    });
-                }
-                OwnershipGrant {
+                OwnershipCommand::Transfer {
                     tablet,
-                    owner: next_owner,
-                    epoch: next_epoch,
-                    committed_index: entry.index,
-                    committed_term: entry.term,
+                    expected_owner,
+                    expected_epoch,
+                    next_owner,
+                    next_epoch,
+                } => {
+                    let current = self
+                        .grant(tablet)
+                        .ok_or(OwnershipError::UnknownTablet { tablet })?;
+                    if expected_epoch < current.epoch {
+                        return Err(OwnershipError::StaleEpoch {
+                            committed: current.epoch,
+                            presented: expected_epoch,
+                        });
+                    }
+                    if expected_epoch > current.epoch {
+                        return Err(OwnershipError::FutureEpoch {
+                            committed: current.epoch,
+                            presented: expected_epoch,
+                        });
+                    }
+                    if expected_owner != current.owner {
+                        return Err(OwnershipError::WrongOwner {
+                            committed: current.owner,
+                            presented: expected_owner,
+                        });
+                    }
+                    if next_epoch <= current.epoch {
+                        return Err(OwnershipError::EpochNotAdvanced {
+                            committed: current.epoch,
+                            proposed: next_epoch,
+                        });
+                    }
+                    OwnershipGrant {
+                        tablet,
+                        owner: next_owner,
+                        epoch: next_epoch,
+                        committed_index: entry.index,
+                        committed_term: entry.term,
+                    }
                 }
-            }
-        };
+            };
 
             Ok(grant)
         })();
