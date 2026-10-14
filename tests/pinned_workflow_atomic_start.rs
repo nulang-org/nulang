@@ -181,7 +181,9 @@ fn pinned_workflow_process_restart_helper() {
     let Ok(mode) = std::env::var("NULANG_PIN_TEST_CHILD_MODE") else {
         return;
     };
-    let path = std::env::var_os("NULANG_PIN_TEST_CHILD_DATABASE").expect("test database path");
+    let path = std::path::PathBuf::from(
+        std::env::var_os("NULANG_PIN_TEST_CHILD_DATABASE").expect("test database path"),
+    );
     let bytes = b"workflow-v1";
     match mode.as_str() {
         "create" => {
