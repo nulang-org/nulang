@@ -308,6 +308,10 @@ fn sigkill_during_staged_completion_rolls_back_snapshot_effects_and_outbox() {
         .unwrap()
         .is_some());
     assert_eq!(quarantined.persistence.read_journal(ACTOR_ID).len(), 1);
+    let verified = LibsqlStore::new(fixture.database()).unwrap();
+    assert_eq!(count(&verified, "durable_transitions"), 2);
+    assert_eq!(count(&verified, "durable_effect_records"), 1);
+    assert_eq!(count(&verified, "durable_outbox"), 1);
 }
 
 #[test]
