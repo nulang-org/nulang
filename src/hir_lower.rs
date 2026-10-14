@@ -1678,7 +1678,7 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
             });
             hir::Operand::Var(temp, ty)
         }
-        Expr::Block { exprs, span: _ } => {
+        Expr::Block { exprs, span } => {
             push_defer_scope();
             let mut last = hir::Operand::Unit;
             for e in exprs {
@@ -1696,6 +1696,14 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
             }
             if !body.is_terminated() {
                 let scope = pop_defer_scope();
+                // A block result is evaluated before scope-exit cleanup. A
+                // variable operand still refers to mutable storage, so
+                // snapshot it before a deferred assignment can modify it.
+                if scope.iter().any(|(_, error_only)| !error_only)
+                    && matches!(last, hir::Operand::Var(..))
+                {
+                    last = capture_exit_value(last, *span, body);
+                }
                 for (expr, error_only) in scope.into_iter().rev() {
                     if body.is_terminated() {
                         break;
