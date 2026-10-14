@@ -312,3 +312,38 @@ fn appended_fake_execution_pin_is_rejected_on_recovery() {
         ErrorKind::InvalidData,
     );
 }
+
+#[test]
+fn later_workflow_started_event_cannot_be_accepted_as_one_execution() {
+    let mut store = MemoryStore::new();
+    let bytes = b"workflow-v1";
+    commit_pinned_workflow_start(
+        &mut store, 56, "payments/56", "Order", &manifest(bytes), bytes,
+        snapshot(56), vec![],
+    ).unwrap();
+
+    store.commit_transition(DurableTransition {
+        version: DURABLE_TRANSITION_VERSION,
+        actor_id: 56,
+        activation_epoch: 1,
+        sequence: 2,
+        expected_previous_sequence: 1,
+        command: None,
+        snapshot: None,
+        workflow_events: vec![WorkflowEvent::WorkflowStarted {
+            sequence: 2,
+            name: "SecondStart".into(),
+            state: vec![],
+        }],
+        domain_events: vec![],
+        durable_effects: vec![],
+        outbox: vec![],
+    }).unwrap();
+
+    assert_eq!(
+        verify_pinned_workflow_resume(&store, 56, "payments/56", &manifest(bytes), bytes)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidData,
+    );
+}
