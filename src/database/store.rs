@@ -14,6 +14,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use super::checkpoint::{self, CheckpointError};
+use super::ownership::{NodeId, OwnershipError, OwnershipStateMachine};
 use super::tablet::{
     transaction_digest, MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletWrite,
     TransactionId, TransactionIdentity, TransactionReceipt,
@@ -54,6 +55,55 @@ impl WalBackedTablet {
 
     pub fn current_sequence(&self) -> u64 {
         self.tablet.current_sequence()
+    }
+
+    /// Commit only for the node+epoch selected by an already-applied
+    /// consensus ownership log. The data WAL *also* checks its local durable
+    /// epoch. Callers must supply a state machine built from verified committed
+    /// entries, never uncommitted proposals.
+    ///
+    /// This protects the local RPC dispatch boundary; it does not replicate
+    /// data writes or make the control-plane and data-plane logs atomic.
+    pub fn commit_with_ownership(
+        &mut self,
+        authority: &OwnershipStateMachine,
+        node: NodeId,
+        epoch: u64,
+        id: TransactionId,
+        mutations: Vec<TabletMutation>,
+    ) -> Result<TransactionReceipt, WalBackedError> {
+        authority.authorize_writer(self.tablet.descriptor().id(), node, epoch)?;
+        self.commit_idempotent_at_epoch(epoch, id, mutations)
+    }
+
+    /// Install an already committed leadership handoff into the local WAL.
+    /// A newer authoritative epoch must be durably fenced locally before
+    /// this tablet accepts writes from the new owner.
+    ///
+    /// Errors after the WAL append begins can be ambiguous; close/reopen
+    /// with the intended descriptor epoch and reconcile from the WAL.
+    pub fn install_committed_ownership(
+        &mut self,
+        authority: &OwnershipStateMachine,
+        node: NodeId,
+    ) -> Result<u64, WalBackedError> {
+        let tablet_id = self.tablet.descriptor().id();
+        let grant = authority
+            .grant(tablet_id)
+            .ok_or(OwnershipError::UnknownTablet { tablet: tablet_id })?;
+        authority.authorize_writer(tablet_id, node, grant.epoch)?;
+        let current = self.tablet.descriptor().ownership_epoch();
+        if grant.epoch < current {
+            return Err(TabletError::StaleEpoch {
+                current,
+                presented: grant.epoch,
+            }
+            .into());
+        }
+        if grant.epoch == current {
+            return Ok(self.tablet.current_sequence());
+        }
+        self.advance_ownership_epoch(current, grant.epoch)
     }
 
     /// Append an explicit durable ownership epoch barrier. A barrier consumes
@@ -213,6 +263,7 @@ pub enum WalBackedError {
     Wal(WalError),
     Checkpoint(CheckpointError),
     IdempotencyConflict(TransactionId),
+    Ownership(OwnershipError),
 }
 
 impl From<TabletError> for WalBackedError {
@@ -224,6 +275,12 @@ impl From<TabletError> for WalBackedError {
 impl From<WalError> for WalBackedError {
     fn from(error: WalError) -> Self {
         Self::Wal(error)
+    }
+}
+
+impl From<OwnershipError> for WalBackedError {
+    fn from(error: OwnershipError) -> Self {
+        Self::Ownership(error)
     }
 }
 
@@ -242,6 +299,7 @@ impl fmt::Display for WalBackedError {
             Self::IdempotencyConflict(id) => {
                 write!(f, "transaction ID {id:?} reused with different mutations")
             },
+            Self::Ownership(error) => write!(f, "tablet ownership rejected: {error}"),
         }
     }
 }
