@@ -93,7 +93,9 @@ def parse_records(output: str, expected_runtime: str) -> dict[str, dict[str, int
             )
         name = match.group("benchmark")
         if name not in EXPECTED_MESSAGES:
-            raise RuntimeError(f"{runtime}: unknown benchmark {name}")
+            # Nulang also emits skynet; do not conflate extra valid workloads
+            # with the four workloads shared by the external baselines.
+            continue
         if name in records:
             raise RuntimeError(f"{runtime}: duplicate benchmark {name}")
         messages = int(match.group("messages"))
