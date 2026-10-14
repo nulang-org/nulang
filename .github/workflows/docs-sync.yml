@@ -30,8 +30,7 @@ jobs:
     name: Regenerate and sync docs
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read
 
     steps:
       - name: Checkout repository
@@ -75,44 +74,33 @@ jobs:
           pnpm run build
         # Deployment remains handled by the Cloudflare Pages Git integration.
         # This step validates the exact generated site before assets are
-        # proposed to protected main through the generated-assets PR.
+        # archived for review as generated assets (no protected-branch writes).
 
-      - name: Open or update generated-assets PR
-        env:
-          # Optional PAT/GitHub-App token avoids the approval gate GitHub
-          # applies to PR workflows created by GITHUB_TOKEN. Without it, the
-          # generated-assets PR is still created safely but a maintainer must
-          # approve its workflow runs in the PR UI.
-          GH_TOKEN: ${{ secrets.DOCS_SYNC_TOKEN || github.token }}
+      - name: Open      # Keep generated output recoverable even when organization-wide branch
+      # rules require reviewed PRs for all branch writes.
+      - name: Archive generated docs and playground
+        uses: actions/upload-artifact@v7
+        with:
+          name: nulang-generated-docs
+          path: |
+            docs/src/content/docs/stdlib/
+            docs/api.md
+            docs/public/playground/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Report generated asset drift
+        shell: bash
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/src/content/docs/stdlib/ docs/api.md docs/public/playground/
-
-          if git diff --staged --quiet; then
-            echo "Generated docs and playground assets are already current."
-            exit 0
-          fi
-
-          sync_branch="automation/docs-sync"
-          git checkout -B "$sync_branch"
-          git commit -m "docs: auto-sync generated site assets"
-          git push --force origin "HEAD:$sync_branch"
-
-          pr_number="$(gh pr list --head "$sync_branch" --base main --state open --json number --jq '.[0].number // empty')"
-          if [ -n "$pr_number" ]; then
-            gh pr edit "$pr_number" \
-              --title "docs: sync generated site assets" \
-              --body "Automated refresh of generated standard-library/API docs and the browser-playground bundle from the current main branch."
+          git add -- docs/src/content/docs/stdlib/ docs/api.md docs/public/playground/
+          if git diff --cached --quiet; then
+            echo "Generated docs are already current."
           else
-            gh pr create \
-              --base main \
-              --head "$sync_branch" \
-              --title "docs: sync generated site assets" \
-              --body "Automated refresh of generated standard-library/API docs and the browser-playground bundle from the current main branch."
+            echo "::warning::Generated docs differ from main. Download the 'nulang-generated-docs' artifact from https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID and import it through a reviewed PR; no protected branch push was attempted."
+            git diff --cached --stat
           fi
 
-      - name: Ping DeepWiki to refresh index
+ DeepWiki to refresh index
         # Best-effort request to encourage DeepWiki to re-index the repo docs.
         # DeepWiki does not publish a guaranteed refresh endpoint, so this step
         # is allowed to fail without failing the workflow.
