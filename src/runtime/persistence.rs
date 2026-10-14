@@ -384,6 +384,11 @@ pub const DURABLE_TRANSITION_VERSION: u16 = 1;
 /// execution claim. No user workflow may emit this name as a regular event.
 pub const PINNED_WORKFLOW_START_EVENT: &str = "__nulang.execution_pin/v1";
 
+/// Reserved atomic transition marker for acquiring the next workflow
+/// activation epoch. This transition must never be acknowledged as an
+/// idempotent retry by a second claimant.
+pub const PINNED_RECOVERY_CLAIM_EVENT: &str = "__nulang.recovery_claim/v1";
+
 /// One outbound actor message staged inside a durable transition.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DurableOutboxMessage {
@@ -438,17 +443,19 @@ pub struct DurableCommit {
 }
 
 impl DurableTransition {
-    /// Starting a pinned execution is a *create-only* transaction, never an
-    /// idempotent retry that may acknowledge two independent starters.
-    ///
-    /// This property is inferred from a reserved committed event instead of
-    /// adding a field to the frozen durable transition digest envelope.
-    pub fn is_create_only_pinned_start(&self) -> bool {
-        self.sequence == 1
-            && self.expected_previous_sequence == 0
-            && self.workflow_events.iter().any(|event| {
-                matches!(event, WorkflowEvent::Custom { name, .. } if name == PINNED_WORKFLOW_START_EVENT)
-            })
+    /// A pinned start or recovery epoch claim must have one successful
+    /// committer, even if contenders propose byte-for-byte identical payloads.
+    /// Ordinary durable transitions retain idempotent retry semantics.
+    pub fn is_create_only_pinned_transition(&self) -> bool {
+        self.workflow_events.iter().any(|event| {
+            matches!(event,
+                WorkflowEvent::Custom { name, .. }
+                    if (name == PINNED_WORKFLOW_START_EVENT
+                        && self.sequence == 1
+                        && self.expected_previous_sequence == 0)
+                        || name == PINNED_RECOVERY_CLAIM_EVENT
+            )
+        })
     }
 
     fn validate_structure(&self) -> io::Result<()> {
@@ -918,10 +925,10 @@ impl PersistenceStore for MemoryStore {
             if transition.activation_epoch == tail.activation_epoch
                 && transition.sequence == tail.sequence
             {
-                if digest == tail.digest && transition.is_create_only_pinned_start() {
+                if digest == tail.digest && transition.is_create_only_pinned_transition() {
                     return Err(io::Error::new(
                         io::ErrorKind::AlreadyExists,
-                        "pinned execution already created; identical start is not a retry",
+                        "pinned workflow create/claim already committed; identical claim is not a retry",
                     ));
                 }
                 if digest == tail.digest {
@@ -1920,11 +1927,11 @@ impl PersistenceStore for LibsqlStore {
 
             if let Some((epoch, sequence, stored_digest)) = &current_tail {
                 if transition.activation_epoch == *epoch && transition.sequence == *sequence {
-                    if stored_digest == &digest_hex && transition.is_create_only_pinned_start() {
+                    if stored_digest == &digest_hex && transition.is_create_only_pinned_transition() {
                         let _ = tx.rollback().await;
                         return Err(io::Error::new(
                             io::ErrorKind::AlreadyExists,
-                            "pinned execution already created; identical start is not a retry",
+                            "pinned workflow create/claim already committed; identical claim is not a retry",
                         ));
                     }
                     if stored_digest == &digest_hex {
