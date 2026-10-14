@@ -392,3 +392,130 @@ fn migrated_workflow_recovery_keeps_actor_local_behavior_layout() {
     assert_eq!(rt.behavior_id_for(actor_id, "first"), Some(0));
     assert_eq!(rt.behavior_id_for(actor_id, "second"), Some(1));
 }
+
+#[test]
+fn migration_rejects_snapshot_for_a_different_logical_actor() {
+    let module = compile(
+        r#"
+        persistent actor Counter {
+            state durable n: Int = 0
+            behavior hit() { nil }
+        }
+        "#,
+    );
+    let snapshot = ActorSnapshot {
+        actor_id: 7101,
+        schema_name: Some("Counter".to_string()),
+        ..ActorSnapshot::default()
+    };
+
+    let mut rt = Runtime::new();
+    assert!(
+        !rt.receive_migrated_actor(
+            7102,
+            module.to_nbc(None).expect("nbc"),
+            serde_json::to_vec(&snapshot).expect("snapshot"),
+        ),
+        "migration must not assign a different logical actor's durable state"
+    );
+    assert!(!rt.actors.contains_key(&7102));
+}
+
+#[test]
+fn recovery_rejects_journal_payload_with_incompatible_behavior_arity() {
+    use nulang::runtime::JournalEntry;
+
+    let module = compile(
+        r#"
+        persistent actor Counter {
+            state durable n: Int = 0
+            behavior add(delta: Int) { self.n = self.n + delta }
+        }
+        "#,
+    );
+    let behavior_id = u16::try_from(module.actor_metadata[0].behavior_indices[0])
+        .expect("behavior id");
+    let actor_id = 7103;
+    let mut rt = Runtime::new();
+    register_for_recovery(&mut rt, actor_id, module);
+    rt.persistence
+        .save_snapshot(ActorSnapshot {
+            actor_id,
+            schema_name: Some("Counter".to_string()),
+            ..ActorSnapshot::default()
+        })
+        .expect("snapshot");
+    rt.persistence
+        .append_journal(
+            actor_id,
+            JournalEntry {
+                sequence: 1,
+                behavior_id,
+                payload: vec![],
+            },
+        )
+        .expect("journal");
+
+    assert_eq!(
+        rt.recover_actor(actor_id),
+        None,
+        "a persisted wrong-arity command must fail before actor publication"
+    );
+    assert!(!rt.actors.contains_key(&actor_id));
+}
+
+#[test]
+fn grain_hydration_rejects_foreign_journal_behavior_before_publication() {
+    use nulang::runtime::JournalEntry;
+
+    let module = compile(
+        r#"
+        virtual entity Counter(key: String) {
+            state durable n: Int = 0
+            behavior hit() { self.n = self.n + 1 }
+        }
+        actor Other {
+            behavior hit() { nil }
+        }
+        "#,
+    );
+    let foreign_behavior = u16::try_from(
+        module
+            .actor_metadata
+            .iter()
+            .find(|meta| meta.name == "Other")
+            .expect("Other metadata")
+            .behavior_indices[0],
+    )
+    .expect("behavior id");
+    let grain = GrainId::new("Counter", "replay-foreign-behavior");
+    let mut rt = Runtime::new();
+    rt.register_module_grains(&module);
+    let actor_id = rt.resolve_or_hydrate_grain(grain.clone()).expect("fresh grain");
+    rt.actors.remove(&actor_id);
+    rt.grain_residents.remove(&grain);
+    rt.actor_grain_id.remove(&actor_id);
+    rt.persistence
+        .save_snapshot(ActorSnapshot {
+            actor_id,
+            schema_name: Some("Counter".to_string()),
+            ..ActorSnapshot::default()
+        })
+        .expect("snapshot");
+    rt.persistence
+        .append_journal(
+            actor_id,
+            JournalEntry {
+                sequence: 1,
+                behavior_id: foreign_behavior,
+                payload: vec![],
+            },
+        )
+        .expect("journal");
+
+    let error = rt
+        .resolve_or_hydrate_grain(grain)
+        .expect_err("foreign behavior must be rejected before grain publication");
+    assert!(error.to_string().contains("not owned"), "{error}");
+    assert!(!rt.actors.contains_key(&actor_id));
+}
