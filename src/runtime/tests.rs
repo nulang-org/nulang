@@ -12,6 +12,61 @@ use crate::vm::{Frame, Value};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
+#[test]
+fn cooperative_yield_is_requeued_even_without_mail() {
+    let mut rt = Runtime::new();
+    let actor_id = 42_000_001;
+    let mut actor = Actor::new(actor_id, "yielding", 0);
+    actor.state = ActorState::Running;
+    actor.run_state = ActorRunState::Running;
+    let mut vm = crate::vm::VM::new_without_jit();
+    vm.set_current_frame(Frame::new(None, 0));
+    actor.suspended_execution = Some(SuspendedExecution {
+        vm_state: vm.take_suspended_state().unwrap(),
+        behavior_idx: 0,
+        activation: None,
+        step_name: String::new(),
+    });
+    actor.jit_yield_pending = true;
+    assert!(actor.mailbox.is_empty());
+    rt.actors.insert(actor_id, actor);
+
+    rt.finish_actor_turn(actor_id);
+
+    assert_eq!(
+        rt.claim_next_ready_actor(),
+        Some(actor_id),
+        "a cooperative yield must remain runnable without a new message"
+    );
+}
+
+#[test]
+fn external_wait_is_not_requeued_without_a_completion() {
+    let mut rt = Runtime::new();
+    let actor_id = 42_000_002;
+    let mut actor = Actor::new(actor_id, "waiting", 0);
+    actor.state = ActorState::Running;
+    actor.run_state = ActorRunState::Running;
+    let mut vm = crate::vm::VM::new_without_jit();
+    vm.set_current_frame(Frame::new(None, 0));
+    actor.suspended_execution = Some(SuspendedExecution {
+        vm_state: vm.take_suspended_state().unwrap(),
+        behavior_idx: 0,
+        activation: None,
+        step_name: String::new(),
+    });
+    actor.jit_yield_pending = false;
+    rt.actors.insert(actor_id, actor);
+
+    rt.finish_actor_turn(actor_id);
+
+    assert_eq!(
+        rt.claim_next_ready_actor(),
+        None,
+        "a signal or external-I/O wait must not spin the scheduler"
+    );
+}
+
 fn noop_test_behavior(_actor: &mut Actor, _args: &[Value]) {}
 
 fn declare_test_behavior(rt: &mut Runtime, actor_id: u64, name: &str) {
