@@ -79,6 +79,21 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
 }
 
+fn method_not_allowed_response() -> HttpResponse {
+    HttpResponse {
+        status: 405,
+        headers: vec![
+            (
+                "Allow".into(),
+                "GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS".into(),
+            ),
+            ("Content-Type".into(), "text/plain; charset=utf-8".into()),
+        ],
+        body: b"Method not allowed".to_vec(),
+    }
+}
+
+
 /// Manages the background HTTP listener thread.
 /// Stored on Runtime; `HttpServerState::bind()` spawns the thread.
 pub struct HttpServerState {
@@ -185,14 +200,7 @@ impl HttpServerState {
                             else {
                                 HttpServerState::write_response(
                                     &mut stream,
-                                    &HttpResponse {
-                                        status: 405,
-                                        headers: vec![(
-                                            "Content-Type".into(),
-                                            "text/plain; charset=utf-8".into(),
-                                        )],
-                                        body: b"Method not allowed".to_vec(),
-                                    },
+                                    &method_not_allowed_response(),
                                 );
                                 break;
                             };
@@ -884,14 +892,7 @@ impl WebDevServer {
                             else {
                                 HttpServerState::write_response(
                                     &mut stream,
-                                    &HttpResponse {
-                                        status: 405,
-                                        headers: vec![(
-                                            "Content-Type".into(),
-                                            "text/plain; charset=utf-8".into(),
-                                        )],
-                                        body: b"Method not allowed".to_vec(),
-                                    },
+                                    &method_not_allowed_response(),
                                 );
                                 break;
                             };
@@ -1280,7 +1281,13 @@ mod tests {
         );
 
         let unknown = format!("TRACE / HTTP/1.1\r\nHost: {host}\r\n\r\n");
-        assert!(send(server.port, &unknown).starts_with("HTTP/1.1 405 Method Not Allowed"));
+        let response = send(server.port, &unknown);
+        assert!(response.starts_with("HTTP/1.1 405 Method Not Allowed"));
+        assert!(
+            response.contains("Allow: GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS\r\n"),
+            "405 responses must advertise the supported methods"
+        );
+
     }
 
     #[test]
