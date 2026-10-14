@@ -269,3 +269,20 @@ fn tagged_request_digest_distinguishes_values_and_float_bits() {
         key(PersistedValue::Int(1))
     );
 }
+
+#[test]
+fn detailed_memory_inbox_receipt_distinguishes_new_and_replayed_commit() {
+    let mut store = MemoryStore::new();
+    let input = inbox(42, "precise-disposition", 3);
+    let transition = transition(42, 0, 3);
+    let first = store
+        .commit_inbox_transition_detailed(input.clone(), transition.clone())
+        .expect("new atomic admission");
+    assert!(first.newly_accepted);
+    let retry = store
+        .commit_inbox_transition_detailed(input, transition)
+        .expect("idempotent replay");
+    assert!(!retry.newly_accepted);
+    assert_eq!(first.commit, retry.commit);
+    assert_eq!(store.read_journal(42).len(), 1);
+}
