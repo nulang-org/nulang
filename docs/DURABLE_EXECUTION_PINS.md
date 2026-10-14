@@ -136,6 +136,57 @@ activation; add fail-closed host-level migration policy, stale-owner fencing,
 transaction rollback/fault-injection, and end-to-end crash-point coverage.
 Do not advertise transparent worker upgrades until that work is complete.
 
+## Opt-in Runtime lifecycle integration
+
+`Runtime::try_spawn_pinned_workflow_actor` now uses the atomic creation
+primitive to stage initial actor state and commit the snapshot, start event,
+and pin **before** scheduling the actor. A failed atomic write removes the
+unpublished actor from memory. It intentionally does not clear the durable
+store on an ambiguous commit error: recovery must first inspect the committed
+history. Duplicate starts on an already-persisted actor ID are rejected by a
+preflight history check.
+
+`Runtime::recover_pinned_workflow_actor` reads the durable pin, calls a
+host-supplied `ImmutablePinnedArtifactResolver` **by the original executable
+digest**, verifies the bundle against the persisted execution identity and
+complete behavior manifest, and only then hydrates the actor.
+
+Plain `Runtime::recover_actor` rejects an execution pin or the recognizable
+atomic-start fingerprint. This prevents a legacy bypass when a decoded pin
+is missing from otherwise recognizable pinned start history.
+
+These APIs are currently an **opt-in native-workflow path**, not blanket
+enforcement for every workflow. An already registered bytecode recovery module
+is rejected by the pinned API, because digest verification of separate bytes
+does not establish that the executable module actually dispatched was loaded
+from them. A verified immutable bytecode-module loader is required first.
+
+```bash
+cargo test --locked --test pinned_workflow_runtime
+cargo test --locked --features sqlite --test pinned_workflow_runtime
+```
+
+The sqlite tests include subprocess-backed workflow creation, changed-artifact
+rejection, and verified restart on a fresh Runtime.
+
+### Remaining safety constraints
+
+- The generic atomic persistence contract treats identical committed
+  transitions as idempotent retries. A preflight existing-history check
+  prevents ordinary repeated starts, but it is not a cross-process atomic
+  **create-only** operation. A storage-level conditional creation primitive
+  is still required for concurrent identical starters.
+- Legacy unpinned workflow creation still uses its original separate writes.
+  There is no automatic provenance check for old unpinned histories.
+- Persisted event readers that silently omit every corrupt start record can
+  defeat the atomic-start fingerprint. Strong recovery requires checked,
+  corruption-reporting history reads.
+- No immutable artifact retention/garbage-collection controller, signed
+  provenance attestation, cross-node epoch test, or automatic Cloud admission
+  integration has been implemented.
+- Promotion requires exact-head Rust build, Clippy, all relevant feature tests,
+  crash/fault-injection coverage and independently reviewed concurrency tests.
+
 ## Next increment / non-goals of v1
 
 1. Atomically persist a pin at execution creation with the existing
