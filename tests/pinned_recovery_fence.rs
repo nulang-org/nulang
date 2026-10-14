@@ -174,3 +174,115 @@ fn competing_libsql_claims_with_one_observed_tail_have_one_winner() {
     assert_eq!(store.load_durable_tail_position(47).unwrap().unwrap().sequence, 2);
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn runtime_refuses_claim_if_another_worker_wins_during_artifact_resolution() {
+    use nulang::runtime::{
+        ImmutablePinnedArtifactResolver, LibsqlStore, PinnedArtifactBundle, Runtime,
+    };
+    use std::io;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct RacingResolver {
+        path: PathBuf,
+        bundle: PinnedArtifactBundle,
+    }
+
+    impl ImmutablePinnedArtifactResolver for RacingResolver {
+        fn resolve(&self, digest: &str) -> io::Result<Option<PinnedArtifactBundle>> {
+            if digest != self.bundle.manifest.artifact.digest {
+                return Ok(None);
+            }
+            // Simulate another worker claiming the exact old committed tail
+            // while this worker is resolving the pinned immutable artifact.
+            let mut contender = LibsqlStore::new(&self.path)?;
+            let observed = contender.load_durable_tail_position(48)?
+                .expect("committed pinned workflow");
+            claim_pinned_workflow_recovery(&mut contender, 48, observed)?;
+            Ok(Some(self.bundle.clone()))
+        }
+    }
+
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "nulang-fenced-resolver-race-{}-{nonce}", std::process::id(),
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("workflow.db");
+    {
+        let mut store = LibsqlStore::new(&path).unwrap();
+        start(&mut store, 48);
+    }
+
+    let bytes = b"fenced-workflow-v1";
+    let resolver = RacingResolver {
+        path: path.clone(),
+        bundle: PinnedArtifactBundle {
+            manifest: behavior(bytes),
+            executable: bytes.to_vec(),
+        },
+    };
+    let mut runtime = Runtime::new();
+    runtime.persistence = Box::new(LibsqlStore::new(&path).unwrap());
+    let error = runtime.recover_pinned_workflow_actor(
+        48, "payments/one", &resolver,
+    ).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+    assert!(!runtime.actors.contains_key(&48));
+    assert_eq!(
+        runtime.persistence.load_durable_tail_position(48)
+            .unwrap().unwrap().sequence,
+        2,
+    );
+    drop(runtime);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn runtime_recovers_with_claimed_epoch_from_original_pinned_artifact() {
+    use nulang::runtime::{
+        ImmutablePinnedArtifactResolver, LibsqlStore, PinnedArtifactBundle, Runtime,
+    };
+    use std::io;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct Resolver(PinnedArtifactBundle);
+    impl ImmutablePinnedArtifactResolver for Resolver {
+        fn resolve(&self, digest: &str) -> io::Result<Option<PinnedArtifactBundle>> {
+            Ok((digest == self.0.manifest.artifact.digest).then(|| self.0.clone()))
+        }
+    }
+
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "nulang-epoch-restart-{}-{nonce}", std::process::id(),
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("workflow.db");
+    {
+        let mut store = LibsqlStore::new(&path).unwrap();
+        start(&mut store, 49);
+    }
+
+    let bytes = b"fenced-workflow-v1";
+    let mut runtime = Runtime::new();
+    runtime.persistence = Box::new(LibsqlStore::new(&path).unwrap());
+    assert_eq!(
+        runtime.recover_pinned_workflow_actor(
+            49, "payments/one",
+            &Resolver(PinnedArtifactBundle {
+                manifest: behavior(bytes),
+                executable: bytes.to_vec(),
+            }),
+        ).unwrap(),
+        49,
+    );
+    let actor = &runtime.actors[&49];
+    assert_eq!(actor.activation_epoch, 2);
+    assert_eq!(actor.sequence, 2);
+    drop(runtime);
+    std::fs::remove_dir_all(directory).unwrap();
+}
