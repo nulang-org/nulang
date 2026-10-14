@@ -56,6 +56,45 @@ impl WalBackedTablet {
         self.tablet.current_sequence()
     }
 
+    /// Append an explicit durable ownership epoch barrier. A barrier consumes
+    /// one committed sequence but changes no user rows or transaction receipts.
+    /// This is local fencing only: the caller must obtain its new epoch from a
+    /// trusted coordinator before invoking it. This API does not establish
+    /// distributed leader authority or invalidate an existing remote writer.
+    ///
+    /// An I/O error may leave an ambiguous durable barrier. Drop the poisoned
+    /// handle, reopen with the intended epoch, and reconcile its sequence.
+    pub fn advance_ownership_epoch(
+        &mut self,
+        expected_epoch: u64,
+        new_epoch: u64,
+    ) -> Result<u64, WalBackedError> {
+        let current = self.tablet.descriptor().ownership_epoch();
+        if expected_epoch < current {
+            return Err(TabletError::StaleEpoch {
+                current,
+                presented: expected_epoch,
+            }
+            .into());
+        }
+        if expected_epoch > current {
+            return Err(TabletError::UnknownEpoch {
+                current,
+                presented: expected_epoch,
+            }
+            .into());
+        }
+        let write = TabletWrite::prepare_epoch_fence(
+            self.tablet.descriptor(),
+            new_epoch,
+            self.tablet.current_sequence(),
+        )?;
+        let sequence = write.sequence();
+        self.wal.append_write(&write)?;
+        self.tablet.publish_epoch_fence(new_epoch, sequence);
+        Ok(sequence)
+    }
+
     pub fn prepare_write(
         &self,
         presented_epoch: u64,
@@ -74,8 +113,8 @@ impl WalBackedTablet {
     /// so it survives restart and log reclamation. A failed append may have
     /// committed; reopen the tablet and retry with the exact same ID/payload.
     ///
-    /// This single-writer prototype does not coordinate concurrent handles
-    /// opened on the same WAL path. Identifiers are scoped to one tablet.
+    /// Only one writer may hold the local WAL lock at a time. Identifiers are
+    /// scoped to one tablet; this API does not coordinate distributed writers.
     pub fn commit_idempotent(
         &mut self,
         id: TransactionId,
