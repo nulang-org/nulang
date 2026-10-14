@@ -940,6 +940,29 @@ mod tests {
 
     #[cfg(feature = "python")]
     #[test]
+    fn test_direct_value_wrapper_registers_a_distinct_temporary_handle() {
+        // The legacy conversion always registers a new object ID, including
+        // when its input is an already registered Python-tagged VM value.
+        let original = pyo3::Python::attach(|py| {
+            crate::python::register_object(py.None())
+        });
+        let vm_value = unsafe {
+            Value::from_raw(crate::python::TAG_PYTHON | original.0)
+        };
+        let wrapper = crate::python::value_to_python_object_id(vm_value)
+            .expect("wrap an already registered object");
+        assert_ne!(wrapper, original, "conversion should create a temporary registry slot");
+        {
+            let mut temporary = TemporaryPythonHandles::default();
+            temporary.track(wrapper);
+        }
+        assert!(crate::python::get_object(wrapper).is_none());
+        assert!(crate::python::get_object(original).is_some());
+        crate::python::unregister_object(original);
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
     fn test_foreign_interop_owned_unicode_string_roundtrip() {
         let mut fi = DefaultForeignInterop::new().expect("failed to create Python bridge");
         fi.import("builtins").expect("failed to import builtins");
