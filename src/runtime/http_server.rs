@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -1051,27 +1051,8 @@ impl WebDevServer {
     ) -> HttpResponse {
         let trimmed = path.trim_start_matches('/');
         let file_path = static_dir
-            .map(|d| {
-                let p = d.join(trimmed);
-                if trimmed.is_empty() || p.is_dir() {
-                    d.join("index.html")
-                } else {
-                    p
-                }
-            })
-            .filter(|p| p.is_file())
-            .or_else(|| {
-                output_dir
-                    .map(|d| {
-                        let p = d.join(trimmed);
-                        if trimmed.is_empty() || p.is_dir() {
-                            d.join("index.html")
-                        } else {
-                            p
-                        }
-                    })
-                    .filter(|p| p.is_file())
-            });
+            .and_then(|root| contained_static_file(root, trimmed))
+            .or_else(|| output_dir.and_then(|root| contained_static_file(root, trimmed)));
 
         if let Some(p) = file_path {
             if let Ok(data) = std::fs::read(&p) {
@@ -1091,6 +1072,34 @@ impl WebDevServer {
     }
 }
 
+/// Resolve static files only inside the configured root. Normalize both the
+/// root and target before testing containment so a symlink cannot escape the
+/// served directory. Reject explicit parent/absolute/prefix components before
+/// filesystem lookup. This does not defend against hostile concurrent
+/// filesystem mutation of the configured (trusted) static directory.
+fn contained_static_file(root: &Path, relative: &str) -> Option<PathBuf> {
+    if !Path::new(relative)
+        .components()
+        .all(|part| matches!(part, Component::Normal(_)))
+    {
+        return None;
+    }
+
+    let root = root.canonicalize().ok()?;
+    let joined = root.join(relative);
+    let candidate = if relative.is_empty() || joined.is_dir() {
+        root.join("index.html")
+    } else {
+        joined
+    };
+    let canonical = candidate.canonicalize().ok()?;
+    if canonical.starts_with(&root) && canonical.is_file() {
+        Some(canonical)
+    } else {
+        None
+    }
+}
+
 fn guess_content_type(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()) {
         Some("html") => "text/html; charset=utf-8",
@@ -1105,6 +1114,46 @@ fn guess_content_type(path: &Path) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Real filesystem fixture: a file adjacent to the configured static root
+    // must never be served through a URL path containing parent traversals.
+    #[test]
+    fn web_static_file_fallback_cannot_read_parent_directory() {
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fixture = Cleanup(std::env::temp_dir().join(format!(
+            "nulang-static-containment-{}-{suffix}",
+            std::process::id()
+        )));
+        let public = fixture.0.join("public");
+        std::fs::create_dir_all(&public).unwrap();
+        std::fs::write(public.join("hello.txt"), b"public").unwrap();
+        std::fs::write(fixture.0.join("private.txt"), b"private").unwrap();
+
+        let allowed = WebDevServer::serve_static(Some(&public), None, "/hello.txt");
+        assert_eq!(allowed.status, 200);
+        assert_eq!(allowed.body, b"public");
+
+        let escaped = WebDevServer::serve_static(Some(&public), None, "/../private.txt");
+        assert_eq!(escaped.status, 404, "parent traversal must fail closed");
+        assert!(!escaped.body.windows(7).any(|part| part == b"private"));
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("../private.txt", public.join("shortcut.txt")).unwrap();
+            let escaped = WebDevServer::serve_static(Some(&public), None, "/shortcut.txt");
+            assert_eq!(escaped.status, 404, "symlink outside root must fail closed");
+        }
+    }
 
     #[test]
     fn test_match_route_exact() {
