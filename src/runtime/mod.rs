@@ -1125,7 +1125,7 @@ impl Runtime {
         let snapshot = self.persistence.load_snapshot(actor_id)
             .ok_or_else(|| Error::new(ErrorKind::WouldBlock, "durable completion snapshot is missing"))?;
         if tail.activation_epoch != epoch
-            || tail.sequence <= admitted_sequence
+            || Some(tail.sequence) != admitted_sequence.checked_add(1)
             || snapshot.sequence != tail.sequence
             || snapshot.activation_epoch != epoch
             || snapshot.schema_name.as_deref() != Some(expected_schema.as_str())
@@ -1135,9 +1135,28 @@ impl Runtime {
                 "admitted command has no matching epoch-fenced completion snapshot",
             ));
         }
+        // Do not expose a partially reconstructed state to the next command.
+        // This conservative adapter accepts only complete durable-field
+        // snapshots from this actor's compiler-owned state declaration.
+        let actor = &self.actors[&actor_id];
+        if snapshot.state.keys().any(|name| {
+            !matches!(actor.state_models.get(name), Some(StateModel::Durable))
+        }) || actor.state_models.iter().any(|(name, model)| {
+            matches!(model, StateModel::Durable) && !snapshot.state.contains_key(name)
+        }) {
+            return Err(Error::new(
+                ErrorKind::WouldBlock,
+                "completion snapshot does not match the actor's durable field set",
+            ));
+        }
 
         let actor = self.actors.get_mut(&actor_id)
             .expect("actor remains present while completing the admitted command");
+        for (name, value) in &snapshot.state {
+            let restored = value.to_value_on_heap(actor);
+            actor.set_state_field(name, restored);
+            actor.dirty_fields.remove(name);
+        }
         if !actor.mailbox.finish_admitted_command(admitted_sequence) {
             return Err(Error::new(ErrorKind::InvalidInput, "completion fence changed"));
         }
