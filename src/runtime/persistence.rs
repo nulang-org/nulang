@@ -1490,6 +1490,40 @@ fn decode_inbox_digest(value: &str) -> io::Result<[u8; 32]> {
     Ok(decoded)
 }
 
+/// Crash-test-only hook. Compiled out of ordinary production and full builds.
+///
+/// Used by the SIGKILL integration test to stop a child after a journal INSERT
+/// while the IMMEDIATE transaction remains open. Requires an explicit Cargo
+/// feature *and* stage + actor-specific environment variables.
+#[cfg(feature = "durability-fault-injection")]
+fn halt_inflight_inbox_after_journal_for_test(actor_id: u64) -> io::Result<()> {
+    if std::env::var("NULANG_INBOX_TEST_HALT_STAGE")
+        .ok()
+        .as_deref()
+        != Some("after-journal-before-receipt")
+    {
+        return Ok(());
+    }
+    let expected_actor = std::env::var("NULANG_INBOX_TEST_HALT_ACTOR")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+    if expected_actor != Some(actor_id) {
+        return Ok(());
+    }
+    let marker = std::env::var_os("NULANG_INBOX_TEST_HALT_READY").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "in-flight inbox crash test requires a ready-marker path",
+        )
+    })?;
+    std::fs::write(PathBuf::from(marker), b"journal-written-transaction-still-open")?;
+    // A parent test will SIGKILL the process at this open transaction
+    // boundary. Spurious park wakeups must never let it commit.
+    loop {
+        std::thread::park();
+    }
+}
+
 #[cfg(feature = "sqlite")]
 pub struct LibsqlStore {
     conn: std::sync::Mutex<libsql::Connection>,
@@ -2166,6 +2200,14 @@ impl LibsqlStore {
                 )
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            }
+
+            // Only an explicitly feature-enabled crash-test worker can stop
+            // here. The command and snapshot are staged but the transaction
+            // has not yet written its receipt or committed.
+            #[cfg(feature = "durability-fault-injection")]
+            if inbox_id.is_some() && transition.command.is_some() {
+                halt_inflight_inbox_after_journal_for_test(transition.actor_id)?;
             }
 
             for (ordinal, event_json) in workflow_json.iter().enumerate() {

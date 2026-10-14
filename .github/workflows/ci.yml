@@ -133,6 +133,32 @@ jobs:
         run: python3 scripts/verify_implementation.py --skip-tests
 
   # -----------------------------------------------------------------------
+  # Real SIGKILL while the durable inbox SQL transaction is still open.
+  # The dangerous hook is feature-gated and absent from release builds.
+  # Keep the isolated sqlite-only test separate from expensive full CI.
+  # -----------------------------------------------------------------------
+  durable-inbox-inflight-crash:
+    name: Durable inbox mid-transaction SIGKILL
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Kill an in-flight inbox transaction and verify crash rollback
+        run: |
+          cargo test --locked --no-default-features \
+            --features durability-fault-injection \
+            --test libsql_inflight_inbox_sigkill -- --nocapture
+
+  # -----------------------------------------------------------------------
   # Release build — catches optimization-only errors
   # -----------------------------------------------------------------------
   release:

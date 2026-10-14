@@ -62,6 +62,9 @@ mobile-runtime = []
 savina-bench = []
 python = ["dep:pyo3"]
 sqlite = ["dep:libsql", "dep:tokio"]
+# Dangerous test-only fault injection for deterministic SIGKILL mid-transaction.
+# Never part of the default/full/release-cli feature profiles. Requires sqlite.
+durability-fault-injection = ["sqlite"]
 lsp = ["dep:tower-lsp", "dep:tokio", "dep:futures", "dep:tower-service"]
 ai-runtime = ["dep:nulang-ai", "dep:nulang-ai-local", "dep:uuid", "dep:reqwest", "dep:tokio"]
 wasm-backend = ["native-codegen", "dep:wasm-encoder", "dep:wasmtime", "dep:wat", "dep:borsh"]
