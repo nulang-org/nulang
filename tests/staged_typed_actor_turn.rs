@@ -144,7 +144,12 @@ fn foreign_behavior_and_non_durable_state_are_refused_before_commit() {
 #[test]
 fn transient_actors_cannot_be_upgraded_by_a_staged_durable_call() {
     let module = compile(
-        "actor Transient { state count: Int = 0; behavior add(amount: Int) { self.count = amount } }"
+        r#"
+        actor Transient {
+            state count: Int = 0
+            behavior add(amount: Int) { self.count = amount }
+        }
+        "#,
     );
     let behavior = module.actor_metadata[0].behavior_indices[0] as u16;
     let mut runtime = Runtime::new();
