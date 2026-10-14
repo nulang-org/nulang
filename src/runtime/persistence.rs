@@ -380,6 +380,10 @@ impl WorkflowEvent {
 /// Version of the atomic durable-transition persistence contract.
 pub const DURABLE_TRANSITION_VERSION: u16 = 1;
 
+/// Reserved runtime metadata event identifying an immutable, create-only
+/// execution claim. No user workflow may emit this name as a regular event.
+pub const PINNED_WORKFLOW_START_EVENT: &str = "__nulang.execution_pin/v1";
+
 /// One outbound actor message staged inside a durable transition.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DurableOutboxMessage {
@@ -434,6 +438,19 @@ pub struct DurableCommit {
 }
 
 impl DurableTransition {
+    /// Starting a pinned execution is a *create-only* transaction, never an
+    /// idempotent retry that may acknowledge two independent starters.
+    ///
+    /// This property is inferred from a reserved committed event instead of
+    /// adding a field to the frozen durable transition digest envelope.
+    pub fn is_create_only_pinned_start(&self) -> bool {
+        self.sequence == 1
+            && self.expected_previous_sequence == 0
+            && self.workflow_events.iter().any(|event| {
+                matches!(event, WorkflowEvent::Custom { name, .. } if name == PINNED_WORKFLOW_START_EVENT)
+            })
+    }
+
     fn validate_structure(&self) -> io::Result<()> {
         if self.version != DURABLE_TRANSITION_VERSION {
             return Err(io::Error::new(
@@ -657,6 +674,16 @@ pub trait PersistenceStore: Send + Sync {
         ))
     }
 
+    /// Read workflow history without silently dropping corrupt/unreadable
+    /// rows. Implementations that cannot prove completeness must return
+    /// Unsupported rather than an apparently valid partial event history.
+    fn read_workflow_events_checked(&self, _actor_id: u64) -> io::Result<Vec<WorkflowEvent>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "strict workflow history reads are unavailable on this persistence backend",
+        ))
+    }
+
     /// Load the newest durable record for one logical external effect.
     ///
     /// Backends that cannot recover durable-effect records MUST fail closed
@@ -855,6 +882,10 @@ impl MemoryStore {
 }
 
 impl PersistenceStore for MemoryStore {
+    fn read_workflow_events_checked(&self, actor_id: u64) -> io::Result<Vec<WorkflowEvent>> {
+        Ok(self.read_workflow_events(actor_id))
+    }
+
     fn load_durable_tail_position(&self, actor_id: u64) -> io::Result<Option<DurableTailPosition>> {
         Ok(self
             .durable_tails
@@ -887,6 +918,12 @@ impl PersistenceStore for MemoryStore {
             if transition.activation_epoch == tail.activation_epoch
                 && transition.sequence == tail.sequence
             {
+                if digest == tail.digest && transition.is_create_only_pinned_start() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "pinned execution already created; identical start is not a retry",
+                    ));
+                }
                 if digest == tail.digest {
                     return Ok(DurableCommit {
                         actor_id: transition.actor_id,
@@ -1668,6 +1705,44 @@ impl LibsqlStore {
 
 #[cfg(feature = "sqlite")]
 impl PersistenceStore for LibsqlStore {
+    fn read_workflow_events_checked(&self, actor_id: u64) -> io::Result<Vec<WorkflowEvent>> {
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let mut events = Vec::new();
+            for sql in [
+                "SELECT event FROM workflow_events WHERE actor_id = ?1 ORDER BY sequence ASC",
+                "SELECT event FROM durable_workflow_events
+                 WHERE actor_id = ?1 ORDER BY sequence ASC, ordinal ASC",
+            ] {
+                let mut rows = conn
+                    .query(sql, libsql::params![actor_id as i64])
+                    .await
+                    .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+                loop {
+                    let Some(row) = rows
+                        .next()
+                        .await
+                        .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?
+                    else {
+                        break;
+                    };
+                    let serialized: String = row
+                        .get(0)
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+                    let event: WorkflowEvent = serde_json::from_str(&serialized)
+                        .map_err(|error| io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("corrupt workflow event for actor {actor_id}: {error}"),
+                        ))?;
+                    events.push(event);
+                }
+            }
+            events.sort_by_key(WorkflowEvent::sequence);
+            Ok(events)
+        })
+    }
+
+
     fn load_durable_tail_position(&self, actor_id: u64) -> io::Result<Option<DurableTailPosition>> {
         let conn = self.conn();
         self.rt.block_on(async {
@@ -1845,6 +1920,13 @@ impl PersistenceStore for LibsqlStore {
 
             if let Some((epoch, sequence, stored_digest)) = &current_tail {
                 if transition.activation_epoch == *epoch && transition.sequence == *sequence {
+                    if stored_digest == &digest_hex && transition.is_create_only_pinned_start() {
+                        let _ = tx.rollback().await;
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            "pinned execution already created; identical start is not a retry",
+                        ));
+                    }
                     if stored_digest == &digest_hex {
                         tx.commit()
                             .await
