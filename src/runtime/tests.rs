@@ -12,6 +12,28 @@ use crate::vm::{Frame, Value};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "python")]
+#[test]
+fn test_python_builtin_get_attr_returns_constant_without_invoking_it() {
+    let mut rt = Runtime::new();
+    let strings = vec![
+        Constant::String("math".to_string()),
+        Constant::String("pi".to_string()),
+    ];
+    let imported = rt.perform_python_builtin(Some("import"), &strings, &[Value::string(0)]);
+    assert!(matches!(imported, Some(value) if value.is_unit()));
+
+    let value = rt
+        .perform_python_builtin(
+            Some("get_attr"),
+            &strings,
+            &[Value::string(0), Value::string(1)],
+        )
+        .expect("Python.get_attr must return a result");
+    let float = value.as_float().expect("math.pi must be a float");
+    assert!((float - std::f64::consts::PI).abs() < f64::EPSILON);
+}
+
 fn noop_test_behavior(_actor: &mut Actor, _args: &[Value]) {}
 
 fn declare_test_behavior(rt: &mut Runtime, actor_id: u64, name: &str) {
