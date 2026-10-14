@@ -2850,6 +2850,57 @@ mod tests {
     #[cfg(feature = "tcp")]
     use std::thread::sleep;
 
+    // Regression: an inbound packet must wake a dormant TCP node without
+    // consuming or duplicating it before the normal receive boundary.
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn test_transport_idle_wait_wakes_on_packet_and_preserves_it() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let transport = TcpTransport::bind(addr, TlsConfig::PlaintextInsecure).unwrap();
+        let tx = transport.incoming_tx.clone();
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(5));
+            tx.send(IncomingPacket {
+                from_node: NodeId(17),
+                seq: 41,
+                packet: Packet::Ack { packet_seq: 7 },
+            })
+            .unwrap();
+        });
+
+        let mut transport: Box<dyn NetworkTransport> = Box::new(transport);
+        assert!(transport.wait_for_activity(Duration::from_secs(1)));
+        sender.join().unwrap();
+        let packets = transport.receive();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].seq, 41);
+        assert!(matches!(&packets[0].packet, Packet::Ack { packet_seq: 7 }));
+        assert!(transport.receive().is_empty(), "wakeup duplicated a packet");
+        transport.shutdown();
+    }
+
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn test_transport_idle_wait_preserves_prequeued_fifo_packets() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let mut transport = TcpTransport::bind(addr, TlsConfig::PlaintextInsecure).unwrap();
+        for seq in 1..=3 {
+            transport.incoming_tx.send(IncomingPacket {
+                from_node: NodeId(17),
+                seq,
+                packet: Packet::Ack { packet_seq: seq },
+            }).unwrap();
+        }
+        assert!(transport.wait_for_activity(Duration::from_secs(1)));
+        let packets = transport.receive();
+        assert_eq!(
+            packets.iter().map(|packet| packet.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(!transport.wait_for_activity(Duration::from_millis(2)));
+        transport.shutdown();
+    }
+
     // ------------------------------------------------------------------
     // 1. NodeId hashing
     // ------------------------------------------------------------------
