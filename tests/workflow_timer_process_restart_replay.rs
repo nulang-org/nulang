@@ -197,7 +197,9 @@ fn timer_crash_cutpoints_recover_once_across_successive_runtime_restarts() {
                 actor.current_workflow_activation = Some(activation);
             }
             if crash_after_timer_preparation {
-                runtime.schedule_workflow_timer(actor_id, "wake", 60_000).unwrap();
+                runtime
+                    .schedule_workflow_timer(actor_id, "wake", 60_000)
+                    .unwrap();
                 assert_eq!(runtime.timer_wheel.len(), 1);
             } else {
                 assert_eq!(runtime.timer_wheel.len(), 0);
@@ -226,7 +228,9 @@ fn timer_crash_cutpoints_recover_once_across_successive_runtime_restarts() {
                 "recovery must only rearm a timer whose preparation was committed"
             );
 
-            recovered.schedule_workflow_timer(actor_id, "wake", 60_000).unwrap();
+            recovered
+                .schedule_workflow_timer(actor_id, "wake", 60_000)
+                .unwrap();
             assert_eq!(recovered.timer_wheel.len(), 1);
             assert_eq!(
                 recovered
