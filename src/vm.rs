@@ -6342,7 +6342,7 @@ mod vm_tests {
             result = vm.resume().expect("resume next quantum");
         }
         assert!(!vm.yield_pending, "halt should complete, not yield");
-        assert_eq!(result, Value::unit());
+        assert_eq!(result, Value::nil());
     }
 
     #[test]
