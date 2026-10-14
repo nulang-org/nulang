@@ -78,7 +78,6 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
 }
 
-
 /// Framing errors are rejected before executing a user handler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HttpReadError {
@@ -194,7 +193,9 @@ fn read_http_request<R: Read>(reader: &mut R) -> Result<Option<HttpRequest>, Htt
             if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
                 return Err(HttpReadError::BadRequest);
             }
-            let length = value.parse::<usize>().map_err(|_| HttpReadError::BadRequest)?;
+            let length = value
+                .parse::<usize>()
+                .map_err(|_| HttpReadError::BadRequest)?;
             if content_length.replace(length).is_some() {
                 return Err(HttpReadError::BadRequest);
             }
@@ -363,11 +364,11 @@ impl HttpServerState {
             302 => "Found",
             304 => "Not Modified",
             400 => "Bad Request",
-            408 => "Request Timeout",
             401 => "Unauthorized",
             403 => "Forbidden",
             404 => "Not Found",
             405 => "Method Not Allowed",
+            408 => "Request Timeout",
             413 => "Payload Too Large",
             417 => "Expectation Failed",
             422 => "Unprocessable Entity",
@@ -383,7 +384,11 @@ impl HttpServerState {
         for (k, v) in &response.headers {
             out.push_str(&format!("{}: {}\r\n", k, v));
         }
-        if !response.headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("connection")) {
+        if !response
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("connection"))
+        {
             out.push_str("Connection: close\r\n");
         }
         out.push_str(&format!("Content-Length: {}\r\n", response.body.len()));
@@ -1151,7 +1156,10 @@ mod tests {
     }
 
     fn chunks(input: &[u8], max_chunk: usize) -> FixedChunkReader<'_> {
-        FixedChunkReader { remaining: input, max_chunk }
+        FixedChunkReader {
+            remaining: input,
+            max_chunk,
+        }
     }
 
     #[test]
@@ -1179,7 +1187,10 @@ mod tests {
             &b"POST / HTTP/1.1\r\nContent-Length: nope\r\n\r\n"[..],
             &b"POST / HTTP/1.1\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\nok"[..],
         ] {
-            assert_eq!(read_http_request(&mut chunks(raw, 7)).unwrap_err(), HttpReadError::BadRequest);
+            assert_eq!(
+                read_http_request(&mut chunks(raw, 7)).unwrap_err(),
+                HttpReadError::BadRequest
+            );
         }
     }
 
