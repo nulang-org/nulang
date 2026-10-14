@@ -363,10 +363,9 @@ fn try_spawn_actor_with_id_pinned(
                     .copied()
                     .unwrap_or(StateModel::Local);
                 if model.is_persistent() {
-                    state.push(PersistedValue::from_value_resolved(
-                        value,
-                        actor.bytecode_module.as_deref(),
-                    ));
+                    // Resolve actor-owned heap strings before the initial
+                    // durable event is committed, not only in the snapshot.
+                    state.push(actor.persist_value(value));
                 }
             }
             state
