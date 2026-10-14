@@ -229,8 +229,9 @@ recorded executable digest, checks the complete behavior manifest, and decodes
 the **actual verified `.nbc` bytes** with `CodeModule::from_nbc`. The decoded
 module is not supplied by the caller as a pre-existing in-memory
 `CodeModule`: recovery validates the persisted actor schema, checks that it
-is a durable workflow in both the compiler module and sidecar, and rejects
-missing, duplicate or out-of-range behavior references/bytecode offsets.
+is a durable workflow in both the compiler module and sidecar, requires
+the compiled and declared schema versions to match, and rejects missing,
+duplicate or out-of-range behavior references/bytecode offsets.
 
 The resulting verified module, step offsets, and compensation offsets are
 installed into `Runtime::recovery_modules` **before** actor hydration and
