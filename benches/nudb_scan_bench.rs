@@ -6,6 +6,7 @@
 use std::num::NonZeroUsize;
 
 use criterion::{black_box, criterion_group, Criterion, Throughput};
+use nulang::database::selection::SelectionBitmap;
 use nulang::database::tablet::{
     KeyRange, MemoryTablet, TabletDescriptor, TabletId, TabletMutation,
 };
@@ -79,4 +80,57 @@ fn benchmark_scan(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, benchmark_scan);
+/// Compare full scalar predicate evaluation with a batch-local selection
+/// bitmap pipeline. Bitmap generation is presently row-wise and may be slower
+/// for a single filter; the purpose is to measure its downstream composition
+/// overhead before introducing encoded-page pushdown or SIMD operators.
+fn benchmark_selection(c: &mut Criterion) {
+    let mut group = c.benchmark_group("nudb/selection");
+    let (tablet, _keys, range) = fixture(16_384);
+    group.throughput(Throughput::Elements(16_384));
+
+    for target in [64, 1024] {
+        let batches: Vec<_> = tablet
+            .scan_range_at(&range, 2, NonZeroUsize::new(target).unwrap())
+            .unwrap()
+            .collect();
+
+        group.bench_function(format!("scalar/{target}"), |b| {
+            b.iter(|| {
+                let mut matches = 0;
+                for batch in &batches {
+                    for row in &batch.rows {
+                        if black_box(row.key.ends_with(b"0")) && row.value.starts_with(b"y") {
+                            black_box(row.value);
+                            matches += 1;
+                        }
+                    }
+                }
+                black_box(matches)
+            });
+        });
+
+        group.bench_function(format!("bitmap_and/{target}"), |b| {
+            b.iter(|| {
+                let mut matches = 0;
+                for batch in &batches {
+                    let by_key = SelectionBitmap::from_predicate(batch, |row| {
+                        row.key.ends_with(b"0")
+                    });
+                    let by_value = SelectionBitmap::from_predicate(batch, |row| {
+                        row.value.starts_with(b"y")
+                    });
+                    let selected = by_key.and(&by_value).unwrap();
+                    for index in selected.selected_indices() {
+                        black_box(batch.rows[index].value);
+                        matches += 1;
+                    }
+                }
+                black_box(matches)
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, benchmark_scan, benchmark_selection);
