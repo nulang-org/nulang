@@ -955,15 +955,11 @@ impl WebDevServer {
             .iter()
             .filter(|r| r.route.method == request.method)
             .find_map(|r| {
-                crate::web::dispatch::match_route(r, &request.path)
-                    .map(|params| (r, params))
+                crate::web::dispatch::match_route(r, &request.path).map(|params| (r, params))
             })
         {
-            let captured = HttpRequestBindingInputs::capture(
-                &request.path,
-                &request.headers,
-                &request.body,
-            );
+            let captured =
+                HttpRequestBindingInputs::capture(&request.path, &request.headers, &request.body);
             if let Some(response) = invalid_ui_action_response(&captured) {
                 response
             } else {
@@ -972,8 +968,8 @@ impl WebDevServer {
                     request: request.clone(),
                     params: params.clone(),
                 };
-                let rendered = with_request_context(ctx, || {
-                    match render_direct_request(route, &values) {
+                let rendered =
+                    with_request_context(ctx, || match render_direct_request(route, &values) {
                         Ok(Some(rendered)) => Ok(Some(rendered)),
                         Ok(None) => Ok(render_route_handler(
                             &route.route.handler_module,
@@ -981,23 +977,16 @@ impl WebDevServer {
                             None,
                         )),
                         Err(error) => Err(error),
-                    }
-                });
+                    });
                 match rendered {
                     Ok(Some(html)) => HttpResponse {
                         status: 200,
-                        headers: vec![(
-                            "Content-Type".into(),
-                            "text/html; charset=utf-8".into(),
-                        )],
+                        headers: vec![("Content-Type".into(), "text/html; charset=utf-8".into())],
                         body: inject_client_runtime_script(&html).into_bytes(),
                     },
                     Ok(None) => HttpResponse {
                         status: 500,
-                        headers: vec![(
-                            "Content-Type".into(),
-                            "text/plain".into(),
-                        )],
+                        headers: vec![("Content-Type".into(), "text/plain".into())],
                         body: b"Internal server error".to_vec(),
                     },
                     Err(DirectRequestRenderError::Decode(error)) => {
@@ -1012,21 +1001,14 @@ impl WebDevServer {
                         eprintln!("typed route dispatch error: {error}");
                         HttpResponse {
                             status: 500,
-                            headers: vec![(
-                                "Content-Type".into(),
-                                "text/plain".into(),
-                            )],
+                            headers: vec![("Content-Type".into(), "text/plain".into())],
                             body: b"Internal server error".to_vec(),
                         }
                     }
                 }
             }
         } else {
-            Self::serve_static(
-                static_dir.as_deref(),
-                output_dir.as_deref(),
-                &request.path,
-            )
+            Self::serve_static(static_dir.as_deref(), output_dir.as_deref(), &request.path)
         };
         for cookie in take_response_cookies() {
             response.headers.push(("Set-Cookie".into(), cookie));
