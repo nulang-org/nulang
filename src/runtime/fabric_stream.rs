@@ -1043,7 +1043,9 @@ impl FileFabricStreamStore {
         Ok(())
     }
 
-    /// Read records after the consumer's last committed sequence.
+    /// Read records after the consumer's cursor, without exposing an
+    /// uncommitted local tail on replicated streams. Standalone local streams
+    /// retain their existing append-and-replay behavior.
     pub fn read_consumer(
         &mut self,
         name: &str,
@@ -1051,13 +1053,25 @@ impl FileFabricStreamStore {
         limit: usize,
     ) -> io::Result<Vec<FabricStreamRecord>> {
         let cursor = self.cursor(name, consumer)?;
+        if self.replication_policy(name)?.is_some() {
+            let committed = self.committed_sequence(name)?;
+            if cursor > committed {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Fabric consumer cursor {cursor} exceeds committed sequence {committed}"
+                    ),
+                ));
+            }
+            return self.read_committed(name, cursor.saturating_add(1), limit);
+        }
         self.read_from(name, cursor.saturating_add(1), limit)
     }
 
     /// Persist a consumer's last fully processed sequence.
     ///
-    /// Cursors are monotonic. Committing beyond the stream tail or moving a
-    /// cursor backwards is rejected.
+    /// Cursors are monotonic and cannot advance beyond the quorum-committed
+    /// index on replicated streams (or the local tail on standalone streams).
     pub fn commit_cursor(&mut self, name: &str, consumer: &str, sequence: u64) -> io::Result<()> {
         validate_name("consumer", consumer)?;
         self.ensure_state(name)?;
@@ -1067,16 +1081,30 @@ impl FileFabricStreamStore {
             .and_then(|state| state.next_sequence.checked_sub(1))
             .filter(|&seq| seq > 0)
             .unwrap_or(0);
-        if sequence > last_sequence {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("Fabric cursor {sequence} is beyond stream tail {last_sequence}"),
-            ));
-        }
+        let replicated = self.replication_policy(name)?.is_some();
+        let upper_bound = if replicated {
+            self.committed_sequence(name)?
+        } else {
+            last_sequence
+        };
 
         let path = self.stream_dir(name).join("cursors.json");
         let mut cursors = read_cursors(&path)?;
         let current = cursors.cursors.get(consumer).copied().unwrap_or(0);
+        if replicated && current > upper_bound {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Fabric consumer cursor {current} exceeds committed sequence {upper_bound}"
+                ),
+            ));
+        }
+        if sequence > upper_bound {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Fabric cursor {sequence} is beyond consumer-visible boundary {upper_bound}"),
+            ));
+        }
         if sequence < current {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
