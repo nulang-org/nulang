@@ -1818,6 +1818,63 @@ fn test_unlink_actors() {
 }
 
 #[test]
+fn monitor_references_distinguish_independent_watches_and_cancel_exactly_one() {
+    let mut rt = Runtime::new();
+    let watcher = rt.spawn_actor(Box::new(Vec::new));
+    let stranger = rt.spawn_actor(Box::new(Vec::new));
+    let target = rt.spawn_actor(Box::new(Vec::new));
+
+    let first = rt.monitor_ref(watcher, target).expect("first monitor");
+    let second = rt.monitor_ref(watcher, target).expect("second monitor");
+    assert_ne!(first, second, "each monitor must have its own reference");
+    assert!(
+        !rt.demonitor_ref(stranger, first),
+        "a different watcher must not cancel someone else's monitor"
+    );
+    assert!(rt.demonitor_ref(watcher, first));
+
+    rt.exit_actor(target, ExitReason::Error("failure".to_string()));
+    let mailbox = &mut rt.actors.get_mut(&watcher).unwrap().mailbox;
+    let down = mailbox.pop().expect("surviving monitor receives DOWN");
+    assert_eq!(down.payload.len(), 4);
+    assert_eq!(down.payload[0].as_int(), Some(target as i64));
+    assert_eq!(down.payload[1].as_int(), Some(watcher as i64));
+    assert_eq!(down.payload[2].as_int(), Some(1));
+    assert_eq!(down.payload[3].as_int(), Some(second.0 as i64));
+    assert!(mailbox.pop().is_none(), "canceled monitor must not send DOWN");
+    assert!(!rt.demonitor_ref(watcher, second), "delivered ref is retired");
+}
+
+#[test]
+fn monitor_reference_reports_noproc_and_is_not_left_registered() {
+    let mut rt = Runtime::new();
+    let watcher = rt.spawn_actor(Box::new(Vec::new));
+    let absent = 40_000_001;
+
+    let reference = rt.monitor_ref(watcher, absent).expect("valid watcher");
+    let down = rt.actors.get_mut(&watcher).unwrap().mailbox.pop().unwrap();
+    assert_eq!(down.payload.len(), 4);
+    assert_eq!(down.payload[0].as_int(), Some(absent as i64));
+    assert_eq!(down.payload[2].as_int(), Some(1));
+    assert_eq!(down.payload[3].as_int(), Some(reference.0 as i64));
+    assert!(!rt.demonitor_ref(watcher, reference));
+    assert!(rt.monitor_ref(absent, watcher).is_none(), "dead watcher rejected");
+}
+
+#[test]
+fn monitor_reference_cleanup_on_watcher_exit_does_not_send_to_dead_actor() {
+    let mut rt = Runtime::new();
+    let watcher = rt.spawn_actor(Box::new(Vec::new));
+    let target = rt.spawn_actor(Box::new(Vec::new));
+    let reference = rt.monitor_ref(watcher, target).expect("monitor");
+    rt.exit_actor(watcher, ExitReason::Normal);
+    assert!(!rt.demonitor_ref(watcher, reference), "watcher death removes reference");
+
+    rt.exit_actor(target, ExitReason::Normal);
+    assert_eq!(rt.monitor_refs.len(), 0, "monitor registry must be empty");
+}
+
+#[test]
 fn test_monitor_target() {
     let mut rt = Runtime::new();
     let watcher = rt.spawn_actor(Box::new(|| vec![]));
