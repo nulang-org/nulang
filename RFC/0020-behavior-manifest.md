@@ -23,6 +23,24 @@ and canonical migration-body identity remain follow-up work. Migration identity
 is explicitly marked `topology-only` until migration expressions have a
 canonical semantic representation.
 
+The `upgrade_preflight_from` API now reports evidence gaps separately from
+structural errors: version transitions require verified migration execution,
+and any compiler/executable identity change affecting an existing durable owner
+requires explicit history/replay safety evidence. The strict
+`validate_unattended_upgrade_from` API verifies both sidecars against their
+exact executable bytes and refuses unattended promotion while any such gaps
+remain. Exact unchanged durable executables and ephemeral-only replacements
+may pass; this does not constitute a deployed-history recovery proof.
+
+**Integration boundary:** This API is an experimental library contract, not
+yet wired into the Nulang Cloud deployment admission controller or the `nula
+deploy` command. They must not treat a successful
+`validate_upgrade_from` structural check as authorization to promote. Future
+attested migration/replay verification must be an explicit separate workflow
+bound to the original and incoming artifact identities. Never persist a
+synthetic migration receipt merely to satisfy this preflight.
+
+
 ## Summary
 
 Define a versioned, machine-readable **Nulang Behavior Manifest** emitted beside a compiled artifact. The manifest describes the program's externally relevant semantics without freezing compiler internals such as HIR or MIR.
