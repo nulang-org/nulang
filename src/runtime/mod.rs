@@ -6581,7 +6581,11 @@ impl Runtime {
     /// produces an immediate, reference-bearing DOWN; an absent watcher fails
     /// without creating a reference.
     pub fn monitor_ref(&mut self, watcher: u64, target: u64) -> Option<MonitorRef> {
-        if !self.actors.contains_key(&watcher) {
+        if !self
+            .actors
+            .get(&watcher)
+            .is_some_and(|actor| actor.state != ActorState::Terminated)
+        {
             return None;
         }
         let token = MONITOR_REF_COUNTER.fetch_add(1, Ordering::Relaxed);
