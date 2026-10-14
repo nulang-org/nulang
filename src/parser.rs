@@ -4305,6 +4305,11 @@ impl Parser {
                 self.advance();
                 "ref".to_string()
             }
+            // Python.import is a built-in effect operation, not a module import.
+            TokenKind::Import => {
+                self.advance();
+                "import".to_string()
+            }
             _ => self.expect_ident("operation name")?,
         };
         self.expect(TokenKind::LParen)?;
