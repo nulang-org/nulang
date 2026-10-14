@@ -138,3 +138,33 @@ fn strict_gate_rejects_sync_bypass_after_successful_atomic_result() {
     );
     assert_eq!(rt.persistence.latest_sequence(actor_id), command + 1);
 }
+
+#[test]
+fn isolated_staged_execution_rejects_unprotected_actor_until_strict_opt_in() {
+    let (mut rt, actor_id, behavior) = strict_counter();
+    rt.send_message_by_id(actor_id, behavior, &[Value::int(5)]);
+    let sequence = admit(&mut rt, actor_id, behavior, 5);
+    let error = rt
+        .execute_and_commit_admitted_pure_typed_actor_turn(actor_id, sequence)
+        .expect_err("staged execution must require a strict admission policy");
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(rt.persistence.latest_sequence(actor_id), sequence);
+    assert_eq!(
+        rt.actors[&actor_id].get_state_field("total").and_then(|v| v.as_int()),
+        Some(0)
+    );
+    assert_eq!(
+        rt.actors[&actor_id].mailbox.admitted_command_sequence(),
+        Some(sequence)
+    );
+
+    rt.enable_strict_typed_actor_admission(actor_id).unwrap();
+    let committed = rt
+        .execute_and_commit_admitted_pure_typed_actor_turn(actor_id, sequence)
+        .expect("retry after strict opt-in");
+    assert_eq!(committed.sequence, sequence + 1);
+    assert_eq!(
+        rt.actors[&actor_id].get_state_field("total").and_then(|v| v.as_int()),
+        Some(5)
+    );
+}
