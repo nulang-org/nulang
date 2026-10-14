@@ -1148,10 +1148,16 @@ impl Runtime {
         }
         let epoch = actor.activation_epoch;
         let expected_schema = actor.name.clone();
-        let tail = self.persistence.load_durable_tail_position(actor_id)?
+        let tail = self
+            .persistence
+            .load_durable_tail_position(actor_id)?
             .ok_or_else(|| Error::new(ErrorKind::WouldBlock, "durable completion is missing"))?;
-        let snapshot = self.persistence.load_snapshot(actor_id)
-            .ok_or_else(|| Error::new(ErrorKind::WouldBlock, "durable completion snapshot is missing"))?;
+        let snapshot = self
+            .persistence
+            .load_snapshot(actor_id)
+            .ok_or_else(|| {
+                Error::new(ErrorKind::WouldBlock, "durable completion snapshot is missing")
+            })?;
         if tail.activation_epoch != epoch
             || Some(tail.sequence) != admitted_sequence.checked_add(1)
             || snapshot.sequence != tail.sequence
@@ -1198,7 +1204,9 @@ impl Runtime {
             ));
         }
 
-        let actor = self.actors.get_mut(&actor_id)
+        let actor = self
+            .actors
+            .get_mut(&actor_id)
             .expect("actor remains present while completing the admitted command");
         for (name, value) in &snapshot.state {
             let restored = value.to_value_on_heap(actor);
