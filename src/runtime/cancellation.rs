@@ -5,6 +5,152 @@
 //! This module does not suspend an actor, park a scheduler thread, or journal
 //! a durable workflow cancellation.
 
+use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+
+/// Why a transient scoped operation should stop. A requested cancellation
+/// takes precedence over an elapsed deadline when both are observable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancellationReason {
+    Requested,
+    DeadlineExceeded,
+}
+
+impl fmt::Display for CancellationReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Requested => f.write_str("operation cancelled"),
+            Self::DeadlineExceeded => f.write_str("operation deadline exceeded"),
+        }
+    }
+}
+
+impl std::error::Error for CancellationReason {}
+
+#[derive(Debug)]
+struct CancellationState {
+    requested: AtomicBool,
+    // A strong parent link retains the cancellation signal even when the
+    // lexical parent handle is dropped. Children do not retain one another.
+    parent: Option<CancellationToken>,
+    // Effective deadline: inherited minimum, if any.
+    deadline: Option<Instant>,
+}
+
+/// A cheap, thread-safe, cooperative cancellation handle for transient work.
+///
+/// Clones refer to the same scope. Children observe ancestor cancellation and
+/// cannot extend an inherited deadline. A child's cancel request never
+/// cancels the parent or its sibling scopes.
+///
+/// This is not an actor termination signal or a durable workflow command.
+/// Consumers must check the token at well-defined suspension/admission points.
+/// Deadline checks use a monotonic Instant; `check_at` accepts a supplied
+/// clock value so replay/simulation tests do not sleep.
+#[derive(Debug, Clone)]
+pub struct CancellationToken {
+    inner: Arc<CancellationState>,
+}
+
+impl Default for CancellationToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CancellationToken {
+    /// Create an independent, active scope with no deadline.
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(CancellationState {
+                requested: AtomicBool::new(false),
+                parent: None,
+                deadline: None,
+            }),
+        }
+    }
+
+    /// Create an independent scope whose deadline is monotonic.
+    pub fn with_deadline(deadline: Instant) -> Self {
+        Self {
+            inner: Arc::new(CancellationState {
+                requested: AtomicBool::new(false),
+                parent: None,
+                deadline: Some(deadline),
+            }),
+        }
+    }
+
+    /// Create a child scope inheriting its parent's effective deadline.
+    pub fn child(&self) -> Self {
+        self.linked_child(self.deadline())
+    }
+
+    /// Create a child with a deadline no later than its parent's.
+    pub fn child_with_deadline(&self, deadline: Instant) -> Self {
+        let effective = self.deadline().map_or(deadline, |parent| parent.min(deadline));
+        self.linked_child(Some(effective))
+    }
+
+    fn linked_child(&self, deadline: Option<Instant>) -> Self {
+        Self {
+            inner: Arc::new(CancellationState {
+                requested: AtomicBool::new(false),
+                parent: Some(self.clone()),
+                deadline,
+            }),
+        }
+    }
+
+    /// The effective deadline, after inheriting any parent constraint.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.inner.deadline
+    }
+
+    /// Request cancellation for this scope and its descendants.
+    ///
+    /// Returns true only on the first transition for this scope. This method
+    /// does not interrupt a running worker or awaken a parked scheduler task.
+    pub fn cancel(&self) -> bool {
+        !self.inner.requested.swap(true, Ordering::AcqRel)
+    }
+
+    /// Poll cancellation and deadline expiry at an explicitly supplied time.
+    ///
+    /// Traverses parent links iteratively so deeply nested scopes do not
+    /// overflow the stack. Explicit cancellation dominates elapsed deadlines.
+    pub fn check_at(&self, now: Instant) -> Result<(), CancellationReason> {
+        let mut scope = Some(self);
+        while let Some(token) = scope {
+            if token.inner.requested.load(Ordering::Acquire) {
+                return Err(CancellationReason::Requested);
+            }
+            scope = token.inner.parent.as_ref();
+        }
+        if self.inner.deadline.is_some_and(|deadline| now >= deadline) {
+            Err(CancellationReason::DeadlineExceeded)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Poll using the host monotonic clock. Do not call during deterministic
+    /// durable replay; use an injected clock via `check_at` instead.
+    pub fn check(&self) -> Result<(), CancellationReason> {
+        self.check_at(Instant::now())
+    }
+
+    pub fn is_cancelled_at(&self, now: Instant) -> bool {
+        self.check_at(now).is_err()
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.check().is_err()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CancellationReason, CancellationToken};
