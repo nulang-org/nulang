@@ -4880,6 +4880,105 @@ mod tests {
         assert_eq!(apply_subst(&ty, &s), Type::int());
     }
 
+    #[test]
+    fn test_match_bool_rejects_missing_branch() {
+        let mut tc = TypeChecker::new();
+        let ctx = TypeContext::new();
+        let expr = Expr::Match {
+            scrutinee: Box::new(bool_lit(true)),
+            arms: vec![(Pattern::Lit(Literal::Bool(true)), None, int_lit(1))],
+            span: sp(),
+        };
+
+        let error = tc.infer_expr(&ctx, &expr).unwrap_err();
+        assert!(
+            format!("{error}").contains("non-exhaustive match"),
+            "expected a non-exhaustive match diagnostic, got: {error}"
+        );
+        assert!(format!("{error}").contains("false"));
+    }
+
+    #[test]
+    fn test_match_bool_accepts_both_unguarded_branches() {
+        let mut tc = TypeChecker::new();
+        let ctx = TypeContext::new();
+        let expr = Expr::Match {
+            scrutinee: Box::new(bool_lit(true)),
+            arms: vec![
+                (Pattern::Lit(Literal::Bool(true)), None, int_lit(1)),
+                (Pattern::Lit(Literal::Bool(false)), None, int_lit(0)),
+            ],
+            span: sp(),
+        };
+
+        let (subst, ty) = tc.infer_expr(&ctx, &expr).unwrap();
+        assert_eq!(apply_subst(&ty, &subst), Type::int());
+    }
+
+    #[test]
+    fn test_match_bool_guarded_catchall_is_not_exhaustive() {
+        let mut tc = TypeChecker::new();
+        let ctx = TypeContext::new();
+        let expr = Expr::Match {
+            scrutinee: Box::new(bool_lit(true)),
+            arms: vec![(Pattern::Wild, Some(bool_lit(true)), int_lit(1))],
+            span: sp(),
+        };
+
+        let error = tc.infer_expr(&ctx, &expr).unwrap_err();
+        assert!(format!("{error}").contains("non-exhaustive match"));
+    }
+
+    #[test]
+    fn test_match_closed_variant_requires_all_constructors() {
+        let choice_type = Type::Variant(vec![
+            ("Some".to_string(), Some(Type::int())),
+            ("None".to_string(), None),
+        ]);
+        let ctx = ctx_with("choice", choice_type);
+        let mut tc = TypeChecker::new();
+        let expr = Expr::Match {
+            scrutinee: Box::new(var("choice")),
+            arms: vec![(
+                Pattern::Variant("Some".to_string(), Some(Box::new(Pattern::Var("x".to_string())))),
+                None,
+                int_lit(1),
+            )],
+            span: sp(),
+        };
+        let error = tc.infer_expr(&ctx, &expr).unwrap_err();
+        assert!(
+            format!("{error}").contains("non-exhaustive match"),
+            "expected a non-exhaustive match diagnostic, got: {error}"
+        );
+        assert!(format!("{error}").contains("None"));
+    }
+
+    #[test]
+    fn test_match_closed_variant_accepts_unguarded_constructors() {
+        let choice_type = Type::Variant(vec![
+            ("Some".to_string(), Some(Type::int())),
+            ("None".to_string(), None),
+        ]);
+        let ctx = ctx_with("choice", choice_type);
+        let mut tc = TypeChecker::new();
+        let expr = Expr::Match {
+            scrutinee: Box::new(var("choice")),
+            arms: vec![
+                (
+                    Pattern::Variant("Some".to_string(), Some(Box::new(Pattern::Wild))),
+                    None,
+                    int_lit(1),
+                ),
+                (Pattern::Variant("None".to_string(), None), None, int_lit(0)),
+            ],
+            span: sp(),
+        };
+
+        let (subst, ty) = tc.infer_expr(&ctx, &expr).unwrap();
+        assert_eq!(apply_subst(&ty, &subst), Type::int());
+    }
+
     // -----------------------------------------------------------------------
     // Test: Pipe operator
     // -----------------------------------------------------------------------
