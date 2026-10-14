@@ -291,10 +291,10 @@ fn pinned_runtime_process_recovery_helper() {
             let actor_id = std::fs::read_to_string(id_path)
                 .unwrap().parse::<u64>().unwrap();
             assert_eq!(runtime.recover_actor(actor_id), None);
-            let selected = if mode == "changed" {
-                b"runtime-process-immutable-v2".as_slice()
+            let selected: &[u8] = if mode == "changed" {
+                b"runtime-process-immutable-v2"
             } else {
-                bytes.as_slice()
+                bytes
             };
             let resolver = FixtureResolver {
                 expected_digest: behavior.artifact.digest.clone(),
