@@ -6983,6 +6983,14 @@ mod tests {
     }
 
     #[test]
+    fn test_keyword_authority_exception_does_not_apply_to_other_namespaces() {
+        assert!(
+            parse_expr("spawn Worker {} with [Other::import]").is_err(),
+            "reserved keywords remain invalid authority operations outside Python"
+        );
+    }
+
+    #[test]
     fn test_prelude_cache_build_preserves_active_source_map() {
         let source = "let t = ((1, 2), 3) in t.0.1";
         crate::types::set_source_map_with_file(source, Some("caller.nula"));
