@@ -35,17 +35,15 @@ const RESULT: &str = "provider-durable-response";
 struct LedgerProvider {
     directory: PathBuf,
     crash_at_commit: bool,
-    actor_id: u64,
     calls: Arc<AtomicUsize>,
     new_mutations: Arc<AtomicUsize>,
 }
 
 impl LedgerProvider {
-    fn new(directory: PathBuf, crash_at_commit: bool, actor_id: u64) -> Self {
+    fn new(directory: PathBuf, crash_at_commit: bool) -> Self {
         Self {
             directory,
             crash_at_commit,
-            actor_id,
             calls: Arc::new(AtomicUsize::new(0)),
             new_mutations: Arc::new(AtomicUsize::new(0)),
         }
@@ -126,7 +124,7 @@ fn child_provider_commits_while_compiled_workflow_is_suspended() {
         vm.run().expect("spawn real compiled workflow")
     };
     let actor_id = reference.as_actor_id().expect("actor id");
-    let provider = LedgerProvider::new(directory.clone(), true, actor_id);
+    let provider = LedgerProvider::new(directory.clone(), true);
     rt.borrow_mut().set_llm_client(Box::new(provider.clone()));
     rt.borrow_mut().send_message_by_id(actor_id, 0, &[]);
     loop {
@@ -209,7 +207,7 @@ fn child_terminal_checkpoint_after_compiled_inference() {
         vm.run().expect("spawn compiled workflow")
     };
     let actor_id = reference.as_actor_id().expect("actor id");
-    let provider = LedgerProvider::new(directory.clone(), false, actor_id);
+    let provider = LedgerProvider::new(directory.clone(), false);
     rt.borrow_mut().set_llm_client(Box::new(provider.clone()));
     rt.borrow_mut().send_message_by_id(actor_id, 0, &[]);
     rt.borrow_mut().run_scheduler();
@@ -331,7 +329,7 @@ fn compiled_inference_provider_commit_receipt_loss_deduplicates_on_recovery() {
     runtime.borrow_mut().persistence = Box::new(
         LibsqlStore::new(directory.join("actor.db")).expect("reopen SQLite after SIGKILL"),
     );
-    let provider = LedgerProvider::new(directory.clone(), false, actor_id);
+    let provider = LedgerProvider::new(directory.clone(), false);
     runtime
         .borrow_mut()
         .set_llm_client(Box::new(provider.clone()));
@@ -454,7 +452,7 @@ fn compiled_inference_after_terminal_checkpoint_does_not_redispatch() {
     runtime.borrow_mut().persistence = Box::new(
         LibsqlStore::new(directory.join("actor.db")).expect("reopen SQLite after SIGKILL"),
     );
-    let provider = LedgerProvider::new(directory.clone(), false, actor_id);
+    let provider = LedgerProvider::new(directory.clone(), false);
     runtime
         .borrow_mut()
         .set_llm_client(Box::new(provider.clone()));
