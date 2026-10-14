@@ -170,6 +170,32 @@ fn try_spawn_actor_with_id(
     }
     actor.state_models = state_models;
     actor.persistent = persistent;
+    // Initial workflow persistence happens before spawn-from-module finishes
+    // wiring bytecode defaults. constant_to_value represents string defaults
+    // as Nil pending heap allocation, so materialize compiler-owned defaults
+    // before WorkflowStarted and its initial checkpoint are written.
+    if let Some((module, schema_name)) = expected_schema {
+        actor.bytecode_module = Some(Box::new(module.clone()));
+        if let Some(metadata) = module
+            .actor_metadata
+            .iter()
+            .find(|metadata| metadata.name == schema_name)
+        {
+            for (field, constant) in &metadata.state_defaults {
+                if let crate::bytecode::Constant::String(value) = constant {
+                    if actor.get_state_field(field).is_some_and(|current| current.is_nil()) {
+                        let allocated = actor.allocate_string(value);
+                        if allocated.is_nil() {
+                            return Err(std::io::Error::other(
+                                "could not initialize compiled actor string state",
+                            ));
+                        }
+                        actor.set_state_field(field, allocated);
+                    }
+                }
+            }
+        }
+    }
     let workflow_name = workflow.map(|n| n.to_string());
     if let Some(name) = workflow {
         // Legacy storage field retained until the versioned ActorRole format
@@ -213,10 +239,9 @@ fn try_spawn_actor_with_id(
                     .copied()
                     .unwrap_or(StateModel::Local);
                 if model.is_persistent() {
-                    state.push(PersistedValue::from_value_resolved(
-                        value,
-                        actor.bytecode_module.as_deref(),
-                    ));
+                    // Heap-backed string defaults require actor provenance;
+                    // the generic conversion would silently encode them as Nil.
+                    state.push(actor.persist_value(value));
                 }
             }
             state

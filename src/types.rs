@@ -1207,6 +1207,9 @@ pub struct TypeContext {
     /// typechecker to validate `emit EventName(args)` calls. Stored as
     /// `(event_name, [(param_name, param_type)])`.
     pub entity_events: Option<Vec<(String, Vec<(String, Type)>)>>,
+    /// Types of explicitly declared workflow user fields in the current body.
+    /// None in ordinary expressions, actors and other compilation contexts.
+    pub workflow_state_fields: Option<HashMap<String, Type>>,
     /// Typeclass constraints on type variables: maps each type variable to
     /// the list of class names it must satisfy. Populated when a function
     /// signature declares `fn f[T: Eq, Ord](...)` or through `where` clauses.

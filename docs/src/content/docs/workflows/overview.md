@@ -27,7 +27,31 @@ workflow PurchaseOrder {
 }
 ```
 
-Each `step` becomes a persistent actor behavior. The runtime tracks `step_index` automatically — it starts at 0 and advances by 1 after each step completes. Workflows are flagged persistent in actor metadata, so the runtime journals their state.
+Each `step` becomes a persistent actor behavior. The runtime tracks `step_index` automatically — it starts at 0 and advances by 1 after each step completes. **Workflow progress is durable, but user fields are not durable merely because they are assigned through `self`.**
+
+### Explicit workflow state (draft implementation)
+
+The native bytecode implementation in [PR #1550](https://github.com/nulang-org/nulang/pull/1550) proposes explicit user-state declarations:
+
+```nulang
+workflow Summarize {
+    state durable answer: String = ""
+    state local attempts_in_process: Int = 0
+
+    step ask {
+        self.answer = perform Inference.ask("Summarize this report")
+        self.attempts_in_process = self.attempts_in_process + 1
+    }
+}
+```
+
+- **`state durable`** belongs to the compiler-owned actor schema and is included in committed snapshots.
+- **`state local`** exists only in the current runtime process; it is intentionally excluded from checkpoints.
+- Initializers currently must be typed literals, and each field must explicitly select `durable` or `local`. Internal fields such as `step_index` cannot be redeclared.
+- An **undeclared** `self.field` assignment is not automatically persisted. Declare every user field whose value must survive recovery.
+- Inference requests and other external effects may be **re-dispatched** after an interrupted activation. These declarations do not provide exactly-once provider execution.
+
+This addition is **not yet released or verified by terminal-green CI**. Until PR #1550 and its stacked crash tests pass, treat it as an in-progress language/runtime contract, not an available production guarantee.
 
 ## Steps and Parallel Branches
 

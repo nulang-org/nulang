@@ -788,6 +788,8 @@ pub enum Decl {
     Workflow {
         name: String,
         input: Option<(String, Type)>,
+        /// Explicitly typed user state. Undeclared self-fields remain local.
+        state_fields: Vec<(String, StateModel, Type, Expr)>,
         items: Vec<WorkflowItem>,
         compensate: Option<Expr>,
         span: Span,

@@ -446,8 +446,12 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
             };
         }
         Decl::Workflow {
-            name, items, span, ..
-        } => desugar_workflow(name, items, *span),
+            name,
+            state_fields,
+            items,
+            span,
+            ..
+        } => desugar_workflow(name, state_fields, items, *span),
         Decl::StateMachine {
             name,
             states,
@@ -981,7 +985,12 @@ fn desugar_agent(
 /// `compile_workflow` for the sequential case; a workflow containing a
 /// `parallel` block falls back honestly (parallel-branch synthesis and its
 /// progress-counter bookkeeping is a separate, not-yet-ported effort).
-fn desugar_workflow(name: &str, items: &[ast::WorkflowItem], span: Span) -> hir::Decl {
+fn desugar_workflow(
+    name: &str,
+    declared_state: &[(String, ast::StateModel, Type, Expr)],
+    items: &[ast::WorkflowItem],
+    span: Span,
+) -> hir::Decl {
     // Flatten the ordered workflow items into a list of sequential steps.
     // Each `parallel` block becomes a synthetic step whose body runs
     // branches sequentially (guarded by a durable `parallel_progress`
@@ -1077,7 +1086,7 @@ fn desugar_workflow(name: &str, items: &[ast::WorkflowItem], span: Span) -> hir:
         }
     }
 
-    let state_fields: Vec<(String, ast::StateModel, Type, hir::Operand)> = vec![
+    let mut state_fields: Vec<(String, ast::StateModel, Type, hir::Operand)> = vec![
         (
             "step_index".to_string(),
             ast::StateModel::Durable,
@@ -1097,6 +1106,21 @@ fn desugar_workflow(name: &str, items: &[ast::WorkflowItem], span: Span) -> hir:
             hir::Operand::Literal(Literal::Int(0), Type::int()),
         ),
     ];
+
+    // The parser accepts only literal initializers: the corresponding
+    // operands can be embedded directly in compiler-owned actor metadata.
+    // Unlike implicit self writes, these models control snapshot selection.
+    state_fields.extend(declared_state.iter().map(|(name, model, ty, default)| {
+        let Expr::Literal(value, _) = default else {
+            unreachable!("parser rejects non-literal workflow state defaults");
+        };
+        (
+            name.clone(),
+            *model,
+            lower_runtime_type(ty),
+            hir::Operand::Literal(value.clone(), lower_runtime_type(ty)),
+        )
+    }));
 
     let behaviors = flattened_steps
         .iter()

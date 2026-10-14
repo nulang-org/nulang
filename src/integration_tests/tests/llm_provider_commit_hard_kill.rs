@@ -22,6 +22,7 @@ const TERMINAL_DIR_ENV: &str = "NULANG_LLM_TERMINAL_CHECKPOINT_KILL_DIR";
 const TERMINAL_READY: &str = "NULANG_LLM_TERMINAL_CHECKPOINT:";
 const SOURCE: &str = r#"
     workflow ProviderCommitKill {
+        state durable answer: String = ""
         step ask_step { self.answer = perform Inference.ask("hello") }
     }
     let w = spawn ProviderCommitKill {} in { w }

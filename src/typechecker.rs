@@ -164,6 +164,12 @@ fn apply_subst_to_ctx(ctx: &TypeContext, subst: &Substitution) -> TypeContext {
     }
     let mut result = TypeContext::new();
     result.entity_events = ctx.entity_events.clone();
+    result.workflow_state_fields = ctx.workflow_state_fields.as_ref().map(|fields| {
+        fields
+            .iter()
+            .map(|(name, ty)| (name.clone(), apply_subst(ty, subst)))
+            .collect()
+    });
     for (name, (ty, cap, mutable)) in ctx.iter() {
         result.bind(name.clone(), apply_subst(ty, subst), *cap, *mutable);
     }
@@ -1710,6 +1716,7 @@ impl TypeChecker {
             Decl::Workflow {
                 name: _,
                 input,
+                state_fields,
                 items,
                 span: _,
                 ..
@@ -1721,6 +1728,18 @@ impl TypeChecker {
                 if let Some((input_name, input_ty)) = input {
                     workflow_ctx.bind(input_name.clone(), input_ty.clone(), Capability::Ref, false);
                 }
+                // An explicit workflow field cannot silently fall back to a
+                // different runtime type than its compiler-owned schema.
+                for (_name, _model, declared_ty, default) in state_fields {
+                    let (subst, actual_ty) = self.infer_expr(&workflow_ctx, default)?;
+                    let _ = mgu(&apply_subst(&actual_ty, &subst), declared_ty, default.span())?;
+                }
+                workflow_ctx.workflow_state_fields = Some(
+                    state_fields
+                        .iter()
+                        .map(|(name, _, ty, _)| (name.clone(), ty.clone()))
+                        .collect(),
+                );
                 for item in items {
                     match item {
                         crate::ast::WorkflowItem::Step(step) => {
@@ -2176,6 +2195,24 @@ impl TypeChecker {
                 value,
                 span,
             } => {
+                // A compiled workflow is an actor with compiler-owned user
+                // state models. Enforce declared field types at each direct
+                // self assignment, including those inside nested expressions.
+                // Implicit self fields keep their existing dynamic semantics.
+                if let Expr::FieldAccess { expr, field, .. } = target.as_ref() {
+                    if matches!(expr.as_ref(), Expr::SelfRef(_)) {
+                        if let Some(ty) = ctx
+                            .workflow_state_fields
+                            .as_ref()
+                            .and_then(|fields| fields.get(field))
+                        {
+                            let (subst, actual) = self.infer_expr(ctx, value)?;
+                            let required = apply_subst(ty, &subst);
+                            let unify = mgu(&apply_subst(&actual, &subst), &required, *span)?;
+                            return Ok((compose_subst(&unify, &subst), Type::unit()));
+                        }
+                    }
+                }
                 // Check for mutable local variable reassignment first:
                 // `var x = 0; x = 5` reassigns the mutable binding `x`.
                 if let Expr::Var(name, _) = target.as_ref() {
@@ -2966,6 +3003,18 @@ impl TypeChecker {
         field: &str,
         span: Span,
     ) -> NuResult<(Substitution, Type)> {
+        // Workflow fields use their declared type for reads. This also
+        // prevents an unconstrained self field from disguising a wrong-typed
+        // value passed to an operation.
+        if matches!(expr, Expr::SelfRef(_)) {
+            if let Some(ty) = ctx
+                .workflow_state_fields
+                .as_ref()
+                .and_then(|fields| fields.get(field))
+            {
+                return Ok((vec![], ty.clone()));
+            }
+        }
         // Pipeline built-in namespace: Pipeline.new / Pipeline.stage.
         if let Expr::Var(base, _) = expr {
             if base == "Pipeline" {

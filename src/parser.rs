@@ -2166,6 +2166,7 @@ impl Parser {
         self.expect(TokenKind::LBrace)?;
 
         let mut items = Vec::new();
+        let mut state_fields: Vec<(String, StateModel, Type, Expr)> = Vec::new();
         let mut compensate = None;
 
         self.skip_newlines();
@@ -2175,6 +2176,51 @@ impl Parser {
                 break;
             }
             match self.peek_kind() {
+                TokenKind::State => {
+                    self.advance(); // 'state'
+                    let model = match self.peek_kind() {
+                        TokenKind::Durable => {
+                            self.advance();
+                            StateModel::Durable
+                        }
+                        TokenKind::Local => {
+                            self.advance();
+                            StateModel::Local
+                        }
+                        _ => {
+                            return Err(NuError::parse_error(
+                                "Workflow state requires an explicit 'durable' or 'local' model"
+                                    .to_string(),
+                                self.current_span(),
+                            ));
+                        }
+                    };
+                    let field_name = self.expect_ident("workflow state field name")?;
+                    if matches!(
+                        field_name.as_str(),
+                        "step_index" | "workflow_name" | "parallel_progress"
+                    ) || state_fields
+                        .iter()
+                        .any(|(name, _, _, _)| name == &field_name)
+                    {
+                        return Err(NuError::parse_error(
+                            format!("Duplicate or reserved workflow state field '{field_name}'"),
+                            self.current_span(),
+                        ));
+                    }
+                    self.expect(TokenKind::Colon)?;
+                    let ty = self.parse_type()?;
+                    self.expect(TokenKind::Assign)?;
+                    let default = self.parse_expr()?;
+                    if !matches!(&default, Expr::Literal(..)) {
+                        return Err(NuError::parse_error(
+                            "Workflow state defaults must be literals".to_string(),
+                            default.span(),
+                        ));
+                    }
+                    state_fields.push((field_name, model, ty, default));
+                    self.skip_newlines_semicolons();
+                }
                 TokenKind::Step => {
                     items.push(WorkflowItem::Step(self.parse_workflow_step()?));
                 }
@@ -2207,7 +2253,7 @@ impl Parser {
                 _ => {
                     return Err(NuError::parse_error(
                         format!(
-                            "Expected 'step', 'parallel', or 'compensate' in workflow body, got {}",
+                            "Expected 'state', 'step', 'parallel', or 'compensate' in workflow body, got {}",
                             self.peek_kind()
                         ),
                         self.current_span(),
@@ -2220,6 +2266,7 @@ impl Parser {
         Ok(Decl::Workflow {
             name,
             input: None,
+            state_fields,
             items,
             compensate,
             span,
@@ -8312,6 +8359,40 @@ mod tests {
             }
             _ => panic!("Expected workflow declaration"),
         }
+    }
+
+    #[test]
+    fn test_parse_workflow_explicit_state_models() {
+        let ast = parse(
+            "workflow W { state durable answer: String = \"\" state local temp: Int = 0 step write { self.answer = \"ok\" } }",
+        )
+        .unwrap();
+        match &ast.decls[0] {
+            Decl::Workflow {
+                state_fields, items, ..
+            } => {
+                assert_eq!(state_fields.len(), 2);
+                assert_eq!(state_fields[0].0, "answer");
+                assert_eq!(state_fields[0].1, StateModel::Durable);
+                assert_eq!(state_fields[1].0, "temp");
+                assert_eq!(state_fields[1].1, StateModel::Local);
+                assert_eq!(items.len(), 1);
+            }
+            _ => panic!("Expected workflow declaration"),
+        }
+    }
+
+    #[test]
+    fn test_parse_workflow_rejects_implicit_or_duplicate_state_models() {
+        assert!(parse("workflow W { state answer: String = \"\" step write { 1 } }").is_err());
+        assert!(parse(
+            "workflow W { state durable step_index: Int = 0 step write { 1 } }"
+        )
+        .is_err());
+        assert!(parse(
+            "workflow W { state durable answer: Int = 0 state local answer: Int = 0 step write { 1 } }"
+        )
+        .is_err());
     }
 
     #[test]

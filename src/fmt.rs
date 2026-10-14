@@ -265,6 +265,7 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
         Decl::Workflow {
             name,
             input,
+            state_fields,
             items,
             compensate,
             ..
@@ -274,6 +275,22 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
                 out.push_str(&format!("({}: {})", in_name, fmt_type(in_ty)));
             }
             out.push_str(" {\n");
+            for (field, model, ty, default) in state_fields {
+                let keyword = match model {
+                    crate::ast::StateModel::Durable => "durable",
+                    crate::ast::StateModel::Local => "local",
+                    _ => unreachable!("workflow parser restricts state models"),
+                };
+                out.push_str(&format!(
+                    "{}    state {} {}: {} = ",
+                    sp,
+                    keyword,
+                    field,
+                    fmt_type(ty)
+                ));
+                fmt_expr(out, default, indent + 4, had_unhandled);
+                out.push('\n');
+            }
             for item in items {
                 match item {
                     crate::ast::WorkflowItem::Step(step) => {

@@ -12347,4 +12347,180 @@ match { a: 2, b: 9 } with {
         let value2 = vm2.run().expect("execute from disk");
         assert_eq!(value2.as_int(), Some(90));
     }
+
+    /// User-declared workflow state is authoritative for checkpoints: durable
+    /// fields survive a completed step; local fields must not leak to storage.
+    #[test]
+    fn test_workflow_declared_state_models_checkpoint_after_compiled_step() {
+        let source = r#"
+            workflow StateCheckpoint {
+                state durable answer: String = ""
+                state local temporary: Int = 0
+                step write {
+                    (self.answer = "persisted-answer", self.temporary = 99)
+                }
+            }
+            let w = spawn StateCheckpoint {} in { w }
+        "#;
+        let (module, _ty) = compile_source(source).expect("compile declared workflow state");
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        let backing = SharedMemoryStore::new();
+        rt.borrow_mut().persistence = Box::new(backing.clone());
+        let reference = {
+            let mut vm = VM::new();
+            vm.load_module(module);
+            vm.set_actor_callbacks(Box::new(RuntimeVmCallbacks::new(rt.clone())));
+            vm.run().expect("spawn compiled workflow")
+        };
+        let actor_id = reference.as_actor_id().expect("workflow actor id");
+        let initial = backing.load_snapshot(actor_id).expect("initial durable checkpoint");
+        assert_eq!(
+            initial.state.get("answer"),
+            Some(&crate::runtime::PersistedValue::String(String::new())),
+            "initial declared durable string must be saved before the first step"
+        );
+        rt.borrow_mut().send_message_by_id(actor_id, 0, &[]);
+        rt.borrow_mut().run_scheduler();
+        let saved = backing.load_snapshot(actor_id).expect("durable step checkpoint");
+        assert_eq!(
+            saved.state.get("answer"),
+            Some(&crate::runtime::PersistedValue::String("persisted-answer".to_string()))
+        );
+        assert!(!saved.state.contains_key("temporary"), "local state must not be checkpointed");
+        assert_eq!(
+            saved.state.get("step_index"),
+            Some(&crate::runtime::PersistedValue::Int(1))
+        );
+    }
+
+    /// Restore declared user state in an entirely new runtime, independently
+    /// of the real-process LLM/SIGKILL acceptance fixture.
+    #[test]
+    fn test_workflow_declared_string_state_restores_after_runtime_recreation() {
+        let source = r#"
+            workflow RecoveredState {
+                state durable answer: String = ""
+                state local scratch: Int = 0
+                step write {
+                    (self.answer = "answer-after-restart", self.scratch = 77)
+                }
+            }
+            let w = spawn RecoveredState {} in { w }
+        "#;
+        let (module, _ty) = compile_source(source).expect("compile recovery fixture");
+        let persistence = SharedMemoryStore::new();
+        let rt1 = Rc::new(RefCell::new(Runtime::new()));
+        rt1.borrow_mut().persistence = Box::new(persistence.clone());
+        let value = {
+            let mut vm = VM::new();
+            vm.load_module(module.clone());
+            vm.set_actor_callbacks(Box::new(RuntimeVmCallbacks::new(rt1.clone())));
+            vm.run().expect("spawn durable workflow")
+        };
+        let actor_id = value.as_actor_id().expect("workflow actor id");
+        rt1.borrow_mut().send_message_by_id(actor_id, 0, &[]);
+        rt1.borrow_mut().run_scheduler();
+
+        let checkpoint = persistence
+            .load_snapshot(actor_id)
+            .expect("completed-step checkpoint");
+        assert_eq!(
+            checkpoint.state.get("answer"),
+            Some(&crate::runtime::PersistedValue::String(
+                "answer-after-restart".to_string()
+            ))
+        );
+        assert!(!checkpoint.state.contains_key("scratch"));
+
+        let meta = module.actor_metadata.first().expect("workflow metadata");
+        let mut offsets = vec![0; module.behaviors.len()];
+        for &index in &meta.behavior_indices {
+            offsets[index] = module.behaviors[index].code_offset;
+        }
+        drop(rt1);
+
+        let rt2 = Rc::new(RefCell::new(Runtime::new()));
+        rt2.borrow_mut().persistence = Box::new(persistence.clone());
+        rt2.borrow_mut().register_recovery_module(
+            actor_id,
+            module.clone(),
+            offsets,
+            vec![None; module.behaviors.len()],
+        );
+        assert_eq!(
+            rt2.borrow_mut().recover_actor(actor_id),
+            Some(actor_id),
+            "a completed workflow with declared state must recover"
+        );
+        let restored = rt2.borrow();
+        let actor = restored.actors.get(&actor_id).expect("restored actor");
+        assert_eq!(
+            actor
+                .get_state_field("answer")
+                .map(|value| actor.persist_value(&value)),
+            Some(crate::runtime::PersistedValue::String(
+                "answer-after-restart".to_string()
+            ))
+        );
+        assert_eq!(
+            actor.get_state_field("step_index").and_then(|value| value.as_int()),
+            Some(1)
+        );
+        assert_ne!(
+            actor.get_state_field("scratch").and_then(|value| value.as_int()),
+            Some(77),
+            "process-local state must not be restored from a durable snapshot"
+        );
+    }
+
+    #[test]
+    fn test_workflow_declared_state_rejects_mismatched_step_assignment() {
+        let source = r#"
+            workflow BadMutation {
+                state durable answer: String = ""
+                step write { self.answer = 42 }
+            }
+        "#;
+        match compile_source(source) {
+            Err(NuError::TypeError { msg, .. }) => {
+                assert!(msg.contains("Type mismatch"), "{msg}");
+            }
+            Err(err) => panic!("expected an assignment type error, got {err}"),
+            Ok(_) => panic!("wrong-typed durable assignment unexpectedly compiled"),
+        }
+    }
+
+    #[test]
+    fn test_workflow_declared_local_field_rejects_mismatched_step_assignment() {
+        let source = r#"
+            workflow BadLocalMutation {
+                state local temporary: Int = 0
+                step write { self.temporary = "wrong" }
+            }
+        "#;
+        match compile_source(source) {
+            Err(NuError::TypeError { msg, .. }) => {
+                assert!(msg.contains("Type mismatch"), "{msg}");
+            }
+            Err(err) => panic!("expected a local field type error, got {err}"),
+            Ok(_) => panic!("wrong-typed local assignment unexpectedly compiled"),
+        }
+    }
+
+    #[test]
+    fn test_workflow_declared_state_type_mismatch_is_rejected() {
+        let source = r#"
+            workflow BadState {
+                state durable count: Int = "wrong"
+                step write { self.count = 1 }
+            }
+        "#;
+        match compile_source(source) {
+            Err(NuError::TypeError { msg, .. }) => {
+                assert!(msg.contains("Type mismatch"), "{msg}");
+            }
+            Err(err) => panic!("expected a default type error, got {err}"),
+            Ok(_) => panic!("wrong-typed durable default unexpectedly compiled"),
+        }
+    }
 }
