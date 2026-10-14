@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::store::{WalBackedError, WalBackedTablet};
-use super::tablet::{KeyRange, TabletDescriptor, TabletId, TabletMutation};
+use super::tablet::{KeyRange, TabletDescriptor, TabletError, TabletId, TabletMutation};
 use super::wal::{FileWal, WalError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,6 +257,105 @@ mod tests {
             assert_eq!(reopened.read_at(b"k", 1).unwrap(), Some(&b"v1"[..]));
             assert_eq!(reopened.read_at(b"k", 2).unwrap(), Some(&b"v2"[..]));
 
+            commit_put(&mut reopened, b"v3");
+            assert_eq!(reopened.current_sequence(), 3);
+            cleanup(&wal_path);
+        }
+    }
+
+    #[test]
+    fn mvcc_retention_checkpoint_failures_require_reopen_before_further_writes() {
+        for (point, persisted_floor) in [
+            (StorageInterruptionPoint::CheckpointAfterTempWrite, 0),
+            (StorageInterruptionPoint::CheckpointAfterTempSync, 0),
+            (StorageInterruptionPoint::CheckpointAfterRename, 2),
+            (StorageInterruptionPoint::CheckpointAfterDirectorySync, 2),
+        ] {
+            let wal_path = temp_wal("retention_checkpoint");
+            cleanup(&wal_path);
+
+            let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
+            commit_put(&mut tablet, b"v1");
+            commit_put(&mut tablet, b"v2");
+            assert!(with_interruption(point, || tablet.reclaim_history_before(2)).is_err());
+
+            // The checkpoint may have been renamed to its canonical location
+            // even though the caller observed an error. Until recovery, the
+            // live tablet cannot assume that its snapshot floor matches disk.
+            assert_eq!(
+                tablet.read_at(b"k", 1),
+                Err(TabletError::RecoveryRequired),
+                "{point:?} must invalidate snapshot reads on the live handle"
+            );
+            assert_eq!(
+                tablet.prepare_write(
+                    7,
+                    tablet.current_sequence(),
+                    vec![TabletMutation::Put {
+                        key: b"k".to_vec(),
+                        value: b"unsafe".to_vec(),
+                    }],
+                ),
+                Err(TabletError::RecoveryRequired),
+                "{point:?} must prohibit live writes"
+            );
+            assert!(
+                tablet.publish_checkpoint().is_err(),
+                "{point:?} must not overwrite a possibly newer retention checkpoint"
+            );
+            drop(tablet);
+
+            let mut reopened = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
+            assert_eq!(reopened.oldest_retained_snapshot(), persisted_floor);
+            assert_eq!(reopened.read_latest(b"k"), Some(&b"v2"[..]));
+            if persisted_floor == 2 {
+                assert_eq!(
+                    reopened.read_at(b"k", 1),
+                    Err(TabletError::SnapshotExpired {
+                        requested: 1,
+                        oldest_retained: 2,
+                    })
+                );
+            } else {
+                assert_eq!(reopened.read_at(b"k", 1).unwrap(), Some(&b"v1"[..]));
+            }
+            commit_put(&mut reopened, b"v3");
+            assert_eq!(reopened.read_latest(b"k"), Some(&b"v3"[..]));
+            cleanup(&wal_path);
+        }
+    }
+
+    #[test]
+    fn mvcc_retention_wal_reclaim_failures_preserve_floor_and_sequence() {
+        for point in [
+            StorageInterruptionPoint::WalReclaimAfterReplacementWrite,
+            StorageInterruptionPoint::WalReclaimAfterReplacementSync,
+            StorageInterruptionPoint::WalReclaimAfterRename,
+            StorageInterruptionPoint::WalReclaimAfterDirectorySync,
+        ] {
+            let wal_path = temp_wal("retention_reclaim");
+            cleanup(&wal_path);
+
+            let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
+            commit_put(&mut tablet, b"v1");
+            commit_put(&mut tablet, b"v2");
+            assert!(with_interruption(point, || tablet.reclaim_history_before(2)).is_err());
+
+            assert_eq!(tablet.read_at(b"k", 1), Err(TabletError::RecoveryRequired));
+            assert!(tablet.publish_checkpoint().is_err());
+            drop(tablet);
+
+            let mut reopened = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
+            assert_eq!(reopened.current_sequence(), 2);
+            assert_eq!(reopened.oldest_retained_snapshot(), 2);
+            assert_eq!(
+                reopened.read_at(b"k", 1),
+                Err(TabletError::SnapshotExpired {
+                    requested: 1,
+                    oldest_retained: 2,
+                })
+            );
+            assert_eq!(reopened.read_at(b"k", 2).unwrap(), Some(&b"v2"[..]));
             commit_put(&mut reopened, b"v3");
             assert_eq!(reopened.current_sequence(), 3);
             cleanup(&wal_path);

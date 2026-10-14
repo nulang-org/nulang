@@ -131,6 +131,15 @@ fn crash_fixture_child() {
             tablet.checkpoint().unwrap();
             format!("ACK CHECKPOINT_RECLAIMED {sequence}")
         }
+        "retention" => {
+            let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
+            tablet.reclaim_history_before(2).unwrap();
+            format!(
+                "ACK RETENTION {} {}",
+                tablet.current_sequence(),
+                tablet.oldest_retained_snapshot()
+            )
+        }
         other => panic!("unknown crash fixture action: {other}"),
     };
 
@@ -208,5 +217,36 @@ fn reclaimed_wal_survives_immediate_process_kill() {
     commit_put(&mut tablet, b"k", b"v3");
     assert_eq!(tablet.current_sequence(), 3);
 
+    cleanup(&wal_path);
+}
+
+#[test]
+fn acknowledged_retention_survives_immediate_process_kill() {
+    let wal_path = temp_wal("retention_ack");
+    cleanup(&wal_path);
+
+    {
+        let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
+        commit_put(&mut tablet, b"k", b"v1");
+        commit_put(&mut tablet, b"k", b"v2");
+    }
+
+    let ack = run_until_ack_then_kill(&wal_path, "retention");
+    assert_eq!(ack.trim(), "ACK RETENTION 2 2");
+
+    let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
+    assert_eq!(tablet.current_sequence(), 2);
+    assert_eq!(tablet.oldest_retained_snapshot(), 2);
+    assert_eq!(tablet.read_at(b"k", 2).unwrap(), Some(&b"v2"[..]));
+    assert!(matches!(
+        tablet.read_at(b"k", 1),
+        Err(nulang::database::tablet::TabletError::SnapshotExpired {
+            requested: 1,
+            oldest_retained: 2,
+        })
+    ));
+
+    commit_put(&mut tablet, b"k", b"v3");
+    assert_eq!(tablet.read_at(b"k", 3).unwrap(), Some(&b"v3"[..]));
     cleanup(&wal_path);
 }
