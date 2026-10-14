@@ -347,7 +347,9 @@ impl Mailbox {
         }
 
         if self.capacity == 0 {
-            self.normal_count.fetch_add(1, Ordering::Relaxed);
+            // Most actors use an unbounded mailbox. Preserve the original
+            // single-counter hot path; the normal credit count is only read
+            // when admission is bounded.
             self.queued_count.fetch_add(1, Ordering::Relaxed);
             return true;
         }
@@ -374,7 +376,7 @@ impl Mailbox {
     fn release_slot(&self, system: bool) {
         let previous = self.queued_count.fetch_sub(1, Ordering::Relaxed);
         debug_assert!(previous > 0, "mailbox logical count underflow");
-        if !system {
+        if !system && self.capacity != 0 {
             let previous_normal = self.normal_count.fetch_sub(1, Ordering::Relaxed);
             debug_assert!(previous_normal > 0, "mailbox normal credit underflow");
         }
