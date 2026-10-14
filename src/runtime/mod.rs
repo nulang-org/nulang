@@ -947,6 +947,144 @@ impl Runtime {
         spawn::register_recovery_module(self, actor_id, module, offsets, compensation_offsets)
     }
 
+    /// Explicit host adapter: admit one compiled persistent actor command
+    /// atomically before returning its original mailbox envelope for execution.
+    ///
+    /// The caller supplies the *same* transition (including predecessor,
+    /// sequence and payload) on retry after an ambiguous persistence result.
+    /// This restricted boundary accepts command-only turns: no external
+    /// effects, outbox, state publication, or workflow/agent dispatch.
+    ///
+    /// Existing bytecode scheduler delivery is not automatically redirected
+    /// here. A trusted host must execute the returned message and coordinate
+    /// completion separately. Pending admission is process-local; a message
+    /// that has not committed is NOT recoverable across a process crash.
+    pub fn admit_next_typed_actor_command(
+        &mut self,
+        actor_id: u64,
+        transition: DurableTransition,
+    ) -> std::io::Result<Option<(Message, DurableCommit)>> {
+        use std::io::{Error, ErrorKind};
+
+        let actor = self
+            .actors
+            .get(&actor_id)
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "actor does not exist"))?;
+        if !actor.persistent || actor.is_workflow || actor.is_agent {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "atomic command admission requires a persistent non-workflow, non-agent actor",
+            ));
+        }
+        let module = actor.bytecode_module.as_ref().ok_or_else(|| {
+            Error::new(ErrorKind::InvalidInput, "actor has no compiler-owned metadata")
+        })?;
+        let meta = behavior_ownership::actor_meta_for_runtime_name(module, &actor.name)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "unknown actor schema"))?;
+        if !meta.persistent {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "compiler schema does not declare durable execution",
+            ));
+        }
+        if transition.actor_id != actor_id || transition.activation_epoch != actor.activation_epoch
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "transition actor or activation epoch does not match the live actor",
+            ));
+        }
+        if transition.snapshot.is_some()
+            || !transition.workflow_events.is_empty()
+            || !transition.domain_events.is_empty()
+            || !transition.durable_effects.is_empty()
+            || !transition.outbox.is_empty()
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "command admission cannot publish state, events, effects or outbox",
+            ));
+        }
+
+        let candidate = self
+            .actors
+            .get_mut(&actor_id)
+            .expect("actor remains present during exclusive runtime access")
+            .mailbox
+            .begin_durable_admission()
+            .cloned();
+        let Some(candidate) = candidate else {
+            return Ok(None);
+        };
+
+        if candidate.priority == MessagePriority::System {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "system-priority runtime messages use their existing supervisor admission path",
+            ));
+        }
+        let actor = &self.actors[&actor_id];
+        let module = actor
+            .bytecode_module
+            .as_ref()
+            .expect("compiler metadata validated before admission");
+        let index = behavior_ownership::module_behavior_index_for_actor(
+            module,
+            &actor.name,
+            candidate.behavior_id as usize,
+        )
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                "incoming behavior is not owned by the typed actor",
+            )
+        })?;
+        let expected = module.behaviors.get(index).ok_or_else(|| {
+            Error::new(ErrorKind::InvalidInput, "compiled behavior index is invalid")
+        })?;
+        if candidate.payload.len() != expected.param_count {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "incoming payload does not match compiler-defined behavior arity",
+            ));
+        }
+
+        let command = transition.command.as_ref().ok_or_else(|| {
+            Error::new(ErrorKind::InvalidInput, "atomic admission requires a command")
+        })?;
+        let canonical_payload = self.persist_journal_payload(
+            actor_id,
+            (candidate.sender != 0).then_some(candidate.sender),
+            candidate.payload.as_slice(),
+        );
+        if command.sequence != transition.sequence
+            || command.behavior_id != candidate.behavior_id
+            || command.payload != canonical_payload
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "atomic command does not match pending mailbox message",
+            ));
+        }
+
+        // Persistence and mailbox are disjoint fields. Do not release the
+        // reserved slot or return the message on storage errors.
+        let persistence = &mut self.persistence;
+        let mailbox = &mut self
+            .actors
+            .get_mut(&actor_id)
+            .expect("actor remains present during exclusive runtime access")
+            .mailbox;
+        let committed = mailbox.admit_durable_with(|_| persistence.commit_transition(transition))?;
+        if let Some((message, commit)) = committed {
+            // Mirror the existing step_actor receiver ownership handoff.
+            self.hold_payload_refs(actor_id, &message.payload);
+            Ok(Some((message, commit)))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Register all `virtual entity` types declared in `module` with the
     /// grain registry so they can be hydrated on demand.  Safe to call
     /// multiple times for the same module (later calls are no-ops).
