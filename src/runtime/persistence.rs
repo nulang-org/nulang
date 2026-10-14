@@ -4,7 +4,7 @@
 //! snapshot of durable actor state and an append-only journal of messages.
 //! On recovery the runtime loads the latest snapshot and replays the journal.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -645,6 +645,25 @@ pub trait PersistenceStore: Send + Sync {
         ))
     }
 
+    /// Permanently opt an actor into strict typed durable admission. Backends
+    /// must persist this policy before the runtime enables strict execution:
+    /// a process crash must never silently restore legacy handler replay.
+    fn persist_strict_typed_actor_admission(&mut self, _actor_id: u64) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "persisted strict actor admission policy is unsupported by this backend",
+        ))
+    }
+
+    /// Read the committed strict admission policy. Unsupported backends can
+    /// never enable the policy and therefore retain legacy recovery behavior.
+    fn load_strict_typed_actor_admission(&self, _actor_id: u64) -> io::Result<bool> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "persisted strict actor admission policy is unsupported by this backend",
+        ))
+    }
+
     /// Atomically accept one logical inbound command and its dedup receipt
     /// with the canonical transition. Implementations MUST NOT fake this with
     /// `load` followed by `commit_transition`: concurrent hosts could both
@@ -882,6 +901,7 @@ pub struct MemoryStore {
     durable_tails: HashMap<u64, DurableTail>,
     committed_transitions: HashMap<u64, Vec<DurableTransition>>,
     durable_inbox_receipts: HashMap<DurableInboxId, DurableInboxReceipt>,
+    strict_typed_actor_admission: HashSet<u64>,
 }
 
 impl MemoryStore {
@@ -902,6 +922,22 @@ impl MemoryStore {
 }
 
 impl PersistenceStore for MemoryStore {
+    fn persist_strict_typed_actor_admission(&mut self, actor_id: u64) -> io::Result<()> {
+        if actor_id == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "strict actor admission requires a non-zero actor identity",
+            ));
+        }
+        self.strict_typed_actor_admission.insert(actor_id);
+        Ok(())
+    }
+
+    fn load_strict_typed_actor_admission(&self, actor_id: u64) -> io::Result<bool> {
+        Ok(self.strict_typed_actor_admission.contains(&actor_id))
+    }
+
+
     fn load_durable_tail_position(&self, actor_id: u64) -> io::Result<Option<DurableTailPosition>> {
         Ok(self
             .durable_tails
