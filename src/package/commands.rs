@@ -2596,6 +2596,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_discovery_ignores_comments_and_string_literals() {
+        let source = r#"
+            // fn test_from_comment() {}
+            fn helper() { "fn test_from_string()" }
+            fn test_actual() { 42 }
+            fn test_second() { 7 }
+        "#;
+        assert_eq!(
+            discover_test_functions(source),
+            vec!["test_actual".to_string(), "test_second".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_discovery_skips_functions_that_require_arguments() {
+        let source = r#"
+            fn test_needs_argument(value: Int) { value }
+            fn test_zero_args() { 1 }
+        "#;
+        assert_eq!(discover_test_functions(source), vec!["test_zero_args".to_string()]);
+    }
+
+    #[test]
     fn test_manifest_language_pin() {
         let dir = std::env::temp_dir().join(format!("nulang_lang_pin_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
