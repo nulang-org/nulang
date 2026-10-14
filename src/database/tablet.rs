@@ -487,6 +487,21 @@ impl MemoryTablet {
     }
 
     fn apply_mutations(&mut self, sequence: u64, mutations: Vec<TabletMutation>) {
+        // Avoid an additional map allocation on the common single-key path.
+        if mutations.len() == 1 {
+            let mutation = mutations.into_iter().next().expect("length checked");
+            let (key, value) = match mutation {
+                TabletMutation::Put { key, value } => (key, Some(value)),
+                TabletMutation::Delete { key } => (key, None),
+            };
+            self.rows
+                .entry(key)
+                .or_default()
+                .push(VersionedValue { sequence, value });
+            self.current_sequence = sequence;
+            return;
+        }
+
         // A transaction exposes only its final mutation for each key. This
         // also normalizes old WAL records that contain repeated keys, keeping
         // checkpoints strictly increasing by sequence for every row.
@@ -722,14 +737,28 @@ mod mvcc_retention_tests {
         let mut tablet = MemoryTablet::new(descriptor);
         let batches = [
             vec![
-                TabletMutation::Put { key: b"k".to_vec(), value: b"v1".to_vec() },
-                TabletMutation::Put { key: b"gone".to_vec(), value: b"x".to_vec() },
+                TabletMutation::Put {
+                    key: b"k".to_vec(),
+                    value: b"v1".to_vec(),
+                },
+                TabletMutation::Put {
+                    key: b"gone".to_vec(),
+                    value: b"x".to_vec(),
+                },
             ],
             vec![
-                TabletMutation::Put { key: b"k".to_vec(), value: b"v2".to_vec() },
-                TabletMutation::Delete { key: b"gone".to_vec() },
+                TabletMutation::Put {
+                    key: b"k".to_vec(),
+                    value: b"v2".to_vec(),
+                },
+                TabletMutation::Delete {
+                    key: b"gone".to_vec(),
+                },
             ],
-            vec![TabletMutation::Put { key: b"k".to_vec(), value: b"v3".to_vec() }],
+            vec![TabletMutation::Put {
+                key: b"k".to_vec(),
+                value: b"v3".to_vec(),
+            }],
         ];
         for batch in batches {
             let previous = tablet.current_sequence();
@@ -747,7 +776,51 @@ mod mvcc_retention_tests {
         assert_eq!(tablet.read_at(b"k", 3).unwrap(), Some(&b"v3"[..]));
         assert_eq!(
             tablet.read_at(b"k", 1),
-            Err(TabletError::SnapshotExpired { requested: 1, oldest_retained: 2 })
+            Err(TabletError::SnapshotExpired {
+                requested: 1,
+                oldest_retained: 2
+            })
         );
+    }
+
+    #[test]
+    fn legacy_checkpoint_versions_at_the_same_sequence_are_coalesced() {
+        let descriptor = TabletDescriptor::new(
+            TabletId::new(92).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            1,
+        )
+        .unwrap();
+        let state = TabletSnapshotState {
+            current_sequence: 1,
+            oldest_retained_snapshot: 0,
+            rows: vec![TabletSnapshotRow {
+                key: b"k".to_vec(),
+                versions: vec![
+                    VersionedValue {
+                        sequence: 1,
+                        value: Some(b"old".to_vec()),
+                    },
+                    VersionedValue {
+                        sequence: 1,
+                        value: None,
+                    },
+                    VersionedValue {
+                        sequence: 1,
+                        value: Some(b"last".to_vec()),
+                    },
+                ],
+            }],
+        };
+        let restored = MemoryTablet::restore_snapshot(descriptor, state).unwrap();
+        assert_eq!(restored.rows.get(b"k".as_slice()).unwrap().len(), 1);
+        assert_eq!(restored.read_at(b"k", 1).unwrap(), Some(&b"last"[..]));
+    }
+
+    #[test]
+    fn checkpoints_without_retention_metadata_default_to_genesis_snapshot() {
+        let serialized = serde_json::json!({"current_sequence": 0, "rows": []});
+        let old_checkpoint: TabletSnapshotState = serde_json::from_value(serialized).unwrap();
+        assert_eq!(old_checkpoint.oldest_retained_snapshot, 0);
     }
 }
