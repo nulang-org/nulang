@@ -5,12 +5,16 @@
 //! The child is a separate invocation of this test binary, using --exact.
 //! The parent kills it only after a ready-file confirms the desired boundary.
 
+use nulang::authority::{AuthorityGrant, AuthorityManifest};
+use nulang::durable_effect::{DurableEffectId, DurableEffectRecord, DurableEffectSpec};
+use nulang::durable_effect_persistence::DurableEffectPersistenceRecord;
 use nulang::durable_inbox::DurableInboxCommand;
+use nulang::primitives::{DeliverySemantics, EffectBoundary};
 use nulang::lexer::Lexer;
 use nulang::parser::Parser;
 use nulang::runtime::{
-    ActorSnapshot, DurableTransition, JournalEntry, LibsqlStore, PersistedValue,
-    PersistenceStore, Runtime, DURABLE_TRANSITION_VERSION,
+    ActorSnapshot, DurableOutboxMessage, DurableTransition, JournalEntry, LibsqlStore,
+    PersistedValue, PersistenceStore, Runtime, DURABLE_TRANSITION_VERSION,
 };
 use nulang::typechecker::TypeChecker;
 use std::collections::HashMap;
@@ -125,7 +129,10 @@ fn durable_process_kill_worker() {
 
     match stage.as_str() {
         "before-admission" => {}
-        "after-admission" | "after-completion" => {
+        "after-admission"
+        | "after-completion"
+        | "after-staged-result"
+        | "after-staged-result-before-publish" => {
             store
                 .commit_inbox_transition_detailed(request(), transition(1, true))
                 .expect("persist atomic command + inbox receipt");
@@ -133,6 +140,43 @@ fn durable_process_kill_worker() {
                 store
                     .commit_transition(transition(2, false))
                     .expect("persist completed actor state");
+            } else if stage == "after-staged-result"
+                || stage == "after-staged-result-before-publish"
+            {
+                // Exercise the new runtime adapter, not a manually assembled
+                // completion transition as in the existing crash window.
+                let mut runtime = runtime_for_recovery(store);
+                assert_eq!(runtime.recover_actor(ACTOR_ID), Some(ACTOR_ID));
+                assert_eq!(
+                    runtime.actors[&ACTOR_ID].mailbox.admitted_command_sequence(),
+                    Some(1)
+                );
+                let grant = "Audit::Write"
+                    .parse::<AuthorityGrant>()
+                    .expect("canonical grant");
+                runtime.actors.get_mut(&ACTOR_ID).unwrap()
+                    .install_authority_manifest(&AuthorityManifest::from_grants([grant]));
+                let spec = DurableEffectSpec::new(
+                    DurableEffectId::derive(ACTOR_ID, "staged-result", 0, "Audit::Write"),
+                    "Audit::Write",
+                    EffectBoundary::External,
+                    DeliverySemantics::EffectivelyOnceWithDeduplication,
+                );
+                runtime.commit_admitted_typed_actor_result(
+                    ACTOR_ID,
+                    1,
+                    HashMap::from([("total".to_string(), PersistedValue::Int(5))]),
+                    vec![DurableEffectPersistenceRecord::from_effect(
+                        DurableEffectRecord::prepare(spec, b"amount=5"),
+                    )],
+                    vec![DurableOutboxMessage {
+                        destination_actor_id: ACTOR_ID + 1,
+                        ordinal: 0,
+                        behavior_id: 0,
+                        payload: vec![PersistedValue::Int(5)],
+                    }],
+                )
+                .expect("complete quarantined actor through runtime API");
             }
         }
         _ => panic!("unknown process-kill stage"),
@@ -200,6 +244,7 @@ fn kill_at(stage: &str) -> CrashFixture {
             .env("NULANG_TEST_CRASH_WINDOW", stage)
             .env("NULANG_TEST_DB", fixture.database())
             .env("NULANG_TEST_READY", &marker)
+            .env("NULANG_TEST_STAGED_RESULT_ACTOR", ACTOR_ID.to_string())
             .spawn()
             .expect("launch separate durable writer"),
     );
@@ -291,4 +336,86 @@ fn kill_after_completion_recovers_state_and_suppresses_duplicate_command() {
     assert!(actor.mailbox.requires_strict_durable_admission());
     assert_eq!(actor.get_state_field("total").and_then(|v| v.as_int()), Some(5));
     assert_eq!(actor.sequence, 2);
+}
+
+#[test]
+fn kill_after_staged_result_commit_reopens_snapshot_effect_outbox_and_dedup_receipt() {
+    let fixture = kill_at("after-staged-result");
+    let mut store = fixture.reopen();
+    let tail = store.load_durable_tail_position(ACTOR_ID).unwrap().unwrap();
+    assert_eq!(tail.sequence, 2);
+    let completed = store.load_snapshot(ACTOR_ID).expect("completion survives SIGKILL");
+    assert_eq!(completed.sequence, 2);
+    assert_eq!(completed.state.get("total"), Some(&PersistedValue::Int(5)));
+    assert_eq!(store.read_journal(ACTOR_ID).len(), 1);
+
+    let effect_id = DurableEffectId::derive(ACTOR_ID, "staged-result", 0, "Audit::Write");
+    let effect = store
+        .load_durable_effect(ACTOR_ID, effect_id)
+        .unwrap()
+        .expect("prepared effect survives the same commit");
+    assert!(matches!(effect.effect(), DurableEffectRecord::Prepared { .. }));
+
+    let outbox_count = store.query(
+        &format!(
+            "SELECT COUNT(*) FROM durable_outbox WHERE actor_id = {ACTOR_ID} AND sequence = 2"
+        ),
+        &[],
+    ).unwrap();
+    assert_eq!(outbox_count, vec!["[1]".to_string()]);
+
+    let replay = store
+        .commit_inbox_transition_detailed(request(), transition(1, true))
+        .expect("lost-ACK replay must return original admission");
+    assert!(!replay.newly_accepted);
+    assert_eq!(replay.commit.sequence, 1);
+    assert_eq!(store.read_journal(ACTOR_ID).len(), 1);
+
+    let mut runtime = runtime_for_recovery(store);
+    assert_eq!(runtime.recover_actor(ACTOR_ID), Some(ACTOR_ID));
+    let actor = &runtime.actors[&ACTOR_ID];
+    assert!(actor.mailbox.requires_strict_durable_admission());
+    assert_eq!(actor.mailbox.admitted_command_sequence(), None);
+    assert_eq!(actor.get_state_field("total").and_then(|value| value.as_int()), Some(5));
+    assert_eq!(actor.sequence, 2);
+}
+
+#[cfg(feature = "durability-fault-injection")]
+#[test]
+fn kill_after_staged_commit_before_live_publication_recovers_without_replay() {
+    // The feature-gated runtime hook writes the marker immediately after
+    // commit_transition returns, *before* finish_admitted_typed_actor_command.
+    // SIGKILL therefore exercises the exact durable/live publication gap.
+    let fixture = kill_at("after-staged-result-before-publish");
+    let mut store = fixture.reopen();
+    assert_eq!(store.load_durable_tail_position(ACTOR_ID).unwrap().unwrap().sequence, 2);
+    assert_eq!(
+        store.load_snapshot(ACTOR_ID).unwrap().state.get("total"),
+        Some(&PersistedValue::Int(5))
+    );
+    let effect_id = DurableEffectId::derive(ACTOR_ID, "staged-result", 0, "Audit::Write");
+    let effect = store.load_durable_effect(ACTOR_ID, effect_id).unwrap().unwrap();
+    assert!(matches!(effect.effect(), DurableEffectRecord::Prepared { .. }));
+    assert_eq!(
+        store.query(
+            &format!("SELECT COUNT(*) FROM durable_outbox WHERE actor_id = {ACTOR_ID}"),
+            &[],
+        ).unwrap(),
+        vec!["[1]".to_string()]
+    );
+    let retry = store
+        .commit_inbox_transition_detailed(request(), transition(1, true))
+        .expect("duplicate must not reexecute a completed command");
+    assert!(!retry.newly_accepted);
+    assert_eq!(retry.commit.sequence, 1);
+    assert_eq!(store.read_journal(ACTOR_ID).len(), 1);
+
+    let mut runtime = runtime_for_recovery(store);
+    assert_eq!(runtime.recover_actor(ACTOR_ID), Some(ACTOR_ID));
+    let actor = &runtime.actors[&ACTOR_ID];
+    assert!(actor.mailbox.requires_strict_durable_admission());
+    assert_eq!(actor.mailbox.admitted_command_sequence(), None);
+    assert_eq!(actor.get_state_field("total").and_then(|value| value.as_int()), Some(5));
+    assert_eq!(actor.sequence, 2);
+    assert_eq!(runtime.persistence.read_journal(ACTOR_ID).len(), 1);
 }
