@@ -8,9 +8,10 @@
 use crate::package::manifest::BudgetsSection;
 use crate::runtime::WebRoute;
 use crate::web::bindings::{compile_route_bindings, RouteBindingContract};
-use crate::web::contracts::{HandlerParamContract, RouteContract, RouteParamContract};
+use crate::web::contracts::{
+    ContractCompilation, HandlerParamContract, RouteContract, RouteParamContract,
+};
 use crate::web::modules::ModuleRegistry;
-use crate::web::package_contracts::compile_contracts_from_tree;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -88,21 +89,22 @@ impl DeploymentIr {
 /// `signal_graph_path` is the optional path to `app.signals.json` emitted by
 /// the reactivity pass. `src_root` is the package `src/` directory used both
 /// for static contract extraction and legacy capability/module discovery.
-/// `budgets` are parsed from `Nulang.toml`.
+/// `budgets` are parsed from `Nulang.toml`. `contracts` must be the
+/// validated package compilation also used to attach runtime route plans.
+/// Do not rediscover contracts here: doing so can diverge from validation.
 pub fn generate_deployment_ir(
     routes: &[WebRoute],
     signal_graph_path: Option<&Path>,
     src_root: &Path,
     budgets: &BudgetsSection,
+    contracts: &ContractCompilation,
 ) -> DeploymentIr {
-    let contracts = compile_contracts_from_tree(src_root);
     let contract_index: HashMap<(String, String), &RouteContract> = contracts
         .routes
         .iter()
         .map(|contract| ((contract.method.clone(), contract.path.clone()), contract))
         .collect();
 
-    let mut binding_diagnostics = Vec::new();
     let mut ir_routes = Vec::new();
     for route in routes {
         let method = route.method.as_str().to_string();
@@ -110,9 +112,6 @@ pub fn generate_deployment_ir(
             .get(&(method.clone(), route.path.clone()))
             .copied();
         let binding_compilation = contract.map(compile_route_bindings);
-        if let Some(compilation) = &binding_compilation {
-            binding_diagnostics.extend(compilation.diagnostics.iter().cloned());
-        }
         let placement = contract
             .and_then(|contract| contract.placement.clone())
             .unwrap_or_else(|| default_route_placement(&method, &route.path));
@@ -164,13 +163,6 @@ pub fn generate_deployment_ir(
 
     let cloud_config = infer_module_cloud_config(&source_text);
     let middleware = infer_middleware(&source_text);
-
-    // Contract/binding diagnostics are compile-time concerns. They
-    // intentionally do not become part of the deployment schema; the IR
-    // contains only deployable metadata and the compiler can hard-fail these
-    // diagnostics when the route pass moves into the typed frontend.
-    let _contract_diagnostics = contracts.diagnostics;
-    let _binding_diagnostics = binding_diagnostics;
 
     DeploymentIr {
         // This is an additive v1 extension: every new per-route field is
