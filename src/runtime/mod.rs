@@ -948,6 +948,36 @@ impl Runtime {
         spawn::register_recovery_module(self, actor_id, module, offsets, compensation_offsets)
     }
 
+    /// Opt a compiler-owned ordinary persistent actor into strict admission.
+    /// Legacy mailbox receive and synchronous ask will not execute user
+    /// messages. This is process-local and must be re-enabled after recovery.
+    pub fn enable_strict_typed_actor_admission(&mut self, actor_id: u64) -> std::io::Result<()> {
+        use std::io::{Error, ErrorKind};
+        let actor = self
+            .actors
+            .get_mut(&actor_id)
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "actor does not exist"))?;
+        if !actor.persistent || actor.is_workflow || actor.is_agent {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "strict durable admission requires a persistent non-workflow, non-agent actor",
+            ));
+        }
+        let module = actor.bytecode_module.as_ref().ok_or_else(|| {
+            Error::new(ErrorKind::InvalidInput, "actor has no compiler-owned metadata")
+        })?;
+        let meta = behavior_ownership::actor_meta_for_runtime_name(module, &actor.name)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "unknown actor schema"))?;
+        if !meta.persistent {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "compiler schema does not declare persistent execution",
+            ));
+        }
+        actor.mailbox.require_strict_durable_admission();
+        Ok(())
+    }
+
     /// Explicit host adapter: admit one compiled persistent actor command
     /// atomically before returning its original mailbox envelope for execution.
     ///
@@ -2527,6 +2557,20 @@ impl Runtime {
         behavior_id: u16,
         args: &[Value],
     ) -> crate::types::NuResult<Value> {
+        // Synchronous asks bypass the mailbox; even a completed prior command
+        // may not re-enable legacy bytecode dispatch in strict mode.
+        if self
+            .actors
+            .get(&actor_id)
+            .is_some_and(|actor| actor.mailbox.requires_strict_durable_admission())
+        {
+            return Err(NuError::VMError {
+                msg: format!(
+                    "actor {actor_id} cannot execute synchronous ask while strict durable admission requires host execution"
+                ),
+                span: Span::default(),
+            });
+        }
         // Synchronous calls bypass the normal mailbox receive path. An actor
         // with a reserved or already-admitted durable command must not run a
         // second user handler before that command's atomic completion.
@@ -3635,7 +3679,8 @@ impl Runtime {
             .get(&actor_id)
             .map(|actor| {
                 !actor.mailbox.is_empty()
-                    && (!(actor.mailbox.has_pending_durable_admission()
+                    && (!(actor.mailbox.requires_strict_durable_admission()
+                        || actor.mailbox.has_pending_durable_admission()
                         || actor.mailbox.admitted_command_sequence().is_some())
                         || actor.mailbox.has_ready_system_message())
                     && actor.suspended_execution.is_none()
@@ -3734,6 +3779,8 @@ impl Runtime {
                     .get(&actor_id)
                     .map(|actor| {
                         !actor.mailbox.is_empty()
+                            && (!actor.mailbox.requires_strict_durable_admission()
+                                || actor.mailbox.has_ready_system_message())
                             && !actor.should_yield()
                             && actor.suspended_execution.is_none()
                     })
