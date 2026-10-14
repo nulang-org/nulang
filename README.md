@@ -226,7 +226,7 @@ WASM-backend validation. For local validation, run `cargo test --locked`; add
 
 ## Roadmap
 
-The roadmap below refreshes weekly (and on demand) from the live GitHub [roadmap tracker](https://github.com/nulang-org/nulang/issues/331), through a reviewable [automation pull request](.github/workflows/readme-roadmap-sync.yml). Changes appear on `main` after that PR is reviewed and merged. Open issue counts are **not** proof of remaining or completed implementation.
+The roadmap below refreshes weekly (and on demand) from the live GitHub [roadmap tracker](https://github.com/nulang-org/nulang/issues/331), through a reviewable [automation pull request](.github/workflows/readme-roadmap-sync.yml). Changes appear on `main` after that PR is reviewed and merged. This is the architecture-focused roadmap tracked in #331, not an exhaustive list of all current work. Open issue counts are **not** proof of remaining or completed implementation.
 
 <!-- roadmap:start -->
 _Generated from the [maintained roadmap tracker](https://github.com/nulang-org/nulang/issues/331). Statuses reflect linked GitHub issues and PRs, **not verified feature completion**._
