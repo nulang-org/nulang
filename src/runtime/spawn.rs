@@ -214,6 +214,29 @@ pub(crate) fn try_spawn_pinned_compiled_workflow(
             std::io::ErrorKind::InvalidData,
             "compiled pinned workflow schema is missing",
         ))?;
+    let mut default_names = std::collections::HashSet::new();
+    for (name, constant) in &meta.state_defaults {
+        if !default_names.insert(name.as_str()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "compiled pinned workflow has duplicate state default fields",
+            ));
+        }
+        if !matches!(
+            constant,
+            crate::bytecode::Constant::Int(_)
+                | crate::bytecode::Constant::Float(_)
+                | crate::bytecode::Constant::Bool(_)
+                | crate::bytecode::Constant::String(_)
+                | crate::bytecode::Constant::Nil
+                | crate::bytecode::Constant::Unit
+        ) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "compiled pinned workflow contains an unsupported state default constant",
+            ));
+        }
+    }
     let state_models: HashMap<String, StateModel> = meta
         .state_models
         .iter()
@@ -314,7 +337,16 @@ fn try_spawn_actor_with_id_pinned(
             .expect("schema was validated before actor allocation");
         for (name, constant) in &meta.state_defaults {
             let value = match constant {
-                crate::bytecode::Constant::String(string) => actor.allocate_string(string),
+                crate::bytecode::Constant::String(string) => {
+                    let value = actor.allocate_string(string);
+                    if value.is_nil() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::OutOfMemory,
+                            "failed to allocate compiler default string for pinned workflow",
+                        ));
+                    }
+                    value
+                }
                 other => crate::vm::constant_to_value(other),
             };
             actor.set_state_field(name, value);
