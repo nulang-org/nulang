@@ -9,6 +9,7 @@ use std::fmt;
 
 /// Stable identifier for one logical tablet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct TabletId(u64);
 
 impl TabletId {
