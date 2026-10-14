@@ -65,7 +65,7 @@ Marshalling (`src/python/marshal.rs`) converts primitives directly and keeps eve
 | `Float` | `float` |
 | `Bool` | `bool` |
 | `()` / `nil` | `None` |
-| `String` | placeholder descriptor (see caveat below) |
+| `String` | actual text through the owned foreign-call boundary; the direct VM converter rejects unresolved string IDs |
 | Python object handle | the object itself |
 
 | Python object | Nulang value |
@@ -79,7 +79,7 @@ Marshalling (`src/python/marshal.rs`) converts primitives directly and keeps eve
 Complex Python values arrive as opaque handles tagged `TAG_PYTHON` — cheap `Copy` ids into the registry, not ORCA-managed heap objects. There are no `iso`/linear capability requirements on values crossing the boundary; the gates are the compile-time `os` capability and, for code running inside an actor behavior, an explicit authority grant (e.g. `spawn Worker {} with [Python::call]`).
 
 :::caution
-Two marshalling sharp edges, both verified against the implementation: Nulang strings passed as call arguments currently arrive in Python as placeholder descriptors (`<nulang_string:ID>`), not real `str` values, and Python `str` results come back as opaque handles that cannot be concatenated with Nulang strings directly. Numeric arguments and results round-trip cleanly.
+String marshalling depends on the execution boundary. The owned foreign-call boundary converts Nulang strings to Python `str` by content and converts Python `str` results back to owned strings. The direct VM-value converter cannot access module-local string pools and now rejects unresolved string IDs rather than silently substituting placeholder text. Python `str` results on the legacy direct-value path still return opaque handles that are not ordinary Nulang strings.
 :::
 
 ### Where Python effects run
@@ -104,7 +104,7 @@ fn main() {
 ```
 
 :::note
-Current state of this surface, verified with the compiler binary: `perform Python.import(...)` does not parse today — `import` is a reserved keyword and the parser does not exempt it as an effect operation name (error `E0102`). Until that is fixed there is no way to import a module from pure Nulang source, so `Python.call`/`Python.get_attr` compile and dispatch but return `nil` with a `module '<name>' not imported` diagnostic for never-imported modules, and performing `Python.*` from inside a behavior traps the behavior silently. The bridge itself (import, call, attribute access, marshalling) is implemented and unit-tested at the Rust level; driving it end-to-end from source is blocked on the import syntax gap.
+The parser now accepts the keyword-named operation `perform Python.import("math")`. This removes a source-syntax blocker but does not imply that every Python effect runs successfully end-to-end. The actor-runtime host and a binary built with the `python` feature are still required; the legacy direct-value call path cannot round-trip ordinary Nulang strings, and Python import/call failures currently emit a diagnostic and a `nil` result. Prefer the explicitly owned foreign-call boundary for correct string conversion, and validate real source-to-runtime execution in a Python-enabled environment before relying on it in production.
 :::
 
 ## The C FFI
