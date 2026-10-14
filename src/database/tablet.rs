@@ -217,6 +217,10 @@ impl TransactionReceipt {
     pub fn sequence(self) -> u64 {
         self.sequence
     }
+
+    pub(crate) fn digest(self) -> [u8; 32] {
+        self.digest
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
