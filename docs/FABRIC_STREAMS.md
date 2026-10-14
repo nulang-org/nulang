@@ -85,6 +85,44 @@ authorization to delete files later**: the stream may change between preview
 and any future trim. Cluster retention first requires a quorum-proven
 committed frontier, follower catch-up, and consumer-progress coordination.
 
+### Experimental physical retention with a durable floor
+
+`FileFabricStreamStore::apply_retention(stream, keep_from_sequence)`
+and `Runtime::fabric_stream_apply_retention` can physically remove **complete**
+log segments in a single-owner standalone stream. The requested sequence is
+a *minimum* retained boundary: only whole segments ending before it qualify,
+and the active final segment is never deleted.
+
+The deletion protocol is intentionally ordered:
+
+1. Recompute eligibility against persisted cursors, segments, replication
+   policy, and producer-checkpoint restrictions.
+2. Atomically replace and fsync `retention.json` with the first surviving
+   segment sequence **before** removing any historical segment.
+3. Unlink segments below the durable floor, then sync the stream directory.
+
+If the process crashes between steps 2 and 3, recovery loads the floor and
+ignores the obsolete prefix, even if its files still exist. Calling
+`apply_retention` again at that floor finishes pending cleanup. Once
+recorded, replay requests below the floor **fail** rather than silently
+skipping removed history. A missing retained segment fails closed on recovery.
+Absolute stream sequence numbers never reset.
+
+A new consumer must explicitly initialize its cursor to at least
+`first_retained_sequence - 1` before reading the surviving suffix. This
+acknowledges that older history is unavailable; it does **not** attest that
+the consumer processed it. A previously registered cursor below the floor
+is treated as inconsistent state. A trimmed stream cannot become replicated
+without an explicit migration.
+
+**Do not deploy this draft without the exclusive stream-root lock in PR #1719,
+exact-head tests, and a platform-specific fsync/unlink review.** Concurrent
+writers could invalidate eligibility between checks and physical deletion.
+Distributed retention, time/byte policies, producer-state migration, backup
+coordination, and dead-letter streams remain out of scope. A backup must
+preserve `retention.json`, stream metadata, live segments, and cursor files
+as one consistent unit.
+
 ## Runtime APIs
 
 After opening storage:
