@@ -821,11 +821,10 @@ impl Runtime {
 
         let shard_idx = self.shard_idx;
         let shard_count = self.shard_count.max(1);
-        let local_mailboxes: HashMap<u64, (usize, usize)> = self
-            .actors
-            .iter()
-            .map(|(&actor_id, actor)| (actor_id, (actor.mailbox.len(), actor.mailbox.capacity())))
-            .collect();
+        // Only matching local targets need their mailbox scored. Reading the
+        // actor table on demand avoids cloning every actor's pressure metrics
+        // into a temporary hash map for each publication.
+        let actors = &self.actors;
         let cluster_known = self.distributed.cluster.is_some();
         let healthy_remote: HashSet<NodeId> = self
             .distributed
@@ -847,7 +846,9 @@ impl Runtime {
                 FabricTarget::Local { actor_id, .. } => {
                     let owner_shard = (*actor_id % shard_count as u64) as u16;
                     if owner_shard == shard_idx {
-                        let (depth, capacity) = *local_mailboxes.get(actor_id)?;
+                        let actor = actors.get(actor_id)?;
+                        let depth = actor.mailbox.len();
+                        let capacity = actor.mailbox.capacity();
                         if capacity > 0 && depth >= capacity {
                             return None;
                         }
