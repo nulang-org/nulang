@@ -998,6 +998,11 @@ impl Runtime {
                 "compiler schema does not declare persistent execution",
             ));
         }
+        // Durable first, memory second. On storage failure leave the actor
+        // in its existing mode and report the error; no unpersisted strict
+        // policy may be treated as recoverable after a process restart.
+        self.persistence
+            .persist_strict_typed_actor_admission(actor_id)?;
         actor.mailbox.require_strict_durable_admission();
         Ok(())
     }
@@ -5993,6 +5998,23 @@ impl Runtime {
     /// any other state captured in workflow events.
     pub fn recover_actor(&mut self, actor_id: u64) -> Option<u64> {
         let snapshot = self.persistence.load_snapshot(actor_id)?;
+        let strict_admission = match self
+            .persistence
+            .load_strict_typed_actor_admission(actor_id)
+        {
+            Ok(required) => required,
+            // Backends without policy support can never persistently opt in
+            // through enable_strict_typed_actor_admission. Preserve their
+            // historical, explicitly non-strict recovery behavior.
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => false,
+            Err(error) => {
+                warn!(
+                    "nulang-recover: refusing actor {} after strict policy read failed: {}",
+                    actor_id, error
+                );
+                return None;
+            }
+        };
         if snapshot.activation_epoch == 0 {
             warn!(
                 "nulang-recover: refusing actor {} with invalid activation epoch 0",
@@ -6053,6 +6075,43 @@ impl Runtime {
             .as_ref()
             .map(|meta| meta.is_agent)
             .unwrap_or(false);
+
+        if strict_admission {
+            // The recovery policy applies only to compiler-owned persistent
+            // user actors. A missing/foreign module cannot mint safe recovery.
+            if is_workflow
+                || is_agent
+                || !selected_meta.as_ref().is_some_and(|meta| meta.persistent)
+            {
+                warn!(
+                    "nulang-recover: refusing strict actor {} without supported compiler metadata",
+                    actor_id
+                );
+                return None;
+            }
+            // A journal-only admitted command must not be executed by the
+            // legacy non-workflow replay path before a completion snapshot.
+            match self.persistence.load_durable_tail_position(actor_id) {
+                Ok(Some(tail))
+                    if tail.activation_epoch != snapshot.activation_epoch
+                        || tail.sequence > snapshot.sequence =>
+                {
+                    warn!(
+                        "nulang-recover: refusing strict actor {} with incomplete or mismatched atomic tail",
+                        actor_id
+                    );
+                    return None;
+                }
+                Err(error) => {
+                    warn!(
+                        "nulang-recover: refusing strict actor {} after atomic tail read failed: {}",
+                        actor_id, error
+                    );
+                    return None;
+                }
+                _ => {}
+            }
+        }
 
         // RFC 0022 activation recovery: durable-effect transitions can move
         // the atomic tail beyond the admitted command while the last completed
@@ -6183,6 +6242,13 @@ impl Runtime {
                 .filter(|entry| entry.sequence > snapshot.sequence)
                 .collect()
         };
+        if strict_admission && !journal_to_replay.is_empty() {
+            warn!(
+                "nulang-recover: refusing strict actor {} with uncompleted journaled command history",
+                actor_id
+            );
+            return None;
+        }
         if let (Some(meta), Some((module, _, _))) =
             (selected_meta.as_ref(), self.recovery_modules.get(&actor_id))
         {
@@ -6225,6 +6291,10 @@ impl Runtime {
                 .unwrap_or_else(|| format!("actor_{}", actor_id)),
             0,
         );
+        // Install the durable fence *before publication/enqueue/replay*.
+        if strict_admission {
+            actor.mailbox.require_strict_durable_admission();
+        }
         actor.persistent = true;
         actor.is_workflow = is_workflow;
         actor.is_agent = is_agent;
