@@ -6048,6 +6048,54 @@ impl Runtime {
             .map(|meta| meta.is_agent)
             .unwrap_or(false);
 
+        // An ordinary actor admitted through the atomic command adapter
+        // must not fall back to legacy bytecode-journal replay after a crash.
+        // Until a trusted host can resume the same logical invocation with
+        // staged effects, the last completed snapshot is the only safe state.
+        // Workflow activations have a separate replay-identified recovery
+        // protocol below. Backends without atomic tail support retain their
+        // historical recovery behavior.
+        if !is_workflow {
+            match self.persistence.load_durable_tail_position(actor_id) {
+                Ok(Some(tail)) => {
+                    if tail.activation_epoch != snapshot.activation_epoch
+                        || tail.sequence != snapshot.sequence
+                    {
+                        warn!(
+                            "nulang-recover: refusing ordinary actor {}: atomic tail epoch/sequence ({}, {}) differs from completed snapshot ({}, {})",
+                            actor_id,
+                            tail.activation_epoch,
+                            tail.sequence,
+                            snapshot.activation_epoch,
+                            snapshot.sequence
+                        );
+                        return None;
+                    }
+                    if self
+                        .persistence
+                        .read_journal(actor_id)
+                        .iter()
+                        .any(|entry| entry.sequence > tail.sequence)
+                    {
+                        warn!(
+                            "nulang-recover: refusing ordinary actor {}: journal extends beyond committed atomic tail {}",
+                            actor_id, tail.sequence
+                        );
+                        return None;
+                    }
+                }
+                Ok(None) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {}
+                Err(error) => {
+                    warn!(
+                        "nulang-recover: refusing ordinary actor {}: atomic tail read failed: {}",
+                        actor_id, error
+                    );
+                    return None;
+                }
+            }
+        }
+
         // RFC 0022 activation recovery: durable-effect transitions can move
         // the atomic tail beyond the admitted command while the last completed
         // snapshot intentionally remains at the pre-command boundary. Replay-
