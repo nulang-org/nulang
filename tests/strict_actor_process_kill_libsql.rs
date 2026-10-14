@@ -129,7 +129,10 @@ fn durable_process_kill_worker() {
 
     match stage.as_str() {
         "before-admission" => {}
-        "after-admission" | "after-completion" | "after-staged-result" => {
+        "after-admission"
+        | "after-completion"
+        | "after-staged-result"
+        | "after-staged-result-before-publish" => {
             store
                 .commit_inbox_transition_detailed(request(), transition(1, true))
                 .expect("persist atomic command + inbox receipt");
@@ -137,7 +140,9 @@ fn durable_process_kill_worker() {
                 store
                     .commit_transition(transition(2, false))
                     .expect("persist completed actor state");
-            } else if stage == "after-staged-result" {
+            } else if stage == "after-staged-result"
+                || stage == "after-staged-result-before-publish"
+            {
                 // Exercise the new runtime adapter, not a manually assembled
                 // completion transition as in the existing crash window.
                 let mut runtime = runtime_for_recovery(store);
@@ -239,6 +244,7 @@ fn kill_at(stage: &str) -> CrashFixture {
             .env("NULANG_TEST_CRASH_WINDOW", stage)
             .env("NULANG_TEST_DB", fixture.database())
             .env("NULANG_TEST_READY", &marker)
+            .env("NULANG_TEST_STAGED_RESULT_ACTOR", ACTOR_ID.to_string())
             .spawn()
             .expect("launch separate durable writer"),
     );
@@ -372,4 +378,44 @@ fn kill_after_staged_result_commit_reopens_snapshot_effect_outbox_and_dedup_rece
     assert_eq!(actor.mailbox.admitted_command_sequence(), None);
     assert_eq!(actor.get_state_field("total").and_then(|value| value.as_int()), Some(5));
     assert_eq!(actor.sequence, 2);
+}
+
+#[cfg(feature = "durability-fault-injection")]
+#[test]
+fn kill_after_staged_commit_before_live_publication_recovers_without_replay() {
+    // The feature-gated runtime hook writes the marker immediately after
+    // commit_transition returns, *before* finish_admitted_typed_actor_command.
+    // SIGKILL therefore exercises the exact durable/live publication gap.
+    let fixture = kill_at("after-staged-result-before-publish");
+    let mut store = fixture.reopen();
+    assert_eq!(store.load_durable_tail_position(ACTOR_ID).unwrap().unwrap().sequence, 2);
+    assert_eq!(
+        store.load_snapshot(ACTOR_ID).unwrap().state.get("total"),
+        Some(&PersistedValue::Int(5))
+    );
+    let effect_id = DurableEffectId::derive(ACTOR_ID, "staged-result", 0, "Audit::Write");
+    let effect = store.load_durable_effect(ACTOR_ID, effect_id).unwrap().unwrap();
+    assert!(matches!(effect.effect(), DurableEffectRecord::Prepared { .. }));
+    assert_eq!(
+        store.query(
+            &format!("SELECT COUNT(*) FROM durable_outbox WHERE actor_id = {ACTOR_ID}"),
+            &[],
+        ).unwrap(),
+        vec!["[1]".to_string()]
+    );
+    let retry = store
+        .commit_inbox_transition_detailed(request(), transition(1, true))
+        .expect("duplicate must not reexecute a completed command");
+    assert!(!retry.newly_accepted);
+    assert_eq!(retry.commit.sequence, 1);
+    assert_eq!(store.read_journal(ACTOR_ID).len(), 1);
+
+    let mut runtime = runtime_for_recovery(store);
+    assert_eq!(runtime.recover_actor(ACTOR_ID), Some(ACTOR_ID));
+    let actor = &runtime.actors[&ACTOR_ID];
+    assert!(actor.mailbox.requires_strict_durable_admission());
+    assert_eq!(actor.mailbox.admitted_command_sequence(), None);
+    assert_eq!(actor.get_state_field("total").and_then(|value| value.as_int()), Some(5));
+    assert_eq!(actor.sequence, 2);
+    assert_eq!(runtime.persistence.read_journal(ACTOR_ID).len(), 1);
 }
