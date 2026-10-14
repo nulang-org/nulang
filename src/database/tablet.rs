@@ -548,20 +548,6 @@ impl MemoryTablet {
     /// WAL replay intentionally does not re-check historical ownership epochs:
     /// an older owner epoch is valid history. It does re-check sequence order
     /// and current tablet range before mutating state.
-    pub(crate) fn replay_committed(
-        &mut self,
-        sequence: u64,
-        expected_previous_sequence: u64,
-        mutations: Vec<TabletMutation>,
-    ) -> Result<(), TabletError> {
-        self.replay_committed_with_identity(
-            sequence,
-            expected_previous_sequence,
-            mutations,
-            None,
-        )
-    }
-
     pub(crate) fn replay_committed_with_identity(
         &mut self,
         sequence: u64,
