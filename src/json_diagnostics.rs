@@ -339,6 +339,27 @@ mod tests {
     }
 
     #[test]
+    fn test_typo_edit_rejects_span_for_another_identifier() {
+        let source = "fn main() = counter + countr\n";
+        set_source_map_with_file(source, Some("test.nula"));
+        let start = "fn main() = ".len() as u32;
+        let err = NuError::unbound_variable(
+            "countr",
+            Span::new(start, start + 7),
+            Some(vec!["counter".to_string()]),
+        );
+        assert!(
+            diagnostics_from_error(&err)[0]
+                .suggestion
+                .as_ref()
+                .and_then(|suggestion| suggestion.edit.as_ref())
+                .is_none(),
+            "source span must refer to the exact misspelled name"
+        );
+        clear_source_map();
+    }
+
+    #[test]
     fn test_multiple_flattens() {
         let span = Span::default();
         let errs = NuError::Multiple(vec![
