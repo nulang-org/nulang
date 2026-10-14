@@ -380,12 +380,7 @@ mod tests {
             Err(AdmissionError::NonIncreasingRevision)
         );
         assert!(matches!(
-            registry.reserve(
-                &owner,
-                &module(),
-                &request(2, "key-1", "Hello"),
-                &params()
-            ),
+            registry.reserve(&owner, &module(), &request(2, "key-1", "Hello"), &params()),
             Err(AdmissionError::Binding(_))
         ));
     }
@@ -397,7 +392,10 @@ mod tests {
         registry.register_document(&owner, document(1)).unwrap();
 
         let mut bad = request(1, "same-key", "Hello");
-        let HostToRuntimeMessage::InvokeAction { request: forged_request, .. } = &mut bad;
+        let HostToRuntimeMessage::InvokeAction {
+            request: forged_request,
+            ..
+        } = &mut bad;
         forged_request.action_id = "unregistered".into();
         assert!(matches!(
             registry.reserve(&owner, &module(), &bad, &params()),
