@@ -349,9 +349,7 @@ impl FileFabricStreamStore {
         if keep_from_sequence == 0 || keep_from_sequence > next_sequence {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!(
-                    "Fabric keep-from sequence must be in 1..={next_sequence}"
-                ),
+                format!("Fabric keep-from sequence must be in 1..={next_sequence}"),
             ));
         }
         if self.replication_policy(name)?.is_some() {
@@ -372,14 +370,19 @@ impl FileFabricStreamStore {
         }
 
         let cursors = read_cursors(&dir.join("cursors.json"))?;
+        let tail = next_sequence.saturating_sub(1);
+        if cursors.cursors.values().any(|&cursor| cursor > tail) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric retention preview found a consumer cursor beyond the local tail",
+            ));
+        }
         let minimum_consumer_cursor = cursors.cursors.values().copied().min();
         if let Some(minimum) = minimum_consumer_cursor {
             if keep_from_sequence.saturating_sub(1) > minimum {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    format!(
-                        "Fabric retention would pass consumer cursor {minimum}"
-                    ),
+                    format!("Fabric retention would pass consumer cursor {minimum}"),
                 ));
             }
         }
