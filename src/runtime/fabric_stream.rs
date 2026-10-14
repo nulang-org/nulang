@@ -1832,6 +1832,36 @@ mod tests {
     }
 
     #[test]
+    fn stream_store_rejects_second_writer_until_first_is_dropped() {
+        let root = test_dir("single-writer");
+        let mut first = FileFabricStreamStore::open(&root).unwrap();
+        first
+            .create_stream("events", FabricStreamConfig::default())
+            .unwrap();
+        assert_eq!(first.append("events", b"first").unwrap(), 1);
+
+        // Opening the same root twice currently succeeds. Two owners can
+        // allocate overlapping sequences and corrupt the segmented log.
+        let error = FileFabricStreamStore::open(&root).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+
+        drop(first);
+        let mut next_owner = FileFabricStreamStore::open(&root).unwrap();
+        assert_eq!(next_owner.append("events", b"second").unwrap(), 2);
+        assert_eq!(
+            next_owner
+                .read_from("events", 1, 10)
+                .unwrap()
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        drop(next_owner);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn segmented_append_replay_and_rotation() {
         let root = test_dir("rotation");
         let mut store = FileFabricStreamStore::open(&root).unwrap();
