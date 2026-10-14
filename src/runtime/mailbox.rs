@@ -431,6 +431,33 @@ impl Mailbox {
         Some(message)
     }
 
+    /// Run the atomic persistence admission for one staged message. Publish
+    /// the message to the caller only after the supplied commit succeeds.
+    ///
+    /// The callback MUST only commit Nulang-owned durable records. Do not
+    /// perform external provider calls or irreversible side effects here.
+    /// A failed commit retains the same message and reservation for retry.
+    pub fn admit_durable_with<T, E>(
+        &mut self,
+        commit: impl FnOnce(&Message) -> Result<T, E>,
+    ) -> Result<Option<(Message, T)>, E> {
+        let Some(candidate) = self.begin_durable_admission() else {
+            return Ok(None);
+        };
+        match commit(candidate) {
+            Ok(result) => {
+                let message = self
+                    .commit_durable_admission()
+                    .expect("candidate exists until durable admission commits");
+                Ok(Some((message, result)))
+            }
+            Err(error) => {
+                self.abort_durable_admission();
+                Err(error)
+            }
+        }
+    }
+
     /// Legacy nontransactional receive remains unavailable while a durable
     /// candidate is pending. No caller may bypass persistence admission.
     pub fn pop(&mut self) -> Option<Message> {
