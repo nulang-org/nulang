@@ -3938,6 +3938,48 @@ mod lsp_tests {
     // -- Crash-safety regression tests --
 
     #[test]
+    fn test_compiler_typo_quick_fix_removes_original_error() {
+        let source = "fn main() { let counter: Int = 41; countr + 1 }";
+        let before = NulangLanguageServer::compute_diagnostics(source);
+        assert!(
+            before
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("Unbound variable")),
+            "the compiler must diagnose the misspelled name: {:?}",
+            before.diagnostics
+        );
+        let uri = Url::parse("file:///test.nula").unwrap();
+        let actions = NulangLanguageServer::diagnostic_fix_actions(
+            source,
+            &uri,
+            &before.diagnostics,
+        );
+        assert_eq!(actions.len(), 1);
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("expected source edit");
+        };
+        let edit = &action.edit.as_ref().unwrap().changes.as_ref().unwrap()[&uri][0];
+        assert_eq!(edit.new_text, "counter");
+        let start = source.find("countr +").unwrap();
+        let fixed = format!(
+            "{}{}{}",
+            &source[..start],
+            edit.new_text,
+            &source[start + "countr".len()..]
+        );
+        let after = NulangLanguageServer::compute_diagnostics(&fixed);
+        assert!(
+            !after
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("Unbound variable")),
+            "the edit should remove the unknown-name diagnostic: {:?}",
+            after.diagnostics
+        );
+    }
+
+    #[test]
     fn test_compiler_typo_edit_reaches_lsp_quick_fix() {
         let source = "fn main() = countr + 1\n";
         crate::types::set_source_map_with_file(source, Some("test.nula"));
