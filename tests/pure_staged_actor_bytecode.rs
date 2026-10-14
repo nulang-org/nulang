@@ -235,3 +235,124 @@ fn early_halt_is_not_a_valid_completed_durable_handler() {
         Some(0)
     );
 }
+
+#[derive(Default)]
+struct RejectResultStore {
+    inner: nulang::runtime::MemoryStore,
+    reject_result: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl nulang::runtime::PersistenceStore for RejectResultStore {
+    fn commit_transition(
+        &mut self,
+        transition: DurableTransition,
+    ) -> std::io::Result<nulang::runtime::DurableCommit> {
+        if transition.snapshot.is_some()
+            && self
+                .reject_result
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(std::io::Error::other("injected result commit failure"));
+        }
+        self.inner.commit_transition(transition)
+    }
+
+    fn load_durable_tail_position(
+        &self,
+        actor_id: u64,
+    ) -> std::io::Result<Option<nulang::runtime::DurableTailPosition>> {
+        self.inner.load_durable_tail_position(actor_id)
+    }
+
+    fn save_snapshot(&mut self, snapshot: nulang::runtime::ActorSnapshot) -> std::io::Result<()> {
+        self.inner.save_snapshot(snapshot)
+    }
+
+    fn load_snapshot(&self, actor_id: u64) -> Option<nulang::runtime::ActorSnapshot> {
+        self.inner.load_snapshot(actor_id)
+    }
+
+    fn append_journal(&mut self, actor_id: u64, entry: JournalEntry) -> std::io::Result<()> {
+        self.inner.append_journal(actor_id, entry)
+    }
+
+    fn read_journal(&self, actor_id: u64) -> Vec<JournalEntry> {
+        self.inner.read_journal(actor_id)
+    }
+
+    fn append_workflow_event(
+        &mut self,
+        actor_id: u64,
+        event: nulang::runtime::WorkflowEvent,
+    ) -> std::io::Result<()> {
+        self.inner.append_workflow_event(actor_id, event)
+    }
+
+    fn read_workflow_events(&self, actor_id: u64) -> Vec<nulang::runtime::WorkflowEvent> {
+        self.inner.read_workflow_events(actor_id)
+    }
+
+    fn append_event(
+        &mut self,
+        actor_id: u64,
+        event: nulang::runtime::EventEntry,
+    ) -> std::io::Result<()> {
+        self.inner.append_event(actor_id, event)
+    }
+
+    fn read_events(&self, actor_id: u64) -> Vec<nulang::runtime::EventEntry> {
+        self.inner.read_events(actor_id)
+    }
+
+    fn latest_sequence(&self, actor_id: u64) -> u64 {
+        self.inner.latest_sequence(actor_id)
+    }
+
+    fn clear(&mut self, actor_id: u64) -> std::io::Result<()> {
+        self.inner.clear(actor_id)
+    }
+}
+
+#[test]
+fn failed_atomic_result_commit_keeps_live_state_fenced_until_retry_succeeds() {
+    use nulang::runtime::PersistenceStore;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let (mut runtime, actor_id, behavior) = spawned(&compiled_counter());
+    let reject_result = Arc::new(AtomicBool::new(true));
+    runtime.persistence = Box::new(RejectResultStore {
+        inner: nulang::runtime::MemoryStore::default(),
+        reject_result: Arc::clone(&reject_result),
+    });
+    let sequence = admit(&mut runtime, actor_id, behavior, 5);
+    let error = runtime
+        .execute_and_commit_admitted_pure_typed_actor_turn(actor_id, sequence)
+        .expect_err("persisted state must commit before any live publication");
+    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+    assert_eq!(runtime.persistence.latest_sequence(actor_id), sequence);
+    assert!(runtime.persistence.load_snapshot(actor_id).is_none());
+    assert_eq!(
+        runtime.actors[&actor_id].mailbox.admitted_command_sequence(),
+        Some(sequence)
+    );
+    assert_eq!(
+        runtime.actors[&actor_id]
+            .get_state_field("total")
+            .and_then(|value| value.as_int()),
+        Some(0)
+    );
+
+    reject_result.store(false, Ordering::SeqCst);
+    let result = runtime
+        .execute_and_commit_admitted_pure_typed_actor_turn(actor_id, sequence)
+        .expect("same admitted command safely retries after storage recovers");
+    assert_eq!(result.sequence, sequence + 1);
+    assert_eq!(runtime.persistence.read_journal(actor_id).len(), 1);
+    assert_eq!(
+        runtime.actors[&actor_id]
+            .get_state_field("total")
+            .and_then(|value| value.as_int()),
+        Some(5)
+    );
+}
