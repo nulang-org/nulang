@@ -159,3 +159,28 @@ fn ordinary_transient_actor_can_execute_when_durable_journal_is_unavailable() {
     );
     assert!(runtime.persistence.read_journal(actor_id).is_empty());
 }
+
+#[test]
+fn synchronous_native_ask_returns_admission_failure_without_executing_handler() {
+    let mut runtime = Runtime::new();
+    let actor_id = runtime.spawn_actor(Box::new(Vec::new));
+    {
+        let actor = runtime.actors.get_mut(&actor_id).unwrap();
+        actor.persistent = true;
+        actor.register_behavior("bump", native_bump);
+        actor.set_state_field("count", Value::int(0));
+    }
+    runtime.persistence = Box::new(RejectJournalStore::default());
+    let error = runtime
+        .ask_actor_sync(actor_id, 0, &[])
+        .expect_err("durable journal failure must propagate to synchronous caller");
+
+    assert!(error.to_string().contains("durable journal admission failed"));
+    assert_eq!(
+        runtime.actors[&actor_id]
+            .get_state_field("count")
+            .and_then(|value| value.as_int()),
+        Some(0)
+    );
+    assert!(runtime.persistence.read_journal(actor_id).is_empty());
+}
