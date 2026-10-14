@@ -2728,6 +2728,164 @@ mod tests {
     use crate::ast::{Param, Pattern};
 
     #[test]
+    fn test_errdefer_skipped_on_normal_scope_exit() {
+        let span = Span::default();
+        let expr = Expr::Block {
+            exprs: vec![
+                Expr::Defer {
+                    expr: Box::new(Expr::Panic("error-only".to_string(), span)),
+                    error_only: true,
+                    span,
+                },
+                Expr::Defer {
+                    expr: Box::new(Expr::Panic("ordinary-cleanup".to_string(), span)),
+                    error_only: false,
+                    span,
+                },
+                Expr::Literal(Literal::Int(42), span),
+            ],
+            span,
+        };
+        let body = with_fresh_defer_stack(|| lower_body(&expr));
+        let panics: Vec<_> = body
+            .stmts
+            .iter()
+            .filter_map(|stmt| match stmt {
+                hir::Stmt::Let {
+                    value: hir::RValue::Panic(message),
+                    ..
+                } => Some(message.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(panics, ["ordinary-cleanup"]);
+    }
+
+    #[test]
+    fn test_return_evaluates_and_captures_value_before_defer() {
+        let span = Span::default();
+        let expr = Expr::Block {
+            exprs: vec![
+                Expr::Defer {
+                    expr: Box::new(Expr::Panic("cleanup".to_string(), span)),
+                    error_only: false,
+                    span,
+                },
+                Expr::Defer {
+                    expr: Box::new(Expr::Panic("error-only".to_string(), span)),
+                    error_only: true,
+                    span,
+                },
+                Expr::Return(Some(Box::new(Expr::Var("x".to_string(), span))), span),
+            ],
+            span,
+        };
+        let body = with_fresh_defer_stack(|| lower_body(&expr));
+        let (returned, _) = match &body.terminator {
+            hir::Terminator::FnReturn(Some(hir::Operand::Var(name, ty))) => {
+                (name.as_str(), ty)
+            }
+            other => panic!("expected variable-valued return, got {other:?}"),
+        };
+        let capture_pos = body
+            .stmts
+            .iter()
+            .position(|stmt| {
+                matches!(
+                    stmt,
+                    hir::Stmt::Let {
+                        name,
+                        value: hir::RValue::Use(hir::Operand::Var(source, _)),
+                        ..
+                    } if name == returned && source == "x"
+                )
+            })
+            .expect("return value must be captured before cleanup");
+        let cleanup_pos = body
+            .stmts
+            .iter()
+            .position(|stmt| matches!(
+                stmt,
+                hir::Stmt::Let {
+                    value: hir::RValue::Panic(message),
+                    ..
+                } if message == "cleanup"
+            ))
+            .expect("ordinary defer must run before return");
+        assert!(capture_pos < cleanup_pos, "return value evaluated after cleanup");
+        assert!(
+            !body.stmts.iter().any(|stmt| matches!(
+                stmt,
+                hir::Stmt::Let {
+                    value: hir::RValue::Panic(message),
+                    ..
+                } if message == "error-only"
+            )),
+            "errdefer must not execute on an ordinary return"
+        );
+    }
+
+    #[test]
+    fn test_break_evaluates_and_captures_value_before_defer() {
+        let span = Span::default();
+        let expr = Expr::Block {
+            exprs: vec![
+                Expr::Defer {
+                    expr: Box::new(Expr::Panic("cleanup".to_string(), span)),
+                    error_only: false,
+                    span,
+                },
+                Expr::Defer {
+                    expr: Box::new(Expr::Panic("error-only".to_string(), span)),
+                    error_only: true,
+                    span,
+                },
+                Expr::Break(Some(Box::new(Expr::Var("x".to_string(), span))), span),
+            ],
+            span,
+        };
+        let body = with_fresh_defer_stack(|| lower_body(&expr));
+        let returned = match &body.terminator {
+            hir::Terminator::Break(Some(hir::Operand::Var(name, _))) => name,
+            other => panic!("expected value-valued break, got {other:?}"),
+        };
+        let capture_pos = body
+            .stmts
+            .iter()
+            .position(|stmt| matches!(
+                stmt,
+                hir::Stmt::Let {
+                    name,
+                    value: hir::RValue::Use(hir::Operand::Var(source, _)),
+                    ..
+                } if name == returned && source == "x"
+            ))
+            .expect("break value must be captured before cleanup");
+        let cleanup_pos = body
+            .stmts
+            .iter()
+            .position(|stmt| matches!(
+                stmt,
+                hir::Stmt::Let {
+                    value: hir::RValue::Panic(message),
+                    ..
+                } if message == "cleanup"
+            ))
+            .expect("ordinary defer must run before break");
+        assert!(capture_pos < cleanup_pos, "break value evaluated after cleanup");
+        assert!(
+            !body.stmts.iter().any(|stmt| matches!(
+                stmt,
+                hir::Stmt::Let {
+                    value: hir::RValue::Panic(message),
+                    ..
+                } if message == "error-only"
+            )),
+            "errdefer must not execute on an ordinary break"
+        );
+    }
+
+    #[test]
     fn test_lower_literal() {
         let ast = ast::AstModule {
             name: "test".to_string(),
