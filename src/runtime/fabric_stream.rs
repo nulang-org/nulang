@@ -2420,7 +2420,10 @@ mod tests {
             .unwrap();
         }
         let mut reopened = FileFabricStreamStore::open(&root).unwrap();
-        assert_eq!(reopened.read_from("events", 1, 1).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            reopened.read_from("events", 1, 1).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
         assert_eq!(reopened.read_from("events", 3, 10).unwrap().len(), 1);
         assert_eq!(reopened.append("events", b"four").unwrap(), 4);
         assert_eq!(reopened.apply_retention("events", 3).unwrap().eligible_segment_count, 0);
