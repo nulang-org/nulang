@@ -51,6 +51,7 @@ pub fn suggested_source_edit(err: &NuError, source: &str) -> Option<DiagnosticSo
         return None;
     }
     let NuError::TypeError {
+        msg,
         similar_names: Some(names),
         span,
         ..
@@ -67,7 +68,13 @@ pub fn suggested_source_edit(err: &NuError, source: &str) -> Option<DiagnosticSo
         matches!(chars.next(), Some(c) if c.is_alphabetic() || c == '_')
             && chars.all(|c| c.is_alphanumeric() || c == '_')
     };
-    if !valid_identifier(original) || !valid_identifier(replacement) || original == replacement {
+    // Do not trust a stale or overly broad error span: it must name the
+    // precise identifier diagnosed by the compiler, not merely any token.
+    if msg != &format!("Unbound variable: '{}'", original)
+        || !valid_identifier(original)
+        || !valid_identifier(replacement)
+        || original == replacement
+    {
         return None;
     }
     Some(DiagnosticSourceEdit {
