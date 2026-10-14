@@ -4,8 +4,8 @@
 
 use nulang::durable_inbox::DurableInboxCommand;
 use nulang::runtime::{
-    DurableTransition, JournalEntry, LibsqlStore, PersistedValue, PersistenceStore,
-    DURABLE_TRANSITION_VERSION,
+    ActorSnapshot, DurableOutboxMessage, DurableTransition, EventEntry, JournalEntry, LibsqlStore,
+    PersistedValue, PersistenceStore, WorkflowEvent, DURABLE_TRANSITION_VERSION,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -235,4 +235,142 @@ fn two_connections_competing_for_same_sequence_never_both_commit() {
                 .is_some() as usize),
         1
     );
+}
+
+#[test]
+fn concurrent_retries_of_same_identity_share_one_persisted_receipt() {
+    let file = TestDatabase::new();
+    // Establish the schema before racing independent connections; this test
+    // exercises receipt contention, not concurrent schema initialization.
+    drop(file.store());
+    let path_a = file.0.clone();
+    let path_b = file.0.clone();
+    let barrier = Arc::new(Barrier::new(2));
+    let (left, right) = std::thread::scope(|scope| {
+        let barrier_a = Arc::clone(&barrier);
+        let barrier_b = Arc::clone(&barrier);
+        let left = scope.spawn(move || {
+            let store = LibsqlStore::new(path_a);
+            barrier_a.wait();
+            let mut store = store.expect("first libSQL connection");
+            store.commit_inbox_transition(identity(51, "same-message", 7), command(51, 0, 7))
+        });
+        let right = scope.spawn(move || {
+            let store = LibsqlStore::new(path_b);
+            barrier_b.wait();
+            let mut store = store.expect("second libSQL connection");
+            store.commit_inbox_transition(identity(51, "same-message", 7), command(51, 0, 7))
+        });
+        (left.join().unwrap(), right.join().unwrap())
+    });
+
+    // A contender can encounter SQLITE_BUSY instead of waiting for the
+    // winner. Either outcome must recover the same committed receipt.
+    assert!(
+        left.is_ok() || right.is_ok(),
+        "at least one concurrent admission must succeed: left={left:?}, right={right:?}"
+    );
+    let first = match (&left, &right) {
+        (Ok(first), Ok(replay)) => {
+            assert_eq!(first, replay, "duplicate admission returned a different commit");
+            *first
+        }
+        (Ok(first), Err(_)) | (Err(_), Ok(first)) => *first,
+        (Err(_), Err(_)) => unreachable!("checked that at least one commit succeeded"),
+    };
+
+    let request = identity(51, "same-message", 7);
+    let mut reopened = file.store();
+    let receipt = reopened
+        .load_durable_inbox_receipt(request.id())
+        .unwrap()
+        .expect("one durable receipt must survive both contenders");
+    assert_eq!(receipt.commit, first);
+    assert_eq!(receipt.request_digest, request.request_digest());
+    assert_eq!(reopened.read_journal(51).len(), 1);
+    assert_eq!(
+        reopened.load_durable_tail_position(51).unwrap().unwrap().sequence,
+        1
+    );
+    assert_eq!(
+        reopened.commit_inbox_transition(request, command(51, 0, 7)).unwrap(),
+        first,
+        "a retry after contention must return the original acknowledgment"
+    );
+    assert_eq!(reopened.read_journal(51).len(), 1);
+}
+
+#[test]
+fn receipt_insert_failure_rolls_back_previously_written_transition_records() {
+    let file = TestDatabase::new();
+    let mut store = file.store();
+    // Force a failure at the last write, after snapshot, journal, events,
+    // outbox and tail have been staged, rather than at admission validation.
+    let path = file.0.to_string_lossy().into_owned();
+    let rt = tokio::runtime::Runtime::new().expect("create trigger runtime");
+    rt.block_on(async {
+        let db = libsql::Builder::new_local(path)
+            .build()
+            .await
+            .expect("open the same file-backed database");
+        let conn = db.connect().expect("connect to failure-injection database");
+        conn.execute(
+            "CREATE TRIGGER reject_inbox_receipt BEFORE INSERT ON durable_inbox_receipts
+             BEGIN SELECT RAISE(ABORT, 'injected durable inbox receipt write failure'); END",
+            (),
+        )
+        .await
+        .expect("install receipt insert failure");
+    });
+    drop(rt);
+
+    let request = identity(51, "failure-at-receipt", 7);
+    let mut transition = command(51, 0, 7);
+    transition.snapshot = Some(ActorSnapshot {
+        actor_id: 51,
+        activation_epoch: 3,
+        sequence: 1,
+        ..ActorSnapshot::default()
+    });
+    transition.workflow_events.push(WorkflowEvent::WorkflowStarted {
+        sequence: 1,
+        name: "rollback-test".to_string(),
+        state: vec![],
+    });
+    transition.domain_events.push(EventEntry {
+        sequence: 1,
+        field_name: "counter".to_string(),
+        event_name: "Changed".to_string(),
+        args: vec![],
+        value: PersistedValue::Int(7),
+    });
+    transition.outbox.push(DurableOutboxMessage {
+        destination_actor_id: 52,
+        ordinal: 0,
+        behavior_id: 12,
+        payload: vec![PersistedValue::Int(9)],
+    });
+
+    assert!(
+        store.commit_inbox_transition(request.clone(), transition).is_err(),
+        "the injected receipt failure must abort the transaction"
+    );
+    for table in [
+        "snapshots",
+        "journal",
+        "durable_workflow_events",
+        "durable_domain_events",
+        "durable_outbox",
+        "durable_transitions",
+        "durable_tails",
+        "durable_inbox_receipts",
+    ] {
+        let rows = store
+            .query(&format!("SELECT actor_id FROM {table} WHERE actor_id = 51"), &[])
+            .unwrap();
+        assert!(rows.is_empty(), "{table} must roll back with the receipt");
+    }
+    assert!(store.read_journal(51).is_empty());
+    assert!(store.load_durable_tail_position(51).unwrap().is_none());
+    assert!(store.load_durable_inbox_receipt(request.id()).unwrap().is_none());
 }
