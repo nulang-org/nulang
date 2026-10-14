@@ -6213,8 +6213,24 @@ impl Runtime {
                         return None;
                     }
                 }
-                Ok(None) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {}
+                Ok(None) => {
+                    if recover_strict_admission {
+                        warn!(
+                            "nulang-recover: refusing strict actor {} with no committed atomic tail",
+                            actor_id
+                        );
+                        return None;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+                    if recover_strict_admission {
+                        warn!(
+                            "nulang-recover: refusing strict actor {} without atomic tail support",
+                            actor_id
+                        );
+                        return None;
+                    }
+                }
                 Err(error) => {
                     warn!(
                         "nulang-recover: refusing ordinary actor {}: atomic tail read failed: {}",
