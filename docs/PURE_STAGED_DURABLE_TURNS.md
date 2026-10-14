@@ -4,7 +4,7 @@
 
 An opt-in trusted-host API, `Runtime::execute_and_commit_admitted_pure_typed_actor_turn(actor_id, admitted_sequence)`, advances the **compiler-owned ordinary persistent actor** path from command admission to atomic result persistence for a narrow class of pure handlers.
 
-The host first calls `admit_next_typed_actor_command` with the exact canonical command. The adapter then:
+The host first enables `enable_strict_typed_actor_admission(actor_id)` **before routing messages**, then calls `admit_next_typed_actor_command` with the exact canonical command. This integration refuses isolated execution without the strict gate even when a command has already been admitted. The adapter then:
 
 1. Checks the in-memory admitted-command fence and the exact persisted journal entry.
 2. Resolves the behavior using the selected compiled actor schema and verifies parameter count.
@@ -22,7 +22,7 @@ Everything else — including sends/asks, actor spawn, closures, file/network IO
 ## Guarantees and limitations
 
 - Rejection, interpreter errors, or incompatible staged values leave live actor state unchanged and the admitted-command fence intact. Reconciliation remains the responsibility of the trusted host.
-- The method requires an **already committed command**; it is not a general-purpose actor scheduler and does not automatically enable strict admission (see draft #1699).
+- The method requires **both** a live strict-admission opt-in and an already committed exact command. It is not a general-purpose actor scheduler and does not automatically enable strict admission. The ported guard originates from draft #1699 and is integrated in draft #1720.
 - Persistence commit errors remain subject to the existing exact-transition-idempotency and ambiguous-acknowledgment rules. The host must not change transition identity on retries.
 - The adapter stages **no** external effects or outbox messages. It does not provide external exactly-once delivery, deduplicated incoming messages, migration-body verification or automatic resumption after restart.
 - The current underlying two-transition protocol has one command-admission commit and a subsequent result commit. The conservative recovery fence in draft #1700 rejects incomplete ordinary-actor turns rather than guessing whether to run them.
@@ -35,6 +35,8 @@ At the exact PR head:
 ```bash
 cargo fmt --all -- --check
 cargo test --locked --test pure_staged_actor_bytecode
+cargo test --locked --test strict_pure_durable_bridge
+cargo test --locked --test strict_typed_durable_admission
 cargo test --locked --test admitted_typed_actor_atomic_result
 cargo test --locked --test ordinary_atomic_turn_recovery_fence
 cargo test --locked --test atomic_persistent_mailbox_admission
