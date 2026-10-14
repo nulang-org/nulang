@@ -513,12 +513,19 @@ impl DurableTransition {
                 "durable transition workflow event sequence does not match transition sequence",
             ));
         }
+        let mut replay_ids = std::collections::HashSet::new();
         for event in &self.workflow_events {
             if let Some(activation) = event.activation_id() {
                 if activation.actor_id != self.actor_id {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         "durable transition workflow activation actor does not match transition actor",
+                    ));
+                }
+                if activation.command_sequence == 0 || activation.command_sequence > self.sequence {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "durable transition workflow activation references missing or future command",
                     ));
                 }
                 if let Some(command) = &self.command {
@@ -528,6 +535,37 @@ impl DurableTransition {
                             "durable transition workflow activation command sequence does not match accepted command",
                         ));
                     }
+                }
+            }
+
+            if let Some(replay_id) = event.replay_id() {
+                if replay_id.activation.actor_id != self.actor_id {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "durable transition workflow replay activation actor does not match transition actor",
+                    ));
+                }
+                if replay_id.activation.command_sequence == 0
+                    || replay_id.activation.command_sequence > self.sequence
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "durable transition workflow replay identity refers to missing or future command",
+                    ));
+                }
+                if let Some(command) = &self.command {
+                    if replay_id.activation.command_sequence != command.sequence {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "durable transition workflow replay identity does not match accepted command",
+                        ));
+                    }
+                }
+                if !replay_ids.insert(replay_id) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "duplicate workflow replay identity in durable transition",
+                    ));
                 }
             }
         }
@@ -540,6 +578,22 @@ impl DurableTransition {
                 io::ErrorKind::InvalidInput,
                 "durable transition domain event sequence does not match transition sequence",
             ));
+        }
+
+        // A stable logical effect may have one persisted state per turn.
+        // Duplicate IDs (even with identical bytes) make replay lookup and
+        // effect receipt publication ambiguous. Reject before any store write.
+        let mut effect_ids = BTreeSet::new();
+        for record in &self.durable_effects {
+            record.validate().map_err(|error| {
+                io::Error::new(io::ErrorKind::InvalidInput, error)
+            })?;
+            if !effect_ids.insert(record.effect().spec().id) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "duplicate durable effect identity in transition",
+                ));
+            }
         }
 
         let mut ordinals = BTreeSet::new();
