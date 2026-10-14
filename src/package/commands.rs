@@ -1397,12 +1397,23 @@ fn cmd_build_web() -> NuResult<()> {
     })?;
     let routes = vm.take_web_routes();
     let src_root = root.join("src");
-    crate::web::dispatch::compile_runtime_routes(routes.clone(), &src_root).map_err(
-        |diagnostics| NuError::PackageError {
-            msg: format!("invalid web route contract:\n{}", diagnostics.join("\n")),
-            span: Span::default(),
-        },
-    )?;
+    // Validate once: runtime route plans and deployment IR must consume the
+    // same compiler-owned contracts rather than re-extracting source.
+    let validated_contracts =
+        crate::web::validation::compile_validated_contracts_from_tree(&src_root).map_err(
+            |diagnostics| NuError::PackageError {
+                msg: format!("invalid web route contract:\n{}", diagnostics.join("\n")),
+                span: Span::default(),
+            },
+        )?;
+    crate::web::dispatch::compile_runtime_routes_from_contracts(
+        routes.clone(),
+        &validated_contracts,
+    )
+    .map_err(|diagnostics| NuError::PackageError {
+        msg: format!("invalid web route contract:\n{}", diagnostics.join("\n")),
+        span: Span::default(),
+    })?;
 
     eprintln!("  Rendering {} route(s)...", routes.len());
     for route in &routes {
@@ -1446,6 +1457,7 @@ fn cmd_build_web() -> NuResult<()> {
         Some(&signals_path),
         &src_root,
         &manifest.budgets,
+        &validated_contracts,
     );
     let ir_path = output_dir.join("nulang-app.ir.json");
     let ir_json = ir.to_json();
