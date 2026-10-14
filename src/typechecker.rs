@@ -1732,7 +1732,11 @@ impl TypeChecker {
                 // different runtime type than its compiler-owned schema.
                 for (_name, _model, declared_ty, default) in state_fields {
                     let (subst, actual_ty) = self.infer_expr(&workflow_ctx, default)?;
-                    let _ = mgu(&apply_subst(&actual_ty, &subst), declared_ty, default.span())?;
+                    let _ = mgu(
+                        &apply_subst(&actual_ty, &subst),
+                        declared_ty,
+                        default.span(),
+                    )?;
                 }
                 workflow_ctx.workflow_state_fields = Some(
                     state_fields
