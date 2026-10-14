@@ -201,6 +201,7 @@ fn build_actor_snapshot_at_sequence(
         crdt_field_map,
         schema_name,
         authority_tokens,
+        strict_admission_policy_version: if actor.mailbox.requires_strict_durable_admission() { 1 } else { 0 },
     }))
 }
 
