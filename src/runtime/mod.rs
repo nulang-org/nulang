@@ -67,6 +67,7 @@ pub mod crdt_reg;
 mod distribution;
 mod exit;
 mod http_server;
+mod inspect;
 #[cfg(feature = "ai-runtime")]
 mod llm;
 mod metrics;
@@ -114,6 +115,7 @@ pub use gc::{ForeignRefOp, GcStats, OrcaCoordinator, OrcaGc, OrcaHeap};
 pub use grain::*;
 pub use heap::*;
 pub use http_server::{render_route_handler, HttpMethod, HttpServerState, WebDevServer, WebRoute};
+pub use inspect::{ActorInfo, MAX_ACTOR_INFO_PAGE_SIZE};
 pub use mailbox::*;
 pub use network::NetworkTransport;
 pub use network::*;
