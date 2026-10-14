@@ -16,7 +16,6 @@ import re
 import shutil
 import statistics
 import subprocess
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -24,6 +23,13 @@ ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "benchmarks" / "cross_runtime"
 BUILD = ROOT / "target" / "cross-runtime"
 BENCHMARKS = ("counting", "ping_pong", "thread_ring", "fork_join")
+# Counts are part of the workload contract, not untrusted fixture metadata.
+EXPECTED_MESSAGES = {
+    "counting": 200_000,
+    "ping_pong": 40_001,
+    "thread_ring": 20_000,
+    "fork_join": 100_000,
+}
 RECORD_RE = re.compile(
     r"\[cross-bench\]\s+runtime=(?P<runtime>[a-z0-9_-]+)\s+"
     r"benchmark=(?P<benchmark>[a-z0-9_-]+)\s+"
@@ -72,27 +78,40 @@ def maybe_version(command: list[str]) -> str | None:
 
 
 def parse_records(output: str, expected_runtime: str) -> dict[str, dict[str, int]]:
+    """Reject invalid fixture output rather than publishing misleading timings."""
     records: dict[str, dict[str, int]] = {}
-    for match in RECORD_RE.finditer(output):
+    for line in output.splitlines():
+        if "[cross-bench]" not in line:
+            continue
+        match = RECORD_RE.fullmatch(line.strip())
+        if match is None:
+            raise RuntimeError(f"{expected_runtime}: malformed benchmark record: {line!r}")
         runtime = match.group("runtime")
         if runtime != expected_runtime:
-            continue
+            raise RuntimeError(
+                f"expected runtime {expected_runtime}, got {runtime} in benchmark record"
+            )
         name = match.group("benchmark")
-        if name not in BENCHMARKS:
-            continue
-        records[name] = {
-            "messages": int(match.group("messages")),
-            "elapsed_ns": int(match.group("elapsed_ns")),
-        }
+        if name not in EXPECTED_MESSAGES:
+            raise RuntimeError(f"{runtime}: unknown benchmark {name}")
+        if name in records:
+            raise RuntimeError(f"{runtime}: duplicate benchmark {name}")
+        messages = int(match.group("messages"))
+        if messages != EXPECTED_MESSAGES[name]:
+            raise RuntimeError(
+                f"{runtime}/{name}: message count {messages}, expected {EXPECTED_MESSAGES[name]}"
+            )
+        elapsed_ns = int(match.group("elapsed_ns"))
+        if elapsed_ns <= 0:
+            raise RuntimeError(f"{runtime}/{name}: elapsed_ns must be positive")
+        records[name] = {"messages": messages, "elapsed_ns": elapsed_ns}
 
     missing = [name for name in BENCHMARKS if name not in records]
     if missing:
-        print(output, file=sys.stderr)
         raise RuntimeError(
             f"{expected_runtime} did not emit records for: {', '.join(missing)}"
         )
     return records
-
 
 def build_commands(selected: list[str]) -> dict[str, list[str]]:
     BUILD.mkdir(parents=True, exist_ok=True)
