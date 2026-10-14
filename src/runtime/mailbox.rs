@@ -1179,4 +1179,37 @@ mod transactional_receive_tests {
         assert!(mailbox.is_empty());
         assert_eq!(store.read_journal(42).len(), 1);
     }
+
+    #[test]
+    fn supervisor_notification_bypasses_pending_durable_user_message() {
+        let mut mailbox = Mailbox::new(1);
+        mailbox.push_local(make_msg(7, 10)).unwrap();
+        assert_eq!(mailbox.begin_durable_admission().unwrap().sender, 10);
+
+        let mut system = make_msg(0, 99);
+        system.priority = MessagePriority::System;
+        mailbox.push(system).unwrap();
+        assert!(mailbox.has_ready_system_message());
+        assert_eq!(mailbox.pop().unwrap().sender, 99);
+        assert_eq!(mailbox.len(), 1, "pending durable reservation is preserved");
+        assert!(mailbox.pop().is_none(), "ordinary pending message stays fenced");
+        assert_eq!(mailbox.commit_durable_admission().unwrap().sender, 10);
+        assert_eq!(mailbox.len(), 0);
+    }
+
+    #[test]
+    fn ordinary_durable_admission_does_not_capture_system_notification() {
+        let mut mailbox = Mailbox::new(1);
+        let mut notice = make_msg(0, 99);
+        notice.priority = MessagePriority::System;
+        mailbox.push_local(notice).unwrap();
+
+        assert!(
+            mailbox.begin_durable_admission().is_none(),
+            "system messages must retain their supervisor delivery path"
+        );
+        assert!(!mailbox.has_pending_durable_admission());
+        assert_eq!(mailbox.pop().unwrap().sender, 99);
+        assert!(mailbox.is_empty());
+    }
 }
