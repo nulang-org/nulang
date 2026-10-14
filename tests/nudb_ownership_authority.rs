@@ -114,24 +114,39 @@ fn uncommitted_or_out_of_order_entries_never_mutate_authority() {
 }
 
 #[test]
-fn ownership_transfer_must_match_previous_owner_and_epoch() {
+fn rejected_committed_commands_advance_log_without_changing_owner() {
     let mut state = OwnershipStateMachine::new();
     state.apply_committed(bootstrap(1, 3, 91, 11, 7)).unwrap();
-    let before = state.clone();
+    let initial = state.grant(tablet(91)).unwrap();
+    let rejected = transfer(2, 3, 91, 22, 7, 33, 9);
 
     assert!(matches!(
-        state.apply_committed(transfer(2, 3, 91, 22, 7, 33, 9)),
+        state.apply_committed(rejected),
         Err(OwnershipError::WrongOwner { .. })
     ));
+    assert_eq!(state.applied_index(), 2);
+    assert_eq!(state.grant(tablet(91)).unwrap(), initial);
+    // Replaying the same committed semantic rejection must be deterministic.
     assert!(matches!(
-        state.apply_committed(transfer(2, 3, 91, 11, 6, 22, 9)),
+        state.apply_committed(rejected),
+        Err(OwnershipError::WrongOwner { .. })
+    ));
+
+    let stale = transfer(3, 3, 91, 11, 6, 22, 9);
+    assert!(matches!(
+        state.apply_committed(stale),
         Err(OwnershipError::StaleEpoch { .. })
     ));
+    let non_advance = transfer(4, 3, 91, 11, 7, 22, 7);
     assert!(matches!(
-        state.apply_committed(transfer(2, 3, 91, 11, 7, 22, 7)),
+        state.apply_committed(non_advance),
         Err(OwnershipError::EpochNotAdvanced { .. })
     ));
-    assert_eq!(state, before);
+    assert_eq!(state.applied_index(), 4);
+    assert_eq!(state.grant(tablet(91)).unwrap(), initial);
+
+    state.apply_committed(transfer(5, 4, 91, 11, 7, 22, 9)).unwrap();
+    state.authorize_writer(tablet(91), node(22), 9).unwrap();
 }
 
 #[test]
@@ -168,13 +183,14 @@ fn bootstrap_cannot_steal_existing_tablet_or_use_zero_epoch() {
         state.apply_committed(bootstrap(1, 1, 91, 11, 0)),
         Err(OwnershipError::InvalidEpoch)
     ));
-    assert_eq!(state.applied_index(), 0);
-    state.apply_committed(bootstrap(1, 1, 91, 11, 7)).unwrap();
+    assert_eq!(state.applied_index(), 1);
+    state.apply_committed(bootstrap(2, 1, 91, 11, 7)).unwrap();
     assert!(matches!(
-        state.apply_committed(bootstrap(2, 1, 91, 22, 8)),
+        state.apply_committed(bootstrap(3, 1, 91, 22, 8)),
         Err(OwnershipError::AlreadyBootstrapped { .. })
     ));
-    assert_eq!(state.applied_index(), 1);
+    assert_eq!(state.applied_index(), 3);
+    state.authorize_writer(tablet(91), node(11), 7).unwrap();
 }
 
 #[test]
