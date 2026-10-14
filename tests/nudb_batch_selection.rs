@@ -76,6 +76,14 @@ fn selections_reject_cross_batch_length_mismatch() {
 
     assert_eq!(one.and(&two), Err(SelectionError::LengthMismatch { left: 1, right: 2 }));
     assert_eq!(two.or(&one), Err(SelectionError::LengthMismatch { left: 2, right: 1 }));
+
+    // Same shape is not enough: physical positions belong to their own batch.
+    let another_small = TabletScanBatch {
+        rows: vec![TabletScanRow { key: b"other", value: b"3" }],
+    };
+    let other_one = SelectionBitmap::from_predicate(&another_small, |_| true);
+    assert_eq!(one.and(&other_one), Err(SelectionError::DifferentBatch));
+    assert_eq!(other_one.or(&one), Err(SelectionError::DifferentBatch));
 }
 
 #[test]
