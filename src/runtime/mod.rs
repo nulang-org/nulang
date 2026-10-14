@@ -5469,6 +5469,13 @@ impl Runtime {
     /// any other state captured in workflow events.
     pub fn recover_actor(&mut self, actor_id: u64) -> Option<u64> {
         let snapshot = self.persistence.load_snapshot(actor_id)?;
+        if snapshot.actor_id != actor_id {
+            warn!(
+                "nulang-recover: refusing actor {}: snapshot belongs to actor {}",
+                actor_id, snapshot.actor_id
+            );
+            return None;
+        }
         if snapshot.activation_epoch == 0 {
             warn!(
                 "nulang-recover: refusing actor {} with invalid activation epoch 0",
@@ -5663,31 +5670,26 @@ impl Runtime {
             (selected_meta.as_ref(), self.recovery_modules.get(&actor_id))
         {
             for entry in &journal_to_replay {
-                if behavior_ownership::module_behavior_index_for_runtime_id(
+                if let Err(error) = behavior_ownership::validate_replayed_behavior(
                     module,
                     &meta.name,
                     entry.behavior_id as usize,
-                )
-                .is_none()
-                {
-                    warn!(
-                        "nulang-recover: refusing actor {}: journal behavior id {} is not owned by schema '{}'",
-                        actor_id, entry.behavior_id, meta.name
-                    );
+                    entry.payload.len(),
+                ) {
+                    warn!("nulang-recover: refusing actor {}: {}", actor_id, error);
                     return None;
                 }
             }
             if let Some((_, entry)) = &pending_atomic_workflow_replay {
-                if behavior_ownership::module_behavior_index_for_runtime_id(
+                if let Err(error) = behavior_ownership::validate_replayed_behavior(
                     module,
                     &meta.name,
                     entry.behavior_id as usize,
-                )
-                .is_none()
-                {
+                    entry.payload.len(),
+                ) {
                     warn!(
-                        "nulang-recover: refusing workflow actor {}: unfinished atomic command behavior id {} is not owned by schema '{}'",
-                        actor_id, entry.behavior_id, meta.name
+                        "nulang-recover: refusing workflow actor {}: {}",
+                        actor_id, error
                     );
                     return None;
                 }
@@ -6021,6 +6023,12 @@ impl Runtime {
         expected_schema_name: Option<&str>,
         runtime_name: Option<String>,
     ) -> Result<Actor, String> {
+        if snapshot.actor_id != actor_id {
+            return Err(format!(
+                "actor {} snapshot belongs to different actor {}",
+                actor_id, snapshot.actor_id
+            ));
+        }
         if snapshot.activation_epoch == 0 {
             return Err(format!(
                 "actor {} snapshot has invalid activation epoch 0",
@@ -6178,6 +6186,34 @@ impl Runtime {
         );
 
         let snapshot = self.persistence.load_snapshot(stable_actor_id);
+
+        // Verify the entire post-snapshot command journal before exposing a
+        // hydrated grain. A foreign behavior or wrong arity must not execute
+        // under the requested virtual-actor schema.
+        if let Some(ref snap) = snapshot {
+            for entry in self
+                .persistence
+                .read_journal(stable_actor_id)
+                .iter()
+                .filter(|entry| entry.sequence > snap.sequence)
+            {
+                if let Err(error) = behavior_ownership::validate_replayed_behavior(
+                    &grain_type.module,
+                    &grain_id.grain_type,
+                    entry.behavior_id as usize,
+                    entry.payload.len(),
+                ) {
+                    return Err(NuError::RuntimeError {
+                        msg: format!(
+                            "invalid durable journal for virtual actor {}: {}",
+                            grain_id.actor_name(),
+                            error
+                        ),
+                        span: Span::new(0, 0),
+                    });
+                }
+            }
+        }
 
         let actor = if let Some(ref snap) = snapshot {
             Self::restore_actor_from_snapshot(
