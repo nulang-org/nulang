@@ -410,7 +410,18 @@ impl Mailbox {
     /// in-memory primitive; it is not a persisted or crash-proof inbox.
     pub fn begin_durable_admission(&mut self) -> Option<&Message> {
         if self.pending_durable_admission.is_none() {
-            self.pending_durable_admission = self.pop_uncommitted();
+            match self.pop_uncommitted() {
+                Some(message) if message.priority == MessagePriority::System => {
+                    // Supervision/monitor notifications use the runtime ABI,
+                    // not compiler-typed user command admission. Return them
+                    // to the highest-priority lane without releasing a slot.
+                    self.system_skip_buffer.push_front((message, false));
+                    self.active_match = None;
+                    self.invalidate_receive_indexes();
+                    return None;
+                }
+                other => self.pending_durable_admission = other,
+            }
             if self.pending_durable_admission.is_some() {
                 self.active_match = None;
                 self.invalidate_receive_indexes();
@@ -428,6 +439,32 @@ impl Mailbox {
     /// A trusted host explicitly retries the same candidate and transition.
     pub fn has_pending_durable_admission(&self) -> bool {
         self.pending_durable_admission.is_some()
+    }
+
+    /// System supervision messages must remain runnable even if an ordinary
+    /// command is awaiting durable admission. Only checked on paused actors.
+    pub fn has_ready_system_message(&self) -> bool {
+        !self.system_skip_buffer.is_empty()
+            || !self.system_queue.is_empty()
+            || self
+                .local_queue
+                .iter()
+                .any(|message| message.priority == MessagePriority::System)
+    }
+
+    /// Bypass a pending normal admission solely for system-priority messages.
+    fn pop_ready_system(&mut self) -> Option<Message> {
+        self.system_skip_buffer
+            .pop_front()
+            .map(|(message, _)| message)
+            .or_else(|| self.system_queue.pop())
+            .or_else(|| {
+                let index = self
+                    .local_queue
+                    .iter()
+                    .position(|message| message.priority == MessagePriority::System)?;
+                self.local_queue.remove(index)
+            })
     }
 
     /// Commit admission and only then release its mailbox slot.
@@ -467,10 +504,11 @@ impl Mailbox {
     /// Legacy nontransactional receive remains unavailable while a durable
     /// candidate is pending. No caller may bypass persistence admission.
     pub fn pop(&mut self) -> Option<Message> {
-        if self.pending_durable_admission.is_some() {
-            return None;
-        }
-        let result = self.pop_uncommitted();
+        let result = if self.pending_durable_admission.is_some() {
+            self.pop_ready_system()
+        } else {
+            self.pop_uncommitted()
+        };
         if result.is_some() {
             self.active_match = None;
             self.invalidate_receive_indexes();
