@@ -521,3 +521,82 @@ fn grain_hydration_rejects_foreign_journal_behavior_before_publication() {
     assert!(error.to_string().contains("not owned"), "{error}");
     assert!(!rt.actors.contains_key(&actor_id));
 }
+
+#[test]
+fn recovery_rejects_unreplayed_journal_without_compiler_module() {
+    use nulang::runtime::JournalEntry;
+
+    let actor_id = 7104;
+    let mut rt = Runtime::new();
+    rt.persistence
+        .save_snapshot(ActorSnapshot {
+            actor_id,
+            ..ActorSnapshot::default()
+        })
+        .expect("legacy snapshot");
+    rt.persistence
+        .append_journal(
+            actor_id,
+            JournalEntry {
+                sequence: 1,
+                behavior_id: 0,
+                payload: vec![],
+            },
+        )
+        .expect("journal");
+
+    assert_eq!(
+        rt.recover_actor(actor_id),
+        None,
+        "without executable recovery metadata, a journal must not be silently ignored"
+    );
+    assert!(!rt.actors.contains_key(&actor_id));
+}
+
+#[test]
+fn grain_hydration_rejects_wrong_arity_before_publication() {
+    use nulang::runtime::JournalEntry;
+
+    let module = compile(
+        r#"
+        virtual entity Counter(key: String) {
+            state durable n: Int = 0
+            behavior add(delta: Int) { self.n = self.n + delta }
+        }
+        "#,
+    );
+    let behavior = u16::try_from(module.actor_metadata[0].behavior_indices[0])
+        .expect("behavior id");
+    let grain = GrainId::new("Counter", "replay-wrong-arity");
+    let mut rt = Runtime::new();
+    rt.register_module_grains(&module);
+    let actor_id = rt
+        .resolve_or_hydrate_grain(grain.clone())
+        .expect("fresh grain");
+    rt.actors.remove(&actor_id);
+    rt.grain_residents.remove(&grain);
+    rt.actor_grain_id.remove(&actor_id);
+    rt.persistence
+        .save_snapshot(ActorSnapshot {
+            actor_id,
+            schema_name: Some("Counter".to_string()),
+            ..ActorSnapshot::default()
+        })
+        .expect("snapshot");
+    rt.persistence
+        .append_journal(
+            actor_id,
+            JournalEntry {
+                sequence: 1,
+                behavior_id: behavior,
+                payload: vec![],
+            },
+        )
+        .expect("journal");
+
+    let error = rt
+        .resolve_or_hydrate_grain(grain)
+        .expect_err("wrong-arity replay must fail before publication");
+    assert!(error.to_string().contains("expects 1 arguments"), "{error}");
+    assert!(!rt.actors.contains_key(&actor_id));
+}
