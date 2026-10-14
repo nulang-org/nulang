@@ -464,6 +464,7 @@ impl FileFabricStreamStore {
         }
         let path = self.stream_dir(name).join("producer_state.json");
         let mut producers = read_producer_state(&path)?;
+        self.validate_producer_checkpoint_tail(name, &producers)?;
         let digest = producer_digest(payload);
 
         if let Some(pending) = producers.pending.clone() {
@@ -581,13 +582,36 @@ impl FileFabricStreamStore {
     }
 
     fn reject_unfinished_producer_intent(&self, name: &str) -> io::Result<()> {
-        if read_producer_state(&self.stream_dir(name).join("producer_state.json"))?
-            .pending
-            .is_some()
-        {
+        let producers = read_producer_state(&self.stream_dir(name).join("producer_state.json"))?;
+        self.validate_producer_checkpoint_tail(name, &producers)?;
+        if producers.pending.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "Fabric has an unfinished producer append; retry the pending token first",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_producer_checkpoint_tail(
+        &self,
+        name: &str,
+        producers: &ProducerStateFile,
+    ) -> io::Result<()> {
+        let tail = self
+            .states
+            .get(name)
+            .expect("stream state recovered")
+            .next_sequence
+            .saturating_sub(1);
+        if producers
+            .checkpoints
+            .values()
+            .any(|checkpoint| checkpoint.stream_sequence > tail)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric producer checkpoint exceeds recovered stream tail",
             ));
         }
         Ok(())
