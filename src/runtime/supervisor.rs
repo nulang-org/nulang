@@ -121,9 +121,9 @@ impl ChildSpec {
 /// registration wire into a fresh actor: state fields, the native behavior
 /// table, and the bytecode module with its behavior offsets.
 ///
-/// State values are captured shallowly: heap-pointer values still refer to
-/// the old incarnation's heap and are only meaningful while that heap is
-/// alive or retired.
+/// Initial values are captured in an independently owned, restorable form.
+/// Unsupported heap-backed values disable this template so a failed actor
+/// cannot be restarted with references into its old incarnation's heap.
 #[derive(Debug, Clone)]
 pub struct RestartTemplate {
     /// Independently owned initial state captured at registration.
