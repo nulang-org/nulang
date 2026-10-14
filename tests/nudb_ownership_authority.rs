@@ -16,7 +16,13 @@ fn tablet(value: u64) -> TabletId {
     TabletId::new(value).unwrap()
 }
 
-fn bootstrap(index: u64, term: u64, tablet_id: u64, owner: u64, epoch: u64) -> CommittedOwnershipEntry {
+fn bootstrap(
+    index: u64,
+    term: u64,
+    tablet_id: u64,
+    owner: u64,
+    epoch: u64,
+) -> CommittedOwnershipEntry {
     CommittedOwnershipEntry {
         index,
         term,
