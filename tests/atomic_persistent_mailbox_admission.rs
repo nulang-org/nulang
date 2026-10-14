@@ -174,3 +174,140 @@ fn admission_rejects_transient_actors_without_touching_durable_store() {
     assert_eq!(runtime.persistence.latest_sequence(actor_id), predecessor);
     assert_eq!(runtime.actors[&actor_id].mailbox.len(), 1);
 }
+
+#[derive(Default)]
+struct AcknowledgmentLossStore {
+    inner: nulang::runtime::MemoryStore,
+    fail_after_commit: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PersistenceStore for AcknowledgmentLossStore {
+    fn commit_transition(
+        &mut self,
+        transition: DurableTransition,
+    ) -> std::io::Result<nulang::runtime::DurableCommit> {
+        let commit = self.inner.commit_transition(transition)?;
+        if self
+            .fail_after_commit
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(std::io::Error::other("injected lost commit acknowledgment"));
+        }
+        Ok(commit)
+    }
+
+    fn save_snapshot(&mut self, snapshot: nulang::runtime::ActorSnapshot) -> std::io::Result<()> {
+        self.inner.save_snapshot(snapshot)
+    }
+
+    fn load_snapshot(&self, actor_id: u64) -> Option<nulang::runtime::ActorSnapshot> {
+        self.inner.load_snapshot(actor_id)
+    }
+
+    fn append_journal(&mut self, actor_id: u64, entry: JournalEntry) -> std::io::Result<()> {
+        self.inner.append_journal(actor_id, entry)
+    }
+
+    fn read_journal(&self, actor_id: u64) -> Vec<JournalEntry> {
+        self.inner.read_journal(actor_id)
+    }
+
+    fn append_workflow_event(
+        &mut self,
+        actor_id: u64,
+        event: nulang::runtime::WorkflowEvent,
+    ) -> std::io::Result<()> {
+        self.inner.append_workflow_event(actor_id, event)
+    }
+
+    fn read_workflow_events(&self, actor_id: u64) -> Vec<nulang::runtime::WorkflowEvent> {
+        self.inner.read_workflow_events(actor_id)
+    }
+
+    fn append_event(
+        &mut self,
+        actor_id: u64,
+        event: nulang::runtime::EventEntry,
+    ) -> std::io::Result<()> {
+        self.inner.append_event(actor_id, event)
+    }
+
+    fn read_events(&self, actor_id: u64) -> Vec<nulang::runtime::EventEntry> {
+        self.inner.read_events(actor_id)
+    }
+
+    fn latest_sequence(&self, actor_id: u64) -> u64 {
+        self.inner.latest_sequence(actor_id)
+    }
+
+    fn clear(&mut self, actor_id: u64) -> std::io::Result<()> {
+        self.inner.clear(actor_id)
+    }
+}
+
+#[test]
+fn lost_commit_acknowledgment_retries_same_transition_without_duplicate_journal() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let (module, behavior, _) = compiled_counter();
+    let lose_ack = Arc::new(AtomicBool::new(false));
+    let mut runtime = Runtime::new();
+    runtime.persistence = Box::new(AcknowledgmentLossStore {
+        inner: nulang::runtime::MemoryStore::new(),
+        fail_after_commit: Arc::clone(&lose_ack),
+    });
+    let actor_id = runtime
+        .spawn_from_module(&module, behavior as usize, vec![])
+        .as_actor_id()
+        .expect("spawn persistent Counter");
+    let predecessor = runtime.persistence.latest_sequence(actor_id);
+    runtime.send_message_by_id(actor_id, behavior, &[Value::int(5)]);
+
+    let same_turn = command(&runtime, actor_id, behavior, predecessor, 5);
+    lose_ack.store(true, Ordering::SeqCst);
+
+    assert!(runtime
+        .admit_next_typed_actor_command(actor_id, same_turn.clone())
+        .is_err());
+    assert_eq!(
+        runtime.persistence.latest_sequence(actor_id),
+        predecessor + 1,
+        "the original transaction did commit despite the lost acknowledgment"
+    );
+    assert_eq!(runtime.actors[&actor_id].mailbox.len(), 1);
+    assert_eq!(runtime.persistence.read_journal(actor_id).len(), 1);
+
+    let (message, committed) = runtime
+        .admit_next_typed_actor_command(actor_id, same_turn)
+        .expect("repeat exact transition is idempotent")
+        .expect("original message now acknowledged");
+    assert_eq!(message.payload[0].as_int(), Some(5));
+    assert_eq!(committed.sequence, predecessor + 1);
+    assert_eq!(runtime.persistence.read_journal(actor_id).len(), 1);
+    assert!(runtime.actors[&actor_id].mailbox.is_empty());
+}
+
+#[test]
+fn command_admission_rejects_outbox_and_external_effect_dispatch() {
+    let (mut runtime, actor_id, behavior, _) = spawned();
+    let predecessor = runtime.persistence.latest_sequence(actor_id);
+    runtime.send_message_by_id(actor_id, behavior, &[Value::int(5)]);
+    let mut unsafe_turn = command(&runtime, actor_id, behavior, predecessor, 5);
+    unsafe_turn.outbox.push(nulang::runtime::DurableOutboxMessage {
+        destination_actor_id: actor_id + 1,
+        ordinal: 0,
+        behavior_id: behavior,
+        payload: vec![PersistedValue::Int(5)],
+    });
+
+    assert_eq!(
+        runtime
+            .admit_next_typed_actor_command(actor_id, unsafe_turn)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    assert_eq!(runtime.actors[&actor_id].mailbox.len(), 1);
+    assert_eq!(runtime.persistence.latest_sequence(actor_id), predecessor);
+}
