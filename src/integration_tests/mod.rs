@@ -12373,7 +12373,9 @@ match { a: 2, b: 9 } with {
             vm.run().expect("spawn compiled workflow")
         };
         let actor_id = reference.as_actor_id().expect("workflow actor id");
-        let initial = backing.load_snapshot(actor_id).expect("initial durable checkpoint");
+        let initial = backing
+            .load_snapshot(actor_id)
+            .expect("initial durable checkpoint");
         assert_eq!(
             initial.state.get("answer"),
             Some(&crate::runtime::PersistedValue::String(String::new())),
@@ -12381,12 +12383,19 @@ match { a: 2, b: 9 } with {
         );
         rt.borrow_mut().send_message_by_id(actor_id, 0, &[]);
         rt.borrow_mut().run_scheduler();
-        let saved = backing.load_snapshot(actor_id).expect("durable step checkpoint");
+        let saved = backing
+            .load_snapshot(actor_id)
+            .expect("durable step checkpoint");
         assert_eq!(
             saved.state.get("answer"),
-            Some(&crate::runtime::PersistedValue::String("persisted-answer".to_string()))
+            Some(&crate::runtime::PersistedValue::String(
+                "persisted-answer".to_string()
+            ))
         );
-        assert!(!saved.state.contains_key("temporary"), "local state must not be checkpointed");
+        assert!(
+            !saved.state.contains_key("temporary"),
+            "local state must not be checkpointed"
+        );
         assert_eq!(
             saved.state.get("step_index"),
             Some(&crate::runtime::PersistedValue::Int(1))
@@ -12511,11 +12520,15 @@ match { a: 2, b: 9 } with {
             ))
         );
         assert_eq!(
-            actor.get_state_field("step_index").and_then(|value| value.as_int()),
+            actor
+                .get_state_field("step_index")
+                .and_then(|value| value.as_int()),
             Some(1)
         );
         assert_ne!(
-            actor.get_state_field("scratch").and_then(|value| value.as_int()),
+            actor
+                .get_state_field("scratch")
+                .and_then(|value| value.as_int()),
             Some(77),
             "process-local state must not be restored from a durable snapshot"
         );
