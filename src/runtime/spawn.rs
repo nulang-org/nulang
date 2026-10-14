@@ -88,6 +88,21 @@ fn preflight_persistent_snapshot(
     let Some(snapshot) = rt.persistence.load_snapshot(actor_id) else {
         return Ok(None);
     };
+    if snapshot.strict_admission_policy_version > 1 {
+        return Err("unknown persisted strict admission policy version".to_string());
+    }
+    if snapshot.strict_admission_policy_version == 1 && expected_schema.is_none() {
+        return Err("strict policy requires compiler-owned actor schema".to_string());
+    }
+    // The snapshot cannot be replayed over an unfinished atomic command.
+    if snapshot.strict_admission_policy_version == 1 {
+        let tail = rt.persistence.load_durable_tail_position(actor_id)
+            .map_err(|error| format!("strict policy tail read failed: {error}"))?
+            .ok_or_else(|| "strict policy has no atomic tail".to_string())?;
+        if tail.sequence != snapshot.sequence || tail.activation_epoch != snapshot.activation_epoch {
+            return Err("strict policy does not match the committed actor tail".to_string());
+        }
+    }
     let manifest =
         AuthorityManifest::from_tokens(snapshot.authority_tokens.iter().map(String::as_str))
             .map_err(|error| error.to_string())?;
@@ -271,6 +286,9 @@ fn restore_persistent_state(
     // before the actor was initialized or made observable.
     if let Some((snapshot, authority)) = snapshot {
         actor.install_authority_manifest(&authority);
+        if snapshot.strict_admission_policy_version == 1 {
+            actor.mailbox.require_strict_durable_admission();
+        }
         actor.sequence = snapshot.sequence;
         actor.activation_epoch = snapshot.activation_epoch;
         actor.waiting_signal = snapshot.waiting_signal;
