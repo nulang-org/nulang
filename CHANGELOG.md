@@ -1,4 +1,9 @@
 # Nulang Changelog
+
+### Linux distribution packages — 2026-10-14
+- **Future tagged releases will include Debian and RPM packages for Linux x86_64 and aarch64**, alongside the existing checksummed tarballs. Release CI builds the packages from the exact tested CLI binary and validates checksums, architecture metadata, executable payloads, and Linux native smoke execution before publication.
+- **Linux release builds target the Ubuntu 22.04 glibc 2.35 / OpenSSL 3 baseline** rather than drifting with the latest GitHub Actions image. This does not guarantee support for older-glibc enterprise distributions or Alpine/musl; clean-host installation remains a release gate.
+
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
