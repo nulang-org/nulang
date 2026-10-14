@@ -42,6 +42,7 @@ class DocsSyncPolicyTests(unittest.TestCase):
         self.assertIn("if git diff --cached --quiet", self.workflow)
         self.assertIn("::warning::Generated docs differ from main", self.workflow)
         self.assertIn("      - name: Ping DeepWiki to refresh index", self.workflow)
+        self.assertNotIn("      - name: Open", self.workflow)
 
 
 if __name__ == "__main__":

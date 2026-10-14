@@ -76,7 +76,7 @@ jobs:
         # This step validates the exact generated site before assets are
         # archived for review as generated assets (no protected-branch writes).
 
-      - name: Open      # Keep generated output recoverable even when organization-wide branch
+      # Keep generated output recoverable even when organization-wide branch
       # rules require reviewed PRs for all branch writes.
       - name: Archive generated docs and playground
         uses: actions/upload-artifact@v7
