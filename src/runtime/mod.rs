@@ -5666,6 +5666,14 @@ impl Runtime {
                 .filter(|entry| entry.sequence > snapshot.sequence)
                 .collect()
         };
+        if !journal_to_replay.is_empty() && !self.recovery_modules.contains_key(&actor_id) {
+            warn!(
+                "nulang-recover: refusing actor {}: {} journal commands require registered executable recovery metadata",
+                actor_id,
+                journal_to_replay.len()
+            );
+            return None;
+        }
         if let (Some(meta), Some((module, _, _))) =
             (selected_meta.as_ref(), self.recovery_modules.get(&actor_id))
         {
