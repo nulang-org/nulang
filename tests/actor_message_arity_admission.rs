@@ -45,13 +45,26 @@ fn durable_actor_rejects_missing_argument_without_journaling() {
     rt.run_scheduler();
 
     assert_eq!(rt.persistence.read_journal(actor_id).len(), initial_journal);
-    assert_eq!(rt.actors[&actor_id].get_state_field("total").and_then(|v| v.as_int()), Some(0));
+    assert_eq!(
+        rt.actors[&actor_id]
+            .get_state_field("total")
+            .and_then(|v| v.as_int()),
+        Some(0)
+    );
 
     rt.send_message_by_id(actor_id, behavior_id, &[Value::int(4)]);
     rt.run_scheduler();
 
-    assert_eq!(rt.persistence.read_journal(actor_id).len(), initial_journal + 1);
-    assert_eq!(rt.actors[&actor_id].get_state_field("total").and_then(|v| v.as_int()), Some(4));
+    assert_eq!(
+        rt.persistence.read_journal(actor_id).len(),
+        initial_journal + 1
+    );
+    assert_eq!(
+        rt.actors[&actor_id]
+            .get_state_field("total")
+            .and_then(|v| v.as_int()),
+        Some(4)
+    );
 }
 
 #[test]
@@ -63,7 +76,12 @@ fn durable_actor_rejects_extra_argument_without_journaling() {
     rt.run_scheduler();
 
     assert_eq!(rt.persistence.read_journal(actor_id).len(), initial_journal);
-    assert_eq!(rt.actors[&actor_id].get_state_field("total").and_then(|v| v.as_int()), Some(0));
+    assert_eq!(
+        rt.actors[&actor_id]
+            .get_state_field("total")
+            .and_then(|v| v.as_int()),
+        Some(0)
+    );
 }
 
 #[test]
@@ -73,7 +91,12 @@ fn synchronous_actor_ask_rejects_wrong_arity_before_execution() {
         .ask_actor_sync(actor_id, behavior_id, &[])
         .expect_err("wrong argument count must be rejected");
     assert!(error.to_string().contains("expects 1 argument"), "{error}");
-    assert_eq!(rt.actors[&actor_id].get_state_field("total").and_then(|v| v.as_int()), Some(0));
+    assert_eq!(
+        rt.actors[&actor_id]
+            .get_state_field("total")
+            .and_then(|v| v.as_int()),
+        Some(0)
+    );
 }
 
 #[test]
@@ -84,5 +107,10 @@ fn malformed_queued_message_is_not_executed_during_synchronous_mailbox_flush() {
         .ask_actor_sync(actor_id, behavior_id, &[Value::int(7)])
         .expect("valid ask executes");
     let _ = result;
-    assert_eq!(rt.actors[&actor_id].get_state_field("total").and_then(|v| v.as_int()), Some(7));
+    assert_eq!(
+        rt.actors[&actor_id]
+            .get_state_field("total")
+            .and_then(|v| v.as_int()),
+        Some(7)
+    );
 }
