@@ -87,8 +87,8 @@ impl DeploymentIr {
 ///
 /// `routes` are the routes collected by running the compiled entry point.
 /// `signal_graph_path` is the optional path to `app.signals.json` emitted by
-/// the reactivity pass. `src_root` is the package `src/` directory used both
-/// for static contract extraction and legacy capability/module discovery.
+/// the reactivity pass. `src_root` is the package `src/` directory used
+/// for legacy capability/module discovery, not route-contract extraction.
 /// `budgets` are parsed from `Nulang.toml`. `contracts` must be the
 /// validated package compilation also used to attach runtime route plans.
 /// Do not rediscover contracts here: doing so can diverge from validation.
