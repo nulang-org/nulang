@@ -176,3 +176,102 @@ fn bootstrap_cannot_steal_existing_tablet_or_use_zero_epoch() {
     ));
     assert_eq!(state.applied_index(), 1);
 }
+
+#[test]
+fn committed_owner_grant_must_agree_with_the_durable_wal_epoch() {
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use nulang::database::store::{WalBackedError, WalBackedTablet};
+    use nulang::database::tablet::{
+        KeyRange, TabletDescriptor, TabletError, TabletMutation, TransactionId,
+    };
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+
+    let path = std::env::temp_dir().join(format!(
+        "nudb_authority_{}_{}.wal",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(path.with_extension("checkpoint"));
+    let descriptor = |epoch| {
+        TabletDescriptor::new(
+            tablet(91),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            epoch,
+        )
+        .unwrap()
+    };
+    let mutations = |value: &[u8]| {
+        vec![TabletMutation::Put {
+            key: b"k".to_vec(),
+            value: value.to_vec(),
+        }]
+    };
+
+    let mut state = OwnershipStateMachine::new();
+    state.apply_committed(bootstrap(1, 1, 91, 11, 7)).unwrap();
+    let mut wal = WalBackedTablet::open(descriptor(7), &path).unwrap();
+    let first = wal
+        .commit_with_ownership(
+            &state,
+            node(11),
+            7,
+            TransactionId::new([1; 16]),
+            mutations(b"first"),
+        )
+        .unwrap();
+    assert_eq!(first.sequence(), 1);
+
+    state.apply_committed(transfer(2, 2, 91, 11, 7, 22, 9)).unwrap();
+    assert!(matches!(
+        wal.commit_with_ownership(
+            &state, node(11), 7, TransactionId::new([2; 16]), mutations(b"stale")
+        ),
+        Err(WalBackedError::Ownership(OwnershipError::StaleEpoch { .. }))
+    ));
+    assert!(matches!(
+        wal.commit_with_ownership(
+            &state, node(22), 9, TransactionId::new([2; 16]), mutations(b"new")
+        ),
+        Err(WalBackedError::Tablet(TabletError::UnknownEpoch { .. }))
+    ));
+    assert_eq!(wal.current_sequence(), 1);
+
+    assert_eq!(wal.install_committed_ownership(&state, node(22)).unwrap(), 2);
+    let new_receipt = wal
+        .commit_with_ownership(
+            &state, node(22), 9, TransactionId::new([2; 16]), mutations(b"new")
+        )
+        .unwrap();
+    assert_eq!(new_receipt.sequence(), 3);
+    assert_eq!(wal.read_latest(b"k"), Some(&b"new"[..]));
+    drop(wal);
+
+    let mut replayed = OwnershipStateMachine::new();
+    replayed.apply_committed(bootstrap(1, 1, 91, 11, 7)).unwrap();
+    replayed.apply_committed(transfer(2, 2, 91, 11, 7, 22, 9)).unwrap();
+    let mut reopened = WalBackedTablet::open(descriptor(9), &path).unwrap();
+    assert_eq!(
+        reopened
+            .commit_with_ownership(
+                &replayed, node(22), 9,
+                TransactionId::new([2; 16]), mutations(b"new")
+            )
+            .unwrap(),
+        new_receipt
+    );
+    assert_eq!(reopened.current_sequence(), 3);
+    assert!(matches!(
+        reopened.commit_with_ownership(
+            &replayed, node(11), 7, TransactionId::new([1; 16]), mutations(b"first")
+        ),
+        Err(WalBackedError::Ownership(OwnershipError::StaleEpoch { .. }))
+    ));
+    drop(reopened);
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(path.with_extension("checkpoint"));
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let _ = fs::remove_file(std::path::PathBuf::from(lock_path));
+}
