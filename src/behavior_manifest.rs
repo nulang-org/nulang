@@ -1002,6 +1002,119 @@ mod tests {
     }
 
     #[test]
+    fn unattended_preflight_allows_exact_durable_executable_with_package_relabel() {
+        let previous = base_manifest(actor(1, b"schema-v1"));
+        let mut incoming = previous.clone();
+        incoming.package.version = "1.0.1".to_string();
+
+        let report = incoming.upgrade_preflight_from(&previous).unwrap();
+        assert!(report.unverified.is_empty());
+        incoming
+            .validate_unattended_upgrade_from(
+                &previous,
+                b"artifact-bytes",
+                b"artifact-bytes",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn unattended_preflight_blocks_unverified_code_change_even_without_schema_drift() {
+        let previous = base_manifest(actor(1, b"schema-v1"));
+        let mut incoming = previous.clone();
+        incoming.artifact.digest = artifact_digest(b"new-executable");
+
+        // Structural compatibility alone must not authorize a replacement
+        // of the code that will interpret persisted histories.
+        incoming.validate_upgrade_from(&previous).unwrap();
+        let report = incoming.upgrade_preflight_from(&previous).unwrap();
+        assert_eq!(
+            report.unverified,
+            vec![UpgradeEvidenceGap::DurableExecutableChanged {
+                actor: "payments::Account".to_string(),
+            }]
+        );
+        assert!(matches!(
+            incoming.validate_unattended_upgrade_from(
+                &previous,
+                b"artifact-bytes",
+                b"new-executable",
+            ),
+            Err(BehaviorAdmissionError::UnverifiedDurableUpgrade { .. })
+        ));
+    }
+
+    #[test]
+    fn unattended_preflight_identifies_every_unverified_migration_transition() {
+        let previous = base_manifest(actor(1, b"schema-v1"));
+        let incoming = base_manifest(actor(3, b"schema-v3"));
+        incoming.validate_upgrade_from(&previous).unwrap();
+        let report = incoming.upgrade_preflight_from(&previous).unwrap();
+        assert_eq!(
+            report.unverified,
+            vec![
+                UpgradeEvidenceGap::MigrationExecutionUnverified {
+                    actor: "payments::Account".to_string(),
+                    from: 1,
+                    to: 2,
+                },
+                UpgradeEvidenceGap::MigrationExecutionUnverified {
+                    actor: "payments::Account".to_string(),
+                    from: 2,
+                    to: 3,
+                },
+            ]
+        );
+        assert!(matches!(
+            incoming.validate_unattended_upgrade_from(
+                &previous,
+                b"artifact-bytes",
+                b"artifact-bytes",
+            ),
+            Err(BehaviorAdmissionError::UnverifiedDurableUpgrade { .. })
+        ));
+    }
+
+    #[test]
+    fn unattended_preflight_does_not_require_replay_for_ephemeral_only_updates() {
+        let mut previous = base_manifest(actor(1, b"schema-v1"));
+        previous.actors[0].persistence = BehaviorPersistence::Ephemeral;
+        let mut incoming = previous.clone();
+        incoming.artifact.digest = artifact_digest(b"changed-ephemeral-binary");
+        assert!(incoming.upgrade_preflight_from(&previous).unwrap().unverified.is_empty());
+        incoming
+            .validate_unattended_upgrade_from(
+                &previous,
+                b"artifact-bytes",
+                b"changed-ephemeral-binary",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn unattended_preflight_fails_closed_on_artifact_mismatch_and_schema_drift() {
+        let previous = base_manifest(actor(1, b"schema-v1"));
+        let incoming = previous.clone();
+
+        assert!(matches!(
+            incoming.validate_unattended_upgrade_from(
+                &previous,
+                b"artifact-bytes",
+                b"tampered",
+            ),
+            Err(BehaviorAdmissionError::InvalidIncomingManifest(
+                BehaviorManifestError::ArtifactDigestMismatch { .. }
+            ))
+        ));
+
+        let changed_schema = base_manifest(actor(1, b"schema-v2"));
+        assert!(matches!(
+            changed_schema.upgrade_preflight_from(&previous),
+            Err(BehaviorAdmissionError::UnversionedSchemaChange { .. })
+        ));
+    }
+
+    #[test]
     fn tampered_artifact_binding_fails_closed() {
         let valid = base_manifest(actor(1, b"schema-v1"));
         let mut value: serde_json::Value =
