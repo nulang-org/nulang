@@ -23,6 +23,27 @@ On pull requests, the version-tag check is skipped (there is no tag) and the
 positive execution evidence. This does **not** replace clean-machine checks,
 particularly native Linux arm64 execution.
 
+**Exact-head CI publication gate:** A pushed release tag must resolve to a
+commit on `main` whose most recent `CI` **push** workflow run has completed
+successfully. The release preflight reads the GitHub Actions API and verifies
+that the default, minimal, WASM, release, lint/audit, documentation, package,
+and Lean jobs each actually completed successfully. Queued, skipped, cancelled,
+missing, zero-job, or incomplete API evidence fails closed before release
+artifacts are built/published. A successful PR check for another SHA is not
+sufficient. The tag preflight requires `GITHUB_TOKEN` with `actions: read`.
+
+The verifier and its failure-case tests are checked in at
+`scripts/check_release_ci_proof.py` and
+`scripts/tests/test_release_ci_proof.py`. To run the offline policy tests:
+
+```bash
+python3 -m unittest discover -s scripts/tests -p test_release_ci_proof.py
+```
+
+**Scope:** This proves the exact tagged code passed the required CI lanes; it
+does not certify Nulang's experimental durable, distributed, or AI runtime
+features for production, nor replace independent review or branch protection.
+
 ## 3. Tag and push
 
 Only after the release candidate passes the checklist and all required reviews,
