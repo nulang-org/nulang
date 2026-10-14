@@ -957,3 +957,134 @@ mod transactional_receive_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod bounded_admission_conformance_tests {
+    use super::*;
+    use std::thread;
+
+    fn msg(id: u16, priority: MessagePriority) -> Message {
+        Message {
+            behavior_id: id,
+            payload: MessagePayload::from_slice(&[Value::int(id as i64)]),
+            sender: id as u64,
+            priority,
+            trace_id: None,
+        }
+    }
+
+    #[test]
+    fn system_messages_bypass_capacity_without_considering_it_occupied() {
+        let mut mb = Mailbox::new(2);
+        for id in 1..=3 {
+            mb.push(msg(id, MessagePriority::System)).unwrap();
+        }
+        mb.push(msg(4, MessagePriority::Normal))
+            .expect("system traffic must not consume a normal slot");
+        mb.push_local(msg(5, MessagePriority::Bulk))
+            .expect("the second normal/bulk slot must remain available");
+        let rejected = msg(6, MessagePriority::Normal);
+        assert_eq!(mb.push(rejected.clone()), Err(rejected));
+        assert_eq!(mb.len(), 5);
+
+        for expected in 1..=3 {
+            assert_eq!(mb.pop().unwrap().behavior_id, expected);
+        }
+        assert_eq!(mb.pop().unwrap().behavior_id, 5);
+        assert_eq!(mb.pop().unwrap().behavior_id, 4);
+        assert!(mb.is_empty());
+    }
+
+    #[test]
+    fn staged_system_signal_does_not_consume_a_normal_slot() {
+        let mut mb = Mailbox::new(1);
+        mb.push(msg(1, MessagePriority::System)).unwrap();
+        assert!(mb.receive_match(&[1]).is_some());
+
+        mb.push(msg(2, MessagePriority::Normal))
+            .expect("staged supervisor signal must not block normal admission");
+        assert!(mb.push(msg(3, MessagePriority::Normal)).is_err());
+        mb.commit_receive_match().expect("commit system signal");
+        assert_eq!(mb.len(), 1);
+        assert!(mb.push(msg(4, MessagePriority::Normal)).is_err());
+        assert_eq!(mb.pop().unwrap().behavior_id, 2);
+        mb.push(msg(4, MessagePriority::Normal))
+            .expect("normal credit returns only after consuming normal message");
+    }
+
+    #[test]
+    fn rejected_message_is_owned_by_sender_and_can_retry_after_pop() {
+        let mut mb = Mailbox::new(1);
+        mb.push(msg(1, MessagePriority::Normal)).unwrap();
+        let attempted = msg(2, MessagePriority::Bulk);
+        let rejected = mb.push(attempted.clone()).expect_err("bounded queue full");
+        assert_eq!(rejected, attempted);
+        assert_eq!(mb.len(), 1);
+
+        assert_eq!(mb.pop().unwrap().behavior_id, 1);
+        mb.push(rejected).expect("retry after a credit is released");
+        assert_eq!(mb.pop().unwrap().behavior_id, 2);
+    }
+
+    #[test]
+    fn selective_receive_keeps_normal_credit_until_commit() {
+        let mut mb = Mailbox::new(1);
+        mb.push(msg(1, MessagePriority::Normal)).unwrap();
+        assert!(mb.receive_match(&[1]).is_some());
+        assert!(mb.push(msg(2, MessagePriority::Normal)).is_err());
+        mb.commit_receive_match().expect("commit matched normal message");
+        mb.push(msg(2, MessagePriority::Normal))
+            .expect("commit releases the reserved normal credit");
+    }
+
+    #[test]
+    fn reset_releases_credits_even_for_staged_normal_messages() {
+        let mut mb = Mailbox::new(1);
+        mb.push(msg(1, MessagePriority::Normal)).unwrap();
+        assert!(mb.receive_match(&[1]).is_some());
+        mb.reset(1);
+        assert!(mb.is_empty());
+        mb.push(msg(2, MessagePriority::Normal))
+            .expect("reset must release staged and live credits");
+        assert!(mb.push(msg(3, MessagePriority::Normal)).is_err());
+    }
+
+    #[test]
+    fn concurrent_normal_producers_cannot_exceed_capacity_under_system_flood() {
+        let mailbox = Arc::new(Mailbox::new(32));
+        for id in 0..256 {
+            mailbox
+                .push(msg(id, MessagePriority::System))
+                .expect("system messages must never be capacity-rejected");
+        }
+
+        let mut handles = Vec::new();
+        for producer in 0..8 {
+            let mb = Arc::clone(&mailbox);
+            handles.push(thread::spawn(move || {
+                let mut accepted = 0;
+                for i in 0..40 {
+                    if mb
+                        .push(msg(300 + producer * 40 + i, MessagePriority::Normal))
+                        .is_ok()
+                    {
+                        accepted += 1;
+                    }
+                }
+                accepted
+            }));
+        }
+
+        let admitted: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(admitted, 32, "normal capacity must be exactly bounded");
+        assert_eq!(mailbox.len(), 256 + 32);
+        let mut mailbox = Arc::try_unwrap(mailbox).expect("all producers finished");
+        for _ in 0..256 {
+            assert_eq!(mailbox.pop().unwrap().priority, MessagePriority::System);
+        }
+        for _ in 0..32 {
+            assert_eq!(mailbox.pop().unwrap().priority, MessagePriority::Normal);
+        }
+        assert!(mailbox.is_empty());
+    }
+}
