@@ -52,12 +52,12 @@ class CrossRuntimeRecordTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "runtime"):
             bench.parse_records(fixture("erlang"), "rust")
 
-    def test_rejects_unknown_workload_instead_of_ignoring(self):
-        with self.assertRaisesRegex(RuntimeError, "unknown benchmark"):
-            bench.parse_records(
-                fixture() + "\n[cross-bench] runtime=rust benchmark=other messages=1 elapsed_ns=3",
-                "rust",
-            )
+    def test_allows_additional_valid_noncomparable_workload(self):
+        records = bench.parse_records(
+            fixture() + "\n[cross-bench] runtime=rust benchmark=skynet messages=1 elapsed_ns=3",
+            "rust",
+        )
+        self.assertEqual(set(COUNTS), set(records))
 
     def test_rejects_missing_workload(self):
         with self.assertRaisesRegex(RuntimeError, "did not emit"):
