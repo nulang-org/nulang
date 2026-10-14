@@ -198,6 +198,10 @@ name = "nulang"
 path = "src/main.rs"
 
 [[bin]]
+name = "nulang-execution-preflight"
+path = "src/bin/nulang_execution_preflight.rs"
+
+[[bin]]
 name = "nula_difffuzz"
 path = "src/bin/nula_difffuzz.rs"
 required-features = ["difffuzz"]
