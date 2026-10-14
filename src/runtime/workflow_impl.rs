@@ -131,7 +131,7 @@ fn timer_set_replay_disposition(
 ///
 /// This is pure staging: callers decide whether the snapshot is committed as a
 /// legacy checkpoint or inside an atomic durable transition.
-fn build_actor_snapshot_at_sequence(
+pub(crate) fn build_actor_snapshot_at_sequence(
     rt: &Runtime,
     actor_id: u64,
     sequence: u64,
