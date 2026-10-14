@@ -499,3 +499,61 @@ fn unsupported_message_values_cannot_be_normalized_to_nil_in_durable_history() {
     assert_eq!(runtime.persistence.latest_sequence(actor_id), previous);
     assert_eq!(runtime.actors[&actor_id].mailbox.len(), 1);
 }
+
+#[test]
+fn completion_cannot_install_forged_external_authority_from_snapshot() {
+    let (mut runtime, actor_id, behavior, _) = spawned();
+    let previous = runtime.persistence.latest_sequence(actor_id);
+    runtime.send_message_by_id(actor_id, behavior, &[Value::int(5)]);
+    let first = command(&runtime, actor_id, behavior, previous, 5);
+    let (_, accepted) = runtime
+        .admit_next_typed_actor_command(actor_id, first)
+        .unwrap()
+        .expect("atomic admission");
+
+    let mut completion = runtime.persistence.load_snapshot(actor_id).unwrap_or_default();
+    completion.actor_id = actor_id;
+    completion.sequence = accepted.sequence + 1;
+    completion.activation_epoch = accepted.activation_epoch;
+    completion.schema_name = Some("Counter".into());
+    completion.state.insert("total".into(), PersistedValue::Int(5));
+    completion
+        .authority_tokens
+        .insert("Net::TcpOut(*)".to_string());
+    runtime
+        .persistence
+        .commit_transition(DurableTransition {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id,
+            activation_epoch: accepted.activation_epoch,
+            sequence: accepted.sequence + 1,
+            expected_previous_sequence: accepted.sequence,
+            command: None,
+            snapshot: Some(completion),
+            workflow_events: vec![],
+            domain_events: vec![],
+            durable_effects: vec![],
+            outbox: vec![],
+        })
+        .expect("stored completion, without granting host authority");
+
+    assert_eq!(
+        runtime
+            .finish_admitted_typed_actor_command(actor_id, accepted.sequence)
+            .expect_err("snapshot cannot grant new authority")
+            .kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        runtime.actors[&actor_id].mailbox.admitted_command_sequence(),
+        Some(accepted.sequence),
+        "untrusted completion must not release the next user command"
+    );
+    assert_eq!(
+        runtime.actors[&actor_id]
+            .get_state_field("total")
+            .and_then(|v| v.as_int()),
+        Some(0),
+        "untrusted completion must not publish state"
+    );
+}
