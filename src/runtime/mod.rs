@@ -1650,6 +1650,32 @@ impl Runtime {
         // Atomic storage commit first. If it fails, leave the actor's live
         // state untouched and its in-flight mailbox fence in place.
         let committed = self.persistence.commit_transition(transition)?;
+        // Deliberately dangerous test-only crash window. With the explicit
+        // fault-injection feature, the SIGKILL harness can observe a fully
+        // committed result before any live actor state/fence is published.
+        // Ordinary builds never compile this hook.
+        #[cfg(feature = "durability-fault-injection")]
+        if std::env::var("NULANG_TEST_CRASH_WINDOW").ok().as_deref()
+            == Some("after-staged-result-before-publish")
+            && std::env::var("NULANG_TEST_STAGED_RESULT_ACTOR")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                == Some(actor_id)
+        {
+            let marker = std::env::var_os("NULANG_TEST_READY").ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidInput,
+                    "staged result crash test requires a ready marker",
+                )
+            })?;
+            std::fs::write(
+                std::path::PathBuf::from(marker),
+                b"result-committed-before-live-publication",
+            )?;
+            loop {
+                std::thread::park();
+            }
+        }
         // This separately verifies exact tail/epoch/schema, authority and
         // state types, hydrates live state, then unlocks the next user turn.
         self.finish_admitted_typed_actor_command(actor_id, admitted_sequence)?;
