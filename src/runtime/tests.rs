@@ -1875,6 +1875,21 @@ fn monitor_reference_cleanup_on_watcher_exit_does_not_send_to_dead_actor() {
 }
 
 #[test]
+fn monitor_reference_survives_supervisor_shutdown_notification() {
+    let mut rt = Runtime::new();
+    let watcher = rt.spawn_actor(Box::new(Vec::new));
+    let supervisor_id = rt.create_supervisor("shutdown-root", RestartStrategy::OneForOne);
+    let reference = rt.monitor_ref(watcher, supervisor_id).expect("monitor supervisor");
+
+    let supervisor = rt.supervisors.remove(&supervisor_id).unwrap();
+    super::exit::shutdown_supervisor(&mut rt, supervisor_id, &supervisor);
+    let message = rt.actors.get_mut(&watcher).unwrap().mailbox.pop().unwrap();
+    assert_eq!(message.payload[3].as_int(), Some(reference.0 as i64));
+    assert!(!rt.demonitor_ref(watcher, reference));
+    assert!(rt.monitor_refs.is_empty());
+}
+
+#[test]
 fn test_monitor_target() {
     let mut rt = Runtime::new();
     let watcher = rt.spawn_actor(Box::new(|| vec![]));
