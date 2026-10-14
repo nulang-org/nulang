@@ -407,4 +407,40 @@ mod tests {
             let _ = fs::remove_file(PathBuf::from(lock));
         }
     }
+
+    #[test]
+    fn poisoned_replica_cannot_supply_a_false_quorum_ack() {
+        let key = NEXT.fetch_add(1, Ordering::Relaxed);
+        let paths: Vec<PathBuf> = (0..3)
+            .map(|i| {
+                std::env::temp_dir().join(format!(
+                    "nudb_quorum_poisoned_{}_{}_{}.log",
+                    std::process::id(), key, i
+                ))
+            })
+            .collect();
+        let mut log = FixedTermQuorumLog::open(&paths, 3).unwrap();
+        log.replicas[0].as_mut().unwrap().poisoned = true;
+        let command = OwnershipCommand::Bootstrap {
+            tablet: TabletId::new(18).unwrap(),
+            owner: NodeId::new(1).unwrap(),
+            epoch: 7,
+        };
+
+        // Only replicas 1 and 2 may vote. Repeated proposals cannot count
+        // the poisoned journal, even if an earlier write was ambiguous.
+        assert_eq!(log.propose(command).unwrap().committed_index, 1);
+        assert!(log.replicas[0].as_ref().unwrap().entries.is_empty());
+        drop(log);
+
+        let restored = FixedTermQuorumLog::open(&paths, 3).unwrap();
+        assert_eq!(restored.authority().applied_index(), 1);
+        drop(restored);
+        for path in paths {
+            let _ = fs::remove_file(&path);
+            let mut lock = path.as_os_str().to_os_string();
+            lock.push(".lock");
+            let _ = fs::remove_file(PathBuf::from(lock));
+        }
+    }
 }
