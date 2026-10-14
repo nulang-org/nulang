@@ -412,6 +412,35 @@ mod tests {
     }
 
     #[test]
+    fn test_python_integer_roundtrips_at_signed_48_bit_limits() {
+        let min = -(1_i64 << 47);
+        let max = (1_i64 << 47) - 1;
+        assert_eq!(vm_int_checked(min).unwrap().as_int(), Some(min));
+        assert_eq!(vm_int_checked(max).unwrap().as_int(), Some(max));
+    }
+
+    #[test]
+    fn test_python_integer_conversion_rejects_48_bit_overflow() {
+        let error = vm_int_checked(1_i64 << 47).unwrap_err();
+        assert!(error.contains("48-bit"), "{error}");
+        assert!(vm_int_checked(-(1_i64 << 47) - 1).is_err());
+        let error = owned_foreign_to_vm_value(
+            &crate::runtime::OwnedForeignValue::Int(i64::MAX),
+        ).unwrap_err();
+        assert!(error.contains("48-bit"), "{error}");
+    }
+
+    #[test]
+    fn test_python_integer_conversion_rejects_unbounded_bigints() {
+        let value = Python::attach(|py| {
+            let builtins = py.import("builtins").unwrap();
+            let large = builtins.call_method1("int", ("999999999999999999999999999999",)).unwrap();
+            python_to_nulang(&large)
+        });
+        assert!(value.unwrap_err().contains("64-bit"));
+    }
+
+    #[test]
     fn test_unresolved_vm_string_never_becomes_a_python_placeholder() {
         let error = nulang_to_python(Value::string(42))
             .err()
