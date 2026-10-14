@@ -1516,7 +1516,7 @@ fn halt_inflight_inbox_after_journal_for_test(actor_id: u64) -> io::Result<()> {
             "in-flight inbox crash test requires a ready-marker path",
         )
     })?;
-    std::fs::write(marker, b"journal-written-transaction-still-open")?;
+    std::fs::write(PathBuf::from(marker), b"journal-written-transaction-still-open")?;
     // A parent test will SIGKILL the process at this open transaction
     // boundary. Spurious park wakeups must never let it commit.
     loop {
