@@ -2253,7 +2253,12 @@ impl Runtime {
             };
             let behavior_idx = msg.behavior_id as usize;
             if let Some(expected) = self.bytecode_behavior_arity(actor_id, behavior_idx) {
-                if msg.payload.len() != expected {
+                // The runtime ABI delivers link-exit (2 args) and monitor
+                // DOWN (3 args) as system-priority behavior-0 messages.
+                // Only normal actor messages obey the compiler's user arity.
+                if msg.payload.len() != expected
+                    && !(msg.priority == MessagePriority::System && msg.behavior_id == 0)
+                {
                     warn!(
                         actor_id,
                         behavior_idx,
@@ -3937,7 +3942,12 @@ impl Runtime {
             }
             let behavior_idx = msg.behavior_id as usize;
             if let Some(expected) = self.bytecode_behavior_arity(actor_id, behavior_idx) {
-                if msg.payload.len() != expected {
+                // The runtime ABI delivers link-exit (2 args) and monitor
+                // DOWN (3 args) as system-priority behavior-0 messages.
+                // Only normal actor messages obey the compiler's user arity.
+                if msg.payload.len() != expected
+                    && !(msg.priority == MessagePriority::System && msg.behavior_id == 0)
+                {
                     warn!(
                         actor_id,
                         behavior_idx,
