@@ -39,6 +39,18 @@ class LinuxPackageContractTests(unittest.TestCase):
         self.assertIn("cargo metadata --locked --no-deps --format-version 1", workflow)
         self.assertNotIn('version="$(python3 -c \'import tomllib', workflow)
 
+    def test_arm64_release_is_built_and_smoked_natively(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn(
+            "os: ubuntu-22.04-arm\n            target: aarch64-unknown-linux-gnu",
+            workflow,
+        )
+        self.assertNotIn("dpkg --add-architecture arm64", workflow)
+        self.assertNotIn("gcc-aarch64-linux-gnu", workflow)
+        self.assertNotIn("configure_ubuntu_arm64_sources.py", workflow)
+        self.assertIn("if: runner.os == 'Linux'\n        shell: bash\n        run: bash scripts/check_release_linux.sh", workflow)
+        self.assertIn("run: strip target/${{ matrix.target }}/release/nulang", workflow)
+
     def test_architecture_metadata_and_package_contents(self):
         script = PACKAGER.read_text(encoding="utf-8")
         self.assertIn("deb_arch=amd64", script)
