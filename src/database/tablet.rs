@@ -260,6 +260,9 @@ pub(crate) struct TabletSnapshotRow {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct TabletSnapshotState {
     pub(crate) current_sequence: u64,
+    // Defaults to zero when loading checkpoints written before MVCC retention.
+    #[serde(default)]
+    pub(crate) oldest_retained_snapshot: u64,
     pub(crate) rows: Vec<TabletSnapshotRow>,
 }
 
@@ -273,6 +276,7 @@ pub(crate) struct TabletSnapshotState {
 pub struct MemoryTablet {
     descriptor: TabletDescriptor,
     current_sequence: u64,
+    oldest_retained_snapshot: u64,
     rows: BTreeMap<Vec<u8>, Vec<VersionedValue>>,
 }
 
@@ -281,6 +285,7 @@ impl MemoryTablet {
         Self {
             descriptor,
             current_sequence: 0,
+            oldest_retained_snapshot: 0,
             rows: BTreeMap::new(),
         }
     }
@@ -293,9 +298,15 @@ impl MemoryTablet {
         self.current_sequence
     }
 
+    /// Earliest snapshot that this tablet still promises to serve.
+    pub fn oldest_retained_snapshot(&self) -> u64 {
+        self.oldest_retained_snapshot
+    }
+
     pub(crate) fn snapshot_state(&self) -> TabletSnapshotState {
         TabletSnapshotState {
             current_sequence: self.current_sequence,
+            oldest_retained_snapshot: self.oldest_retained_snapshot,
             rows: self
                 .rows
                 .iter()
@@ -311,23 +322,35 @@ impl MemoryTablet {
         descriptor: TabletDescriptor,
         state: TabletSnapshotState,
     ) -> Result<Self, TabletError> {
+        if state.oldest_retained_snapshot > state.current_sequence {
+            return Err(TabletError::InvalidSnapshotHistory);
+        }
         let mut rows = BTreeMap::new();
         for row in state.rows {
             if !descriptor.range.contains(&row.key) {
                 return Err(TabletError::KeyOutsideTabletRange);
             }
 
+            // Older checkpoints may contain multiple mutations of a key at
+            // the same commit sequence. Coalesce these in original order so
+            // the last mutation wins, as it did for snapshot reads.
             let mut previous = 0_u64;
-            for version in &row.versions {
+            let mut versions: Vec<VersionedValue> = Vec::with_capacity(row.versions.len());
+            for version in row.versions {
                 if version.sequence == 0
                     || version.sequence > state.current_sequence
-                    || version.sequence <= previous
+                    || version.sequence < previous
                 {
                     return Err(TabletError::InvalidSnapshotHistory);
                 }
-                previous = version.sequence;
+                if version.sequence == previous {
+                    *versions.last_mut().expect("a prior version exists") = version;
+                } else {
+                    previous = version.sequence;
+                    versions.push(version);
+                }
             }
-            if rows.insert(row.key, row.versions).is_some() {
+            if rows.insert(row.key, versions).is_some() {
                 return Err(TabletError::InvalidSnapshotHistory);
             }
         }
@@ -335,6 +358,7 @@ impl MemoryTablet {
         Ok(Self {
             descriptor,
             current_sequence: state.current_sequence,
+            oldest_retained_snapshot: state.oldest_retained_snapshot,
             rows,
         })
     }
@@ -463,23 +487,62 @@ impl MemoryTablet {
     }
 
     fn apply_mutations(&mut self, sequence: u64, mutations: Vec<TabletMutation>) {
+        // A transaction exposes only its final mutation for each key. This
+        // also normalizes old WAL records that contain repeated keys, keeping
+        // checkpoints strictly increasing by sequence for every row.
+        let mut final_values = BTreeMap::new();
         for mutation in mutations {
             match mutation {
                 TabletMutation::Put { key, value } => {
-                    self.rows.entry(key).or_default().push(VersionedValue {
-                        sequence,
-                        value: Some(value),
-                    });
+                    final_values.insert(key, Some(value));
                 }
                 TabletMutation::Delete { key } => {
-                    self.rows.entry(key).or_default().push(VersionedValue {
-                        sequence,
-                        value: None,
-                    });
+                    final_values.insert(key, None);
                 }
             }
         }
+        for (key, value) in final_values {
+            self.rows
+                .entry(key)
+                .or_default()
+                .push(VersionedValue { sequence, value });
+        }
         self.current_sequence = sequence;
+    }
+
+    /// Discard superseded versions before an explicit, caller-approved snapshot
+    /// floor. There is no snapshot registry yet: callers MUST ensure that no
+    /// active reader, backup, or other consumer needs an older snapshot.
+    pub fn prune_history_before(&mut self, floor: u64) -> Result<(), TabletError> {
+        if floor < self.oldest_retained_snapshot {
+            return Err(TabletError::RetentionFloorRegression {
+                requested: floor,
+                oldest_retained: self.oldest_retained_snapshot,
+            });
+        }
+        if floor > self.current_sequence {
+            return Err(TabletError::SnapshotAhead {
+                committed: self.current_sequence,
+                requested: floor,
+            });
+        }
+
+        for versions in self.rows.values_mut() {
+            let boundary = versions.partition_point(|version| version.sequence <= floor);
+            if boundary != 0 {
+                // Keep one anchor value visible at the floor. A tombstone
+                // needs no anchor: absence is the default for earlier reads.
+                let discard = if versions[boundary - 1].value.is_some() {
+                    boundary - 1
+                } else {
+                    boundary
+                };
+                versions.drain(..discard);
+            }
+        }
+        self.rows.retain(|_, versions| !versions.is_empty());
+        self.oldest_retained_snapshot = floor;
+        Ok(())
     }
 
     /// Read one key at an already committed snapshot sequence.
@@ -488,6 +551,12 @@ impl MemoryTablet {
             return Err(TabletError::SnapshotAhead {
                 committed: self.current_sequence,
                 requested: snapshot,
+            });
+        }
+        if snapshot < self.oldest_retained_snapshot {
+            return Err(TabletError::SnapshotExpired {
+                requested: snapshot,
+                oldest_retained: self.oldest_retained_snapshot,
             });
         }
         if !self.descriptor.range.contains(key) {
@@ -547,6 +616,14 @@ pub enum TabletError {
         committed: u64,
         requested: u64,
     },
+    SnapshotExpired {
+        requested: u64,
+        oldest_retained: u64,
+    },
+    RetentionFloorRegression {
+        requested: u64,
+        oldest_retained: u64,
+    },
     InvalidSnapshotHistory,
     KeyOutsideTabletRange,
 }
@@ -604,6 +681,20 @@ impl fmt::Display for TabletError {
                 f,
                 "snapshot {requested} is ahead of committed tablet sequence {committed}"
             ),
+            Self::SnapshotExpired {
+                requested,
+                oldest_retained,
+            } => write!(
+                f,
+                "snapshot {requested} was reclaimed; oldest retained snapshot is {oldest_retained}"
+            ),
+            Self::RetentionFloorRegression {
+                requested,
+                oldest_retained,
+            } => write!(
+                f,
+                "retention floor {requested} is below current floor {oldest_retained}"
+            ),
             Self::InvalidSnapshotHistory => {
                 f.write_str("tablet snapshot contains invalid MVCC version history")
             }
@@ -615,3 +706,48 @@ impl fmt::Display for TabletError {
 }
 
 impl std::error::Error for TabletError {}
+
+#[cfg(test)]
+mod mvcc_retention_tests {
+    use super::*;
+
+    #[test]
+    fn pruning_discards_old_values_and_obsolete_tombstones() {
+        let descriptor = TabletDescriptor::new(
+            TabletId::new(91).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            1,
+        )
+        .unwrap();
+        let mut tablet = MemoryTablet::new(descriptor);
+        let batches = [
+            vec![
+                TabletMutation::Put { key: b"k".to_vec(), value: b"v1".to_vec() },
+                TabletMutation::Put { key: b"gone".to_vec(), value: b"x".to_vec() },
+            ],
+            vec![
+                TabletMutation::Put { key: b"k".to_vec(), value: b"v2".to_vec() },
+                TabletMutation::Delete { key: b"gone".to_vec() },
+            ],
+            vec![TabletMutation::Put { key: b"k".to_vec(), value: b"v3".to_vec() }],
+        ];
+        for batch in batches {
+            let previous = tablet.current_sequence();
+            let write = tablet.prepare_write(1, previous, batch).unwrap();
+            tablet.commit(write).unwrap();
+        }
+
+        assert_eq!(tablet.rows.get(b"k".as_slice()).unwrap().len(), 3);
+        assert_eq!(tablet.rows.get(b"gone".as_slice()).unwrap().len(), 2);
+        tablet.prune_history_before(2).unwrap();
+
+        assert_eq!(tablet.rows.get(b"k".as_slice()).unwrap().len(), 2);
+        assert!(!tablet.rows.contains_key(b"gone".as_slice()));
+        assert_eq!(tablet.read_at(b"k", 2).unwrap(), Some(&b"v2"[..]));
+        assert_eq!(tablet.read_at(b"k", 3).unwrap(), Some(&b"v3"[..]));
+        assert_eq!(
+            tablet.read_at(b"k", 1),
+            Err(TabletError::SnapshotExpired { requested: 1, oldest_retained: 2 })
+        );
+    }
+}
