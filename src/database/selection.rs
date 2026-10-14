@@ -15,11 +15,22 @@ use super::tablet::{TabletScanBatch, TabletScanRow};
 /// The bitmap borrows its source batch: callers cannot outlive it, and
 /// combining equal-sized selections from different batches is rejected.
 /// Bits above the visible row count are always zero.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct SelectionBitmap<'batch, 'row> {
     batch: &'batch TabletScanBatch<'row>,
     words: Vec<u64>,
 }
+
+// Equality compares *positions in the same batch*, never the borrowed
+// row contents. Two separately allocated batches may happen to contain
+// identical rows, but their row-position masks are not interchangeable.
+impl<'batch, 'row> PartialEq for SelectionBitmap<'batch, 'row> {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.batch, other.batch) && self.words == other.words
+    }
+}
+
+impl Eq for SelectionBitmap<'_, '_> {}
 
 impl<'batch, 'row> SelectionBitmap<'batch, 'row> {
     /// Evaluate a predicate over borrowed, snapshot-visible rows.
