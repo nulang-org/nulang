@@ -3356,13 +3356,27 @@ impl Runtime {
     ) -> DeterministicRunResult {
         let mut steps: u64 = 0;
         loop {
-            if steps >= max_steps {
-                return DeterministicRunResult::StepLimitExceeded { steps };
-            }
-            // Drain cross-shard messages first (mirrors the production
-            // scheduler's `run_scheduler`); enqueued actors then show up
-            // in `pick_ready_actor_deterministic`'s ready set.
+            // Drain cross-shard messages before determining whether a bounded
+            // run is idle: messages in the transport channel still count as
+            // pending work even when no local mailbox was populated yet.
             self.drain_cross_shard_messages();
+            if steps >= max_steps {
+                // A run that used its *last* permitted step to handle its
+                // final message is complete, not a livelock. Do not tick a
+                // timer or advance virtual time when the budget is depleted.
+                // Timers without a virtual clock retain the existing
+                // wall-clock/quiescence contract: they cannot be progressed
+                // by this deterministic scheduler.
+                let pending_messages = self.actors.values().any(|actor| !actor.mailbox.is_empty());
+                let pending_virtual_timers =
+                    self.virtual_clock.is_some() && !self.timer_wheel.is_empty();
+                if pending_messages || pending_virtual_timers {
+                    return DeterministicRunResult::StepLimitExceeded { steps };
+                }
+                self.process_gc_ops();
+                self.process_deferred_all();
+                return DeterministicRunResult::Quiescent { steps };
+            }
             // Tick timers first (respects virtual clock via self.now())
             self.tick_timers();
             match self.pick_ready_actor_deterministic(rng) {
