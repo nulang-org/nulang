@@ -2189,6 +2189,132 @@ mod tests {
     }
 
     #[test]
+    fn physical_retention_survives_reopen_and_preserves_absolute_sequences() {
+        let root = test_dir("retention-physical-reopen");
+        {
+            let mut store = FileFabricStreamStore::open(&root).unwrap();
+            store
+                .create_stream(
+                    "events",
+                    FabricStreamConfig {
+                        segment_max_bytes: 96,
+                    },
+                )
+                .unwrap();
+            for value in 1..=4 {
+                store.append("events", &[value; 48]).unwrap();
+            }
+            store.commit_cursor("events", "worker", 3).unwrap();
+            let applied = store.apply_retention("events", 4).unwrap();
+            assert_eq!(applied.eligible_segment_count, 3);
+            assert_eq!(applied.first_retained_sequence, Some(4));
+            assert!(store.read_from("events", 1, 1).is_err());
+            assert_eq!(store.read_from("events", 4, 10).unwrap()[0].sequence, 4);
+            assert_eq!(list_segments(&root.join("events")).unwrap().len(), 1);
+        }
+
+        let mut reopened = FileFabricStreamStore::open(&root).unwrap();
+        assert_eq!(reopened.read_from("events", 4, 10).unwrap().len(), 1);
+        assert_eq!(reopened.append("events", b"after-retention").unwrap(), 5);
+        assert_eq!(reopened.cursor("events", "worker").unwrap(), 3);
+        assert_eq!(reopened.read_consumer("events", "worker", 10).unwrap().len(), 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retention_floor_committed_before_deletion_replays_only_live_suffix() {
+        let root = test_dir("retention-interrupted-deletion");
+        {
+            let mut store = FileFabricStreamStore::open(&root).unwrap();
+            store
+                .create_stream(
+                    "events",
+                    FabricStreamConfig {
+                        segment_max_bytes: 96,
+                    },
+                )
+                .unwrap();
+            for _ in 0..3 {
+                store.append("events", &[7; 48]).unwrap();
+            }
+            store.commit_cursor("events", "worker", 2).unwrap();
+            // Simulate a crash after the durable trim floor is persisted but
+            // before the obsolete segment files have been removed.
+            write_json_atomic(
+                &root.join("events").join("retention.json"),
+                &RetentionFile {
+                    version: STREAM_FORMAT_VERSION,
+                    first_retained_sequence: 3,
+                },
+            )
+            .unwrap();
+        }
+        let mut reopened = FileFabricStreamStore::open(&root).unwrap();
+        assert_eq!(reopened.read_from("events", 1, 1).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(reopened.read_from("events", 3, 10).unwrap().len(), 1);
+        assert_eq!(reopened.append("events", b"four").unwrap(), 4);
+        assert_eq!(reopened.apply_retention("events", 3).unwrap().eligible_segment_count, 0);
+        assert_eq!(list_segments(&root.join("events")).unwrap().len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retention_requires_explicit_cursor_start_for_new_consumers() {
+        let root = test_dir("retention-new-consumer");
+        let mut store = FileFabricStreamStore::open(&root).unwrap();
+        store
+            .create_stream(
+                "events",
+                FabricStreamConfig {
+                    segment_max_bytes: 96,
+                },
+            )
+            .unwrap();
+        for _ in 0..3 {
+            store.append("events", &[5; 48]).unwrap();
+        }
+        store.commit_cursor("events", "existing", 2).unwrap();
+        store.apply_retention("events", 3).unwrap();
+        assert_eq!(
+            store.read_consumer("events", "new-consumer", 10).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert!(store.commit_cursor("events", "new-consumer", 1).is_err());
+        store.commit_cursor("events", "new-consumer", 2).unwrap();
+        assert_eq!(store.read_consumer("events", "new-consumer", 10).unwrap()[0].sequence, 3);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retention_fails_closed_if_committed_suffix_is_missing() {
+        let root = test_dir("retention-missing-suffix");
+        {
+            let mut store = FileFabricStreamStore::open(&root).unwrap();
+            store
+                .create_stream(
+                    "events",
+                    FabricStreamConfig {
+                        segment_max_bytes: 96,
+                    },
+                )
+                .unwrap();
+            for _ in 0..3 {
+                store.append("events", &[9; 48]).unwrap();
+            }
+            store.commit_cursor("events", "worker", 2).unwrap();
+            store.apply_retention("events", 3).unwrap();
+        }
+        let retained = segment_path(&root.join("events"), 3);
+        fs::remove_file(retained).unwrap();
+        let mut reopened = FileFabricStreamStore::open(&root).unwrap();
+        assert_eq!(
+            reopened.read_from("events", 3, 1).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn runtime_retention_preview_does_not_mutate_replay_or_cursors() {
         let root = test_dir("runtime-retention-preview");
         let mut runtime = Runtime::new();
