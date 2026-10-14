@@ -143,6 +143,15 @@ use nulang_ai::{
 
 static ACTOR_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// Process-local, non-durable monitor token. Distinct registrations receive
+/// distinct references even when the watcher and target IDs are identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MonitorRef(pub u64);
+
+static MONITOR_REF_COUNTER: AtomicU64 = AtomicU64::new(1);
+/// A monitor reference must round-trip through Nulang's signed tagged Int.
+const MAX_MONITOR_REF: u64 = (1 << 46) - 1;
+
 /// Generate a fresh, globally unique actor ID.
 pub fn fresh_actor_id() -> u64 {
     ACTOR_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -352,6 +361,9 @@ pub(crate) enum MessageAdmission {
 pub struct Runtime {
     pub actors: HashMap<u64, Actor>,
     pub supervisors: HashMap<u64, Supervisor>,
+    /// Reference-indexed, process-local monitors. Legacy Actor.monitor uses
+    /// Actor::monitors until the source-level API is migrated explicitly.
+    pub(crate) monitor_refs: HashMap<MonitorRef, (u64, u64)>,
     pub scheduler: Scheduler,
     pub next_run_slot: Option<u64>,
     pub actor_pool: Vec<Actor>,
@@ -641,6 +653,7 @@ impl Runtime {
         Runtime {
             actors: HashMap::new(),
             supervisors: HashMap::new(),
+            monitor_refs: HashMap::new(),
             scheduler: Scheduler::new(4),
             next_run_slot: None,
             actor_pool: Vec::new(),
@@ -6557,6 +6570,76 @@ impl Runtime {
     pub fn demonitor(&mut self, watcher: u64, target: u64) {
         if let Some(actor) = self.actors.get_mut(&target) {
             actor.monitors.retain(|&id| id != watcher);
+        }
+    }
+
+    /// Monitor a local actor with a unique reference, so multiple independent
+    /// watches from the same watcher can be canceled individually. The legacy
+    /// Actor.monitor API remains unchanged and does not return a reference.
+    ///
+    /// This API is process-local (not distributed or durable). A missing target
+    /// produces an immediate, reference-bearing DOWN; an absent watcher fails
+    /// without creating a reference.
+    pub fn monitor_ref(&mut self, watcher: u64, target: u64) -> Option<MonitorRef> {
+        if !self.actors.contains_key(&watcher) {
+            return None;
+        }
+        let token = MONITOR_REF_COUNTER.fetch_add(1, Ordering::Relaxed);
+        if token == 0 || token > MAX_MONITOR_REF {
+            return None;
+        }
+        let reference = MonitorRef(token);
+        if self
+            .actors
+            .get(&target)
+            .is_some_and(|actor| actor.state != ActorState::Terminated)
+        {
+            self.monitor_refs.insert(reference, (watcher, target));
+        } else {
+            exit::send_down_message_with_ref(
+                self,
+                watcher,
+                target,
+                &ExitReason::Error("noproc".to_string()),
+                Some(reference),
+            );
+        }
+        Some(reference)
+    }
+
+    /// Cancel exactly one watch owned by `watcher`. This does not flush a
+    /// DOWN already enqueued before cancellation; consumers must correlate
+    /// DOWN messages by reference and ignore responses to retired tokens.
+    pub fn demonitor_ref(&mut self, watcher: u64, reference: MonitorRef) -> bool {
+        match self.monitor_refs.get(&reference) {
+            Some((owner, _)) if *owner == watcher => {
+                self.monitor_refs.remove(&reference);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Retire the monitors attached to an exiting local actor, whether as
+    /// watcher or target. Deliver each target-side DOWN at most once.
+    pub(crate) fn retire_monitor_refs_on_exit(&mut self, actor_id: u64, reason: &ExitReason) {
+        let retired: Vec<_> = self
+            .monitor_refs
+            .iter()
+            .filter(|(_, (watcher, target))| *watcher == actor_id || *target == actor_id)
+            .map(|(reference, &(watcher, target))| (*reference, watcher, target))
+            .collect();
+        for (reference, watcher, target) in retired {
+            self.monitor_refs.remove(&reference);
+            if target == actor_id && watcher != actor_id {
+                exit::send_down_message_with_ref(
+                    self,
+                    watcher,
+                    target,
+                    reason,
+                    Some(reference),
+                );
+            }
         }
     }
 
