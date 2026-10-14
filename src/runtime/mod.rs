@@ -5492,7 +5492,7 @@ impl Runtime {
     pub fn recover_actor(&mut self, actor_id: u64) -> Option<u64> {
         // A decoded immutable pin is an explicit opt-in to strict recovery.
         // Never let the legacy loader bypass artifact identity verification.
-        if pinned_execution::has_execution_pin_marker(self.persistence.as_ref(), actor_id) {
+        if pinned_execution::requires_pinned_recovery(self.persistence.as_ref(), actor_id) {
             warn!(
                 "nulang-recover: refusing unverified pinned workflow actor {}; use recover_pinned_workflow_actor",
                 actor_id
