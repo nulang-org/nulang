@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -1051,27 +1051,8 @@ impl WebDevServer {
     ) -> HttpResponse {
         let trimmed = path.trim_start_matches('/');
         let file_path = static_dir
-            .map(|d| {
-                let p = d.join(trimmed);
-                if trimmed.is_empty() || p.is_dir() {
-                    d.join("index.html")
-                } else {
-                    p
-                }
-            })
-            .filter(|p| p.is_file())
-            .or_else(|| {
-                output_dir
-                    .map(|d| {
-                        let p = d.join(trimmed);
-                        if trimmed.is_empty() || p.is_dir() {
-                            d.join("index.html")
-                        } else {
-                            p
-                        }
-                    })
-                    .filter(|p| p.is_file())
-            });
+            .and_then(|root| contained_static_file(root, trimmed))
+            .or_else(|| output_dir.and_then(|root| contained_static_file(root, trimmed)));
 
         if let Some(p) = file_path {
             if let Ok(data) = std::fs::read(&p) {
@@ -1088,6 +1069,34 @@ impl WebDevServer {
             headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
             body: b"Not found".to_vec(),
         }
+    }
+}
+
+/// Resolve static files only inside the configured root. Normalize both the
+/// root and target before testing containment so a symlink cannot escape the
+/// served directory. Reject explicit parent/absolute/prefix components before
+/// filesystem lookup. This does not defend against hostile concurrent
+/// filesystem mutation of the configured (trusted) static directory.
+fn contained_static_file(root: &Path, relative: &str) -> Option<PathBuf> {
+    if !Path::new(relative)
+        .components()
+        .all(|part| matches!(part, Component::Normal(_)))
+    {
+        return None;
+    }
+
+    let root = root.canonicalize().ok()?;
+    let joined = root.join(relative);
+    let candidate = if relative.is_empty() || joined.is_dir() {
+        root.join("index.html")
+    } else {
+        joined
+    };
+    let canonical = candidate.canonicalize().ok()?;
+    if canonical.starts_with(&root) && canonical.is_file() {
+        Some(canonical)
+    } else {
+        None
     }
 }
 
