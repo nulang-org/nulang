@@ -149,3 +149,36 @@ fn strict_gate_refuses_transient_and_missing_actors() {
         std::io::ErrorKind::NotFound
     );
 }
+
+#[test]
+fn enabling_strict_gate_invalidates_an_already_selected_receive() {
+    let (mut rt, actor_id, _, behavior) = actors();
+    rt.send_message_by_id(actor_id, behavior, &[Value::int(5)]);
+    assert!(
+        rt.actors.get_mut(&actor_id).unwrap().mailbox
+            .receive_match(&[behavior]).is_some(),
+        "before the opt-in, the legacy selective receive can find a candidate"
+    );
+    rt.enable_strict_typed_actor_admission(actor_id).unwrap();
+
+    let mailbox = &mut rt.actors.get_mut(&actor_id).unwrap().mailbox;
+    assert!(
+        mailbox.commit_receive_match().is_none(),
+        "an active receive selected before opt-in must not commit afterward"
+    );
+    assert!(mailbox.receive_match(&[behavior]).is_none());
+    assert_eq!(mailbox.len(), 1, "no user message may be lost");
+}
+
+#[test]
+fn default_legacy_execution_is_unchanged_until_host_opts_in() {
+    let (mut rt, actor_id, _, behavior) = actors();
+    assert!(!rt.actors[&actor_id].mailbox.requires_strict_durable_admission());
+    rt.send_message_by_id(actor_id, behavior, &[Value::int(5)]);
+    rt.step_actor(actor_id);
+    assert_eq!(
+        rt.actors[&actor_id].get_state_field("total").unwrap().as_int(),
+        Some(5),
+        "the opt-in must not silently change existing execution semantics"
+    );
+}
