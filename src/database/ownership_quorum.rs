@@ -178,12 +178,26 @@ pub struct FixedTermQuorumLog {
 }
 
 impl FixedTermQuorumLog {
-    /// Open three or more odd-numbered, distinct replica paths.
-    ///
-    /// New journal paths are created only for an entirely fresh membership.
-    /// An unavailable member of an established set is never silently
-    /// replaced with an empty journal (that needs authenticated resync).
+    /// Explicitly bootstrap new voting journals. Refuses to overwrite even
+    /// a partially initialized cluster; operators must recover/reconcile it.
+    pub fn bootstrap(paths: &[PathBuf], term: u64) -> Result<Self, QuorumLogError> {
+        if paths.iter().any(|path| path.exists()) {
+            return Err(QuorumLogError::AlreadyInitialized);
+        }
+        Self::open_internal(paths, term, true)
+    }
+
+    /// Reopen an existing voting cluster. Never creates missing journals.
+    /// Missing voters require an explicit, authenticated repair operation.
     pub fn open(paths: &[PathBuf], term: u64) -> Result<Self, QuorumLogError> {
+        Self::open_internal(paths, term, false)
+    }
+
+    fn open_internal(
+        paths: &[PathBuf],
+        term: u64,
+        initialize: bool,
+    ) -> Result<Self, QuorumLogError> {
         if paths.len() < 3 || paths.len() % 2 == 0 {
             return Err(QuorumLogError::InvalidMembership);
         }
@@ -197,16 +211,19 @@ impl FixedTermQuorumLog {
             return Err(QuorumLogError::DuplicateReplicaPath);
         }
 
-        let fresh = paths.iter().all(|path| !path.exists());
+        if initialize && paths.iter().any(|path| path.exists()) {
+            return Err(QuorumLogError::AlreadyInitialized);
+        }
         let quorum = paths.len() / 2 + 1;
         let mut replicas = Vec::with_capacity(paths.len());
         for path in paths {
-            // Once initialized, a missing file represents an offline voter.
-            if !fresh && !path.exists() {
+            // An absent file is an offline voter during ordinary restart,
+            // even when every journal was accidentally deleted.
+            if !initialize && !path.exists() {
                 replicas.push(None);
                 continue;
             }
-            match FileReplica::open(path, fresh) {
+            match FileReplica::open(path, initialize) {
                 Ok(replica) => replicas.push(Some(replica)),
                 Err(_) => replicas.push(None),
             }
@@ -319,6 +336,7 @@ impl FixedTermQuorumLog {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QuorumLogError {
+    AlreadyInitialized,
     InvalidMembership,
     DuplicateReplicaPath,
     InvalidTerm,
