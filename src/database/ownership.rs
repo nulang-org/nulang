@@ -219,8 +219,8 @@ impl OwnershipStateMachine {
 
             Ok(grant)
         })();
-        if let Ok(grant) = result {
-            self.owners.insert(grant.tablet, grant);
+        if let Ok(grant) = &result {
+            self.owners.insert(grant.tablet, *grant);
         }
         self.applied_index = entry.index;
         self.applied_term = entry.term;
