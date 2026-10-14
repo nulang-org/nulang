@@ -128,7 +128,7 @@ impl ChildSpec {
 pub struct RestartTemplate {
     /// Independently owned initial state captured at registration.
     /// Heap pointers and constant-pool IDs are never copied between incarnations.
-    pub state_data: Vec<(String, persistence::PersistedValue)>,
+    pub state_data: Vec<(String, PersistedValue)>,
     /// Persistence model per state field.
     pub state_models: HashMap<String, StateModel>,
     /// Native behavior handlers (name, handler).
@@ -338,7 +338,7 @@ impl Supervisor {
         if let Some(ref snap) = snapshot {
             for (name, value) in &snap.state {
                 let v = value.to_value_on_heap(&mut new_actor);
-                if matches!(value, persistence::PersistedValue::String(_)) && v.is_nil() {
+                if matches!(value, PersistedValue::String(_)) && v.is_nil() {
                     warn!(
                         "supervisor '{}': cannot restore persisted string field '{}' for child '{}'",
                         self.name, name, spec.id
@@ -361,7 +361,7 @@ impl Supervisor {
                 continue;
             }
             let restored = value.to_value_on_heap(&mut new_actor);
-            if matches!(value, persistence::PersistedValue::String(_)) && restored.is_nil() {
+            if matches!(value, PersistedValue::String(_)) && restored.is_nil() {
                 warn!(
                     "supervisor '{}': cannot restore initial string field '{}' for child '{}'",
                     self.name, name, spec.id
