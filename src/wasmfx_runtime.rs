@@ -314,8 +314,13 @@ mod tests {
         let mut runtime = WasmFxRuntime::new(wasm).expect("instantiate");
         let err = runtime.run().expect_err("infinite guest must exhaust fuel");
         assert!(
-            err.to_string().to_ascii_lowercase().contains("fuel"),
-            "expected an out-of-fuel trap, got: {err}"
+            matches!(err, NuError::VMError { .. }),
+            "runaway guest must be reported as a VM trap"
+        );
+        let remaining_fuel = runtime.store.get_fuel().expect("fuel metering enabled");
+        assert!(
+            remaining_fuel < DEFAULT_WASM_FUEL,
+            "the guest must consume fuel before trapping"
         );
     }
 
