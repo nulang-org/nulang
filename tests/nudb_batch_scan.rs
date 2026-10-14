@@ -149,5 +149,5 @@ fn wal_backed_scans_are_identical_after_checkpoint_and_reopen() {
 
     let _ = fs::remove_file(&path);
     // Checkpoint path is not a test-wide shared path; remove its sidecar too.
-    let _ = fs::remove_file(nulang::database::checkpoint::checkpoint_path_for_wal(&path));
+    let _ = fs::remove_file(path.with_extension("checkpoint"));
 }
