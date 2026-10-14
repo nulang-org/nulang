@@ -3876,6 +3876,12 @@ impl Runtime {
             .unwrap_or(false);
         if yielded {
             self.resume_suspended_jit_yield(actor_id);
+            // One resumed continuation consumes this scheduler turn. Even if
+            // it completes, processing another queued message here would
+            // bypass the fair scheduling handoff to other ready actors.
+            // finish_actor_turn will requeue this actor when mail remains.
+            self.current_actor = None;
+            return;
         }
 
         let msg_opt = {
