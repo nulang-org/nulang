@@ -424,6 +424,12 @@ impl Mailbox {
         self.pending_durable_admission.is_some()
     }
 
+    /// A failed durable admission deliberately pauses automatic scheduling.
+    /// A trusted host explicitly retries the same candidate and transition.
+    pub fn has_pending_durable_admission(&self) -> bool {
+        self.pending_durable_admission.is_some()
+    }
+
     /// Commit admission and only then release its mailbox slot.
     pub fn commit_durable_admission(&mut self) -> Option<Message> {
         let message = self.pending_durable_admission.take()?;
