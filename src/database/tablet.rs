@@ -162,6 +162,31 @@ impl TabletMutation {
     }
 }
 
+/// Stable hash of the exact ordered mutation list, including key/value lengths.
+/// The domain separator prevents reuse of this digest for unrelated records.
+pub(crate) fn transaction_digest(mutations: &[TabletMutation]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"nudb/transaction-mutations/v1");
+    hasher.update(&(mutations.len() as u64).to_le_bytes());
+    for mutation in mutations {
+        match mutation {
+            TabletMutation::Put { key, value } => {
+                hasher.update(&[1]);
+                hasher.update(&(key.len() as u64).to_le_bytes());
+                hasher.update(key);
+                hasher.update(&(value.len() as u64).to_le_bytes());
+                hasher.update(value);
+            }
+            TabletMutation::Delete { key } => {
+                hasher.update(&[2]);
+                hasher.update(&(key.len() as u64).to_le_bytes());
+                hasher.update(key);
+            }
+        }
+    }
+    *hasher.finalize().as_bytes()
+}
+
 /// Caller-provided, stable transaction identifier within a single tablet.
 /// Generate a distinct ID for each logical transaction, and reuse it on retry.
 #[derive(
