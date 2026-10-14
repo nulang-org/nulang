@@ -46,6 +46,43 @@ pub(crate) fn module_behavior_index_for_runtime_id(
     module_behavior_index_for_meta(meta, runtime_behavior_idx)
 }
 
+/// Validate a persisted message against the compiler-owned behavior signature.
+///
+/// The runtime id namespace is actor-local for workflows and module-global for
+/// ordinary actors. Never trust a journaled numeric id or argument count as a
+/// substitute for the selected actor schema.
+pub(crate) fn validate_replayed_behavior(
+    module: &CodeModule,
+    schema_name: &str,
+    runtime_behavior_idx: usize,
+    argument_count: usize,
+) -> Result<(), String> {
+    let module_idx = module_behavior_index_for_runtime_id(
+        module,
+        schema_name,
+        runtime_behavior_idx,
+    )
+    .ok_or_else(|| {
+        format!(
+            "journal behavior id {} is not owned by schema '{}'",
+            runtime_behavior_idx, schema_name
+        )
+    })?;
+    let behavior = module.behaviors.get(module_idx).ok_or_else(|| {
+        format!(
+            "journal behavior id {} for schema '{}' has no compiler-owned signature",
+            runtime_behavior_idx, schema_name
+        )
+    })?;
+    if behavior.param_count != argument_count {
+        return Err(format!(
+            "journal behavior id {} for schema '{}' expects {} arguments, found {}",
+            runtime_behavior_idx, schema_name, behavior.param_count, argument_count
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn module_behavior_index_for_actor(
     module: &CodeModule,
     runtime_name: &str,
