@@ -7013,6 +7013,17 @@ impl Runtime {
             }
         };
 
+        // Distributed migration does not yet transfer an atomic strict
+        // admission tail or its inbox fence. Reject instead of publishing a
+        // migrated actor that would resume legacy user dispatch.
+        if snapshot.strict_admission_policy_version != 0 {
+            warn!(
+                "nulang-migrate: refusing actor {} with strict or unknown persisted dispatch policy",
+                actor_id
+            );
+            return false;
+        }
+
         let schema_meta = if module.actor_metadata.is_empty() && snapshot.schema_name.is_none() {
             None
         } else {
