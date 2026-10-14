@@ -3961,13 +3961,13 @@ mod lsp_tests {
         };
         let edit = &action.edit.as_ref().unwrap().changes.as_ref().unwrap()[&uri][0];
         assert_eq!(edit.new_text, "counter");
-        let start = source.find("countr +").unwrap();
-        let fixed = format!(
-            "{}{}{}",
-            &source[..start],
-            edit.new_text,
-            &source[start + "countr".len()..]
-        );
+        // The fixture is ASCII, so LSP UTF-16 character offsets are also
+        // byte offsets; apply the actual emitted edit rather than searching
+        // the source for the misspelled name independently.
+        let start = edit.range.start.character as usize;
+        let end = edit.range.end.character as usize;
+        assert_eq!(&source[start..end], "countr");
+        let fixed = format!("{}{}{}", &source[..start], edit.new_text, &source[end..]);
         let after = NulangLanguageServer::compute_diagnostics(&fixed);
         assert!(
             !after
