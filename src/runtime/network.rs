@@ -2915,11 +2915,14 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
         let mut transport = TcpTransport::bind(addr, TlsConfig::PlaintextInsecure).unwrap();
         for seq in 1..=3 {
-            transport.incoming_tx.send(IncomingPacket {
-                from_node: NodeId(17),
-                seq,
-                packet: Packet::Ack { packet_seq: seq },
-            }).unwrap();
+            transport
+                .incoming_tx
+                .send(IncomingPacket {
+                    from_node: NodeId(17),
+                    seq,
+                    packet: Packet::Ack { packet_seq: seq },
+                })
+                .unwrap();
         }
         assert!(transport.wait_for_activity(Duration::from_secs(1)));
         let packets = transport.receive();
