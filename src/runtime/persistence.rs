@@ -1717,6 +1717,22 @@ impl LibsqlStore {
             )
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            // Monotonic activation policy. A strict actor must never recover
+            // into legacy scheduler/bytecode journaling after a crash.
+            // This independent durable marker survives actor snapshots.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS durable_actor_admission_policy (
+                    actor_id INTEGER PRIMARY KEY NOT NULL,
+                    policy_version INTEGER NOT NULL,
+                    strict_required INTEGER NOT NULL,
+                    CHECK(policy_version = 1),
+                    CHECK(strict_required = 1)
+                )",
+                (),
+            )
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
             // Versioned v1 durable-inbox dedup receipts. This table must be
             // written in the same transaction as durable_tails and journal.
             // The primary key serializes competing host attempts for the
@@ -2372,6 +2388,71 @@ impl LibsqlStore {
 
 #[cfg(feature = "sqlite")]
 impl PersistenceStore for LibsqlStore {
+    fn persist_strict_typed_actor_admission(&mut self, actor_id: u64) -> io::Result<()> {
+        if actor_id == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "strict actor admission requires a non-zero actor identity",
+            ));
+        }
+        let actor_id = i64::try_from(actor_id).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "strict actor identity exceeds libSQL range")
+        })?;
+        let conn = self.conn();
+        self.rt.block_on(async {
+            conn.execute(
+                "INSERT INTO durable_actor_admission_policy
+                 (actor_id, policy_version, strict_required)
+                 VALUES (?1, 1, 1)
+                 ON CONFLICT(actor_id) DO UPDATE SET
+                    policy_version=1, strict_required=1",
+                libsql::params![actor_id],
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+        })
+    }
+
+    fn load_strict_typed_actor_admission(&self, actor_id: u64) -> io::Result<bool> {
+        let actor_id = i64::try_from(actor_id).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "strict actor identity exceeds libSQL range")
+        })?;
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let mut rows = conn
+                .query(
+                    "SELECT policy_version, strict_required
+                     FROM durable_actor_admission_policy
+                     WHERE actor_id = ?1",
+                    libsql::params![actor_id],
+                )
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+            else {
+                return Ok(false);
+            };
+            let version: i64 = row.get(0).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+            })?;
+            let required: i64 = row.get(1).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+            })?;
+            if version != 1 || required != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid or unsupported durable actor admission policy",
+                ));
+            }
+            Ok(true)
+        })
+    }
+
+
     fn commit_inbox_transition(
         &mut self,
         request: DurableInboxCommand,
