@@ -1268,6 +1268,31 @@ fn emit_stdlib_docs(dir: &str) -> Result<(), String> {
 /// Run a distributed Nulang node: parse arguments, create a Runtime,
 /// enable distribution, join a seed cluster if requested, and run forever.
 #[cfg(feature = "tcp")]
+/// Require an explicit, local-only plaintext opt-in; never infer plaintext
+/// from missing TLS files. The caller must still validate and load each file.
+#[cfg(feature = "tcp")]
+fn validate_node_security_mode(
+    plaintext: bool,
+    has_cert: bool,
+    has_key: bool,
+    has_ca: bool,
+    bind_addr: std::net::SocketAddr,
+) -> Result<(), &'static str> {
+    if plaintext {
+        if has_cert || has_key || has_ca {
+            return Err("--plaintext cannot be combined with TLS options");
+        }
+        if !bind_addr.ip().is_loopback() {
+            return Err("--plaintext is only permitted on loopback addresses");
+        }
+        return Ok(());
+    }
+    if !(has_cert && has_key && has_ca) {
+        return Err("node requires --tls-cert, --tls-key and --tls-ca (or explicit loopback --plaintext)");
+    }
+    Ok(())
+}
+
 fn run_node_cmd(args: &[String]) -> NuResult<()> {
     let mut listen_addr = "127.0.0.1:9000".to_string();
     let mut seed_addr: Option<String> = None;
@@ -1362,34 +1387,41 @@ fn run_node_cmd(args: &[String]) -> NuResult<()> {
             span: Span::default(),
         })?;
 
+    validate_node_security_mode(
+        plaintext,
+        tls_cert.is_some(),
+        tls_key.is_some(),
+        tls_ca.is_some(),
+        bind_addr,
+    )
+    .map_err(|msg| NuError::RuntimeError {
+        msg: msg.to_string(),
+        span: Span::default(),
+    })?;
+
     let tls_config = if plaintext {
         nulang::runtime::TlsConfig::PlaintextInsecure
     } else {
-        let cert = tls_cert
-            .as_ref()
-            .map(|p| std::fs::read_to_string(p).ok())
-            .flatten()
-            .unwrap_or_default();
-        let key = tls_key
-            .as_ref()
-            .map(|p| std::fs::read_to_string(p).ok())
-            .flatten()
-            .unwrap_or_default();
-        let ca = tls_ca
-            .as_ref()
-            .map(|p| std::fs::read_to_string(p).ok())
-            .flatten()
-            .unwrap_or_default();
-        if cert.is_empty() && key.is_empty() && ca.is_empty() {
-            eprintln!("Warning: no TLS certificates provided; using plaintext transport");
-            nulang::runtime::TlsConfig::PlaintextInsecure
-        } else {
-            nulang::runtime::TlsConfig::MutualTls {
-                ca_cert_pem: ca.into_bytes(),
-                server_cert_pem: cert.into_bytes(),
-                server_key_pem: key.into_bytes(),
-                server_name: None,
-            }
+        let load = |path: &str| {
+            std::fs::read(path).map_err(|e| NuError::RuntimeError {
+                msg: format!("unable to read TLS file '{path}': {e}"),
+                span: Span::default(),
+            })
+        };
+        let cert = load(tls_cert.as_deref().expect("validated TLS certificate path"))?;
+        let key = load(tls_key.as_deref().expect("validated TLS private key path"))?;
+        let ca = load(tls_ca.as_deref().expect("validated TLS CA path"))?;
+        if cert.is_empty() || key.is_empty() || ca.is_empty() {
+            return Err(NuError::RuntimeError {
+                msg: "TLS certificate, private key and CA must all be nonempty".to_string(),
+                span: Span::default(),
+            });
+        }
+        nulang::runtime::TlsConfig::MutualTls {
+            ca_cert_pem: ca,
+            server_cert_pem: cert,
+            server_key_pem: key,
+            server_name: None,
         }
     };
 
