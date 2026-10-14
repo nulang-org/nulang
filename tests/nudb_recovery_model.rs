@@ -108,9 +108,10 @@ fn seeded_committed_history_matches_mvcc_before_and_after_recovery() {
         assert_history(&tablet, &history, seed, 0);
 
         for step in 0..32 {
-            let key = KEYS[next(&mut rng) as usize % KEYS.len()].to_vec();
+            let first_index = next(&mut rng) as usize % KEYS.len();
+            let key = KEYS[first_index].to_vec();
             let delete = next(&mut rng) % 4 == 0;
-            let mutation = if delete {
+            let first_mutation = if delete {
                 TabletMutation::Delete { key: key.clone() }
             } else {
                 TabletMutation::Put {
@@ -118,6 +119,24 @@ fn seeded_committed_history_matches_mvcc_before_and_after_recovery() {
                     value: format!("seed={seed:#x};step={step}").into_bytes(),
                 }
             };
+            let mut mutations = vec![first_mutation];
+
+            // Every third transaction changes two DISTINCT keys atomically.
+            // Repeated keys within a batch are tracked separately in #1702.
+            if step % 3 == 0 {
+                let second_index =
+                    (first_index + 1 + next(&mut rng) as usize % (KEYS.len() - 1)) % KEYS.len();
+                let other_key = KEYS[second_index].to_vec();
+                let second_mutation = if next(&mut rng) % 3 == 0 {
+                    TabletMutation::Delete { key: other_key }
+                } else {
+                    TabletMutation::Put {
+                        key: other_key,
+                        value: format!("seed={seed:#x};step={step};second").into_bytes(),
+                    }
+                };
+                mutations.push(second_mutation);
+            }
 
             let predecessor = tablet.current_sequence();
 
@@ -133,7 +152,7 @@ fn seeded_committed_history_matches_mvcc_before_and_after_recovery() {
                     }],
                 )
                 .unwrap();
-            let prepared = tablet.prepare_write(9, predecessor, vec![mutation.clone()]).unwrap();
+            let prepared = tablet.prepare_write(9, predecessor, mutations.clone()).unwrap();
             let acknowledged = tablet.commit(prepared).unwrap();
             assert_eq!(acknowledged, predecessor + 1);
             assert_eq!(
@@ -146,12 +165,14 @@ fn seeded_committed_history_matches_mvcc_before_and_after_recovery() {
             );
 
             let mut expected = history.last().unwrap().clone();
-            match mutation {
-                TabletMutation::Put { key, value } => {
-                    expected.insert(key, value);
-                }
-                TabletMutation::Delete { key } => {
-                    expected.remove(&key);
+            for mutation in mutations {
+                match mutation {
+                    TabletMutation::Put { key, value } => {
+                        expected.insert(key, value);
+                    }
+                    TabletMutation::Delete { key } => {
+                        expected.remove(&key);
+                    }
                 }
             }
             history.push(expected);
