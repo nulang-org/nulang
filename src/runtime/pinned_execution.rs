@@ -7,11 +7,9 @@ use crate::behavior_manifest::BehaviorManifest;
 use crate::execution_compatibility::DurableExecutionPin;
 use crate::runtime::persistence::{
     ActorSnapshot, DurableCommit, DurableTransition, PersistedValue, PersistenceStore,
-    WorkflowEvent, DURABLE_TRANSITION_VERSION,
+    WorkflowEvent, PINNED_WORKFLOW_START_EVENT, DURABLE_TRANSITION_VERSION,
 };
 use std::io;
-
-const EXECUTION_PIN_EVENT: &str = "__nulang.execution_pin/v1";
 
 /// Immutable, content-addressed bundle obtained from a trusted artifact store.
 #[derive(Debug, Clone)]
@@ -30,9 +28,20 @@ pub trait ImmutablePinnedArtifactResolver {
 /// damaged pin record was not decoded by a legacy reader. The latter is
 /// deliberately conservative; pinned callers must use strict preflight.
 pub(crate) fn requires_pinned_recovery(store: &dyn PersistenceStore, actor_id: u64) -> bool {
-    let events = store.read_workflow_events(actor_id);
+    let events = match store.read_workflow_events_checked(actor_id) {
+        Ok(events) => events,
+        // Older backends without atomic pinning retain their legacy recovery
+        // behavior. Atomic pin-enabled stores MUST provide strict reads.
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+            store.read_workflow_events(actor_id)
+        }
+        Err(error) => {
+            tracing::warn!(actor_id, %error, "refusing legacy recovery after unreadable workflow history");
+            return true;
+        }
+    };
     if events.iter().any(|event| {
-        matches!(event, WorkflowEvent::Custom { name, .. } if name == EXECUTION_PIN_EVENT)
+        matches!(event, WorkflowEvent::Custom { name, .. } if name == PINNED_WORKFLOW_START_EVENT)
     }) {
         return true;
     }
@@ -127,7 +136,7 @@ pub fn commit_pinned_workflow_start(
             WorkflowEvent::Custom {
                 sequence: 1,
                 replay_id: None,
-                name: EXECUTION_PIN_EVENT.to_owned(),
+                name: PINNED_WORKFLOW_START_EVENT.to_owned(),
                 args: vec![PersistedValue::String(serialized_pin)],
             },
         ],
@@ -182,7 +191,7 @@ pub fn read_pinned_workflow_pin(
     let mut start_count = 0usize;
     let mut pin_count = 0usize;
     let mut serialized_pin = None;
-    for event in store.read_workflow_events(actor_id) {
+    for event in store.read_workflow_events_checked(actor_id)? {
         match event {
             WorkflowEvent::WorkflowStarted { sequence, .. } => {
                 if sequence != 1 {
@@ -193,7 +202,7 @@ pub fn read_pinned_workflow_pin(
                 start_count += 1;
             }
             WorkflowEvent::Custom { sequence, name, args, replay_id }
-                if name == EXECUTION_PIN_EVENT =>
+                if name == PINNED_WORKFLOW_START_EVENT =>
             {
                 pin_count += 1;
                 if sequence != 1 || replay_id.is_some() || args.len() != 1 {
