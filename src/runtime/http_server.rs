@@ -1340,7 +1340,8 @@ mod tests {
         }
         let accepted = threads
             .into_iter()
-            .filter(|handle| handle.join().unwrap())
+            .map(|handle| handle.join().unwrap())
+            .filter(|accepted| *accepted)
             .count();
         assert_eq!(accepted, 3);
         assert_eq!(slots.active.load(Ordering::Relaxed), 0);
