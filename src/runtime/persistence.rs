@@ -1773,7 +1773,7 @@ impl LibsqlStore {
         &mut self,
         transition: DurableTransition,
         inbox: Option<DurableInboxCommand>,
-    ) -> io::Result<DurableCommit> {
+    ) -> io::Result<DurableInboxCommitOutcome> {
         transition.validate_structure()?;
         if let Some(ref request) = inbox {
             let command = transition.command.as_ref().ok_or_else(|| {
@@ -1926,11 +1926,14 @@ impl LibsqlStore {
                     tx.commit()
                         .await
                         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-                    return Ok(DurableCommit {
-                        actor_id: actor,
-                        activation_epoch: epoch,
-                        sequence,
-                        digest: committed_digest,
+                    return Ok(DurableInboxCommitOutcome {
+                        commit: DurableCommit {
+                            actor_id: actor,
+                            activation_epoch: epoch,
+                            sequence,
+                            digest: committed_digest,
+                        },
+                        newly_accepted: false,
                     });
                 }
                 drop(rows);
@@ -1981,11 +1984,14 @@ impl LibsqlStore {
                         tx.commit()
                             .await
                             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-                        return Ok(DurableCommit {
-                            actor_id: transition.actor_id,
-                            activation_epoch: transition.activation_epoch,
-                            sequence: transition.sequence,
-                            digest,
+                        return Ok(DurableInboxCommitOutcome {
+                            commit: DurableCommit {
+                                actor_id: transition.actor_id,
+                                activation_epoch: transition.activation_epoch,
+                                sequence: transition.sequence,
+                                digest,
+                            },
+                            newly_accepted: false,
                         });
                     }
                     let _ = tx.rollback().await;
@@ -2254,11 +2260,14 @@ impl LibsqlStore {
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
-            Ok(DurableCommit {
-                actor_id: transition.actor_id,
-                activation_epoch: transition.activation_epoch,
-                sequence: transition.sequence,
-                digest,
+            Ok(DurableInboxCommitOutcome {
+                commit: DurableCommit {
+                    actor_id: transition.actor_id,
+                    activation_epoch: transition.activation_epoch,
+                    sequence: transition.sequence,
+                    digest,
+                },
+                newly_accepted: true,
             })
         })
     }
@@ -2330,6 +2339,15 @@ impl PersistenceStore for LibsqlStore {
         request: DurableInboxCommand,
         transition: DurableTransition,
     ) -> io::Result<DurableCommit> {
+        self.commit_transition_with_inbox(transition, Some(request))
+            .map(|outcome| outcome.commit)
+    }
+
+    fn commit_inbox_transition_detailed(
+        &mut self,
+        request: DurableInboxCommand,
+        transition: DurableTransition,
+    ) -> io::Result<DurableInboxCommitOutcome> {
         self.commit_transition_with_inbox(transition, Some(request))
     }
 
@@ -2470,6 +2488,7 @@ impl PersistenceStore for LibsqlStore {
 
     fn commit_transition(&mut self, transition: DurableTransition) -> io::Result<DurableCommit> {
         self.commit_transition_with_inbox(transition, None)
+            .map(|outcome| outcome.commit)
     }
 
     fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()> {
