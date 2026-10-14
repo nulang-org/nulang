@@ -6184,9 +6184,9 @@ impl Runtime {
         if !is_workflow {
             match self.persistence.load_durable_tail_position(actor_id) {
                 Ok(Some(tail)) => {
-                    if selected_meta.is_some() {
-                        recover_strict_admission = true;
-                    }
+                    // Any ordinary atomic tail is a strict-dispatch boundary,
+                    // including pre-policy history without compiler metadata.
+                    recover_strict_admission = true;
                     if tail.activation_epoch != snapshot.activation_epoch
                         || tail.sequence != snapshot.sequence
                     {
