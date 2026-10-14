@@ -1187,6 +1187,56 @@ mod tests {
     }
 
     #[test]
+    fn request_context_and_cookies_are_cleared_when_handler_panics() {
+        let _ = take_response_cookies();
+        let request = RequestContext {
+            request: HttpRequest {
+                method: HttpMethod::Post,
+                path: "/isolation".into(),
+                headers: vec![],
+                body: vec![],
+            },
+            params: HashMap::new(),
+        };
+
+        let failed = std::panic::catch_unwind(|| {
+            with_request_context(request, || {
+                assert_eq!(current_request_method().as_deref(), Some("POST"));
+                set_cookie("transient", "secret");
+                panic!("simulate a failed request handler");
+            });
+        });
+
+        assert!(failed.is_err());
+        assert_eq!(current_request_method(), None, "request state leaked");
+        assert!(
+            take_response_cookies().is_empty(),
+            "pending cookies leaked after handler panic"
+        );
+    }
+
+    #[test]
+    fn request_cookies_survive_success_until_response_commit() {
+        let _ = take_response_cookies();
+        let request = RequestContext {
+            request: HttpRequest {
+                method: HttpMethod::Get,
+                path: "/success".into(),
+                headers: vec![],
+                body: vec![],
+            },
+            params: HashMap::new(),
+        };
+        with_request_context(request, || set_cookie("ok", "1"));
+
+        assert_eq!(current_request_method(), None);
+        let cookies = take_response_cookies();
+        assert_eq!(cookies.len(), 1);
+        assert!(cookies[0].starts_with("ok=1;"));
+        assert!(take_response_cookies().is_empty());
+    }
+
+    #[test]
     fn test_current_request_method() {
         let _ctx = with_request_context(
             RequestContext {
