@@ -104,6 +104,9 @@ struct CursorFile {
 struct RetentionFile {
     version: u16,
     first_retained_sequence: u64,
+    /// Durable high-water mark: recovery must not reuse an already accepted
+    /// sequence even if the remaining active segment is later torn or lost.
+    minimum_next_sequence: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -473,6 +476,11 @@ impl FileFabricStreamStore {
                 &RetentionFile {
                     version: STREAM_FORMAT_VERSION,
                     first_retained_sequence: new_floor,
+                    minimum_next_sequence: self
+                        .states
+                        .get(name)
+                        .expect("stream state recovered")
+                        .next_sequence,
                 },
             )?;
         }
@@ -1623,7 +1631,8 @@ fn recover_stream(dir: &Path) -> io::Result<StreamState> {
     }
     let config = metadata.config.validate()?;
 
-    let floor = read_retention_floor(&dir.join("retention.json"))?;
+    let retention = read_retention_file(&dir.join("retention.json"))?;
+    let floor = retention.first_retained_sequence;
     let segments: Vec<_> = list_segments(dir)?
         .into_iter()
         .filter(|(base, _)| *base >= floor)
@@ -1660,6 +1669,12 @@ fn recover_stream(dir: &Path) -> io::Result<StreamState> {
         current_segment_len = fs::metadata(path)?.len();
     }
 
+    if expected_sequence < retention.minimum_next_sequence {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Fabric retained suffix is below its durable trim high-water mark",
+        ));
+    }
     Ok(StreamState {
         config,
         next_sequence: expected_sequence,
@@ -1973,19 +1988,30 @@ fn read_commit(path: &Path) -> io::Result<CommitFile> {
     Ok(commit)
 }
 
-fn read_retention_floor(path: &Path) -> io::Result<u64> {
+fn read_retention_file(path: &Path) -> io::Result<RetentionFile> {
     if !path.exists() {
-        return Ok(1);
+        return Ok(RetentionFile {
+            version: STREAM_FORMAT_VERSION,
+            first_retained_sequence: 1,
+            minimum_next_sequence: 1,
+        });
     }
     let bytes = fs::read(path)?;
     let file: RetentionFile = serde_json::from_slice(&bytes).map_err(json_error)?;
-    if file.version != STREAM_FORMAT_VERSION || file.first_retained_sequence == 0 {
+    if file.version != STREAM_FORMAT_VERSION
+        || file.first_retained_sequence == 0
+        || file.minimum_next_sequence <= file.first_retained_sequence
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "invalid durable Fabric retention floor",
+            "invalid durable Fabric retention floor or high-water mark",
         ));
     }
-    Ok(file.first_retained_sequence)
+    Ok(file)
+}
+
+fn read_retention_floor(path: &Path) -> io::Result<u64> {
+    Ok(read_retention_file(path)?.first_retained_sequence)
 }
 
 fn read_cursors(path: &Path) -> io::Result<CursorFile> {
@@ -2388,6 +2414,7 @@ mod tests {
                 &RetentionFile {
                     version: STREAM_FORMAT_VERSION,
                     first_retained_sequence: 3,
+                    minimum_next_sequence: 4,
                 },
             )
             .unwrap();
