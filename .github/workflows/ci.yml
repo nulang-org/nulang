@@ -138,7 +138,7 @@ jobs:
   # Keep the isolated sqlite-only test separate from expensive full CI.
   # -----------------------------------------------------------------------
   durable-inbox-inflight-crash:
-    name: Durable inbox mid-transaction SIGKILL
+    name: Durable inbox and staged-result SIGKILL
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -157,6 +157,9 @@ jobs:
           cargo test --locked --no-default-features \
             --features durability-fault-injection \
             --test libsql_inflight_inbox_sigkill -- --nocapture
+          cargo test --locked --no-default-features \
+            --features durability-fault-injection \
+            --test strict_staged_completion_sigkill -- --nocapture
 
   # -----------------------------------------------------------------------
   # Release build — catches optimization-only errors
