@@ -182,3 +182,19 @@ fn default_legacy_execution_is_unchanged_until_host_opts_in() {
         "the opt-in must not silently change existing execution semantics"
     );
 }
+
+#[test]
+fn strict_gate_does_not_requeue_blocked_normal_work_forever() {
+    let (mut rt, actor_id, _, behavior) = actors();
+    rt.enable_strict_typed_actor_admission(actor_id).unwrap();
+    let predecessor = rt.persistence.latest_sequence(actor_id);
+    rt.send_message_by_id(actor_id, behavior, &[Value::int(5)]);
+
+    // No durable host admission has occurred. The scheduler must quiesce
+    // rather than running legacy bytecode or hot-looping the queued command.
+    rt.run_scheduler();
+
+    assert_eq!(rt.actors[&actor_id].mailbox.len(), 1);
+    assert_eq!(rt.persistence.latest_sequence(actor_id), predecessor);
+    assert_eq!(rt.actors[&actor_id].get_state_field("total").unwrap().as_int(), Some(0));
+}
