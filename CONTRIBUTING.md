@@ -40,6 +40,29 @@ Run the doctor's hermetic regression tests after changing its behavior:
 python3 -m unittest scripts.tests.test_dev_doctor
 ```
 
+## Verify the first-run developer workflow
+
+After building a local Nulang executable, run the isolated smoke test:
+
+```bash
+cargo build --locked --bin nulang
+python3 scripts/smoke_first_run.py --bin target/debug/nulang
+```
+
+The smoke test creates a temporary `lib` package and verifies the published
+CLI path: version, evaluation, package creation, type-check, build artifact,
+execution, discovered package tests, and formatter check-mode idempotence.
+It never publishes or deploys and deletes the temporary package afterward.
+This test is designed for a real native CLI, not the browser playground.
+It deliberately uses the formatter's currently supported type-declaration
+subset; it does not certify formatting parity for every language construct.
+
+The same contract is exposed as Dev Plane's `first_run` verification entry;
+its `doctor` command now invokes the portable doctor rather than only printing
+tool versions. Python subprocess tests for the smoke driver run with the
+repository's regular `scripts/tests` discovery, but their passing results do
+not substitute for running the smoke test against a real compiled executable.
+
 ## Run the tests
 
 ```bash
