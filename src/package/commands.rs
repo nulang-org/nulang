@@ -2629,6 +2629,43 @@ mod tests {
     }
 
     #[test]
+    fn test_strip_main_ignores_strings_and_comments() {
+        let source = r#"
+            // fn main() { this is only a comment }
+            fn helper() { "fn main() { not a declaration }" }
+            fn main() { let label = "{ literal }"; 0 }
+            fn test_real() { helper() }
+        "#;
+        let stripped = strip_main_function(source);
+        assert!(stripped.contains("fn helper()"));
+        assert!(stripped.contains("fn test_real()"));
+        assert!(stripped.contains("fn main() { not a declaration }"));
+        assert!(!stripped.contains("let label"));
+    }
+
+    #[test]
+    fn test_strip_main_handles_nested_braces_and_public_declaration() {
+        let source = r#"
+            pub fn main() {
+                let v = if true then { 1 } else { 2 }
+                v
+            }
+            fn test_real() { 42 }
+        "#;
+        let stripped = strip_main_function(source);
+        assert!(!stripped.contains("pub fn main"));
+        assert!(!stripped.contains("let v"));
+        assert!(stripped.contains("fn test_real()"));
+        assert!(discover_test_functions(&stripped).contains(&"test_real".to_string()));
+    }
+
+    #[test]
+    fn test_strip_main_does_not_remove_other_names() {
+        let source = "fn mainframe() { 1 }\\nfn test_real() { 2 }\\n";
+        assert_eq!(strip_main_function(source), source);
+    }
+
+    #[test]
     fn test_manifest_language_pin() {
         let dir = std::env::temp_dir().join(format!("nulang_lang_pin_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
