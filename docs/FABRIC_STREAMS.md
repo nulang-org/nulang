@@ -98,7 +98,10 @@ The deletion protocol is intentionally ordered:
 1. Recompute eligibility against persisted cursors, segments, replication
    policy, and producer-checkpoint restrictions.
 2. Atomically replace and fsync `retention.json` with the first surviving
-   segment sequence **before** removing any historical segment.
+   segment sequence **and the acknowledged trim-time next-sequence high-water**
+   before removing any historical segment. Recovery refuses a retained log
+   ending before that high-water mark, preventing reuse of accepted sequences
+   after subsequent tail loss.
 3. Unlink segments below the durable floor, then sync the stream directory.
 
 If the process crashes between steps 2 and 3, recovery loads the floor and
