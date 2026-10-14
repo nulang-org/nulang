@@ -285,34 +285,7 @@ jobs:
           rpm="dist/nulang-${version}-1.${arch}.rpm"
           test "$(dpkg-deb --field "$deb" Architecture)" = "${{ matrix.deb_arch }}"
           test "$(rpm -qp --qf '%{ARCH}' "$rpm")" = "$arch"
-          dpkg-deb --contents "$deb" | grep -E '/usr/bin/nulang
-  publish:
-    name: Publish Release
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    needs: release
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: nulang-*
-          path: dist
-
-      - name: Flatten artifacts
-        run: |
-          mkdir -p dist-flat
-          for d in dist/nulang-*/; do
-            cp "$d"* dist-flat/
-          done
-          ls -la dist-flat/
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
-        with:
-          files: dist-flat/*
-          generate_release_notes: true
-
+          dpkg-deb --contents "$deb" | grep -E '/usr/bin/nulang$'
           rpm -qpl "$rpm" | grep -Fx '/usr/bin/nulang'
           (cd dist && sha256sum -c "$(basename "$deb").sha256" && sha256sum -c "$(basename "$rpm").sha256")
           mkdir -p package-smoke/deb package-smoke/rpm
