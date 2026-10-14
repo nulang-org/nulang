@@ -2320,6 +2320,18 @@ mod tests {
     }
 
     #[test]
+    fn retention_preserves_legacy_zero_start_on_untrimmed_streams() {
+        let root = test_dir("retention-zero-start");
+        let mut store = FileFabricStreamStore::open(&root).unwrap();
+        store
+            .create_stream("events", FabricStreamConfig::default())
+            .unwrap();
+        store.append("events", b"one").unwrap();
+        assert_eq!(store.read_from("events", 0, 10).unwrap()[0].sequence, 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn physical_retention_survives_reopen_and_preserves_absolute_sequences() {
         let root = test_dir("retention-physical-reopen");
         {
