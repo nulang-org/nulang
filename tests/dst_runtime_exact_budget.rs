@@ -7,6 +7,9 @@ use std::time::Duration;
 use nulang::runtime::{DeterministicRunResult, Runtime};
 use nulang::vm::Value;
 
+// The counter fixture registers exactly one behavior, at index zero.
+const INC_BEHAVIOR_ID: u16 = 0;
+
 fn runtime_with_counter() -> (Runtime, u64) {
     let mut runtime = Runtime::new();
     runtime.install_virtual_clock();
@@ -87,10 +90,9 @@ fn zero_budget_does_not_execute_queued_actor() {
 fn zero_budget_does_not_advance_virtual_time_or_fire_timer() {
     let (mut runtime, actor_id) = runtime_with_counter();
     let start = runtime.now();
-    let behavior_id = runtime.actors[&actor_id].behavior_id("inc").unwrap();
     runtime
         .timer_wheel
-        .send_after(Duration::from_secs(60), actor_id, behavior_id, vec![]);
+        .send_after(Duration::from_secs(60), actor_id, INC_BEHAVIOR_ID, vec![]);
 
     assert_eq!(
         runtime.run_scheduler_deterministic(7, 0),
@@ -104,10 +106,9 @@ fn zero_budget_does_not_advance_virtual_time_or_fire_timer() {
 #[test]
 fn virtual_timer_and_message_quiesce_at_exact_two_step_budget() {
     let (mut runtime, actor_id) = runtime_with_counter();
-    let behavior_id = runtime.actors[&actor_id].behavior_id("inc").unwrap();
     runtime
         .timer_wheel
-        .send_after(Duration::from_secs(60), actor_id, behavior_id, vec![]);
+        .send_after(Duration::from_secs(60), actor_id, INC_BEHAVIOR_ID, vec![]);
 
     assert_eq!(
         runtime.run_scheduler_deterministic(7, 2),
@@ -120,10 +121,9 @@ fn virtual_timer_and_message_quiesce_at_exact_two_step_budget() {
 #[test]
 fn timer_advance_uses_budget_and_cannot_execute_handler_without_next_step() {
     let (mut runtime, actor_id) = runtime_with_counter();
-    let behavior_id = runtime.actors[&actor_id].behavior_id("inc").unwrap();
     runtime
         .timer_wheel
-        .send_after(Duration::from_secs(60), actor_id, behavior_id, vec![]);
+        .send_after(Duration::from_secs(60), actor_id, INC_BEHAVIOR_ID, vec![]);
 
     assert_eq!(
         runtime.run_scheduler_deterministic(7, 1),
