@@ -26,13 +26,33 @@ pub trait ImmutablePinnedArtifactResolver {
     fn resolve(&self, executable_digest: &str) -> io::Result<Option<PinnedArtifactBundle>>;
 }
 
-/// Detect a persisted pin marker so unverified legacy recovery cannot run a
-/// correctly decoded pinned execution. Malformed/unreadable history is handled
-/// by the strict pinned recovery preflight, not interpreted as a valid pin.
-pub(crate) fn has_execution_pin_marker(store: &dyn PersistenceStore, actor_id: u64) -> bool {
-    store.read_workflow_events(actor_id).iter().any(|event| {
+/// Guard both recognized pin records and the atomic-start shape when a
+/// damaged pin record was not decoded by a legacy reader. The latter is
+/// deliberately conservative; pinned callers must use strict preflight.
+pub(crate) fn requires_pinned_recovery(store: &dyn PersistenceStore, actor_id: u64) -> bool {
+    let events = store.read_workflow_events(actor_id);
+    if events.iter().any(|event| {
         matches!(event, WorkflowEvent::Custom { name, .. } if name == EXECUTION_PIN_EVENT)
-    })
+    }) {
+        return true;
+    }
+    // Atomic pinned startup has a safe snapshot at sequence 1 and a start
+    // event in the same transaction. Legacy startup writes the snapshot in
+    // a later independent commit. Never interpret a missing pin as an
+    // invitation to use an unverified executable.
+    let initial_atomic_tail = matches!(
+        store.load_durable_tail_position(actor_id),
+        Ok(Some(tail)) if tail.sequence >= 1
+    );
+    let initial_snapshot = store
+        .load_snapshot(actor_id)
+        .map(|snapshot| snapshot.sequence == 1)
+        .unwrap_or(false);
+    initial_atomic_tail
+        && initial_snapshot
+        && events.iter().any(|event| {
+            matches!(event, WorkflowEvent::WorkflowStarted { sequence: 1, .. })
+        })
 }
 
 
