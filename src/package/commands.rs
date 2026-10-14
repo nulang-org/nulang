@@ -2732,6 +2732,18 @@ mod tests {
     }
 
     #[test]
+    fn test_wrapper_paths_are_unique_across_files_with_same_test_name() {
+        let temp_dir = std::env::temp_dir().join("nula-test-wrapper-fixtures");
+        let first = per_function_wrapper_path(&temp_dir, 0, 0);
+        let second_file = per_function_wrapper_path(&temp_dir, 1, 0);
+        let second_test = per_function_wrapper_path(&temp_dir, 0, 1);
+
+        assert_ne!(first, second_file);
+        assert_ne!(first, second_test);
+        assert_ne!(second_file, second_test);
+    }
+
+    #[test]
     fn test_manifest_language_pin() {
         let dir = std::env::temp_dir().join(format!("nulang_lang_pin_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
