@@ -99,6 +99,13 @@ struct CursorFile {
     cursors: BTreeMap<String, u64>,
 }
 
+/// Durable logical trim floor, fsynced before deletion of obsolete files.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RetentionFile {
+    version: u16,
+    first_retained_sequence: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CommitFile {
     version: u16,
@@ -346,10 +353,12 @@ impl FileFabricStreamStore {
             .get(name)
             .expect("state recovered")
             .next_sequence;
-        if keep_from_sequence == 0 || keep_from_sequence > next_sequence {
+        let dir = self.stream_dir(name);
+        let floor = read_retention_floor(&dir.join("retention.json"))?;
+        if keep_from_sequence < floor || keep_from_sequence > next_sequence {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("Fabric keep-from sequence must be in 1..={next_sequence}"),
+                format!("Fabric keep-from sequence must be in {floor}..={next_sequence}"),
             ));
         }
         if self.replication_policy(name)?.is_some() {
@@ -358,7 +367,6 @@ impl FileFabricStreamStore {
                 "replicated Fabric retention needs a quorum-safe trim frontier",
             ));
         }
-        let dir = self.stream_dir(name);
         // Local idempotent producer checkpoints refer to exact log records.
         // Do not claim an eligibility proof until their migration/expiry
         // semantics have been implemented alongside retention.
@@ -379,6 +387,12 @@ impl FileFabricStreamStore {
         }
         let minimum_consumer_cursor = cursors.cursors.values().copied().min();
         if let Some(minimum) = minimum_consumer_cursor {
+            if minimum < floor.saturating_sub(1) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Fabric consumer cursor predates committed retention floor",
+                ));
+            }
             if keep_from_sequence.saturating_sub(1) > minimum {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -387,7 +401,16 @@ impl FileFabricStreamStore {
             }
         }
 
-        let segments = list_segments(&dir)?;
+        let segments: Vec<_> = list_segments(&dir)?
+            .into_iter()
+            .filter(|(base, _)| *base >= floor)
+            .collect();
+        if floor > 1 && segments.first().map(|(base, _)| *base) != Some(floor) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric retention floor has no matching retained segment",
+            ));
+        }
         let mut eligible_segment_count = 0;
         let mut eligible_bytes = 0u64;
         // Always retain the last segment. The current append state may still
@@ -421,6 +444,50 @@ impl FileFabricStreamStore {
             eligible_bytes,
             minimum_consumer_cursor,
         })
+    }
+
+    /// Persist a logical trim fence before deleting standalone log segments.
+    /// Retrying after an interrupted cleanup removes the obsolete prefix.
+    /// Requires an exclusive stream-root lock (provided by the separate
+    /// single-writer ownership PR) before safe production use.
+    pub fn apply_retention(
+        &mut self,
+        name: &str,
+        keep_from_sequence: u64,
+    ) -> io::Result<FabricStreamRetentionPreview> {
+        let preview = self.preview_retention(name, keep_from_sequence)?;
+        let dir = self.stream_dir(name);
+        let previous_floor = read_retention_floor(&dir.join("retention.json"))?;
+        let new_floor = preview.first_retained_sequence.unwrap_or(previous_floor);
+        if new_floor < previous_floor {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric retention floor cannot move backwards",
+            ));
+        }
+        if new_floor > previous_floor {
+            // write_json_atomic includes file fsync, rename, and directory fsync.
+            // This MUST precede every physical unlink.
+            write_json_atomic(
+                &dir.join("retention.json"),
+                &RetentionFile {
+                    version: STREAM_FORMAT_VERSION,
+                    first_retained_sequence: new_floor,
+                },
+            )?;
+        }
+
+        let mut removed = false;
+        for (base, path) in list_segments(&dir)? {
+            if base < new_floor {
+                fs::remove_file(path)?;
+                removed = true;
+            }
+        }
+        if removed {
+            sync_dir(&dir)?;
+        }
+        Ok(preview)
     }
 
     pub fn append(&mut self, name: &str, payload: &[u8]) -> io::Result<u64> {
@@ -576,12 +643,22 @@ impl FileFabricStreamStore {
         limit: usize,
     ) -> io::Result<Vec<FabricStreamRecord>> {
         self.ensure_state(name)?;
+        let dir = self.stream_dir(name);
+        let floor = read_retention_floor(&dir.join("retention.json"))?;
+        if start_sequence < floor {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Fabric sequence {start_sequence} is below retained floor {floor}"),
+            ));
+        }
         if limit == 0 {
             return Ok(Vec::new());
         }
-
         let mut result = Vec::with_capacity(limit.min(256));
-        for (base, path) in list_segments(&self.stream_dir(name))? {
+        for (base, path) in list_segments(&dir)? {
+            if base < floor {
+                continue;
+            }
             let records = decode_segment(&path, base, false)?;
             for record in records {
                 if record.sequence < start_sequence {
@@ -687,6 +764,12 @@ impl FileFabricStreamStore {
             ));
         }
 
+        if read_retention_floor(&self.stream_dir(name).join("retention.json"))? > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Fabric physical retention requires migration before enabling replication",
+            ));
+        }
         let path = self.stream_dir(name).join("replication_policy.json");
         if let Some(existing) = read_replication_policy(&path)? {
             if existing == policy {
@@ -1179,8 +1262,21 @@ impl FileFabricStreamStore {
             ));
         }
 
+        let floor = read_retention_floor(&self.stream_dir(name).join("retention.json"))?;
+        if sequence < floor.saturating_sub(1) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Fabric cursor cannot commit before retained history",
+            ));
+        }
         let path = self.stream_dir(name).join("cursors.json");
         let mut cursors = read_cursors(&path)?;
+        if cursors.cursors.get(consumer).is_some_and(|&cursor| cursor < floor.saturating_sub(1)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric persisted consumer cursor predates retained history",
+            ));
+        }
         let current = cursors.cursors.get(consumer).copied().unwrap_or(0);
         if sequence < current {
             return Err(io::Error::new(
@@ -1284,6 +1380,16 @@ impl Runtime {
     ) -> io::Result<FabricStreamRetentionPreview> {
         self.fabric_stream_store_mut()?
             .preview_retention(name, keep_from_sequence)
+    }
+
+    /// Experimental standalone-only crash-fenced physical retention.
+    pub fn fabric_stream_apply_retention(
+        &mut self,
+        name: &str,
+        keep_from_sequence: u64,
+    ) -> io::Result<FabricStreamRetentionPreview> {
+        self.fabric_stream_store_mut()?
+            .apply_retention(name, keep_from_sequence)
     }
 
     pub fn fabric_stream_names(&mut self) -> io::Result<Vec<String>> {
@@ -1517,9 +1623,19 @@ fn recover_stream(dir: &Path) -> io::Result<StreamState> {
     }
     let config = metadata.config.validate()?;
 
-    let segments = list_segments(dir)?;
-    let mut expected_sequence = 1_u64;
-    let mut current_segment_base = 1_u64;
+    let floor = read_retention_floor(&dir.join("retention.json"))?;
+    let segments: Vec<_> = list_segments(dir)?
+        .into_iter()
+        .filter(|(base, _)| *base >= floor)
+        .collect();
+    if floor > 1 && segments.first().map(|(base, _)| *base) != Some(floor) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Fabric retained log suffix missing at durable retention floor",
+        ));
+    }
+    let mut expected_sequence = floor;
+    let mut current_segment_base = floor;
     let mut current_segment_len = 0_u64;
 
     for (index, (base, path)) in segments.iter().enumerate() {
@@ -1855,6 +1971,21 @@ fn read_commit(path: &Path) -> io::Result<CommitFile> {
         ));
     }
     Ok(commit)
+}
+
+fn read_retention_floor(path: &Path) -> io::Result<u64> {
+    if !path.exists() {
+        return Ok(1);
+    }
+    let bytes = fs::read(path)?;
+    let file: RetentionFile = serde_json::from_slice(&bytes).map_err(json_error)?;
+    if file.version != STREAM_FORMAT_VERSION || file.first_retained_sequence == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid durable Fabric retention floor",
+        ));
+    }
+    Ok(file.first_retained_sequence)
 }
 
 fn read_cursors(path: &Path) -> io::Result<CursorFile> {
