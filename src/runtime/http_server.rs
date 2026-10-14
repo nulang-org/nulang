@@ -2,7 +2,8 @@
 //!
 //! Phase 1: each request dispatches to a standalone VM on the listener thread.
 //! Handlers are non-capturing `fn(String) -> String` — no closures with env.
-//! Status is always 200; Content-Type is always text/plain.
+//! Responses use standard HTTP status codes; bodies are text/plain unless the
+//! response carries another Content-Type.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
