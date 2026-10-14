@@ -87,7 +87,7 @@ jobs:
             artifact: nulang-linux-x86_64
             package_arch: x86_64
             deb_arch: amd64
-          - os: ubuntu-22.04
+          - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             artifact: nulang-linux-aarch64
             package_arch: aarch64
@@ -103,27 +103,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install cross-compilation toolchain (Linux aarch64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+      # Build both GNU/Linux architectures natively to avoid Ubuntu multiarch
+      # apt mirror failures and exercise actual ARM64 code before release.
+      - name: Install native Linux build dependencies
+        if: runner.os == 'Linux'
         run: |
-          sudo dpkg --add-architecture arm64
-          # Ubuntu 22.04 runners may have BOTH sources.list and deb822 files.
-          # Constrain all official Ubuntu amd64 mirrors; ARM64 uses ports.
-          CODENAME="$(lsb_release -cs)"
-          sudo python3 scripts/configure_ubuntu_arm64_sources.py --codename "$CODENAME"
           sudo apt-get update
-          # The public CLI does not require cross-target Python headers or
-          # shared libraries. Keep the cross toolchain and OpenSSL only.
-          # --no-install-recommends omits the target glibc development sysroot
-          # on some Ubuntu images. Without it, ring's C build may resolve
-          # /usr/include/stdint.h and fail on bits/libc-header-start.h.
-          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross libssl-dev:arm64 pkg-config
-          # Fail early if the compiler cannot find target libc headers.
-          printf '#include <stdint.h>\nint main(void) { return (int)sizeof(uint64_t); }\n' \
-            | aarch64-linux-gnu-gcc -x c -c - -o "$RUNNER_TEMP/nulang-arm64-libc-smoke.o"
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
-          echo "PKG_CONFIG_ALLOW_CROSS=1" >> $GITHUB_ENV
-          echo "PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig" >> $GITHUB_ENV
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+          test "$(uname -m)" = "${{ matrix.package_arch }}"
 
       - name: Install macOS system dependencies
         if: runner.os == 'macOS'
@@ -156,14 +143,14 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          # readelf understands both native x86_64 and cross-built aarch64 ELF.
+          # Keep public artifacts independent of the runner's Python ABI.
           if readelf -d target/${{ matrix.target }}/release/nulang | grep -Eq 'Shared library: \[libpython'; then
             echo "::error::Public release CLI unexpectedly depends on libpython"
             exit 1
           fi
 
       - name: Smoke native Linux release CLI
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        if: runner.os == 'Linux'
         shell: bash
         run: bash scripts/check_release_linux.sh target/${{ matrix.target }}/release/nulang
 
@@ -195,18 +182,9 @@ jobs:
         run: cargo test --locked --release --target ${{ matrix.target }} --no-default-features --features release-cli
 
       - name: Strip binary
-        # No strip on Windows: the MSVC toolchain has no equivalent
-        # single-step strip, and the binary is already release-sized.
+        # Native strip handles both Linux architectures and macOS.
         if: runner.os != 'Windows'
-        run: |
-          # The host strip cannot process a cross-compiled aarch64 ELF;
-          # use the cross binutils strip (from gcc-aarch64-linux-gnu).
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-            STRIP=aarch64-linux-gnu-strip
-          else
-            STRIP=strip
-          fi
-          $STRIP target/${{ matrix.target }}/release/nulang
+        run: strip target/${{ matrix.target }}/release/nulang
 
       - name: Package binary
         # bash shell: the default pwsh on Windows runners cannot run the
@@ -240,7 +218,6 @@ jobs:
           test "$(tar tzf dist/${{ matrix.artifact }}.tar.gz)" = "${{ matrix.artifact }}"
 
       - name: Smoke extracted native release archive
-        if: matrix.target != 'aarch64-unknown-linux-gnu'
         shell: bash
         run: |
           mkdir -p release-smoke
@@ -288,10 +265,8 @@ jobs:
           rpm2cpio "$rpm" | (cd package-smoke/rpm && cpio -id --quiet)
           cmp package-smoke/deb/usr/bin/nulang "target/${{ matrix.target }}/release/nulang"
           cmp package-smoke/rpm/usr/bin/nulang "target/${{ matrix.target }}/release/nulang"
-          if [ "$arch" = x86_64 ]; then
-            bash scripts/check_release_linux.sh package-smoke/deb/usr/bin/nulang
-            bash scripts/check_release_linux.sh package-smoke/rpm/usr/bin/nulang
-          fi
+          bash scripts/check_release_linux.sh package-smoke/deb/usr/bin/nulang
+          bash scripts/check_release_linux.sh package-smoke/rpm/usr/bin/nulang
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
