@@ -21,8 +21,8 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use super::tablet::{
-    transaction_digest, MemoryTablet, TabletDescriptor, TabletId, TabletMutation,
-    TabletWrite, TransactionIdentity,
+    transaction_digest, MemoryTablet, TabletDescriptor, TabletId, TabletMutation, TabletWrite,
+    TransactionIdentity,
 };
 
 const WAL_MAGIC: &[u8; 8] = b"NUDBWAL3";
