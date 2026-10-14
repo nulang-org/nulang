@@ -956,4 +956,67 @@ mod transactional_receive_tests {
             "reset must rewind indexed cursors and clear tried state"
         );
     }
+
+    #[test]
+    fn durable_admission_keeps_message_and_capacity_until_commit() {
+        let mut mailbox = Mailbox::new(1);
+        mailbox.push_local(make_msg(7, 17)).unwrap();
+
+        assert_eq!(mailbox.begin_durable_admission().unwrap().sender, 17);
+        assert_eq!(mailbox.len(), 1, "a staged message still owns its mailbox slot");
+        assert!(
+            mailbox.push_local(make_msg(8, 18)).is_err(),
+            "concurrent producers cannot use the uncommitted slot"
+        );
+
+        assert!(mailbox.abort_durable_admission());
+        assert_eq!(mailbox.begin_durable_admission().unwrap().sender, 17);
+        assert_eq!(mailbox.commit_durable_admission().unwrap().sender, 17);
+        assert_eq!(mailbox.len(), 0);
+
+        mailbox.push_local(make_msg(8, 18)).unwrap();
+        assert_eq!(mailbox.pop().unwrap().sender, 18);
+    }
+
+    #[test]
+    fn durable_admission_retry_preserves_head_order_after_new_arrivals() {
+        let mut mailbox = Mailbox::new(0);
+        mailbox.push_local(make_msg(3, 10)).unwrap();
+
+        assert_eq!(mailbox.begin_durable_admission().unwrap().sender, 10);
+        mailbox.push_local(make_msg(3, 11)).unwrap();
+        assert!(mailbox.abort_durable_admission());
+
+        assert_eq!(mailbox.begin_durable_admission().unwrap().sender, 10);
+        assert_eq!(mailbox.commit_durable_admission().unwrap().sender, 10);
+        assert_eq!(mailbox.pop().unwrap().sender, 11);
+        assert!(mailbox.is_empty());
+    }
+
+    #[test]
+    fn durable_admission_respects_system_priority_and_reset_discards_pending() {
+        let mut mailbox = Mailbox::new(1);
+        mailbox.push_local(make_msg(3, 10)).unwrap();
+        let mut system = make_msg(0, 99);
+        system.priority = MessagePriority::System;
+        mailbox.push(system).unwrap();
+
+        assert_eq!(mailbox.begin_durable_admission().unwrap().sender, 99);
+        assert_eq!(mailbox.len(), 2);
+        mailbox.reset(1);
+        assert!(mailbox.commit_durable_admission().is_none());
+        assert_eq!(mailbox.len(), 0);
+        assert!(mailbox.is_empty());
+    }
+
+    #[test]
+    fn ordinary_pop_cannot_overtake_an_uncommitted_durable_candidate() {
+        let mut mailbox = Mailbox::new(0);
+        mailbox.push_local(make_msg(3, 5)).unwrap();
+        assert_eq!(mailbox.begin_durable_admission().unwrap().sender, 5);
+        mailbox.push_local(make_msg(3, 6)).unwrap();
+        assert_eq!(mailbox.pop().unwrap().sender, 5);
+        assert_eq!(mailbox.pop().unwrap().sender, 6);
+        assert_eq!(mailbox.len(), 0);
+    }
 }
