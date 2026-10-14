@@ -122,8 +122,22 @@ pub enum StepResult {
     Quiescent,
 }
 
+/// Terminal result of a bounded simulation. A step limit is never success:
+/// retain the seed and budget so a failed interleaving can be reproduced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "check whether the simulation reached quiescence"]
+pub enum SimulationRunResult {
+    Quiescent { steps: u64 },
+    StepLimitExceeded {
+        seed: u64,
+        steps: u64,
+        max_steps: u64,
+    },
+}
+
 /// The deterministic simulator.
 pub struct Simulator {
+    seed: u64,
     pub rng: DeterministicRng,
     pub actors: HashMap<u64, SimActor>,
     pub pending_messages: VecDeque<SimMessage>,
@@ -137,6 +151,7 @@ impl Simulator {
     /// Create a new simulator with the given random seed.
     pub fn new(seed: u64) -> Self {
         Self {
+            seed,
             rng: DeterministicRng::new(seed),
             actors: HashMap::new(),
             pending_messages: VecDeque::new(),
@@ -179,7 +194,14 @@ impl Simulator {
     /// Advance the simulation by one step.
     pub fn step(&mut self) -> StepResult {
         if self.step_count >= self.max_steps {
-            return StepResult::NoProgress;
+            // The last permitted step may have processed the final message.
+            // That is successful quiescence, not budget exhaustion. Do not
+            // consume another step or advance virtual time to find out.
+            return if self.has_pending_work() {
+                StepResult::NoProgress
+            } else {
+                StepResult::Quiescent
+            };
         }
         self.step_count += 1;
 
@@ -247,13 +269,53 @@ impl Simulator {
         }
     }
 
-    /// Run the simulation until quiescence or step limit.
-    pub fn run_until_quiescence(&mut self) {
+    /// Return whether any work remains in the lightweight simulation:
+    /// undelivered messages, actor mailboxes, or scheduled timers.
+    ///
+    /// This is not a detector for suspended real-runtime actors or external
+    /// asynchronous operations. Use the real Runtime DST for those scenarios.
+    pub fn has_pending_work(&self) -> bool {
+        !self.pending_messages.is_empty()
+            || !self.timers.is_empty()
+            || self.actors.values().any(|actor| !actor.mailbox.is_empty())
+    }
+
+    /// Run without hiding a step-budget exhaustion. On failure, the seed and
+    /// budget can be used to reproduce the same scheduling interleaving.
+    pub fn run_until_quiescence_checked(&mut self) -> SimulationRunResult {
         loop {
             match self.step() {
-                StepResult::Quiescent | StepResult::NoProgress => break,
-                _ => {}
+                StepResult::MessageProcessed { .. } => {}
+                StepResult::Quiescent => {
+                    return SimulationRunResult::Quiescent {
+                        steps: self.step_count,
+                    };
+                }
+                StepResult::NoProgress => {
+                    return SimulationRunResult::StepLimitExceeded {
+                        seed: self.seed,
+                        steps: self.step_count,
+                        max_steps: self.max_steps,
+                    };
+                }
             }
+        }
+    }
+
+    /// Run to quiescence or panic with a reproducible failure message.
+    ///
+    /// Preserves the original void API for callers using the harness in
+    /// tests, but a depleted budget no longer masquerades as success.
+    pub fn run_until_quiescence(&mut self) {
+        if let SimulationRunResult::StepLimitExceeded {
+            seed,
+            steps,
+            max_steps,
+        } = self.run_until_quiescence_checked()
+        {
+            panic!(
+                "DST step limit exceeded: seed={seed}, steps={steps}, max_steps={max_steps}"
+            );
         }
     }
 
