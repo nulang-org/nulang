@@ -14,6 +14,32 @@ cargo build --release
 Requires Rust 1.95.0 (pinned by `rust-toolchain.toml`), Linux or macOS.
 Windows is unsupported; use WSL.
 
+## Check your development environment
+
+Before building, run the portable contributor doctor:
+
+```bash
+bash scripts/dev-doctor.sh
+```
+
+This checks required Rust/C/Python tools, the pinned Rust version, locked Cargo
+metadata, filesystem locality, and free disk space. A normal Cargo build does
+**not** require `mise` or `mbx`; their absence is a warning, not a blocker.
+
+For linked worktrees or parallel agent builds that use the optional `mise`
+tasks and `mbx` Cargo cache wrapper, validate the stricter profile:
+
+```bash
+bash scripts/dev-doctor.sh --accelerated
+mise run setup
+```
+
+Run the doctor's hermetic regression tests after changing its behavior:
+
+```bash
+python3 -m unittest scripts.tests.test_dev_doctor
+```
+
 ## Run the tests
 
 ```bash
