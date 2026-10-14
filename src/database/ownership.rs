@@ -32,7 +32,7 @@ impl NodeId {
 }
 
 /// Command selected by the external consensus control plane.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OwnershipCommand {
     Bootstrap {
         tablet: TabletId,
@@ -60,7 +60,7 @@ impl OwnershipCommand {
 ///
 /// Merely constructing this value does NOT constitute quorum commitment.
 /// This type exists to isolate the deterministic *apply* boundary.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommittedOwnershipEntry {
     pub index: u64,
     pub term: u64,
