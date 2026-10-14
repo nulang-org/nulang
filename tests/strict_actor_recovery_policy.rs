@@ -121,9 +121,94 @@ fn unfinished_atomic_command_refuses_recovery_instead_of_replaying_handler() {
 
     assert_eq!(
         runtime.recover_actor(actor_id),
-        None,
-        "do not let legacy recovery replay an atomic strict command"
+        Some(actor_id),
+        "one proven unfinished strict command can be recovered only as fenced state"
     );
+    let actor = &runtime.actors[&actor_id];
+    assert!(actor.mailbox.requires_strict_durable_admission());
+    assert_eq!(
+        actor.mailbox.admitted_command_sequence(),
+        Some(command_sequence),
+        "uncompleted command must remain fenced"
+    );
+    assert_eq!(actor.get_state_field("total").and_then(|v| v.as_int()), Some(0));
+    assert_eq!(runtime.persistence.read_journal(actor_id).len(), 1);
+
+    // A queued normal message must not cause the recovered user handler to
+    // run while the prior durable command has no completion snapshot.
+    runtime.send_message_by_id(actor_id, behavior, &[Value::int(9)]);
+    runtime.step_actor(actor_id);
+    assert_eq!(runtime.actors[&actor_id].mailbox.len(), 1);
+    assert_eq!(
+        runtime.actors[&actor_id].get_state_field("total").and_then(|v| v.as_int()),
+        Some(0)
+    );
+    assert_eq!(
+        runtime.finish_admitted_typed_actor_command(actor_id, command_sequence)
+            .unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn strict_recovery_rejects_ambiguous_unfinished_history() {
+    let (mut runtime, actor_id, behavior) = recovered_fixture();
+    runtime.enable_strict_typed_actor_admission(actor_id).unwrap();
+    let checkpoint = runtime.persistence.load_snapshot(actor_id).unwrap();
+    let first = checkpoint.sequence + 1;
+    runtime.persistence.commit_transition(DurableTransition {
+        version: DURABLE_TRANSITION_VERSION,
+        actor_id,
+        activation_epoch: checkpoint.activation_epoch,
+        sequence: first,
+        expected_previous_sequence: checkpoint.sequence,
+        command: Some(JournalEntry {
+            sequence: first,
+            behavior_id: behavior,
+            payload: vec![PersistedValue::Int(5)],
+        }),
+        snapshot: None,
+        workflow_events: vec![],
+        domain_events: vec![],
+        durable_effects: vec![],
+        outbox: vec![],
+    }).unwrap();
+    // A second committed atomic journal command without a completion
+    // snapshot is ambiguous and must not be published as recoverable work.
+    runtime.persistence.commit_transition(DurableTransition {
+        version: DURABLE_TRANSITION_VERSION,
+        actor_id,
+        activation_epoch: checkpoint.activation_epoch,
+        sequence: first + 1,
+        expected_previous_sequence: first,
+        command: Some(JournalEntry {
+            sequence: first + 1,
+            behavior_id: behavior,
+            payload: vec![PersistedValue::Int(6)],
+        }),
+        snapshot: None,
+        workflow_events: vec![],
+        domain_events: vec![],
+        durable_effects: vec![],
+        outbox: vec![],
+    }).unwrap();
+    runtime.actors.remove(&actor_id);
+    assert_eq!(runtime.recover_actor(actor_id), None);
+    assert!(!runtime.actors.contains_key(&actor_id));
+}
+
+#[test]
+fn strict_recovery_rejects_orphaned_post_snapshot_journal() {
+    let (mut runtime, actor_id, behavior) = recovered_fixture();
+    runtime.enable_strict_typed_actor_admission(actor_id).unwrap();
+    let snapshot = runtime.persistence.load_snapshot(actor_id).unwrap();
+    runtime.persistence.append_journal(actor_id, JournalEntry {
+        sequence: snapshot.sequence + 1,
+        behavior_id: behavior,
+        payload: vec![PersistedValue::Int(5)],
+    }).unwrap();
+    runtime.actors.remove(&actor_id);
+    assert_eq!(runtime.recover_actor(actor_id), None);
     assert!(!runtime.actors.contains_key(&actor_id));
 }
 
