@@ -43,6 +43,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      issues: read
 
     steps:
       - name: Checkout main
