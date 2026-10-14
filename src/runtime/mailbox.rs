@@ -291,6 +291,8 @@ pub struct Mailbox {
     active_match: Option<(MatchLane, usize, Arc<Vec<Value>>)>,
     /// Candidate awaiting persistence admission, retaining its mailbox slot.
     pending_durable_admission: Option<Message>,
+    /// An admitted user command whose durable completion is pending.
+    admitted_command_sequence: Option<u64>,
 }
 
 impl Mailbox {
@@ -311,6 +313,7 @@ impl Mailbox {
             receive_indexes: None,
             active_match: None,
             pending_durable_admission: None,
+            admitted_command_sequence: None,
         }
     }
 
@@ -328,6 +331,7 @@ impl Mailbox {
         self.receive_indexes = None;
         self.active_match = None;
         self.pending_durable_admission = None;
+        self.admitted_command_sequence = None;
     }
 
     /// Reserve one logical mailbox slot.
@@ -409,8 +413,22 @@ impl Mailbox {
     /// exact same message, even after newly arriving messages. This is an
     /// in-memory primitive; it is not a persisted or crash-proof inbox.
     pub fn begin_durable_admission(&mut self) -> Option<&Message> {
+        if self.admitted_command_sequence.is_some() {
+            return None;
+        }
         if self.pending_durable_admission.is_none() {
-            self.pending_durable_admission = self.pop_uncommitted();
+            match self.pop_uncommitted() {
+                Some(message) if message.priority == MessagePriority::System => {
+                    // Supervision/monitor notifications use the runtime ABI,
+                    // not compiler-typed user command admission. Return them
+                    // to the highest-priority lane without releasing a slot.
+                    self.system_skip_buffer.push_front((message, false));
+                    self.active_match = None;
+                    self.invalidate_receive_indexes();
+                    return None;
+                }
+                other => self.pending_durable_admission = other,
+            }
             if self.pending_durable_admission.is_some() {
                 self.active_match = None;
                 self.invalidate_receive_indexes();
@@ -422,6 +440,58 @@ impl Mailbox {
     /// Abort admission without losing the message or freeing capacity.
     pub fn abort_durable_admission(&mut self) -> bool {
         self.pending_durable_admission.is_some()
+    }
+
+    /// A failed durable admission deliberately pauses automatic scheduling.
+    /// A trusted host explicitly retries the same candidate and transition.
+    pub fn has_pending_durable_admission(&self) -> bool {
+        self.pending_durable_admission.is_some()
+    }
+
+    pub fn admitted_command_sequence(&self) -> Option<u64> {
+        self.admitted_command_sequence
+    }
+
+    /// Fence all later user commands while the host commits completion.
+    pub fn fence_admitted_command(&mut self, sequence: u64) {
+        debug_assert!(self.pending_durable_admission.is_none());
+        debug_assert!(self.admitted_command_sequence.is_none());
+        self.admitted_command_sequence = Some(sequence);
+    }
+
+    /// Runtime verifies durable completion before releasing this fence.
+    pub fn finish_admitted_command(&mut self, sequence: u64) -> bool {
+        if self.admitted_command_sequence != Some(sequence) {
+            return false;
+        }
+        self.admitted_command_sequence = None;
+        true
+    }
+
+    /// System supervision messages must remain runnable even if an ordinary
+    /// command is awaiting durable admission. Only checked on paused actors.
+    pub fn has_ready_system_message(&self) -> bool {
+        !self.system_skip_buffer.is_empty()
+            || !self.system_queue.is_empty()
+            || self
+                .local_queue
+                .iter()
+                .any(|message| message.priority == MessagePriority::System)
+    }
+
+    /// Bypass a pending normal admission solely for system-priority messages.
+    fn pop_ready_system(&mut self) -> Option<Message> {
+        self.system_skip_buffer
+            .pop_front()
+            .map(|(message, _)| message)
+            .or_else(|| self.system_queue.pop())
+            .or_else(|| {
+                let index = self
+                    .local_queue
+                    .iter()
+                    .position(|message| message.priority == MessagePriority::System)?;
+                self.local_queue.remove(index)
+            })
     }
 
     /// Commit admission and only then release its mailbox slot.
@@ -461,10 +531,13 @@ impl Mailbox {
     /// Legacy nontransactional receive remains unavailable while a durable
     /// candidate is pending. No caller may bypass persistence admission.
     pub fn pop(&mut self) -> Option<Message> {
-        if self.pending_durable_admission.is_some() {
-            return None;
-        }
-        let result = self.pop_uncommitted();
+        let result = if self.pending_durable_admission.is_some()
+            || self.admitted_command_sequence.is_some()
+        {
+            self.pop_ready_system()
+        } else {
+            self.pop_uncommitted()
+        };
         if result.is_some() {
             self.active_match = None;
             self.invalidate_receive_indexes();
@@ -530,7 +603,9 @@ impl Mailbox {
     /// guard actually succeeded.
     pub fn receive_match(&mut self, behavior_ids: &[u16]) -> Option<(usize, Arc<Vec<Value>>)> {
         // A candidate awaiting persistence cannot be consumed by selective receive.
-        if self.pending_durable_admission.is_some() {
+        if self.pending_durable_admission.is_some()
+            || self.admitted_command_sequence.is_some()
+        {
             return None;
         }
         // If the VM asks for another candidate before commit, the previous
@@ -1071,8 +1146,13 @@ mod transactional_receive_tests {
         system.priority = MessagePriority::System;
         mailbox.push(system).unwrap();
 
-        assert_eq!(mailbox.begin_durable_admission().unwrap().sender, 99);
+        assert!(
+            mailbox.begin_durable_admission().is_none(),
+            "supervisor notices must stay outside typed user-command admission"
+        );
         assert_eq!(mailbox.len(), 2);
+        assert_eq!(mailbox.pop().unwrap().sender, 99);
+        assert_eq!(mailbox.len(), 1);
         mailbox.reset(1);
         assert!(mailbox.commit_durable_admission().is_none());
         assert_eq!(mailbox.len(), 0);
@@ -1172,5 +1252,38 @@ mod transactional_receive_tests {
         assert_eq!(accepted.1.sequence, 1);
         assert!(mailbox.is_empty());
         assert_eq!(store.read_journal(42).len(), 1);
+    }
+
+    #[test]
+    fn supervisor_notification_bypasses_pending_durable_user_message() {
+        let mut mailbox = Mailbox::new(1);
+        mailbox.push_local(msg(7, 10, MessagePriority::Normal)).unwrap();
+        assert_eq!(mailbox.begin_durable_admission().unwrap().sender, 10);
+
+        let mut system = msg(0, 99, MessagePriority::Normal);
+        system.priority = MessagePriority::System;
+        mailbox.push(system).unwrap();
+        assert!(mailbox.has_ready_system_message());
+        assert_eq!(mailbox.pop().unwrap().sender, 99);
+        assert_eq!(mailbox.len(), 1, "pending durable reservation is preserved");
+        assert!(mailbox.pop().is_none(), "ordinary pending message stays fenced");
+        assert_eq!(mailbox.commit_durable_admission().unwrap().sender, 10);
+        assert_eq!(mailbox.len(), 0);
+    }
+
+    #[test]
+    fn ordinary_durable_admission_does_not_capture_system_notification() {
+        let mut mailbox = Mailbox::new(1);
+        let mut notice = msg(0, 99, MessagePriority::Normal);
+        notice.priority = MessagePriority::System;
+        mailbox.push_local(notice).unwrap();
+
+        assert!(
+            mailbox.begin_durable_admission().is_none(),
+            "system messages must retain their supervisor delivery path"
+        );
+        assert!(!mailbox.has_pending_durable_admission());
+        assert_eq!(mailbox.pop().unwrap().sender, 99);
+        assert!(mailbox.is_empty());
     }
 }
