@@ -76,6 +76,66 @@ structural schema compatibility, changed manifest identity with unchanged bytes,
 incorrect executable/sidecar binding, cross-execution reuse, unknown pin version,
 missing pin, and malformed digests.
 
+## Atomic storage integration (stacked increment)
+
+`runtime::commit_pinned_workflow_start` creates a pinned workflow's initial
+`ActorSnapshot`, `WorkflowStarted`, and reserved execution-pin record in
+one `DurableTransition` at sequence 1. This uses the existing
+`PersistenceStore::commit_transition` transaction boundary and refuses to
+initialize actor histories that already have a committed predecessor.
+
+`runtime::verify_pinned_workflow_resume` checks the atomic tail, snapshot,
+unique initial start record and pin, then verifies the provided executable
+bytes and complete manifest before the host rehydrates any actor.
+
+The pin is encoded as a reserved `WorkflowEvent::Custom` record inside the
+**same initial atomic transition**. It is not an ordinary user-visible workflow
+command. The implementation deliberately does not introduce new tables, a
+new bytecode format, or a second journaling backend.
+
+Example host integration:
+
+```text
+# Creation path — before publishing or scheduling any actor:
+snapshot = stage_initial_workflow_snapshot(actor)
+commit_pinned_workflow_start(store, actor_id, execution_id,
+                             name, manifest, executable_bytes,
+                             snapshot, initial_state)
+publish_actor_only_after_commit()
+
+# Restart path — before resolving mutable 'latest' code or running handlers:
+immutable_bytes = artifact_store.resolve(pinned_artifact_digest)
+verify_pinned_workflow_resume(store, actor_id, execution_id,
+                              pinned_manifest, immutable_bytes)
+recover_actor_using_verified_module()
+```
+
+The Rust APIs implement the two persistence-side operations above, **not**
+automatic `Runtime::try_spawn_workflow_actor` / `Runtime::recover_actor`
+interposition. An embedding host must enforce that sequencing and must not
+fall back to a legacy recovery API after a failed preflight. In particular,
+an executable loaded from an unpinned mutable "latest" alias is not acceptable.
+
+`MemoryStore` and `LibsqlStore` are covered by deterministic regression
+tests, including an integration test that exits the first test process, opens
+libSQL in another process, verifies the original artifact, then rejects a
+changed candidate. Backends without atomic `commit_transition` support
+must return `Unsupported` and leave no partially created history.
+
+Focused verification:
+
+```bash
+cargo test --locked --test pinned_workflow_atomic_start
+cargo test --locked --features sqlite --test pinned_workflow_atomic_start
+cargo fmt --all -- --check
+```
+
+**Remaining release blockers:** bind these two APIs to the automatic actor
+spawn and recovery paths; register/resolve an immutable artifact before
+activation; add fail-closed host-level migration policy, stale-owner fencing,
+transaction rollback/fault-injection, and end-to-end crash-point coverage.
+Do not advertise transparent worker upgrades until that work is complete.
+
 ## Next increment / non-goals of v1
 
 1. Atomically persist a pin at execution creation with the existing
