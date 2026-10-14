@@ -80,6 +80,8 @@ pub mod package;
 pub mod parallel_analysis;
 pub mod parallel_marker;
 pub mod parser;
+#[allow(dead_code)]
+pub(crate) mod persistence_file_recovery;
 // Compiled and tested now; consumed by persistence backends in #290.
 #[allow(dead_code)]
 pub(crate) mod persistence_integrity;
