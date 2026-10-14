@@ -118,7 +118,11 @@ fn compiled_pinned_spawn_commits_schema_and_default_state_before_publication() {
     assert_eq!(history.len(), 2);
     assert!(matches!(
         &history[0],
-        WorkflowEvent::WorkflowStarted { sequence: 1, name, .. } if name == "Payment",
+        WorkflowEvent::WorkflowStarted { sequence: 1, name, state }
+            if name == "Payment"
+                && state.iter().any(|value| matches!(
+                    value, nulang::runtime::PersistedValue::String(s) if s == "initial-value"
+                )),
     ));
 }
 
