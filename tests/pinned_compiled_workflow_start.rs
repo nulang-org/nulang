@@ -174,6 +174,41 @@ fn invalid_behavior_reference_fails_before_atomic_start() {
     assert!(runtime.actors.is_empty());
 }
 
+
+#[test]
+fn duplicate_compiler_state_defaults_are_rejected_before_creation() {
+    let mut module = compiled_payment();
+    module.actor_metadata[0]
+        .state_defaults
+        .push(("counter".into(), Constant::Int(99)));
+    let bytes = module.to_nbc(None).unwrap();
+    let mut runtime = Runtime::new();
+    assert_eq!(
+        runtime.try_spawn_pinned_compiled_workflow(
+            "payments/duplicate-default", "Payment", &manifest(&bytes), &bytes,
+        ).unwrap_err().kind(),
+        ErrorKind::InvalidData,
+    );
+    assert!(runtime.actors.is_empty());
+}
+
+#[test]
+fn non_state_compiler_constant_cannot_be_used_as_durable_default() {
+    let mut module = compiled_payment();
+    module.actor_metadata[0]
+        .state_defaults
+        .push(("unsupported".into(), Constant::FunctionRef(0)));
+    let bytes = module.to_nbc(None).unwrap();
+    let mut runtime = Runtime::new();
+    assert_eq!(
+        runtime.try_spawn_pinned_compiled_workflow(
+            "payments/unsupported-default", "Payment", &manifest(&bytes), &bytes,
+        ).unwrap_err().kind(),
+        ErrorKind::InvalidData,
+    );
+    assert!(runtime.actors.is_empty());
+}
+
 #[test]
 fn unsupported_atomic_backend_never_publishes_compiled_workflow() {
     let directory = std::env::temp_dir().join(format!(
