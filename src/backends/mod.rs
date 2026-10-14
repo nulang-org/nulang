@@ -862,9 +862,7 @@ mod tests {
     #[cfg(feature = "python")]
     #[test]
     fn test_python_temporary_handles_release_registered_objects() {
-        let id = pyo3::Python::attach(|py| {
-            crate::python::register_object(py.None())
-        });
+        let id = pyo3::Python::attach(|py| crate::python::register_object(py.None()));
         {
             let mut temporary = TemporaryPythonHandles::default();
             temporary.track(id);
@@ -876,9 +874,7 @@ mod tests {
     #[cfg(feature = "python")]
     #[test]
     fn test_python_temporary_handles_can_keep_returned_objects() {
-        let id = pyo3::Python::attach(|py| {
-            crate::python::register_object(py.None())
-        });
+        let id = pyo3::Python::attach(|py| crate::python::register_object(py.None()));
         {
             let mut temporary = TemporaryPythonHandles::default();
             temporary.track(id);
@@ -893,19 +889,26 @@ mod tests {
     fn test_foreign_interop_owned_python_handle_is_reusable_after_call() {
         let mut fi = DefaultForeignInterop::new().expect("Python backend init failed");
         fi.import("builtins").expect("builtins import failed");
-        let result = fi.call_owned(&crate::runtime::ForeignCallRequest::new(
-            "builtins",
-            "list",
-            vec![],
-        )).expect("Python list call failed");
+        let result = fi
+            .call_owned(&crate::runtime::ForeignCallRequest::new(
+                "builtins",
+                "list",
+                vec![],
+            ))
+            .expect("Python list call failed");
         let crate::runtime::OwnedForeignValue::OpaqueHandle { backend: "python", id } = result else {
             panic!("list() must return an opaque Python object");
         };
-        let reused = fi.call_owned(&crate::runtime::ForeignCallRequest::new(
-            "builtins",
-            "len",
-            vec![crate::runtime::OwnedForeignValue::OpaqueHandle { backend: "python", id }],
-        )).expect("Python handle should survive temporary cleanup");
+        let reused = fi
+            .call_owned(&crate::runtime::ForeignCallRequest::new(
+                "builtins",
+                "len",
+                vec![crate::runtime::OwnedForeignValue::OpaqueHandle {
+                    backend: "python",
+                    id,
+                }],
+            ))
+            .expect("Python handle should survive temporary cleanup");
         assert_eq!(reused, crate::runtime::OwnedForeignValue::Int(0));
         crate::python::unregister_object(crate::python::PythonObjectId(id));
     }
