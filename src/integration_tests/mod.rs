@@ -12393,6 +12393,54 @@ match { a: 2, b: 9 } with {
         );
     }
 
+    /// Two successful synchronous workflow steps each advance progress once.
+    /// A completed-step checkpoint must agree with the terminal event history.
+    #[test]
+    fn test_workflow_synchronous_steps_advance_progress_once_each() {
+        let source = r#"
+            workflow TwoStepProgress {
+                state durable count: Int = 0
+                step first { self.count = 1 }
+                step second { self.count = 2 }
+            }
+            let w = spawn TwoStepProgress {} in { w }
+        "#;
+        let (module, _) = compile_source(source).expect("compile two-step workflow");
+        let store = SharedMemoryStore::new();
+        let rt = Rc::new(RefCell::new(Runtime::new()));
+        rt.borrow_mut().persistence = Box::new(store.clone());
+        let reference = {
+            let mut vm = VM::new();
+            vm.load_module(module);
+            vm.set_actor_callbacks(Box::new(RuntimeVmCallbacks::new(rt.clone())));
+            vm.run().expect("spawn compiled workflow")
+        };
+        let actor_id = reference.as_actor_id().expect("workflow actor id");
+
+        for (behavior_id, expected_step) in [(0, 1), (1, 2)] {
+            rt.borrow_mut().send_message_by_id(actor_id, behavior_id, &[]);
+            rt.borrow_mut().run_scheduler();
+            let saved = store.load_snapshot(actor_id).expect("completed step checkpoint");
+            assert_eq!(
+                saved.state.get("step_index"),
+                Some(&crate::runtime::PersistedValue::Int(expected_step))
+            );
+            assert_eq!(
+                saved.state.get("count"),
+                Some(&crate::runtime::PersistedValue::Int(expected_step))
+            );
+            assert_eq!(
+                store
+                    .read_workflow_events(actor_id)
+                    .iter()
+                    .filter(|event| matches!(event, WorkflowEvent::StepCompleted { .. }))
+                    .count(),
+                expected_step as usize,
+                "each successful step must append exactly one terminal event"
+            );
+        }
+    }
+
     /// Restore declared user state in an entirely new runtime, independently
     /// of the real-process LLM/SIGKILL acceptance fixture.
     #[test]
