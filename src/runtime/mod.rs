@@ -154,6 +154,22 @@ pub fn fresh_actor_id() -> u64 {
 /// real `fresh_actor_id()` result.
 const MAIN_HEAP_ACTOR_ID: u64 = 0;
 
+/// Outcome of receipt-backed typed actor command admission.
+///
+/// Only New may be executed by a trusted host. Duplicate is the already
+/// committed acknowledgment; the mailbox envelope was consumed without
+/// running a second handler. Neither variant performs bytecode execution.
+#[derive(Debug)]
+pub enum TypedInboxAdmission {
+    New {
+        message: Message,
+        commit: DurableCommit,
+    },
+    Duplicate {
+        commit: DurableCommit,
+    },
+}
+
 /// Maximum number of membership entries carried by a single gossip packet.
 const GOSSIP_PAYLOAD_MAX_ENTRIES: usize = 256;
 
@@ -945,6 +961,482 @@ impl Runtime {
         compensation_offsets: Vec<Option<usize>>,
     ) {
         spawn::register_recovery_module(self, actor_id, module, offsets, compensation_offsets)
+    }
+
+    /// Opt a compiler-defined persistent actor into strict host-controlled
+    /// atomic command admission for its current in-memory activation.
+    ///
+    /// Once enabled, legacy scheduler receives, selective receives, and
+    /// synchronous asks cannot run ordinary user messages. System-priority
+    /// supervisor/monitor messages remain eligible. Hosts must explicitly
+    /// admit commands via `admit_next_typed_actor_command` and finish with
+    /// `finish_admitted_typed_actor_command` after a committed state tail.
+    ///
+    /// This flag is **process-local**. The host must reapply it when restoring
+    /// an activation; it does not provide a durable inbox ID, automatic
+    /// bytecode staging, or external exactly-once effects.
+    pub fn enable_strict_typed_actor_admission(&mut self, actor_id: u64) -> std::io::Result<()> {
+        use std::io::{Error, ErrorKind};
+        let actor = self
+            .actors
+            .get_mut(&actor_id)
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "actor does not exist"))?;
+        if !actor.persistent || actor.is_workflow || actor.is_agent {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "strict durable admission requires a persistent non-workflow, non-agent actor",
+            ));
+        }
+        let module = actor.bytecode_module.as_ref().ok_or_else(|| {
+            Error::new(ErrorKind::InvalidInput, "actor has no compiler-owned metadata")
+        })?;
+        let meta = behavior_ownership::actor_meta_for_runtime_name(module, &actor.name)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "unknown actor schema"))?;
+        if !meta.persistent {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "compiler schema does not declare persistent execution",
+            ));
+        }
+        actor.mailbox.require_strict_durable_admission();
+        Ok(())
+    }
+
+    /// Explicit host adapter: admit one compiled persistent actor command
+    /// atomically before returning its original mailbox envelope for execution.
+    ///
+    /// The caller supplies the *same* transition (including predecessor,
+    /// sequence and payload) on retry after an ambiguous persistence result.
+    /// This restricted boundary accepts command-only turns: no external
+    /// effects, outbox, state publication, or workflow/agent dispatch.
+    ///
+    /// Existing bytecode scheduler delivery is not automatically redirected
+    /// here. A trusted host must execute the returned message and coordinate
+    /// completion separately. Pending admission is process-local; a message
+    /// that has not committed is NOT recoverable across a process crash.
+    pub fn admit_next_typed_actor_command(
+        &mut self,
+        actor_id: u64,
+        transition: DurableTransition,
+    ) -> std::io::Result<Option<(Message, DurableCommit)>> {
+        match self.admit_typed_actor_command_internal(actor_id, transition, None)? {
+            None => Ok(None),
+            Some(TypedInboxAdmission::New { message, commit }) => Ok(Some((message, commit))),
+            Some(TypedInboxAdmission::Duplicate { .. }) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unreceipted admission unexpectedly returned a duplicate",
+            )),
+        }
+    }
+
+    /// Admit one compiler-typed mailbox command with a stable, sender-scoped
+    /// inbox identity. Strict admission must be enabled first; this method
+    /// will fail closed if the persistence backend cannot atomically report
+    /// whether the durable receipt is new or merely a duplicate.
+    ///
+    /// Duplicate never returns a message for execution. The trusted host
+    /// must acknowledge it to the sender and independently coordinate
+    /// recovery of any earlier committed but unfinished actor turn.
+    pub fn admit_next_typed_actor_command_with_inbox(
+        &mut self,
+        actor_id: u64,
+        request: crate::durable_inbox::DurableInboxCommand,
+        transition: DurableTransition,
+    ) -> std::io::Result<Option<TypedInboxAdmission>> {
+        use std::io::{Error, ErrorKind};
+        let actor = self
+            .actors
+            .get(&actor_id)
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "actor does not exist"))?;
+        if !actor.mailbox.requires_strict_durable_admission() {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "receipt-backed admission requires strict typed actor admission",
+            ));
+        }
+        self.admit_typed_actor_command_internal(actor_id, transition, Some(request))
+    }
+
+    fn admit_typed_actor_command_internal(
+        &mut self,
+        actor_id: u64,
+        transition: DurableTransition,
+        request: Option<crate::durable_inbox::DurableInboxCommand>,
+    ) -> std::io::Result<Option<TypedInboxAdmission>> {
+        use std::io::{Error, ErrorKind};
+
+        let actor = self
+            .actors
+            .get(&actor_id)
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "actor does not exist"))?;
+        if !actor.persistent || actor.is_workflow || actor.is_agent {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "atomic command admission requires a persistent non-workflow, non-agent actor",
+            ));
+        }
+        if actor.mailbox.admitted_command_sequence().is_some() {
+            return Err(Error::new(
+                ErrorKind::WouldBlock,
+                "previous admitted actor command must durably complete before another is admitted",
+            ));
+        }
+        let module = actor.bytecode_module.as_ref().ok_or_else(|| {
+            Error::new(ErrorKind::InvalidInput, "actor has no compiler-owned metadata")
+        })?;
+        let meta = behavior_ownership::actor_meta_for_runtime_name(module, &actor.name)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "unknown actor schema"))?;
+        if !meta.persistent {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "compiler schema does not declare durable execution",
+            ));
+        }
+        if transition.actor_id != actor_id || transition.activation_epoch != actor.activation_epoch
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "transition actor or activation epoch does not match the live actor",
+            ));
+        }
+        if transition.snapshot.is_some()
+            || !transition.workflow_events.is_empty()
+            || !transition.domain_events.is_empty()
+            || !transition.durable_effects.is_empty()
+            || !transition.outbox.is_empty()
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "command admission cannot publish state, events, effects or outbox",
+            ));
+        }
+
+        let candidate = self
+            .actors
+            .get_mut(&actor_id)
+            .expect("actor remains present during exclusive runtime access")
+            .mailbox
+            .begin_durable_admission()
+            .cloned();
+        let Some(candidate) = candidate else {
+            return Ok(None);
+        };
+
+        if candidate.priority == MessagePriority::System {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "system-priority runtime messages use their existing supervisor admission path",
+            ));
+        }
+        let actor = &self.actors[&actor_id];
+        let module = actor
+            .bytecode_module
+            .as_ref()
+            .expect("compiler metadata validated before admission");
+        let index = behavior_ownership::module_behavior_index_for_actor(
+            module,
+            &actor.name,
+            candidate.behavior_id as usize,
+        )
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                "incoming behavior is not owned by the typed actor",
+            )
+        })?;
+        let expected = module.behaviors.get(index).ok_or_else(|| {
+            Error::new(ErrorKind::InvalidInput, "compiled behavior index is invalid")
+        })?;
+        if candidate.payload.len() != expected.param_count {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "incoming payload does not match compiler-defined behavior arity",
+            ));
+        }
+
+        let command = transition.command.as_ref().ok_or_else(|| {
+            Error::new(ErrorKind::InvalidInput, "atomic admission requires a command")
+        })?;
+        let canonical_payload = self.persist_journal_payload(
+            actor_id,
+            (candidate.sender != 0).then_some(candidate.sender),
+            candidate.payload.as_slice(),
+        );
+        // The legacy serializer normalizes unsupported object/closure or
+        // unresolved string references to Nil. Never commit that lossy
+        // conversion as if it represented an actual typed user message.
+        let lossless = candidate
+            .payload
+            .as_slice()
+            .iter()
+            .zip(&canonical_payload)
+            .all(|(actual, stored)| match stored {
+                PersistedValue::Int(value) => actual.as_int() == Some(*value),
+                PersistedValue::Float(value) => actual
+                    .as_float()
+                    .map(f64::to_bits)
+                    == Some(value.to_bits()),
+                PersistedValue::Bool(value) => actual.as_bool() == Some(*value),
+                PersistedValue::String(_) => {
+                    actual.as_string_id().is_some() || actual.as_ptr().is_some()
+                }
+                PersistedValue::Nil => actual.is_nil(),
+                PersistedValue::Unit => actual.is_unit(),
+                PersistedValue::Actor(id) => actual.as_actor_id() == Some(*id),
+            });
+        if !lossless {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "typed command contains a value that cannot be durably encoded without loss",
+            ));
+        }
+        if command.sequence != transition.sequence
+            || command.behavior_id != candidate.behavior_id
+            || command.payload != canonical_payload
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "atomic command does not match pending mailbox message",
+            ));
+        }
+
+        // Persistence and mailbox are disjoint fields. Do not release the
+        // reserved slot or return the message on storage errors.
+        let expected_schema = self
+            .actors
+            .get(&actor_id)
+            .expect("actor validated before admission")
+            .name
+            .clone();
+        let persistence = &mut self.persistence;
+        let mailbox = &mut self
+            .actors
+            .get_mut(&actor_id)
+            .expect("actor remains present during exclusive runtime access")
+            .mailbox;
+        let committed = mailbox.admit_durable_with(|_| match request {
+            Some(request) => {
+                let outcome =
+                    persistence.commit_inbox_transition_detailed(request, transition)?;
+                if !outcome.newly_accepted {
+                    // Admission is not completion. Retain the mailbox
+                    // candidate and fail closed while the earlier command
+                    // lacks a compatible, epoch-fenced completion snapshot.
+                    // The original command must be recovered by the host,
+                    // not executed again because its ACK was lost.
+                    let tail = persistence
+                        .load_durable_tail_position(actor_id)?
+                        .ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::WouldBlock,
+                                "duplicate command has no durable completion tail",
+                            )
+                        })?;
+                    let snapshot = persistence.load_snapshot(actor_id).ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::WouldBlock,
+                            "duplicate command has no durable completion snapshot",
+                        )
+                    })?;
+                    let completed_after = outcome
+                        .commit
+                        .sequence
+                        .checked_add(1)
+                        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "sequence overflow"))?;
+                    if tail.activation_epoch != outcome.commit.activation_epoch
+                        || tail.sequence < completed_after
+                        || snapshot.sequence < completed_after
+                        || snapshot.sequence > tail.sequence
+                        || snapshot.activation_epoch != outcome.commit.activation_epoch
+                        || snapshot.schema_name.as_deref() != Some(expected_schema.as_str())
+                    {
+                        return Err(Error::new(
+                            ErrorKind::WouldBlock,
+                            "duplicate command has not durably completed in this activation",
+                        ));
+                    }
+                }
+                Ok(outcome)
+            }
+            None => persistence
+                .commit_transition(transition)
+                .map(|commit| crate::durable_inbox::DurableInboxCommitOutcome {
+                    commit,
+                    newly_accepted: true,
+                }),
+        })?;
+        if let Some((message, outcome)) = committed {
+            if !outcome.newly_accepted {
+                // A replayed receipt must never enter the handler. However,
+                // the live actor might still have stale in-memory state after
+                // a host restart/lost ACK. Fence subsequent user commands
+                // until a trusted host revalidates and hydrates the committed
+                // state via finish_admitted_typed_actor_command, or restores
+                // a verified activation. A later tail can make the direct
+                // finish adapter reject; in that case fail closed and recover.
+                self.actors
+                    .get_mut(&actor_id)
+                    .expect("actor remains present after durable inbox replay")
+                    .mailbox
+                    .fence_admitted_command(outcome.commit.sequence);
+                return Ok(Some(TypedInboxAdmission::Duplicate {
+                    commit: outcome.commit,
+                }));
+            }
+            // Fence ordinary mailbox dispatch before returning new work
+            // to the trusted host. It must durably finalize this turn.
+            self.actors
+                .get_mut(&actor_id)
+                .expect("actor remains present during admission")
+                .mailbox
+                .fence_admitted_command(outcome.commit.sequence);
+            self.hold_payload_refs(actor_id, &message.payload);
+            Ok(Some(TypedInboxAdmission::New {
+                message,
+                commit: outcome.commit,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Release a successfully admitted command only after its completion state
+    /// has itself been atomically persisted. A journal entry alone is never
+    /// sufficient. This is a host-controlled fence, not bytecode execution.
+    pub fn finish_admitted_typed_actor_command(
+        &mut self,
+        actor_id: u64,
+        admitted_sequence: u64,
+    ) -> std::io::Result<()> {
+        use std::io::{Error, ErrorKind};
+
+        let actor = self
+            .actors
+            .get(&actor_id)
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "actor does not exist"))?;
+        if actor.mailbox.admitted_command_sequence() != Some(admitted_sequence) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "actor has no matching admitted command pending completion",
+            ));
+        }
+        let epoch = actor.activation_epoch;
+        let expected_schema = actor.name.clone();
+        let tail = self
+            .persistence
+            .load_durable_tail_position(actor_id)?
+            .ok_or_else(|| Error::new(ErrorKind::WouldBlock, "durable completion is missing"))?;
+        let snapshot = self
+            .persistence
+            .load_snapshot(actor_id)
+            .ok_or_else(|| {
+                Error::new(ErrorKind::WouldBlock, "durable completion snapshot is missing")
+            })?;
+        if tail.activation_epoch != epoch
+            || Some(tail.sequence) != admitted_sequence.checked_add(1)
+            || snapshot.sequence != tail.sequence
+            || snapshot.activation_epoch != epoch
+            || snapshot.schema_name.as_deref() != Some(expected_schema.as_str())
+        {
+            return Err(Error::new(
+                ErrorKind::WouldBlock,
+                "admitted command has no matching epoch-fenced completion snapshot",
+            ));
+        }
+        // Do not expose a partially reconstructed state to the next command.
+        // This conservative adapter accepts only complete durable-field
+        // snapshots from this actor's compiler-owned state declaration.
+        let actor = &self.actors[&actor_id];
+        // A storage record cannot mint or silently replace external effect
+        // authority. The currently installed actor manifest remains the
+        // trusted ceiling; only an explicit control-plane authority operation
+        // may change it. Do not publish state or unblock future commands if
+        // the snapshot attempts to cross that boundary.
+        let effective_authority = actor
+            .authority_manifest()
+            .map_err(|err| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    format!("actor has invalid live authority manifest: {err}"),
+                )
+            })?
+            .canonical_token_set();
+        if snapshot.authority_tokens != effective_authority {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "completion snapshot authority differs from live actor grants",
+            ));
+        }
+        if snapshot.state.keys().any(|name| {
+            !matches!(actor.state_models.get(name), Some(StateModel::Durable))
+        }) || actor.state_models.iter().any(|(name, model)| {
+            matches!(model, StateModel::Durable) && !snapshot.state.contains_key(name)
+        }) {
+            return Err(Error::new(
+                ErrorKind::WouldBlock,
+                "completion snapshot does not match the actor's durable field set",
+            ));
+        }
+        // The host-facing completion adapter supports only primitive values
+        // backed by a compiler-owned literal field default. Never publish an
+        // incompatible or unsupported value, even when the persisted envelope
+        // has matching actor, schema, and sequence identities. Full structural
+        // types require canonical compiler-emitted state type descriptors.
+        let meta = actor
+            .bytecode_module
+            .as_ref()
+            .and_then(|module| {
+                behavior_ownership::actor_meta_for_runtime_name(module, &actor.name)
+            })
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    "completion cannot resolve compiler-owned actor state schema",
+                )
+            })?;
+        for (name, value) in &snapshot.state {
+            let matches_default = meta
+                .state_defaults
+                .iter()
+                .find(|(field, _)| field == name)
+                .is_some_and(|(_, default)| {
+                    matches!(
+                        (default, value),
+                        (crate::bytecode::Constant::Int(_), PersistedValue::Int(_))
+                            | (crate::bytecode::Constant::Float(_), PersistedValue::Float(_))
+                            | (crate::bytecode::Constant::Bool(_), PersistedValue::Bool(_))
+                            | (crate::bytecode::Constant::String(_), PersistedValue::String(_))
+                            | (crate::bytecode::Constant::Nil, PersistedValue::Nil)
+                            | (crate::bytecode::Constant::Unit, PersistedValue::Unit)
+                    )
+                });
+            if !matches_default {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "durable completion field '{name}' is incompatible with compiled primitive state type"
+                    ),
+                ));
+            }
+        }
+
+        let actor = self
+            .actors
+            .get_mut(&actor_id)
+            .expect("actor remains present while completing the admitted command");
+        for (name, value) in &snapshot.state {
+            let restored = value.to_value_on_heap(actor);
+            actor.set_state_field(name, restored);
+            actor.dirty_fields.remove(name);
+        }
+        if !actor.mailbox.finish_admitted_command(admitted_sequence) {
+            return Err(Error::new(ErrorKind::InvalidInput, "completion fence changed"));
+        }
+        actor.sequence = tail.sequence;
+        if !actor.mailbox.is_empty() {
+            self.enqueue_actor(actor_id);
+        }
+        Ok(())
     }
 
     /// Register all `virtual entity` types declared in `module` with the
@@ -2025,6 +2517,32 @@ impl Runtime {
         behavior_id: u16,
         args: &[Value],
     ) -> crate::types::NuResult<Value> {
+        // Synchronous calls bypass the normal mailbox receive path. An actor
+        // with a reserved or already-admitted durable command must not run a
+        // second user handler before that command's atomic completion.
+        if self
+            .actors
+            .get(&actor_id)
+            .is_some_and(|actor| actor.mailbox.requires_strict_durable_admission())
+        {
+            return Err(NuError::VMError {
+                msg: format!(
+                    "actor {actor_id} cannot execute synchronous ask while strict durable admission requires host execution"
+                ),
+                span: Span::default(),
+            });
+        }
+        if self.actors.get(&actor_id).is_some_and(|actor| {
+            actor.mailbox.has_pending_durable_admission()
+                || actor.mailbox.admitted_command_sequence().is_some()
+        }) {
+            return Err(NuError::VMError {
+                msg: format!(
+                    "actor {actor_id} cannot execute synchronous ask while durable admission or completion is pending"
+                ),
+                span: Span::default(),
+            });
+        }
         let behavior_idx = behavior_id as usize;
         if !self.actor_has_behavior_id(actor_id, behavior_id) {
             return Err(NuError::VMError {
@@ -3119,6 +3637,10 @@ impl Runtime {
             .get(&actor_id)
             .map(|actor| {
                 !actor.mailbox.is_empty()
+                    && (!(actor.mailbox.requires_strict_durable_admission()
+                        || actor.mailbox.has_pending_durable_admission()
+                        || actor.mailbox.admitted_command_sequence().is_some())
+                        || actor.mailbox.has_ready_system_message())
                     && actor.suspended_execution.is_none()
                     && matches!(
                         actor.state,
@@ -3215,6 +3737,8 @@ impl Runtime {
                     .get(&actor_id)
                     .map(|actor| {
                         !actor.mailbox.is_empty()
+                            && (!actor.mailbox.requires_strict_durable_admission()
+                                || actor.mailbox.has_ready_system_message())
                             && !actor.should_yield()
                             && actor.suspended_execution.is_none()
                     })

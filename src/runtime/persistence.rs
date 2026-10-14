@@ -10,8 +10,10 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use crate::durable_effect::DurableEffectId;
-use crate::durable_inbox::{DurableInboxCommand, DurableInboxId, DurableInboxReceipt};
 use crate::durable_effect_persistence::DurableEffectPersistenceRecord;
+use crate::durable_inbox::{
+    DurableInboxCommand, DurableInboxCommitOutcome, DurableInboxId, DurableInboxReceipt,
+};
 use crate::vm::Value;
 
 use tracing::warn;
@@ -659,6 +661,20 @@ pub trait PersistenceStore: Send + Sync {
         ))
     }
 
+    /// Receipt-aware atomic admission. The bool-like disposition is
+    /// determined *inside the same write transaction* as command admission:
+    /// callers must never infer it using a prior independent receipt read.
+    fn commit_inbox_transition_detailed(
+        &mut self,
+        _request: DurableInboxCommand,
+        _transition: DurableTransition,
+    ) -> io::Result<DurableInboxCommitOutcome> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "receipt-aware atomic inbox admission is unsupported by this backend",
+        ))
+    }
+
     /// Recover the original accepted receipt for a stable logical message ID.
     /// Unknown backends return Unsupported, not Ok(None): absence cannot be
     /// inferred from a backend that does not support inbox deduplication.
@@ -917,11 +933,11 @@ impl PersistenceStore for MemoryStore {
         Ok(self.durable_inbox_receipts.get(&id).copied())
     }
 
-    fn commit_inbox_transition(
+    fn commit_inbox_transition_detailed(
         &mut self,
         request: DurableInboxCommand,
         transition: DurableTransition,
-    ) -> io::Result<DurableCommit> {
+    ) -> io::Result<DurableInboxCommitOutcome> {
         transition.validate_structure()?;
         let command = transition.command.as_ref().ok_or_else(|| {
             io::Error::new(
@@ -941,7 +957,10 @@ impl PersistenceStore for MemoryStore {
                     "durable inbox identity already accepted with a different request",
                 ));
             }
-            return Ok(existing.commit);
+            return Ok(DurableInboxCommitOutcome {
+                commit: existing.commit,
+                newly_accepted: false,
+            });
         }
 
         // Do not retroactively attach an inbox receipt to an ordinary atomic
@@ -969,7 +988,19 @@ impl PersistenceStore for MemoryStore {
                 commit,
             },
         );
-        Ok(commit)
+        Ok(DurableInboxCommitOutcome {
+            commit,
+            newly_accepted: true,
+        })
+    }
+
+    fn commit_inbox_transition(
+        &mut self,
+        request: DurableInboxCommand,
+        transition: DurableTransition,
+    ) -> io::Result<DurableCommit> {
+        self.commit_inbox_transition_detailed(request, transition)
+            .map(|outcome| outcome.commit)
     }
 
     fn commit_transition(&mut self, transition: DurableTransition) -> io::Result<DurableCommit> {
@@ -1744,7 +1775,7 @@ impl LibsqlStore {
         &mut self,
         transition: DurableTransition,
         inbox: Option<DurableInboxCommand>,
-    ) -> io::Result<DurableCommit> {
+    ) -> io::Result<DurableInboxCommitOutcome> {
         transition.validate_structure()?;
         if let Some(ref request) = inbox {
             let command = transition.command.as_ref().ok_or_else(|| {
@@ -1897,11 +1928,14 @@ impl LibsqlStore {
                     tx.commit()
                         .await
                         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-                    return Ok(DurableCommit {
-                        actor_id: actor,
-                        activation_epoch: epoch,
-                        sequence,
-                        digest: committed_digest,
+                    return Ok(DurableInboxCommitOutcome {
+                        commit: DurableCommit {
+                            actor_id: actor,
+                            activation_epoch: epoch,
+                            sequence,
+                            digest: committed_digest,
+                        },
+                        newly_accepted: false,
                     });
                 }
                 drop(rows);
@@ -1952,11 +1986,14 @@ impl LibsqlStore {
                         tx.commit()
                             .await
                             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-                        return Ok(DurableCommit {
-                            actor_id: transition.actor_id,
-                            activation_epoch: transition.activation_epoch,
-                            sequence: transition.sequence,
-                            digest,
+                        return Ok(DurableInboxCommitOutcome {
+                            commit: DurableCommit {
+                                actor_id: transition.actor_id,
+                                activation_epoch: transition.activation_epoch,
+                                sequence: transition.sequence,
+                                digest,
+                            },
+                            newly_accepted: false,
                         });
                     }
                     let _ = tx.rollback().await;
@@ -2225,11 +2262,14 @@ impl LibsqlStore {
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
-            Ok(DurableCommit {
-                actor_id: transition.actor_id,
-                activation_epoch: transition.activation_epoch,
-                sequence: transition.sequence,
-                digest,
+            Ok(DurableInboxCommitOutcome {
+                commit: DurableCommit {
+                    actor_id: transition.actor_id,
+                    activation_epoch: transition.activation_epoch,
+                    sequence: transition.sequence,
+                    digest,
+                },
+                newly_accepted: true,
             })
         })
     }
@@ -2301,6 +2341,15 @@ impl PersistenceStore for LibsqlStore {
         request: DurableInboxCommand,
         transition: DurableTransition,
     ) -> io::Result<DurableCommit> {
+        self.commit_transition_with_inbox(transition, Some(request))
+            .map(|outcome| outcome.commit)
+    }
+
+    fn commit_inbox_transition_detailed(
+        &mut self,
+        request: DurableInboxCommand,
+        transition: DurableTransition,
+    ) -> io::Result<DurableInboxCommitOutcome> {
         self.commit_transition_with_inbox(transition, Some(request))
     }
 
@@ -2441,6 +2490,7 @@ impl PersistenceStore for LibsqlStore {
 
     fn commit_transition(&mut self, transition: DurableTransition) -> io::Result<DurableCommit> {
         self.commit_transition_with_inbox(transition, None)
+            .map(|outcome| outcome.commit)
     }
 
     fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()> {

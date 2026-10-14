@@ -125,6 +125,14 @@ impl DurableInboxCommand {
     }
 }
 
+/// Storage-returned admission disposition. Only a newly accepted command may
+/// be handed to a user handler. A replayed receipt is an ACK, not work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DurableInboxCommitOutcome {
+    pub commit: DurableCommit,
+    pub newly_accepted: bool,
+}
+
 /// Receipt recorded together with an accepted transition.
 ///
 /// An equal logical identity with an unequal request digest is a conflict,
