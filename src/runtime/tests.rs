@@ -79,6 +79,82 @@ fn bytecode_actor_preempts_and_completes_without_a_followup_message() {
     assert_eq!(rt.claim_next_ready_actor(), None, "no duplicate ready token");
 }
 
+/// Resuming one preempted behavior must not consume a second message in
+/// the same scheduling turn. The next message remains independently runnable.
+#[test]
+fn resumed_bytecode_turn_yields_to_queued_mail_before_next_dispatch() {
+    use crate::bytecode::{BehaviorTableEntry, Instruction, OpCode};
+
+    let mut module = CodeModule::new("non-reentrant-resume");
+    let field_idx = module.add_constant(Constant::String("phase".to_string()));
+    let one_idx = module.add_constant(Constant::Int(1));
+    let two_idx = module.add_constant(Constant::Int(2));
+    for name in ["Busy.first", "Busy.second"] {
+        module.add_behavior(BehaviorTableEntry {
+            name: name.to_string(),
+            param_count: 0,
+            code_offset: 0,
+            local_count: 4,
+            effect_mask: 0,
+            compensate_offset: None,
+            content_hash: None,
+            source_location: None,
+            parallel_branches: None,
+        });
+    }
+    for _ in 0..10 {
+        module.emit(Instruction::new0(OpCode::Nop));
+    }
+    module.emit(Instruction::new3(
+        OpCode::ConstU, (one_idx >> 8) as u8, one_idx as u8, 1,
+    ));
+    module.emit(Instruction::new3(OpCode::StateSet, 0, 0, 1));
+    module.emit(Instruction::new1(OpCode::RetVal, 1));
+    let second_offset = module.instructions.len();
+    module.emit(Instruction::new3(
+        OpCode::ConstU, (two_idx >> 8) as u8, two_idx as u8, 1,
+    ));
+    module.emit(Instruction::new3(OpCode::StateSet, 0, 0, 1));
+    module.emit(Instruction::new1(OpCode::RetVal, 1));
+
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![("phase".to_string(), Value::int(0))]));
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.max_reductions = 4;
+        actor.bytecode_module = Some(Box::new(module.clone()));
+        actor.bytecode_offsets = vec![0, second_offset];
+        actor.compensation_offsets = vec![None, None];
+    }
+    rt.register_recovery_module(actor_id, module, vec![0, second_offset], vec![None, None]);
+    rt.send_message_by_id(actor_id, 0, &[]);
+    rt.send_message_by_id(actor_id, 1, &[]);
+
+    let mut saw_first_completion = false;
+    for _ in 0..12 {
+        assert_eq!(rt.claim_next_ready_actor(), Some(actor_id));
+        rt.step_actor(actor_id);
+        if rt.actors[&actor_id].get_state_field("phase") == Some(Value::int(1)) {
+            assert_eq!(
+                rt.actors[&actor_id].mailbox.len(),
+                1,
+                "the second message must wait for a new scheduler turn"
+            );
+            assert!(!rt.actors[&actor_id].jit_yield_pending);
+            saw_first_completion = true;
+            rt.finish_actor_turn(actor_id);
+            break;
+        }
+        rt.finish_actor_turn(actor_id);
+    }
+    assert!(saw_first_completion, "first behavior must finish after resumption");
+
+    assert_eq!(rt.claim_next_ready_actor(), Some(actor_id));
+    rt.step_actor(actor_id);
+    rt.finish_actor_turn(actor_id);
+    assert_eq!(rt.actors[&actor_id].get_state_field("phase"), Some(Value::int(2)));
+}
+
 #[test]
 fn cooperative_yield_is_requeued_even_without_mail() {
     let mut rt = Runtime::new();
