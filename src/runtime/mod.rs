@@ -28,6 +28,7 @@ pub(crate) mod heap_serialize;
 mod mailbox;
 mod scheduler;
 mod schema_identity;
+mod pure_staged;
 pub use heap_serialize::*;
 mod cluster;
 mod distributed;
