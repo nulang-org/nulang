@@ -1108,6 +1108,35 @@ mod tests {
     }
 
     #[test]
+    fn extreme_schema_version_without_migrations_fails_closed() {
+        let mut manifest = base_manifest(actor(1, b"schema-v1"));
+        manifest.actors[0].schema_version = u32::MAX;
+        // Must not loop through billions of versions in untrusted JSON.
+        assert!(matches!(
+            BehaviorManifest::from_json(
+                &serde_json::to_vec(&manifest).expect("serialize")
+            ),
+            Err(BehaviorManifestError::InvalidActor { .. })
+        ));
+    }
+
+    #[test]
+    fn invalid_max_version_migration_cannot_saturate_into_noop() {
+        let mut manifest = base_manifest(actor(1, b"schema-v1"));
+        manifest.actors[0].schema_version = u32::MAX;
+        manifest.actors[0].migrations = vec![BehaviorMigrationStep {
+            from: u32::MAX,
+            to: u32::MAX,
+            state: true,
+            events: Vec::new(),
+        }];
+        assert!(matches!(
+            manifest.to_json(),
+            Err(BehaviorManifestError::InvalidActor { .. })
+        ));
+    }
+
+    #[test]
     fn unattended_preflight_allows_exact_durable_executable_with_package_relabel() {
         let previous = base_manifest(actor(1, b"schema-v1"));
         let mut incoming = previous.clone();
