@@ -53,6 +53,10 @@ impl DurableExecutionPin {
         &self.execution_id
     }
 
+    pub fn executable_digest(&self) -> &str {
+        &self.executable_digest
+    }
+
     pub fn to_json(&self) -> Result<Vec<u8>, ExecutionPinError> {
         self.validate()?;
         serde_json::to_vec_pretty(self).map_err(|error| ExecutionPinError::Json(error.to_string()))
