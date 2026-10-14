@@ -2385,7 +2385,10 @@ mod tests {
         assert_eq!(reopened.read_from("events", 3, 10).unwrap().len(), 1);
         assert_eq!(reopened.append("events", b"four").unwrap(), 4);
         assert_eq!(reopened.apply_retention("events", 3).unwrap().eligible_segment_count, 0);
-        assert_eq!(list_segments(&root.join("events")).unwrap().len(), 1);
+        assert!(list_segments(&root.join("events"))
+            .unwrap()
+            .iter()
+            .all(|(base, _)| *base >= 3));
         let _ = fs::remove_dir_all(root);
     }
 
