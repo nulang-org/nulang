@@ -2293,6 +2293,20 @@ impl Runtime {
         behavior_id: u16,
         args: &[Value],
     ) -> crate::types::NuResult<Value> {
+        // Synchronous calls bypass the normal mailbox receive path. An actor
+        // with a reserved or already-admitted durable command must not run a
+        // second user handler before that command's atomic completion.
+        if self.actors.get(&actor_id).is_some_and(|actor| {
+            actor.mailbox.has_pending_durable_admission()
+                || actor.mailbox.admitted_command_sequence().is_some()
+        }) {
+            return Err(NuError::VMError {
+                msg: format!(
+                    "actor {actor_id} cannot execute synchronous ask while durable admission or completion is pending"
+                ),
+                span: Span::default(),
+            });
+        }
         let behavior_idx = behavior_id as usize;
         if !self.actor_has_behavior_id(actor_id, behavior_id) {
             return Err(NuError::VMError {
