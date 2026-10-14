@@ -33,6 +33,12 @@ class LinuxPackageContractTests(unittest.TestCase):
         self.assertIn("apt-get remove -y nulang", workflow)
         self.assertIn("dnf remove -y nulang", workflow)
 
+    def test_linux_package_version_does_not_require_python_311(self):
+        # ubuntu-22.04 ships Python 3.10 by default; tomllib is 3.11+.
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("cargo metadata --locked --no-deps --format-version 1", workflow)
+        self.assertNotIn('version="$(python3 -c \'import tomllib', workflow)
+
     def test_architecture_metadata_and_package_contents(self):
         script = PACKAGER.read_text(encoding="utf-8")
         self.assertIn("deb_arch=amd64", script)
