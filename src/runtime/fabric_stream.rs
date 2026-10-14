@@ -2432,6 +2432,42 @@ mod tests {
     }
 
     #[test]
+    fn retained_tail_truncation_below_trim_highwater_fails_closed() {
+        let root = test_dir("retention-tail-highwater");
+        {
+            let mut store = FileFabricStreamStore::open(&root).unwrap();
+            store
+                .create_stream(
+                    "events",
+                    FabricStreamConfig {
+                        segment_max_bytes: 96,
+                    },
+                )
+                .unwrap();
+            for _ in 0..3 {
+                store.append("events", &[9; 48]).unwrap();
+            }
+            store.commit_cursor("events", "worker", 2).unwrap();
+            store.apply_retention("events", 3).unwrap();
+        }
+
+        // Keep the final segment header but lose the acknowledged record.
+        let path = segment_path(&root.join("events"), 3);
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(SEGMENT_HEADER_LEN as u64)
+            .unwrap();
+        let mut reopened = FileFabricStreamStore::open(&root).unwrap();
+        assert_eq!(
+            reopened.append("events", b"replacement").unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn retention_fails_closed_if_committed_suffix_is_missing() {
         let root = test_dir("retention-missing-suffix");
         {
