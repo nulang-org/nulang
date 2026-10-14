@@ -1203,6 +1203,48 @@ impl Runtime {
                 "completion snapshot does not match the actor's durable field set",
             ));
         }
+        // The host-facing completion adapter supports only primitive values
+        // backed by a compiler-owned literal field default. Never publish an
+        // incompatible or unsupported value, even when the persisted envelope
+        // has matching actor, schema, and sequence identities. Full structural
+        // types require canonical compiler-emitted state type descriptors.
+        let meta = actor
+            .bytecode_module
+            .as_ref()
+            .and_then(|module| {
+                behavior_ownership::actor_meta_for_runtime_name(module, &actor.name)
+            })
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    "completion cannot resolve compiler-owned actor state schema",
+                )
+            })?;
+        for (name, value) in &snapshot.state {
+            let matches_default = meta
+                .state_defaults
+                .iter()
+                .find(|(field, _)| field == name)
+                .is_some_and(|(_, default)| {
+                    matches!(
+                        (default, value),
+                        (crate::bytecode::Constant::Int(_), PersistedValue::Int(_))
+                            | (crate::bytecode::Constant::Float(_), PersistedValue::Float(_))
+                            | (crate::bytecode::Constant::Bool(_), PersistedValue::Bool(_))
+                            | (crate::bytecode::Constant::String(_), PersistedValue::String(_))
+                            | (crate::bytecode::Constant::Nil, PersistedValue::Nil)
+                            | (crate::bytecode::Constant::Unit, PersistedValue::Unit)
+                    )
+                });
+            if !matches_default {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "durable completion field '{name}' is incompatible with compiled primitive state type"
+                    ),
+                ));
+            }
+        }
 
         let actor = self
             .actors
