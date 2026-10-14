@@ -8742,3 +8742,46 @@ fn pending_atomic_mailbox_admission_pauses_scheduler_requeue() {
     );
     assert_eq!(actor.mailbox.len(), 1, "uncommitted message remains owned");
 }
+
+#[test]
+fn pending_durable_user_command_still_schedules_supervisor_notice() {
+    let mut runtime = Runtime::new();
+    let actor_id = runtime.spawn_actor(Box::new(Vec::new));
+    {
+        let actor = runtime.actors.get_mut(&actor_id).unwrap();
+        actor.state = ActorState::Running;
+        actor.run_state = ActorRunState::Running;
+        actor
+            .mailbox
+            .push_local(Message {
+                behavior_id: 7,
+                payload: MessagePayload::from_slice(&[Value::int(5)]),
+                sender: 10,
+                priority: MessagePriority::Normal,
+                trace_id: None,
+            })
+            .unwrap();
+        assert!(actor.mailbox.begin_durable_admission().is_some());
+        actor
+            .mailbox
+            .push_local(Message {
+                behavior_id: 0,
+                payload: MessagePayload::from_slice(&[Value::int(99)]),
+                sender: 99,
+                priority: MessagePriority::System,
+                trace_id: None,
+            })
+            .unwrap();
+    }
+
+    runtime.finish_actor_turn(actor_id);
+    assert_eq!(
+        runtime.actors[&actor_id].run_state,
+        ActorRunState::Queued,
+        "a queued supervisor notice may bypass the pending durable user command"
+    );
+    let actor = runtime.actors.get_mut(&actor_id).unwrap();
+    assert_eq!(actor.receive().unwrap().sender, 99);
+    assert_eq!(actor.mailbox.len(), 1);
+    assert!(actor.mailbox.has_pending_durable_admission());
+}
