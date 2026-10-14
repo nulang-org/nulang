@@ -13,6 +13,29 @@ use std::io;
 
 const EXECUTION_PIN_EVENT: &str = "__nulang.execution_pin/v1";
 
+/// Immutable, content-addressed bundle obtained from a trusted artifact store.
+#[derive(Debug, Clone)]
+pub struct PinnedArtifactBundle {
+    pub manifest: BehaviorManifest,
+    pub executable: Vec<u8>,
+}
+
+/// Host-provided immutable artifact lookup. Implementations must resolve by
+/// content digest, never by a mutable tag such as "latest".
+pub trait ImmutablePinnedArtifactResolver {
+    fn resolve(&self, executable_digest: &str) -> io::Result<Option<PinnedArtifactBundle>>;
+}
+
+/// Detect a persisted pin marker so unverified legacy recovery cannot run a
+/// correctly decoded pinned execution. Malformed/unreadable history is handled
+/// by the strict pinned recovery preflight, not interpreted as a valid pin.
+pub(crate) fn has_execution_pin_marker(store: &dyn PersistenceStore, actor_id: u64) -> bool {
+    store.read_workflow_events(actor_id).iter().any(|event| {
+        matches!(event, WorkflowEvent::Custom { name, .. } if name == EXECUTION_PIN_EVENT)
+    })
+}
+
+
 fn invalid_data(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
@@ -94,6 +117,17 @@ pub fn verify_pinned_workflow_resume(
     manifest: &BehaviorManifest,
     executable_bytes: &[u8],
 ) -> io::Result<()> {
+    read_pinned_workflow_pin(store, actor_id)?
+        .validate_resume(execution_id, manifest, executable_bytes)
+        .map_err(invalid_data)
+}
+
+/// Parse and validate the immutable pin before choosing a recovery artifact.
+/// No mutable alias or latest-deployment fallback is permitted.
+pub fn read_pinned_workflow_pin(
+    store: &dyn PersistenceStore,
+    actor_id: u64,
+) -> io::Result<DurableExecutionPin> {
     let tail = store
         .load_durable_tail_position(actor_id)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no atomic workflow history"))?;
@@ -152,6 +186,5 @@ pub fn verify_pinned_workflow_resume(
             .as_bytes(),
     )
     .map_err(invalid_data)?;
-    pin.validate_resume(execution_id, manifest, executable_bytes)
-        .map_err(invalid_data)
+    Ok(pin)
 }
