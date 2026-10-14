@@ -63,7 +63,7 @@ fn handoff(
 fn three_file_quorum_commits_and_recovers_identical_grants() {
     let paths = paths();
     cleanup(&paths);
-    let mut log = FixedTermQuorumLog::open(&paths, 12).unwrap();
+    let mut log = FixedTermQuorumLog::bootstrap(&paths, 12).unwrap();
     let first = log.propose(bootstrap()).unwrap();
     assert_eq!(first.epoch, 7);
     assert_eq!(first.committed_index, 1);
@@ -84,7 +84,7 @@ fn three_file_quorum_commits_and_recovers_identical_grants() {
 fn fixed_term_cannot_silently_transition_to_new_leader_term() {
     let paths = paths();
     cleanup(&paths);
-    let mut log = FixedTermQuorumLog::open(&paths, 4).unwrap();
+    let mut log = FixedTermQuorumLog::bootstrap(&paths, 4).unwrap();
     log.propose(bootstrap()).unwrap();
     drop(log);
 
@@ -102,7 +102,7 @@ fn fixed_term_cannot_silently_transition_to_new_leader_term() {
 fn rejected_committed_command_still_advances_durable_quorum_log() {
     let paths = paths();
     cleanup(&paths);
-    let mut log = FixedTermQuorumLog::open(&paths, 3).unwrap();
+    let mut log = FixedTermQuorumLog::bootstrap(&paths, 3).unwrap();
     log.propose(bootstrap()).unwrap();
     assert!(matches!(
         log.propose(handoff(2, 7, 3, 8)),
@@ -124,7 +124,7 @@ fn rejected_committed_command_still_advances_durable_quorum_log() {
 fn loss_of_one_voter_still_permits_quorum_recovery() {
     let paths = paths();
     cleanup(&paths);
-    let mut log = FixedTermQuorumLog::open(&paths, 2).unwrap();
+    let mut log = FixedTermQuorumLog::bootstrap(&paths, 2).unwrap();
     log.propose(bootstrap()).unwrap();
     drop(log);
 
@@ -142,7 +142,7 @@ fn loss_of_one_voter_still_permits_quorum_recovery() {
 fn no_quorum_cannot_recover_or_issue_ownership_grants() {
     let paths = paths();
     cleanup(&paths);
-    let mut log = FixedTermQuorumLog::open(&paths, 2).unwrap();
+    let mut log = FixedTermQuorumLog::bootstrap(&paths, 2).unwrap();
     log.propose(bootstrap()).unwrap();
     drop(log);
 
@@ -172,7 +172,7 @@ fn corrupted_minor_replica_does_not_override_majority() {
     use std::io::Write;
     let paths = paths();
     cleanup(&paths);
-    let mut log = FixedTermQuorumLog::open(&paths, 4).unwrap();
+    let mut log = FixedTermQuorumLog::bootstrap(&paths, 4).unwrap();
     let committed = log.propose(bootstrap()).unwrap();
     drop(log);
 
@@ -199,7 +199,7 @@ fn corrupted_minor_replica_does_not_override_majority() {
 fn hardlinked_journal_files_must_not_be_counted_twice() {
     let paths = paths();
     cleanup(&paths);
-    let log = FixedTermQuorumLog::open(&paths, 3).unwrap();
+    let log = FixedTermQuorumLog::bootstrap(&paths, 3).unwrap();
     drop(log);
 
     fs::remove_file(&paths[1]).unwrap();
@@ -211,3 +211,38 @@ fn hardlinked_journal_files_must_not_be_counted_twice() {
     cleanup(&paths);
 }
 
+#[test]
+fn all_missing_journals_cannot_implicitly_rebootstrap_an_existing_cluster() {
+    let paths = paths();
+    cleanup(&paths);
+    let mut original = FixedTermQuorumLog::bootstrap(&paths, 3).unwrap();
+    original.propose(bootstrap()).unwrap();
+    drop(original);
+    for path in &paths {
+        fs::remove_file(path).unwrap();
+    }
+    // A normal restart must not mistake total replica loss for a fresh
+    // cluster. Reinitialization requires an explicit operator action.
+    assert!(matches!(
+        FixedTermQuorumLog::open(&paths, 3),
+        Err(QuorumLogError::NotEnoughReplicas {
+            available: 0,
+            required: 2
+        })
+    ));
+    cleanup(&paths);
+}
+
+#[test]
+fn explicit_bootstrap_rejects_partially_existing_membership() {
+    let paths = paths();
+    cleanup(&paths);
+    let log = FixedTermQuorumLog::bootstrap(&paths, 3).unwrap();
+    drop(log);
+    fs::remove_file(&paths[2]).unwrap();
+    assert!(matches!(
+        FixedTermQuorumLog::bootstrap(&paths, 3),
+        Err(QuorumLogError::AlreadyInitialized)
+    ));
+    cleanup(&paths);
+}
