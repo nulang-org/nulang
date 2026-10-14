@@ -215,7 +215,7 @@ semantics that later cluster and stream layers can reuse.
 - [ ] Consumer ACK/NACK and timed redelivery.
 - [x] Replay by sequence and committed consumer cursor.
 - [ ] Seek by time.
-- [ ] Retention policies.
+- [ ] Retention policies (read-only local whole-segment eligibility preview available; deletion and enforcement not implemented).
 - [ ] Dead-letter streams.
 - [ ] Deduplication/idempotency keys.
 - [x] Per-record checksums and torn-tail recovery.
