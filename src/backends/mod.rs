@@ -594,6 +594,15 @@ impl ForeignInterop for DefaultForeignInterop {
         Ok(())
     }
 
+    fn get_attr(&mut self, module: &str, attr: &str) -> Result<Value, String> {
+        let module_id = *self
+            .modules
+            .get(module)
+            .ok_or_else(|| format!("module '{}' not imported", module))?;
+        let attr_id = self.bridge.get_attr(module_id, attr)?;
+        crate::python::python_object_id_to_value(attr_id)
+    }
+
     fn call(&mut self, module: &str, function: &str, args: &[Value]) -> Result<Value, String> {
         let module_id = *self
             .modules
