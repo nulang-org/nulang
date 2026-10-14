@@ -5,11 +5,18 @@
 //! run for a given seed. This enables reproducible debugging of concurrency
 //! bugs, deadlock detection, and invariant checking.
 //!
-//! Usage:
-//!   let mut sim = Simulator::new(42); // seed = 42
-//!   sim.load_program("examples/pingpong.nula");
-//!   sim.run_until_quiescence();
-//!   assert!(!sim.has_deadlock());
+//! The lightweight `Simulator` records message deliveries rather than
+//! executing Nulang actor behaviors. For semantic/GC/durability testing, use
+//! the real `Runtime::run_scheduler_deterministic` and its virtual clock.
+//!
+//! Lightweight example:
+//!   let mut sim = Simulator::new(42).with_max_steps(100);
+//!   sim.register_actor(1, "worker");
+//!   sim.send(0, 1, "work", vec![]);
+//!   assert_eq!(
+//!       sim.run_until_quiescence_checked(),
+//!       SimulationRunResult::Quiescent { steps: 2 },
+//!   );
 
 use std::collections::{HashMap, VecDeque};
 
@@ -462,6 +469,35 @@ mod tests {
         sim.run_until_quiescence();
         assert!(sim.timers.is_empty());
         assert_eq!(sim.clock_ms(), 100);
+    }
+
+    #[test]
+    fn test_dst_checked_run_is_quiescent_with_zero_budget_and_no_work() {
+        let mut sim = Simulator::new(7).with_max_steps(0);
+
+        assert_eq!(
+            sim.run_until_quiescence_checked(),
+            SimulationRunResult::Quiescent { steps: 0 }
+        );
+        assert!(!sim.has_pending_work());
+    }
+
+    #[test]
+    fn test_dst_pending_work_includes_undelivered_messages() {
+        let mut sim = Simulator::new(7).with_max_steps(0);
+        sim.register_actor(1, "worker");
+        sim.send(0, 1, "pending", vec![]);
+
+        assert!(sim.has_pending_work());
+        assert_eq!(sim.step_count(), 0);
+        assert_eq!(
+            sim.run_until_quiescence_checked(),
+            SimulationRunResult::StepLimitExceeded {
+                seed: 7,
+                steps: 0,
+                max_steps: 0,
+            }
+        );
     }
 
     #[test]
