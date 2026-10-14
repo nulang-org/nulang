@@ -63,6 +63,14 @@ pub fn suggested_source_edit(err: &NuError, source: &str) -> Option<DiagnosticSo
         return None;
     };
     let original = source.get(span.start as usize..span.end as usize)?;
+    let before = source.get(..span.start as usize)?.chars().next_back();
+    let after = source.get(span.end as usize..)?.chars().next();
+    let continues_identifier = |ch: char| ch.is_alphanumeric() || ch == '_';
+    // Source spans must cover an entire identifier. Replacing only a prefix
+    // or suffix can silently corrupt unrelated source after error recovery.
+    if before.is_some_and(continues_identifier) || after.is_some_and(continues_identifier) {
+        return None;
+    }
     let valid_identifier = |name: &str| {
         let mut chars = name.chars();
         matches!(chars.next(), Some(c) if c.is_alphabetic() || c == '_')
