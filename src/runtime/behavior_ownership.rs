@@ -57,17 +57,14 @@ pub(crate) fn validate_replayed_behavior(
     runtime_behavior_idx: usize,
     argument_count: usize,
 ) -> Result<(), String> {
-    let module_idx = module_behavior_index_for_runtime_id(
-        module,
-        schema_name,
-        runtime_behavior_idx,
-    )
-    .ok_or_else(|| {
-        format!(
-            "journal behavior id {} is not owned by schema '{}'",
-            runtime_behavior_idx, schema_name
-        )
-    })?;
+    let module_idx =
+        module_behavior_index_for_runtime_id(module, schema_name, runtime_behavior_idx)
+            .ok_or_else(|| {
+                format!(
+                    "journal behavior id {} is not owned by schema '{}'",
+                    runtime_behavior_idx, schema_name
+                )
+            })?;
     let behavior = module.behaviors.get(module_idx).ok_or_else(|| {
         format!(
             "journal behavior id {} for schema '{}' has no compiler-owned signature",
