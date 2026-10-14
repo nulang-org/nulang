@@ -2532,7 +2532,10 @@ pub struct VM {
     pub handler_stack: Vec<HandlerFrame>,
     /// Step counter (for debugging / limits).
     step_count: usize,
-    /// Set by try_jit_execute when a JIT safepoint triggers a yield.
+    /// Optional per-run cooperative quantum for actor bytecode dispatch.
+    /// None retains the standalone VM's historical run-to-completion behavior.
+    cooperative_instruction_budget: Option<u32>,
+    /// Set by JIT safepoints or an exhausted interpreter quantum.
     /// Consumed by run_from / resume to return early; reset at start of run_from.
     pub yield_pending: bool,
     /// Optional JIT session for tiered compilation.
@@ -2738,6 +2741,7 @@ impl VM {
             current_frame_idx: None,
             handler_stack: Vec::new(),
             step_count: 0,
+            cooperative_instruction_budget: None,
             yield_pending: false,
             jit_session: if enable_jit {
                 create_default_jit()
@@ -3005,6 +3009,15 @@ impl VM {
         self.frames.clear();
         self.frames.push(frame);
         self.current_frame_idx = Some(0);
+    }
+
+    /// Limit interpreted dispatches per actor activation or resume call.
+    ///
+    /// This is opt-in: standalone programs retain run-to-completion behavior.
+    /// Compiled regions retain their separate JIT safepoint budget; callers
+    /// must also arrange to requeue yielded continuations.
+    pub fn set_cooperative_instruction_budget(&mut self, budget: Option<u32>) {
+        self.cooperative_instruction_budget = budget.map(|limit| limit.max(1));
     }
 
     /// Return the module index of the currently executing frame, if any.
@@ -3384,6 +3397,7 @@ impl VM {
     /// handlers receive their arguments.
     pub fn run_from(&mut self, module_idx: usize, pc: usize) -> NuResult<Value> {
         self.yield_pending = false;
+        let mut remaining = self.cooperative_instruction_budget;
 
         if self.frames.is_empty() {
             let mut frame = Frame::new(None, module_idx);
@@ -3428,6 +3442,17 @@ impl VM {
                 }
             } else {
                 return Ok(Value::unit());
+            }
+
+            // Yield only when there is another instruction to execute. The
+            // halt / end-of-module checks above must win at the exact limit,
+            // otherwise a completed behavior would be falsely suspended.
+            if let Some(left) = remaining.as_mut() {
+                if *left == 0 {
+                    self.yield_pending = true;
+                    return Ok(Value::nil());
+                }
+                *left -= 1;
             }
 
             match self.step() {
@@ -3489,6 +3514,7 @@ impl VM {
     /// until the program halts, yields again, or errors.
     pub fn resume(&mut self) -> NuResult<Value> {
         self.yield_pending = false;
+        let mut remaining = self.cooperative_instruction_budget;
         loop {
             if let Some(idx) = self.current_frame_idx {
                 let m_idx = self.frames[idx].module_idx;
@@ -3519,6 +3545,17 @@ impl VM {
                 }
             } else {
                 return Ok(Value::unit());
+            }
+
+            // Yield only when there is another instruction to execute. The
+            // halt / end-of-module checks above must win at the exact limit,
+            // otherwise a completed behavior would be falsely suspended.
+            if let Some(left) = remaining.as_mut() {
+                if *left == 0 {
+                    self.yield_pending = true;
+                    return Ok(Value::nil());
+                }
+                *left -= 1;
             }
 
             match self.step() {
