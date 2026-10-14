@@ -1068,4 +1068,30 @@ mod transactional_receive_tests {
         assert_eq!(mailbox.pop().unwrap().sender, 6);
         assert_eq!(mailbox.len(), 0);
     }
+
+    #[test]
+    fn durable_admission_closure_exposes_envelope_only_after_successful_commit() {
+        let mut mailbox = Mailbox::new(1);
+        mailbox.push_local(make_msg(7, 51)).unwrap();
+
+        let failure = mailbox.admit_durable_with(|message| {
+            assert_eq!(message.sender, 51);
+            Err::<u64, &'static str>("store unavailable")
+        });
+        assert_eq!(failure, Err("store unavailable"));
+        assert_eq!(mailbox.len(), 1);
+        assert!(mailbox.push_local(make_msg(7, 52)).is_err());
+
+        let accepted = mailbox
+            .admit_durable_with(|message| {
+                assert_eq!(message.sender, 51);
+                Ok::<u64, &'static str>(99)
+            })
+            .unwrap()
+            .expect("the same message should commit");
+        assert_eq!(accepted.0.sender, 51);
+        assert_eq!(accepted.1, 99);
+        assert_eq!(mailbox.len(), 0);
+        assert!(mailbox.pop().is_none());
+    }
 }
