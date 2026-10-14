@@ -553,6 +553,12 @@ pub trait ForeignInterop: Send {
     /// Import a foreign module, making its exports available via `call`.
     /// Returns an error string if the module cannot be loaded.
     fn import(&mut self, name: &str) -> Result<(), String>;
+
+    /// Read a module attribute without invoking it. Existing foreign backends
+    /// default to unsupported rather than accidentally calling a value.
+    fn get_attr(&mut self, module: &str, attr: &str) -> Result<Value, String> {
+        Err(format!("foreign backend does not support attribute lookup: {module}.{attr}"))
+    }
 }
 
 // ---------------------------------------------------------------------------
