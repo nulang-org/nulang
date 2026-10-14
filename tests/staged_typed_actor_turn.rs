@@ -193,3 +193,36 @@ fn duplicate_external_effect_identity_is_rejected_without_commit() {
         Some(0)
     );
 }
+
+#[test]
+fn rejected_atomic_store_predecessor_never_publishes_staged_state_or_effect() {
+    let (mut runtime, actor_id, behavior, _) = spawn();
+    let committed_tail = runtime.persistence.latest_sequence(actor_id);
+    let effect_intent = effect(actor_id);
+    let effect_id = effect_intent.effect().spec().id;
+
+    let error = runtime
+        .commit_staged_typed_actor_turn(
+            actor_id,
+            committed_tail + 1,
+            behavior,
+            vec![PersistedValue::Int(5)],
+            HashMap::from([("count".to_string(), PersistedValue::Int(5))]),
+            vec![effect_intent],
+            outbox(),
+        )
+        .expect_err("backend must reject missing predecessor even for valid data");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(runtime.persistence.latest_sequence(actor_id), committed_tail);
+    assert!(runtime
+        .persistence
+        .load_durable_effect(actor_id, effect_id)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        runtime.actors[&actor_id]
+            .get_state_field("count")
+            .and_then(|value| value.as_int()),
+        Some(0)
+    );
+}
