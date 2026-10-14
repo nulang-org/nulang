@@ -6,6 +6,7 @@
 
 pub mod checkpoint;
 pub mod ownership;
+pub mod ownership_quorum;
 pub mod store;
 pub mod tablet;
 pub mod wal;
