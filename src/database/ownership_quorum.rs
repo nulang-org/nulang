@@ -31,6 +31,9 @@ struct FileReplica {
     // Sidecar lock must not be unlinked: ownership survives journal reopen.
     _writer_lock: File,
     entries: Vec<CommittedOwnershipEntry>,
+    // An interrupted append may have emitted a partial frame. Do not let a
+    // second append acknowledge a corrupt journal without full reopen.
+    poisoned: bool,
 }
 
 impl FileReplica {
@@ -112,10 +115,18 @@ impl FileReplica {
             entries.push(entry);
         }
         file.seek(SeekFrom::End(0))?;
-        Ok(Self { file, _writer_lock: lock, entries })
+        Ok(Self {
+            file,
+            _writer_lock: lock,
+            entries,
+            poisoned: false,
+        })
     }
 
     fn append_durable(&mut self, entry: CommittedOwnershipEntry) -> Result<(), QuorumLogError> {
+        if self.poisoned {
+            return Err(QuorumLogError::RequiresReopen);
+        }
         let offset = (entry.index as usize)
             .checked_sub(1)
             .ok_or(QuorumLogError::InvalidJournal)?;
@@ -139,11 +150,15 @@ impl FileReplica {
         }
         let length = u32::try_from(payload.len()).map_err(|_| QuorumLogError::InvalidJournal)?;
         self.file.seek(SeekFrom::End(0))?;
+        // From this point, any error can leave the physical journal
+        // corrupted. Never acknowledge subsequent writes on this handle.
+        self.poisoned = true;
         self.file.write_all(&length.to_le_bytes())?;
         self.file.write_all(&payload)?;
         self.file.write_all(blake3::hash(&payload).as_bytes())?;
         self.file.sync_data()?;
         self.entries.push(entry);
+        self.poisoned = false;
         Ok(())
     }
 }
@@ -300,7 +315,6 @@ impl FixedTermQuorumLog {
         }
         self.authority.apply_committed(entry).map_err(QuorumLogError::CommandRejected)
     }
-
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
