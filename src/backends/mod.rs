@@ -557,7 +557,9 @@ pub trait ForeignInterop: Send {
     /// Read a module attribute without invoking it. Existing foreign backends
     /// default to unsupported rather than accidentally calling a value.
     fn get_attr(&mut self, module: &str, attr: &str) -> Result<Value, String> {
-        Err(format!("foreign backend does not support attribute lookup: {module}.{attr}"))
+        Err(format!(
+            "foreign backend does not support attribute lookup: {module}.{attr}"
+        ))
     }
 }
 
