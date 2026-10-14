@@ -291,6 +291,8 @@ pub struct Mailbox {
     active_match: Option<(MatchLane, usize, Arc<Vec<Value>>)>,
     /// Candidate awaiting persistence admission, retaining its mailbox slot.
     pending_durable_admission: Option<Message>,
+    /// An admitted user command whose durable completion is pending.
+    admitted_command_sequence: Option<u64>,
 }
 
 impl Mailbox {
@@ -311,6 +313,7 @@ impl Mailbox {
             receive_indexes: None,
             active_match: None,
             pending_durable_admission: None,
+            admitted_command_sequence: None,
         }
     }
 
@@ -328,6 +331,7 @@ impl Mailbox {
         self.receive_indexes = None;
         self.active_match = None;
         self.pending_durable_admission = None;
+        self.admitted_command_sequence = None;
     }
 
     /// Reserve one logical mailbox slot.
@@ -409,6 +413,9 @@ impl Mailbox {
     /// exact same message, even after newly arriving messages. This is an
     /// in-memory primitive; it is not a persisted or crash-proof inbox.
     pub fn begin_durable_admission(&mut self) -> Option<&Message> {
+        if self.admitted_command_sequence.is_some() {
+            return None;
+        }
         if self.pending_durable_admission.is_none() {
             match self.pop_uncommitted() {
                 Some(message) if message.priority == MessagePriority::System => {
@@ -439,6 +446,26 @@ impl Mailbox {
     /// A trusted host explicitly retries the same candidate and transition.
     pub fn has_pending_durable_admission(&self) -> bool {
         self.pending_durable_admission.is_some()
+    }
+
+    pub fn admitted_command_sequence(&self) -> Option<u64> {
+        self.admitted_command_sequence
+    }
+
+    /// Fence all later user commands while the host commits completion.
+    pub fn fence_admitted_command(&mut self, sequence: u64) {
+        debug_assert!(self.pending_durable_admission.is_none());
+        debug_assert!(self.admitted_command_sequence.is_none());
+        self.admitted_command_sequence = Some(sequence);
+    }
+
+    /// Runtime verifies durable completion before releasing this fence.
+    pub fn finish_admitted_command(&mut self, sequence: u64) -> bool {
+        if self.admitted_command_sequence != Some(sequence) {
+            return false;
+        }
+        self.admitted_command_sequence = None;
+        true
     }
 
     /// System supervision messages must remain runnable even if an ordinary
@@ -504,7 +531,9 @@ impl Mailbox {
     /// Legacy nontransactional receive remains unavailable while a durable
     /// candidate is pending. No caller may bypass persistence admission.
     pub fn pop(&mut self) -> Option<Message> {
-        let result = if self.pending_durable_admission.is_some() {
+        let result = if self.pending_durable_admission.is_some()
+            || self.admitted_command_sequence.is_some()
+        {
             self.pop_ready_system()
         } else {
             self.pop_uncommitted()
@@ -574,7 +603,9 @@ impl Mailbox {
     /// guard actually succeeded.
     pub fn receive_match(&mut self, behavior_ids: &[u16]) -> Option<(usize, Arc<Vec<Value>>)> {
         // A candidate awaiting persistence cannot be consumed by selective receive.
-        if self.pending_durable_admission.is_some() {
+        if self.pending_durable_admission.is_some()
+            || self.admitted_command_sequence.is_some()
+        {
             return None;
         }
         // If the VM asks for another candidate before commit, the previous
