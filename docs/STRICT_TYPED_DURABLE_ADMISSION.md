@@ -18,6 +18,8 @@ With strict admission enabled:
   `finish_admitted_typed_actor_command` still requires a separate,
   epoch-fenced completion snapshot.
 
+The experimental isolated pure-bytecode executor (stacked PR #1720) now **requires** this opt-in before executing any admitted command; attempting to execute without it is rejected without publishing state. Successful completion does not disable the strict policy, and subsequent user commands still require atomic admission.
+
 No change is made to ordinary actors unless a trusted host opts in. This is
 not a default source-language semantic change.
 
@@ -31,9 +33,7 @@ or production durability guarantee.
 
 A trusted host can still call lower-level runtime APIs; this feature is a
 guard against *accidental* fallback, not a sandbox boundary against a
-malicious host. It does not execute compiled bytecode handlers under a staged
-snapshot, intercept external provider calls, durably identify incoming
-messages, or guarantee externally observable exactly-once behavior.
+malicious host. The separate #1720 staged executor can run a bounded, pure scalar handler in an isolated VM after opt-in; this strict gate itself does not intercept external provider calls, durably identify incoming messages, or guarantee externally observable exactly-once behavior.
 
 The next integration must:
 
@@ -53,6 +53,7 @@ pass on its stacked base PR #1686.
 ```sh
 cargo fmt --all -- --check
 cargo test --locked --test strict_typed_durable_admission
+cargo test --locked --test strict_pure_durable_bridge
 cargo test --locked --test atomic_persistent_mailbox_admission
 cargo test --locked --lib runtime::mailbox::tests
 cargo test --locked
