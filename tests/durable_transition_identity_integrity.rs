@@ -187,10 +187,16 @@ fn workflow_replay_identity_cannot_claim_future_command() {
 #[test]
 fn workflow_replay_identity_must_match_admitted_command_when_present() {
     let mut candidate = transition();
+    // A continuation for command 1 is not permitted to masquerade as the
+    // event of a newly admitted command 2 in the same atomic turn.
+    candidate.sequence = 2;
+    candidate.expected_previous_sequence = 1;
+    candidate.command.as_mut().unwrap().sequence = 2;
+    candidate.snapshot.as_mut().unwrap().sequence = 2;
     candidate.workflow_events.push(WorkflowEvent::Custom {
-        sequence: 1,
+        sequence: 2,
         replay_id: Some(WorkflowReplayEventId::new(
-            WorkflowActivationId::new(ACTOR_ID, 0),
+            WorkflowActivationId::new(ACTOR_ID, 1),
             0,
         )),
         name: "Wrong".into(),
