@@ -15,6 +15,8 @@ on:
       - 'scripts/tests/test_release_cli_profile.py'
       - 'scripts/package_linux.sh'
       - 'scripts/tests/test_linux_packages.py'
+      - 'scripts/configure_ubuntu_arm64_sources.py'
+      - 'scripts/tests/test_arm64_apt_sources.py'
 
 env:
   CARGO_TERM_COLOR: always
@@ -36,6 +38,7 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts/tests -p test_release_cli_profile.py
           python3 -m unittest discover -s scripts/tests -p test_linux_packages.py
+          python3 -m unittest discover -s scripts/tests -p test_arm64_apt_sources.py
 
       - name: Verify tag matches crate and CLI versions
         if: github.event_name == 'push'
@@ -103,19 +106,10 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo dpkg --add-architecture arm64
-          # Restrict the runner's amd64 sources and add arm64 via
-          # ports.ubuntu.com (archive/security mirrors 404 on arm64).
-          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
-            sudo sed -i '/^Types: deb$/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources
-          else
-            # Ubuntu 22.04 still uses traditional sources.list entries.
-            sudo sed -i -E 's|^(deb(-src)?)[[:space:]]+(http[^[:space:]]+)|\1 [arch=amd64] \3|' /etc/apt/sources.list
-          fi
-          CODENAME=$(lsb_release -cs)
-          # printf (not an indented heredoc) so the deb822 stanza has no
-          # leading whitespace — indented continuation lines would merge
-          # into the previous field and break the source.
-          printf 'Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports/\nSuites: %s %s-updates %s-backports %s-security\nComponents: main restricted universe multiverse\nArchitectures: arm64\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n' "$CODENAME" "$CODENAME" "$CODENAME" "$CODENAME" | sudo tee /etc/apt/sources.list.d/arm64.sources
+          # Ubuntu 22.04 runners may have BOTH sources.list and deb822 files.
+          # Constrain all official Ubuntu amd64 mirrors; ARM64 uses ports.
+          CODENAME="$(lsb_release -cs)"
+          sudo python3 scripts/configure_ubuntu_arm64_sources.py --codename "$CODENAME"
           sudo apt-get update
           # The public CLI does not require cross-target Python headers or
           # shared libraries. Keep the cross toolchain and OpenSSL only.
