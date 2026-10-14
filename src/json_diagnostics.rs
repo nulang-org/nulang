@@ -257,6 +257,69 @@ mod tests {
     }
 
     #[test]
+    fn test_unique_unbound_name_emits_scoped_nonautomatic_edit() {
+        let source = "fn main() = countr + 1\n";
+        set_source_map_with_file(source, Some("test.nula"));
+        let start = "fn main() = ".len() as u32;
+        let err = NuError::unbound_variable(
+            "countr",
+            Span::new(start, start + 6),
+            Some(vec!["counter".to_string()]),
+        );
+        let diag = diagnostics_from_error(&err).remove(0);
+        let suggestion = diag.suggestion.expect("unique typo must have a suggestion");
+        let edit = suggestion.edit.expect("suggestion must carry a scoped source edit");
+        assert_eq!(edit.expected, "countr");
+        assert_eq!(edit.replacement, "counter");
+        assert_eq!(edit.start, start);
+        assert_eq!(edit.end, start + 6);
+        assert_eq!(
+            edit.applicability,
+            crate::diagnostic::EditApplicability::MaybeIncorrect
+        );
+        let fixed = format!(
+            "{}{}{}",
+            &source[..edit.start as usize],
+            edit.replacement,
+            &source[edit.end as usize..]
+        );
+        assert_eq!(fixed, "fn main() = counter + 1\n");
+        clear_source_map();
+    }
+
+    #[test]
+    fn test_ambiguous_or_out_of_bounds_typo_has_no_edit() {
+        let source = "fn main() = countr + 1\n";
+        set_source_map_with_file(source, Some("test.nula"));
+        let start = "fn main() = ".len() as u32;
+        let ambiguous = NuError::unbound_variable(
+            "countr",
+            Span::new(start, start + 6),
+            Some(vec!["counter".into(), "county".into()]),
+        );
+        assert!(
+            diagnostics_from_error(&ambiguous)[0]
+                .suggestion
+                .as_ref()
+                .and_then(|s| s.edit.as_ref())
+                .is_none()
+        );
+        let invalid = NuError::unbound_variable(
+            "countr",
+            Span::new(9000, 9010),
+            Some(vec!["counter".into()]),
+        );
+        assert!(
+            diagnostics_from_error(&invalid)[0]
+                .suggestion
+                .as_ref()
+                .and_then(|s| s.edit.as_ref())
+                .is_none()
+        );
+        clear_source_map();
+    }
+
+    #[test]
     fn test_multiple_flattens() {
         let span = Span::default();
         let errs = NuError::Multiple(vec![
