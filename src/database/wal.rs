@@ -16,7 +16,7 @@
 //! record, while a complete-but-corrupt frame fails closed.
 
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -154,7 +154,32 @@ impl WalRecord {
     }
 }
 
+/// A persistent sidecar lock guards all writers to this WAL path. It is not
+/// removed on drop: unlinking a live lockfile could let another process lock
+/// a new inode while the old writer still holds the previous one.
+fn acquire_writer_lock(wal_path: &Path) -> Result<File, WalError> {
+    let mut name = wal_path.as_os_str().to_os_string();
+    name.push(".lock");
+    let lock_path = PathBuf::from(name);
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)?;
+
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(WalError::WriterAlreadyActive { lock_path }),
+        Err(TryLockError::Error(error)) => Err(WalError::from(error)),
+    }
+}
+
 /// File-backed, per-tablet append-only WAL.
+///
+/// Opening requires an OS-exclusive `<wal>.lock` sidecar. This protects
+/// cooperative single-host writers sharing a canonical WAL path; it is not
+/// quorum fencing and cannot protect against paths aliasing through hardlinks,
+/// deletion of a live sidecar, or filesystems with unreliable lock semantics.
 ///
 /// A WAL starts at tablet sequence 1 and requires each new record to name the
 /// current tail as its predecessor. Ownership epochs may advance over time,
@@ -163,6 +188,9 @@ impl WalRecord {
 pub struct FileWal {
     path: PathBuf,
     file: File,
+    // Lock the stable sidecar, not the WAL inode: reclamation atomically
+    // replaces that inode. The lock must stay held through reopen.
+    writer_lock: Option<File>,
     records: Vec<WalRecord>,
     record_end_offsets: Vec<u64>,
     base_sequence: u64,
@@ -182,7 +210,15 @@ impl FileWal {
         {
             fs::create_dir_all(parent)?;
         }
+        // Obtain ownership before WAL initialization, recovery or crash-tail
+        // truncation. A contender must not modify any on-disk state.
+        let writer_lock = acquire_writer_lock(&path)?;
+        Self::open_with_lock(path, Some(writer_lock))
+    }
 
+    // The caller must already own this tablet lock if writer_lock is None.
+    // Only WAL reclamation may invoke this path without acquiring a new lock.
+    fn open_with_lock(path: PathBuf, writer_lock: Option<File>) -> Result<Self, WalError> {
         let file_existed = path.exists();
         let mut file = OpenOptions::new()
             .create(true)
@@ -273,6 +309,7 @@ impl FileWal {
         Ok(Self {
             path,
             file,
+            writer_lock,
             records,
             record_end_offsets,
             base_sequence,
@@ -465,7 +502,16 @@ impl FileWal {
             super::interruption::StorageInterruptionPoint::WalReclaimAfterDirectorySync,
         )?;
 
-        *self = Self::open(&self.path)?;
+        // Keep the original sidecar lock live throughout the reopen. Trying
+        // the public open() here would self-conflict; moving the lock only
+        // after the replacement is fully validated avoids a release window.
+        let mut reopened = Self::open_with_lock(self.path.clone(), None)?;
+        reopened.writer_lock = Some(
+            self.writer_lock
+                .take()
+                .expect("reclaiming a WAL requires exclusive writer ownership"),
+        );
+        *self = reopened;
         Ok(())
     }
 
@@ -785,6 +831,9 @@ pub enum WalError {
         message: String,
     },
     InvalidHeader,
+    WriterAlreadyActive {
+        lock_path: PathBuf,
+    },
     WalHeaderChecksumMismatch,
     InvalidFrameHeader {
         offset: u64,
@@ -864,6 +913,11 @@ impl fmt::Display for WalError {
         match self {
             Self::Io { message, .. } => write!(f, "WAL I/O error: {message}"),
             Self::InvalidHeader => f.write_str("invalid NuDB WAL header"),
+            Self::WriterAlreadyActive { lock_path } => write!(
+                f,
+                "NuDB WAL writer already active (lock file: {})",
+                lock_path.display()
+            ),
             Self::WalHeaderChecksumMismatch => f.write_str("NuDB WAL header checksum mismatch"),
             Self::InvalidFrameHeader { offset, reason } => {
                 write!(

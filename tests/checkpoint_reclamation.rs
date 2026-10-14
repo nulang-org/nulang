@@ -60,6 +60,11 @@ fn checkpoint_reclaims_wal_prefix_and_restart_restores_mvcc_history() {
         tablet.checkpoint().unwrap();
 
         assert_eq!(tablet.current_sequence(), 3);
+    }
+
+    // The WAL inspector also opens a writable handle. Release the tablet
+    // writer first; only one handle may own a WAL path at any instant.
+    {
         let wal = FileWal::open(&wal_path).unwrap();
         assert_eq!(wal.base_sequence(), 3);
         assert!(wal.records().is_empty());
