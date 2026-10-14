@@ -6,7 +6,11 @@ use nulang::behavior_manifest::BehaviorManifest;
 use nulang::execution_compatibility::DurableExecutionPin;
 use std::fs;
 
-const USAGE: &str = "usage:\n  nulang-execution-preflight pin <execution-id> <behavior.json> <artifact.nbc>\n  nulang-execution-preflight verify <execution-id> <pin.json> <behavior.json> <artifact.nbc>";
+const USAGE: &str = concat!(
+    "usage:\n",
+    "  nulang-execution-preflight pin <execution-id> <behavior.json> <artifact.nbc>\n",
+    "  nulang-execution-preflight verify <execution-id> <pin.json> <behavior.json> <artifact.nbc>"
+);
 
 fn read_file(path: &str) -> Result<Vec<u8>, String> {
     fs::read(path).map_err(|error| format!("cannot read {path}: {error}"))
