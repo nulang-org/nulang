@@ -18,13 +18,13 @@ test from leaving a live writer holding the database.
 | Crash window | Durable records before kill | Expected after reopen |
 | --- | --- | --- |
 | Before admission | Strict policy + safe snapshot only | No inbox receipt, journal entry or atomic tail; recovered actor remains strict |
-| After admission | Strict policy + inbox receipt + command journal/tail, **no completed state** | Retry returns original receipt (not new work); strict recovery refuses legacy handler replay |
+| After admission | Strict policy + inbox receipt + command journal/tail, **no completed state** | Retry returns original receipt; strict actor recovers quarantined with the committed command fenced and **no handler replay** |
 | After completion | Strict policy + original receipt + journal plus completed state snapshot/tail | Retry remains duplicate; completed state and strict mailbox policy recover without rerunning the command |
 
 The test uses the actual compiled `Counter` metadata in the recovery
-runtime. Incomplete admitted commands deliberately fail recovery: they are
-**not** safely resumed, and user bytecode is never automatically re-executed
-by the strict recovery path. This is a test of *at-most-once replay rejection
+runtime. A uniquely identified incomplete admission may recover as a
+**quarantined actor** with an in-flight completion fence; it is never
+automatically executed. Ambiguous history still refuses recovery. This is a test of *at-most-once replay rejection
 at these chosen boundaries*, not of lossless intake or exactly-once effects.
 
 ## Not yet established
