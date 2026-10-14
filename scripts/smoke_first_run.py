@@ -6,6 +6,7 @@ This test never publishes, deploys, downloads packages, or modifies the repo.
 """
 
 import argparse
+import os
 import pathlib
 import re
 import subprocess
@@ -26,10 +27,15 @@ def check(condition: bool, message: str) -> None:
 
 def execute(binary: pathlib.Path, workdir: pathlib.Path, *args: str) -> str:
     label = " ".join(args)
+    # The package manager looks for CARGO_BIN_EXE_nulang before falling back
+    # to a Cargo rebuild. Point it at the exact binary under smoke test, even
+    # when running from an isolated package outside the repository.
+    env = os.environ.copy()
+    env["CARGO_BIN_EXE_nulang"] = str(binary)
     try:
         proc = subprocess.run(
             [str(binary), *args], cwd=workdir, capture_output=True,
-            text=True, timeout=90, check=False,
+            text=True, timeout=90, check=False, env=env,
         )
     except subprocess.TimeoutExpired as error:
         raise SmokeFailure(f"{label}: timed out after 90 seconds") from error
