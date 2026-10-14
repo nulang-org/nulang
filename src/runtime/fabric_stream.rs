@@ -2723,6 +2723,9 @@ mod tests {
             .fabric_stream_commit_cursor("audit", "consumer-a", 1)
             .unwrap();
 
+        // The previous runtime must release the store's exclusive root lock
+        // before a restarted runtime can recover the same stream.
+        drop(runtime);
         let mut restarted = Runtime::new();
         restarted.fabric_stream_open(&root).unwrap();
         assert_eq!(
