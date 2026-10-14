@@ -2727,7 +2727,7 @@ mod tests {
 
     #[test]
     fn test_strip_main_does_not_remove_other_names() {
-        let source = "fn mainframe() { 1 }\\nfn test_real() { 2 }\\n";
+        let source = "fn mainframe() { 1 }\nfn test_real() { 2 }\n";
         assert_eq!(strip_main_function(source), source);
     }
 
