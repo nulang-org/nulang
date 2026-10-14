@@ -3,8 +3,8 @@
 
 use nulang::artifact_identity::ArtifactIdentityManifest;
 use nulang::behavior_manifest::{
-    BehaviorArtifact, BehaviorManifest, BehaviorPackage, BEHAVIOR_ARTIFACT_KIND_NBC_V1,
-    BEHAVIOR_MANIFEST_SCHEMA,
+    BehaviorActor, BehaviorArtifact, BehaviorManifest, BehaviorPackage, BehaviorPersistence,
+    MigrationIdentityCoverage, BEHAVIOR_ARTIFACT_KIND_NBC_V1, BEHAVIOR_MANIFEST_SCHEMA,
 };
 use nulang::content_identity::SemanticId;
 use nulang::execution_compatibility::{DurableExecutionPin, ExecutionPinError};
@@ -38,7 +38,18 @@ fn manifest(executable: &[u8]) -> BehaviorManifest {
             backend: identity.backend().to_string(),
             flags: Vec::new(),
         },
-        actors: Vec::new(),
+        actors: vec![BehaviorActor {
+            name: "payments::PaymentProcess".to_string(),
+            persistence: BehaviorPersistence::Durable,
+            schema_version: 1,
+            state_schema_semantic_id: SemanticId::from_canonical_bytes(
+                b"payment-process-state-v1",
+                [],
+            )
+            .to_string(),
+            migration_identity: MigrationIdentityCoverage::TopologyOnly,
+            migrations: Vec::new(),
+        }],
     }
 }
 
