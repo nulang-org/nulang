@@ -463,3 +463,38 @@ fn mismatched_completion_schema_cannot_release_admitted_message_fence() {
         Some(receipt.sequence)
     );
 }
+
+#[test]
+fn unsupported_message_values_cannot_be_normalized_to_nil_in_durable_history() {
+    use nulang::runtime::{Message, MessagePayload, MessagePriority};
+
+    let (mut runtime, actor_id, behavior, _) = spawned();
+    let previous = runtime.persistence.latest_sequence(actor_id);
+    // Model a dynamically delivered object-store reference without a stable
+    // canonical codec. Legacy conversion would silently journal this as Nil.
+    runtime
+        .actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .mailbox
+        .push_local(Message {
+            behavior_id: behavior,
+            payload: MessagePayload::from_slice(&[Value::object(999)]),
+            sender: 0,
+            priority: MessagePriority::Normal,
+            trace_id: None,
+        })
+        .unwrap();
+
+    let mut forged = command(&runtime, actor_id, behavior, previous, 0);
+    forged.command.as_mut().unwrap().payload = vec![PersistedValue::Nil];
+    assert_eq!(
+        runtime
+            .admit_next_typed_actor_command(actor_id, forged)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    assert_eq!(runtime.persistence.latest_sequence(actor_id), previous);
+    assert_eq!(runtime.actors[&actor_id].mailbox.len(), 1);
+}
