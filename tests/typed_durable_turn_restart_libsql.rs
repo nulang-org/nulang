@@ -99,7 +99,9 @@ fn first_turn(module: &nulang::bytecode::CodeModule) -> DurableTransition {
         }),
         workflow_events: vec![],
         domain_events: vec![],
-        durable_effects: vec![DurableEffectPersistenceRecord::from_effect(prepared_effect())],
+        durable_effects: vec![DurableEffectPersistenceRecord::from_effect(
+            prepared_effect(),
+        )],
         outbox: vec![DurableOutboxMessage {
             destination_actor_id: ACTOR_ID + 1,
             ordinal: 0,
@@ -134,7 +136,9 @@ fn compiled_actor_state_command_effect_and_outbox_share_atomic_disk_commit() {
     {
         let mut store = LibsqlStore::new(&db_path).expect("create store");
         let candidate = first_turn(&module);
-        let first = store.commit_transition(candidate.clone()).expect("commit turn");
+        let first = store
+            .commit_transition(candidate.clone())
+            .expect("commit turn");
         let retry = store.commit_transition(candidate).expect("retry commit");
         assert_eq!(first, retry);
         assert_eq!(store.latest_sequence(ACTOR_ID), 1);
@@ -150,7 +154,10 @@ fn compiled_actor_state_command_effect_and_outbox_share_atomic_disk_commit() {
         assert_eq!(recovered.recover_actor(ACTOR_ID), Some(ACTOR_ID));
         let actor = &recovered.actors[&ACTOR_ID];
         assert_eq!(actor.name, "Counter");
-        assert_eq!(actor.get_state_field("count").and_then(|v| v.as_int()), Some(5));
+        assert_eq!(
+            actor.get_state_field("count").and_then(|v| v.as_int()),
+            Some(5)
+        );
         assert_eq!(recovered.persistence.read_journal(ACTOR_ID).len(), 1);
 
         let restored = recovered
@@ -166,7 +173,10 @@ fn compiled_actor_state_command_effect_and_outbox_share_atomic_disk_commit() {
             DurableEffectRecoveryAction::RetryWithDeduplication { operation_id: id }
         );
         assert!(
-            restored.effect().recovery_action_for_request(b"count=6").is_err(),
+            restored
+                .effect()
+                .recovery_action_for_request(b"count=6")
+                .is_err(),
             "recovered request digest must be immutable"
         );
 
@@ -228,7 +238,9 @@ fn incompatible_compiler_schema_cannot_adopt_persisted_actor() {
     fs::create_dir_all(&directory).expect("create store directory");
     {
         let mut store = LibsqlStore::new(&db_path).expect("create store");
-        store.commit_transition(first_turn(&counter_module())).unwrap();
+        store
+            .commit_transition(first_turn(&counter_module()))
+            .unwrap();
     }
 
     let incompatible = compile(
