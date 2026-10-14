@@ -425,3 +425,53 @@ fn malformed_libsql_command_sequence_or_behavior_id_is_rejected() {
         ErrorKind::InvalidData,
     );
 }
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn corrupt_command_journal_blocks_runtime_pinned_recovery_before_epoch_claim() {
+    use nulang::runtime::{
+        ImmutablePinnedArtifactResolver, JournalEntry, LibsqlStore,
+        PinnedArtifactBundle, Runtime,
+    };
+    use std::io;
+
+    struct Resolver(PinnedArtifactBundle);
+    impl ImmutablePinnedArtifactResolver for Resolver {
+        fn resolve(&self, digest: &str) -> io::Result<Option<PinnedArtifactBundle>> {
+            Ok((digest == self.0.manifest.artifact.digest).then(|| self.0.clone()))
+        }
+    }
+
+    let mut store = LibsqlStore::in_memory().unwrap();
+    start(&mut store, 65);
+    store.append_journal(65, JournalEntry {
+        sequence: 1,
+        behavior_id: 0,
+        payload: vec![],
+    }).unwrap();
+    store.query(
+        "UPDATE journal SET payload = 'broken-json' WHERE actor_id = 65",
+        &[],
+    ).unwrap();
+
+    let initial = store.load_durable_tail_position(65).unwrap().unwrap();
+    let mut runtime = Runtime::new();
+    runtime.persistence = Box::new(store);
+    let bytes = b"fenced-workflow-v1";
+    assert_eq!(
+        runtime.recover_pinned_workflow_actor(
+            65,
+            "payments/one",
+            &Resolver(PinnedArtifactBundle {
+                manifest: behavior(bytes),
+                executable: bytes.to_vec(),
+            }),
+        ).unwrap_err().kind(),
+        ErrorKind::InvalidData,
+    );
+    assert!(!runtime.actors.contains_key(&65));
+    assert_eq!(
+        runtime.persistence.load_durable_tail_position(65).unwrap().unwrap(),
+        initial,
+    );
+}
