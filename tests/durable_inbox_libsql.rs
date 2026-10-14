@@ -218,22 +218,19 @@ fn two_connections_competing_for_same_sequence_never_both_commit() {
         });
         (left.join().unwrap(), right.join().unwrap())
     });
-    assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+    assert_eq!((left.is_ok() as usize) + (right.is_ok() as usize), 1);
 
     let store = file.store();
     assert_eq!(store.read_journal(51).len(), 1);
     assert_eq!(
-        usize::from(
-            store
-                .load_durable_inbox_receipt(identity(51, "first", 7).id())
-                .unwrap()
-                .is_some()
-        ) + usize::from(
-            store
+        (store
+            .load_durable_inbox_receipt(identity(51, "first", 7).id())
+            .unwrap()
+            .is_some() as usize)
+            + (store
                 .load_durable_inbox_receipt(identity(51, "second", 8).id())
                 .unwrap()
-                .is_some()
-        ),
+                .is_some() as usize),
         1
     );
 }
