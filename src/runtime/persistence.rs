@@ -691,6 +691,24 @@ pub trait PersistenceStore: Send + Sync {
         ))
     }
 
+    /// Read a snapshot without treating storage errors or corrupt metadata
+    /// as absence. Pinned recovery must use this checked API.
+    fn load_snapshot_checked(&self, _actor_id: u64) -> io::Result<Option<ActorSnapshot>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "strict snapshot recovery reads are unavailable on this persistence backend",
+        ))
+    }
+
+    /// Read all command journal rows, reporting corrupted/missing columns or
+    /// malformed payloads instead of silently skipping accepted commands.
+    fn read_journal_checked(&self, _actor_id: u64) -> io::Result<Vec<JournalEntry>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "strict command journal reads are unavailable on this persistence backend",
+        ))
+    }
+
     /// Load the newest durable record for one logical external effect.
     ///
     /// Backends that cannot recover durable-effect records MUST fail closed
@@ -889,6 +907,14 @@ impl MemoryStore {
 }
 
 impl PersistenceStore for MemoryStore {
+    fn load_snapshot_checked(&self, actor_id: u64) -> io::Result<Option<ActorSnapshot>> {
+        Ok(self.load_snapshot(actor_id))
+    }
+
+    fn read_journal_checked(&self, actor_id: u64) -> io::Result<Vec<JournalEntry>> {
+        Ok(self.read_journal(actor_id))
+    }
+
     fn read_workflow_events_checked(&self, actor_id: u64) -> io::Result<Vec<WorkflowEvent>> {
         Ok(self.read_workflow_events(actor_id))
     }
@@ -1712,6 +1738,115 @@ impl LibsqlStore {
 
 #[cfg(feature = "sqlite")]
 impl PersistenceStore for LibsqlStore {
+    fn load_snapshot_checked(&self, actor_id: u64) -> io::Result<Option<ActorSnapshot>> {
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let mut rows = conn.query(
+                "SELECT sequence, activation_epoch, state, waiting_signal,
+                        crdt_snapshot, crdt_field_map, schema_name, authority_tokens
+                 FROM snapshots WHERE actor_id = ?1",
+                libsql::params![actor_id as i64],
+            ).await.map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+            let Some(row) = rows.next().await
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?
+            else {
+                return Ok(None);
+            };
+            let invalid = |error: String| io::Error::new(io::ErrorKind::InvalidData, error);
+            let sequence: i64 = row.get(0).map_err(|error| invalid(error.to_string()))?;
+            let activation_epoch: i64 = row.get(1).map_err(|error| invalid(error.to_string()))?;
+            if sequence <= 0 || activation_epoch <= 0 {
+                return Err(invalid("invalid durable snapshot sequence or epoch".into()));
+            }
+            let state_json: String = row.get(2).map_err(|error| invalid(error.to_string()))?;
+            let waiting_signal: Option<String> = row.get(3)
+                .map_err(|error| invalid(error.to_string()))?;
+            let crdt_json: Option<String> = row.get(4)
+                .map_err(|error| invalid(error.to_string()))?;
+            let crdt_map_json: Option<String> = row.get(5)
+                .map_err(|error| invalid(error.to_string()))?;
+            let schema_name: Option<String> = row.get(6)
+                .map_err(|error| invalid(error.to_string()))?;
+            let authority_json: Option<String> = row.get(7)
+                .map_err(|error| invalid(error.to_string()))?;
+
+            let parse = |json: &str| -> io::Result<serde_json::Value> {
+                serde_json::from_str(json)
+                    .map_err(|error| invalid(format!("corrupt snapshot for actor {actor_id}: {error}")))
+            };
+            let state: HashMap<String, PersistedValue> =
+                serde_json::from_value(parse(&state_json)?)
+                    .map_err(|error| invalid(error.to_string()))?;
+            let crdt_snapshot: Option<Vec<(u64, u8, Vec<u8>)>> = match crdt_json {
+                Some(json) => serde_json::from_value(parse(&json)?)
+                    .map_err(|error| invalid(error.to_string()))?,
+                None => None,
+            };
+            let crdt_field_map: Option<HashMap<String, u64>> = match crdt_map_json {
+                Some(json) => serde_json::from_value(parse(&json)?)
+                    .map_err(|error| invalid(error.to_string()))?,
+                None => None,
+            };
+            let authority_tokens: BTreeSet<String> = match authority_json {
+                Some(json) => serde_json::from_value(parse(&json)?)
+                    .map_err(|error| invalid(error.to_string()))?,
+                None => BTreeSet::new(),
+            };
+            Ok(Some(ActorSnapshot {
+                actor_id,
+                sequence: sequence as u64,
+                activation_epoch: activation_epoch as u64,
+                state,
+                waiting_signal,
+                crdt_snapshot,
+                crdt_field_map,
+                schema_name,
+                authority_tokens,
+            }))
+        })
+    }
+
+    fn read_journal_checked(&self, actor_id: u64) -> io::Result<Vec<JournalEntry>> {
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let mut rows = conn.query(
+                "SELECT sequence, behavior_id, payload
+                 FROM journal WHERE actor_id = ?1 ORDER BY sequence ASC",
+                libsql::params![actor_id as i64],
+            ).await.map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+            let mut journal = Vec::new();
+            loop {
+                let Some(row) = rows.next().await
+                    .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?
+                else {
+                    break;
+                };
+                let invalid = |error: String| io::Error::new(io::ErrorKind::InvalidData, error);
+                let sequence: i64 = row.get(0)
+                    .map_err(|error| invalid(error.to_string()))?;
+                let behavior_id: i64 = row.get(1)
+                    .map_err(|error| invalid(error.to_string()))?;
+                if sequence <= 0 || !(0..=u16::MAX as i64).contains(&behavior_id) {
+                    return Err(invalid(format!(
+                        "invalid persisted command journal sequence or behavior id for actor {actor_id}",
+                    )));
+                }
+                let payload_json: String = row.get(2)
+                    .map_err(|error| invalid(error.to_string()))?;
+                let payload: Vec<PersistedValue> = serde_json::from_str(&payload_json)
+                    .map_err(|error| invalid(format!(
+                        "corrupt persisted command journal for actor {actor_id}: {error}",
+                    )))?;
+                journal.push(JournalEntry {
+                    sequence: sequence as u64,
+                    behavior_id: behavior_id as u16,
+                    payload,
+                });
+            }
+            Ok(journal)
+        })
+    }
+
     fn read_workflow_events_checked(&self, actor_id: u64) -> io::Result<Vec<WorkflowEvent>> {
         let conn = self.conn();
         self.rt.block_on(async {
