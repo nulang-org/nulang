@@ -1738,14 +1738,24 @@ fn cmd_test(filter: Option<&str>, verbose: bool, json: bool) -> NuResult<()> {
     }
 
     let mut tests: Vec<TestCase> = Vec::new();
-    let temp_dir = std::env::temp_dir().join("nula_test");
-    let _ = std::fs::create_dir_all(&temp_dir);
+    static TEST_RUN_SEQUENCE: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    let run_id = TEST_RUN_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp_dir = std::env::temp_dir().join(format!(
+        "nula_test_{}_{}",
+        std::process::id(),
+        run_id
+    ));
+    std::fs::create_dir_all(&temp_dir).map_err(|error| NuError::PackageError {
+        msg: format!("could not create test-wrapper directory: {error}"),
+        span: Span::default(),
+    })?;
 
-    for file in &test_files {
-        let content = match std::fs::read_to_string(file) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
+    for (file_index, file) in test_files.iter().enumerate() {
+        let content = std::fs::read_to_string(file).map_err(|error| NuError::PackageError {
+            msg: format!("could not read test file {}: {error}", file.display()),
+            span: Span::default(),
+        })?;
         let test_fns = discover_test_functions(&content);
         let relative = file
             .strip_prefix(&tests_dir.parent().unwrap_or(&tests_dir))
@@ -1765,17 +1775,21 @@ fn cmd_test(filter: Option<&str>, verbose: bool, json: bool) -> NuResult<()> {
             }
             // Strip fn main() for per-function wrappers
             let stripped = strip_main_function(&content);
-            for fn_name in &test_fns {
+            for (test_index, fn_name) in test_fns.iter().enumerate() {
                 let wrapper = format!(
                     "{}{}\nfn main() {{ {}() }}\n",
                     stripped,
                     if stripped.ends_with('\n') { "" } else { "\n" },
                     fn_name
                 );
-                let temp_path = temp_dir.join(format!("test_{}.nula", fn_name));
-                if std::fs::write(&temp_path, &wrapper).is_err() {
-                    continue;
-                }
+                let temp_path = per_function_wrapper_path(&temp_dir, file_index, test_index);
+                std::fs::write(&temp_path, &wrapper).map_err(|error| NuError::PackageError {
+                    msg: format!(
+                        "could not write test-wrapper file {}: {error}",
+                        temp_path.display()
+                    ),
+                    span: Span::default(),
+                })?;
                 tests.push(TestCase {
                     display: fn_name.clone(),
                     file_to_run: temp_path,
@@ -1902,6 +1916,14 @@ fn cmd_test_watch(filter: Option<&str>, verbose: bool) -> NuResult<()> {
             let _ = cmd_test(filter, verbose, false);
         }
     }
+}
+
+/// Construct a collision-free path for a generated test wrapper.
+///
+/// Source files may use identical function names; the runner must never
+/// overwrite one file's wrapper while preparing another file's tests.
+fn per_function_wrapper_path(temp_dir: &Path, file_index: usize, test_index: usize) -> PathBuf {
+    temp_dir.join(format!("test_{file_index}_{test_index}.nula"))
 }
 
 /// Discover top-level, zero-argument test functions from parsed declarations.
