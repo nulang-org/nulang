@@ -645,7 +645,7 @@ impl FileFabricStreamStore {
         self.ensure_state(name)?;
         let dir = self.stream_dir(name);
         let floor = read_retention_floor(&dir.join("retention.json"))?;
-        if start_sequence < floor {
+        if floor > 1 && start_sequence < floor {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("Fabric sequence {start_sequence} is below retained floor {floor}"),
