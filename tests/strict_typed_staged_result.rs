@@ -430,3 +430,97 @@ fn previously_persisted_external_effect_id_cannot_be_staged_again() {
         Some(admitted)
     );
 }
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn file_backed_outbox_insert_failure_rolls_back_staged_state_effect_and_fence() {
+    use nulang::authority::{AuthorityGrant, AuthorityManifest};
+    use nulang::runtime::LibsqlStore;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct FileGuard(PathBuf);
+    impl Drop for FileGuard {
+        fn drop(&mut self) {
+            for extension in ["", "-wal", "-shm"] {
+                let path = format!("{}{}", self.0.display(), extension);
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let file = FileGuard(std::env::temp_dir().join(format!(
+        "nulang-staged-result-rollback-{}-{unique}.db",
+        std::process::id()
+    )));
+    let (mut runtime, actor_id, behavior) = spawned_counter();
+    let grant = "Audit::Write".parse::<AuthorityGrant>().unwrap();
+    runtime.actors.get_mut(&actor_id).unwrap()
+        .install_authority_manifest(&AuthorityManifest::from_grants([grant]));
+
+    runtime.persistence = Box::new(LibsqlStore::new(&file.0).unwrap());
+    runtime.checkpoint_actor(actor_id);
+    let admitted = admit(&mut runtime, actor_id, behavior, 5);
+    let effect = prepared_effect(actor_id);
+    let effect_id = effect.effect().spec().id;
+
+    // Inject an actual database write failure after earlier writes in the
+    // same result transaction, rather than rejecting the result in validation.
+    let path = file.0.to_string_lossy().into_owned();
+    let trigger_runtime = tokio::runtime::Runtime::new().unwrap();
+    trigger_runtime.block_on(async {
+        let db = libsql::Builder::new_local(path).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "CREATE TRIGGER reject_staged_result_outbox
+             BEFORE INSERT ON durable_outbox
+             BEGIN SELECT RAISE(ABORT, 'injected staged result outbox failure'); END",
+            (),
+        )
+        .await
+        .unwrap();
+    });
+    drop(trigger_runtime);
+
+    runtime
+        .commit_admitted_typed_actor_result(
+            actor_id,
+            admitted,
+            HashMap::from([("total".to_string(), PersistedValue::Int(5))]),
+            vec![effect],
+            vec![DurableOutboxMessage {
+                destination_actor_id: actor_id + 1,
+                ordinal: 0,
+                behavior_id: 0,
+                payload: vec![PersistedValue::Int(5)],
+            }],
+        )
+        .expect_err("injected persistence failure must abort staged result");
+
+    assert_eq!(runtime.persistence.latest_sequence(actor_id), admitted);
+    assert_eq!(runtime.persistence.load_snapshot(actor_id).unwrap().sequence, admitted - 1);
+    assert_eq!(runtime.persistence.read_journal(actor_id).len(), 1);
+    assert!(runtime.persistence.load_durable_effect(actor_id, effect_id).unwrap().is_none());
+    assert_eq!(
+        runtime.actors[&actor_id].mailbox.admitted_command_sequence(),
+        Some(admitted),
+        "failed result commit must not release the admitted command"
+    );
+    assert_eq!(
+        runtime.actors[&actor_id].get_state_field("total").and_then(|value| value.as_int()),
+        Some(0),
+        "failed result commit must not publish staged live state"
+    );
+
+    drop(runtime);
+    let reopened = LibsqlStore::new(&file.0).unwrap();
+    assert_eq!(reopened.load_durable_tail_position(actor_id).unwrap().unwrap().sequence, admitted);
+    assert_eq!(reopened.load_snapshot(actor_id).unwrap().sequence, admitted - 1);
+    assert!(reopened.load_durable_effect(actor_id, effect_id).unwrap().is_none());
+    let outbox = reopened.query(
+        &format!("SELECT COUNT(*) FROM durable_outbox WHERE actor_id = {actor_id}"),
+        &[],
+    ).unwrap();
+    assert_eq!(outbox, vec!["[0]".to_string()]);
+}
