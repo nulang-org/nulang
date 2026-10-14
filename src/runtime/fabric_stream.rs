@@ -228,9 +228,16 @@ struct StreamState {
 /// Stream metadata and cursor files use atomic temp-file + rename replacement.
 /// On open, a truncated final record is repaired back to the last complete
 /// frame; checksum or sequence corruption fails closed.
+///
+/// A store owns an OS-level exclusive advisory lock for its entire lifetime.
+/// Opening the same directory from another process or runtime fails rather
+/// than allowing competing writers to allocate overlapping log sequences.
+/// This is a local-filesystem ownership guard, not distributed leader fencing.
 #[derive(Debug)]
 pub struct FileFabricStreamStore {
     root: PathBuf,
+    // Keep the file descriptor alive: dropping it releases the OS lock.
+    _root_lock: File,
     states: HashMap<String, StreamState>,
 }
 
@@ -238,8 +245,18 @@ impl FileFabricStreamStore {
     pub fn open(root: impl AsRef<Path>) -> io::Result<Self> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
+        // Do not remove or replace the lockfile: OS locks attach to file
+        // identity, so unlinking it while a store is open breaks exclusion.
+        let root_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(root.join(".fabric-store.lock"))?;
+        root_lock.try_lock()?;
         Ok(Self {
             root,
+            _root_lock: root_lock,
             states: HashMap::new(),
         })
     }
