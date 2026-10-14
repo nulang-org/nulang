@@ -227,3 +227,107 @@ fn externally_registered_module_cannot_override_verified_bytecode_loader() {
     );
     assert!(!runtime.actors.contains_key(&501));
 }
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn verified_pinned_bytecode_subprocess_helper() {
+    use nulang::runtime::LibsqlStore;
+    let Ok(mode) = std::env::var("NULANG_VERIFIED_NBC_CHILD_MODE") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(
+        std::env::var_os("NULANG_VERIFIED_NBC_CHILD_DB").expect("child database path"),
+    );
+    let module = fixture_module("Payment");
+    let bytes = module.to_nbc(None).unwrap();
+
+    match mode.as_str() {
+        "create" => {
+            let mut store = LibsqlStore::new(&path).unwrap();
+            commit_pinned_workflow_start(
+                &mut store,
+                502,
+                "payments/502",
+                "Payment",
+                &manifest(&bytes),
+                &bytes,
+                ActorSnapshot {
+                    actor_id: 502,
+                    sequence: 1,
+                    activation_epoch: 1,
+                    schema_name: Some("Payment".into()),
+                    ..ActorSnapshot::default()
+                },
+                vec![],
+            )
+            .unwrap();
+        }
+        "reject-substitute" | "resume" => {
+            let mut runtime = Runtime::new();
+            runtime.persistence = Box::new(LibsqlStore::new(&path).unwrap());
+            assert_eq!(runtime.recover_actor(502), None);
+
+            let provided = if mode == "reject-substitute" {
+                fixture_module("Other").to_nbc(None).unwrap()
+            } else {
+                bytes.clone()
+            };
+            let selected = Resolver {
+                digest: manifest(&bytes).artifact.digest,
+                bundle: PinnedArtifactBundle {
+                    manifest: manifest(&provided),
+                    executable: provided,
+                },
+            };
+            let outcome = runtime.recover_pinned_workflow_actor(
+                502, "payments/502", &selected,
+            );
+
+            if mode == "reject-substitute" {
+                assert_eq!(outcome.unwrap_err().kind(), ErrorKind::InvalidData);
+                assert!(runtime.actors.is_empty());
+            } else {
+                assert_eq!(outcome.unwrap(), 502);
+                let loaded = runtime.actors[&502].bytecode_module
+                    .as_ref().expect("decoded pinned bytecode");
+                assert_eq!(loaded.name, module.name);
+                assert_eq!(runtime.actors[&502].bytecode_offsets, vec![0]);
+            }
+        }
+        invalid => panic!("unexpected subprocess mode: {invalid}"),
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn verified_bytecode_loader_survives_real_process_restart() {
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "nulang-verified-bytecode-restart-{}-{nonce}", std::process::id(),
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let database = directory.join("recovery.db");
+
+    for mode in ["create", "reject-substitute", "resume"] {
+        let result = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "verified_pinned_bytecode_subprocess_helper"])
+            .env("NULANG_VERIFIED_NBC_CHILD_MODE", mode)
+            .env("NULANG_VERIFIED_NBC_CHILD_DB", &database)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{mode}: stdout={} stderr={}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr),
+        );
+        assert!(
+            String::from_utf8_lossy(&result.stdout).contains("1 passed"),
+            "{mode} helper did not execute",
+        );
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}
