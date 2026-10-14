@@ -2,6 +2,7 @@
 import importlib.util
 from pathlib import Path
 import unittest
+from unittest import mock
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "check_release_ci_proof.py"
 spec = importlib.util.spec_from_file_location("release_ci_proof", MODULE_PATH)
@@ -94,6 +95,37 @@ class ExactHeadReleaseProofTests(unittest.TestCase):
     def test_missing_run_fails_closed(self):
         with self.assertRaises(proof.ProofError):
             proof.choose_latest_main_push_run([], SHA)
+
+    def test_github_verification_queries_exact_main_sha_and_latest_jobs(self):
+        requests = []
+
+        def fake_github_json(path, token):
+            requests.append((path, token))
+            if "/actions/workflows/ci.yml/runs?" in path:
+                return {"total_count": 1, "workflow_runs": [valid_run()]}
+            return {"total_count": len(valid_jobs()), "jobs": valid_jobs()}
+
+        with mock.patch.object(proof, "github_json", side_effect=fake_github_json):
+            self.assertEqual(proof.check_release("nulang-org/nulang", SHA, "fixture-token"), 1234)
+
+        self.assertIn("head_sha=" + SHA, requests[0][0])
+        self.assertIn("branch=main", requests[0][0])
+        self.assertIn("event=push", requests[0][0])
+        self.assertIn("/actions/runs/1234/jobs?", requests[1][0])
+        self.assertIn("filter=latest", requests[1][0])
+        self.assertEqual([token for _, token in requests], ["fixture-token"] * 2)
+
+    def test_invalid_identifiers_or_missing_token_fail_before_api(self):
+        for repo, sha, token in (
+            ("not-a-repo", SHA, "token"),
+            ("nulang-org/nulang", "not-a-sha", "token"),
+            ("nulang-org/nulang", SHA, None),
+        ):
+            with self.subTest(repo=repo, sha=sha, token=token):
+                with mock.patch.object(proof, "github_json") as api:
+                    with self.assertRaises(proof.ProofError):
+                        proof.check_release(repo, sha, token)
+                    api.assert_not_called()
 
 
 if __name__ == "__main__":
