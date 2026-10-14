@@ -793,6 +793,35 @@ mod tests {
 
     #[cfg(feature = "python")]
     #[test]
+    fn test_foreign_interop_owned_unicode_string_roundtrip() {
+        let mut fi = DefaultForeignInterop::new().expect("failed to create Python bridge");
+        fi.import("builtins").expect("failed to import builtins");
+
+        let text = "Olá, Nulang 🐍".to_string();
+        let request = crate::runtime::ForeignCallRequest::new(
+            "builtins",
+            "str",
+            vec![crate::runtime::OwnedForeignValue::String(text.clone())],
+        );
+        let result = fi.call_owned(&request).expect("owned Python string call failed");
+        assert_eq!(result, crate::runtime::OwnedForeignValue::String(text));
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
+    fn test_foreign_interop_direct_unresolved_string_fails_closed() {
+        let mut fi = DefaultForeignInterop::new().expect("failed to create Python bridge");
+        fi.import("builtins").expect("failed to import builtins");
+
+        let err = fi
+            .call("builtins", "str", &[Value::string(17)])
+            .err()
+            .expect("direct call cannot resolve string pool IDs");
+        assert!(err.contains("string pool"), "unexpected diagnostic: {err}");
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
     fn test_foreign_interop_python_roundtrip() {
         // Ensure Python is initialized (auto-initialize feature handles this).
         let _ = pyo3::Python::attach(|_py| ());
