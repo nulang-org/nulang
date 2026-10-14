@@ -7,6 +7,7 @@ This test never publishes, deploys, downloads packages, or modifies the repo.
 
 import argparse
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -62,7 +63,10 @@ def smoke(binary: pathlib.Path) -> None:
         output = execute(binary, package, "nula", "run")
         check("Library package ready." in output, "nula run did not execute the template")
         result = execute(binary, package, "nula", "test")
-        check("passed" in result.lower(), "nula test did not report passing tests")
+        summary = re.search(r"test result:\s*(\d+) passed;\s*(\d+) failed", result)
+        check(summary is not None and int(summary.group(1)) > 0
+              and int(summary.group(2)) == 0,
+              "nula test did not report at least one passing test and zero failures")
 
         # Restrict this formatter smoke to constructs currently implemented by
         # src/fmt.rs. Formatting the more complex scaffold is not yet supported.
