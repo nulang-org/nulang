@@ -1063,6 +1063,34 @@ impl Runtime {
             (candidate.sender != 0).then_some(candidate.sender),
             candidate.payload.as_slice(),
         );
+        // The legacy serializer normalizes unsupported object/closure or
+        // unresolved string references to Nil. Never commit that lossy
+        // conversion as if it represented an actual typed user message.
+        let lossless = candidate
+            .payload
+            .as_slice()
+            .iter()
+            .zip(&canonical_payload)
+            .all(|(actual, stored)| match stored {
+                PersistedValue::Int(value) => actual.as_int() == Some(*value),
+                PersistedValue::Float(value) => actual
+                    .as_float()
+                    .map(f64::to_bits)
+                    == Some(value.to_bits()),
+                PersistedValue::Bool(value) => actual.as_bool() == Some(*value),
+                PersistedValue::String(_) => {
+                    actual.as_string_id().is_some() || actual.as_ptr().is_some()
+                }
+                PersistedValue::Nil => actual.is_nil(),
+                PersistedValue::Unit => actual.is_unit(),
+                PersistedValue::Actor(id) => actual.as_actor_id() == Some(*id),
+            });
+        if !lossless {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "typed command contains a value that cannot be durably encoded without loss",
+            ));
+        }
         if command.sequence != transition.sequence
             || command.behavior_id != candidate.behavior_id
             || command.payload != canonical_payload
