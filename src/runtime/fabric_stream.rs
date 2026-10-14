@@ -471,12 +471,19 @@ impl FileFabricStreamStore {
         limit: usize,
     ) -> io::Result<Vec<FabricStreamRecord>> {
         self.ensure_state(name)?;
-        if limit == 0 {
+        let next_sequence = self
+            .states
+            .get(name)
+            .expect("stream state must exist after ensure_state")
+            .next_sequence;
+        if limit == 0 || start_sequence >= next_sequence {
             return Ok(Vec::new());
         }
 
+        let segments = list_segments(&self.stream_dir(name))?;
+        let first = segment_start_index(&segments, start_sequence);
         let mut result = Vec::with_capacity(limit.min(256));
-        for (base, path) in list_segments(&self.stream_dir(name))? {
+        for (base, path) in segments.into_iter().skip(first) {
             let records = decode_segment(&path, base, false)?;
             for record in records {
                 if record.sequence < start_sequence {
@@ -1621,6 +1628,15 @@ fn list_segments(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
     }
     segments.sort_by_key(|(base, _)| *base);
     Ok(segments)
+}
+
+/// Select the segment containing the requested sequence, or the preceding
+/// segment if the request falls between segment base sequences. Segment bases
+/// are sorted by list_segments(). Avoid decoding unrelated historical segments.
+fn segment_start_index(segments: &[(u64, PathBuf)], start_sequence: u64) -> usize {
+    segments
+        .partition_point(|(base, _)| *base <= start_sequence)
+        .saturating_sub(1)
 }
 
 fn segment_path(dir: &Path, base_sequence: u64) -> PathBuf {
