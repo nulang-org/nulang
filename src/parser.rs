@@ -6952,6 +6952,27 @@ mod tests {
     }
 
     #[test]
+    fn test_spawn_accepts_keyword_named_python_import_authority() {
+        let expr = parse_expr(
+            "spawn Worker {} with [Python::import, Python::call, Python::get_attr]",
+        )
+        .expect("Python::import must be legal in a literal authority grant");
+        match expr {
+            Expr::Spawn { capabilities, .. } => {
+                assert_eq!(
+                    capabilities,
+                    vec![
+                        "Python::call".to_string(),
+                        "Python::get_attr".to_string(),
+                        "Python::import".to_string(),
+                    ]
+                );
+            }
+            other => panic!("expected spawn, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_prelude_cache_build_preserves_active_source_map() {
         let source = "let t = ((1, 2), 3) in t.0.1";
         crate::types::set_source_map_with_file(source, Some("caller.nula"));
