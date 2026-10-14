@@ -6807,11 +6807,25 @@ impl Runtime {
             Some("call") => {
                 let module = string_arg(0)?;
                 let function = string_arg(1)?;
-                let args: Vec<Value> = regs.iter().skip(2).copied().collect();
-                match fi.call(&module, &function, &args) {
+                // VM string values contain module-local pool indices. Resolve
+                // every argument before crossing the Python boundary, rather
+                // than passing invalid indices or placeholder descriptors.
+                let result = crate::runtime::ForeignCallRequest::from_vm_args(
+                    &module,
+                    &function,
+                    &regs[2..],
+                    |id| match constants.get(id as usize) {
+                        Some(crate::bytecode::Constant::String(value)) => Some(value.clone()),
+                        _ => None,
+                    },
+                )
+                .map_err(|error| error.to_string())
+                .and_then(|request| fi.call_owned(&request))
+                .and_then(|owned| crate::python::owned_foreign_to_vm_value(&owned));
+                match result {
                     Ok(result) => Some(result),
-                    Err(e) => {
-                        eprintln!("Python call error: {}", e);
+                    Err(error) => {
+                        eprintln!("Python call error: {}", error);
                         Some(Value::nil())
                     }
                 }
