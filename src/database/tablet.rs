@@ -251,6 +251,7 @@ pub struct TabletWrite {
     expected_previous_sequence: u64,
     mutations: Vec<TabletMutation>,
     identity: Option<TransactionIdentity>,
+    epoch_fence: bool,
 }
 
 impl TabletWrite {
@@ -297,6 +298,7 @@ impl TabletWrite {
             expected_previous_sequence,
             mutations,
             identity: None,
+            epoch_fence: false,
         })
     }
 
@@ -318,6 +320,35 @@ impl TabletWrite {
 
     pub fn mutations(&self) -> &[TabletMutation] {
         &self.mutations
+    }
+
+    /// A barrier consumes one WAL sequence number without changing user rows.
+    /// Only the owner of the WAL may append this record and advance its epoch.
+    pub(crate) fn prepare_epoch_fence(
+        descriptor: &TabletDescriptor,
+        new_epoch: u64,
+        committed_sequence: u64,
+    ) -> Result<Self, TabletError> {
+        if new_epoch <= descriptor.ownership_epoch {
+            return Err(TabletError::EpochNotAdvanced {
+                current: descriptor.ownership_epoch,
+                proposed: new_epoch,
+            });
+        }
+        let sequence = committed_sequence.checked_add(1).ok_or(TabletError::SequenceOverflow)?;
+        Ok(Self {
+            tablet_id: descriptor.id,
+            ownership_epoch: new_epoch,
+            sequence,
+            expected_previous_sequence: committed_sequence,
+            mutations: Vec::new(),
+            identity: None,
+            epoch_fence: true,
+        })
+    }
+
+    pub(crate) fn epoch_fence(&self) -> bool {
+        self.epoch_fence
     }
 
     pub(crate) fn with_identity(mut self, identity: TransactionIdentity) -> Self {
@@ -532,6 +563,13 @@ impl MemoryTablet {
     /// This operation is intentionally infallible so a WAL-backed coordinator
     /// can perform all fallible validation before fsync, then publish the
     /// already-durable write without creating an ambiguous commit result.
+    /// Called only after the epoch barrier has been validated and WAL-synced.
+    /// The existing MVCC versions and transaction receipts are unchanged.
+    pub(crate) fn publish_epoch_fence(&mut self, new_epoch: u64, sequence: u64) {
+        self.descriptor.ownership_epoch = new_epoch;
+        self.current_sequence = sequence;
+    }
+
     pub(crate) fn publish_validated(&mut self, write: TabletWrite) -> u64 {
         let sequence = write.sequence;
         self.apply_mutations(sequence, write.mutations);
