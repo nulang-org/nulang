@@ -148,3 +148,130 @@ fn timer_preparation_replay_survives_process_restart_without_duplicate_history_o
     drop(recovered);
     fs::remove_dir_all(store_dir).unwrap();
 }
+
+#[test]
+fn timer_crash_cutpoints_recover_once_across_successive_runtime_restarts() {
+    // These are deterministic *runtime-drop* crash cutpoints; they are not a
+    // subprocess SIGKILL test. Each restart uses a new Runtime and freshly
+    // opened file-backed LibsqlStore (not a shared in-memory fake).
+    for crash_after_timer_preparation in [false, true] {
+        let (store_dir, db_path) = test_store_path();
+        fs::create_dir_all(&store_dir).expect("create isolated libsql test directory");
+
+        // Process A: admit a durable command. Either drop immediately before
+        // timer preparation or commit the TimerSet and drop immediately after.
+        let (actor_id, activation) = {
+            let mut runtime = Runtime::new();
+            runtime.persistence = Box::new(LibsqlStore::new(&db_path).unwrap());
+
+            let actor_id = runtime
+                .try_spawn_workflow_actor("CutpointTimer", Box::new(Vec::new), HashMap::new())
+                .unwrap();
+            let expected_previous_sequence = runtime.persistence.latest_sequence(actor_id);
+            let sequence = expected_previous_sequence + 1;
+            let activation_epoch = runtime.actors[&actor_id].activation_epoch;
+            runtime
+                .persistence
+                .commit_transition(DurableTransition {
+                    version: DURABLE_TRANSITION_VERSION,
+                    actor_id,
+                    activation_epoch,
+                    sequence,
+                    expected_previous_sequence,
+                    command: Some(JournalEntry {
+                        sequence,
+                        behavior_id: 0,
+                        payload: vec![],
+                    }),
+                    snapshot: None,
+                    workflow_events: vec![],
+                    domain_events: vec![],
+                    durable_effects: vec![],
+                    outbox: vec![],
+                })
+                .unwrap();
+            let activation = WorkflowActivationId::new(actor_id, sequence);
+            {
+                let actor = runtime.actors.get_mut(&actor_id).unwrap();
+                actor.sequence = sequence;
+                actor.current_workflow_activation = Some(activation);
+            }
+            if crash_after_timer_preparation {
+                runtime.schedule_workflow_timer(actor_id, "wake", 60_000).unwrap();
+                assert_eq!(runtime.timer_wheel.len(), 1);
+            } else {
+                assert_eq!(runtime.timer_wheel.len(), 0);
+            }
+
+            (actor_id, activation)
+        }; // Crash point A: discard ALL process-local state, including timers.
+
+        // Process B: recover the accepted command and prepare/replay the timer.
+        {
+            let mut recovered = Runtime::new();
+            recovered.persistence = Box::new(LibsqlStore::new(&db_path).unwrap());
+            assert_eq!(
+                recovered.recover_actor(actor_id),
+                Some(actor_id),
+                "cutpoint after_timer={crash_after_timer_preparation}: recover command"
+            );
+            assert_eq!(
+                recovered.actors[&actor_id].current_workflow_activation,
+                Some(activation),
+                "unfinished accepted command must retain its durable activation"
+            );
+            assert_eq!(
+                recovered.timer_wheel.len(),
+                usize::from(crash_after_timer_preparation),
+                "recovery must only rearm a timer whose preparation was committed"
+            );
+
+            recovered.schedule_workflow_timer(actor_id, "wake", 60_000).unwrap();
+            assert_eq!(recovered.timer_wheel.len(), 1);
+            assert_eq!(
+                recovered
+                    .persistence
+                    .read_workflow_events(actor_id)
+                    .into_iter()
+                    .filter(|event| matches!(event, WorkflowEvent::TimerSet { .. }))
+                    .count(),
+                1,
+                "timer preparation and replay must persist exactly one TimerSet"
+            );
+        } // Crash point B: drop after the first replay/preparation.
+
+        // Process C: replay the same activation once more. It must neither
+        // re-arm a duplicate live timer nor append a duplicate durable event.
+        let mut recovered_again = Runtime::new();
+        recovered_again.persistence = Box::new(LibsqlStore::new(&db_path).unwrap());
+        assert_eq!(recovered_again.recover_actor(actor_id), Some(actor_id));
+        assert_eq!(
+            recovered_again.actors[&actor_id].current_workflow_activation,
+            Some(activation)
+        );
+        assert_eq!(recovered_again.timer_wheel.len(), 1);
+        recovered_again
+            .schedule_workflow_timer(actor_id, "wake", 60_000)
+            .unwrap();
+        assert_eq!(recovered_again.timer_wheel.len(), 1);
+        let timer_sets: Vec<_> = recovered_again
+            .persistence
+            .read_workflow_events(actor_id)
+            .into_iter()
+            .filter(|event| matches!(event, WorkflowEvent::TimerSet { .. }))
+            .collect();
+        assert_eq!(timer_sets.len(), 1);
+        assert!(matches!(
+            &timer_sets[0],
+            WorkflowEvent::TimerSet {
+                replay_id: Some(id),
+                name,
+                duration_ms: 60_000,
+                ..
+            } if *id == WorkflowReplayEventId::new(activation, 0) && name == "wake"
+        ));
+
+        drop(recovered_again);
+        fs::remove_dir_all(store_dir).expect("remove isolated test directory");
+    }
+}
