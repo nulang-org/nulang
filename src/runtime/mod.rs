@@ -976,6 +976,12 @@ impl Runtime {
                 "atomic command admission requires a persistent non-workflow, non-agent actor",
             ));
         }
+        if actor.mailbox.admitted_command_sequence().is_some() {
+            return Err(Error::new(
+                ErrorKind::WouldBlock,
+                "previous admitted actor command must durably complete before another is admitted",
+            ));
+        }
         let module = actor.bytecode_module.as_ref().ok_or_else(|| {
             Error::new(ErrorKind::InvalidInput, "actor has no compiler-owned metadata")
         })?;
@@ -1077,12 +1083,69 @@ impl Runtime {
             .mailbox;
         let committed = mailbox.admit_durable_with(|_| persistence.commit_transition(transition))?;
         if let Some((message, commit)) = committed {
+            // Fence ordinary mailbox dispatch before returning the message
+            // to the trusted host. The host must durably finalize this turn.
+            self.actors
+                .get_mut(&actor_id)
+                .expect("actor remains present during admission")
+                .mailbox
+                .fence_admitted_command(commit.sequence);
             // Mirror the existing step_actor receiver ownership handoff.
             self.hold_payload_refs(actor_id, &message.payload);
             Ok(Some((message, commit)))
         } else {
             Ok(None)
         }
+    }
+
+    /// Release a successfully admitted command only after its completion state
+    /// has itself been atomically persisted. A journal entry alone is never
+    /// sufficient. This is a host-controlled fence, not bytecode execution.
+    pub fn finish_admitted_typed_actor_command(
+        &mut self,
+        actor_id: u64,
+        admitted_sequence: u64,
+    ) -> std::io::Result<()> {
+        use std::io::{Error, ErrorKind};
+
+        let actor = self
+            .actors
+            .get(&actor_id)
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "actor does not exist"))?;
+        if actor.mailbox.admitted_command_sequence() != Some(admitted_sequence) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "actor has no matching admitted command pending completion",
+            ));
+        }
+        let epoch = actor.activation_epoch;
+        let expected_schema = actor.name.clone();
+        let tail = self.persistence.load_durable_tail_position(actor_id)?
+            .ok_or_else(|| Error::new(ErrorKind::WouldBlock, "durable completion is missing"))?;
+        let snapshot = self.persistence.load_snapshot(actor_id)
+            .ok_or_else(|| Error::new(ErrorKind::WouldBlock, "durable completion snapshot is missing"))?;
+        if tail.activation_epoch != epoch
+            || tail.sequence <= admitted_sequence
+            || snapshot.sequence != tail.sequence
+            || snapshot.activation_epoch != epoch
+            || snapshot.schema_name.as_deref() != Some(expected_schema.as_str())
+        {
+            return Err(Error::new(
+                ErrorKind::WouldBlock,
+                "admitted command has no matching epoch-fenced completion snapshot",
+            ));
+        }
+
+        let actor = self.actors.get_mut(&actor_id)
+            .expect("actor remains present while completing the admitted command");
+        if !actor.mailbox.finish_admitted_command(admitted_sequence) {
+            return Err(Error::new(ErrorKind::InvalidInput, "completion fence changed"));
+        }
+        actor.sequence = tail.sequence;
+        if !actor.mailbox.is_empty() {
+            self.enqueue_actor(actor_id);
+        }
+        Ok(())
     }
 
     /// Register all `virtual entity` types declared in `module` with the
@@ -3257,7 +3320,8 @@ impl Runtime {
             .get(&actor_id)
             .map(|actor| {
                 !actor.mailbox.is_empty()
-                    && (!actor.mailbox.has_pending_durable_admission()
+                    && (!(actor.mailbox.has_pending_durable_admission()
+                        || actor.mailbox.admitted_command_sequence().is_some())
                         || actor.mailbox.has_ready_system_message())
                     && actor.suspended_execution.is_none()
                     && matches!(
