@@ -305,6 +305,52 @@ An external embedding host must not expose the mutable runtime midway
 through this call. Cross-process starter fencing and coherent verification
 and recovery snapshots still need separate crash/concurrency validation.
 
+## Atomic recovery claim and activation epoch fencing
+
+`Runtime::recover_pinned_workflow_actor` now observes the committed
+`DurableTailPosition` **before** invoking an external immutable-artifact
+resolver. After identity, bytes, manifest and compiled schema validation, it
+calls `claim_pinned_workflow_recovery` against that exact observed
+predecessor. The claim is a single `DurableTransition` that atomically:
+
+- Advances the durable sequence and activation epoch together
+- Preserves the fully committed snapshot state at the new epoch
+- Appends a reserved `__nulang.recovery_claim/v1` workflow event
+- Uses the backend's existing atomic predecessor/epoch validation
+
+A duplicate claim against the same tail must not acknowledge two winners:
+both MemoryStore and libSQL treat a claim marker as **create-only** even
+when competing payloads are byte-for-byte equal. Successful hydration then
+checks that the committed epoch/sequence still match the claim; failure
+discards the recovered actor, module registration, and CRDT-field mapping.
+
+The first increment **deliberately fails closed for unfinished durable
+commands**: snapshot sequence/epoch must exactly match the observed atomic
+tail. A tail beyond the last safe snapshot needs a separate durable
+activation-replay handoff that preserves the pending command, not a blind
+new-epoch checkpoint. Post-tail workflow events also block this claim.
+
+```bash
+cargo test --locked --test pinned_recovery_fence
+cargo test --locked --features sqlite --test pinned_recovery_fence
+```
+
+The tests exercise competing local libSQL workers, immutable-artifact
+resolver races, same-tail replay rejection, stale-epoch durable write
+rejection, sequential epoch advancement, and refusal of incomplete
+checkpoints.
+
+**Safety boundary:** this is a fencing **claim**, not a renewable distributed
+lease. A claimant obtaining a later epoch will fence the old actor's
+subsequent atomic persistence writes, but unguarded external effects, queued
+timers, and non-transactional legacy writes are not automatically fenced.
+A post-hydration epoch check narrows—but does not eliminate—the interval
+before an old actor becomes stale. Read-only verification and the claim are
+not yet an authenticated multi-table history snapshot; corruption-resistant
+event commitments and checked journal/snapshot reads remain required.
+Production multi-host deployment needs owner identity, lease/liveness,
+effect/outbox fencing, and fault-injected failover tests.
+
 ## Next increment / non-goals of v1
 
 1. Atomically persist a pin at execution creation with the existing
