@@ -18,7 +18,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use super::ownership::{
-    CommittedOwnershipEntry, OwnershipCommand, OwnershipError, OwnershipGrant, OwnershipStateMachine,
+    CommittedOwnershipEntry, OwnershipCommand, OwnershipError, OwnershipGrant,
+    OwnershipStateMachine,
 };
 
 const JOURNAL_MAGIC: &[u8; 8] = b"NUOWLOG1";
@@ -102,7 +103,9 @@ impl FileReplica {
                 serde_json::from_slice(&payload).map_err(|_| QuorumLogError::InvalidJournal)?;
             if entry.index != entries.len() as u64 + 1
                 || entry.term == 0
-                || entries.last().is_some_and(|last: &CommittedOwnershipEntry| entry.term < last.term)
+                || entries
+                    .last()
+                    .is_some_and(|last: &CommittedOwnershipEntry| entry.term < last.term)
             {
                 return Err(QuorumLogError::InvalidJournal);
             }
@@ -129,7 +132,8 @@ impl FileReplica {
                 presented: entry.index,
             });
         }
-        let payload = serde_json::to_vec(&entry).map_err(|e| QuorumLogError::Storage(e.to_string()))?;
+        let payload =
+            serde_json::to_vec(&entry).map_err(|e| QuorumLogError::Storage(e.to_string()))?;
         if payload.is_empty() || payload.len() > MAX_ENTRY_BYTES {
             return Err(QuorumLogError::InvalidJournal);
         }
@@ -372,9 +376,15 @@ mod tests {
         drop(log);
 
         // The one fsynced minority suffix is not recovered as committed.
-        let restored = FixedTermQuorumLog::open(&paths, 3).unwrap();
+        let mut restored = FixedTermQuorumLog::open(&paths, 3).unwrap();
         assert_eq!(restored.authority().applied_index(), 0);
         assert!(restored.authority().grant(TabletId::new(18).unwrap()).is_none());
+
+        // Retrying the same entry after reconciliation gains a majority
+        // without exposing the earlier minority-only write as committed.
+        let receipt = restored.propose(command).unwrap();
+        assert_eq!(receipt.committed_index, 1);
+        assert_eq!(restored.authority().applied_index(), 1);
         drop(restored);
         for path in paths {
             let _ = fs::remove_file(&path);
