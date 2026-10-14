@@ -121,10 +121,11 @@ fn failed_commit_keeps_original_message_and_retry_preserves_fifo() {
         .expect("original message");
     assert_eq!(message.payload[0].as_int(), Some(5));
     assert_eq!(runtime.actors[&actor_id].mailbox.len(), 1);
-    assert_eq!(
-        runtime.actors[&actor_id].mailbox.pop().unwrap().payload[0].as_int(),
-        Some(6)
+    assert!(
+        runtime.actors[&actor_id].mailbox.pop().is_none(),
+        "a second user command must stay queued until admitted work is completed"
     );
+    assert_eq!(runtime.actors[&actor_id].mailbox.len(), 1);
 }
 
 #[test]
