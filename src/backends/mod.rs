@@ -915,6 +915,31 @@ mod tests {
 
     #[cfg(feature = "python")]
     #[test]
+    fn test_python_attribute_string_survives_temporary_registry_cleanup() {
+        let mut fi = DefaultForeignInterop::new().expect("Python backend init failed");
+        fi.import("builtins").expect("builtins import failed");
+        let value = fi.get_attr("builtins", "__name__").expect("attribute lookup failed");
+        let id = value.as_raw() & crate::value_layout::PAYLOAD_MASK;
+        assert_eq!(
+            value.as_raw() & crate::value_layout::TAG_MASK,
+            crate::python::TAG_PYTHON
+        );
+        let result = fi
+            .call_owned(&crate::runtime::ForeignCallRequest::new(
+                "builtins",
+                "len",
+                vec![crate::runtime::OwnedForeignValue::OpaqueHandle {
+                    backend: "python",
+                    id,
+                }],
+            ))
+            .expect("returned attribute must survive cleanup");
+        assert_eq!(result, crate::runtime::OwnedForeignValue::Int(8));
+        crate::python::unregister_object(crate::python::PythonObjectId(id));
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
     fn test_foreign_interop_owned_unicode_string_roundtrip() {
         let mut fi = DefaultForeignInterop::new().expect("failed to create Python bridge");
         fi.import("builtins").expect("failed to import builtins");
