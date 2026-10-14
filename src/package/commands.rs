@@ -1904,24 +1904,34 @@ fn cmd_test_watch(filter: Option<&str>, verbose: bool) -> NuResult<()> {
     }
 }
 
-/// Find all `fn test_*` function names in a source string.
+/// Discover top-level, zero-argument test functions from parsed declarations.
+///
+/// A textual scan falsely matched `fn test_*` inside comments and strings.
+/// Invalid source is left to the normal compilation step to diagnose.
 fn discover_test_functions(source: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut rest = source;
-    while let Some(pos) = rest.find("fn test_") {
-        let start = pos + 3; // skip "fn "
-        let after_fn = &rest[start..];
-        // Find end of identifier: whitespace or '('
-        let end = after_fn
-            .find(|c: char| c.is_whitespace() || c == '(')
-            .unwrap_or(after_fn.len());
-        let name = after_fn[..end].trim().to_string();
-        if !name.is_empty() {
-            names.push(name);
-        }
-        rest = &after_fn[end..];
-    }
-    names
+    let tokens = match crate::lexer::Lexer::new(source).lex() {
+        Ok(tokens) => tokens,
+        Err(_) => return Vec::new(),
+    };
+    let module = match crate::parser::Parser::new(tokens).parse_module() {
+        Ok(module) => module,
+        Err(_) => return Vec::new(),
+    };
+    module
+        .decls
+        .into_iter()
+        .filter_map(|decl| match decl {
+            crate::ast::Decl::Function {
+                name,
+                params,
+                using_params,
+                ..
+            } if name.starts_with("test_") && params.is_empty() && using_params.is_empty() => {
+                Some(name)
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Strip the `fn main() { ... }` block from source, keeping everything else.
