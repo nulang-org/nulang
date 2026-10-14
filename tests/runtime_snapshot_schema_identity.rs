@@ -433,8 +433,8 @@ fn recovery_rejects_journal_payload_with_incompatible_behavior_arity() {
         }
         "#,
     );
-    let behavior_id = u16::try_from(module.actor_metadata[0].behavior_indices[0])
-        .expect("behavior id");
+    let behavior_id =
+        u16::try_from(module.actor_metadata[0].behavior_indices[0]).expect("behavior id");
     let actor_id = 7103;
     let mut rt = Runtime::new();
     register_for_recovery(&mut rt, actor_id, module);
@@ -491,7 +491,9 @@ fn grain_hydration_rejects_foreign_journal_behavior_before_publication() {
     let grain = GrainId::new("Counter", "replay-foreign-behavior");
     let mut rt = Runtime::new();
     rt.register_module_grains(&module);
-    let actor_id = rt.resolve_or_hydrate_grain(grain.clone()).expect("fresh grain");
+    let actor_id = rt
+        .resolve_or_hydrate_grain(grain.clone())
+        .expect("fresh grain");
     rt.actors.remove(&actor_id);
     rt.grain_residents.remove(&grain);
     rt.actor_grain_id.remove(&actor_id);
