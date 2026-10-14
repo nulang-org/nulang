@@ -262,7 +262,7 @@ pub fn claim_pinned_workflow_recovery(
     }
 
     let mut snapshot = store
-        .load_snapshot(actor_id)
+        .load_snapshot_checked(actor_id)?
         .ok_or_else(|| invalid_data("pinned recovery snapshot is missing"))?;
     if snapshot.actor_id != actor_id
         || snapshot.sequence != observed_tail.sequence
@@ -283,7 +283,7 @@ pub fn claim_pinned_workflow_recovery(
         ));
     }
     if store
-        .read_journal(actor_id)
+        .read_journal_checked(actor_id)?
         .iter()
         .any(|entry| entry.sequence > observed_tail.sequence)
     {
@@ -350,7 +350,7 @@ pub fn read_pinned_workflow_pin(
     }
 
     let snapshot = store
-        .load_snapshot(actor_id)
+        .load_snapshot_checked(actor_id)?
         .ok_or_else(|| invalid_data("committed workflow snapshot is missing"))?;
     if snapshot.actor_id != actor_id
         || snapshot.sequence == 0
