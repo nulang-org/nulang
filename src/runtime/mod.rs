@@ -1204,8 +1204,56 @@ impl Runtime {
             .get_mut(&actor_id)
             .expect("actor remains present during exclusive runtime access")
             .mailbox;
+        let expected_schema = self
+            .actors
+            .get(&actor_id)
+            .expect("actor validated before admission")
+            .name
+            .clone();
         let committed = mailbox.admit_durable_with(|_| match request {
-            Some(request) => persistence.commit_inbox_transition_detailed(request, transition),
+            Some(request) => {
+                let outcome =
+                    persistence.commit_inbox_transition_detailed(request, transition)?;
+                if !outcome.newly_accepted {
+                    // Admission is not completion. Retain the mailbox
+                    // candidate and fail closed while the earlier command
+                    // lacks a compatible, epoch-fenced completion snapshot.
+                    // The original command must be recovered by the host,
+                    // not executed again because its ACK was lost.
+                    let tail = persistence
+                        .load_durable_tail_position(actor_id)?
+                        .ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::WouldBlock,
+                                "duplicate command has no durable completion tail",
+                            )
+                        })?;
+                    let snapshot = persistence.load_snapshot(actor_id).ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::WouldBlock,
+                            "duplicate command has no durable completion snapshot",
+                        )
+                    })?;
+                    let completed_after = outcome
+                        .commit
+                        .sequence
+                        .checked_add(1)
+                        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "sequence overflow"))?;
+                    if tail.activation_epoch != outcome.commit.activation_epoch
+                        || tail.sequence < completed_after
+                        || snapshot.sequence < completed_after
+                        || snapshot.sequence > tail.sequence
+                        || snapshot.activation_epoch != outcome.commit.activation_epoch
+                        || snapshot.schema_name.as_deref() != Some(expected_schema.as_str())
+                    {
+                        return Err(Error::new(
+                            ErrorKind::WouldBlock,
+                            "duplicate command has not durably completed in this activation",
+                        ));
+                    }
+                }
+                Ok(outcome)
+            }
             None => persistence
                 .commit_transition(transition)
                 .map(|commit| crate::durable_inbox::DurableInboxCommitOutcome {
