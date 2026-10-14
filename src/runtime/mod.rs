@@ -5518,7 +5518,7 @@ impl Runtime {
             );
             return None;
         }
-        self.recover_actor_inner(actor_id)
+        self.recover_actor_inner(actor_id, false)
     }
 
     /// Resolve the originally pinned immutable executable, verify the exact
@@ -5605,7 +5605,7 @@ impl Runtime {
             self.recovery_modules.insert(actor_id, (module, offsets, compensations));
         }
 
-        let hydrated = self.recover_actor_inner(actor_id);
+        let hydrated = self.recover_actor_inner(actor_id, true);
         let still_owned = self.persistence
             .load_durable_tail_position(actor_id)
             .map(|tail| {
@@ -5640,8 +5640,31 @@ impl Runtime {
         }
     }
 
-    fn recover_actor_inner(&mut self, actor_id: u64) -> Option<u64> {
-        let snapshot = self.persistence.load_snapshot(actor_id)?;
+    fn recover_actor_inner(&mut self, actor_id: u64, strict: bool) -> Option<u64> {
+        // Verified pinned workflows must not hydrate using the legacy
+        // lossy readers, which interpret corrupt SQL rows as missing rows.
+        let snapshot = if strict {
+            match self.persistence.load_snapshot_checked(actor_id) {
+                Ok(snapshot) => snapshot?,
+                Err(error) => {
+                    warn!(actor_id, %error, "refusing pinned recovery: snapshot unreadable");
+                    return None;
+                }
+            }
+        } else {
+            self.persistence.load_snapshot(actor_id)?
+        };
+        let checked_journal = if strict {
+            match self.persistence.read_journal_checked(actor_id) {
+                Ok(journal) => journal,
+                Err(error) => {
+                    warn!(actor_id, %error, "refusing pinned recovery: command journal unreadable");
+                    return None;
+                }
+            }
+        } else {
+            self.persistence.read_journal(actor_id)
+        };
         if snapshot.activation_epoch == 0 {
             warn!(
                 "nulang-recover: refusing actor {} with invalid activation epoch 0",
@@ -5693,7 +5716,17 @@ impl Runtime {
                     return None;
                 }
             };
-        let workflow_events = self.persistence.read_workflow_events(actor_id);
+        let workflow_events = if strict {
+            match self.persistence.read_workflow_events_checked(actor_id) {
+                Ok(events) => events,
+                Err(error) => {
+                    warn!(actor_id, %error, "refusing pinned recovery: workflow history unreadable");
+                    return None;
+                }
+            }
+        } else {
+            self.persistence.read_workflow_events(actor_id)
+        };
         let is_workflow = selected_meta
             .as_ref()
             .map(|meta| meta.is_workflow)
@@ -5724,7 +5757,7 @@ impl Runtime {
                         return None;
                     }
 
-                    let journal = self.persistence.read_journal(actor_id);
+                    let journal = checked_journal.clone();
                     if journal.iter().any(|entry| entry.sequence > tail.sequence) {
                         warn!(
                             "nulang-recover: refusing workflow actor {}: command journal extends beyond atomic tail {}",
@@ -5826,8 +5859,7 @@ impl Runtime {
         let journal_to_replay: Vec<JournalEntry> = if is_workflow {
             Vec::new()
         } else {
-            self.persistence
-                .read_journal(actor_id)
+            checked_journal
                 .into_iter()
                 .filter(|entry| entry.sequence > snapshot.sequence)
                 .collect()

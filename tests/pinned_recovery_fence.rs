@@ -326,3 +326,190 @@ fn runtime_recovers_with_claimed_epoch_from_original_pinned_artifact() {
     drop(runtime);
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn memory_checked_snapshot_and_journal_reads_are_lossless() {
+    use nulang::runtime::JournalEntry;
+
+    let mut store = MemoryStore::new();
+    start(&mut store, 61);
+    store.append_journal(
+        61,
+        JournalEntry {
+            sequence: 1,
+            behavior_id: 0,
+            payload: vec![],
+        },
+    ).unwrap();
+
+    let snapshot = store.load_snapshot_checked(61).unwrap().unwrap();
+    assert_eq!(snapshot.actor_id, 61);
+    assert_eq!(snapshot.sequence, 1);
+    assert_eq!(store.read_journal_checked(61).unwrap().len(), 1);
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn corrupt_libsql_snapshot_is_not_interpreted_as_missing_durable_state() {
+    use nulang::runtime::LibsqlStore;
+
+    let mut store = LibsqlStore::in_memory().unwrap();
+    start(&mut store, 62);
+    store.query(
+        "UPDATE snapshots SET state = 'broken-json' WHERE actor_id = 62",
+        &[],
+    ).unwrap();
+
+    assert_eq!(
+        store.load_snapshot_checked(62).unwrap_err().kind(),
+        ErrorKind::InvalidData,
+    );
+    let tail = store.load_durable_tail_position(62).unwrap().unwrap();
+    assert_eq!(
+        claim_pinned_workflow_recovery(&mut store, 62, tail)
+            .unwrap_err().kind(),
+        ErrorKind::InvalidData,
+    );
+    assert_eq!(store.load_durable_tail_position(62).unwrap().unwrap(), tail);
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn corrupt_libsql_command_journal_prevents_fenced_recovery() {
+    use nulang::runtime::{JournalEntry, LibsqlStore};
+
+    let mut store = LibsqlStore::in_memory().unwrap();
+    start(&mut store, 63);
+    store.append_journal(63, JournalEntry {
+        sequence: 1,
+        behavior_id: 0,
+        payload: vec![],
+    }).unwrap();
+    store.query(
+        "UPDATE journal SET payload = 'broken-json' WHERE actor_id = 63",
+        &[],
+    ).unwrap();
+
+    assert_eq!(
+        store.read_journal_checked(63).unwrap_err().kind(),
+        ErrorKind::InvalidData,
+    );
+    let tail = store.load_durable_tail_position(63).unwrap().unwrap();
+    assert_eq!(
+        claim_pinned_workflow_recovery(&mut store, 63, tail)
+            .unwrap_err().kind(),
+        ErrorKind::InvalidData,
+    );
+    assert_eq!(store.load_durable_tail_position(63).unwrap().unwrap(), tail);
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn malformed_libsql_command_sequence_or_behavior_id_is_rejected() {
+    use nulang::runtime::{JournalEntry, LibsqlStore};
+
+    let mut store = LibsqlStore::in_memory().unwrap();
+    start(&mut store, 64);
+    store.append_journal(64, JournalEntry {
+        sequence: 1,
+        behavior_id: 0,
+        payload: vec![],
+    }).unwrap();
+    store.query(
+        "UPDATE journal SET behavior_id = 65536 WHERE actor_id = 64",
+        &[],
+    ).unwrap();
+
+    assert_eq!(
+        store.read_journal_checked(64).unwrap_err().kind(),
+        ErrorKind::InvalidData,
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn corrupt_command_journal_blocks_runtime_pinned_recovery_before_epoch_claim() {
+    use nulang::runtime::{
+        ImmutablePinnedArtifactResolver, JournalEntry, LibsqlStore,
+        PinnedArtifactBundle, Runtime,
+    };
+    use std::io;
+
+    struct Resolver(PinnedArtifactBundle);
+    impl ImmutablePinnedArtifactResolver for Resolver {
+        fn resolve(&self, digest: &str) -> io::Result<Option<PinnedArtifactBundle>> {
+            Ok((digest == self.0.manifest.artifact.digest).then(|| self.0.clone()))
+        }
+    }
+
+    let mut store = LibsqlStore::in_memory().unwrap();
+    start(&mut store, 65);
+    store.append_journal(65, JournalEntry {
+        sequence: 1,
+        behavior_id: 0,
+        payload: vec![],
+    }).unwrap();
+    store.query(
+        "UPDATE journal SET payload = 'broken-json' WHERE actor_id = 65",
+        &[],
+    ).unwrap();
+
+    let initial = store.load_durable_tail_position(65).unwrap().unwrap();
+    let mut runtime = Runtime::new();
+    runtime.persistence = Box::new(store);
+    let bytes = b"fenced-workflow-v1";
+    assert_eq!(
+        runtime.recover_pinned_workflow_actor(
+            65,
+            "payments/one",
+            &Resolver(PinnedArtifactBundle {
+                manifest: behavior(bytes),
+                executable: bytes.to_vec(),
+            }),
+        ).unwrap_err().kind(),
+        ErrorKind::InvalidData,
+    );
+    assert!(!runtime.actors.contains_key(&65));
+    assert_eq!(
+        runtime.persistence.load_durable_tail_position(65).unwrap().unwrap(),
+        initial,
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn process_crash_after_claim_before_hydration_can_be_safely_reclaimed() {
+    use nulang::runtime::LibsqlStore;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "nulang-pinned-abandoned-claim-{}-{nonce}", std::process::id(),
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("workflow.db");
+
+    let abandoned_claim = {
+        let mut store = LibsqlStore::new(&path).unwrap();
+        start(&mut store, 66);
+        let predecessor = store.load_durable_tail_position(66).unwrap().unwrap();
+        claim_pinned_workflow_recovery(&mut store, 66, predecessor).unwrap()
+    };
+
+    let mut new_process = LibsqlStore::new(&path).unwrap();
+    let after_crash = new_process.load_durable_tail_position(66).unwrap().unwrap();
+    assert_eq!(after_crash.sequence, abandoned_claim.sequence);
+    assert_eq!(after_crash.activation_epoch, abandoned_claim.activation_epoch);
+    let successor = claim_pinned_workflow_recovery(&mut new_process, 66, after_crash).unwrap();
+    assert_eq!(successor.sequence, abandoned_claim.sequence + 1);
+    assert_eq!(successor.activation_epoch, abandoned_claim.activation_epoch + 1);
+    assert_eq!(
+        new_process.load_snapshot_checked(66).unwrap().unwrap().activation_epoch,
+        successor.activation_epoch,
+    );
+    assert!(claim_pinned_workflow_recovery(
+        &mut new_process, 66, after_crash,
+    ).is_err());
+    drop(new_process);
+    std::fs::remove_dir_all(directory).unwrap();
+}

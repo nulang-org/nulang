@@ -351,6 +351,44 @@ event commitments and checked journal/snapshot reads remain required.
 Production multi-host deployment needs owner identity, lease/liveness,
 effect/outbox fencing, and fault-injected failover tests.
 
+## Strict snapshot and command-journal recovery reads
+
+The pinned recovery preflight, epoch claim, and post-claim hydration now use
+`PersistenceStore::load_snapshot_checked` and
+`PersistenceStore::read_journal_checked` in addition to the existing strict
+workflow-event reader. `MemoryStore` returns its typed data;
+`LibsqlStore` reports SQL failures, invalid column values, corrupt JSON,
+invalid sequence/epoch, and out-of-range behavior IDs rather than silently
+dropping accepted commands or treating a corrupt snapshot as absent.
+
+Legacy `load_snapshot`/`read_journal` remain available and retain their
+compatibility semantics; only the verified pinned recovery path opts into
+strict hydration. If a checked read returns `Unsupported`, pinned recovery
+fails closed instead of falling back to the legacy reader.
+
+The focused regression suite includes a malformed snapshot, malformed
+journal payloads, invalid behavior IDs, a corrupt-journal runtime recovery
+attempt that must not advance the activation epoch, and a local SQLite
+restart after the first recovery claim is durably committed but before an
+actor is hydrated. A successor must claim a newer epoch before activation.
+
+```bash
+cargo test --locked --test pinned_recovery_fence
+cargo test --locked --features sqlite --test pinned_recovery_fence
+```
+
+**This is strict decode and fail-closed recovery, not authenticated history.**
+Neither the legacy tables nor the current checked readers cryptographically
+prove that every originally committed row is still present or unchanged;
+well-formed malicious edits and deleted records can remain undetected. A
+separate transaction-integrity commitment/verification layer is required
+for tamper-evident recovery. SQL reads during preflight are also not yet a
+single consistent multi-table snapshot held through the atomic claim.
+Atomic predecessor fencing protects against well-formed concurrent
+transition commits, but legacy writers outside that protocol require
+further isolation. External effects and outbox delivery must enforce
+the currently claimed epoch separately.
+
 ## Next increment / non-goals of v1
 
 1. Atomically persist a pin at execution creation with the existing
