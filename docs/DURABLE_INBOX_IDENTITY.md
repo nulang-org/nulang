@@ -40,13 +40,21 @@ Repeated equal requests return their original receipt even after newer turns
 commit; a conflicting request fails without mutating the actor's journal.
 A normal `commit_transition` cannot retroactively mint an inbox receipt.
 
-**Disk-backed implementations including libSQL currently return
-`io::ErrorKind::Unsupported` for these methods.** They must never implement
-a `load`-then-`commit_transition` sequence, since two competing hosts could
-both observe an absent receipt and commit. A production backend must perform
-one atomic transaction with a uniqueness constraint on
-`(namespace/sender/message/receiver)` identity and verify its payload digest
-under the same transaction.
+**libSQL now implements both methods** through an additive
+`durable_inbox_receipts` table, with the unique `message_id` key, request
+digest and committed transition digest. Inbox identity is checked and inserted
+within the existing `IMMEDIATE` transaction that writes the journal, tail,
+snapshot, effects and outbox. Reopening a file-backed database preserves the
+receipt, and stale acknowledgment retries return the original commit without
+modifying the latest actor tail. Other backends without this transaction
+(including JSON file, RocksDB and PostgreSQL where not specifically
+implemented) still return `io::ErrorKind::Unsupported`.
+
+Do not replace this path with `load`-then-`commit_transition`: competing hosts
+could both observe an absent receipt. The storage API requires one transaction
+and a uniqueness constraint over the canonical logical identity; libSQL's
+`message_id` is a versioned digest of namespace, sender, message key and
+receiver.
 
 ## Deliberate limitations
 
@@ -57,8 +65,10 @@ under the same transaction.
   No legacy record is assumed to contain or imply a durable inbox ID.
 - Neither the sender's stable identity nor authorization is validated here:
   the authenticated transport/tenant boundary must supply and check them.
-- The reference `MemoryStore` is not crash-persistent. Its atomic property
-  only models the intended single-owner API semantics in memory.
+- The reference `MemoryStore` is not crash-persistent. The libSQL
+  implementation supplies durable disk receipts on the local file backend,
+  but this does not establish end-to-end inbox delivery without sender retry,
+  authenticated identity, activation fencing and runtime host integration.
 - The runtime's strict admission adapter is not automatically wired to these
   APIs. Until durable backend support and runtime integration are validated,
   this cannot be advertised as exactly-once processing, lossless inbound
@@ -72,12 +82,14 @@ under the same transaction.
 ```sh
 cargo fmt --all -- --check
 cargo test --locked --test durable_inbox_identity
+cargo test --locked --test durable_inbox_libsql --features sqlite
 cargo test --locked --test durable_activation_epoch
 cargo test --locked
 cargo clippy --all-targets -- -D warnings
 ```
 
-Keep experimental until exact-head CI passes. Next steps: implement versioned
-transactional inbox records in libSQL with a real persistence/restart test;
-then integrate the receipt-backed admission API into the strict typed actor
-host boundary and test process kills at each admission/commit/receipt point.
+Keep experimental until exact-head CI passes. Next: integrate the
+receipt-backed admission API into the strict typed actor host boundary, test
+failure injection around the exact commit and acknowledgment boundary, and
+add persisted activation policy. Backend correctness alone does not imply
+automatic bytecode handling or externally exactly-once provider effects.
