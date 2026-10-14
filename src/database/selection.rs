@@ -1,0 +1,144 @@
+//! Batch-local predicate selection bitmaps.
+//!
+//! This is an executor primitive over borrowed, snapshot-visible scan rows.
+//! It is not encoded-page predicate pushdown or SIMD execution: the initial
+//! implementation evaluates the caller's predicate once per visible row.
+//! Bitmaps retain row positions so downstream operators can avoid copying
+//! values until they need to materialize selected rows.
+
+use std::fmt;
+
+use super::tablet::{TabletScanBatch, TabletScanRow};
+
+/// Positions selected inside *one* visible scan batch.
+///
+/// All bits above `len` are zero. Bitmaps may be combined only when they
+/// describe the same number of rows, and callers must not mix bitmaps from
+/// different batches even when lengths happen to match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectionBitmap {
+    len: usize,
+    words: Vec<u64>,
+}
+
+impl SelectionBitmap {
+    /// Evaluate a predicate over borrowed, snapshot-visible rows.
+    /// Evaluation is row-wise; selection output is packed into 64-bit words.
+    pub fn from_predicate<'a, F>(batch: &TabletScanBatch<'a>, mut predicate: F) -> Self
+    where
+        F: FnMut(TabletScanRow<'a>) -> bool,
+    {
+        let len = batch.rows.len();
+        let mut words = vec![0_u64; len / 64 + usize::from(len % 64 != 0)];
+
+        for (index, row) in batch.rows.iter().copied().enumerate() {
+            if predicate(row) {
+                words[index / 64] |= 1_u64 << (index % 64);
+            }
+        }
+
+        Self { len, words }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Returns `None` for positions outside this batch.
+    pub fn get(&self, index: usize) -> Option<bool> {
+        (index < self.len).then(|| (self.words[index / 64] & (1_u64 << (index % 64))) != 0)
+    }
+
+    pub fn count_ones(&self) -> usize {
+        self.words.iter().map(|word| word.count_ones() as usize).sum()
+    }
+
+    /// Select positions that satisfy both predicates.
+    pub fn and(&self, other: &Self) -> Result<Self, SelectionError> {
+        self.combine(other, |left, right| left & right)
+    }
+
+    /// Select positions that satisfy either predicate.
+    pub fn or(&self, other: &Self) -> Result<Self, SelectionError> {
+        self.combine(other, |left, right| left | right)
+    }
+
+    fn combine(
+        &self,
+        other: &Self,
+        op: impl Fn(u64, u64) -> u64,
+    ) -> Result<Self, SelectionError> {
+        if self.len != other.len {
+            return Err(SelectionError::LengthMismatch {
+                left: self.len,
+                right: other.len,
+            });
+        }
+        Ok(Self {
+            len: self.len,
+            words: self
+                .words
+                .iter()
+                .zip(other.words.iter())
+                .map(|(&left, &right)| op(left, right))
+                .collect(),
+        })
+    }
+
+    /// Iterate selected row indexes in ascending order without scanning every
+    /// unselected bit. Complexity is O(words + selected rows).
+    pub fn selected_indices(&self) -> SelectedIndices<'_> {
+        SelectedIndices {
+            words: &self.words,
+            next_word: 0,
+            live_word: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SelectedIndices<'a> {
+    words: &'a [u64],
+    next_word: usize,
+    live_word: u64,
+}
+
+impl Iterator for SelectedIndices<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.live_word != 0 {
+                let bit = self.live_word.trailing_zeros() as usize;
+                self.live_word &= self.live_word - 1;
+                return Some((self.next_word - 1) * 64 + bit);
+            }
+            self.live_word = *self.words.get(self.next_word)?;
+            self.next_word += 1;
+        }
+    }
+}
+
+impl std::iter::FusedIterator for SelectedIndices<'_> {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionError {
+    LengthMismatch { left: usize, right: usize },
+}
+
+impl fmt::Display for SelectionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LengthMismatch { left, right } => write!(
+                f,
+                "batch selection length mismatch: left={left}, right={right}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SelectionError {}
