@@ -6284,6 +6284,44 @@ mod vm_tests {
     use super::*;
     use crate::bytecode::{BehaviorTableEntry, HandlerBinding, HandlerTable, Instruction};
 
+    #[test]
+    fn actor_instruction_quantum_yields_and_resumes_without_restarting() {
+        let mut module = CodeModule::new("cooperative-budget");
+        for _ in 0..18 {
+            module.emit(Instruction::new0(OpCode::Nop));
+        }
+        module.emit(Instruction::new0(OpCode::Halt));
+
+        let mut vm = VM::new_without_jit();
+        vm.load_module(module);
+        vm.set_cooperative_instruction_budget(Some(4));
+
+        let mut result = vm.run_from(0, 0).expect("first quantum");
+        for expected_pc in [4, 8, 12, 16] {
+            assert!(vm.yield_pending, "VM should yield without losing the frame");
+            let suspended = vm.take_suspended_state().expect("suspended execution");
+            assert_eq!(suspended.frames[0].pc, expected_pc);
+            vm.restore_suspended_state(suspended);
+            result = vm.resume().expect("resume next quantum");
+        }
+        assert!(!vm.yield_pending, "halt should complete, not yield");
+        assert_eq!(result, Value::unit());
+    }
+
+    #[test]
+    fn standalone_vm_remains_unbudgeted_by_default() {
+        let mut module = CodeModule::new("unbudgeted");
+        for _ in 0..18 {
+            module.emit(Instruction::new0(OpCode::Nop));
+        }
+        module.emit(Instruction::new0(OpCode::Halt));
+
+        let mut vm = VM::new_without_jit();
+        vm.load_module(module);
+        vm.run_from(0, 0).expect("standalone execution should complete");
+        assert!(!vm.yield_pending);
+    }
+
     #[derive(Debug)]
     struct ReadyValueCallbacks {
         heap: ActorHeap,
