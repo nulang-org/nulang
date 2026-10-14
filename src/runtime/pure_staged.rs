@@ -191,7 +191,11 @@ impl ActorVmCallbacks for PureVmCallbacks {
     }
 
     fn get_state_field(&self, field: &str) -> Value {
-        match self.state.borrow().fields.get(field).and_then(pure_scalar_value) {
+        let result = {
+            let staged = self.state.borrow();
+            staged.fields.get(field).and_then(pure_scalar_value)
+        };
+        match result {
             Some(value) => value,
             None => {
                 self.violation("staged state read is not a declared scalar field");
