@@ -1229,6 +1229,43 @@ mod tests {
     }
 
     #[test]
+    fn web_connection_slots_enforce_limit_and_release_on_drop() {
+        let slots = Arc::new(ConnectionSlots::new(2));
+        let first = slots.try_acquire().expect("first worker capacity");
+        let second = slots.try_acquire().expect("second worker capacity");
+        assert!(slots.try_acquire().is_none(), "third connection must not spawn");
+        assert_eq!(slots.active.load(Ordering::Relaxed), 2);
+        drop(first);
+        assert!(slots.try_acquire().is_some(), "capacity returns on worker exit");
+        drop(second);
+    }
+
+    #[test]
+    fn web_connection_slots_are_bounded_under_concurrent_admission() {
+        let slots = Arc::new(ConnectionSlots::new(3));
+        let start = Arc::new(std::sync::Barrier::new(16));
+        let hold = Arc::new(std::sync::Barrier::new(16));
+        let mut threads = Vec::new();
+        for _ in 0..16 {
+            let slots = slots.clone();
+            let start = start.clone();
+            let hold = hold.clone();
+            threads.push(std::thread::spawn(move || {
+                start.wait();
+                let lease = slots.try_acquire();
+                hold.wait();
+                lease.is_some()
+            }));
+        }
+        let accepted = threads
+            .into_iter()
+            .filter(|handle| handle.join().unwrap())
+            .count();
+        assert_eq!(accepted, 3);
+        assert_eq!(slots.active.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn test_match_route_exact() {
         let params = match_route("/", "/").unwrap();
         assert!(params.is_empty());
