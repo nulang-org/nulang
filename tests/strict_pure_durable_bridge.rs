@@ -68,6 +68,7 @@ fn strict_gate_only_releases_commands_through_persisted_pure_completion() {
     let (mut rt, actor_id, behavior) = strict_counter();
     rt.enable_strict_typed_actor_admission(actor_id)
         .expect("opt into strict admission");
+    let policy_sequence = rt.persistence.latest_sequence(actor_id);
     assert!(rt.actors[&actor_id]
         .mailbox
         .requires_strict_durable_admission());
@@ -76,7 +77,7 @@ fn strict_gate_only_releases_commands_through_persisted_pure_completion() {
     rt.send_message_by_id(actor_id, behavior, &[Value::int(7)]);
     rt.run_scheduler();
     assert_eq!(rt.actors[&actor_id].mailbox.len(), 2);
-    assert_eq!(rt.persistence.latest_sequence(actor_id), 0);
+    assert_eq!(rt.persistence.latest_sequence(actor_id), policy_sequence);
     assert_eq!(
         rt.actors[&actor_id].get_state_field("total").and_then(|v| v.as_int()),
         Some(0)
@@ -158,13 +159,17 @@ fn isolated_staged_execution_rejects_unprotected_actor_until_strict_opt_in() {
         Some(sequence)
     );
 
-    rt.enable_strict_typed_actor_admission(actor_id).unwrap();
-    let committed = rt
-        .execute_and_commit_admitted_pure_typed_actor_turn(actor_id, sequence)
-        .expect("retry after strict opt-in");
-    assert_eq!(committed.sequence, sequence + 1);
+    // Once a command is atomically admitted, the host must not interpose
+    // a different policy transition ahead of its completion.
     assert_eq!(
-        rt.actors[&actor_id].get_state_field("total").and_then(|v| v.as_int()),
-        Some(5)
+        rt.enable_strict_typed_actor_admission(actor_id)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert_eq!(rt.persistence.latest_sequence(actor_id), sequence);
+    assert_eq!(
+        rt.actors[&actor_id].mailbox.admitted_command_sequence(),
+        Some(sequence)
     );
 }

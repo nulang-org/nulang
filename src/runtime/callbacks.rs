@@ -2447,6 +2447,7 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
                     crdt_field_map,
                     schema_name,
                     authority_tokens,
+                    strict_admission_policy_version: if actor.mailbox.requires_strict_durable_admission() { 1 } else { 0 },
                 };
 
                 let snapshot_json = match serde_json::to_vec(&snapshot) {

@@ -26,6 +26,7 @@ fn snapshot_with_payload(payload_bytes: usize) -> ActorSnapshot {
         crdt_field_map: None,
         schema_name: None,
         authority_tokens: Default::default(),
+        strict_admission_policy_version: 0,
     }
 }
 
@@ -40,6 +41,7 @@ fn empty_snapshot() -> ActorSnapshot {
         crdt_field_map: None,
         schema_name: None,
         authority_tokens: Default::default(),
+        strict_admission_policy_version: 0,
     }
 }
 

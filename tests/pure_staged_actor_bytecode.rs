@@ -165,7 +165,7 @@ fn execution_without_an_admitted_command_is_rejected() {
         .execute_and_commit_admitted_pure_typed_actor_turn(actor_id, 1)
         .expect_err("only the exact admitted message may run");
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-    assert_eq!(runtime.persistence.latest_sequence(actor_id), 0);
+    assert_eq!(runtime.persistence.latest_sequence(actor_id), 1);
 }
 
 #[test]
@@ -322,19 +322,32 @@ fn failed_atomic_result_commit_keeps_live_state_fenced_until_retry_succeeds() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
-    let (mut runtime, actor_id, behavior) = spawned(&compiled_counter());
-    let reject_result = Arc::new(AtomicBool::new(true));
+    let mut runtime = Runtime::new();
+    let module = compiled_counter();
+    let behavior = module.actor_metadata[0].behavior_indices[0] as u16;
+    let reject_result = Arc::new(AtomicBool::new(false));
     runtime.persistence = Box::new(RejectResultStore {
         inner: nulang::runtime::MemoryStore::default(),
         reject_result: Arc::clone(&reject_result),
     });
+    let actor_id = runtime
+        .spawn_from_module(&module, behavior as usize, vec![])
+        .as_actor_id()
+        .expect("persistent test actor");
+    runtime.enable_strict_typed_actor_admission(actor_id)
+        .expect("commit policy before fault injection");
+    let policy_sequence = runtime.persistence.latest_sequence(actor_id);
+    reject_result.store(true, Ordering::SeqCst);
     let sequence = admit(&mut runtime, actor_id, behavior, 5);
     let error = runtime
         .execute_and_commit_admitted_pure_typed_actor_turn(actor_id, sequence)
         .expect_err("persisted state must commit before any live publication");
     assert_eq!(error.kind(), std::io::ErrorKind::Other);
     assert_eq!(runtime.persistence.latest_sequence(actor_id), sequence);
-    assert!(runtime.persistence.load_snapshot(actor_id).is_none());
+    let baseline = runtime.persistence.load_snapshot(actor_id).expect("policy snapshot");
+    assert_eq!(baseline.sequence, policy_sequence);
+    assert_eq!(baseline.strict_admission_policy_version, 1);
+    assert_eq!(baseline.state.get("total"), Some(&PersistedValue::Int(0)));
     assert_eq!(
         runtime.actors[&actor_id].mailbox.admitted_command_sequence(),
         Some(sequence)

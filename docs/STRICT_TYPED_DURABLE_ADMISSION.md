@@ -25,11 +25,16 @@ not a default source-language semantic change.
 
 ## What this does **not** solve
 
-The opt-in flag is **process-local** and not a persisted runtime contract.
-Host activation/recovery must reapply the policy before routing user traffic.
-If the host fails to reapply it, the current legacy dispatch policy resumes.
-Accordingly this feature must not be advertised as a general crash-safe inbox
-or production durability guarantee.
+The mailbox flag is process-local, but the opt-in is now **persisted as a
+versioned, epoch-fenced policy transition** (draft #1724). Recovery restores
+strict admission before publishing the actor, and older completed atomic
+ordinary-actor tails are also automatically fenced. Unsupported policy versions
+or missing strict atomic tails fail closed. Each opt-in consumes one durable
+sequence before the first admitted user command.
+
+This closes the process-local fallback but still does **not** provide a
+general crash-safe inbox, process-kill evidence, durable incoming-message
+identities, or exactly-once external effects.
 
 A trusted host can still call lower-level runtime APIs; this feature is a
 guard against *accidental* fallback, not a sandbox boundary against a
@@ -37,7 +42,7 @@ malicious host. The separate #1720 staged executor can run a bounded, pure scala
 
 The next integration must:
 
-1. Attach strict admission to a versioned, persisted activation policy.
+1. Validate the versioned persisted policy and recovery gate end-to-end under exact-head CI and destructive restart tests.
 2. Give incoming commands stable sender/message identities and a durable
    inbox/dedup record (with compatible historical-format migration).
 3. Execute compiler-verified handlers under isolated staged state and

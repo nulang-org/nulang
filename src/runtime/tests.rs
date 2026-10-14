@@ -2333,6 +2333,7 @@ fn test_memory_store_latest_sequence() {
         crdt_field_map: None,
         schema_name: None,
         authority_tokens: Default::default(),
+        strict_admission_policy_version: 0,
     };
     store.save_snapshot(snapshot).unwrap();
     store
@@ -2364,6 +2365,7 @@ fn test_libsql_store_save_load_snapshot() {
         crdt_field_map: None,
         schema_name: None,
         authority_tokens: Default::default(),
+        strict_admission_policy_version: 0,
     };
     store.save_snapshot(snapshot).unwrap();
 
@@ -2420,6 +2422,7 @@ fn test_libsql_store_latest_sequence() {
             crdt_field_map: None,
             schema_name: None,
             authority_tokens: Default::default(),
+            strict_admission_policy_version: 0,
         })
         .unwrap();
     store
@@ -2450,6 +2453,7 @@ fn test_libsql_store_clear() {
             crdt_field_map: None,
             schema_name: None,
             authority_tokens: Default::default(),
+            strict_admission_policy_version: 0,
         })
         .unwrap();
     store
@@ -2488,6 +2492,7 @@ fn test_libsql_store_persists_to_disk() {
                 crdt_field_map: None,
                 schema_name: None,
                 authority_tokens: Default::default(),
+                strict_admission_policy_version: 0,
             })
             .unwrap();
         store
@@ -2530,6 +2535,7 @@ fn test_libsql_store_crdt_snapshot_roundtrip() {
             crdt_field_map: None,
             schema_name: None,
             authority_tokens: Default::default(),
+            strict_admission_policy_version: 0,
         })
         .unwrap();
 
@@ -2551,6 +2557,7 @@ fn test_libsql_store_crdt_snapshot_roundtrip() {
             crdt_field_map: None,
             schema_name: None,
             authority_tokens: Default::default(),
+            strict_admission_policy_version: 0,
         })
         .unwrap();
     let loaded = store.load_snapshot(1).unwrap();
@@ -2596,6 +2603,7 @@ fn test_libsql_store_migrates_old_schema_crdt_column() {
                 crdt_field_map: None,
                 schema_name: None,
                 authority_tokens: Default::default(),
+                strict_admission_policy_version: 0,
             })
             .unwrap();
         let loaded = store.load_snapshot(1).unwrap();
@@ -4939,6 +4947,7 @@ fn test_actor_migration_between_two_nodes() {
                 })
                 .map(str::to_owned),
             authority_tokens: Default::default(),
+            strict_admission_policy_version: 0,
         };
         let json = serde_json::to_vec(&snapshot).unwrap();
         let nbc = module.to_nbc(None).unwrap();

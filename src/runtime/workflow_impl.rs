@@ -131,7 +131,7 @@ fn timer_set_replay_disposition(
 ///
 /// This is pure staging: callers decide whether the snapshot is committed as a
 /// legacy checkpoint or inside an atomic durable transition.
-fn build_actor_snapshot_at_sequence(
+pub(crate) fn build_actor_snapshot_at_sequence(
     rt: &Runtime,
     actor_id: u64,
     sequence: u64,
@@ -201,6 +201,7 @@ fn build_actor_snapshot_at_sequence(
         crdt_field_map,
         schema_name,
         authority_tokens,
+        strict_admission_policy_version: if actor.mailbox.requires_strict_durable_admission() { 1 } else { 0 },
     }))
 }
 
