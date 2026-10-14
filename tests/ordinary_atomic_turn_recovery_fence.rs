@@ -32,8 +32,8 @@ fn compiled_counter() -> nulang::bytecode::CodeModule {
 
 fn recovery_fixture() -> (Runtime, u64, u16) {
     let module = compiled_counter();
-    let behavior = u16::try_from(module.actor_metadata[0].behavior_indices[0])
-        .expect("behavior index");
+    let behavior =
+        u16::try_from(module.actor_metadata[0].behavior_indices[0]).expect("behavior index");
     let offsets = module
         .behaviors
         .iter()
@@ -197,8 +197,8 @@ fn file_backed_restart_refuses_unfinished_command_then_accepts_completed_state()
 
     let module = compiled_counter();
     let actor_id = 71_221;
-    let behavior = u16::try_from(module.actor_metadata[0].behavior_indices[0])
-        .expect("behavior index");
+    let behavior =
+        u16::try_from(module.actor_metadata[0].behavior_indices[0]).expect("behavior index");
     let new_runtime = || {
         let offsets = module
             .behaviors
