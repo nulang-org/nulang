@@ -154,6 +154,11 @@ fn child_provider_commits_while_compiled_workflow_is_suspended() {
             .load_snapshot(actor_id)
             .expect("SQLite workflow checkpoint");
         assert_eq!(snapshot.actor_id, actor_id);
+        assert_eq!(
+            snapshot.waiting_signal.as_deref(),
+            Some("__llm_ask_pending__"),
+            "the last durable snapshot must contain the LLM suspension marker before the provider-commit crash"
+        );
         assert!(
             !current
                 .persistence
@@ -325,6 +330,20 @@ fn compiled_inference_provider_commit_receipt_loss_deduplicates_on_recovery() {
         Some(actor_id),
         "the accepted compiled workflow command must survive the crash"
     );
+    {
+        let recovered = runtime.borrow();
+        let actor = recovered.actors.get(&actor_id).expect("recovered workflow");
+        assert_eq!(
+            actor.waiting_signal.as_deref(),
+            Some("__llm_ask_pending__"),
+            "recovery must restore the committed LLM suspension marker"
+        );
+        assert_eq!(
+            actor.mailbox.len(),
+            1,
+            "unfinished compiled workflow command must be re-enqueued exactly once before the scheduler starts"
+        );
+    }
     runtime.borrow_mut().run_scheduler();
 
     {
