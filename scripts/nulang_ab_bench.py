@@ -85,6 +85,9 @@ def command_output(
         env=env,
     )
     if proc.returncode != 0:
+        # Preserve captured Cargo/compiler diagnostics in CI logs. Using
+        # check=True here previously raised before stdout could be emitted,
+        # leaving only an opaque exit status from failed candidate builds.
         sys.stderr.write(proc.stdout)
         raise subprocess.CalledProcessError(
             proc.returncode,
