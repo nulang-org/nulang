@@ -3861,6 +3861,88 @@ mod lsp_tests {
     // -- Crash-safety regression tests --
 
     #[test]
+    fn test_compiler_typo_edit_reaches_lsp_quick_fix() {
+        let source = "fn main() = countr + 1\n";
+        crate::types::set_source_map_with_file(source, Some("test.nula"));
+        let start = "fn main() = ".len() as u32;
+        let error = NuError::unbound_variable(
+            "countr",
+            crate::types::Span::new(start, start + 6),
+            Some(vec!["counter".to_string()]),
+        );
+        let diagnostic = single_diagnostic(error);
+        let uri = Url::parse("file:///test.nula").unwrap();
+        let actions = NulangLanguageServer::diagnostic_fix_actions(
+            source,
+            &uri,
+            &[diagnostic],
+        );
+        assert_eq!(actions.len(), 1);
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("expected compiler-derived code action");
+        };
+        assert_eq!(action.is_preferred, Some(false));
+        let edits = action
+            .edit
+            .as_ref()
+            .and_then(|workspace| workspace.changes.as_ref())
+            .and_then(|changes| changes.get(&uri))
+            .expect("workspace edit");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "counter");
+        assert_eq!(edits[0].range.start, Position::new(0, start));
+        assert_eq!(edits[0].range.end, Position::new(0, start + 6));
+        crate::types::clear_source_map();
+    }
+
+    #[test]
+    fn test_compiler_quick_fix_rejects_stale_source() {
+        let source = "fn main() = countr + 1\n";
+        crate::types::set_source_map_with_file(source, Some("test.nula"));
+        let start = "fn main() = ".len() as u32;
+        let diagnostic = single_diagnostic(NuError::unbound_variable(
+            "countr",
+            crate::types::Span::new(start, start + 6),
+            Some(vec!["counter".to_string()]),
+        ));
+        let uri = Url::parse("file:///test.nula").unwrap();
+        assert!(NulangLanguageServer::diagnostic_fix_actions(
+            "fn main() = cactus + 1\n",
+            &uri,
+            &[diagnostic],
+        )
+        .is_empty());
+        crate::types::clear_source_map();
+    }
+
+    #[test]
+    fn test_compiler_quick_fix_uses_utf16_columns() {
+        let source = "fn café() = countr\n";
+        crate::types::set_source_map_with_file(source, Some("test.nula"));
+        let start = "fn café() = ".len() as u32;
+        let diagnostic = single_diagnostic(NuError::unbound_variable(
+            "countr",
+            crate::types::Span::new(start, start + 6),
+            Some(vec!["counter".to_string()]),
+        ));
+        let uri = Url::parse("file:///test.nula").unwrap();
+        let actions = NulangLanguageServer::diagnostic_fix_actions(
+            source,
+            &uri,
+            &[diagnostic],
+        );
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("expected code action");
+        };
+        let edit = &action.edit.as_ref().unwrap().changes.as_ref().unwrap()[&uri][0];
+        assert_eq!(
+            edit.range.start,
+            Position::new(0, "fn café() = ".encode_utf16().count() as u32)
+        );
+        crate::types::clear_source_map();
+    }
+
+    #[test]
     fn test_code_action_let_binding_without_rhs() {
         // A half-typed `let` line with no `=` (e.g. `let x y`) must not
         // panic the code action provider; no quick fix can be offered
