@@ -280,33 +280,38 @@ fn non_strict_admission_cannot_use_strict_staged_completion() {
     let predecessor = runtime.persistence.latest_sequence(actor_id);
     let epoch = runtime.actors[&actor_id].activation_epoch;
     runtime.send_message_by_id(actor_id, behavior, &[Value::int(5)]);
-    let (_, admitted) = runtime.admit_next_typed_actor_command(
-        actor_id,
-        DurableTransition {
-            version: DURABLE_TRANSITION_VERSION,
+    let (_, admitted) = runtime
+        .admit_next_typed_actor_command(
             actor_id,
-            activation_epoch: epoch,
-            sequence: predecessor + 1,
-            expected_previous_sequence: predecessor,
-            command: Some(JournalEntry {
+            DurableTransition {
+                version: DURABLE_TRANSITION_VERSION,
+                actor_id,
+                activation_epoch: epoch,
                 sequence: predecessor + 1,
-                behavior_id: behavior,
-                payload: vec![PersistedValue::Int(5)],
-            }),
-            snapshot: None,
-            workflow_events: vec![],
-            domain_events: vec![],
-            durable_effects: vec![],
-            outbox: vec![],
-        },
-    ).unwrap().unwrap();
-    let error = runtime.commit_admitted_typed_actor_result(
-        actor_id,
-        admitted.sequence,
-        HashMap::from([("total".to_owned(), PersistedValue::Int(5))]),
-        vec![],
-        vec![],
-    ).expect_err("strict staged completion requires persisted strict admission policy");
+                expected_previous_sequence: predecessor,
+                command: Some(JournalEntry {
+                    sequence: predecessor + 1,
+                    behavior_id: behavior,
+                    payload: vec![PersistedValue::Int(5)],
+                }),
+                snapshot: None,
+                workflow_events: vec![],
+                domain_events: vec![],
+                durable_effects: vec![],
+                outbox: vec![],
+            },
+        )
+        .unwrap()
+        .unwrap();
+    let error = runtime
+        .commit_admitted_typed_actor_result(
+            actor_id,
+            admitted.sequence,
+            HashMap::from([("total".to_owned(), PersistedValue::Int(5))]),
+            vec![],
+            vec![],
+        )
+        .expect_err("strict staged completion requires persisted strict admission policy");
     assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     assert_eq!(
         runtime.actors[&actor_id].mailbox.admitted_command_sequence(),
@@ -319,9 +324,22 @@ fn a_quarantined_command_accepts_trusted_staged_result_without_bytecode_replay()
     let (mut runtime, actor_id, behavior) = spawned_counter();
     runtime.checkpoint_actor(actor_id);
     let safe_snapshot = runtime.persistence.load_snapshot(actor_id).unwrap();
-    let module = runtime.actors[&actor_id].bytecode_module.as_ref().unwrap().as_ref().clone();
-    let offsets = module.behaviors.iter().map(|b| b.code_offset as usize).collect();
-    let compensation = module.behaviors.iter().map(|b| b.compensate_offset).collect();
+    let module = runtime.actors[&actor_id]
+        .bytecode_module
+        .as_ref()
+        .unwrap()
+        .as_ref()
+        .clone();
+    let offsets = module
+        .behaviors
+        .iter()
+        .map(|behavior| behavior.code_offset as usize)
+        .collect();
+    let compensation = module
+        .behaviors
+        .iter()
+        .map(|behavior| behavior.compensate_offset)
+        .collect();
     runtime.register_recovery_module(actor_id, module, offsets, compensation);
     let admitted = admit(&mut runtime, actor_id, behavior, 5);
     runtime.actors.remove(&actor_id);
@@ -335,16 +353,20 @@ fn a_quarantined_command_accepts_trusted_staged_result_without_bytecode_replay()
     assert_eq!(after_recovery.activation_epoch, safe_snapshot.activation_epoch);
     assert_eq!(after_recovery.state, safe_snapshot.state);
 
-    let result = runtime.commit_admitted_typed_actor_result(
-        actor_id,
-        admitted,
-        HashMap::from([("total".to_owned(), PersistedValue::Int(5))]),
-        vec![],
-        vec![],
-    ).expect("strict host can complete quarantined command atomically");
+    let result = runtime
+        .commit_admitted_typed_actor_result(
+            actor_id,
+            admitted,
+            HashMap::from([("total".to_owned(), PersistedValue::Int(5))]),
+            vec![],
+            vec![],
+        )
+        .expect("strict host can complete quarantined command atomically");
     assert_eq!(result.sequence, admitted + 1);
     assert_eq!(
-        runtime.actors[&actor_id].get_state_field("total").and_then(|v| v.as_int()),
+        runtime.actors[&actor_id]
+            .get_state_field("total")
+            .and_then(|value| value.as_int()),
         Some(5)
     );
     assert_eq!(
@@ -360,37 +382,48 @@ fn previously_persisted_external_effect_id_cannot_be_staged_again() {
 
     let (mut runtime, actor_id, behavior) = spawned_counter();
     let grant = "Audit::Write".parse::<AuthorityGrant>().unwrap();
-    runtime.actors.get_mut(&actor_id).unwrap()
+    runtime
+        .actors
+        .get_mut(&actor_id)
+        .unwrap()
         .install_authority_manifest(&AuthorityManifest::from_grants([grant]));
     let prior = prepared_effect(actor_id);
     let spec_id = prior.effect().spec().id;
     let epoch = runtime.actors[&actor_id].activation_epoch;
 
-    runtime.persistence.commit_transition(DurableTransition {
-        version: DURABLE_TRANSITION_VERSION,
-        actor_id,
-        activation_epoch: epoch,
-        sequence: 1,
-        expected_previous_sequence: 0,
-        command: None,
-        snapshot: None,
-        workflow_events: vec![],
-        domain_events: vec![],
-        durable_effects: vec![prior.clone()],
-        outbox: vec![],
-    }).expect("persist previous logical effect");
+    runtime
+        .persistence
+        .commit_transition(DurableTransition {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id,
+            activation_epoch: epoch,
+            sequence: 1,
+            expected_previous_sequence: 0,
+            command: None,
+            snapshot: None,
+            workflow_events: vec![],
+            domain_events: vec![],
+            durable_effects: vec![prior.clone()],
+            outbox: vec![],
+        })
+        .expect("persist previous logical effect");
 
     let admitted = admit(&mut runtime, actor_id, behavior, 5);
-    let error = runtime.commit_admitted_typed_actor_result(
-        actor_id,
-        admitted,
-        HashMap::from([("total".to_string(), PersistedValue::Int(5))]),
-        vec![prior],
-        vec![],
-    ).expect_err("historical effect ID must not be minted twice");
+    let error = runtime
+        .commit_admitted_typed_actor_result(
+            actor_id,
+            admitted,
+            HashMap::from([("total".to_string(), PersistedValue::Int(5))]),
+            vec![prior],
+            vec![],
+        )
+        .expect_err("historical effect ID must not be minted twice");
     assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
-    assert!(runtime.persistence.load_durable_effect(actor_id, spec_id)
-        .unwrap().is_some());
+    assert!(runtime
+        .persistence
+        .load_durable_effect(actor_id, spec_id)
+        .unwrap()
+        .is_some());
     assert_eq!(runtime.persistence.latest_sequence(actor_id), admitted);
     assert_eq!(
         runtime.actors[&actor_id].mailbox.admitted_command_sequence(),
