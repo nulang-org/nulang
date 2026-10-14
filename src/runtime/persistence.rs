@@ -1457,7 +1457,8 @@ impl LibsqlStore {
                     crdt_snapshot TEXT,
                     crdt_field_map TEXT,
                     schema_name TEXT,
-                    authority_tokens TEXT
+                    authority_tokens TEXT,
+                    strict_admission_policy_version INTEGER NOT NULL DEFAULT 0
                 )",
                 (),
             )
@@ -1492,6 +1493,12 @@ impl LibsqlStore {
             // remain NULL and therefore restore with empty (deny-by-default) authority.
             let _ = conn
                 .execute("ALTER TABLE snapshots ADD COLUMN authority_tokens TEXT", ())
+                .await;
+            let _ = conn
+                .execute(
+                    "ALTER TABLE snapshots ADD COLUMN strict_admission_policy_version INTEGER NOT NULL DEFAULT 0",
+                    (),
+                )
                 .await;
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS journal (
@@ -1766,6 +1773,7 @@ impl PersistenceStore for LibsqlStore {
                     snapshot.schema_name.clone(),
                     serde_json::to_string(&snapshot.authority_tokens)
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+                    snapshot.strict_admission_policy_version as i64,
                 ))
             })
             .transpose()?;
@@ -1935,13 +1943,13 @@ impl PersistenceStore for LibsqlStore {
 
             if let (
                 Some(snapshot),
-                Some((state_json, crdt_json, crdt_field_map_json, schema_name, authority_json)),
+                Some((state_json, crdt_json, crdt_field_map_json, schema_name, authority_json, policy_version)),
             ) = (&transition.snapshot, &snapshot_data)
             {
                 tx.execute(
                     "INSERT INTO snapshots
-                     (actor_id, sequence, activation_epoch, state, waiting_signal, crdt_snapshot, crdt_field_map, schema_name, authority_tokens)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                     (actor_id, sequence, activation_epoch, state, waiting_signal, crdt_snapshot, crdt_field_map, schema_name, authority_tokens, strict_admission_policy_version)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                      ON CONFLICT(actor_id) DO UPDATE SET
                        sequence=excluded.sequence,
                        activation_epoch=excluded.activation_epoch,
@@ -1950,7 +1958,8 @@ impl PersistenceStore for LibsqlStore {
                        crdt_snapshot=excluded.crdt_snapshot,
                        crdt_field_map=excluded.crdt_field_map,
                        schema_name=excluded.schema_name,
-                       authority_tokens=excluded.authority_tokens",
+                       authority_tokens=excluded.authority_tokens,
+                       strict_admission_policy_version=excluded.strict_admission_policy_version",
                     libsql::params![
                         snapshot.actor_id as i64,
                         snapshot.sequence as i64,
@@ -1960,7 +1969,8 @@ impl PersistenceStore for LibsqlStore {
                         crdt_json.as_str(),
                         crdt_field_map_json.as_str(),
                         schema_name.as_deref(),
-                        authority_json.as_str()
+                        authority_json.as_str(),
+                        *policy_version
                     ],
                 )
                 .await
@@ -2129,9 +2139,9 @@ impl PersistenceStore for LibsqlStore {
         let conn = self.conn();
         self.rt.block_on(async {
             conn.execute(
-                "INSERT INTO snapshots (actor_id, sequence, activation_epoch, state, waiting_signal, crdt_snapshot, crdt_field_map, schema_name, authority_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                 ON CONFLICT(actor_id) DO UPDATE SET sequence=excluded.sequence, activation_epoch=excluded.activation_epoch, state=excluded.state, waiting_signal=excluded.waiting_signal, crdt_snapshot=excluded.crdt_snapshot, crdt_field_map=excluded.crdt_field_map, schema_name=excluded.schema_name, authority_tokens=excluded.authority_tokens",
-                libsql::params![snapshot.actor_id as i64, snapshot.sequence as i64, snapshot.activation_epoch as i64, state_json, snapshot.waiting_signal.as_deref(), crdt_json.as_str(), crdt_field_map_json.as_str(), snapshot.schema_name.as_deref(), authority_json.as_str()],
+                "INSERT INTO snapshots (actor_id, sequence, activation_epoch, state, waiting_signal, crdt_snapshot, crdt_field_map, schema_name, authority_tokens, strict_admission_policy_version) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(actor_id) DO UPDATE SET sequence=excluded.sequence, activation_epoch=excluded.activation_epoch, state=excluded.state, waiting_signal=excluded.waiting_signal, crdt_snapshot=excluded.crdt_snapshot, crdt_field_map=excluded.crdt_field_map, schema_name=excluded.schema_name, authority_tokens=excluded.authority_tokens, strict_admission_policy_version=excluded.strict_admission_policy_version",
+                libsql::params![snapshot.actor_id as i64, snapshot.sequence as i64, snapshot.activation_epoch as i64, state_json, snapshot.waiting_signal.as_deref(), crdt_json.as_str(), crdt_field_map_json.as_str(), snapshot.schema_name.as_deref(), authority_json.as_str(), snapshot.strict_admission_policy_version as i64],
             ).await.map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
         })
     }
@@ -2141,7 +2151,7 @@ impl PersistenceStore for LibsqlStore {
         self.rt.block_on(async {
             let mut rows = conn
                 .query(
-                    "SELECT sequence, activation_epoch, state, waiting_signal, crdt_snapshot, crdt_field_map, schema_name, authority_tokens FROM snapshots WHERE actor_id = ?1",
+                    "SELECT sequence, activation_epoch, state, waiting_signal, crdt_snapshot, crdt_field_map, schema_name, authority_tokens, strict_admission_policy_version FROM snapshots WHERE actor_id = ?1",
                     libsql::params![actor_id as i64],
                 )
                 .await
@@ -2155,6 +2165,8 @@ impl PersistenceStore for LibsqlStore {
             let crdt_field_map_json: Option<String> = row.get(5).ok()?;
             let schema_name: Option<String> = row.get(6).ok()?;
             let authority_json: Option<String> = row.get(7).ok()?;
+            let policy_version: i64 = row.get(8).ok()?;
+            let policy_version = u16::try_from(policy_version).ok()?;
             let crdt_snapshot: Option<Vec<(u64, u8, Vec<u8>)>> = match crdt_json {
                 Some(j) => serde_json::from_str(&j).ok()?,
                 None => None,
@@ -2187,7 +2199,7 @@ impl PersistenceStore for LibsqlStore {
                 crdt_field_map,
                 schema_name,
                 authority_tokens,
-                strict_admission_policy_version: 0,
+                strict_admission_policy_version: policy_version,
             })
         })
     }
@@ -2815,7 +2827,8 @@ impl PostgresStore {
                 crdt_snapshot TEXT,
                 crdt_field_map TEXT,
                 schema_name TEXT,
-                authority_tokens TEXT
+                authority_tokens TEXT,
+                strict_admission_policy_version BIGINT NOT NULL DEFAULT 0
             )",
             &[],
         )
@@ -2832,6 +2845,11 @@ impl PostgresStore {
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         conn.execute(
             "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS authority_tokens TEXT",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS strict_admission_policy_version BIGINT NOT NULL DEFAULT 0",
             &[],
         )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
