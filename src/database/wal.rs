@@ -176,6 +176,11 @@ fn acquire_writer_lock(wal_path: &Path) -> Result<File, WalError> {
 
 /// File-backed, per-tablet append-only WAL.
 ///
+/// Opening requires an OS-exclusive `<wal>.lock` sidecar. This protects
+/// cooperative single-host writers sharing a canonical WAL path; it is not
+/// quorum fencing and cannot protect against paths aliasing through hardlinks,
+/// deletion of a live sidecar, or filesystems with unreliable lock semantics.
+///
 /// A WAL starts at tablet sequence 1 and requires each new record to name the
 /// current tail as its predecessor. Ownership epochs may advance over time,
 /// but all records in one WAL must belong to the same tablet id.
@@ -501,7 +506,11 @@ impl FileWal {
         // the public open() here would self-conflict; moving the lock only
         // after the replacement is fully validated avoids a release window.
         let mut reopened = Self::open_with_lock(self.path.clone(), None)?;
-        reopened.writer_lock = self.writer_lock.take();
+        reopened.writer_lock = Some(
+            self.writer_lock
+                .take()
+                .expect("reclaiming a WAL requires exclusive writer ownership"),
+        );
         *self = reopened;
         Ok(())
     }
