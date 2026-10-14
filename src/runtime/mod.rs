@@ -959,10 +959,7 @@ impl Runtime {
     /// This flag is **process-local**. The host must reapply it when restoring
     /// an activation; it does not provide a durable inbox ID, automatic
     /// bytecode staging, or external exactly-once effects.
-    pub fn enable_strict_typed_actor_admission(
-        &mut self,
-        actor_id: u64,
-    ) -> std::io::Result<()> {
+    pub fn enable_strict_typed_actor_admission(&mut self, actor_id: u64) -> std::io::Result<()> {
         use std::io::{Error, ErrorKind};
         let actor = self
             .actors
@@ -2388,9 +2385,11 @@ impl Runtime {
         // Synchronous calls bypass the normal mailbox receive path. An actor
         // with a reserved or already-admitted durable command must not run a
         // second user handler before that command's atomic completion.
-        if self.actors.get(&actor_id).is_some_and(|actor| {
-            actor.mailbox.requires_strict_durable_admission()
-        }) {
+        if self
+            .actors
+            .get(&actor_id)
+            .is_some_and(|actor| actor.mailbox.requires_strict_durable_admission())
+        {
             return Err(NuError::VMError {
                 msg: format!(
                     "actor {actor_id} cannot execute synchronous ask while strict durable admission requires host execution"
