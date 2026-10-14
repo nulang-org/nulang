@@ -207,3 +207,47 @@ fn distinct_workflow_replay_identities_commit_and_remain_replay_stable() {
     assert_eq!(first, repeated);
     assert_eq!(store.committed_transitions(ACTOR_ID).len(), 1);
 }
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn libsql_reopens_only_valid_atomic_effect_history_after_rejected_turn() {
+    use nulang::runtime::LibsqlStore;
+
+    let root = std::env::temp_dir().join(format!(
+        "nulang_transition_identity_integrity_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("actor.sqlite3");
+
+    {
+        let mut store = LibsqlStore::new(&path).expect("open local transactional store");
+        let mut invalid = transition();
+        invalid.durable_effects = vec![effect(0), effect(0)];
+        let error = store.commit_transition(invalid).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(store.latest_sequence(ACTOR_ID), 0);
+        assert!(store.load_snapshot(ACTOR_ID).is_none());
+
+        let mut valid = transition();
+        valid.durable_effects = vec![effect(0), effect(1)];
+        store
+            .commit_transition(valid)
+            .expect("atomic valid two-effect turn");
+        assert_eq!(store.latest_sequence(ACTOR_ID), 1);
+    }
+
+    // This is an actual close/reopen boundary, not merely a cloned in-memory store.
+    {
+        let store = LibsqlStore::new(&path).expect("recover local store");
+        assert_eq!(store.latest_sequence(ACTOR_ID), 1);
+        let snapshot = store.load_snapshot(ACTOR_ID).expect("durable state");
+        assert_eq!(snapshot.schema_name.as_deref(), Some("Counter"));
+        for ordinal in 0..2 {
+            let id = effect(ordinal).effect().spec().id;
+            assert!(store.load_durable_effect(ACTOR_ID, id).unwrap().is_some());
+        }
+    }
+
+    std::fs::remove_dir_all(&root).expect("cleanup test database");
+}
