@@ -10,8 +10,8 @@ use crate::web::action_dispatch::{
 };
 use crate::web::contracts::HandlerParamContract;
 use nulang_ui_protocol::{
-    ActionId, ActionPlacement, ActionRequest, DocumentId, HostToRuntimeMessage,
-    IdempotencyKey, Revision, UiDocument, WireValue,
+    ActionId, ActionPlacement, ActionRequest, DocumentId, HostToRuntimeMessage, IdempotencyKey,
+    Revision, UiDocument, WireValue,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -164,7 +164,9 @@ impl SessionActionAdmission {
             {
                 return Err(AdmissionError::CapacityExceeded);
             }
-            session.documents.insert(document.document_id.clone(), document);
+            session
+                .documents
+                .insert(document.document_id.clone(), document);
         } else {
             if sessions.len() >= self.limits.max_sessions
                 || self.limits.max_documents_per_session == 0
@@ -233,9 +235,10 @@ impl SessionActionAdmission {
         if session.admitted.len() >= self.limits.max_admissions_per_session {
             return Err(AdmissionError::CapacityExceeded);
         }
-        session
-            .admitted
-            .insert(request.idempotency_key.clone(), InvocationSignature::from(request));
+        session.admitted.insert(
+            request.idempotency_key.clone(),
+            InvocationSignature::from(request),
+        );
         Ok(AdmissionDecision::Accepted(bound))
     }
 }
@@ -319,7 +322,12 @@ mod tests {
             Ok(AdmissionDecision::Duplicate)
         );
         assert_eq!(
-            registry.reserve(&ctx, &module(), &request(1, "mutation-1", "Changed"), &params()),
+            registry.reserve(
+                &ctx,
+                &module(),
+                &request(1, "mutation-1", "Changed"),
+                &params()
+            ),
             Err(AdmissionError::ReplayConflict)
         );
     }
@@ -332,7 +340,12 @@ mod tests {
 
         let foreign = identity("session-1", "owner-2");
         assert_eq!(
-            registry.reserve(&foreign, &module(), &request(1, "key-1", "Hello"), &params()),
+            registry.reserve(
+                &foreign,
+                &module(),
+                &request(1, "key-1", "Hello"),
+                &params()
+            ),
             Err(AdmissionError::SessionOwnerMismatch)
         );
         assert_eq!(
@@ -391,7 +404,12 @@ mod tests {
             Err(AdmissionError::Binding(_))
         ));
         assert!(matches!(
-            registry.reserve(&owner, &module(), &request(1, "same-key", "Hello"), &params()),
+            registry.reserve(
+                &owner,
+                &module(),
+                &request(1, "same-key", "Hello"),
+                &params()
+            ),
             Ok(AdmissionDecision::Accepted(_))
         ));
     }
@@ -402,7 +420,9 @@ mod tests {
         let owner = identity("session-1", "owner-1");
         registry.register_document(&owner, document(1)).unwrap();
         let original = request(1, "key-1", "Hello");
-        registry.reserve(&owner, &module(), &original, &params()).unwrap();
+        registry
+            .reserve(&owner, &module(), &original, &params())
+            .unwrap();
 
         registry.register_document(&owner, document(2)).unwrap();
         assert_eq!(
@@ -421,7 +441,9 @@ mod tests {
         let owner = identity("session-1", "owner-1");
         registry.register_document(&owner, document(1)).unwrap();
         let original = request(1, "key-1", "Hello");
-        registry.reserve(&owner, &module(), &original, &params()).unwrap();
+        registry
+            .reserve(&owner, &module(), &original, &params())
+            .unwrap();
 
         let mut retried = original.clone();
         let HostToRuntimeMessage::InvokeAction { request, .. } = &mut retried;
@@ -462,7 +484,10 @@ mod tests {
                 })
             })
             .collect();
-        let results: Vec<_> = threads.into_iter().map(|handle| handle.join().unwrap()).collect();
+        let results: Vec<_> = threads
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
         let accepted = results
             .iter()
             .filter(|result| matches!(result, Ok(AdmissionDecision::Accepted(_))))
@@ -514,7 +539,12 @@ mod tests {
             Ok(AdmissionDecision::Duplicate)
         );
         assert_eq!(
-            registry.reserve(&owner, &module(), &request(2, "key-1", "Changed"), &params()),
+            registry.reserve(
+                &owner,
+                &module(),
+                &request(2, "key-1", "Changed"),
+                &params()
+            ),
             Err(AdmissionError::ReplayConflict)
         );
         assert_eq!(
