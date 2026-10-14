@@ -3420,6 +3420,36 @@ impl TypeChecker {
         }
     }
 
+    /// Prove a pattern cannot fail for a value of the given type.
+    /// Recurse only through tuples and records with known shapes. A literal
+    /// or a nested constructor remains refutable unless the type checker
+    /// gains general usefulness analysis.
+    fn pattern_is_irrefutable_for_type(pattern: &Pattern, ty: &Type) -> bool {
+        match pattern {
+            Pattern::Wild | Pattern::Var(_) => true,
+            Pattern::Alias(_, inner) => Self::pattern_is_irrefutable_for_type(inner, ty),
+            Pattern::Tuple(patterns) => match ty {
+                Type::Tuple(types) if patterns.len() == types.len() => patterns
+                    .iter()
+                    .zip(types)
+                    .all(|(pattern, ty)| Self::pattern_is_irrefutable_for_type(pattern, ty)),
+                _ => false,
+            },
+            Pattern::Record(patterns) => match ty {
+                Type::Record(fields) => patterns.iter().all(|(field_name, pattern)| {
+                    fields
+                        .iter()
+                        .find(|(name, _)| name == field_name)
+                        .is_some_and(|(_, ty)| {
+                            Self::pattern_is_irrefutable_for_type(pattern, ty)
+                        })
+                }),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     /// Prove that a pattern covers every value of this variant constructor.
     /// Nested patterns with literals or variants cannot establish coverage
     /// without recursively checking the payload's actual type.
@@ -3435,7 +3465,7 @@ impl TypeChecker {
             Pattern::Variant(name, nested) if name == constructor => {
                 match (nested.as_deref(), payload) {
                     (None, None) => true,
-                    (Some(inner), Some(_)) => Self::pattern_is_catchall(inner),
+                    (Some(inner), Some(ty)) => Self::pattern_is_irrefutable_for_type(inner, ty),
                     _ => false,
                 }
             }
