@@ -1006,7 +1006,7 @@ impl Runtime {
                 ),
             ));
         }
-        for field_name in state_updates.keys() {
+        for (field_name, value) in &state_updates {
             if !matches!(
                 actor.state_models.get(field_name),
                 Some(StateModel::Durable)
@@ -1014,6 +1014,34 @@ impl Runtime {
                 return Err(Error::new(
                     ErrorKind::InvalidInput,
                     format!("staged state field '{field_name}' is not declared durable"),
+                ));
+            }
+            // This restricted host adapter cannot infer arbitrarily complex
+            // field types from runtime bytes. Admit only fields with a
+            // compiler-owned primitive literal default of the same type.
+            // Full typed state manifests must replace this conservative rule.
+            let compatible = metadata
+                .state_defaults
+                .iter()
+                .find(|(name, _)| name == field_name)
+                .map(|(_, default)| {
+                    matches!(
+                        (default, value),
+                        (crate::bytecode::Constant::Int(_), PersistedValue::Int(_))
+                            | (crate::bytecode::Constant::Float(_), PersistedValue::Float(_))
+                            | (crate::bytecode::Constant::Bool(_), PersistedValue::Bool(_))
+                            | (crate::bytecode::Constant::String(_), PersistedValue::String(_))
+                            | (crate::bytecode::Constant::Nil, PersistedValue::Nil)
+                            | (crate::bytecode::Constant::Unit, PersistedValue::Unit)
+                    )
+                })
+                .unwrap_or(false);
+            if !compatible {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "staged state field '{field_name}' has incompatible or unsupported compiled type"
+                    ),
                 ));
             }
         }
