@@ -134,7 +134,9 @@ pub enum StepResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use = "check whether the simulation reached quiescence"]
 pub enum SimulationRunResult {
-    Quiescent { steps: u64 },
+    Quiescent {
+        steps: u64,
+    },
     StepLimitExceeded {
         seed: u64,
         steps: u64,
