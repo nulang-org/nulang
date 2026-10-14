@@ -2232,6 +2232,9 @@ mod tests {
             .fabric_stream_commit_cursor("audit", "consumer-a", 1)
             .unwrap();
 
+        // A restart transfers ownership: release the first runtime's
+        // exclusive file-store lock before opening the same root again.
+        drop(runtime);
         let mut restarted = Runtime::new();
         restarted.fabric_stream_open(&root).unwrap();
         assert_eq!(
