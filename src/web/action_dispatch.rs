@@ -5,8 +5,8 @@
 //! hosts must enforce session authority and idempotency before execution.
 
 use crate::bytecode::{CodeModule, Constant};
-use crate::web::contracts::HandlerParamContract;
 use crate::vm::{Value, VM};
+use crate::web::contracts::HandlerParamContract;
 use nulang_ui_protocol::{ActionPlacement, HostToRuntimeMessage, Revision, UiDocument, WireValue};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,9 +249,7 @@ pub fn bind_document_action_payload(
         }
         let mut arguments = Vec::with_capacity(params.len());
         for param in params {
-            if param.name.trim().is_empty()
-                || param.capability.is_some()
-                || param.request.is_some()
+            if param.name.trim().is_empty() || param.capability.is_some() || param.request.is_some()
             {
                 return Err(UiActionDispatchError::InvalidPayload(
                     "unsupported or privileged compiler parameter contract".to_owned(),
@@ -292,12 +290,8 @@ fn decode_action_scalar(value: &WireValue, ty: &str) -> Option<Constant> {
         ("Int", WireValue::I64(value)) => Some(Constant::Int(value.0)),
         ("Int", WireValue::String(value)) => value.parse::<i64>().ok().map(Constant::Int),
         ("Bool", WireValue::Bool(value)) => Some(Constant::Bool(*value)),
-        ("Bool", WireValue::String(value)) if value == "true" => {
-            Some(Constant::Bool(true))
-        }
-        ("Bool", WireValue::String(value)) if value == "false" => {
-            Some(Constant::Bool(false))
-        }
+        ("Bool", WireValue::String(value)) if value == "true" => Some(Constant::Bool(true)),
+        ("Bool", WireValue::String(value)) if value == "false" => Some(Constant::Bool(false)),
         ("Float", WireValue::F64(value)) => {
             let float = value.to_f64();
             float.is_finite().then_some(Constant::Float(float))
@@ -516,7 +510,10 @@ mod tests {
             ("title", WireValue::from("value")),
             ("admin", WireValue::Bool(true)),
         ]);
-        let params = [typed_param("title", "String"), typed_param("title", "String")];
+        let params = [
+            typed_param("title", "String"),
+            typed_param("title", "String"),
+        ];
 
         assert!(matches!(
             bind_document_action_payload(&module, &document, &message, &params),
