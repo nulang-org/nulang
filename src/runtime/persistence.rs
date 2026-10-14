@@ -1490,17 +1490,15 @@ fn decode_inbox_digest(value: &str) -> io::Result<[u8; 32]> {
     Ok(decoded)
 }
 
-/// Crash-test-only hook. Compiled out of ordinary production and full builds.
-///
-/// Used by the SIGKILL integration test to stop a child after a journal INSERT
-/// while the IMMEDIATE transaction remains open. Requires an explicit Cargo
-/// feature *and* stage + actor-specific environment variables.
+/// Crash-test-only hook. Not compiled into default/full/release builds.
+/// Requires an explicit feature and actor-scoped, stage-scoped environment
+/// variables. Its deliberate infinite park is terminated by a parent SIGKILL.
 #[cfg(feature = "durability-fault-injection")]
-fn halt_inflight_inbox_after_journal_for_test(actor_id: u64) -> io::Result<()> {
+fn halt_durable_transition_for_test(actor_id: u64, stage: &str) -> io::Result<()> {
     if std::env::var("NULANG_INBOX_TEST_HALT_STAGE")
         .ok()
         .as_deref()
-        != Some("after-journal-before-receipt")
+        != Some(stage)
     {
         return Ok(());
     }
@@ -1513,12 +1511,12 @@ fn halt_inflight_inbox_after_journal_for_test(actor_id: u64) -> io::Result<()> {
     let marker = std::env::var_os("NULANG_INBOX_TEST_HALT_READY").ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "in-flight inbox crash test requires a ready-marker path",
+            "durability fault injection requires a ready-marker path",
         )
     })?;
-    std::fs::write(PathBuf::from(marker), b"journal-written-transaction-still-open")?;
-    // A parent test will SIGKILL the process at this open transaction
-    // boundary. Spurious park wakeups must never let it commit.
+    std::fs::write(PathBuf::from(marker), stage.as_bytes())?;
+    // The transaction remains open and uncommitted while the parent
+    // terminates the child. Spurious park wakeups must not resume COMMIT.
     loop {
         std::thread::park();
     }
@@ -2207,7 +2205,10 @@ impl LibsqlStore {
             // has not yet written its receipt or committed.
             #[cfg(feature = "durability-fault-injection")]
             if inbox_id.is_some() && transition.command.is_some() {
-                halt_inflight_inbox_after_journal_for_test(transition.actor_id)?;
+                halt_durable_transition_for_test(
+                    transition.actor_id,
+                    "after-journal-before-receipt",
+                )?;
             }
 
             for (ordinal, event_json) in workflow_json.iter().enumerate() {
@@ -2287,6 +2288,22 @@ impl LibsqlStore {
             )
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+            // Fault-injection-only: the completion snapshot, Prepared effect
+            // records, outbox and transition row have been written inside
+            // the existing IMMEDIATE transaction; the atomic tail has not
+            // advanced and no COMMIT occurred.
+            #[cfg(feature = "durability-fault-injection")]
+            if inbox_id.is_none()
+                && transition.command.is_none()
+                && transition.snapshot.is_some()
+                && transition.expected_previous_sequence > 0
+            {
+                halt_durable_transition_for_test(
+                    transition.actor_id,
+                    "after-staged-result-before-tail",
+                )?;
+            }
 
             if let Some((old_epoch, old_sequence, old_digest)) = current_tail {
                 let changed = tx
