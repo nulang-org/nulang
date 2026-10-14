@@ -95,13 +95,29 @@ fn preflight_persistent_snapshot(
         return Err("strict policy requires compiler-owned actor schema".to_string());
     }
     // The snapshot cannot be replayed over an unfinished atomic command.
-    if snapshot.strict_admission_policy_version == 1 {
-        let tail = rt.persistence.load_durable_tail_position(actor_id)
-            .map_err(|error| format!("strict policy tail read failed: {error}"))?
-            .ok_or_else(|| "strict policy has no atomic tail".to_string())?;
-        if tail.sequence != snapshot.sequence || tail.activation_epoch != snapshot.activation_epoch {
-            return Err("strict policy does not match the committed actor tail".to_string());
+    // Older atomic actor results predate the versioned marker; the tail is
+    // still authoritative evidence of strict dispatch. Never revive those
+    // actors into the compatibility scheduler.
+    match rt.persistence.load_durable_tail_position(actor_id) {
+        Ok(Some(tail)) => {
+            if tail.sequence != snapshot.sequence || tail.activation_epoch != snapshot.activation_epoch {
+                return Err("persisted ordinary actor tail does not match its safe snapshot".to_string());
+            }
+            if expected_schema.is_none() {
+                return Err("atomic actor tail requires a compiler-owned schema".to_string());
+            }
         }
+        Ok(None) => {
+            if snapshot.strict_admission_policy_version == 1 {
+                return Err("strict policy has no atomic tail".to_string());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+            if snapshot.strict_admission_policy_version == 1 {
+                return Err("strict policy requires supported atomic tail reads".to_string());
+            }
+        }
+        Err(error) => return Err(format!("actor tail read failed: {error}")),
     }
     let manifest =
         AuthorityManifest::from_tokens(snapshot.authority_tokens.iter().map(String::as_str))
@@ -286,7 +302,14 @@ fn restore_persistent_state(
     // before the actor was initialized or made observable.
     if let Some((snapshot, authority)) = snapshot {
         actor.install_authority_manifest(&authority);
-        if snapshot.strict_admission_policy_version == 1 {
+        if snapshot.strict_admission_policy_version == 1
+            || rt
+                .persistence
+                .load_durable_tail_position(actor.id)
+                .ok()
+                .flatten()
+                .is_some()
+        {
             actor.mailbox.require_strict_durable_admission();
         }
         actor.sequence = snapshot.sequence;
