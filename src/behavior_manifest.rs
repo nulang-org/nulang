@@ -489,7 +489,7 @@ impl BehaviorManifest {
 
             let mut origins = BTreeSet::new();
             for step in &actor.migrations {
-                if step.from == 0 || step.to != step.from.saturating_add(1) {
+                if step.from == 0 || step.from.checked_add(1) != Some(step.to) {
                     return Err(BehaviorManifestError::InvalidActor {
                         actor: actor.name.clone(),
                         message: format!(
@@ -514,18 +514,34 @@ impl BehaviorManifest {
                     });
                 }
             }
-            for from in 1..actor.schema_version {
-                if !origins.contains(&from) {
+            // Validation cost must depend on supplied migration records, not
+            // an untrusted schema_version. BTreeSet gives unique sorted origins.
+            let mut expected_from = 1u32;
+            for from in origins {
+                if from != expected_from {
                     return Err(BehaviorManifestError::InvalidActor {
                         actor: actor.name.clone(),
                         message: format!(
                             "missing migration {} -> {} required by schema version {}",
-                            from,
-                            from + 1,
+                            expected_from,
+                            expected_from + 1,
                             actor.schema_version
                         ),
                     });
                 }
+                // checked_add above rejects origin u32::MAX.
+                expected_from += 1;
+            }
+            if expected_from != actor.schema_version {
+                return Err(BehaviorManifestError::InvalidActor {
+                    actor: actor.name.clone(),
+                    message: format!(
+                        "missing migration {} -> {} required by schema version {}",
+                        expected_from,
+                        expected_from + 1,
+                        actor.schema_version
+                    ),
+                });
             }
         }
         Ok(())
