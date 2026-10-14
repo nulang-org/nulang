@@ -32,6 +32,7 @@ elif args == ["nula", "new", "smoke-app", "--template", "lib"]:
 elif args == ["--check", "src/main.nula"]:
     assert (Path.cwd() / "src" / "main.nula").is_file()
 elif args == ["nula", "build"]:
+    assert Path(os.environ["CARGO_BIN_EXE_nulang"]).resolve() == Path(sys.argv[0]).resolve()
     target = Path.cwd() / ".nula" / "dist"
     target.mkdir(parents=True)
     (target / "smoke-app.nbc").write_bytes(b"test")
@@ -77,6 +78,11 @@ class FirstRunSmokeTests(unittest.TestCase):
             "--check src/main.nula", "nula build", "nula run", "nula test",
             "fmt stripped.nula", "fmt --check stripped.nula",
         ])
+        self.assertIn("first-run smoke passed", proc.stdout)
+
+    def test_stale_binary_override_is_replaced_with_selected_executable(self):
+        proc = self.invoke(CARGO_BIN_EXE_nulang="/does/not/exist")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("first-run smoke passed", proc.stdout)
 
     def test_failure_is_reported_and_stops_before_later_stages(self):
