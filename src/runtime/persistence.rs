@@ -1405,6 +1405,24 @@ pub enum SqliteSyncMode {
     Full,
 }
 
+/// Decode a persisted 32-byte digest from the canonical lower-case hex
+/// representation. Corrupt receipts must never be treated as new messages.
+#[cfg(feature = "sqlite")]
+fn decode_inbox_digest(value: &str) -> io::Result<[u8; 32]> {
+    if value.len() != 64 || !value.is_ascii() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid durable inbox receipt digest length",
+        ));
+    }
+    let mut decoded = [0u8; 32];
+    for (index, byte) in decoded.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid inbox hex digest"))?;
+    }
+    Ok(decoded)
+}
+
 #[cfg(feature = "sqlite")]
 pub struct LibsqlStore {
     conn: std::sync::Mutex<libsql::Connection>,
@@ -1632,6 +1650,26 @@ impl LibsqlStore {
             )
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            // Versioned v1 durable-inbox dedup receipts. This table must be
+            // written in the same transaction as durable_tails and journal.
+            // The primary key serializes competing host attempts for the
+            // *logical* sender message independently of receiver sequence.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS durable_inbox_receipts (
+                    message_id TEXT PRIMARY KEY NOT NULL,
+                    request_digest TEXT NOT NULL,
+                    actor_id INTEGER NOT NULL,
+                    activation_epoch INTEGER NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    transition_digest TEXT NOT NULL,
+                    CHECK(length(message_id) = 64),
+                    CHECK(length(request_digest) = 64),
+                    CHECK(length(transition_digest) = 64)
+                )",
+                (),
+            )
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS durable_transitions (
                     actor_id INTEGER NOT NULL,
@@ -1699,140 +1737,32 @@ impl LibsqlStore {
         })
     }
 
-    /// Execute a SQL query and return rows as a Vec of JSON strings.
-    pub fn query(&self, sql: &str, params: &[Value]) -> io::Result<Vec<String>> {
-        let conn = self.conn();
-        self.rt.block_on(async {
-            let param_values: Vec<String> = params
-                .iter()
-                .map(|v| {
-                    if let Some(i) = v.as_int() {
-                        i.to_string()
-                    } else if let Some(f) = v.as_float() {
-                        f.to_string()
-                    } else if let Some(b) = v.as_bool() {
-                        b.to_string()
-                    } else {
-                        v.to_string_repr()
-                    }
-                })
-                .collect();
-            let param_refs: Vec<&str> = param_values.iter().map(|s| s.as_str()).collect();
-            let mut rows = conn
-                .query(sql, libsql::params_from_iter(param_refs))
-                .await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-            let mut results = Vec::new();
-            loop {
-                match rows.next().await {
-                    Ok(Some(row)) => {
-                        let mut cols: Vec<serde_json::Value> = Vec::new();
-                        for i in 0..row.column_count() {
-                            let val = row
-                                .get_value(i)
-                                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-                            let json_val = match val {
-                                libsql::Value::Null => serde_json::Value::Null,
-                                libsql::Value::Integer(n) => {
-                                    serde_json::value::Number::from_i128(n as i128)
-                                        .map(serde_json::Value::Number)
-                                        .unwrap_or(serde_json::Value::Null)
-                                }
-                                libsql::Value::Real(f) => serde_json::value::Number::from_f64(f)
-                                    .map(serde_json::Value::Number)
-                                    .unwrap_or(serde_json::Value::Null),
-                                libsql::Value::Text(s) => serde_json::Value::String(s),
-                                libsql::Value::Blob(_) => serde_json::Value::Null,
-                            };
-                            cols.push(json_val);
-                        }
-                        let json = serde_json::to_string(&cols)
-                            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-                        results.push(json);
-                    }
-                    Ok(None) => break,
-                    Err(e) => return Err(io::Error::new(io::ErrorKind::Other, e.to_string())),
-                }
-            }
-            Ok(results)
-        })
-    }
-}
-
-#[cfg(feature = "sqlite")]
-impl PersistenceStore for LibsqlStore {
-    fn load_durable_tail_position(&self, actor_id: u64) -> io::Result<Option<DurableTailPosition>> {
-        let conn = self.conn();
-        self.rt.block_on(async {
-            let mut rows = conn
-                .query(
-                    "SELECT activation_epoch, sequence
-                     FROM durable_tails
-                     WHERE actor_id = ?1",
-                    libsql::params![actor_id as i64],
-                )
-                .await
-                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
-
-            match rows
-                .next()
-                .await
-                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?
-            {
-                Some(row) => {
-                    let activation_epoch: i64 = row.get(0).map_err(|error| {
-                        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
-                    })?;
-                    let sequence: i64 = row.get(1).map_err(|error| {
-                        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
-                    })?;
-                    Ok(Some(DurableTailPosition {
-                        activation_epoch: activation_epoch as u64,
-                        sequence: sequence as u64,
-                    }))
-                }
-                None => Ok(None),
-            }
-        })
-    }
-
-    fn load_durable_effect(
-        &self,
-        actor_id: u64,
-        effect_id: DurableEffectId,
-    ) -> io::Result<Option<DurableEffectPersistenceRecord>> {
-        let conn = self.conn();
-        self.rt.block_on(async {
-            let mut rows = conn
-                .query(
-                    "SELECT record FROM durable_effect_records
-                     WHERE actor_id = ?1
-                     ORDER BY sequence DESC, ordinal DESC",
-                    libsql::params![actor_id as i64],
-                )
-                .await
-                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
-
-            while let Some(row) = rows
-                .next()
-                .await
-                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?
-            {
-                let json: String = row.get(0).map_err(|error| {
-                    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
-                })?;
-                let record = DurableEffectPersistenceRecord::from_json(json.as_bytes())
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                if record.effect().spec().id == effect_id {
-                    return Ok(Some(record));
-                }
-            }
-            Ok(None)
-        })
-    }
-
-    fn commit_transition(&mut self, transition: DurableTransition) -> io::Result<DurableCommit> {
+    /// Shared libSQL transaction for regular transitions and deduplicated
+    /// inbox transitions. An inbox receipt is checked and inserted strictly
+    /// inside the same immediate transaction as the journal/tail records.
+    fn commit_transition_with_inbox(
+        &mut self,
+        transition: DurableTransition,
+        inbox: Option<DurableInboxCommand>,
+    ) -> io::Result<DurableCommit> {
         transition.validate_structure()?;
+        if let Some(ref request) = inbox {
+            let command = transition.command.as_ref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "durable inbox transition requires a command",
+                )
+            })?;
+            request.validate_command(transition.actor_id, command)?;
+        }
+        let inbox_id = inbox.as_ref().map(|request| request.id().to_string());
+        let inbox_digest = inbox.as_ref().map(|request| {
+            request
+                .request_digest()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        });
         let digest = transition.digest()?;
         let digest_hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
 
@@ -1906,6 +1836,77 @@ impl PersistenceStore for LibsqlStore {
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
+            // Check under the same IMMEDIATE write lock used for the
+            // transition. A committed receipt must win over a changed tail:
+            // retrying an old message after subsequent commands returns the
+            // original acknowledgement without dispatching again.
+            if let (Some(id), Some(request_digest)) =
+                (inbox_id.as_deref(), inbox_digest.as_deref())
+            {
+                let mut rows = tx
+                    .query(
+                        "SELECT request_digest, actor_id, activation_epoch, sequence, transition_digest
+                         FROM durable_inbox_receipts WHERE message_id = ?1",
+                        libsql::params![id],
+                    )
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                if let Some(row) = rows
+                    .next()
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+                {
+                    let stored_request: String = row.get(0).map_err(|e| {
+                        io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                    })?;
+                    if stored_request != request_digest {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            "durable inbox identity is bound to a different request",
+                        ));
+                    }
+                    let actor: i64 = row.get(1).map_err(|e| {
+                        io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                    })?;
+                    let epoch: i64 = row.get(2).map_err(|e| {
+                        io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                    })?;
+                    let sequence: i64 = row.get(3).map_err(|e| {
+                        io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                    })?;
+                    let stored_digest: String = row.get(4).map_err(|e| {
+                        io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                    })?;
+                    let actor = u64::try_from(actor).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "negative inbox actor")
+                    })?;
+                    let epoch = u64::try_from(epoch).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "negative inbox epoch")
+                    })?;
+                    let sequence = u64::try_from(sequence).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "negative inbox sequence")
+                    })?;
+                    if actor != transition.actor_id || epoch == 0 || sequence == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "corrupt durable inbox receipt identity or position",
+                        ));
+                    }
+                    let committed_digest = decode_inbox_digest(&stored_digest)?;
+                    drop(rows);
+                    tx.commit()
+                        .await
+                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    return Ok(DurableCommit {
+                        actor_id: actor,
+                        activation_epoch: epoch,
+                        sequence,
+                        digest: committed_digest,
+                    });
+                }
+                drop(rows);
+            }
+
             let current_tail = {
                 let mut rows = tx
                     .query(
@@ -1938,6 +1939,15 @@ impl PersistenceStore for LibsqlStore {
 
             if let Some((epoch, sequence, stored_digest)) = &current_tail {
                 if transition.activation_epoch == *epoch && transition.sequence == *sequence {
+                    // An ordinary commit with matching bytes cannot mint an
+                    // inbox receipt after the fact: both records must first
+                    // become visible together in one transaction.
+                    if inbox_id.is_some() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            "transition was committed without a durable inbox receipt",
+                        ));
+                    }
                     if stored_digest == &digest_hex {
                         tx.commit()
                             .await
@@ -2191,6 +2201,26 @@ impl PersistenceStore for LibsqlStore {
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             }
 
+            if let (Some(id), Some(request_digest)) =
+                (inbox_id.as_deref(), inbox_digest.as_deref())
+            {
+                tx.execute(
+                    "INSERT INTO durable_inbox_receipts
+                     (message_id, request_digest, actor_id, activation_epoch, sequence, transition_digest)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    libsql::params![
+                        id,
+                        request_digest,
+                        transition.actor_id as i64,
+                        transition.activation_epoch as i64,
+                        transition.sequence as i64,
+                        digest_hex.as_str()
+                    ],
+                )
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            }
+
             tx.commit()
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -2202,6 +2232,215 @@ impl PersistenceStore for LibsqlStore {
                 digest,
             })
         })
+    }
+
+    /// Execute a SQL query and return rows as a Vec of JSON strings.
+    pub fn query(&self, sql: &str, params: &[Value]) -> io::Result<Vec<String>> {
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let param_values: Vec<String> = params
+                .iter()
+                .map(|v| {
+                    if let Some(i) = v.as_int() {
+                        i.to_string()
+                    } else if let Some(f) = v.as_float() {
+                        f.to_string()
+                    } else if let Some(b) = v.as_bool() {
+                        b.to_string()
+                    } else {
+                        v.to_string_repr()
+                    }
+                })
+                .collect();
+            let param_refs: Vec<&str> = param_values.iter().map(|s| s.as_str()).collect();
+            let mut rows = conn
+                .query(sql, libsql::params_from_iter(param_refs))
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            let mut results = Vec::new();
+            loop {
+                match rows.next().await {
+                    Ok(Some(row)) => {
+                        let mut cols: Vec<serde_json::Value> = Vec::new();
+                        for i in 0..row.column_count() {
+                            let val = row
+                                .get_value(i)
+                                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                            let json_val = match val {
+                                libsql::Value::Null => serde_json::Value::Null,
+                                libsql::Value::Integer(n) => {
+                                    serde_json::value::Number::from_i128(n as i128)
+                                        .map(serde_json::Value::Number)
+                                        .unwrap_or(serde_json::Value::Null)
+                                }
+                                libsql::Value::Real(f) => serde_json::value::Number::from_f64(f)
+                                    .map(serde_json::Value::Number)
+                                    .unwrap_or(serde_json::Value::Null),
+                                libsql::Value::Text(s) => serde_json::Value::String(s),
+                                libsql::Value::Blob(_) => serde_json::Value::Null,
+                            };
+                            cols.push(json_val);
+                        }
+                        let json = serde_json::to_string(&cols)
+                            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                        results.push(json);
+                    }
+                    Ok(None) => break,
+                    Err(e) => return Err(io::Error::new(io::ErrorKind::Other, e.to_string())),
+                }
+            }
+            Ok(results)
+        })
+    }
+}
+
+#[cfg(feature = "sqlite")]
+impl PersistenceStore for LibsqlStore {
+    fn commit_inbox_transition(
+        &mut self,
+        request: DurableInboxCommand,
+        transition: DurableTransition,
+    ) -> io::Result<DurableCommit> {
+        self.commit_transition_with_inbox(transition, Some(request))
+    }
+
+    fn load_durable_inbox_receipt(
+        &self,
+        id: DurableInboxId,
+    ) -> io::Result<Option<DurableInboxReceipt>> {
+        let id_hex = id.to_string();
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let mut rows = conn
+                .query(
+                    "SELECT request_digest, actor_id, activation_epoch, sequence, transition_digest
+                     FROM durable_inbox_receipts WHERE message_id = ?1",
+                    libsql::params![id_hex.as_str()],
+                )
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+            else {
+                return Ok(None);
+            };
+            let request_hex: String = row
+                .get(0)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            let actor: i64 = row
+                .get(1)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            let epoch: i64 = row
+                .get(2)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            let sequence: i64 = row
+                .get(3)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            let transition_hex: String = row
+                .get(4)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            let actor = u64::try_from(actor).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "negative durable inbox actor")
+            })?;
+            let epoch = u64::try_from(epoch).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "negative durable inbox epoch")
+            })?;
+            let sequence = u64::try_from(sequence).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "negative durable inbox sequence")
+            })?;
+            if actor == 0 || epoch == 0 || sequence == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid durable inbox receipt position",
+                ));
+            }
+            Ok(Some(DurableInboxReceipt {
+                id,
+                request_digest: decode_inbox_digest(&request_hex)?,
+                commit: DurableCommit {
+                    actor_id: actor,
+                    activation_epoch: epoch,
+                    sequence,
+                    digest: decode_inbox_digest(&transition_hex)?,
+                },
+            }))
+        })
+    }
+
+    fn load_durable_tail_position(&self, actor_id: u64) -> io::Result<Option<DurableTailPosition>> {
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let mut rows = conn
+                .query(
+                    "SELECT activation_epoch, sequence
+                     FROM durable_tails
+                     WHERE actor_id = ?1",
+                    libsql::params![actor_id as i64],
+                )
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+
+            match rows
+                .next()
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?
+            {
+                Some(row) => {
+                    let activation_epoch: i64 = row.get(0).map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                    })?;
+                    let sequence: i64 = row.get(1).map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                    })?;
+                    Ok(Some(DurableTailPosition {
+                        activation_epoch: activation_epoch as u64,
+                        sequence: sequence as u64,
+                    }))
+                }
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn load_durable_effect(
+        &self,
+        actor_id: u64,
+        effect_id: DurableEffectId,
+    ) -> io::Result<Option<DurableEffectPersistenceRecord>> {
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let mut rows = conn
+                .query(
+                    "SELECT record FROM durable_effect_records
+                     WHERE actor_id = ?1
+                     ORDER BY sequence DESC, ordinal DESC",
+                    libsql::params![actor_id as i64],
+                )
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?
+            {
+                let json: String = row.get(0).map_err(|error| {
+                    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                })?;
+                let record = DurableEffectPersistenceRecord::from_json(json.as_bytes())
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                if record.effect().spec().id == effect_id {
+                    return Ok(Some(record));
+                }
+            }
+            Ok(None)
+        })
+    }
+
+    fn commit_transition(&mut self, transition: DurableTransition) -> io::Result<DurableCommit> {
+        self.commit_transition_with_inbox(transition, None)
     }
 
     fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()> {

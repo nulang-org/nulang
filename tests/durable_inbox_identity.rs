@@ -210,25 +210,29 @@ fn ordinary_atomic_commit_cannot_be_retroactively_claimed_as_inbox_commit() {
 
 #[cfg(feature = "sqlite")]
 #[test]
-fn libsql_must_report_unsupported_until_transactional_inbox_is_implemented() {
+fn libsql_reference_behavior_matches_memory_store() {
     use nulang::runtime::LibsqlStore;
     let mut store = LibsqlStore::in_memory().unwrap();
     let request = inbox(42, "request-9", 3);
-    assert_eq!(
-        store
-            .commit_inbox_transition(request.clone(), transition(42, 0, 3))
-            .unwrap_err()
-            .kind(),
-        std::io::ErrorKind::Unsupported
-    );
+    let first = store
+        .commit_inbox_transition(request.clone(), transition(42, 0, 3))
+        .expect("atomically commit journal and inbox receipt");
+    assert_eq!(first.sequence, 1);
     assert_eq!(
         store
             .load_durable_inbox_receipt(request.id())
-            .unwrap_err()
-            .kind(),
-        std::io::ErrorKind::Unsupported
+            .unwrap()
+            .unwrap()
+            .commit,
+        first
     );
-    assert!(store.read_journal(42).is_empty());
+    assert_eq!(
+        store
+            .commit_inbox_transition(request, transition(42, 0, 3))
+            .expect("idempotent replay"),
+        first
+    );
+    assert_eq!(store.read_journal(42).len(), 1);
 }
 
 #[test]
