@@ -79,6 +79,9 @@ impl WalBackedTablet {
         snapshot: u64,
         target_rows: NonZeroUsize,
     ) -> Result<TabletBatchScan<'_>, TabletError> {
+        // A WAL-backed handle may require reopening after ambiguous retention
+        // publication. Preserve the same guard as historical scalar reads.
+        self.read_at(range.start(), snapshot)?;
         self.tablet.scan_range_at(range, snapshot, target_rows)
     }
 
