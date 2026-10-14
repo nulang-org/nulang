@@ -77,6 +77,7 @@ jobs:
     needs: preflight
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           # Build against Ubuntu 22.04's glibc 2.35 / OpenSSL 3 baseline,
@@ -265,7 +266,7 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+          version="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "nulang"))')"
           bash scripts/package_linux.sh "target/${{ matrix.target }}/release/nulang" "$version" "${{ matrix.package_arch }}" dist
 
       - name: Verify Linux packages, architectures, payloads, and checksums
@@ -273,7 +274,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+          version="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "nulang"))')"
           arch="${{ matrix.package_arch }}"
           deb="dist/nulang_${version}_${{ matrix.deb_arch }}.deb"
           rpm="dist/nulang-${version}-1.${arch}.rpm"
