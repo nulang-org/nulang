@@ -8,9 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::interruption::{with_interruption, StorageInterruptionPoint};
 use super::store::{WalBackedError, WalBackedTablet};
-use super::tablet::{
-    KeyRange, TabletDescriptor, TabletId, TabletMutation, TransactionId,
-};
+use super::tablet::{KeyRange, TabletDescriptor, TabletId, TabletMutation, TransactionId};
 
 static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
 
