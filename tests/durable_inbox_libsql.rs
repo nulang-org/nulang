@@ -374,3 +374,63 @@ fn receipt_insert_failure_rolls_back_previously_written_transition_records() {
     assert!(store.load_durable_tail_position(51).unwrap().is_none());
     assert!(store.load_durable_inbox_receipt(request.id()).unwrap().is_none());
 }
+
+#[cfg(unix)]
+#[test]
+fn process_kill_after_commit_before_ack_replays_durable_receipt() {
+    use std::os::unix::process::ExitStatusExt;
+
+    const CHILD_DB_ENV: &str = "NULANG_TEST_INBOX_KILL_AFTER_COMMIT_DB";
+    if let Some(db_path) = std::env::var_os(CHILD_DB_ENV) {
+        // The child commits but never reports an acknowledgment to the
+        // parent; SIGKILL bypasses normal Rust destructors and DB close.
+        let mut store = LibsqlStore::new(PathBuf::from(db_path))
+            .expect("open file-backed libSQL in subprocess");
+        store
+            .commit_inbox_transition(
+                identity(51, "killed-after-commit", 7),
+                command(51, 0, 7),
+            )
+            .expect("durable command and receipt committed before process kill");
+        unsafe {
+            libc::raise(libc::SIGKILL);
+        }
+        panic!("the subprocess should have been killed with SIGKILL");
+    }
+
+    let file = TestDatabase::new();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("process_kill_after_commit_before_ack_replays_durable_receipt")
+        .arg("--nocapture")
+        .env(CHILD_DB_ENV, &file.0)
+        .output()
+        .expect("spawn the integration-test subprocess");
+    assert_eq!(
+        output.status.signal(),
+        Some(libc::SIGKILL),
+        "child did not reach the intentional kill window: stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let request = identity(51, "killed-after-commit", 7);
+    let mut reopened = file.store();
+    let committed = reopened
+        .load_durable_inbox_receipt(request.id())
+        .unwrap()
+        .expect("receipt must survive process death after transaction commit");
+    assert_eq!(committed.request_digest, request.request_digest());
+    assert_eq!(committed.commit.sequence, 1);
+    assert_eq!(
+        reopened
+            .commit_inbox_transition(request, command(51, 0, 7))
+            .expect("retry after lost acknowledgment"),
+        committed.commit
+    );
+    assert_eq!(reopened.read_journal(51).len(), 1);
+    assert_eq!(
+        reopened.load_durable_tail_position(51).unwrap().unwrap().sequence,
+        1
+    );
+}
