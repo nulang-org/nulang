@@ -577,6 +577,37 @@ pub struct DefaultForeignInterop {
 }
 
 #[cfg(feature = "python")]
+#[derive(Default)]
+struct TemporaryPythonHandles {
+    ids: Vec<crate::python::PythonObjectId>,
+}
+
+#[cfg(feature = "python")]
+impl TemporaryPythonHandles {
+    fn track(&mut self, id: crate::python::PythonObjectId) {
+        self.ids.push(id);
+    }
+
+    /// Returned opaque handles must outlive the Python call that produced them.
+    fn keep(&mut self, id: crate::python::PythonObjectId) {
+        self.ids.retain(|candidate| *candidate != id);
+    }
+}
+
+#[cfg(feature = "python")]
+impl Drop for TemporaryPythonHandles {
+    fn drop(&mut self) {
+        // Acquire the GIL before the registry mutex, matching get_object's
+        // lock order. This cleanup runs even when a Python call raises.
+        pyo3::Python::attach(|_py| {
+            for id in self.ids.drain(..) {
+                crate::python::unregister_object(id);
+            }
+        });
+    }
+}
+
+#[cfg(feature = "python")]
 impl DefaultForeignInterop {
     pub fn new() -> Result<Self, String> {
         let bridge = crate::python::PyBridge::new();
@@ -602,6 +633,8 @@ impl ForeignInterop for DefaultForeignInterop {
             .get(module)
             .ok_or_else(|| format!("module '{}' not imported", module))?;
         let attr_id = self.bridge.get_attr(module_id, attr)?;
+        let mut temporary = TemporaryPythonHandles::default();
+        temporary.track(attr_id);
         crate::python::python_object_id_to_value(attr_id)
     }
 
@@ -610,12 +643,20 @@ impl ForeignInterop for DefaultForeignInterop {
             .modules
             .get(module)
             .ok_or_else(|| format!("module '{}' not imported", module))?;
+        let mut temporary = TemporaryPythonHandles::default();
         let func_id = self.bridge.get_attr(module_id, function)?;
-        let py_args: Result<Vec<_>, String> = args
-            .iter()
-            .map(|v| crate::python::value_to_python_object_id(*v))
-            .collect();
-        let result_id = self.bridge.call(func_id, py_args?)?;
+        temporary.track(func_id);
+        let mut py_args = Vec::with_capacity(args.len());
+        for value in args {
+            let id = crate::python::value_to_python_object_id(*value)?;
+            // VM-owned Python handles are borrowed, not temporary allocations.
+            if value.as_raw() & crate::value_layout::TAG_MASK != crate::python::TAG_PYTHON {
+                temporary.track(id);
+            }
+            py_args.push(id);
+        }
+        let result_id = self.bridge.call(func_id, py_args)?;
+        temporary.track(result_id);
         crate::python::python_object_id_to_value(result_id)
     }
 
@@ -627,14 +668,24 @@ impl ForeignInterop for DefaultForeignInterop {
             .modules
             .get(&request.module)
             .ok_or_else(|| format!("module '{}' not imported", request.module))?;
+        let mut temporary = TemporaryPythonHandles::default();
         let func_id = self.bridge.get_attr(module_id, &request.function)?;
-        let py_args: Result<Vec<_>, String> = request
-            .args
-            .iter()
-            .map(crate::python::owned_foreign_to_python_object_id)
-            .collect();
-        let result_id = self.bridge.call(func_id, py_args?)?;
-        crate::python::python_object_id_to_owned_foreign(result_id)
+        temporary.track(func_id);
+        let mut py_args = Vec::with_capacity(request.args.len());
+        for value in &request.args {
+            let id = crate::python::owned_foreign_to_python_object_id(value)?;
+            if !matches!(value, crate::runtime::OwnedForeignValue::OpaqueHandle { .. }) {
+                temporary.track(id);
+            }
+            py_args.push(id);
+        }
+        let result_id = self.bridge.call(func_id, py_args)?;
+        temporary.track(result_id);
+        let result = crate::python::python_object_id_to_owned_foreign(result_id)?;
+        if matches!(result, crate::runtime::OwnedForeignValue::OpaqueHandle { .. }) {
+            temporary.keep(result_id);
+        }
+        Ok(result)
     }
 }
 
