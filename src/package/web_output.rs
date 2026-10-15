@@ -85,9 +85,9 @@ fn ensure_managed_destination(target: &Path) -> io::Result<()> {
             // manifest. Permit that known pre-build state, but not arbitrary
             // user files in a directory we are about to replace.
             if entries.is_empty()
-                || entries.iter().all(|name| {
-                    matches!(name.to_str(), Some("app.client.js" | "app.signals.json"))
-                })
+                || entries
+                    .iter()
+                    .all(|name| matches!(name.to_str(), Some("app.client.js" | "app.signals.json")))
             {
                 return Ok(());
             }
@@ -362,7 +362,10 @@ mod tests {
         std::fs::write(root.join("site/user-notes.txt"), "important").unwrap();
 
         let result = StagedWebOutput::new(&root, "site", "public");
-        assert!(result.is_err(), "unmanaged directories must not be replaced");
+        assert!(
+            result.is_err(),
+            "unmanaged directories must not be replaced"
+        );
         assert_eq!(
             std::fs::read_to_string(root.join("site/user-notes.txt")).unwrap(),
             "important"
