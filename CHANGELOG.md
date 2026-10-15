@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Read-only Web content route admission — 2026-10-15
+- **Plan public Markdown routes without registering handlers or publishing files.** Drafts never claim routes, output is deterministic, and conflicting GET/HEAD routes (including typed or legacy path parameters and trailing slash variants) fail closed using the existing runtime matcher. This is a preflight for later build integration and does not add a second route planner or static renderer.
+
 ### Typed Web content section semantics — 2026-10-15
 - **Preserve Markdown source-path identity and distinguish `_index.md` sections from ordinary leaf and `index.md` pages.** Both kinds retain canonical slugs; collisions fail closed and collection ordering stays deterministic. This is read-only metadata and does not register routes, render, publish assets, or generate HTML.
 
