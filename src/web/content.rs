@@ -3,9 +3,20 @@
 
 use serde::Deserialize;
 
+/// Semantic content category, independent of its canonical route slug.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentKind {
+    Page,
+    Section,
+}
+
 /// One validated content entry. Slugs are stable, leading-slash route paths.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContentPage {
+    /// Collection-relative Markdown source location for diagnostics and future build invalidation.
+    pub source_path: String,
+    /// `_index.md` denotes a collection section; other Markdown files are pages.
+    pub kind: ContentKind,
     pub slug: String,
     pub title: String,
     pub draft: bool,
@@ -30,6 +41,11 @@ struct FrontMatter {
 /// or implicit route registration occurs here.
 pub fn parse_page(relative_path: &str, source: &str) -> Result<ContentPage, String> {
     let slug = slug_from_relative_path(relative_path)?;
+    let kind = if relative_path.rsplit('/').next() == Some("_index.md") {
+        ContentKind::Section
+    } else {
+        ContentKind::Page
+    };
     let payload = source
         .strip_prefix("+++\n")
         .ok_or_else(|| format!("{relative_path}: expected TOML +++ front matter"))?;
@@ -45,6 +61,8 @@ pub fn parse_page(relative_path: &str, source: &str) -> Result<ContentPage, Stri
         return Err(format!("{relative_path}: content tags must not be empty"));
     }
     Ok(ContentPage {
+        source_path: relative_path.to_string(),
+        kind,
         slug,
         title: front.title,
         draft: front.draft,
