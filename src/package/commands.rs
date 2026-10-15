@@ -3190,7 +3190,10 @@ app "counter" {
             fn helper() { "fn test_inside_string() {}" }
             fn test_actual() { 1 }
         "#;
-        assert_eq!(discover_test_functions(source), vec!["test_actual".to_string()]);
+        assert_eq!(
+            discover_test_functions(source),
+            vec!["test_actual".to_string()]
+        );
     }
 
     #[test]
@@ -3198,6 +3201,4 @@ app "counter" {
         let source = "fn main() {\n  let s = \"}\"\n  perform IO.print(s)\n}\nfn test_ok() { 1 }\n";
         assert_eq!(strip_main_function(source).trim(), "fn test_ok() { 1 }");
     }
-
-
 }
