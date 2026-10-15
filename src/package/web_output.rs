@@ -78,7 +78,17 @@ fn ensure_managed_destination(target: &Path) -> io::Result<()> {
             Err(invalid("web output is not a real directory"))
         }
         Ok(_) => {
-            if fs::read_dir(target)?.next().is_none() {
+            let entries = fs::read_dir(target)?
+                .map(|entry| entry.map(|item| item.file_name()))
+                .collect::<io::Result<Vec<_>>>()?;
+            // `nula dev` emits only these two artifacts without a deployment
+            // manifest. Permit that known pre-build state, but not arbitrary
+            // user files in a directory we are about to replace.
+            if entries.is_empty()
+                || entries.iter().all(|name| {
+                    matches!(name.to_str(), Some("app.client.js" | "app.signals.json"))
+                })
+            {
                 return Ok(());
             }
             let marker = target.join("nulang-app.ir.json");
