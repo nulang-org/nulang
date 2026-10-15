@@ -1145,6 +1145,42 @@ mod tests {
     }
 
     #[test]
+    fn web_dev_server_fences_cross_origin_mutations_before_dispatch() {
+        fn send(port: u16, raw: &str) -> String {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream.write_all(raw.as_bytes()).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        }
+
+        let server = WebDevServer::bind(0, None, None, vec![]).unwrap();
+        let host = format!("localhost:{}", server.port);
+        let foreign = format!(
+            "POST /mutation HTTP/1.1\r\nHost: {host}\r\nOrigin: https://attacker.example\r\nContent-Length: 0\r\n\r\n"
+        );
+        assert!(send(server.port, &foreign).starts_with("HTTP/1.1 403 Forbidden"));
+
+        let missing = format!(
+            "POST /mutation HTTP/1.1\r\nHost: {host}\r\nContent-Length: 0\r\n\r\n"
+        );
+        assert!(send(server.port, &missing).starts_with("HTTP/1.1 403 Forbidden"));
+
+        let trusted = format!(
+            "POST /mutation HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nContent-Length: 0\r\n\r\n"
+        );
+        assert!(
+            send(server.port, &trusted).starts_with("HTTP/1.1 404 Not Found"),
+            "same-origin requests must reach normal routing"
+        );
+
+        let unknown = format!("TRACE / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        assert!(send(server.port, &unknown).starts_with("HTTP/1.1 501 Not Implemented"));
+    }
+
+    #[test]
     fn http_request_reassembles_fragmented_headers_and_exact_body() {
         let raw = b"POST /submit HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello";
         let request = read_http_request(&mut chunks(raw, 3)).unwrap().unwrap();
