@@ -5,6 +5,7 @@ pub mod budget;
 pub mod content;
 pub mod content_artifacts;
 pub mod content_render;
+pub mod content_site;
 pub mod content_routes;
 pub mod contracts;
 pub mod dispatch;
