@@ -5,6 +5,7 @@
 //! can consume the resulting claims after validated contract compilation.
 
 use crate::web::content::{ContentKind, ContentPage};
+use crate::web::ir::DeploymentIr;
 use crate::web::runtime_bindings::route_pattern_matches;
 use std::collections::BTreeMap;
 
@@ -14,6 +15,24 @@ pub struct ContentRoute {
     pub slug: String,
     pub source_path: String,
     pub kind: ContentKind,
+}
+
+/// Preflight Markdown publication against the authoritative deployment route IR.
+///
+/// The IR must have been generated from validated compiler contracts. This
+/// adapter never re-extracts contracts, selects placement, or renders content.
+/// It reserves all explicit GET/HEAD routes, including server-placed routes,
+/// because a generated static file could otherwise shadow a live endpoint.
+pub fn plan_content_routes_from_ir(
+    pages: &[ContentPage],
+    ir: &DeploymentIr,
+) -> Result<Vec<ContentRoute>, Vec<String>> {
+    let routes: Vec<(&str, &str)> = ir
+        .routes
+        .iter()
+        .map(|route| (route.method.as_str(), route.path.as_str()))
+        .collect();
+    plan_content_routes(pages, &routes)
 }
 
 /// Reserve static content paths against explicit GET and HEAD routes.
