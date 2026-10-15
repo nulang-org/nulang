@@ -421,6 +421,32 @@ mod tests {
         assert!(!f.root.join("dist/index.html").exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn static_parent_symlink_is_not_followed_in_content_build() {
+        use std::os::unix::fs::symlink;
+        let f = Fixture::new();
+        f.write("content/blog/post.md", PUBLIC);
+        std::fs::create_dir_all(f.root.join("real-assets/public")).unwrap();
+        symlink(
+            f.root.join("real-assets"),
+            f.root.join("asset-link"),
+        )
+        .unwrap();
+        let err = stage_content(
+            &f.root,
+            "content",
+            "asset-link/public",
+            "dist",
+            &f.root.join("staging"),
+            &DeploymentIr::default(),
+            "Demo",
+        )
+        .unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+        assert!(!f.root.join("staging/blog/post/index.html").exists());
+    }
+
     #[test]
     fn missing_or_symlinked_content_directory_cannot_generate_empty_success() {
         let f = Fixture::new();
