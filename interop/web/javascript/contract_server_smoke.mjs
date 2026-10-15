@@ -11,18 +11,17 @@ const contract = JSON.parse(await readFile(contractPath, 'utf8'));
 const operation = contract.paths?.['/probe/{id}']?.get;
 assert.equal(operation?.operationId, 'read_probe');
 assert.equal(operation?.parameters?.find(p => p.name === 'id')?.in, 'path');
-assert.equal(operation?.parameters?.find(p => p.name === 'limit')?.in, 'query');
+assert.equal(operation?.parameters?.filter(p => p.in === 'path').length, 1);
 
 const client = new NulangWebClient({baseUrl, contract, timeoutMs: 5000});
 const response = await client.call('read_probe', {
-  path: {id: 7},
-  query: {limit: 35},
+  path: {id: 42},
 });
 assert.equal(response.status, 200);
 assert.equal((await response.text()).trim(), '42');
 
 await assert.rejects(
-  client.call('read_probe', {path: {id: 7}, query: {limit: 'invalid'}}),
+  client.call('read_probe', {path: {id: 'invalid'}}),
   error => {
     assert.ok(error instanceof ApiError);
     assert.equal(error.status, 400);
