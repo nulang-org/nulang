@@ -34,6 +34,8 @@ jobs:
       - name: Build reference host once
         run: cargo build --locked --bin nulang
       - name: Verify existing seven-stage bootstrap checks
-        run: NULANG_BIN="$PWD/target/debug/nulang" bash bootstrap/verify.sh
+        run: |
+          test -x /tmp/cargo-target/debug/nulang
+          NULANG_BIN=/tmp/cargo-target/debug/nulang bash bootstrap/verify.sh
       - name: Differential bootstrap corpus (host vs self-compiled)
-        run: python3 bootstrap/verify_differential.py --nulang "$PWD/target/debug/nulang"
+        run: python3 bootstrap/verify_differential.py --nulang /tmp/cargo-target/debug/nulang
