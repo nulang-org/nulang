@@ -145,4 +145,93 @@ mod tests {
         }
         assert!(parse_page("blog/post.txt", source).is_err());
     }
+
+    struct CollectionFixture(std::path::PathBuf);
+
+    impl CollectionFixture {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "nulang-web-content-{}-{}",
+                std::process::id(),
+                NEXT_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn write(&self, name: &str, text: &str) {
+            let file = self.0.join(name);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, text).unwrap();
+        }
+    }
+
+    impl Drop for CollectionFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn collection_is_sorted_and_preserves_draft_pages_without_publishing() {
+        let fixture = CollectionFixture::new();
+        fixture.write(
+            "blog/zeta.md",
+            "+++\ntitle = \"Zeta\"\ndraft = true\n+++\n# Draft\n",
+        );
+        fixture.write(
+            "blog/alpha/index.md",
+            "+++\ntitle = \"Alpha\"\n+++\n# Article\n",
+        );
+        fixture.write("blog/alpha/photo.png", "ignored asset");
+        fixture.write("index.md", "+++\ntitle = \"Home\"\n+++\n# Home\n");
+
+        let pages = super::load_collection(&fixture.0).unwrap();
+        let slugs: Vec<&str> = pages.iter().map(|page| page.slug.as_str()).collect();
+        assert_eq!(slugs, vec!["/", "/blog/alpha", "/blog/zeta"]);
+        assert!(pages[2].draft);
+        assert_eq!(pages[1].body, "# Article\n");
+    }
+
+    #[test]
+    fn collection_rejects_leaf_bundle_slug_collisions() {
+        let fixture = CollectionFixture::new();
+        fixture.write("news/story.md", "+++\ntitle = \"Leaf\"\n+++\nLeaf");
+        fixture.write("news/story/index.md", "+++\ntitle = \"Bundle\"\n+++\nBundle");
+
+        let err = super::load_collection(&fixture.0).unwrap_err();
+        assert!(err.contains("duplicate"), "{err}");
+        assert!(err.contains("/news/story"), "{err}");
+    }
+
+    #[test]
+    fn collection_rejects_invalid_markdown_and_invalid_subpaths() {
+        let fixture = CollectionFixture::new();
+        fixture.write("valid.md", "+++\ntitle = \"Valid\"\n+++\nOkay");
+        fixture.write("blog/Bad Name.md", "+++\ntitle = \"Invalid Path\"\n+++\nBody");
+        assert!(super::load_collection(&fixture.0).is_err());
+        std::fs::remove_file(fixture.0.join("blog/Bad Name.md")).unwrap();
+        fixture.write("blog/invalid.md", "No front matter");
+        assert!(super::load_collection(&fixture.0).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collection_rejects_symlinked_pages_and_directories() {
+        use std::os::unix::fs::symlink;
+        let fixture = CollectionFixture::new();
+        let outside = CollectionFixture::new();
+        outside.write("secret.md", "+++\ntitle = \"Secret\"\n+++\nSecret");
+        symlink(
+            outside.0.join("secret.md"),
+            fixture.0.join("linked.md"),
+        ).unwrap();
+        assert!(super::load_collection(&fixture.0).is_err());
+        std::fs::remove_file(fixture.0.join("linked.md")).unwrap();
+        symlink(&outside.0, fixture.0.join("directory")).unwrap();
+        assert!(super::load_collection(&fixture.0).is_err());
+        assert!(super::load_collection(&fixture.0.join("directory")).is_err());
+    }
 }
