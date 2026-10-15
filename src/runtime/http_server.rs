@@ -1306,7 +1306,7 @@ mod tests {
     }
 
     #[test]
-    fn web_connection_slots_enforce_limit_and_release_on_drop() {
+    fn test_web_connection_slots_enforce_limit_and_release_on_drop() {
         let slots = Arc::new(ConnectionSlots::new(2));
         let first = slots.try_acquire().expect("first worker capacity");
         let second = slots.try_acquire().expect("second worker capacity");
@@ -1324,7 +1324,7 @@ mod tests {
     }
 
     #[test]
-    fn web_connection_slots_are_bounded_under_concurrent_admission() {
+    fn test_web_connection_slots_are_bounded_under_concurrent_admission() {
         let slots = Arc::new(ConnectionSlots::new(3));
         let start = Arc::new(std::sync::Barrier::new(16));
         let hold = Arc::new(std::sync::Barrier::new(16));
