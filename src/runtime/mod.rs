@@ -1341,12 +1341,9 @@ impl Runtime {
 
             // Until durable completion is coupled to resumptions, keep
             // interpreter-quantum suspension limited to transient actors.
-            let instruction_budget = (*self_ptr)
-                .actors
-                .get(&actor_id)
-                .and_then(|actor| {
-                    (!actor.persistent && !actor.is_workflow).then_some(actor.max_reductions)
-                });
+            let instruction_budget = (*self_ptr).actors.get(&actor_id).and_then(|actor| {
+                (!actor.persistent && !actor.is_workflow).then_some(actor.max_reductions)
+            });
             vm.set_cooperative_instruction_budget(instruction_budget);
             // JIT regions have their own safe-point budget in addition to
             // the interpreter's per-dispatch quantum.
@@ -4295,10 +4292,12 @@ impl Runtime {
                 let result = self.run_bytecode_behavior(actor_id, behavior_idx, &payload);
                 self.suspend_enabled = saved_suspend;
                 match result {
-                    Ok(_) if self
-                        .actors
-                        .get(&actor_id)
-                        .is_some_and(|actor| actor.jit_yield_pending) => {
+                    Ok(_)
+                        if self
+                            .actors
+                            .get(&actor_id)
+                            .is_some_and(|actor| actor.jit_yield_pending) =>
+                    {
                         // A scheduling yield is not a completed behavior or
                         // a durable checkpoint boundary. The continuation
                         // retains exclusive ownership until it finishes.
@@ -5305,12 +5304,9 @@ impl Runtime {
             // regions also honor their existing independent safepoint budget.
             // Until durable completion is coupled to resumptions, keep
             // interpreter-quantum suspension limited to transient actors.
-            let instruction_budget = (*self_ptr)
-                .actors
-                .get(&actor_id)
-                .and_then(|actor| {
-                    (!actor.persistent && !actor.is_workflow).then_some(actor.max_reductions)
-                });
+            let instruction_budget = (*self_ptr).actors.get(&actor_id).and_then(|actor| {
+                (!actor.persistent && !actor.is_workflow).then_some(actor.max_reductions)
+            });
             vm.set_cooperative_instruction_budget(instruction_budget);
             let result = vm.run_from(module_idx, code_offset);
             vm.set_cooperative_instruction_budget(None);
@@ -5320,12 +5316,13 @@ impl Runtime {
             if vm.yield_pending {
                 if let Some(vm_state) = vm.take_suspended_state() {
                     if let Some(actor) = self.actors.get_mut(&actor_id) {
-                        actor.suspended_execution = Some(crate::runtime::actor::SuspendedExecution {
-                            vm_state,
-                            behavior_idx: 0,
-                            activation: actor.current_workflow_activation,
-                            step_name: String::new(),
-                        });
+                        actor.suspended_execution =
+                            Some(crate::runtime::actor::SuspendedExecution {
+                                vm_state,
+                                behavior_idx: 0,
+                                activation: actor.current_workflow_activation,
+                                step_name: String::new(),
+                            });
                         actor.jit_yield_pending = true;
                     }
                 }
