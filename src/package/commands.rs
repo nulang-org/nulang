@@ -3410,12 +3410,10 @@ app "stale-symlink" {
             "stale managed output replaced by a symlink must fail closed"
         );
         assert_eq!(std::fs::read_to_string(&user_file).unwrap(), "protected");
-        assert!(
-            std::fs::symlink_metadata(&stale)
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
+        assert!(std::fs::symlink_metadata(&stale)
+            .unwrap()
+            .file_type()
+            .is_symlink());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
