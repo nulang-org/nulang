@@ -61,7 +61,10 @@ fn new_alias_creates_same_package_structure_as_nula_new() {
 
     let alias = command(&root, &["new", direct_arg]);
     let old = command(&root, &["nula", "new", legacy_arg]);
-    assert!(old.status.success(), "legacy package command failed: {old:?}");
+    assert!(
+        old.status.success(),
+        "legacy package command failed: {old:?}"
+    );
     assert!(alias.status.success(), "new alias failed: {alias:?}");
     for relative in ["Nulang.toml", "src/main.nula"] {
         assert!(direct.join(relative).exists(), "alias missing {relative}");
@@ -95,7 +98,10 @@ fn explicit_prelude_wraps_effects_without_new_language_semantics() {
     )
     .expect("write source");
     let output = command(&root, &[file.to_str().expect("utf-8 path")]);
-    assert!(output.status.success(), "prelude program failed: {output:?}");
+    assert!(
+        output.status.success(),
+        "prelude program failed: {output:?}"
+    );
     assert!(
         String::from_utf8_lossy(&output.stdout).contains("42"),
         "prelude must produce normal IO output: {output:?}"
@@ -125,10 +131,7 @@ fn prelude_does_not_erase_effects_from_closed_function_signatures() {
         "import stdlib::prelude\nfn main() -> Unit ! {} {\n    println(\"IO is an effect\")\n}\n",
     )
     .expect("write source");
-    let output = command(
-        &root,
-        &["check", file.to_str().expect("utf-8 path")],
-    );
+    let output = command(&root, &["check", file.to_str().expect("utf-8 path")]);
     assert!(
         !output.status.success(),
         "prelude wrappers must preserve effect-row checking: {output:?}"
