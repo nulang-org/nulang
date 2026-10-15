@@ -1,6 +1,65 @@
 //! Read-only site rendering: compose admitted content artifacts with HTML.
 //! No filesystem access or publication is permitted in this module.
 
+use crate::web::content::ContentPage;
+use crate::web::content_artifacts::{plan_content_artifacts, ContentArtifact};
+use crate::web::content_render::{render_content_document, ContentLayout};
+use crate::web::ir::DeploymentIr;
+
+/// Fully rendered output owned by a previously validated content artifact claim.
+///
+/// No bytes are written by this type or its constructor. Publication remains
+/// the responsibility of the staged Web build, after all checks have passed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenderedContentDocument {
+    pub artifact: ContentArtifact,
+    pub html: String,
+}
+
+/// Plan and render the entire content collection, or return all diagnostics.
+///
+/// Explicit Web routes and static asset names are checked before any document
+/// is rendered. An invalid page or layout discards the entire candidate site:
+/// callers must not publish a partial result. Stable order comes from the
+/// compiler-aligned artifact planner.
+pub fn render_content_site(
+    pages: &[ContentPage],
+    ir: &DeploymentIr,
+    static_assets: &[&str],
+    layout: &ContentLayout<'_>,
+) -> Result<Vec<RenderedContentDocument>, Vec<String>> {
+    let planned = plan_content_artifacts(pages, ir, static_assets)?;
+    let mut rendered = Vec::with_capacity(planned.len());
+    let mut diagnostics = Vec::new();
+
+    for artifact in planned {
+        let source = pages.iter().find(|page| {
+            !page.draft
+                && page.source_path == artifact.source_path
+                && page.slug == artifact.slug
+        });
+
+        match source {
+            Some(page) => match render_content_document(page, layout) {
+                Ok(html) => rendered.push(RenderedContentDocument { artifact, html }),
+                Err(error) => diagnostics.push(error),
+            },
+            None => diagnostics.push(format!(
+                "planned content source missing: {} for {}",
+                artifact.source_path, artifact.slug
+            )),
+        }
+    }
+
+    if diagnostics.is_empty() {
+        Ok(rendered)
+    } else {
+        diagnostics.sort();
+        diagnostics.dedup();
+        Err(diagnostics)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
