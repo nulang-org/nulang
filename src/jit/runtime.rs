@@ -320,17 +320,18 @@ pub extern "C" fn nulang_icmp_ge(a: u64, b: u64) -> u64 {
 
 #[no_mangle]
 pub extern "C" fn nulang_fadd(a: u64, b: u64) -> u64 {
-    Value::float(f64::from_bits(a) + f64::from_bits(b)).as_raw()
+    // FAdd treats a runtime non-float (e.g. nil from FDiv) as 0.0.
+    Value::float(fval(a) + fval(b)).as_raw()
 }
 
 #[no_mangle]
 pub extern "C" fn nulang_fsub(a: u64, b: u64) -> u64 {
-    Value::float(f64::from_bits(a) - f64::from_bits(b)).as_raw()
+    Value::float(fval(a) - fval(b)).as_raw()
 }
 
 #[no_mangle]
 pub extern "C" fn nulang_fmul(a: u64, b: u64) -> u64 {
-    Value::float(f64::from_bits(a) * f64::from_bits(b)).as_raw()
+    Value::float(fval(a) * fval(b)).as_raw()
 }
 
 /// Float arithmetic that coerces a non-float (nil) operand to 0.0, matching
