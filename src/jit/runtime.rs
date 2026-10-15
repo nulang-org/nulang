@@ -734,6 +734,18 @@ fn jit_leaf_call(func_idx: usize) -> Option<JitLeafCallEntry> {
     })
 }
 
+/// Expose the active native-leaf routing contract to unit tests only. This
+/// reads the actual TLS installed by `execute_compiled`, not the session cache.
+#[cfg(test)]
+pub(crate) fn native_leaf_table_for_test() -> Vec<(usize, u8)> {
+    JIT_LEAF_CALLS.with(|slot| {
+        slot.borrow()
+            .iter()
+            .map(|entry| (entry.func_idx, entry.return_reg))
+            .collect()
+    })
+}
+
 pub unsafe fn set_jit_vm(vm: *mut crate::vm::VM, module_idx: usize) {
     JIT_VM.with(|cell| cell.set(vm));
     JIT_MODULE_IDX.with(|cell| cell.set(module_idx));
