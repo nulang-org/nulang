@@ -7,7 +7,8 @@ use crate::web::ir::DeploymentIr;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-const USAGE: &str = "Usage: nulang web routes [--ir FILE] | nulang web inspect METHOD PATH [--ir FILE]";
+const USAGE: &str =
+    "Usage: nulang web routes [--ir FILE] | nulang web inspect METHOD PATH [--ir FILE]";
 
 /// Render a deterministic route list or inspect one exact method/path claim.
 ///
@@ -110,7 +111,9 @@ pub fn run_cli(args: &[String]) -> Result<String, String> {
     })?;
     inspect_ir_json(
         &source,
-        query.as_ref().map(|(method, path)| (method.as_str(), path.as_str())),
+        query
+            .as_ref()
+            .map(|(method, path)| (method.as_str(), path.as_str())),
     )
 }
 
@@ -149,9 +152,7 @@ fn parse_cli_args(args: &[String]) -> Result<(Option<(String, String)>, PathBuf)
 
     match (command, operands.as_slice()) {
         ("routes", []) => Ok((None, path)),
-        ("inspect", [method, route_path]) => {
-            Ok((Some((method.clone(), route_path.clone())), path))
-        }
+        ("inspect", [method, route_path]) => Ok((Some((method.clone(), route_path.clone())), path)),
         _ => Err(USAGE.to_string()),
     }
 }
