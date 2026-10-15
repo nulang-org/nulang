@@ -3,6 +3,7 @@ pub mod adapters;
 pub mod bindings;
 pub mod budget;
 pub mod content;
+pub mod content_routes;
 pub mod contracts;
 pub mod dispatch;
 pub mod handler_call;
