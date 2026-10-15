@@ -1254,7 +1254,7 @@ fn op_sym_unary(op: crate::ast::UnOp) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::format_source;
+    use super::{format_directory, format_source};
 
     #[test]
     fn test_fmt_rejects_losing_public_api_or_generic_declaration() {
@@ -1286,6 +1286,43 @@ mod tests {
             format_source(source).is_err(),
             "formatting must not silently remove parameter defaults"
         );
+    }
+
+    #[test]
+    fn test_directory_preflight_prevents_partial_writes_on_unsafe_source() {
+        let root = std::env::temp_dir().join(format!(
+            "nulang_fmt_preflight_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("create scratch directory");
+
+        // Both files are valid source. The first is safely formattable; the
+        // second has a comment that the AST printer cannot yet preserve.
+        let safe = root.join("a.nula");
+        let unsafe_file = root.join("z.nula");
+        let original = "import Foo::Bar";
+        std::fs::write(&safe, original).expect("write first source");
+        std::fs::write(&unsafe_file, "fn f() { 1 } // keep this comment\\n")
+            .expect("write unsafe source");
+
+        let result = format_directory(&root, false);
+        assert!(result.is_err(), "unsafe file must refuse the directory format");
+        assert_eq!(
+            std::fs::read_to_string(&safe).expect("read first source"),
+            original,
+            "directory formatting must not mutate earlier files if preflight fails"
+        );
+        assert!(
+            std::fs::read_to_string(&unsafe_file)
+                .expect("read unsafe source")
+                .contains("// keep this comment"),
+            "unsafe source must remain intact"
+        );
+        std::fs::remove_dir_all(root).expect("remove scratch directory");
     }
 
     /// Formatting must be idempotent: formatting the formatted output is a
