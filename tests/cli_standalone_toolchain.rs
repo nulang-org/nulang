@@ -72,36 +72,21 @@ fn prebuilt_cli_scaffolds_builds_runs_and_tests_without_cargo() {
     assert_success(&created, "nula new");
 
     let project = temp.0.join("standalone-smoke");
-    let built = run_without_external_toolchain(
-        &exe,
-        &project,
-        &no_tools,
-        &["nula", "build"],
-    );
+    let built = run_without_external_toolchain(&exe, &project, &no_tools, &["nula", "build"]);
     assert_success(&built, "nula build");
     assert!(
         project.join(".nula/dist/standalone-smoke.nbc").is_file(),
         "nula build must produce the compiled package artifact"
     );
 
-    let ran = run_without_external_toolchain(
-        &exe,
-        &project,
-        &no_tools,
-        &["nula", "run"],
-    );
+    let ran = run_without_external_toolchain(&exe, &project, &no_tools, &["nula", "run"]);
     assert_success(&ran, "nula run");
     assert!(
         String::from_utf8_lossy(&ran.stdout).contains("Library package ready."),
         "nula run must execute the package entry point"
     );
 
-    let tested = run_without_external_toolchain(
-        &exe,
-        &project,
-        &no_tools,
-        &["nula", "test"],
-    );
+    let tested = run_without_external_toolchain(&exe, &project, &no_tools, &["nula", "test"]);
     assert_success(&tested, "nula test");
     assert!(
         String::from_utf8_lossy(&tested.stdout).contains("test result: 1 passed; 0 failed"),
