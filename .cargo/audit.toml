@@ -6,6 +6,15 @@
 # cranelift-jit updating its own memmap2 requirement.
 ignore = [
     "RUSTSEC-2026-0186",
+    # RUSTSEC-2026-0346 / RUSTSEC-2026-0349 hit only rustls 0.22.4, pulled
+    # exclusively through libsql 0.10.0-pre.4 -> hyper-rustls 0.25. rustls
+    # 0.22 is end-of-life (no patched 0.22 release), and every published libsql
+    # release -- including current git main -- still pins hyper-rustls 0.25
+    # (hyper 0.14). These paths only execute when connecting to a remote Turso
+    # database; Nulang's local SQLite file/in-memory stores never reach them.
+    # Tracked until libsql migrates to hyper 1.0 / rustls 0.23.
+    "RUSTSEC-2026-0346",
+    "RUSTSEC-2026-0349",
     # The rustls-webpki advisories below are transitive through libsql
     # 0.10.0-pre.4 -> hyper-rustls 0.25 -> rustls 0.22.4 -> rustls-webpki 0.102.8.
     # No patched libsql release is available, and the vulnerable code path
