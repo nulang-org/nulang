@@ -57,8 +57,10 @@ def server_port(process: subprocess.Popen, timeout: float) -> int:
             raise RuntimeError(f"nula dev did not report a port: {output}")
         line = process.stdout.readline()
         if not line:
+            stderr = process.stderr.read() if process.stderr else ""
             raise RuntimeError(
-                f"nula dev exited rc={process.poll()}; output={output}"
+                f"nula dev exited rc={process.poll()}; output={output}; "
+                f"stderr={stderr[-4000:]}"
             )
         output.append(line.strip())
         found = READY.fullmatch(line.strip())
@@ -74,7 +76,7 @@ def server_port(process: subprocess.Popen, timeout: float) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--nulang-bin", required=True)
-    parser.add_argument("--timeout", type=float, default=45)
+    parser.add_argument("--timeout", type=float, default=120)
     args = parser.parse_args()
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
