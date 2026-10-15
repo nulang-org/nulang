@@ -132,6 +132,13 @@ pub fn match_runtime_route(
     match_segments(&plan.segments, request_path)
 }
 
+/// Match an existing Web route pattern against a content path without
+/// duplicating the compiler/runtime segment grammar.
+pub fn route_pattern_matches(pattern: &str, path: &str) -> Result<bool, String> {
+    let segments = compile_route_segments(pattern)?;
+    Ok(match_segments(&segments, path).is_some())
+}
+
 /// Match a collected route, preferring its compiler plan and falling back to
 /// the existing `:name` runtime convention when no contract was attached.
 pub fn match_attached_route(
