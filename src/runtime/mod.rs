@@ -3265,8 +3265,7 @@ impl Runtime {
     pub fn run_distributed_node(&mut self) {
         // Preserve periodic timer/send-failure maintenance and a fallback for
         // test transports that cannot signal arrivals directly.
-        const MAINTENANCE_INTERVAL: std::time::Duration =
-            std::time::Duration::from_millis(10);
+        const MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
         loop {
             self.process_network();
             self.run_scheduler();
