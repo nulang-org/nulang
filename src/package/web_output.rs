@@ -146,7 +146,7 @@ impl StagedWebOutput {
     }
 
     pub(super) fn publish(self) -> io::Result<()> {
-        self.publish_with(fs::rename)
+        self.publish_with(|from, to| fs::rename(from, to))
     }
 
     /// The injected install operation makes rollback testable without timing
