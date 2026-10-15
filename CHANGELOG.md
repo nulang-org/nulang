@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Typed Web content section semantics — 2026-10-15
+- **Preserve Markdown source-path identity and distinguish `_index.md` sections from ordinary leaf and `index.md` pages.** Both kinds retain canonical slugs; collisions fail closed and collection ordering stays deterministic. This is read-only metadata and does not register routes, render, publish assets, or generate HTML.
+
 ### Experimental typed Web content collection discovery — 2026-10-15
 - **Added a read-only Markdown content metadata boundary for future Hugo-inspired Web pages.** Typed TOML front matter (title, draft, tags) preserves Markdown source and derives canonical slugs from both leaf pages and page-bundle indexes.
 - **Collection discovery now sorts output deterministically, rejects duplicate slugs and malformed pages, and refuses symlinked content entries.** No Markdown renderer, route registration, asset publishing or deployment-IR integration is introduced by this change.
