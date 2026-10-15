@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Experimental Web staged build publication — 2026-10-15
+- **`nula build --web` stages complete output before publishing.** Compiler validation, static-route prerender, asset copying, deployment IR generation, and configured JavaScript budgets must succeed before the prior `dist` tree is replaced. Successful rebuilds remove obsolete generated artifacts.
+- **Publication protects project inputs and previous successful output.** Reject unsafe or symlinked output roots, accidental replacement of unmanaged directories, traversing static artifact paths, and concurrent builds for the same destination. Synchronous rename failures attempt to restore the previous tree.
+- **Crash/power-loss limitations remain explicit.** Publication uses two renames and is not a crash-atomic filesystem transaction; interrupted builds may leave a backup and lock requiring operator inspection. This work is stacked on the validated-contract and static-route-only Web changes (#1734 and #1738).
+
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
