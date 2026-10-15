@@ -1407,13 +1407,13 @@ fn cmd_build_web() -> NuResult<()> {
     let src_root = root.join("src");
     // Validate once: runtime route plans and deployment IR must consume the
     // same compiler-owned contracts rather than re-extracting source.
-    let validated_contracts =
-        crate::web::validation::compile_validated_contracts_from_tree(&src_root).map_err(
-            |diagnostics| NuError::PackageError {
-                msg: format!("invalid web route contract:\n{}", diagnostics.join("\n")),
-                span: Span::default(),
-            },
-        )?;
+    let validated_contracts = crate::web::validation::compile_validated_contracts_from_tree(
+        &src_root,
+    )
+    .map_err(|diagnostics| NuError::PackageError {
+        msg: format!("invalid web route contract:\n{}", diagnostics.join("\n")),
+        span: Span::default(),
+    })?;
     crate::web::dispatch::compile_runtime_routes_from_contracts(
         routes.clone(),
         &validated_contracts,
@@ -1506,7 +1506,11 @@ fn cmd_build_web() -> NuResult<()> {
     // A failed build drops the stage and preserves the previous output.
     // Publication uses same-parent renames with rollback on install errors.
     staged.publish().map_err(|e| NuError::PackageError {
-        msg: format!("cannot publish web output {}: {}", published_dir.display(), e),
+        msg: format!(
+            "cannot publish web output {}: {}",
+            published_dir.display(),
+            e
+        ),
         span: Span::default(),
     })?;
     println!("Web build succeeded: {}", published_dir.display());
@@ -3156,10 +3160,8 @@ app "mixed-routes" {
 
     #[test]
     fn test_cmd_build_web_failed_budget_preserves_published_site() {
-        let dir = std::env::temp_dir().join(format!(
-            "nulang_web_build_preserve_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("nulang_web_build_preserve_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         scaffold_package(&dir, "budget-site", "web").unwrap();
@@ -3195,10 +3197,8 @@ app "mixed-routes" {
 
     #[test]
     fn test_cmd_build_web_success_removes_obsolete_published_files() {
-        let dir = std::env::temp_dir().join(format!(
-            "nulang_web_build_clean_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("nulang_web_build_clean_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         scaffold_package(&dir, "clean-site", "web").unwrap();
