@@ -3086,9 +3086,11 @@ import stdlib::web::types
 
 fn home() -> Html { text("Static homepage") }
 fn submit() -> Html { text("Server response") }
+fn status() -> Json[String] { "{\"ok\":true}" }
 
 app "mixed-routes" {
     route "GET" "/" -> home
+    route "GET" "/api/status" -> status
     route "POST" "/submit" -> submit
 }
 "#,
@@ -3099,6 +3101,10 @@ app "mixed-routes" {
         cmd_build_web().expect("mixed static/server Web build should succeed");
 
         assert!(dir.join("dist/index.html").is_file());
+        assert!(
+            !dir.join("dist/api/status/index.html").exists(),
+            "GET Json[T] routes must not be prerendered as public HTML"
+        );
         assert!(
             !dir.join("dist/submit/index.html").exists(),
             "POST server routes must not be prerendered as public static pages"
@@ -3115,6 +3121,13 @@ app "mixed-routes" {
             .expect("server route metadata must still be emitted");
         assert_eq!(server["placement"], "server");
         assert!(server["artifact"].is_null());
+        let json = routes
+            .iter()
+            .find(|route| route["method"] == "GET" && route["path"] == "/api/status")
+            .expect("JSON server route metadata must be emitted");
+        assert_eq!(json["placement"], "server");
+        assert!(json["artifact"].is_null());
+        assert_eq!(json["response"]["media_type"], "application/json");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
