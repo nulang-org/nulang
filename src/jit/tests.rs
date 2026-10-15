@@ -20,6 +20,57 @@ fn call_free_compiled_execution_skips_leaf_table_install() {
     );
 }
 
+#[test]
+fn test_native_leaf_dispatch_table_is_cached_by_module() {
+    let mut jit = make_jit();
+    let ptr = std::ptr::NonNull::<u8>::dangling().as_ptr() as *const u8;
+    let first = NativeLeafCall {
+        ptr,
+        return_reg: 7,
+        required_args: 2,
+    };
+    let second = NativeLeafCall {
+        ptr,
+        return_reg: 9,
+        required_args: 1,
+    };
+
+    jit.cache_native_leaf_call(0, 3, first);
+    jit.cache_native_leaf_call(1, 3, second);
+    jit.cache_native_leaf_call(0, 8, second);
+
+    assert_eq!(
+        jit.native_leaf_table(0),
+        &[(3, ptr, 7, 2), (8, ptr, 9, 1)]
+    );
+    assert_eq!(jit.native_leaf_table(1), &[(3, ptr, 9, 1)]);
+    assert!(jit.native_leaf_table(2).is_empty());
+    assert_eq!(jit.native_leaf_calls.len(), 3);
+
+    // A duplicate compilation must not append a second dispatch entry.
+    jit.cache_native_leaf_call(0, 3, first);
+    assert_eq!(jit.native_leaf_table(0).len(), 2);
+    assert_eq!(jit.native_leaf_calls.len(), 3);
+
+    // A region that uses helper-backed calls still executes through the
+    // existing TLS dispatch contract, without borrowing another module's table.
+    jit.store_compiled_with_metadata(
+        0,
+        0,
+        noop_jit_region as *const u8,
+        1,
+        CompilationTier::Baseline,
+        CodegenOptimization::Fast,
+        true,
+        0,
+    );
+    let mut regs = [0u64; 256];
+    assert_eq!(
+        crate::backends::JitBackend::execute_compiled(&mut jit, 0, 0, &mut regs, &[]),
+        crate::backends::TieredAction::RanJit
+    );
+}
+
 fn make_jit() -> JitSession {
     JitSession::new().expect("JIT must be available on test host")
 }
