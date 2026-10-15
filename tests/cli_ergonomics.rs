@@ -138,3 +138,52 @@ fn prelude_does_not_erase_effects_from_closed_function_signatures() {
     );
     std::fs::remove_dir_all(root).expect("remove temp directory");
 }
+
+#[test]
+fn doctor_reports_the_installed_binary_without_modifying_the_project() {
+    let root = temp_dir("doctor");
+    std::fs::write(root.join("sentinel.txt"), "unchanged").expect("create sentinel");
+
+    let result = command(&root, &["doctor"]);
+    assert!(result.status.success(), "doctor failed: {result:?}");
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    for required in [
+        "Nulang doctor",
+        "compiler version:",
+        "language version:",
+        "target:",
+        "binary:",
+        "stdlib:",
+        "package:",
+        "compiled features:",
+    ] {
+        assert!(stdout.contains(required), "missing {required}: {stdout}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.join("sentinel.txt")).expect("read sentinel"),
+        "unchanged"
+    );
+    assert_eq!(
+        std::fs::read_dir(&root).expect("read project").count(),
+        1,
+        "doctor must not create build artifacts or configuration files"
+    );
+    std::fs::remove_dir_all(root).expect("remove temp directory");
+}
+
+#[test]
+fn doctor_rejects_extra_arguments_without_writing_files() {
+    let root = temp_dir("doctor_args");
+    let result = command(&root, &["doctor", "--fix"]);
+    assert!(!result.status.success(), "doctor accepted an unknown flag");
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("Usage: nulang doctor"),
+        "doctor must explain supported syntax"
+    );
+    assert_eq!(
+        std::fs::read_dir(&root).expect("read project").count(),
+        0,
+        "an invalid doctor invocation must be read-only"
+    );
+    std::fs::remove_dir_all(root).expect("remove temp directory");
+}
