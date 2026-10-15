@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Web mutation-origin provenance — 2026-10-15
+- **The experimental Web dev-server rejects cross-origin and missing-origin state-changing requests before route dispatch.** The policy uses unambiguous Host/Origin/Referer and Fetch Metadata checks from the existing #1510 validation module, integrated on top of merged bounded HTTP framing (#1672).
+- **A real-TCP regression covers rejected foreign/missing provenance and admitted same-origin mutations**, while standalone low-level Http.serve remains outside this Web-specific gate. This is not session authentication or tenant authorization; HTTPS proxies configure NULANG_WEB_PUBLIC_ORIGIN.
+
 ### Experimental Web HTML host hardening — 2026-10-15
 - **`Web.html` now validates dynamic element and attribute names and URL-bearing attributes before rendering.** Unsafe markup and scriptable URL schemes fail closed; quoted attribute delimiters are escaped while already escaped `Html` text is preserved.
 - **Six focused regression tests cover normal markup, attribute breakouts, event attributes, high-risk elements, obfuscated URLs, and safe relative/HTTP links.** `Web.raw` remains a trusted-only escape hatch; dynamic script/style/SVG and inline style/event attributes are intentionally rejected pending a future typed context-aware API.
