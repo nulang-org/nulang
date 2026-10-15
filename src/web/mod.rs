@@ -7,6 +7,7 @@ pub mod dispatch;
 pub mod handler_call;
 pub mod http_problem;
 pub mod http_request;
+pub mod inspect;
 pub mod ir;
 pub mod modules;
 pub mod openapi;
