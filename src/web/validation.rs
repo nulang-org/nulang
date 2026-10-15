@@ -8,7 +8,8 @@
 use crate::web::bindings::compile_route_bindings;
 use crate::web::contracts::ContractCompilation;
 use crate::web::package_contracts::compile_contracts_from_tree;
-use std::collections::HashSet;
+use crate::web::runtime_bindings::{compile_route_segments, RuntimeRouteSegment};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// Compile and validate every statically extractable route contract in a
@@ -62,6 +63,32 @@ pub fn validation_diagnostics(compilation: &ContractCompilation) -> Vec<String> 
     let mut diagnostics = compilation.diagnostics.clone();
     for route in &compilation.routes {
         diagnostics.extend(compile_route_bindings(route).diagnostics);
+    }
+
+    // The runtime matches path segments, not parameter names. A later route
+    // with the same method and literal/parameter shape is unreachable, while
+    // OpenAPI would silently overwrite one operation. Reject that disagreement
+    // at the shared compiler-owned validation boundary before serving/building.
+    let mut route_shapes: HashMap<(String, Vec<Option<String>>), &str> = HashMap::new();
+    for route in &compilation.routes {
+        // Malformed paths already have extractor diagnostics; do not invent a
+        // second, differently worded validation policy here.
+        if let Ok(segments) = compile_route_segments(&route.path) {
+            let shape = segments
+                .into_iter()
+                .map(|segment| match segment {
+                    RuntimeRouteSegment::Literal(value) => Some(value),
+                    RuntimeRouteSegment::PathParam(_) => None,
+                })
+                .collect();
+            let method = route.method.to_ascii_uppercase();
+            if let Some(previous) = route_shapes.insert((method.clone(), shape), &route.path) {
+                diagnostics.push(format!(
+                    "ambiguous route {method}: '{previous}' and '{}' match the same request paths",
+                    route.path
+                ));
+            }
+        }
     }
 
     let mut seen = HashSet::new();
