@@ -3166,6 +3166,7 @@ app "mixed-routes" {
         std::fs::create_dir_all(&dir).unwrap();
         scaffold_package(&dir, "budget-site", "web").unwrap();
         std::fs::create_dir_all(dir.join("dist")).unwrap();
+        std::fs::write(dir.join("dist/nulang-app.ir.json"), "{}").unwrap();
         std::fs::write(dir.join("dist/index.html"), "previous deploy").unwrap();
         std::fs::write(dir.join("dist/keep.txt"), "previous file").unwrap();
 
@@ -3203,6 +3204,7 @@ app "mixed-routes" {
         std::fs::create_dir_all(&dir).unwrap();
         scaffold_package(&dir, "clean-site", "web").unwrap();
         std::fs::create_dir_all(dir.join("dist")).unwrap();
+        std::fs::write(dir.join("dist/nulang-app.ir.json"), "{}").unwrap();
         std::fs::write(dir.join("dist/obsolete.html"), "no longer in site").unwrap();
 
         let _guard = ChangeDir::new(&dir);
