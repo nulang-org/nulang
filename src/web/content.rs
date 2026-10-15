@@ -3,9 +3,20 @@
 
 use serde::Deserialize;
 
+/// Semantic content category, independent of its canonical route slug.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentKind {
+    Page,
+    Section,
+}
+
 /// One validated content entry. Slugs are stable, leading-slash route paths.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContentPage {
+    /// Collection-relative Markdown source location for diagnostics and future build invalidation.
+    pub source_path: String,
+    /// `_index.md` denotes a collection section; other Markdown files are pages.
+    pub kind: ContentKind,
     pub slug: String,
     pub title: String,
     pub draft: bool,
@@ -30,6 +41,11 @@ struct FrontMatter {
 /// or implicit route registration occurs here.
 pub fn parse_page(relative_path: &str, source: &str) -> Result<ContentPage, String> {
     let slug = slug_from_relative_path(relative_path)?;
+    let kind = if relative_path.rsplit('/').next() == Some("_index.md") {
+        ContentKind::Section
+    } else {
+        ContentKind::Page
+    };
     let payload = source
         .strip_prefix("+++\n")
         .ok_or_else(|| format!("{relative_path}: expected TOML +++ front matter"))?;
@@ -45,6 +61,8 @@ pub fn parse_page(relative_path: &str, source: &str) -> Result<ContentPage, Stri
         return Err(format!("{relative_path}: content tags must not be empty"));
     }
     Ok(ContentPage {
+        source_path: relative_path.to_string(),
+        kind,
         slug,
         title: front.title,
         draft: front.draft,
@@ -317,6 +335,75 @@ mod tests {
         std::fs::remove_file(fixture.0.join("blog/Bad Name.md")).unwrap();
         fixture.write("blog/invalid.md", "No front matter");
         assert!(super::load_collection(&fixture.0).is_err());
+    }
+
+    #[test]
+    fn section_indexes_are_distinct_from_leaf_and_bundle_pages() {
+        use super::ContentKind;
+
+        let source = "+++\ntitle = \"Docs\"\n+++\nContent";
+        let section = parse_page("docs/_index.md", source).unwrap();
+        let bundle = parse_page("docs/index.md", source).unwrap();
+        let leaf = parse_page("docs.md", source).unwrap();
+        let root_section = parse_page("_index.md", source).unwrap();
+
+        assert_eq!(section.slug, "/docs");
+        assert_eq!(section.kind, ContentKind::Section);
+        assert_eq!(section.source_path, "docs/_index.md");
+        assert_eq!(bundle.slug, "/docs");
+        assert_eq!(bundle.kind, ContentKind::Page);
+        assert_eq!(bundle.source_path, "docs/index.md");
+        assert_eq!(leaf.kind, ContentKind::Page);
+        assert_eq!(leaf.source_path, "docs.md");
+        assert_eq!(root_section.slug, "/");
+        assert_eq!(root_section.kind, ContentKind::Section);
+    }
+
+    #[test]
+    fn collection_preserves_page_and_section_origins_deterministically() {
+        use super::ContentKind;
+        let fixture = CollectionFixture::new();
+        fixture.write("docs/_index.md", "+++\ntitle = \"Docs\"\n+++\nIntro");
+        fixture.write(
+            "docs/guides/getting-started/index.md",
+            "+++\ntitle = \"Start\"\n+++\nStart",
+        );
+        fixture.write(
+            "docs/guides/_index.md",
+            "+++\ntitle = \"Guides\"\n+++\nGuides",
+        );
+        let entries = super::load_collection(&fixture.0).unwrap();
+        let actual: Vec<_> = entries
+            .iter()
+            .map(|entry| (entry.slug.as_str(), entry.source_path.as_str(), entry.kind))
+            .collect();
+        assert_eq!(
+            actual,
+            vec![
+                ("/docs", "docs/_index.md", ContentKind::Section),
+                (
+                    "/docs/guides",
+                    "docs/guides/_index.md",
+                    ContentKind::Section
+                ),
+                (
+                    "/docs/guides/getting-started",
+                    "docs/guides/getting-started/index.md",
+                    ContentKind::Page,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn collection_rejects_page_and_section_claiming_same_slug() {
+        let fixture = CollectionFixture::new();
+        fixture.write("docs.md", "+++\ntitle = \"Page\"\n+++\nPage");
+        fixture.write("docs/_index.md", "+++\ntitle = \"Section\"\n+++\nSection");
+        let error = super::load_collection(&fixture.0).unwrap_err();
+        assert!(error.contains("duplicate content slug /docs"), "{error}");
+        assert!(error.contains("docs.md"), "{error}");
+        assert!(error.contains("docs/_index.md"), "{error}");
     }
 
     #[cfg(unix)]

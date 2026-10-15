@@ -3,6 +3,9 @@
 - **Pinned supported TLS and WASM runtime dependencies to patched versions.** Updated rustls 0.23.45 to 0.23.46 and Wasmtime 48.0.5 to 48.0.6 (including compatible Cranelift and runtime lockfile packages) to address October 2026 RustSec advisories.
 - **Documented the remaining legacy rustls 0.22 advisories in the Cargo audit policy.** The affected version is transitive through libsql's hyper-rustls 0.25 path; explicit advisory exceptions are restricted to the documented IDs until the upstream dependency chain is upgraded.
 
+### Typed Web content section semantics — 2026-10-15
+- **Preserve Markdown source-path identity and distinguish `_index.md` sections from ordinary leaf and `index.md` pages.** Both kinds retain canonical slugs; collisions fail closed and collection ordering stays deterministic. This is read-only metadata and does not register routes, render, publish assets, or generate HTML.
+
 ### Experimental typed Web content collection discovery — 2026-10-15
 - **Added a read-only Markdown content metadata boundary for future Hugo-inspired Web pages.** Typed TOML front matter (title, draft, tags) preserves Markdown source and derives canonical slugs from both leaf pages and page-bundle indexes.
 - **Collection discovery now sorts output deterministically, rejects duplicate slugs and malformed pages, and refuses symlinked content entries.** No Markdown renderer, route registration, asset publishing or deployment-IR integration is introduced by this change.
