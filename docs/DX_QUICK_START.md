@@ -26,6 +26,13 @@ The prelude is **opt in**; it provides a tiny set of ordinary functions:
 The primitive operations remain available. The wrapper does not bypass effect
 tracking, capability checks, or external-authority policy.
 
+## Inspect the installed toolchain
+
+Run `nulang doctor` to inspect the executable path, compiler/language versions,
+compiled features, standard-library directory, and local package manifest.
+This is a read-only report, not a dependency installer or runtime-readiness check.
+It does not require Cargo or Rust to be present alongside the installed CLI.
+
 ## Working with packages
 
 ```bash
