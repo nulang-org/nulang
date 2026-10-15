@@ -24,6 +24,14 @@ normal error unwinding. If installing the new directory fails after the old
 directory has been renamed aside, the publisher attempts to restore the old
 directory and returns an error.
 
+To avoid destructive first-time publication over unrelated directories, a
+nonempty existing output must contain the `nulang-app.ir.json` marker from a
+previous Nulang Web build. The two files emitted by `nula dev`
+(`app.client.js` and `app.signals.json`) are recognized as a safe
+pre-build output when no other files are present. Other nonempty directories
+are rejected; choose a dedicated build path or explicitly migrate its
+contents rather than treating arbitrary files as generated output.
+
 Concurrent `nula build --web` invocations for the same output path are
 rejected using an exclusive sibling lock file. The configured output must be
 a normal relative path and cannot overlap `src`, `.nula`, `.git`, or the
