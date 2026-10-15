@@ -62,6 +62,29 @@ fn validate_content_directory(
     Ok(destination)
 }
 
+/// Validate every configured static source path component, not just its
+/// final directory. A symlinked parent could otherwise escape asset preflight.
+fn inspect_static_root(package_root: &Path, static_dir: &str) -> Result<Option<PathBuf>, String> {
+    let mut path = package_root
+        .canonicalize()
+        .map_err(|error| format!("invalid package root: {error}"))?;
+    for part in Path::new(static_dir).components() {
+        path.push(part.as_os_str());
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(format!("static source symlink forbidden: {}", path.display()));
+            }
+            Ok(meta) if !meta.is_dir() => {
+                return Err(format!("static source must be a directory: {}", path.display()));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("cannot inspect static source {}: {error}", path.display())),
+        }
+    }
+    Ok(Some(path))
+}
+
 fn collect_static_asset_names(root: &Path) -> Result<Vec<String>, String> {
     let kind = match fs::symlink_metadata(root) {
         Ok(meta) => meta.file_type(),
@@ -138,7 +161,10 @@ pub(super) fn stage_content(
 ) -> Result<usize, String> {
     let root = validate_content_directory(package_root, content_dir, static_dir, output_dir)?;
     let pages = load_collection(&root)?;
-    let static_files = collect_static_asset_names(&package_root.join(static_dir))?;
+    let static_files = match inspect_static_root(package_root, static_dir)? {
+        Some(root) => collect_static_asset_names(&root)?,
+        None => Vec::new(),
+    };
     let static_paths: Vec<&str> = static_files.iter().map(String::as_str).collect();
     let docs = render_content_site(
         &pages,
