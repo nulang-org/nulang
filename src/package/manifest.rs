@@ -44,6 +44,7 @@ impl Default for WebSection {
             port: default_web_port(),
             static_dir: default_static_dir(),
             output_dir: default_output_dir(),
+            content_dir: None,
         }
     }
 }
@@ -98,6 +99,10 @@ pub struct WebSection {
     /// Directory where `nula build --web` emits the static site.
     #[serde(default = "default_output_dir")]
     pub output_dir: String,
+    /// Opt-in collection root for typed Markdown page/section publishing.
+    /// Absent by default: existing Web builds have no content side effects.
+    #[serde(default)]
+    pub content_dir: Option<String>,
 }
 
 fn default_web_port() -> u16 {
@@ -288,6 +293,21 @@ mod tests {
     fn test_manifest_parse_invalid_toml_fails() {
         let err = Manifest::parse("not [valid toml").expect_err("garbage should not parse");
         assert!(matches!(err, NuError::PackageError { msg: _, span: _ }));
+    }
+
+    #[test]
+    fn web_content_publishing_is_explicitly_opt_in() {
+        let without_content = Manifest::parse(
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n"
+        )
+        .unwrap();
+        assert_eq!(without_content.web.content_dir, None);
+
+        let opted_in = Manifest::parse(
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n[web]\ncontent_dir = \"content\"\n"
+        )
+        .unwrap();
+        assert_eq!(opted_in.web.content_dir.as_deref(), Some("content"));
     }
 
     #[test]

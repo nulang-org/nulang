@@ -1,4 +1,15 @@
 # Nulang Changelog
+### Opt-in Markdown publishing through staged Web output — 2026-10-15
+- **Add explicit `[web].content_dir` to publish typed Markdown through existing static-build staging.** Discover, route-admit, render and reserve every content artifact before writes; reject collisions with static assets, live Web routes and existing staged output.
+- **Retain previous site on failed Markdown builds.** Validated stage output is only promoted after static asset copying, IR emission and budget checks. Existing builds remain unchanged unless the content feature is explicitly enabled.
+- **Keep the Markdown v1 subset and crash-atomicity limitations explicit.** Full CommonMark, stronger source race protection and comprehensive end-to-end validation remain separate release gates.
+
+### Experimental Web staged build publication — 2026-10-15
+- **`nula build --web` stages complete output before publishing.** Compiler validation, static-route prerender, asset copying, deployment IR generation, and configured JavaScript budgets must succeed before the prior `dist` tree is replaced. Successful rebuilds remove obsolete generated artifacts.
+- **Publication protects project inputs and previous successful output.** Reject unsafe or symlinked output roots, accidental replacement of unmanaged directories, traversing static artifact paths, and concurrent builds for the same destination. Synchronous rename failures attempt to restore the previous tree.
+- **Crash/power-loss limitations remain explicit.** Publication uses two renames and is not a crash-atomic filesystem transaction; interrupted builds may leave a backup and lock requiring operator inspection. This work is stacked on the validated-contract and static-route-only Web changes (#1734 and #1738).
+
+
 ### Read-only Markdown site render composition — 2026-10-15
 - **Compose validated Markdown artifact claims with the escaped HTML renderer.** The new in-memory site pass returns deterministic per-artifact HTML and fails the entire candidate site when any public page, layout, route admission, or static-file collision is invalid.
 - **No filesystem writes or deployments.** The staged Web build remains the only intended publication point. Six tests cover deterministic ordering, drafts, route/static conflicts, malformed content, and layout failures.
