@@ -104,7 +104,8 @@ fn prebuilt_cli_scaffolds_builds_runs_and_tests_without_cargo() {
     );
     assert_success(&tested, "nula test");
     assert!(
-        String::from_utf8_lossy(&tested.stdout).contains("passed"),
-        "nula test must execute package tests"
+        String::from_utf8_lossy(&tested.stdout).contains("test result: 1 passed; 0 failed"),
+        "nula test must discover and execute the library template test; output: {}",
+        String::from_utf8_lossy(&tested.stdout)
     );
 }
