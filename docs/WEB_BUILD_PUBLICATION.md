@@ -19,8 +19,9 @@ adapters can continue reading it after `nula build --web` returns successfully.
 ## Failed builds
 
 Compile, route-validation, prerender, asset-copy, IR-write, and budget failures
-leave the previous output untouched. The staging directory is cleaned up on
-normal error unwinding. If installing the new directory fails after the old
+leave the previous output untouched. When no output exists yet, a failed first
+build leaves the configured target absent. The staging directory is cleaned up
+on normal error unwinding. If installing the new directory fails after the old
 directory has been renamed aside, the publisher attempts to restore the old
 directory and returns an error.
 

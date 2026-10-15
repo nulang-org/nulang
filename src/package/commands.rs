@@ -3197,6 +3197,43 @@ app "mixed-routes" {
     }
 
     #[test]
+    fn test_cmd_build_web_failed_initial_budget_leaves_output_absent() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_web_build_initial_failure_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        scaffold_package(&dir, "initial-budget-site", "web").unwrap();
+        let output = dir.join("dist");
+        assert!(
+            !output.exists(),
+            "the fixture must begin without published web output"
+        );
+
+        let manifest_path = dir.join("Nulang.toml");
+        let manifest = std::fs::read_to_string(&manifest_path).unwrap();
+        std::fs::write(
+            &manifest_path,
+            format!("{manifest}\n[budgets]\ninitial_js = \"1B\"\n"),
+        )
+        .unwrap();
+
+        let _guard = ChangeDir::new(&dir);
+        let error = cmd_build_web().expect_err("oversized client runtime must fail");
+        assert!(
+            format!("{error:?}").contains("performance budget exceeded"),
+            "failure should occur after artifacts are staged: {error:?}"
+        );
+        assert!(
+            !output.exists(),
+            "a failed initial staged build must not create the published output directory"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_cmd_build_web_success_removes_obsolete_published_files() {
         let dir =
             std::env::temp_dir().join(format!("nulang_web_build_clean_{}", std::process::id()));
