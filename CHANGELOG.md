@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Read-only Markdown site render composition — 2026-10-15
+- **Compose validated Markdown artifact claims with the escaped HTML renderer.** The new in-memory site pass returns deterministic per-artifact HTML and fails the entire candidate site when any public page, layout, route admission, or static-file collision is invalid.
+- **No filesystem writes or deployments.** The staged Web build remains the only intended publication point. Six tests cover deterministic ordering, drafts, route/static conflicts, malformed content, and layout failures.
+
 ### Safe Markdown subset rendering and reusable HTML layout — 2026-10-15
 - **Add a small, explicit Markdown-to-HTML renderer with escaped content and metadata.** Supports ATX headings, paragraphs, unordered lists, fenced code blocks, and inline code; rejects draft rendering, malformed fences, and unsupported link, image, or emphasis syntax. No active raw HTML passes through.
 - **Introduce a reusable document layout** with validated language metadata and escaped site/page titles. This renders in memory only; no asset emission, automatic route registration, or build publication is enabled. Full CommonMark remains a separate dependency decision.
