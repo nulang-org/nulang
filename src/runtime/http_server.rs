@@ -366,10 +366,7 @@ impl HttpServerState {
         {
             let fallback = HttpResponse {
                 status: 500,
-                headers: vec![(
-                    "Content-Type".into(),
-                    "text/plain; charset=utf-8".into(),
-                )],
+                headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
                 body: b"Internal server error".to_vec(),
             };
             return Self::write_response(stream, &fallback);
@@ -557,9 +554,8 @@ where
 fn http_token(input: &str) -> bool {
     !input.is_empty()
         && input.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || b"!#$%&'*+-.^_|~".contains(&byte)
-                || byte == 0x60 // backtick
+            byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_|~".contains(&byte) || byte == 0x60
+            // backtick
         })
 }
 
@@ -1204,7 +1200,6 @@ mod tests {
         }
     }
 
-
     fn write_test_response(response: HttpResponse) -> String {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind local test listener");
         let address = listener.local_addr().expect("local listener address");
@@ -1214,7 +1209,9 @@ mod tests {
         });
         let mut connection = TcpStream::connect(address).expect("connect test client");
         let mut output = Vec::new();
-        connection.read_to_end(&mut output).expect("read HTTP response");
+        connection
+            .read_to_end(&mut output)
+            .expect("read HTTP response");
         server.join().expect("response writer did not panic");
         String::from_utf8(output).expect("HTTP output is UTF-8")
     }
@@ -1233,7 +1230,10 @@ mod tests {
                 headers: vec![(name.into(), value.into())],
                 body: b"trusted".to_vec(),
             });
-            assert!(result.starts_with("HTTP/1.1 500 Internal Server Error\r\n"), "{result}");
+            assert!(
+                result.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+                "{result}"
+            );
             assert!(!result.contains("X-Injected"), "{result}");
             assert!(!result.contains("trusted"), "{result}");
             assert_eq!(result.matches("Content-Length:").count(), 1, "{result}");
@@ -1253,7 +1253,10 @@ mod tests {
         clear_cookie("session");
         let cookies = take_response_cookies();
         assert_eq!(cookies.len(), 2);
-        assert_eq!(cookies[0], "session=safe_token-123; Path=/; HttpOnly; SameSite=Lax");
+        assert_eq!(
+            cookies[0],
+            "session=safe_token-123; Path=/; HttpOnly; SameSite=Lax"
+        );
         assert_eq!(cookies[1], "session=; Path=/; Max-Age=0; SameSite=Lax");
     }
 
