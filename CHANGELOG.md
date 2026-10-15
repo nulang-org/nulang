@@ -1,4 +1,8 @@
 # Nulang Changelog
+
+### Durable execution artifact pin preflight — 2026-10-15
+- **An opt-in preflight pins each durable execution to a stable identity, exact executable BLAKE3 digest, and canonical behavior manifest digest.** The `nulang-execution-preflight pin|verify` CLI checks the immutable artifact bytes and rejects missing, mismatched, unsupported, or corrupt pins rather than assuming schema compatibility proves replay safety.
+- **Runtime admission and recovery are not yet automatically pinned by this preflight.** Atomic workflow creation, verified bytecode recovery, distributed ownership fencing, and Cloud artifact retention/admission require separate integration and fault-injection validation before production use.
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
