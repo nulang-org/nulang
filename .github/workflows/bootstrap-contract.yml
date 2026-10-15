@@ -6,11 +6,13 @@ on:
     paths:
       - 'bootstrap/**'
       - 'scripts/tests/test_bootstrap_differential.py'
+      - 'scripts/tests/test_bootstrap_fixup_contract.py'
       - '.github/workflows/bootstrap-contract.yml'
   pull_request:
     paths:
       - 'bootstrap/**'
       - 'scripts/tests/test_bootstrap_differential.py'
+      - 'scripts/tests/test_bootstrap_fixup_contract.py'
       - '.github/workflows/bootstrap-contract.yml'
   workflow_dispatch:
 
@@ -28,7 +30,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Validate harness contract
-        run: python3 -m unittest discover -s scripts/tests -p test_bootstrap_differential.py
+        run: |
+          python3 -m unittest discover -s scripts/tests -p test_bootstrap_differential.py
+          python3 -m unittest discover -s scripts/tests -p test_bootstrap_fixup_contract.py
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build reference host once
