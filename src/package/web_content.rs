@@ -349,6 +349,75 @@ mod tests {
     }
 
     #[test]
+    fn failed_content_build_preserves_last_published_site() {
+        let f = Fixture::new();
+        f.write("dist/nulang-app.ir.json", "{}");
+        f.write("dist/index.html", "last good site");
+        f.write(
+            "content/blog/bad.md",
+            "+++\ntitle = \"Bad\"\n+++\n[unsupported](https://example.org)\n",
+        );
+
+        let staged = crate::package::web_output::StagedWebOutput::new(
+            &f.root,
+            "dist",
+            "static",
+        )
+        .unwrap();
+        let result = stage_content(
+            &f.root,
+            "content",
+            "static",
+            "dist",
+            staged.path(),
+            &DeploymentIr::default(),
+            "Demo",
+        );
+        assert!(result.is_err());
+        drop(staged);
+
+        assert_eq!(
+            std::fs::read_to_string(f.root.join("dist/index.html")).unwrap(),
+            "last good site"
+        );
+    }
+
+    #[test]
+    fn successful_content_stage_publishes_only_after_final_promotion() {
+        let f = Fixture::new();
+        f.write("dist/nulang-app.ir.json", "{}");
+        f.write("dist/index.html", "last good site");
+        f.write("content/blog/post.md", PUBLIC);
+
+        let staged = crate::package::web_output::StagedWebOutput::new(
+            &f.root,
+            "dist",
+            "static",
+        )
+        .unwrap();
+        let count = stage_content(
+            &f.root,
+            "content",
+            "static",
+            "dist",
+            staged.path(),
+            &DeploymentIr::default(),
+            "Demo",
+        )
+        .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            std::fs::read_to_string(f.root.join("dist/index.html")).unwrap(),
+            "last good site"
+        );
+
+        std::fs::write(staged.path().join("nulang-app.ir.json"), "{}").unwrap();
+        staged.publish().unwrap();
+        assert!(f.root.join("dist/blog/post/index.html").is_file());
+        assert!(!f.root.join("dist/index.html").exists());
+    }
+
+    #[test]
     fn missing_or_symlinked_content_directory_cannot_generate_empty_success() {
         let f = Fixture::new();
         assert!(validate_content_directory(&f.root, "missing", "static", "dist").is_err());
