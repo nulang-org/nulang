@@ -63,6 +63,37 @@ except ApiError as error:
 
 When running scripts outside the repository root set `PYTHONPATH` accordingly.
 
+## Compiler-bound Web Contract smoke
+
+The integration workflow validates two different runtime layers:
+
+- `scripts/smoke_web_client_interop.py` checks native `Http.serve` transport
+  compatibility using a hand-authored contract. It **does not** prove typed route
+  dispatch or OpenAPI conformance.
+- `scripts/smoke_web_contract_clients.py` compiles and validates the exact
+  `examples/web_contract_interop/src` contract, exports its OpenAPI 3.1
+  document, launches that package under `nula dev --port 0`, and calls the
+  compiler-bound `GET /probe/{id}` endpoint with Python and JavaScript. Both
+  clients assert the `Int` path/query binding result and a structured 400 for
+  invalid query input. The document is not hand-authored or patched by the test.
+
+The CI workflow discovers the built `nulang` CLI location via
+`cargo metadata --no-deps`; do not assume it is at `./target/debug/nulang`,
+because the workspace config may specify a different target directory.
+
+Run the real-server checks from the repository root after building the
+minimal TCP CLI:
+
+```sh
+cargo build --locked --no-default-features --features tcp --bin nulang
+target_dir="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+python3 scripts/smoke_web_client_interop.py --nulang-bin "$target_dir/debug/nulang"
+python3 scripts/smoke_web_contract_clients.py --nulang-bin "$target_dir/debug/nulang"
+```
+
+This is a local, ephemeral HTTP transport test, not evidence of production
+authentication, TLS, worker supervision, or durable request semantics.
+
 ## Protocol behavior and limitations
 
 - Call by OpenAPI `operationId` with explicitly declared `path`, `query` and
