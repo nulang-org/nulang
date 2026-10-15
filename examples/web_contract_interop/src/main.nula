@@ -1,0 +1,9 @@
+// A real compiler-bound Web route used by both OpenAPI export and nula dev.
+// The handler's path and query inputs must agree across compiler and runtime.
+fn read_probe(id: Int from path, limit: Int from query) -> Int {
+    id + limit
+}
+
+app "web-contract-interop" {
+    route "GET" "/probe/{id: Int}" -> read_probe
+}
