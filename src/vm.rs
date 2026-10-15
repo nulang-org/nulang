@@ -6355,7 +6355,8 @@ mod vm_tests {
 
         let mut vm = VM::new_without_jit();
         vm.load_module(module);
-        vm.run_from(0, 0).expect("standalone execution should complete");
+        vm.run_from(0, 0)
+            .expect("standalone execution should complete");
         assert!(!vm.yield_pending);
     }
 
