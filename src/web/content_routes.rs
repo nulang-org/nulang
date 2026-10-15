@@ -213,6 +213,54 @@ mod tests {
     }
 
     #[test]
+    fn deployment_ir_blocks_content_shadowing_server_get_routes() {
+        let input = vec![page("blog/post.md", false)];
+        let mut ir = crate::web::ir::DeploymentIr::default();
+        ir.routes = vec![
+            serde_json::from_value(serde_json::json!({
+                "method": "GET",
+                "path": "/blog/:slug",
+                "placement": "server",
+                "artifact": null
+            }))
+            .unwrap(),
+        ];
+        let error = plan_content_routes_from_ir(&input, &ir).unwrap_err();
+        assert!(
+            error
+                .iter()
+                .any(|message| message.contains("blog/post.md")
+                    && message.contains("GET /blog/:slug")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn deployment_ir_allows_nonconflicting_routes_and_excludes_drafts() {
+        let input = vec![page("blog/post.md", false), page("blog/draft.md", true)];
+        let mut ir = crate::web::ir::DeploymentIr::default();
+        ir.routes = vec![
+            serde_json::from_value(serde_json::json!({
+                "method": "POST",
+                "path": "/blog/post",
+                "placement": "server",
+                "artifact": null
+            }))
+            .unwrap(),
+            serde_json::from_value(serde_json::json!({
+                "method": "GET",
+                "path": "/about",
+                "placement": "static",
+                "artifact": "about/index.html"
+            }))
+            .unwrap(),
+        ];
+        let routes = plan_content_routes_from_ir(&input, &ir).unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].slug, "/blog/post");
+    }
+
+    #[test]
     fn draft_pages_do_not_claim_explicit_routes() {
         let input = vec![page("blog/draft.md", true)];
         assert!(plan_content_routes(&input, &[("GET", "/blog/draft")])
