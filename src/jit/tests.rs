@@ -5,6 +5,20 @@ use crate::bytecode::*;
 
 extern "C" fn noop_jit_region(_regs: *mut u64, _constants: *const u64) {}
 
+// The test observes dispatch *during* the compiled region. A post-execution
+// lookup would see cleared TLS and could not prove module isolation.
+extern "C" fn inspect_active_native_leaf_table(regs: *mut u64, _constants: *const u64) {
+    let table = crate::jit::runtime::native_leaf_table_for_test();
+    // execute_compiled passes a live 256-slot register file. The region uses
+    // only the first four slots to export the observed TLS dispatch keys.
+    unsafe {
+        *regs.add(0) = table.len() as u64;
+        *regs.add(1) = table.first().map(|entry| entry.0 as u64).unwrap_or(u64::MAX);
+        *regs.add(2) = table.first().map(|entry| entry.1 as u64).unwrap_or(u64::MAX);
+        *regs.add(3) = table.get(1).map(|entry| entry.0 as u64).unwrap_or(u64::MAX);
+    }
+}
+
 #[test]
 fn call_free_compiled_execution_skips_leaf_table_install() {
     let mut jit = make_jit();
@@ -52,23 +66,40 @@ fn test_native_leaf_dispatch_table_is_cached_by_module() {
     assert_eq!(jit.native_leaf_table(0).len(), 2);
     assert_eq!(jit.native_leaf_calls.len(), 3);
 
-    // A region that uses helper-backed calls still executes through the
-    // existing TLS dispatch contract, without borrowing another module's table.
-    jit.store_compiled_with_metadata(
-        0,
-        0,
-        noop_jit_region as *const u8,
-        1,
-        CompilationTier::Baseline,
-        CodegenOptimization::Fast,
-        true,
-        0,
-    );
-    let mut regs = [0u64; 256];
-    assert_eq!(
-        crate::backends::JitBackend::execute_compiled(&mut jit, 0, 0, &mut regs, &[]),
-        crate::backends::TieredAction::RanJit
-    );
+    // Observe actual thread-local dispatch while executing the compiled
+    // region; verify the table is scoped to the selected module and cleared
+    // immediately afterward. The old test only ran a no-op native function.
+    for (module_idx, expected) in [
+        (0usize, [2u64, 3, 7, 8]),
+        (1usize, [1u64, 3, 9, u64::MAX]),
+    ] {
+        jit.store_compiled_with_metadata(
+            module_idx,
+            0,
+            inspect_active_native_leaf_table as *const u8,
+            1,
+            CompilationTier::Baseline,
+            CodegenOptimization::Fast,
+            true,
+            0,
+        );
+        let mut regs = [0u64; 256];
+        assert_eq!(
+            crate::backends::JitBackend::execute_compiled(
+                &mut jit,
+                module_idx,
+                0,
+                &mut regs,
+                &[],
+            ),
+            crate::backends::TieredAction::RanJit
+        );
+        assert_eq!(&regs[..4], &expected);
+        assert!(
+            crate::jit::runtime::native_leaf_table_for_test().is_empty(),
+            "reentrant compiled execution must clear module-local TLS state"
+        );
+    }
 }
 
 fn make_jit() -> JitSession {
