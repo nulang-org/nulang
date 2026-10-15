@@ -378,27 +378,17 @@ mod tests {
         let entries = super::load_collection(&fixture.0).unwrap();
         let actual: Vec<_> = entries
             .iter()
-            .map(|entry| {
-                (
-                    entry.slug.as_str(),
-                    entry.source_path.as_str(),
-                    entry.kind,
-                )
-            })
+            .map(|entry| (entry.slug.as_str(), entry.source_path.as_str(), entry.kind))
             .collect();
         assert_eq!(
             actual,
             vec![
                 ("/docs", "docs/_index.md", ContentKind::Section),
-                (
-                    "/docs/guides",
-                    "docs/guides/_index.md",
-                    ContentKind::Section
-                ),
+                ("/docs/guides", "docs/guides/_index.md", ContentKind::Section),
                 (
                     "/docs/guides/getting-started",
                     "docs/guides/getting-started/index.md",
-                    ContentKind::Page
+                    ContentKind::Page,
                 ),
             ]
         );
