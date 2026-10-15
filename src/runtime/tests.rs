@@ -57,7 +57,10 @@ fn bytecode_actor_preempts_and_completes_without_a_followup_message() {
     assert_eq!(rt.claim_next_ready_actor(), Some(actor_id));
     rt.step_actor(actor_id);
     let actor = &rt.actors[&actor_id];
-    assert!(actor.jit_yield_pending, "interpreter should pause the behavior");
+    assert!(
+        actor.jit_yield_pending,
+        "interpreter should pause the behavior"
+    );
     assert!(actor.mailbox.is_empty(), "original message was consumed");
     assert_eq!(actor.get_state_field("done"), Some(Value::int(0)));
     rt.finish_actor_turn(actor_id);
@@ -73,10 +76,23 @@ fn bytecode_actor_preempts_and_completes_without_a_followup_message() {
         rt.finish_actor_turn(actor_id);
         continuations += 1;
     }
-    assert!(continuations >= 2, "multiple quantum boundaries should be exercised");
-    assert!(!rt.actors[&actor_id].jit_yield_pending, "behavior should complete");
-    assert_eq!(rt.actors[&actor_id].get_state_field("done"), Some(Value::int(1)));
-    assert_eq!(rt.claim_next_ready_actor(), None, "no duplicate ready token");
+    assert!(
+        continuations >= 2,
+        "multiple quantum boundaries should be exercised"
+    );
+    assert!(
+        !rt.actors[&actor_id].jit_yield_pending,
+        "behavior should complete"
+    );
+    assert_eq!(
+        rt.actors[&actor_id].get_state_field("done"),
+        Some(Value::int(1))
+    );
+    assert_eq!(
+        rt.claim_next_ready_actor(),
+        None,
+        "no duplicate ready token"
+    );
 }
 
 /// Resuming one preempted behavior must not consume a second message in
@@ -106,13 +122,19 @@ fn resumed_bytecode_turn_yields_to_queued_mail_before_next_dispatch() {
         module.emit(Instruction::new0(OpCode::Nop));
     }
     module.emit(Instruction::new3(
-        OpCode::ConstU, (one_idx >> 8) as u8, one_idx as u8, 1,
+        OpCode::ConstU,
+        (one_idx >> 8) as u8,
+        one_idx as u8,
+        1,
     ));
     module.emit(Instruction::new3(OpCode::StateSet, 0, 0, 1));
     module.emit(Instruction::new1(OpCode::RetVal, 1));
     let second_offset = module.instructions.len();
     module.emit(Instruction::new3(
-        OpCode::ConstU, (two_idx >> 8) as u8, two_idx as u8, 1,
+        OpCode::ConstU,
+        (two_idx >> 8) as u8,
+        two_idx as u8,
+        1,
     ));
     module.emit(Instruction::new3(OpCode::StateSet, 0, 0, 1));
     module.emit(Instruction::new1(OpCode::RetVal, 1));
@@ -149,12 +171,18 @@ fn resumed_bytecode_turn_yields_to_queued_mail_before_next_dispatch() {
         }
         rt.finish_actor_turn(actor_id);
     }
-    assert!(saw_first_completion, "first behavior must finish after resumption");
+    assert!(
+        saw_first_completion,
+        "first behavior must finish after resumption"
+    );
 
     assert_eq!(rt.claim_next_ready_actor(), Some(actor_id));
     rt.step_actor(actor_id);
     rt.finish_actor_turn(actor_id);
-    assert_eq!(rt.actors[&actor_id].get_state_field("phase"), Some(Value::int(2)));
+    assert_eq!(
+        rt.actors[&actor_id].get_state_field("phase"),
+        Some(Value::int(2))
+    );
 }
 
 #[test]
