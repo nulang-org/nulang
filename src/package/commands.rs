@@ -3355,6 +3355,70 @@ app "stale-static" {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_cmd_build_web_refuses_to_follow_symlinked_stale_pages() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_build_web_stale_symlink_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        scaffold_package(&dir, "stale-symlink", "web").unwrap();
+        let main = dir.join("src/main.nula");
+        std::fs::write(
+            &main,
+            r#"import stdlib::web::html
+import stdlib::web::types
+
+fn old() -> Html { text("Old page") }
+
+app "stale-symlink" {
+    route "GET" "/old" -> old
+}
+"#,
+        )
+        .unwrap();
+
+        let _guard = ChangeDir::new(&dir);
+        cmd_build_web().expect("initial static Web build should succeed");
+        let stale = dir.join("dist/old/index.html");
+        assert!(stale.is_file());
+        let user_file = dir.join("do-not-delete.html");
+        std::fs::write(&user_file, "protected").unwrap();
+        std::fs::remove_file(&stale).unwrap();
+        symlink(&user_file, &stale).unwrap();
+
+        std::fs::write(
+            &main,
+            r#"import stdlib::web::html
+import stdlib::web::types
+
+fn home() -> Html { text("New homepage") }
+
+app "stale-symlink" {
+    route "GET" "/" -> home
+}
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            cmd_build_web().is_err(),
+            "stale managed output replaced by a symlink must fail closed"
+        );
+        assert_eq!(std::fs::read_to_string(&user_file).unwrap(), "protected");
+        assert!(
+            std::fs::symlink_metadata(&stale)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_cmd_build_web_rejects_untrusted_generated_artifact_manifest() {
         let dir = std::env::temp_dir().join(format!(
