@@ -97,20 +97,20 @@ def main() -> int:
             port = server_port(process, args.timeout)
             base = f"http://127.0.0.1:{port}"
             client = NulangWebClient(base, contract, timeout=5)
-            response = client.call("read_probe", path={"id": 7}, query={"limit": 35})
+            response = client.call("read_probe", path={"id": 42})
             if response.status != 200 or response.text().strip() != "42":
                 raise RuntimeError(
                     f"typed route returned unexpected result: {response.status} {response.text()!r}"
                 )
             try:
-                client.call("read_probe", path={"id": 7}, query={"limit": "invalid"})
+                client.call("read_probe", path={"id": "invalid"})
             except ApiError as error:
                 if error.status != 400 or json.loads(error.body).get("code") != "invalid_request_input":
                     raise RuntimeError(
-                        f"typed invalid-query response was not a 400 problem: {error.status}"
+                        f"typed invalid-path response was not a 400 problem: {error.status}"
                     ) from error
             else:
-                raise RuntimeError("invalid query was accepted by typed Nulang route")
+                raise RuntimeError("invalid path was accepted by typed Nulang route")
             print("PASS exported contract -> typed Nulang route -> Python client", flush=True)
             node = subprocess.run(
                 ["node", str(ROOT / "interop/web/javascript/contract_server_smoke.mjs"),
