@@ -291,6 +291,21 @@ mod tests {
     }
 
     #[test]
+    fn web_content_publishing_is_explicitly_opt_in() {
+        let without_content = Manifest::parse(
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n"
+        )
+        .unwrap();
+        assert_eq!(without_content.web.content_dir, None);
+
+        let opted_in = Manifest::parse(
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n[web]\ncontent_dir = \"content\"\n"
+        )
+        .unwrap();
+        assert_eq!(opted_in.web.content_dir.as_deref(), Some("content"));
+    }
+
+    #[test]
     fn test_manifest_parse_web_defaults() {
         let source = r#"
             [package]
