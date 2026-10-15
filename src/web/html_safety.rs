@@ -4,6 +4,142 @@
 //! values have already been rendered. The serializer must not treat dynamic
 //! tag names, attribute names, or URL-bearing attributes as trusted.
 
+/// Render an HTML element from already-rendered Nulang `Html` fragments.
+///
+/// `Web.text` escapes text before this point; do not encode '&' again or
+/// legitimate `&amp;` values become corrupted. Validate names and URL
+/// attributes, and escape delimiter characters in quoted attribute values.
+/// `Web.raw` remains an explicitly trusted escape hatch for HTML children.
+pub(crate) fn render_element(
+    tag: &str,
+    attrs: &[(String, String)],
+    children: &[String],
+) -> Option<String> {
+    if !safe_identifier(tag) || dangerous_tag(tag) {
+        return None;
+    }
+
+    // Validate all attributes before constructing any output.
+    for (name, value) in attrs {
+        if !safe_identifier(name) || dangerous_attribute(name) {
+            return None;
+        }
+        if url_attribute(name) && !safe_url_attribute(value) {
+            return None;
+        }
+    }
+
+    let mut html = String::new();
+    html.push('<');
+    html.push_str(tag);
+    for (name, value) in attrs {
+        html.push(' ');
+        html.push_str(name);
+        html.push_str("=\"");
+        html.push_str(&escape_attribute_delimiters(value));
+        html.push('"');
+    }
+    html.push('>');
+    for child in children {
+        html.push_str(child);
+    }
+    html.push_str("</");
+    html.push_str(tag);
+    html.push('>');
+    Some(html)
+}
+
+fn safe_identifier(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    matches!(bytes.next(), Some(first) if first.is_ascii_alphabetic())
+        && bytes.all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':')
+        })
+}
+
+fn dangerous_tag(tag: &str) -> bool {
+    matches!(
+        tag.to_ascii_lowercase().as_str(),
+        "script"
+            | "style"
+            | "iframe"
+            | "object"
+            | "embed"
+            | "svg"
+            | "math"
+            | "foreignobject"
+            | "template"
+            | "base"
+            | "xmp"
+            | "plaintext"
+            | "noscript"
+            | "frame"
+            | "frameset"
+            | "applet"
+    )
+}
+
+fn dangerous_attribute(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with("on")
+        || matches!(
+            lower.as_str(),
+            "style" | "srcdoc" | "srcset" | "imagesrcset" | "ping" | "http-equiv"
+        )
+}
+
+fn url_attribute(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "href"
+            | "src"
+            | "action"
+            | "formaction"
+            | "poster"
+            | "cite"
+            | "data"
+            | "longdesc"
+            | "background"
+            | "manifest"
+            | "xlink:href"
+    )
+}
+
+fn safe_url_attribute(value: &str) -> bool {
+    if value.trim() != value || value.contains('\\') || value.chars().any(char::is_control) {
+        return false;
+    }
+    // The host receives pre-rendered Html. Allow the HTML-safe ampersands
+    // produced by Web.text; reject all other references that could conceal
+    // a colon or letters of a scriptable scheme (e.g. &#58;, &colon;).
+    let mut rest = value;
+    while let Some(index) = rest.find('&') {
+        if !rest[index..].starts_with("&amp;") {
+            return false;
+        }
+        rest = &rest[index + "&amp;".len()..];
+    }
+
+    if let Some((prefix, _)) = value.split_once(':') {
+        // A slash, query or fragment before ':' means a relative URL.
+        if !prefix.contains(&['/', '?', '#'][..]) {
+            return matches!(
+                prefix.to_ascii_lowercase().as_str(),
+                "http" | "https" | "mailto" | "tel"
+            );
+        }
+    }
+    true
+}
+
+fn escape_attribute_delimiters(value: &str) -> String {
+    value
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 #[cfg(test)]
 mod tests {
     use super::render_element;
@@ -42,7 +178,12 @@ mod tests {
         assert!(render_element("img", &attrs(&[("OnLoad", "alert(1)")]), &[]).is_none());
         assert!(render_element("p", &attrs(&[("title\" autofocus", "x")]), &[]).is_none());
         assert!(render_element("div", &attrs(&[("srcdoc", "<script>")]), &[]).is_none());
-        assert!(render_element("div", &attrs(&[("style", "background:url(javascript:x)")]), &[]).is_none());
+        assert!(render_element(
+            "div",
+            &attrs(&[("style", "background:url(javascript:x)")]),
+            &[]
+        )
+        .is_none());
     }
 
     #[test]
@@ -71,18 +212,44 @@ mod tests {
             "\tjavascript:alert(1)",
             "java\nscript:alert(1)",
         ] {
-            assert!(render_element("a", &attrs(&[("href", url)]), &[]).is_none(), "{url}");
+            assert!(
+                render_element("a", &attrs(&[("href", url)]), &[]).is_none(),
+                "{url}"
+            );
         }
         assert!(render_element("img", &attrs(&[("srcset", "x.jpg 1x")]), &[]).is_none());
-        assert!(render_element("button", &attrs(&[("formaction", "javascript:x")]), &[]).is_none());
+        assert!(render_element(
+            "button",
+            &attrs(&[("formaction", "javascript:x")]),
+            &[]
+        )
+        .is_none());
     }
 
     #[test]
     fn safe_URLs_and_document_metadata_are_preserved() {
-        for url in ["/docs?q=a&amp;b=2", "https://example.com/a", "#section", "mailto:a@example.com"] {
-            assert!(render_element("a", &attrs(&[("href", url)]), &[]).is_some(), "{url}");
+        for url in [
+            "/docs?q=a&amp;b=2",
+            "https://example.com/a",
+            "#section",
+            "mailto:a@example.com",
+        ] {
+            assert!(
+                render_element("a", &attrs(&[("href", url)]), &[]).is_some(),
+                "{url}"
+            );
         }
-        assert!(render_element("meta", &attrs(&[("name", "description"), ("content", "Safe")]), &[]).is_some());
-        assert!(render_element("form", &attrs(&[("method", "POST"), ("action", "/submit")]), &[]).is_some());
+        assert!(render_element(
+            "meta",
+            &attrs(&[("name", "description"), ("content", "Safe")]),
+            &[]
+        )
+        .is_some());
+        assert!(render_element(
+            "form",
+            &attrs(&[("method", "POST"), ("action", "/submit")]),
+            &[]
+        )
+        .is_some());
     }
 }
