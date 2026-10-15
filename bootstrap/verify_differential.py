@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compare Nulang Core bootstrap generations and execute a curated corpus.
 
-Requires an already-built \`nulang\` binary. No network and no repository writes.
+Requires an already-built `nulang` binary. No network and no repository writes.
 This is *bootstrap-generation* parity, not Rust-frontend or full-language parity.
 """
 
