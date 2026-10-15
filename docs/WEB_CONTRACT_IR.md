@@ -258,9 +258,19 @@ Nulang source
 
 The runtime should ultimately execute each route under lightweight supervised request execution with structured cancellation and backpressure. Request-scoped dependencies should move from ambient state toward effect handlers. Stateful realtime/domain coordination should continue to use explicit persistent or virtual actors rather than making every model object an actor.
 
+## Response body algebra
+
+The first explicit response-body contracts are now:
+
+- `Html` / `RawHtml` -> `text/html; charset=utf-8`, with browser-runtime injection permitted.
+- `Json[T]` -> `application/json`, with `T` retained as compiler-owned payload-schema metadata and browser-runtime injection disabled.
+- unwrapped `String` and arbitrary domain return types keep the legacy HTML-oriented behavior; the framework does not guess a media type.
+
+`Json[T]` is currently an already-serialized string marker, not an implicit serializer. This keeps transport semantics explicit while serialization/value codecs evolve independently. The same response contract is lowered into runtime route plans and Deployment IR and is reused by OpenAPI.
+
 ## Remaining implementation priorities
 
-1. Define an explicit request/response algebra (`Json[T]`, `Html`, bytes, streams, typed bodies/media) so Contract IR and OpenAPI can represent payloads without guessing.
+1. Extend the request/response algebra with bytes, streams, typed request bodies/media, and first-class serialization codecs.
 2. Add richer request decoders for optional/default values, repeated query parameters/collections, binary bodies, transparent aliases, and opaque/domain types.
 3. Execute requests under lightweight supervised request actors with structured cancellation/backpressure.
 4. Replace ambient request-context dependency injection with effect handlers once compatibility coverage is sufficient.
