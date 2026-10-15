@@ -98,7 +98,8 @@ mod tests {
         let page = parse_page(
             "blog/hello.md",
             "+++\ntitle = \"Hello\"\ndraft = true\ntags = [\"nulang\", \"web\"]\n+++\n# Hello\n",
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(page.slug, "/blog/hello");
         assert_eq!(page.title, "Hello");
         assert!(page.draft);
@@ -121,14 +122,25 @@ mod tests {
         assert!(parse_page("post.md", "# Missing metadata").is_err());
         assert!(parse_page("post.md", "+++\ndraft = true\n+++\nBody").is_err());
         assert!(parse_page("post.md", "+++\ntitle = 2\n+++\nBody").is_err());
-        assert!(parse_page("post.md", "+++\ntitle = \"Ok\"\ntags = \"not-array\"\n+++\nBody").is_err());
+        assert!(parse_page(
+            "post.md",
+            "+++\ntitle = \"Ok\"\ntags = \"not-array\"\n+++\nBody"
+        )
+        .is_err());
         assert!(parse_page("post.md", "+++\ntitle = \"Incomplete\"\nBody").is_err());
     }
 
     #[test]
     fn rejects_unsafe_or_ambiguous_paths() {
         let source = "+++\ntitle = \"Safe\"\n+++\nBody";
-        for path in ["../post.md", "/absolute.md", "blog/Bad Name.md", "blog\\post.md", "blog/./post.md", "blog//post.md"] {
+        for path in [
+            "../post.md",
+            "/absolute.md",
+            "blog/Bad Name.md",
+            "blog\\post.md",
+            "blog/./post.md",
+            "blog//post.md",
+        ] {
             assert!(parse_page(path, source).is_err(), "{path}");
         }
         assert!(parse_page("blog/post.txt", source).is_err());
