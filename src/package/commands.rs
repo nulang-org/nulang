@@ -3120,6 +3120,118 @@ app "mixed-routes" {
     }
 
     #[test]
+    fn test_cmd_build_web_prunes_only_previously_generated_static_pages() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_build_web_stale_static_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        scaffold_package(&dir, "stale-static", "web").unwrap();
+        let main = dir.join("src/main.nula");
+        std::fs::write(
+            &main,
+            r#"import stdlib::web::html
+import stdlib::web::types
+
+fn home() -> Html { text("Homepage") }
+fn old() -> Html { text("Old generated page") }
+fn assets() -> Html { text("Former generated asset route") }
+
+app "stale-static" {
+    route "GET" "/" -> home
+    route "GET" "/old" -> old
+    route "GET" "/assets" -> assets
+}
+"#,
+        )
+        .unwrap();
+
+        let _guard = ChangeDir::new(&dir);
+        cmd_build_web().expect("first Web build should succeed");
+        assert!(dir.join("dist/old/index.html").is_file());
+        assert!(dir.join("dist/assets/index.html").is_file());
+
+        std::fs::write(dir.join("dist/unmanaged.txt"), "Do not delete me").unwrap();
+        std::fs::create_dir_all(dir.join("static/assets")).unwrap();
+        std::fs::write(
+            dir.join("static/assets/index.html"),
+            "User-managed static asset",
+        )
+        .unwrap();
+
+        std::fs::write(
+            &main,
+            r#"import stdlib::web::html
+import stdlib::web::types
+
+fn home() -> Html { text("Updated homepage") }
+fn submit() -> Html { text("Server-only route") }
+
+app "stale-static" {
+    route "GET" "/" -> home
+    route "POST" "/old" -> submit
+}
+"#,
+        )
+        .unwrap();
+        cmd_build_web().expect("second Web build should succeed");
+
+        assert!(
+            !dir.join("dist/old/index.html").exists(),
+            "a route switched from static GET to server-only POST must not leave stale HTML"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("dist/assets/index.html")).unwrap(),
+            "User-managed static asset"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("dist/unmanaged.txt")).unwrap(),
+            "Do not delete me"
+        );
+        assert!(
+            std::fs::read_to_string(dir.join("dist/index.html"))
+                .unwrap()
+                .contains("Updated homepage")
+        );
+        let generated: Vec<String> = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("dist/.nulang-generated-static.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(generated, vec!["index.html"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cmd_build_web_rejects_untrusted_generated_artifact_manifest() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_build_web_unsafe_manifest_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        scaffold_package(&dir, "unsafe-static-manifest", "web").unwrap();
+        std::fs::create_dir_all(dir.join("dist")).unwrap();
+        std::fs::write(dir.join("do-not-delete.txt"), "user-owned").unwrap();
+        std::fs::write(
+            dir.join("dist/.nulang-generated-static.json"),
+            r#"["../do-not-delete.txt"]"#,
+        )
+        .unwrap();
+
+        let _guard = ChangeDir::new(&dir);
+        assert!(
+            cmd_build_web().is_err(),
+            "manifest entries that escape output must fail closed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("do-not-delete.txt")).unwrap(),
+            "user-owned"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_cmd_build_web_signal_hydration() {
         let dir =
             std::env::temp_dir().join(format!("nulang_build_web_signal_{}", std::process::id()));
