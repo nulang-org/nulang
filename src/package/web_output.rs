@@ -360,6 +360,18 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn accept_existing_dev_generated_client_assets() {
+        let root = fixture("dev_assets");
+        std::fs::create_dir(root.join("dist")).unwrap();
+        std::fs::write(root.join("dist/app.client.js"), "micro-runtime").unwrap();
+        std::fs::write(root.join("dist/app.signals.json"), "{}").unwrap();
+        let pending = StagedWebOutput::new(&root, "dist", "public")
+            .expect("nula dev emits these artifacts without deployment IR");
+        drop(pending);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn reject_symlinked_output_or_parent() {
