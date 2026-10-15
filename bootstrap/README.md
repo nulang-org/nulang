@@ -81,11 +81,11 @@ bootstrap/
 
 ```bash
 # Run existing checks 1–7 (includes the enabled Stage 2 self-compile oracle).
-NULANG_BIN="$PWD/target/debug/nulang" bash bootstrap/verify.sh
+NULANG_BIN=/tmp/cargo-target/debug/nulang bash bootstrap/verify.sh
 
 # Run the independent bootstrap-generation differential corpus.
 python3 -m unittest discover -s scripts/tests -p test_bootstrap_differential.py
-python3 bootstrap/verify_differential.py --nulang "$PWD/target/debug/nulang"
+python3 bootstrap/verify_differential.py --nulang /tmp/cargo-target/debug/nulang
 
 # Single expression through the self-hosting pipeline:
 echo '1 + 2 * 3' | nulang bootstrap/compile_hex.nula |
@@ -99,7 +99,9 @@ python3 bootstrap/diagnose_self_host.py [smoke_expr]
 
 `verify.sh` and `diagnose_self_host.py` accept
 `NULANG_BIN=/path/to/nulang` to skip the `cargo run` rebuild. Build the CLI
-first with `cargo build --locked --bin nulang`. The differential runner
+first with `cargo build --locked --bin nulang`. Cargo's checked-in
+`.cargo/config.toml` currently places the executable at
+`/tmp/cargo-target/debug/nulang`, not `target/debug/nulang`. The differential runner
 requires `--nulang` and uses temporary output files rather than modifying the
 checkout. The checked-in fixture set is intentionally small and does not
 establish Rust-frontend equivalence.
