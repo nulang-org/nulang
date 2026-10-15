@@ -1,5 +1,8 @@
 # Nulang Changelog
 
+### Limited cache-only Nula resolution — 2026-10-13
+- **`nula --offline`-mode package commands resolve local paths and clean cached Git commits without network access.** `--offline` implies `--locked` and fails on missing/stale pins, dirty/missing Git caches, or registry packages without verified integrity; it does not overwrite cached sources.
+
 ### Locked Nula package builds — 2026-10-13
 - **Nula build/test/run commands accept `--locked` for CI-safe lockfile checks.** Missing or changed package pins, Git commit pins, and recorded strong path-source identities are rejected without rewriting `Nulang.lock`. Normal resolution remains the default; locked mode is not offline and does not yet guarantee registry tarball integrity.
 

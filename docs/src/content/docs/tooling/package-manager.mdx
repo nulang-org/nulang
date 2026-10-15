@@ -193,6 +193,30 @@ dependencies with recorded strong `source_id` metadata, it also rejects
 source-content drift. It never rewrites `Nulang.lock`. Commit the lockfile
 after running a normal build whenever dependency changes are intentional.
 
+### Cache-only offline mode
+
+`--offline` implies `--locked`, so a committed `Nulang.lock` is required
+and never rewritten. This is currently a **fail-closed, limited mode**:
+
+- Local path dependencies resolve directly from disk and must match locked pins.
+- Git dependencies require an existing cached checkout at the exact locked
+  commit, a matching cache commit marker, and a clean tracked/untracked worktree.
+  No `git fetch`, clone, reset, or automatic repair is performed.
+- Registry dependencies are rejected until the registry cache can validate
+  cryptographic source identities against a committed lockfile.
+- Native builds still require their normal compiler toolchain and the Nulang
+  compiler; offline mode controls package resolution, not arbitrary effects
+  performed by executed applications.
+
+```bash
+nulang nula build --offline
+nulang nula test --offline
+```
+
+First perform an ordinary online build to populate the Git cache and record
+pins, then commit `Nulang.lock`. Offline mode deliberately reports a missing
+or dirty cache rather than silently reaching the network.
+
 **`--locked` is not `--offline`.** Git and registry resolution may still
 contact remote servers. Older lockfiles without `source_id` metadata cannot
 prove the current contents of path dependencies. The legacy `content_hash`
