@@ -89,7 +89,6 @@ fn slug_from_relative_path(path: &str) -> Result<String, String> {
     }
 }
 
-
 /// Discover typed Markdown pages under a collection root, without rendering or
 /// route registration. Both traversal and final output are deterministic.
 ///
@@ -103,7 +102,10 @@ pub fn load_collection(root: &std::path::Path) -> Result<Vec<ContentPage>, Strin
         .map_err(|error| format!("cannot inspect content root {}: {error}", root.display()))?
         .file_type();
     if root_type.is_symlink() || !root_type.is_dir() {
-        return Err(format!("content root must be a real directory: {}", root.display()));
+        return Err(format!(
+            "content root must be a real directory: {}",
+            root.display()
+        ));
     }
 
     let mut pages = BTreeMap::new();
@@ -116,11 +118,20 @@ fn collect_pages(
     directory: &std::path::Path,
     pages: &mut std::collections::BTreeMap<String, (String, ContentPage)>,
 ) -> Result<(), String> {
-    let entries = std::fs::read_dir(directory)
-        .map_err(|error| format!("cannot read content directory {}: {error}", directory.display()))?;
+    let entries = std::fs::read_dir(directory).map_err(|error| {
+        format!(
+            "cannot read content directory {}: {error}",
+            directory.display()
+        )
+    })?;
     let mut entries = entries
         .collect::<std::io::Result<Vec<_>>>()
-        .map_err(|error| format!("cannot read content entry in {}: {error}", directory.display()))?;
+        .map_err(|error| {
+            format!(
+                "cannot read content entry in {}: {error}",
+                directory.display()
+            )
+        })?;
     entries.sort_by_key(|entry| entry.file_name());
 
     for entry in entries {
@@ -129,7 +140,10 @@ fn collect_pages(
             .file_type()
             .map_err(|error| format!("cannot inspect content path {}: {error}", path.display()))?;
         if file_type.is_symlink() {
-            return Err(format!("symlinks are not permitted in content: {}", path.display()));
+            return Err(format!(
+                "symlinks are not permitted in content: {}",
+                path.display()
+            ));
         }
         if file_type.is_dir() {
             collect_pages(root, &path, pages)?;
@@ -150,9 +164,10 @@ fn collect_pages(
         let segments = relative
             .components()
             .map(|component| {
-                component.as_os_str().to_str().ok_or_else(|| {
-                    format!("content path is not UTF-8: {}", path.display())
-                })
+                component
+                    .as_os_str()
+                    .to_str()
+                    .ok_or_else(|| format!("content path is not UTF-8: {}", path.display()))
             })
             .collect::<Result<Vec<_>, _>>()?;
         let relative_name = segments.join("/");
@@ -169,7 +184,6 @@ fn collect_pages(
     }
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -281,7 +295,10 @@ mod tests {
     fn collection_rejects_leaf_bundle_slug_collisions() {
         let fixture = CollectionFixture::new();
         fixture.write("news/story.md", "+++\ntitle = \"Leaf\"\n+++\nLeaf");
-        fixture.write("news/story/index.md", "+++\ntitle = \"Bundle\"\n+++\nBundle");
+        fixture.write(
+            "news/story/index.md",
+            "+++\ntitle = \"Bundle\"\n+++\nBundle",
+        );
 
         let err = super::load_collection(&fixture.0).unwrap_err();
         assert!(err.contains("duplicate"), "{err}");
@@ -292,7 +309,10 @@ mod tests {
     fn collection_rejects_invalid_markdown_and_invalid_subpaths() {
         let fixture = CollectionFixture::new();
         fixture.write("valid.md", "+++\ntitle = \"Valid\"\n+++\nOkay");
-        fixture.write("blog/Bad Name.md", "+++\ntitle = \"Invalid Path\"\n+++\nBody");
+        fixture.write(
+            "blog/Bad Name.md",
+            "+++\ntitle = \"Invalid Path\"\n+++\nBody",
+        );
         assert!(super::load_collection(&fixture.0).is_err());
         std::fs::remove_file(fixture.0.join("blog/Bad Name.md")).unwrap();
         fixture.write("blog/invalid.md", "No front matter");
@@ -306,10 +326,7 @@ mod tests {
         let fixture = CollectionFixture::new();
         let outside = CollectionFixture::new();
         outside.write("secret.md", "+++\ntitle = \"Secret\"\n+++\nSecret");
-        symlink(
-            outside.0.join("secret.md"),
-            fixture.0.join("linked.md"),
-        ).unwrap();
+        symlink(outside.0.join("secret.md"), fixture.0.join("linked.md")).unwrap();
         assert!(super::load_collection(&fixture.0).is_err());
         std::fs::remove_file(fixture.0.join("linked.md")).unwrap();
         symlink(&outside.0, fixture.0.join("directory")).unwrap();
