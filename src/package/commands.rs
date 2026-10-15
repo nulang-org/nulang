@@ -1369,7 +1369,10 @@ fn cmd_build_web() -> NuResult<()> {
 
     // A previous build owns only the files named in its validated manifest.
     let previous_generated_static = load_generated_static_manifest(&output_dir)?;
-    let client_js_path = output_dir.join("app.client.js");
+    // Do not mutate published output until every compile, render, IR and
+    // budget check has completed against a fresh staging directory.
+    let stage_dir = prepare_web_output_stage(&build_dir)?;
+    let client_js_path = stage_dir.join("app.client.js");
     let client_js_path_str = client_js_path.to_string_lossy().into_owned();
 
     eprintln!("Building {} (web)...", manifest.package.name);
@@ -1419,7 +1422,7 @@ fn cmd_build_web() -> NuResult<()> {
     })?;
 
     // Emit compile-time signal graph if the entry uses `signal` declarations.
-    let signals_path = output_dir.join("app.signals.json");
+    let signals_path = stage_dir.join("app.signals.json");
     nulang_exe(&[
         "--emit-signals",
         &signals_path.to_string_lossy(),
@@ -1456,8 +1459,8 @@ fn cmd_build_web() -> NuResult<()> {
         let out_file = route_path_to_output_file(&route.path);
         let relative = out_file.to_string_lossy().replace('\\', "/");
         let out_file = validate_generated_static_entry(&relative)?;
-        ensure_static_file_path_is_not_symlink(&output_dir, &out_file)?;
-        let dest = output_dir.join(&out_file);
+        ensure_static_file_path_is_not_symlink(&stage_dir, &out_file)?;
+        let dest = stage_dir.join(&out_file);
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|e| NuError::PackageError {
                 msg: format!("cannot create {}: {}", parent.display(), e),
@@ -1469,28 +1472,28 @@ fn cmd_build_web() -> NuResult<()> {
             span: Span::default(),
         })?;
         generated_static.insert(relative);
-        eprintln!("    {} -> {}", route.path, dest.display());
+        eprintln!(
+            "    {} -> {}",
+            route.path,
+            output_dir.join(&out_file).display()
+        );
     }
-
-    // Prune before copying user-managed assets, which may replace older
-    // generated pages at the same path. Never delete unlisted files.
-    prune_stale_generated_static(&output_dir, &previous_generated_static, &generated_static)?;
 
     let static_dir = root.join(&manifest.web.static_dir);
     if static_dir.is_dir() {
-        copy_dir_contents(&static_dir, &output_dir)?;
+        copy_dir_contents(&static_dir, &stage_dir)?;
     }
 
-    let ir_path = output_dir.join("nulang-app.ir.json");
+    let ir_path = stage_dir.join("nulang-app.ir.json");
     let ir_json = ir.to_json();
     std::fs::write(&ir_path, ir_json).map_err(|e| NuError::PackageError {
         msg: format!("cannot write {}: {}", ir_path.display(), e),
         span: Span::default(),
     })?;
-    eprintln!("  Wrote {}", ir_path.display());
 
-    // Enforce performance budgets declared in Nulang.toml.
-    if let Err(violations) = crate::web::budget::check_initial_js_budget(
+    // Enforce the budget against the staged output merged with retained files.
+    if let Err(violations) = crate::web::budget::check_initial_js_budget_with_retained_output(
+        &stage_dir,
         &output_dir,
         manifest.budgets.initial_js_max_bytes(),
     ) {
@@ -1507,7 +1510,14 @@ fn cmd_build_web() -> NuResult<()> {
         });
     }
 
-    write_generated_static_manifest(&output_dir, &generated_static)?;
+    write_generated_static_manifest(&stage_dir, &generated_static)?;
+    publish_staged_web_output(
+        &stage_dir,
+        &output_dir,
+        &previous_generated_static,
+        &generated_static,
+    )?;
+    let _ = std::fs::remove_dir_all(&stage_dir);
 
     println!("Web build succeeded: {}", output_dir.display());
     Ok(())
@@ -1520,6 +1530,71 @@ fn route_path_to_output_file(path: &str) -> PathBuf {
     } else {
         PathBuf::from(trimmed).join("index.html")
     }
+}
+
+const WEB_OUTPUT_STAGE_PREFIX: &str = "web-output-stage";
+
+/// Create a fresh package-private staging directory. Public output remains
+/// untouched until all build-time work succeeds and publication begins.
+fn prepare_web_output_stage(build_dir: &Path) -> NuResult<PathBuf> {
+    let stage_dir = build_dir.join(format!(
+        "{}-{}",
+        WEB_OUTPUT_STAGE_PREFIX,
+        std::process::id()
+    ));
+    match std::fs::symlink_metadata(&stage_dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(generated_static_error(format!(
+                "symlinked Web output staging directory is forbidden: {}",
+                stage_dir.display()
+            )));
+        }
+        Ok(metadata) if metadata.is_dir() => {
+            std::fs::remove_dir_all(&stage_dir).map_err(|error| {
+                generated_static_error(format!(
+                    "cannot clear Web output staging directory {}: {error}",
+                    stage_dir.display()
+                ))
+            })?;
+        }
+        Ok(_) => {
+            return Err(generated_static_error(format!(
+                "Web output staging path is not a directory: {}",
+                stage_dir.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(generated_static_error(format!(
+                "cannot inspect Web output staging directory {}: {error}",
+                stage_dir.display()
+            )));
+        }
+    }
+    std::fs::create_dir_all(&stage_dir).map_err(|error| {
+        generated_static_error(format!(
+            "cannot create Web output staging directory {}: {error}",
+            stage_dir.display()
+        ))
+    })?;
+    Ok(stage_dir)
+}
+
+/// Publish a fully built staging tree after validating every output path this
+/// build owns. Stale generated pages are removed immediately before staged
+/// static assets are copied so user-managed static replacements win.
+fn publish_staged_web_output(
+    stage_dir: &Path,
+    output_dir: &Path,
+    previous_generated: &BTreeSet<String>,
+    generated: &BTreeSet<String>,
+) -> NuResult<()> {
+    for name in generated {
+        let relative = validate_generated_static_entry(name)?;
+        ensure_static_file_path_is_not_symlink(output_dir, &relative)?;
+    }
+    prune_stale_generated_static(output_dir, previous_generated, generated)?;
+    copy_dir_contents(stage_dir, output_dir)
 }
 
 const GENERATED_STATIC_MANIFEST: &str = ".nulang-generated-static.json";
@@ -3308,9 +3383,9 @@ app "stale-static" {
         assert!(dir.join("dist/assets/index.html").is_file());
 
         std::fs::write(dir.join("dist/unmanaged.txt"), "Do not delete me").unwrap();
-        std::fs::create_dir_all(dir.join("static/assets")).unwrap();
+        std::fs::create_dir_all(dir.join("public/assets")).unwrap();
         std::fs::write(
-            dir.join("static/assets/index.html"),
+            dir.join("public/assets/index.html"),
             "User-managed static asset",
         )
         .unwrap();
@@ -3347,11 +3422,138 @@ app "stale-static" {
         assert!(std::fs::read_to_string(dir.join("dist/index.html"))
             .unwrap()
             .contains("Updated homepage"));
+        let ir: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("dist/nulang-app.ir.json")).unwrap(),
+        )
+        .unwrap();
+        let server = ir["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|route| route["method"] == "POST" && route["path"] == "/old")
+            .expect("server route metadata must remain after stale artifact pruning");
+        assert_eq!(server["placement"], "server");
+        assert!(server["artifact"].is_null());
+
         let generated: Vec<String> = serde_json::from_str(
             &std::fs::read_to_string(dir.join("dist/.nulang-generated-static.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(generated, vec!["index.html"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cmd_build_web_preserves_published_output_when_staged_build_fails() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_build_web_staged_failure_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        scaffold_package(&dir, "staged-failure", "web").unwrap();
+        let main = dir.join("src/main.nula");
+        std::fs::write(
+            &main,
+            r#"import stdlib::web::html
+import stdlib::web::types
+
+fn old() -> Html { text("Previously published page") }
+
+app "staged-failure" {
+    route "GET" "/old" -> old
+}
+"#,
+        )
+        .unwrap();
+
+        let _guard = ChangeDir::new(&dir);
+        cmd_build_web().expect("initial Web build should succeed");
+        let old_page = dir.join("dist/old/index.html");
+        let old_html = std::fs::read_to_string(&old_page).unwrap();
+        let old_ir = std::fs::read_to_string(dir.join("dist/nulang-app.ir.json")).unwrap();
+        let old_generated =
+            std::fs::read_to_string(dir.join("dist/.nulang-generated-static.json")).unwrap();
+
+        std::fs::create_dir_all(dir.join("public/assets")).unwrap();
+        std::fs::write(dir.join("public/assets/over-budget.js"), "x").unwrap();
+        let manifest_path = dir.join(MANIFEST_FILE);
+        let mut package_manifest = std::fs::read_to_string(&manifest_path).unwrap();
+        package_manifest.push_str("\n[budgets]\ninitial_js = \"0B\"\n");
+        std::fs::write(&manifest_path, package_manifest).unwrap();
+        std::fs::write(
+            &main,
+            r#"import stdlib::web::html
+import stdlib::web::types
+
+fn submit() -> Html { text("Server-only replacement") }
+
+app "staged-failure" {
+    route "POST" "/old" -> submit
+}
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            cmd_build_web().is_err(),
+            "budget failure must abort before publishing staged output"
+        );
+        assert_eq!(std::fs::read_to_string(&old_page).unwrap(), old_html);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("dist/nulang-app.ir.json")).unwrap(),
+            old_ir
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("dist/.nulang-generated-static.json")).unwrap(),
+            old_generated
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cmd_build_web_budgets_retained_output_javascript() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_build_web_retained_budget_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        scaffold_package(&dir, "retained-budget", "web").unwrap();
+        std::fs::write(
+            dir.join("src/main.nula"),
+            r#"import stdlib::web::html
+import stdlib::web::types
+
+fn home() -> Html { text("Homepage") }
+
+app "retained-budget" {
+    route "GET" "/" -> home
+}
+"#,
+        )
+        .unwrap();
+        let retained_js = dir.join("dist/assets/over-budget.js");
+        std::fs::create_dir_all(retained_js.parent().unwrap()).unwrap();
+        std::fs::write(&retained_js, vec![b'x'; 1024 * 1024 + 1]).unwrap();
+        let manifest_path = dir.join(MANIFEST_FILE);
+        let mut package_manifest = std::fs::read_to_string(&manifest_path).unwrap();
+        package_manifest.push_str("\n[budgets]\ninitial_js = \"1MB\"\n");
+        std::fs::write(&manifest_path, package_manifest).unwrap();
+
+        let _guard = ChangeDir::new(&dir);
+        assert!(
+            cmd_build_web().is_err(),
+            "retained output JavaScript must be included in the staged budget check"
+        );
+        assert_eq!(
+            std::fs::metadata(&retained_js).unwrap().len(),
+            1024 * 1024 + 1
+        );
+        assert!(
+            !dir.join("dist/index.html").exists(),
+            "a rejected staged build must not publish new static pages"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
