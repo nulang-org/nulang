@@ -145,10 +145,7 @@ fn collect_formatted_files(
                 )
             })?;
             let formatted = format_source(&source).map_err(|e| {
-                NuError::parse_error(
-                    format!("{}: {}", path.display(), e),
-                    Span::default(),
-                )
+                NuError::parse_error(format!("{}: {}", path.display(), e), Span::default())
             })?;
             if formatted != source {
                 planned.push((path, formatted));
@@ -1329,7 +1326,10 @@ mod tests {
             .expect("write unsafe source");
 
         let result = format_directory(&root, false);
-        assert!(result.is_err(), "unsafe file must refuse the directory format");
+        assert!(
+            result.is_err(),
+            "unsafe file must refuse the directory format"
+        );
         assert_eq!(
             std::fs::read_to_string(&safe).expect("read first source"),
             original,
