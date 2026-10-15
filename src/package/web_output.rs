@@ -34,7 +34,9 @@ fn overlaps(left: &Path, right: &Path) -> bool {
 fn validate_target(root: &Path, output: &str, static_dir: &str) -> io::Result<PathBuf> {
     let relative = Path::new(output);
     if !normal_relative(relative) {
-        return Err(invalid("web output_dir must be a nonempty relative path without . or .."));
+        return Err(invalid(
+            "web output_dir must be a nonempty relative path without . or ..",
+        ));
     }
 
     for protected in ["src", ".git", ".nula"] {
@@ -44,7 +46,9 @@ fn validate_target(root: &Path, output: &str, static_dir: &str) -> io::Result<Pa
     }
     let static_source = Path::new(static_dir);
     if !normal_relative(static_source) || overlaps(relative, static_source) {
-        return Err(invalid("web output_dir overlaps static_dir or static_dir is unsafe"));
+        return Err(invalid(
+            "web output_dir overlaps static_dir or static_dir is unsafe",
+        ));
     }
 
     let canonical_root = root.canonicalize()?;
@@ -74,7 +78,10 @@ impl BuildLock {
     fn acquire(path: PathBuf) -> io::Result<Self> {
         // A stale lock is intentional: never silently overwrite output after
         // a killed build without inspecting its staging and backup directories.
-        let _file = OpenOptions::new().write(true).create_new(true).open(&path)?;
+        let _file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
         Ok(Self { path })
     }
 }
@@ -226,7 +233,10 @@ mod tests {
 
         pending.publish().unwrap();
 
-        assert_eq!(std::fs::read_to_string(root.join("dist/index.html")).unwrap(), "new");
+        assert_eq!(
+            std::fs::read_to_string(root.join("dist/index.html")).unwrap(),
+            "new"
+        );
         assert!(!root.join("dist/obsolete.html").exists());
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -239,13 +249,22 @@ mod tests {
         {
             let pending = StagedWebOutput::new(&root, "dist", "public").unwrap();
             std::fs::write(pending.path().join("index.html"), "new").unwrap();
-            assert_eq!(std::fs::read_to_string(root.join("dist/index.html")).unwrap(), "old");
+            assert_eq!(
+                std::fs::read_to_string(root.join("dist/index.html")).unwrap(),
+                "old"
+            );
         }
-        assert_eq!(std::fs::read_to_string(root.join("dist/index.html")).unwrap(), "old");
+        assert_eq!(
+            std::fs::read_to_string(root.join("dist/index.html")).unwrap(),
+            "old"
+        );
         let pending = StagedWebOutput::new(&root, "dist", "public").unwrap();
         std::fs::write(pending.path().join("index.html"), "later").unwrap();
         pending.publish().unwrap();
-        assert_eq!(std::fs::read_to_string(root.join("dist/index.html")).unwrap(), "later");
+        assert_eq!(
+            std::fs::read_to_string(root.join("dist/index.html")).unwrap(),
+            "later"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -258,10 +277,16 @@ mod tests {
         std::fs::write(pending.path().join("index.html"), "new").unwrap();
 
         let result = pending.publish_with(|_, _| {
-            Err(io::Error::new(io::ErrorKind::PermissionDenied, "injected install failure"))
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected install failure",
+            ))
         });
         assert!(result.is_err());
-        assert_eq!(std::fs::read_to_string(root.join("dist/index.html")).unwrap(), "old");
+        assert_eq!(
+            std::fs::read_to_string(root.join("dist/index.html")).unwrap(),
+            "old"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -278,7 +303,19 @@ mod tests {
     #[test]
     fn reject_output_paths_that_can_replace_project_inputs() {
         let root = fixture("unsafe");
-        for output in ["", ".", "..", "../escape", "/tmp/out", "src", "src/generated", ".git", ".nula", "public", "public/build"] {
+        for output in [
+            "",
+            ".",
+            "..",
+            "../escape",
+            "/tmp/out",
+            "src",
+            "src/generated",
+            ".git",
+            ".nula",
+            "public",
+            "public/build",
+        ] {
             assert!(
                 StagedWebOutput::new(&root, output, "public").is_err(),
                 "output {output:?} must not be writable"
