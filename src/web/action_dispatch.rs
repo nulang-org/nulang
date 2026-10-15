@@ -1,12 +1,12 @@
 //! Renderer-neutral UI action resolution for Web hosts.
 //!
-//! This layer deliberately stops before parameter binding. A protocol action may
-//! be invoked directly only when compiler bytecode metadata proves the target is
-//! a top-level zero-argument function. Parameterized handlers must wait for a
-//! compiler-owned action binding plan rather than guessing from transport data.
+//! Only document-bound, compiler-described scalar arguments may be decoded.
+//! Binding never invokes a parameterized handler or authorizes external effects;
+//! hosts must enforce session authority and idempotency before execution.
 
-use crate::bytecode::CodeModule;
+use crate::bytecode::{CodeModule, Constant};
 use crate::vm::{Value, VM};
+use crate::web::contracts::HandlerParamContract;
 use nulang_ui_protocol::{ActionPlacement, HostToRuntimeMessage, Revision, UiDocument, WireValue};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,6 +20,7 @@ pub enum UiActionDispatchError {
     },
     UnregisteredAction(String),
     UnexpectedPayload,
+    InvalidPayload(String),
     ClientPlacement,
     UnknownAction(String),
     RequiresBindingPlan {
@@ -49,6 +50,7 @@ impl std::fmt::Display for UiActionDispatchError {
             Self::UnexpectedPayload => f.write_str(
                 "zero-argument UI action received data without a compiler-owned binding plan"
             ),
+            Self::InvalidPayload(message) => write!(f, "invalid UI action payload: {message}"),
             Self::ClientPlacement => {
                 f.write_str("client-placement action cannot be executed by the server runtime")
             }
@@ -127,15 +129,12 @@ pub fn invoke_zero_arg_action(
         .map_err(|error| UiActionDispatchError::Execution(error.to_string()))
 }
 
-/// Resolve a zero-argument server action against a *trusted, server-owned* UI
-/// document. A client-supplied document must never be used as the authority.
-/// This is a dispatch building block; it does not provide authentication,
-/// authorization or idempotent execution on its own.
-pub fn resolve_document_zero_arg_action(
-    module: &CodeModule,
+/// Shared document authorization preflight. A session host must supply a
+/// server-owned document and authenticate the session before calling this.
+fn authorize_document_action(
     document: &UiDocument,
     message: &HostToRuntimeMessage,
-) -> Result<ResolvedUiAction, UiActionDispatchError> {
+) -> Result<(), UiActionDispatchError> {
     document
         .validate()
         .map_err(|error| UiActionDispatchError::InvalidDocument(error.to_string()))?;
@@ -166,7 +165,158 @@ pub fn resolve_document_zero_arg_action(
             request.action_id.as_str().to_owned(),
         ));
     }
+    Ok(())
+}
 
+/// A validated, non-executing action binding. Constants must still cross the
+/// compiler-owned runtime binding ABI before execution; this type grants no
+/// authentication, effect authority, or idempotent execution privileges.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundUiAction {
+    pub action_id: String,
+    pub code_offset: usize,
+    pub arguments: Vec<Constant>,
+}
+
+/// Bind primitive action payloads only after checking the server-owned UI
+/// document and the compiler's declared function arity. The caller must pass
+/// compiler-owned parameter metadata, not a client-provided binding plan.
+///
+/// This stage deliberately does not invoke the handler; the session host still
+/// has to authenticate the principal, authorize the action, and deduplicate
+/// idempotency keys before scheduling effects.
+pub fn bind_document_action_payload(
+    module: &CodeModule,
+    document: &UiDocument,
+    message: &HostToRuntimeMessage,
+    params: &[HandlerParamContract],
+) -> Result<BoundUiAction, UiActionDispatchError> {
+    authorize_document_action(document, message)?;
+    let HostToRuntimeMessage::InvokeAction { request, .. } = message;
+    let action_id = request.action_id.as_str();
+    let Some(info) = module
+        .debug_functions
+        .iter()
+        .find(|function| function.name == action_id)
+    else {
+        return Err(UiActionDispatchError::UnknownAction(action_id.to_owned()));
+    };
+    if !module
+        .function_table
+        .iter()
+        .any(|offset| *offset == info.code_offset)
+    {
+        return Err(UiActionDispatchError::UnknownAction(action_id.to_owned()));
+    }
+    if params.len() != info.params.len() {
+        return Err(UiActionDispatchError::RequiresBindingPlan {
+            action_id: action_id.to_owned(),
+            parameter_count: info.params.len(),
+        });
+    }
+
+    let arguments = if params.is_empty() {
+        if !matches!(&request.payload, WireValue::Null)
+            && !matches!(&request.payload, WireValue::Object(fields) if fields.is_empty())
+        {
+            return Err(UiActionDispatchError::UnexpectedPayload);
+        }
+        Vec::new()
+    } else {
+        let WireValue::Object(fields) = &request.payload else {
+            return Err(UiActionDispatchError::InvalidPayload(
+                "expected object payload for parameterized action".to_owned(),
+            ));
+        };
+        // Neither duplicate parameter names nor extra payload keys may be
+        // interpreted as an authorized field by matching only the field count.
+        let mut parameter_names = std::collections::BTreeSet::new();
+        for param in params {
+            if !parameter_names.insert(param.name.as_str()) {
+                return Err(UiActionDispatchError::InvalidPayload(
+                    "duplicate compiler parameter name".to_owned(),
+                ));
+            }
+        }
+        if fields.len() != params.len()
+            || fields
+                .keys()
+                .any(|name| !parameter_names.contains(name.as_str()))
+        {
+            return Err(UiActionDispatchError::InvalidPayload(
+                "payload fields do not match compiler parameter names".to_owned(),
+            ));
+        }
+        let mut arguments = Vec::with_capacity(params.len());
+        for param in params {
+            if param.name.trim().is_empty() || param.capability.is_some() || param.request.is_some()
+            {
+                return Err(UiActionDispatchError::InvalidPayload(
+                    "unsupported or privileged compiler parameter contract".to_owned(),
+                ));
+            }
+            let Some(ty) = param.ty.as_deref() else {
+                return Err(UiActionDispatchError::InvalidPayload(format!(
+                    "parameter '{}' has no proven type",
+                    param.name
+                )));
+            };
+            let Some(value) = fields.get(&param.name) else {
+                return Err(UiActionDispatchError::InvalidPayload(format!(
+                    "missing parameter '{}'",
+                    param.name
+                )));
+            };
+            arguments.push(decode_action_scalar(value, ty).ok_or_else(|| {
+                UiActionDispatchError::InvalidPayload(format!(
+                    "parameter '{}' is not a valid {} scalar",
+                    param.name, ty
+                ))
+            })?);
+        }
+        arguments
+    };
+
+    Ok(BoundUiAction {
+        action_id: action_id.to_owned(),
+        code_offset: info.code_offset,
+        arguments,
+    })
+}
+
+fn decode_action_scalar(value: &WireValue, ty: &str) -> Option<Constant> {
+    match (ty.trim(), value) {
+        ("String", WireValue::String(value)) => Some(Constant::String(value.clone())),
+        ("Int", WireValue::I64(value)) => Some(Constant::Int(value.0)),
+        ("Int", WireValue::String(value)) => value.parse::<i64>().ok().map(Constant::Int),
+        ("Bool", WireValue::Bool(value)) => Some(Constant::Bool(*value)),
+        ("Bool", WireValue::String(value)) if value == "true" => Some(Constant::Bool(true)),
+        ("Bool", WireValue::String(value)) if value == "false" => Some(Constant::Bool(false)),
+        ("Float", WireValue::F64(value)) => {
+            let float = value.to_f64();
+            float.is_finite().then_some(Constant::Float(float))
+        }
+        ("Float", WireValue::String(value)) => value
+            .parse::<f64>()
+            .ok()
+            .filter(|parsed| parsed.is_finite())
+            .map(Constant::Float),
+        _ => None,
+    }
+}
+
+/// Resolve a zero-argument server action against a *trusted, server-owned* UI
+/// document. A client-supplied document must never be used as the authority.
+/// This is a dispatch building block; it does not provide authentication,
+/// authorization or idempotent execution on its own.
+pub fn resolve_document_zero_arg_action(
+    module: &CodeModule,
+    document: &UiDocument,
+    message: &HostToRuntimeMessage,
+) -> Result<ResolvedUiAction, UiActionDispatchError> {
+    authorize_document_action(document, message)?;
+
+    let HostToRuntimeMessage::InvokeAction { request, .. } = message;
     // A zero-argument action has no defined payload decoder. Do not silently
     // discard client-supplied fields, or reinterpret them as VM registers.
     let payload_empty = match &request.payload {
@@ -247,6 +397,170 @@ mod tests {
             placement,
         });
         UiDocument::new("app", Revision(1), "root", vec![root])
+    }
+
+    fn typed_param(name: &str, ty: &str) -> crate::web::contracts::HandlerParamContract {
+        crate::web::contracts::HandlerParamContract {
+            name: name.to_owned(),
+            ty: Some(ty.to_owned()),
+            capability: None,
+            request: None,
+        }
+    }
+
+    fn action_payload(fields: &[(&str, WireValue)]) -> HostToRuntimeMessage {
+        let mut message = action_message("save", ActionPlacement::Server);
+        let HostToRuntimeMessage::InvokeAction { request, .. } = &mut message;
+        request.payload = WireValue::Object(
+            fields
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), value.clone()))
+                .collect(),
+        );
+        message
+    }
+
+    #[test]
+    fn document_bound_scalar_payload_binds_by_compiler_parameter_order() {
+        let module = module_with_action("save", vec![0, 1, 2]);
+        let document = trusted_document("save", ActionPlacement::Server);
+        let message = action_payload(&[
+            ("count", WireValue::from("42")),
+            ("active", WireValue::Bool(true)),
+            ("title", WireValue::from("Save me")),
+        ]);
+        let params = [
+            typed_param("title", "String"),
+            typed_param("count", "Int"),
+            typed_param("active", "Bool"),
+        ];
+
+        let bound = bind_document_action_payload(&module, &document, &message, &params)
+            .expect("trusted document and exact compiler arity permit scalar binding");
+        assert_eq!(bound.action_id, "save");
+        assert_eq!(
+            bound.arguments,
+            vec![
+                Constant::String("Save me".into()),
+                Constant::Int(42),
+                Constant::Bool(true),
+            ]
+        );
+    }
+
+    #[test]
+    fn document_bound_scalar_payload_rejects_unknown_missing_and_wrong_types() {
+        let module = module_with_action("save", vec![0, 1]);
+        let document = trusted_document("save", ActionPlacement::Server);
+        let params = [typed_param("title", "String"), typed_param("count", "Int")];
+
+        for message in [
+            action_payload(&[("title", WireValue::from("one"))]),
+            action_payload(&[
+                ("title", WireValue::from("one")),
+                ("count", WireValue::I64(1.into())),
+                ("admin", WireValue::Bool(true)),
+            ]),
+            action_payload(&[
+                ("title", WireValue::from("one")),
+                ("count", WireValue::from("not-an-int")),
+            ]),
+        ] {
+            assert!(matches!(
+                bind_document_action_payload(&module, &document, &message, &params),
+                Err(UiActionDispatchError::InvalidPayload(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn document_bound_scalar_payload_rejects_unproven_compiler_contracts() {
+        let module = module_with_action("save", vec![0, 1]);
+        let document = trusted_document("save", ActionPlacement::Server);
+        let message = action_payload(&[("title", WireValue::from("one"))]);
+
+        assert!(matches!(
+            bind_document_action_payload(
+                &module,
+                &document,
+                &message,
+                &[typed_param("title", "String")]
+            ),
+            Err(UiActionDispatchError::RequiresBindingPlan { .. })
+        ));
+
+        let mut privileged = typed_param("title", "String");
+        privileged.capability = Some("iso".into());
+        assert!(matches!(
+            bind_document_action_payload(
+                &module_with_action("save", vec![0]),
+                &document,
+                &message,
+                &[privileged]
+            ),
+            Err(UiActionDispatchError::InvalidPayload(_))
+        ));
+    }
+
+    #[test]
+    fn document_bound_scalar_payload_rejects_duplicate_contract_parameter_names() {
+        let module = module_with_action("save", vec![0, 1]);
+        let document = trusted_document("save", ActionPlacement::Server);
+        let message = action_payload(&[
+            ("title", WireValue::from("value")),
+            ("admin", WireValue::Bool(true)),
+        ]);
+        let params = [
+            typed_param("title", "String"),
+            typed_param("title", "String"),
+        ];
+
+        assert!(matches!(
+            bind_document_action_payload(&module, &document, &message, &params),
+            Err(UiActionDispatchError::InvalidPayload(_))
+        ));
+    }
+
+    #[test]
+    fn document_bound_scalar_payload_rejects_nonfinite_float() {
+        let module = module_with_action("save", vec![0]);
+        let document = trusted_document("save", ActionPlacement::Server);
+        let params = [typed_param("ratio", "Float")];
+        let message = action_payload(&[(
+            "ratio",
+            WireValue::F64(nulang_ui_protocol::F64Bits::from_f64(f64::NAN)),
+        )]);
+
+        assert!(matches!(
+            bind_document_action_payload(&module, &document, &message, &params),
+            Err(UiActionDispatchError::InvalidPayload(_))
+        ));
+    }
+
+    #[test]
+    fn document_bound_scalar_payload_rejects_foreign_or_unregistered_actions() {
+        let module = module_with_action("save", vec![0]);
+        let document = trusted_document("save", ActionPlacement::Server);
+        let message = action_payload(&[("title", WireValue::from("one"))]);
+        let params = [typed_param("title", "String")];
+
+        assert!(matches!(
+            bind_document_action_payload(
+                &module,
+                &trusted_document("other", ActionPlacement::Server),
+                &message,
+                &params
+            ),
+            Err(UiActionDispatchError::UnregisteredAction(_))
+        ));
+
+        let mut stale = message.clone();
+        let HostToRuntimeMessage::InvokeAction { request, .. } = &mut stale;
+        request.revision = Revision(999);
+        assert!(matches!(
+            bind_document_action_payload(&module, &document, &stale, &params),
+            Err(UiActionDispatchError::RevisionMismatch { .. })
+        ));
     }
 
     #[test]
