@@ -33,10 +33,7 @@ pub fn render_content_document(
     layout: &ContentLayout<'_>,
 ) -> Result<String, String> {
     if page.draft {
-        return Err(format!(
-            "cannot render draft content {}",
-            page.source_path
-        ));
+        return Err(format!("cannot render draft content {}", page.source_path));
     }
     if layout.site_title.trim().is_empty() {
         return Err("site title must not be empty".to_string());
@@ -102,11 +99,7 @@ fn render_markdown_blocks(markdown: &str) -> Result<String, String> {
             flush_list(&mut list, &mut html)?;
             let language = language.trim();
             if !language.bytes().all(|b| {
-                b.is_ascii_lowercase()
-                    || b.is_ascii_digit()
-                    || b == b'-'
-                    || b == b'_'
-                    || b == b'+'
+                b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_' || b == b'+'
             }) {
                 return Err(format!("invalid fence language at line {line_number}"));
             }
@@ -279,13 +272,17 @@ mod tests {
     #[test]
     fn rejects_unfinished_fence_and_unsafe_language_identifiers() {
         let missing_end = page("```rust\nlet x = 1;\n");
-        assert!(render_content_document(&missing_end, &ContentLayout::default())
-            .unwrap_err()
-            .contains("unclosed"));
+        assert!(
+            render_content_document(&missing_end, &ContentLayout::default())
+                .unwrap_err()
+                .contains("unclosed")
+        );
         let unsafe_language = page("```rust\" onmouseover=\"alert(1)\nunsafe\n```\n");
-        assert!(render_content_document(&unsafe_language, &ContentLayout::default())
-            .unwrap_err()
-            .contains("fence language"));
+        assert!(
+            render_content_document(&unsafe_language, &ContentLayout::default())
+                .unwrap_err()
+                .contains("fence language")
+        );
     }
 
     #[test]
@@ -323,7 +320,8 @@ mod tests {
 
     #[test]
     fn renders_all_heading_levels_without_trusting_markdown_html() {
-        let md = "# One\n## Two\n### Three\n#### Four\n##### Five\n###### Six\n\n<script>x</script>";
+        let md =
+            "# One\n## Two\n### Three\n#### Four\n##### Five\n###### Six\n\n<script>x</script>";
         let html = render_content_document(&page(md), &ContentLayout::default()).unwrap();
         for level in 1..=6 {
             assert!(html.contains(&format!("<h{level}>")));
