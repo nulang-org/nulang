@@ -368,20 +368,32 @@ pub extern "C" fn nulang_ineg_nil0(a: u64) -> u64 {
 
 #[no_mangle]
 pub extern "C" fn nulang_fdiv(a: u64, b: u64) -> u64 {
-    let bv = f64::from_bits(b);
+    // Mirror VM::run_from FDiv: tagged/nil numerators coerce to 0.0,
+    // while tagged/nil divisors coerce to 1.0. An actual float zero
+    // divisor still produces nil.
+    let bv = if is_float_raw(b) {
+        f64::from_bits(b)
+    } else {
+        1.0
+    };
     if bv == 0.0 {
         return Value::nil().as_raw();
     }
-    Value::float(f64::from_bits(a) / bv).as_raw()
+    Value::float(fval(a) / bv).as_raw()
 }
 
 #[no_mangle]
 pub extern "C" fn nulang_fmod(a: u64, b: u64) -> u64 {
-    let bv = f64::from_bits(b);
+    // Keep FMod consistent with the interpreter's asymmetric defaults.
+    let bv = if is_float_raw(b) {
+        f64::from_bits(b)
+    } else {
+        1.0
+    };
     if bv == 0.0 {
         return Value::nil().as_raw();
     }
-    Value::float(f64::from_bits(a) % bv).as_raw()
+    Value::float(fval(a) % bv).as_raw()
 }
 
 #[no_mangle]
