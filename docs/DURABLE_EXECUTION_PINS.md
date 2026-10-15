@@ -76,6 +76,117 @@ structural schema compatibility, changed manifest identity with unchanged bytes,
 incorrect executable/sidecar binding, cross-execution reuse, unknown pin version,
 missing pin, and malformed digests.
 
+## Atomic storage integration (stacked increment)
+
+`runtime::commit_pinned_workflow_start` creates a pinned workflow's initial
+`ActorSnapshot`, `WorkflowStarted`, and reserved execution-pin record in
+one `DurableTransition` at sequence 1. This uses the existing
+`PersistenceStore::commit_transition` transaction boundary and refuses to
+initialize actor histories that already have a committed predecessor.
+
+`runtime::verify_pinned_workflow_resume` checks the atomic tail, snapshot,
+unique initial start record and pin, then verifies the provided executable
+bytes and complete manifest before the host rehydrates any actor.
+
+The pin is encoded as a reserved `WorkflowEvent::Custom` record inside the
+**same initial atomic transition**. It is not an ordinary user-visible workflow
+command. The implementation deliberately does not introduce new tables, a
+new bytecode format, or a second journaling backend.
+
+Example host integration:
+
+```text
+# Creation path — before publishing or scheduling any actor:
+snapshot = stage_initial_workflow_snapshot(actor)
+commit_pinned_workflow_start(store, actor_id, execution_id,
+                             name, manifest, executable_bytes,
+                             snapshot, initial_state)
+publish_actor_only_after_commit()
+
+# Restart path — before resolving mutable 'latest' code or running handlers:
+immutable_bytes = artifact_store.resolve(pinned_artifact_digest)
+verify_pinned_workflow_resume(store, actor_id, execution_id,
+                              pinned_manifest, immutable_bytes)
+recover_actor_using_verified_module()
+```
+
+The Rust APIs implement the two persistence-side operations above, **not**
+automatic `Runtime::try_spawn_workflow_actor` / `Runtime::recover_actor`
+interposition. An embedding host must enforce that sequencing and must not
+fall back to a legacy recovery API after a failed preflight. In particular,
+an executable loaded from an unpinned mutable "latest" alias is not acceptable.
+
+`MemoryStore` and `LibsqlStore` are covered by deterministic regression
+tests, including an integration test that exits the first test process, opens
+libSQL in another process, verifies the original artifact, then rejects a
+changed candidate. Backends without atomic `commit_transition` support
+must return `Unsupported` and leave no partially created history.
+
+Focused verification:
+
+```bash
+cargo test --locked --test pinned_workflow_atomic_start
+cargo test --locked --features sqlite --test pinned_workflow_atomic_start
+cargo fmt --all -- --check
+```
+
+**Remaining release blockers:** bind these two APIs to the automatic actor
+spawn and recovery paths; register/resolve an immutable artifact before
+activation; add fail-closed host-level migration policy, stale-owner fencing,
+transaction rollback/fault-injection, and end-to-end crash-point coverage.
+Do not advertise transparent worker upgrades until that work is complete.
+
+## Opt-in Runtime lifecycle integration
+
+`Runtime::try_spawn_pinned_workflow_actor` now uses the atomic creation
+primitive to stage initial actor state and commit the snapshot, start event,
+and pin **before** scheduling the actor. A failed atomic write removes the
+unpublished actor from memory. It intentionally does not clear the durable
+store on an ambiguous commit error: recovery must first inspect the committed
+history. Duplicate starts on an already-persisted actor ID are rejected by a
+preflight history check.
+
+`Runtime::recover_pinned_workflow_actor` reads the durable pin, calls a
+host-supplied `ImmutablePinnedArtifactResolver` **by the original executable
+digest**, verifies the bundle against the persisted execution identity and
+complete behavior manifest, and only then hydrates the actor.
+
+Plain `Runtime::recover_actor` rejects an execution pin or the recognizable
+atomic-start fingerprint. This prevents a legacy bypass when a decoded pin
+is missing from otherwise recognizable pinned start history.
+
+These APIs are currently an **opt-in native-workflow path**, not blanket
+enforcement for every workflow. An already registered bytecode recovery module
+is rejected by the pinned API, because digest verification of separate bytes
+does not establish that the executable module actually dispatched was loaded
+from them. A verified immutable bytecode-module loader is required first.
+
+```bash
+cargo test --locked --test pinned_workflow_runtime
+cargo test --locked --features sqlite --test pinned_workflow_runtime
+```
+
+The sqlite tests include subprocess-backed workflow creation, changed-artifact
+rejection, and verified restart on a fresh Runtime.
+
+### Remaining safety constraints
+
+- The generic atomic persistence contract treats identical committed
+  transitions as idempotent retries. A preflight existing-history check
+  prevents ordinary repeated starts, but it is not a cross-process atomic
+  **create-only** operation. A storage-level conditional creation primitive
+  is still required for concurrent identical starters.
+- Legacy unpinned workflow creation still uses its original separate writes.
+  There is no automatic provenance check for old unpinned histories.
+- Persisted event readers that silently omit every corrupt start record can
+  defeat the atomic-start fingerprint. Strong recovery requires checked,
+  corruption-reporting history reads.
+- No immutable artifact retention/garbage-collection controller, signed
+  provenance attestation, cross-node epoch test, or automatic Cloud admission
+  integration has been implemented.
+- Promotion requires exact-head Rust build, Clippy, all relevant feature tests,
+  crash/fault-injection coverage and independently reviewed concurrency tests.
+
 ## Next increment / non-goals of v1
 
 1. Atomically persist a pin at execution creation with the existing

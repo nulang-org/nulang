@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 
 use crate::authority::AuthorityManifest;
+use crate::behavior_manifest::BehaviorManifest;
 use crate::authority_runtime::RuntimeAuthorityError;
 use crate::primitives::ActorRole;
 use crate::runtime::actor::{Actor, ActorBackend, BehaviorEntry};
@@ -132,6 +133,41 @@ pub(crate) fn spawn_actor_with_id(
     }
 }
 
+/// Exact artifact input for the opt-in pinned workflow creation path.
+struct PinnedStart<'a> {
+    execution_id: &'a str,
+    manifest: &'a BehaviorManifest,
+    executable: &'a [u8],
+}
+
+/// Use the same spawn and rollback lifecycle as ordinary workflows, but stage
+/// the pin, initial state and start event in a single durable transition.
+pub(crate) fn try_spawn_pinned_workflow_actor(
+    rt: &mut Runtime,
+    name: &str,
+    execution_id: &str,
+    init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
+    state_models: HashMap<String, StateModel>,
+    manifest: &BehaviorManifest,
+    executable: &[u8],
+) -> std::io::Result<u64> {
+    try_spawn_actor_with_id_pinned(
+        rt,
+        fresh_actor_id(),
+        init,
+        state_models,
+        true,
+        Some(name),
+        None,
+        None,
+        Some(PinnedStart {
+            execution_id,
+            manifest,
+            executable,
+        }),
+    )
+}
+
 fn try_spawn_actor_with_id(
     rt: &mut Runtime,
     id: u64,
@@ -141,6 +177,22 @@ fn try_spawn_actor_with_id(
     workflow: Option<&str>,
     initial_authority: Option<&AuthorityManifest>,
     expected_schema: Option<(&crate::bytecode::CodeModule, &str)>,
+) -> std::io::Result<u64> {
+    try_spawn_actor_with_id_pinned(
+        rt, id, init, state_models, persistent, workflow, initial_authority, expected_schema, None,
+    )
+}
+
+fn try_spawn_actor_with_id_pinned(
+    rt: &mut Runtime,
+    id: u64,
+    init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
+    state_models: HashMap<String, StateModel>,
+    persistent: bool,
+    workflow: Option<&str>,
+    initial_authority: Option<&AuthorityManifest>,
+    expected_schema: Option<(&crate::bytecode::CodeModule, &str)>,
+    pinned: Option<PinnedStart<'_>>,
 ) -> std::io::Result<u64> {
     let restart_snapshot = if persistent && workflow.is_none() {
         match preflight_persistent_snapshot(rt, id, expected_schema) {
@@ -221,26 +273,60 @@ fn try_spawn_actor_with_id(
             }
             state
         };
-        let commit = rt
-            .persistence
-            .append_workflow_event(
-                id,
-                WorkflowEvent::WorkflowStarted {
-                    sequence: seq,
-                    name: workflow_name.as_ref().unwrap().clone(),
+        let commit = if let Some(pin) = pinned.as_ref() {
+            (|| {
+                // Stage the exact state/authority snapshot before dispatch.
+                // commit_transition is the *only* durable write in this path.
+                let snapshot = crate::runtime::workflow::build_actor_snapshot_at_sequence(
+                    rt, id, 1,
+                )?
+                .ok_or_else(|| std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "pinned workflow has no persistent initial snapshot",
+                ))?;
+                crate::runtime::pinned_execution::commit_pinned_workflow_start(
+                    rt.persistence.as_mut(),
+                    id,
+                    pin.execution_id,
+                    workflow_name.as_deref().unwrap(),
+                    pin.manifest,
+                    pin.executable,
+                    snapshot.clone(),
                     state,
-                },
-            )
-            .and_then(|_| crate::runtime::workflow::try_checkpoint_actor(rt, id));
+                )?;
+                if let Some(actor) = rt.actors.get_mut(&id) {
+                    actor.sequence = 1;
+                    actor.dirty_fields.clear();
+                }
+                rt.maybe_shadow_replicate(id, &snapshot);
+                Ok(())
+            })()
+        } else {
+            rt.persistence
+                .append_workflow_event(
+                    id,
+                    WorkflowEvent::WorkflowStarted {
+                        sequence: seq,
+                        name: workflow_name.as_ref().unwrap().clone(),
+                        state,
+                    },
+                )
+                .and_then(|_| crate::runtime::workflow::try_checkpoint_actor(rt, id))
+        };
         if let Err(error) = commit {
             rt.actors.remove(&id);
             if let Some(ref mut mgr) = rt.crdt_manager {
                 mgr.unregister_actor_fields(id);
             }
 
-            // WorkflowStarted may already have committed when the initial
-            // snapshot fails. A failed spawn must not leave that half-created
-            // durable identity behind for later recovery/reconciliation.
+            // An atomic pinned failure may represent a committed-but-
+            // unacknowledged transaction, so never clear storage in that path.
+            // Recovery must decide from the durable tail and exact pin.
+            if pinned.is_some() {
+                return Err(error);
+            }
+            // Legacy workflow creation uses two writes; preserve its cleanup
+            // behavior until that compatibility path is migrated.
             if let Err(cleanup_error) = rt.persistence.clear(id) {
                 return Err(std::io::Error::new(
                     error.kind(),
