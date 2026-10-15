@@ -70,6 +70,30 @@ fn validate_target(root: &Path, output: &str, static_dir: &str) -> io::Result<Pa
     Ok(target)
 }
 
+/// A successful prior Nulang Web build emits an IR manifest. Without that
+/// marker, replacing a nonempty directory could delete unrelated user data.
+fn ensure_managed_destination(target: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(target) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+            Err(invalid("web output is not a real directory"))
+        }
+        Ok(_) => {
+            if fs::read_dir(target)?.next().is_none() {
+                return Ok(());
+            }
+            let marker = target.join("nulang-app.ir.json");
+            match fs::symlink_metadata(&marker) {
+                Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => Ok(()),
+                _ => Err(invalid(
+                    "refusing to replace nonempty unmanaged web output (missing nulang-app.ir.json)",
+                )),
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
 struct BuildLock {
     path: PathBuf,
 }
@@ -103,6 +127,7 @@ pub(super) struct StagedWebOutput {
 impl StagedWebOutput {
     pub(super) fn new(root: &Path, output: &str, static_dir: &str) -> io::Result<Self> {
         let target = validate_target(root, output, static_dir)?;
+        ensure_managed_destination(&target)?;
         let parent = target
             .parent()
             .ok_or_else(|| invalid("web output_dir has no parent"))?;
@@ -155,14 +180,7 @@ impl StagedWebOutput {
     where
         F: FnOnce(&Path, &Path) -> io::Result<()>,
     {
-        match fs::symlink_metadata(&self.target) {
-            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
-                return Err(invalid("published web output is not a real directory"));
-            }
-            Ok(_) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err),
-        }
+        ensure_managed_destination(&self.target)?;
 
         let had_previous = self.target.exists();
         if had_previous {
