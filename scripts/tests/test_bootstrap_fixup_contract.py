@@ -27,7 +27,7 @@ def fixed_words(result):
 class BootstrapFixupContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.fixup = load_fixup().fixup
+        cls.fixup = staticmethod(load_fixup().fixup)
 
     def test_nested_if_offsets_target_nearest_own_boundaries(self):
         source = [
