@@ -2730,9 +2730,7 @@ mod tests {
 
     #[test]
     fn offline_flag_requires_a_lockfile_before_creating_dependency_cache() {
-        let dir = std::env::temp_dir().join(format!(
-            "nula_offline_missing_{}", std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("nula_offline_missing_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         scaffold_package(&dir, "offline-app", "default").unwrap();
         let _guard = ChangeDir::new(&dir);
@@ -2748,9 +2746,7 @@ mod tests {
 
     #[test]
     fn offline_path_only_build_keeps_exact_lockfile_bytes() {
-        let dir = std::env::temp_dir().join(format!(
-            "nula_offline_path_{}", std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("nula_offline_path_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         scaffold_package(&dir, "offline-app", "default").unwrap();
         let _guard = ChangeDir::new(&dir);
