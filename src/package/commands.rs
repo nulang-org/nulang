@@ -1,6 +1,7 @@
 //! `nula` CLI subcommands: `new`, `init`, `build`, `build-wasm`, `test`, `run`,
 //! `list`, `clean`, `add`, `remove`, `watch`, `publish`, `deploy`.
 
+use std::collections::BTreeSet;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1366,6 +1367,8 @@ fn cmd_build_web() -> NuResult<()> {
         span: Span::default(),
     })?;
 
+    // A previous build owns only the files named in its validated manifest.
+    let previous_generated_static = load_generated_static_manifest(&output_dir)?;
     let client_js_path = output_dir.join("app.client.js");
     let client_js_path_str = client_js_path.to_string_lossy().into_owned();
 
@@ -1431,6 +1434,7 @@ fn cmd_build_web() -> NuResult<()> {
         &manifest.budgets,
         &validated_contracts,
     );
+    let mut generated_static = BTreeSet::new();
     let static_count = ir
         .routes
         .iter()
@@ -1450,6 +1454,9 @@ fn cmd_build_web() -> NuResult<()> {
             })?;
         let html = crate::web::reactivity::inject_client_runtime_script(&html);
         let out_file = route_path_to_output_file(&route.path);
+        let relative = out_file.to_string_lossy().replace('\\', "/");
+        let out_file = validate_generated_static_entry(&relative)?;
+        ensure_static_file_path_is_not_symlink(&output_dir, &out_file)?;
         let dest = output_dir.join(&out_file);
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|e| NuError::PackageError {
@@ -1461,8 +1468,13 @@ fn cmd_build_web() -> NuResult<()> {
             msg: format!("cannot write {}: {}", dest.display(), e),
             span: Span::default(),
         })?;
+        generated_static.insert(relative);
         eprintln!("    {} -> {}", route.path, dest.display());
     }
+
+    // Prune before copying user-managed assets, which may replace older
+    // generated pages at the same path. Never delete unlisted files.
+    prune_stale_generated_static(&output_dir, &previous_generated_static, &generated_static)?;
 
     let static_dir = root.join(&manifest.web.static_dir);
     if static_dir.is_dir() {
@@ -1495,6 +1507,8 @@ fn cmd_build_web() -> NuResult<()> {
         });
     }
 
+    write_generated_static_manifest(&output_dir, &generated_static)?;
+
     println!("Web build succeeded: {}", output_dir.display());
     Ok(())
 }
@@ -1506,6 +1520,146 @@ fn route_path_to_output_file(path: &str) -> PathBuf {
     } else {
         PathBuf::from(trimmed).join("index.html")
     }
+}
+
+const GENERATED_STATIC_MANIFEST: &str = ".nulang-generated-static.json";
+
+fn generated_static_error(message: impl Into<String>) -> NuError {
+    NuError::PackageError {
+        msg: message.into(),
+        span: Span::default(),
+    }
+}
+
+/// Only regular normalized relative generated HTML paths may be pruned.
+fn validate_generated_static_entry(name: &str) -> NuResult<PathBuf> {
+    let segments: Vec<&str> = name.split('/').collect();
+    if name.contains('\\')
+        || segments.last() != Some(&"index.html")
+        || segments.iter().any(|segment| {
+            segment.is_empty()
+                || *segment == "."
+                || *segment == ".."
+                || segment.contains(':')
+                || segment.chars().any(char::is_control)
+        })
+    {
+        return Err(generated_static_error(format!(
+            "unsafe generated Web artifact path: {name}"
+        )));
+    }
+    Ok(PathBuf::from(name))
+}
+
+/// Refuse symlinked output roots, intermediate directories and leaf files.
+fn ensure_static_file_path_is_not_symlink(root: &Path, relative: &Path) -> NuResult<()> {
+    let mut current = root.to_path_buf();
+    for component in std::iter::once(None).chain(relative.components().map(Some)) {
+        if let Some(component) = component {
+            current.push(component.as_os_str());
+        }
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(generated_static_error(format!(
+                    "symlinked generated Web artifact path is forbidden: {}",
+                    current.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(generated_static_error(format!(
+                    "cannot inspect generated Web artifact {}: {error}",
+                    current.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn load_generated_static_manifest(output: &Path) -> NuResult<BTreeSet<String>> {
+    let manifest = output.join(GENERATED_STATIC_MANIFEST);
+    ensure_static_file_path_is_not_symlink(output, Path::new(GENERATED_STATIC_MANIFEST))?;
+    let content = match std::fs::read_to_string(&manifest) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BTreeSet::new());
+        }
+        Err(error) => {
+            return Err(generated_static_error(format!(
+                "cannot read generated Web manifest {}: {error}",
+                manifest.display()
+            )));
+        }
+    };
+    let entries: Vec<String> = serde_json::from_str(&content).map_err(|error| {
+        generated_static_error(format!(
+            "invalid generated Web manifest {}: {error}",
+            manifest.display()
+        ))
+    })?;
+    let mut owned = BTreeSet::new();
+    for name in entries {
+        let relative = validate_generated_static_entry(&name)?;
+        ensure_static_file_path_is_not_symlink(output, &relative)?;
+        if !owned.insert(name.clone()) {
+            return Err(generated_static_error(format!(
+                "duplicate generated Web artifact entry: {name}"
+            )));
+        }
+    }
+    Ok(owned)
+}
+
+fn prune_stale_generated_static(
+    output: &Path,
+    previous: &BTreeSet<String>,
+    current: &BTreeSet<String>,
+) -> NuResult<()> {
+    for stale in previous.difference(current) {
+        let relative = validate_generated_static_entry(stale)?;
+        ensure_static_file_path_is_not_symlink(output, &relative)?;
+        let target = output.join(relative);
+        match std::fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.is_file() => {
+                std::fs::remove_file(&target).map_err(|error| {
+                    generated_static_error(format!(
+                        "cannot prune stale generated Web page {}: {error}",
+                        target.display()
+                    ))
+                })?;
+            }
+            Ok(_) => {
+                return Err(generated_static_error(format!(
+                    "refusing to prune non-file generated Web artifact {}",
+                    target.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(generated_static_error(format!(
+                    "cannot inspect stale generated Web page {}: {error}",
+                    target.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_generated_static_manifest(output: &Path, generated: &BTreeSet<String>) -> NuResult<()> {
+    let manifest = output.join(GENERATED_STATIC_MANIFEST);
+    ensure_static_file_path_is_not_symlink(output, Path::new(GENERATED_STATIC_MANIFEST))?;
+    let entries: Vec<&str> = generated.iter().map(String::as_str).collect();
+    let serialized = serde_json::to_string_pretty(&entries)
+        .map_err(|error| generated_static_error(format!("cannot encode generated Web manifest: {error}")))?;
+    std::fs::write(&manifest, serialized).map_err(|error| {
+        generated_static_error(format!(
+            "cannot write generated Web manifest {}: {error}",
+            manifest.display()
+        ))
+    })
 }
 
 fn copy_dir_contents(src: &Path, dst: &Path) -> NuResult<()> {
