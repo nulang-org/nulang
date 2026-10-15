@@ -992,11 +992,7 @@ impl WebDevServer {
                         .spawn(move || {
                             let _lease = lease;
                             Self::handle_connection(
-                                stream,
-                                static_dir,
-                                output_dir,
-                                routes,
-                                shutdown,
+                                stream, static_dir, output_dir, routes, shutdown,
                             );
                         })
                     {
@@ -1314,10 +1310,16 @@ mod tests {
         let slots = Arc::new(ConnectionSlots::new(2));
         let first = slots.try_acquire().expect("first worker capacity");
         let second = slots.try_acquire().expect("second worker capacity");
-        assert!(slots.try_acquire().is_none(), "third connection must not spawn");
+        assert!(
+            slots.try_acquire().is_none(),
+            "third connection must not spawn"
+        );
         assert_eq!(slots.active.load(Ordering::Relaxed), 2);
         drop(first);
-        assert!(slots.try_acquire().is_some(), "capacity returns on worker exit");
+        assert!(
+            slots.try_acquire().is_some(),
+            "capacity returns on worker exit"
+        );
         drop(second);
     }
 
