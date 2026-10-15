@@ -3,6 +3,89 @@
 //! Publication remains owned by the existing Web build pipeline. This module
 //! neither renders Markdown nor writes any files.
 
+use crate::web::content::{ContentKind, ContentPage};
+use crate::web::content_routes::plan_content_routes_from_ir;
+use crate::web::ir::{route_path_to_artifact, DeploymentIr};
+use std::collections::BTreeSet;
+
+/// A public Markdown artifact reservation, not a rendered or written file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentArtifact {
+    pub slug: String,
+    pub source_path: String,
+    pub kind: ContentKind,
+    pub artifact: String,
+}
+
+/// Validate static asset names and plan public content artifact paths.
+///
+/// The deployment IR must already be generated from compiler-validated Web
+/// contracts. Static assets must be enumerated from the package's trusted
+/// static-directory walk; this function validates their relative path syntax
+/// and prevents a later copy from silently replacing generated Markdown HTML.
+/// It does not determine route placement, render Markdown, or publish files.
+pub fn plan_content_artifacts(
+    pages: &[ContentPage],
+    ir: &DeploymentIr,
+    static_assets: &[&str],
+) -> Result<Vec<ContentArtifact>, Vec<String>> {
+    let mut diagnostics = Vec::new();
+    let mut static_names = BTreeSet::new();
+    for path in static_assets {
+        if !valid_relative_asset_path(path) {
+            diagnostics.push(format!("invalid static asset path: {path}"));
+        } else {
+            static_names.insert(*path);
+        }
+    }
+
+    let routes = match plan_content_routes_from_ir(pages, ir) {
+        Ok(routes) => routes,
+        Err(errors) => {
+            diagnostics.extend(errors);
+            Vec::new()
+        }
+    };
+
+    let artifacts = routes
+        .into_iter()
+        .map(|route| {
+            let artifact = route_path_to_artifact(&route.slug);
+            if static_names.contains(artifact.as_str()) {
+                diagnostics.push(format!(
+                    "content route {} from {} would overwrite static asset {}",
+                    route.slug, route.source_path, artifact
+                ));
+            }
+            ContentArtifact {
+                slug: route.slug,
+                source_path: route.source_path,
+                kind: route.kind,
+                artifact,
+            }
+        })
+        .collect();
+
+    if diagnostics.is_empty() {
+        Ok(artifacts)
+    } else {
+        diagnostics.sort();
+        diagnostics.dedup();
+        Err(diagnostics)
+    }
+}
+
+fn valid_relative_asset_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with('/')
+        && !path.contains('\\')
+        && !path.contains('\0')
+        && !path.split('/').next().is_some_and(|segment| segment.contains(':'))
+        && path
+            .split('/')
+            .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
