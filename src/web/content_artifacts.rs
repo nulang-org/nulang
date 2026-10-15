@@ -80,7 +80,10 @@ fn valid_relative_asset_path(path: &str) -> bool {
         && !path.starts_with('/')
         && !path.contains('\\')
         && !path.contains('\0')
-        && !path.split('/').next().is_some_and(|segment| segment.contains(':'))
+        && !path
+            .split('/')
+            .next()
+            .is_some_and(|segment| segment.contains(':'))
         && path
             .split('/')
             .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
@@ -156,35 +159,40 @@ mod tests {
             &["images/cover.png", "docs/post/index.html"],
         )
         .unwrap_err();
-        assert!(err.iter().any(|line| {
-            line.contains("docs/post/index.html")
-                && line.contains("docs/post.md")
-                && line.contains("static asset")
-        }), "{err:?}");
+        assert!(
+            err.iter().any(|line| {
+                line.contains("docs/post/index.html")
+                    && line.contains("docs/post.md")
+                    && line.contains("static asset")
+            }),
+            "{err:?}"
+        );
     }
 
     #[test]
     fn homepage_cannot_replace_explicit_static_index() {
         let pages = vec![page("_index.md", false)];
-        let err = plan_content_artifacts(
-            &pages,
-            &DeploymentIr::default(),
-            &["index.html"],
-        )
-        .unwrap_err();
-        assert!(err.iter().any(|line| line.contains("index.html")), "{err:?}");
+        let err =
+            plan_content_artifacts(&pages, &DeploymentIr::default(), &["index.html"]).unwrap_err();
+        assert!(
+            err.iter().any(|line| line.contains("index.html")),
+            "{err:?}"
+        );
     }
 
     #[test]
     fn fails_closed_on_registered_server_get_route() {
         let pages = vec![page("blog/post.md", false)];
         let mut ir = DeploymentIr::default();
-        ir.routes.push(serde_json::from_value(serde_json::json!({
-            "method": "GET",
-            "path": "/blog/{slug}",
-            "placement": "server",
-            "artifact": null
-        })).unwrap());
+        ir.routes.push(
+            serde_json::from_value(serde_json::json!({
+                "method": "GET",
+                "path": "/blog/{slug}",
+                "placement": "server",
+                "artifact": null
+            }))
+            .unwrap(),
+        );
         let err = plan_content_artifacts(&pages, &ir, &[]).unwrap_err();
         assert!(
             err.iter().any(|line| line.contains("GET /blog/{slug}")),
@@ -195,11 +203,17 @@ mod tests {
     #[test]
     fn malformed_static_asset_paths_are_rejected_without_writing() {
         let pages = vec![page("docs/post.md", false)];
-        for path in ["../index.html", "/index.html", "docs\\post.html", "docs//post.html"] {
-            let err = plan_content_artifacts(&pages, &DeploymentIr::default(), &[path])
-                .unwrap_err();
+        for path in [
+            "../index.html",
+            "/index.html",
+            "docs\\post.html",
+            "docs//post.html",
+        ] {
+            let err =
+                plan_content_artifacts(&pages, &DeploymentIr::default(), &[path]).unwrap_err();
             assert!(
-                err.iter().any(|line| line.contains("invalid static asset path")),
+                err.iter()
+                    .any(|line| line.contains("invalid static asset path")),
                 "{path}: {err:?}"
             );
         }
@@ -209,12 +223,15 @@ mod tests {
     fn unrelated_static_assets_and_post_routes_are_compatible() {
         let pages = vec![page("docs/post.md", false), page("docs/draft.md", true)];
         let mut ir = DeploymentIr::default();
-        ir.routes.push(serde_json::from_value(serde_json::json!({
-            "method": "POST",
-            "path": "/docs/post",
-            "placement": "server",
-            "artifact": null
-        })).unwrap());
+        ir.routes.push(
+            serde_json::from_value(serde_json::json!({
+                "method": "POST",
+                "path": "/docs/post",
+                "placement": "server",
+                "artifact": null
+            }))
+            .unwrap(),
+        );
         let output = plan_content_artifacts(&pages, &ir, &["assets/site.css"]).unwrap();
         assert_eq!(output.len(), 1);
         assert_eq!(output[0].artifact, "docs/post/index.html");
