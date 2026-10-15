@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Static-only Web artifact generation — 2026-10-15
+- **`nula build --web` prerenders only routes that validated Deployment IR classifies as static.** Server-placed routes (including POST mutations) remain in deployment metadata but are not executed or emitted as public HTML during static generation.
+- **A mixed-route build regression validates placement and emitted artifacts**, preserving the compiler-owned validated contract as the shared authority for runtime and deployment.
+
 ### Rustls and Wasmtime security updates — 2026-10-15
 - **Pinned supported TLS and WASM runtime dependencies to patched versions.** Updated rustls 0.23.45 to 0.23.46 and Wasmtime 48.0.5 to 48.0.6 (including compatible Cranelift and runtime lockfile packages) to address October 2026 RustSec advisories.
 - **Documented the remaining legacy rustls 0.22 advisories in the Cargo audit policy.** The affected version is transitive through libsql's hyper-rustls 0.25 path; explicit advisory exceptions are restricted to the documented IDs until the upstream dependency chain is upgraded.
