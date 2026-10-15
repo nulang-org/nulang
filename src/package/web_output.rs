@@ -227,6 +227,7 @@ mod tests {
     fn successful_publish_replaces_stale_output_instead_of_merging() {
         let root = fixture("replace");
         std::fs::create_dir(root.join("dist")).unwrap();
+        std::fs::write(root.join("dist/nulang-app.ir.json"), "{}").unwrap();
         std::fs::write(root.join("dist/obsolete.html"), "old").unwrap();
         let pending = StagedWebOutput::new(&root, "dist", "public").unwrap();
         std::fs::write(pending.path().join("index.html"), "new").unwrap();
@@ -245,6 +246,7 @@ mod tests {
     fn dropped_or_failed_build_preserves_previous_output() {
         let root = fixture("discard");
         std::fs::create_dir(root.join("dist")).unwrap();
+        std::fs::write(root.join("dist/nulang-app.ir.json"), "{}").unwrap();
         std::fs::write(root.join("dist/index.html"), "old").unwrap();
         {
             let pending = StagedWebOutput::new(&root, "dist", "public").unwrap();
@@ -272,6 +274,7 @@ mod tests {
     fn failed_install_renames_previous_output_back() {
         let root = fixture("rollback");
         std::fs::create_dir(root.join("dist")).unwrap();
+        std::fs::write(root.join("dist/nulang-app.ir.json"), "{}").unwrap();
         std::fs::write(root.join("dist/index.html"), "old").unwrap();
         let pending = StagedWebOutput::new(&root, "dist", "public").unwrap();
         std::fs::write(pending.path().join("index.html"), "new").unwrap();
@@ -321,6 +324,21 @@ mod tests {
                 "output {output:?} must not be writable"
             );
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn refuse_to_replace_unmanaged_existing_directory() {
+        let root = fixture("unmanaged");
+        std::fs::create_dir(root.join("site")).unwrap();
+        std::fs::write(root.join("site/user-notes.txt"), "important").unwrap();
+
+        let result = StagedWebOutput::new(&root, "site", "public");
+        assert!(result.is_err(), "unmanaged directories must not be replaced");
+        assert_eq!(
+            std::fs::read_to_string(root.join("site/user-notes.txt")).unwrap(),
+            "important"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
