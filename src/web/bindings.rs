@@ -12,6 +12,7 @@
 //! missing.
 
 pub use crate::web::contracts::RequestParamSource as RouteBindingSource;
+use crate::web::codec::{body_codec_for_type, BodyCodecContract};
 use crate::web::contracts::RouteContract;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -25,6 +26,9 @@ pub struct RouteBindingContract {
     pub handler_index: usize,
     /// Resolved source-level type, when known.
     pub ty: Option<String>,
+    /// Explicit wire codec metadata for whole-body bindings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec: Option<BodyCodecContract>,
 }
 
 /// Result of lowering a route contract into direct handler bindings.
@@ -79,12 +83,18 @@ pub fn compile_route_bindings(contract: &RouteContract) -> BindingCompilation {
             handler_param.ty.clone()
         };
 
+        let codec = if request.source == RouteBindingSource::Body {
+            body_codec_for_type(ty.as_deref())
+        } else {
+            None
+        };
         out.bindings.push(RouteBindingContract {
             source: request.source,
             source_name: request.source_name.clone(),
             handler_param: handler_param.name.clone(),
             handler_index,
             ty,
+            codec,
         });
     }
 
@@ -116,7 +126,30 @@ pub fn compile_route_bindings(contract: &RouteContract) -> BindingCompilation {
             handler_param: handler_param.name.clone(),
             handler_index,
             ty: route_param.ty.clone().or_else(|| handler_param.ty.clone()),
+            codec: None,
         });
+    }
+
+    let typed_body = out.bindings.iter().find(|binding| {
+        binding.source == RouteBindingSource::Body && binding.codec.is_some()
+    });
+    if let Some(body) = typed_body {
+        if out
+            .bindings
+            .iter()
+            .any(|binding| binding.source == RouteBindingSource::Form)
+        {
+            out.diagnostics.push(format!(
+                "{} {}: typed body parameter '{}' uses {} and cannot be combined with form bindings",
+                contract.method,
+                contract.path,
+                body.handler_param,
+                body.codec
+                    .as_ref()
+                    .map(|codec| codec.media_type.as_str())
+                    .unwrap_or("<unknown media type>")
+            ));
+        }
     }
 
     // A handler parameter with neither a request binding nor a same-named
@@ -276,6 +309,56 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.contains("binds unknown path input 'missing'")));
+    }
+
+    #[test]
+    fn typed_json_body_carries_codec_metadata() {
+        let mut contract = route("/users");
+        contract.params.clear();
+        contract.handler_params = vec![HandlerParamContract {
+            name: "payload".to_string(),
+            ty: Some("Json[CreateUser]".to_string()),
+            capability: None,
+            request: Some(request(RouteBindingSource::Body, "body")),
+        }];
+
+        let compiled = compile_route_bindings(&contract);
+        assert!(compiled.diagnostics.is_empty(), "{:?}", compiled.diagnostics);
+        let body = &compiled.bindings[0];
+        let codec = body.codec.as_ref().expect("typed body codec");
+        assert_eq!(codec.media_type, "application/json");
+        assert_eq!(codec.payload_type.as_deref(), Some("CreateUser"));
+
+        let serialized = serde_json::to_value(body).unwrap();
+        assert_eq!(serialized["codec"]["codec"], "json");
+        assert_eq!(serialized["codec"]["media_type"], "application/json");
+        assert_eq!(serialized["codec"]["payload_type"], "CreateUser");
+    }
+
+    #[test]
+    fn typed_json_body_cannot_mix_with_form_bindings() {
+        let mut contract = route("/users");
+        contract.params.clear();
+        contract.handler_params = vec![
+            HandlerParamContract {
+                name: "payload".to_string(),
+                ty: Some("Json[CreateUser]".to_string()),
+                capability: None,
+                request: Some(request(RouteBindingSource::Body, "body")),
+            },
+            HandlerParamContract {
+                name: "title".to_string(),
+                ty: Some("String".to_string()),
+                capability: None,
+                request: Some(request(RouteBindingSource::Form, "title")),
+            },
+        ];
+
+        let compiled = compile_route_bindings(&contract);
+        assert!(compiled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("cannot be combined with form bindings")));
     }
 
     #[test]
