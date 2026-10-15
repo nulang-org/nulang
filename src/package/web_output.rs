@@ -1,3 +1,203 @@
+//! Isolated, fail-closed publication of static Web build artifacts.
+//!
+//! A failed compile, render, asset copy, or budget check must not mutate the
+//! last successful `dist` directory. Promotion uses same-parent renames and
+//! restores the old directory if installation returns an error.
+//!
+//! This is not a crash-atomic filesystem transaction: a process kill between
+//! the two renames can leave an explicitly named backup and a stale lock.
+//! Keep those artifacts for operator recovery rather than guessing on restart.
+
+use std::fs::{self, OpenOptions};
+use std::io;
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static BUILD_ID: AtomicU64 = AtomicU64::new(0);
+
+fn invalid(reason: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, reason)
+}
+
+fn normal_relative(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && path
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
+}
+
+fn overlaps(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
+
+/// Deny output paths that could replace sources or escape the package root.
+fn validate_target(root: &Path, output: &str, static_dir: &str) -> io::Result<PathBuf> {
+    let relative = Path::new(output);
+    if !normal_relative(relative) {
+        return Err(invalid("web output_dir must be a nonempty relative path without . or .."));
+    }
+
+    for protected in ["src", ".git", ".nula"] {
+        if overlaps(relative, Path::new(protected)) {
+            return Err(invalid("web output_dir overlaps protected project inputs"));
+        }
+    }
+    let static_source = Path::new(static_dir);
+    if !normal_relative(static_source) || overlaps(relative, static_source) {
+        return Err(invalid("web output_dir overlaps static_dir or static_dir is unsafe"));
+    }
+
+    let canonical_root = root.canonicalize()?;
+    let mut target = canonical_root.clone();
+    for part in relative.components() {
+        target.push(part.as_os_str());
+        match fs::symlink_metadata(&target) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(invalid("web output_dir traverses a symlink"));
+            }
+            Ok(meta) if !meta.is_dir() => {
+                return Err(invalid("web output_dir collides with a non-directory"));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(target)
+}
+
+struct BuildLock {
+    path: PathBuf,
+}
+
+impl BuildLock {
+    fn acquire(path: PathBuf) -> io::Result<Self> {
+        // A stale lock is intentional: never silently overwrite output after
+        // a killed build without inspecting its staging and backup directories.
+        let _file = OpenOptions::new().write(true).create_new(true).open(&path)?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for BuildLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+pub(super) struct StagedWebOutput {
+    target: PathBuf,
+    stage: PathBuf,
+    backup: PathBuf,
+    _lock: BuildLock,
+    published: bool,
+}
+
+impl StagedWebOutput {
+    pub(super) fn new(root: &Path, output: &str, static_dir: &str) -> io::Result<Self> {
+        let target = validate_target(root, output, static_dir)?;
+        let parent = target
+            .parent()
+            .ok_or_else(|| invalid("web output_dir has no parent"))?;
+        fs::create_dir_all(parent)?;
+        let name = target
+            .file_name()
+            .ok_or_else(|| invalid("web output_dir has no filename"))?
+            .to_string_lossy();
+        let lock = BuildLock::acquire(parent.join(format!(".{name}.nulang-build.lock")))?;
+
+        for _ in 0..32 {
+            let id = BUILD_ID.fetch_add(1, Ordering::Relaxed);
+            let suffix = format!("{}-{id}", std::process::id());
+            let stage = parent.join(format!(".{name}.nulang-stage-{suffix}"));
+            let backup = parent.join(format!(".{name}.nulang-previous-{suffix}"));
+            if backup.exists() {
+                continue;
+            }
+            match fs::create_dir(&stage) {
+                Ok(()) => {
+                    return Ok(Self {
+                        target,
+                        stage,
+                        backup,
+                        _lock: lock,
+                        published: false,
+                    });
+                }
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "unable to reserve unique web build staging directory",
+        ))
+    }
+
+    pub(super) fn path(&self) -> &Path {
+        &self.stage
+    }
+
+    pub(super) fn publish(self) -> io::Result<()> {
+        self.publish_with(fs::rename)
+    }
+
+    /// The injected install operation makes rollback testable without timing
+    /// races or reliance on OS-specific permission behavior.
+    fn publish_with<F>(mut self, install: F) -> io::Result<()>
+    where
+        F: FnOnce(&Path, &Path) -> io::Result<()>,
+    {
+        match fs::symlink_metadata(&self.target) {
+            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                return Err(invalid("published web output is not a real directory"));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+
+        let had_previous = self.target.exists();
+        if had_previous {
+            fs::rename(&self.target, &self.backup)?;
+        }
+
+        if let Err(install_error) = install(&self.stage, &self.target) {
+            if had_previous {
+                if let Err(rollback_error) = fs::rename(&self.backup, &self.target) {
+                    return Err(io::Error::other(format!(
+                        "web publish failed: {install_error}; rollback failed: {rollback_error}; previous build is at {}",
+                        self.backup.display()
+                    )));
+                }
+            }
+            return Err(install_error);
+        }
+
+        self.published = true;
+        if had_previous {
+            // Installation has succeeded. Failed backup cleanup is nonfatal;
+            // retain it for manual recovery rather than misreport the build.
+            if let Err(err) = fs::remove_dir_all(&self.backup) {
+                eprintln!(
+                    "warning: old web build retained at {}: {}",
+                    self.backup.display(),
+                    err
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for StagedWebOutput {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = fs::remove_dir_all(&self.stage);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
