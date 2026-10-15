@@ -553,7 +553,10 @@ impl Resolver {
             .iter()
             .find(|package| package.name == dep_name && package.source == source)
             .ok_or_else(|| NuError::PackageError {
-                msg: format!("offline Git dependency '{}' is not pinned to source '{}' in Nulang.lock", dep_name, source),
+                msg: format!(
+                    "offline Git dependency '{}' is not pinned to source '{}' in Nulang.lock",
+                    dep_name, source
+                ),
                 span: Span::default(),
             })?;
         if pinned.commit.is_empty() {
@@ -575,7 +578,10 @@ impl Resolver {
         let head = git_rev_parse(&dest, "HEAD")?;
         let recorded = std::fs::read_to_string(cache.join(format!("{}.commit", dep_name)))
             .map_err(|e| NuError::PackageError {
-                msg: format!("offline Git commit cache marker for '{}' missing: {}", dep_name, e),
+                msg: format!(
+                    "offline Git commit cache marker for '{}' missing: {}",
+                    dep_name, e
+                ),
                 span: Span::default(),
             })?;
         if head != pinned.commit || recorded.trim() != pinned.commit {
@@ -599,13 +605,19 @@ impl Resolver {
             })?;
         if !status.status.success() || !status.stdout.is_empty() {
             return Err(NuError::PackageError {
-                msg: format!("offline Git checkout for '{}' has uncommitted or untracked changes", dep_name),
+                msg: format!(
+                    "offline Git checkout for '{}' has uncommitted or untracked changes",
+                    dep_name
+                ),
                 span: Span::default(),
             });
         }
 
         let dir = std::fs::canonicalize(&dest).map_err(|e| NuError::PackageError {
-            msg: format!("cannot resolve offline Git checkout for '{}': {}", dep_name, e),
+            msg: format!(
+                "cannot resolve offline Git checkout for '{}': {}",
+                dep_name, e
+            ),
             span: Span::default(),
         })?;
         Ok((dir, pinned.commit.clone()))
