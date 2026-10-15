@@ -39,12 +39,24 @@ impl Default for ActorBackend {
         ActorBackend::Native
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum ActorPriority {
     High,
     #[default]
     Normal,
     Low,
+}
+
+impl ActorPriority {
+    /// Strictly-higher priority levels, in High → Normal → Low order.
+    /// `prior()` is empty for High.
+    pub fn prior(self) -> &'static [ActorPriority] {
+        match self {
+            ActorPriority::High => &[],
+            ActorPriority::Normal => &[ActorPriority::High],
+            ActorPriority::Low => &[ActorPriority::High, ActorPriority::Normal],
+        }
+    }
 }
 
 /// Scheduler ownership state for an actor.
@@ -477,6 +489,76 @@ impl Actor {
             held_objects: HashSet::new(),
             held_object_store: None,
         }
+    }
+
+    /// Reset this actor instance for reuse (pooling).
+    pub fn reset(&mut self, id: u64, name: impl Into<String>, mailbox_cap: usize) {
+        self.id = id;
+        self.name = name.into();
+        self.state = ActorState::Created;
+        self.mailbox.reset(mailbox_cap);
+        self.heap.reset();
+        self.heap.set_actor_id(id);
+        self.orca_gc.reset(id);
+        self.iso_arena.reset();
+        self.state_data.clear();
+        self.state_models.clear();
+        self.event_log.clear();
+        self.event_sourced_sequences.clear();
+        self.event_sourced_compaction_interval = 100;
+        self.persistent = false;
+        self.is_workflow = false;
+        self.behavior_table.clear();
+        #[cfg(feature = "native-codegen")]
+        self.aot_targets.clear();
+        self.bytecode_offsets.clear();
+        self.compensation_offsets.clear();
+        self.compensated_steps.clear();
+        self.bytecode_module = None;
+        self.bytecode_module_idx = None;
+        self.parent = None;
+        self.children.clear();
+        self.monitors.clear();
+        self.links.clear();
+        self.trap_exits = false;
+        self.priority = ActorPriority::Normal;
+        self.run_state = ActorRunState::Idle;
+        self.jit_safepoint_counter = crate::backends::JIT_SAFEPOINT_BUDGET;
+        self.jit_yield_pending = false;
+        self.reduction_count = 0;
+        self.turn_reductions = 0;
+        self.max_reductions = 1000;
+        self.sequence = 0;
+        self.activation_epoch = crate::runtime::persistence::INITIAL_ACTIVATION_EPOCH;
+        self.current_workflow_activation = None;
+        self.workflow_replay_activation = None;
+        self.workflow_replay_event_ordinal = 0;
+        self.cycle_sentinel = None;
+        self.suspended_execution = None;
+        self.waiting_signal = None;
+        self.received_signals.clear();
+        self.query_handlers.clear();
+        self.is_agent = false;
+        self.capabilities.clear();
+        self.backend = ActorBackend::default();
+        #[cfg(feature = "ai-runtime")]
+        {
+            self.llm_inflight = false;
+            self.llm_pending_prompt = None;
+            self.llm_completed = None;
+        }
+        self.dirty_fields.clear();
+        self.receive_wait = None;
+        self.timer_sleep_fired = false;
+        self.retry_config = None;
+        // flight_recorder is left as-is, just clear entries
+        self.flight_recorder = FlightRecorder::runtime_default(1000);
+        self.fallback_config.clear();
+        self.hibernation_state = None;
+        self.idle_ms = 0;
+        self.pinned = false;
+        self.held_objects.clear();
+        self.held_object_store = None;
     }
 
     /// Hibernate this actor: serialize its state and VM continuation,

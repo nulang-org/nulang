@@ -335,10 +335,7 @@ enum CrossShardMsg {
         object_holds: ObjectRefLease,
     },
     /// Enqueue an actor on the target shard (wake from idle/waiting).
-    EnqueueActor {
-        actor_id: u64,
-        priority: ActorPriority,
-    },
+    EnqueueActor { actor_id: u64 },
 }
 
 /// Admission result for a local-process actor delivery.
@@ -356,6 +353,8 @@ pub struct Runtime {
     pub actors: HashMap<u64, Actor>,
     pub supervisors: HashMap<u64, Supervisor>,
     pub scheduler: Scheduler,
+    pub next_run_slot: Option<u64>,
+    pub actor_pool: Vec<Actor>,
     pub current_actor: Option<u64>,
     /// W3C trace context of the message currently being handled on this
     /// shard's scheduler thread. Sends performed while handling a message
@@ -643,6 +642,8 @@ impl Runtime {
             actors: HashMap::new(),
             supervisors: HashMap::new(),
             scheduler: Scheduler::new(4),
+            next_run_slot: None,
+            actor_pool: Vec::new(),
             current_actor: None,
             current_trace: None,
             main_heap: {
@@ -1406,14 +1407,14 @@ impl Runtime {
     /// scheduler enqueue paths go through here so a priority set via
     /// `perform Actor.set_priority` takes effect on the next (re)queue;
     /// unknown actors (e.g. already exited) enqueue at the Normal default.
-    pub(crate) fn enqueue_actor(&mut self, actor_id: u64) {
+    pub(crate) fn enqueue_actor_impl(&mut self, actor_id: u64, is_handoff: bool) {
         if self.shard_count > 1 {
             let target_shard = (actor_id % self.shard_count as u64) as u16;
             if target_shard != self.shard_idx {
-                let priority = ActorPriority::Normal;
                 let tx = self.cross_shard_tx.as_ref().unwrap();
-                let _ = tx[target_shard as usize]
-                    .try_send(CrossShardMsg::EnqueueActor { actor_id, priority });
+                // We do not preserve handoff across shards
+                let _ =
+                    tx[target_shard as usize].try_send(CrossShardMsg::EnqueueActor { actor_id });
                 return;
             }
         }
@@ -1426,7 +1427,39 @@ impl Runtime {
         }
         actor.run_state = ActorRunState::Queued;
         let priority = actor.priority;
-        self.scheduler.enqueue_with_priority(actor_id, priority);
+
+        if is_handoff {
+            if let Some(existing_id) = self.next_run_slot {
+                let existing_priority = self
+                    .actors
+                    .get(&existing_id)
+                    .map(|a| a.priority)
+                    .unwrap_or(ActorPriority::Normal);
+                if priority < existing_priority {
+                    // New actor has higher priority (e.g. High > Normal). Swap them.
+                    self.next_run_slot = Some(actor_id);
+                    self.scheduler
+                        .enqueue_local_with_priority(0, existing_id, existing_priority);
+                } else {
+                    // Slot full with equal or higher priority, queue the new actor normally.
+                    self.scheduler
+                        .enqueue_local_with_priority(0, actor_id, priority);
+                }
+            } else {
+                self.next_run_slot = Some(actor_id);
+            }
+        } else {
+            self.scheduler
+                .enqueue_local_with_priority(0, actor_id, priority);
+        }
+    }
+
+    pub(crate) fn enqueue_actor(&mut self, actor_id: u64) {
+        self.enqueue_actor_impl(actor_id, false);
+    }
+
+    pub(crate) fn enqueue_actor_handoff(&mut self, actor_id: u64) {
+        self.enqueue_actor_impl(actor_id, true);
     }
 
     // -- Cross-shard message handling --
@@ -1594,10 +1627,7 @@ impl Runtime {
                         object_holds,
                     );
                 }
-                CrossShardMsg::EnqueueActor {
-                    actor_id,
-                    priority: _,
-                } => {
+                CrossShardMsg::EnqueueActor { actor_id } => {
                     self.enqueue_actor(actor_id);
                 }
             }
@@ -2844,7 +2874,11 @@ impl Runtime {
                 }
             }
         }
-        self.enqueue_actor(target_id);
+        if self.current_actor.is_some() {
+            self.enqueue_actor_handoff(target_id);
+        } else {
+            self.enqueue_actor(target_id);
+        }
         // Wake an actor suspended in a timed selective receive: resume it
         // so the VM re-executes the ReceiveWait scan. A match resolves the
         // wait; otherwise the behavior re-suspends on its original deadline.
@@ -3041,7 +3075,28 @@ impl Runtime {
     /// invariant as the production scheduler instead of mutating the raw queue.
     pub(crate) fn claim_next_ready_actor(&mut self) -> Option<u64> {
         loop {
-            let actor_id = self.scheduler.dequeue()?;
+            let actor_id = if let Some(id) = self.next_run_slot {
+                // Preserve the strict High > Normal > Low contract: a parked
+                // (LIFO handoff) actor may never preempt queued work of a
+                // strictly-higher priority level. Peek rather than claim when
+                // such work exists.
+                let parked_priority = self
+                    .actors
+                    .get(&id)
+                    .map(|actor| actor.priority)
+                    .unwrap_or(ActorPriority::Normal);
+                let higher_queued = parked_priority
+                    .prior()
+                    .iter()
+                    .any(|&level| self.scheduler.peek_has_priority_work(level));
+                if higher_queued {
+                    self.scheduler.dequeue()?
+                } else {
+                    self.next_run_slot.take().unwrap()
+                }
+            } else {
+                self.scheduler.dequeue()?
+            };
             let claimed = match self.actors.get_mut(&actor_id) {
                 Some(actor) if actor.run_state == ActorRunState::Queued => {
                     actor.run_state = ActorRunState::Running;
@@ -3773,6 +3828,8 @@ impl Runtime {
                 // real heap moves to the retired list.
                 let heap = std::mem::replace(&mut actor.heap, ActorHeap::new(64));
                 self.retired_heaps.push(heap);
+            } else if self.actor_pool.len() < 10_000 {
+                self.actor_pool.push(actor);
             }
         }
     }
