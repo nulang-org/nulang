@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Experimental typed Web content collection discovery — 2026-10-15
+- **Added a read-only Markdown content metadata boundary for future Hugo-inspired Web pages.** Typed TOML front matter (title, draft, tags) preserves Markdown source and derives canonical slugs from both leaf pages and page-bundle indexes.
+- **Collection discovery now sorts output deterministically, rejects duplicate slugs and malformed pages, and refuses symlinked content entries.** No Markdown renderer, route registration, asset publishing or deployment-IR integration is introduced by this change.
+
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
