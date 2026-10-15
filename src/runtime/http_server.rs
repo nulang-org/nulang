@@ -979,11 +979,7 @@ impl WebDevServer {
                         Err(error) => Err(error),
                     });
                 match rendered {
-                    Ok(Some(html)) => HttpResponse {
-                        status: 200,
-                        headers: vec![("Content-Type".into(), "text/html; charset=utf-8".into())],
-                        body: inject_client_runtime_script(&html).into_bytes(),
-                    },
+                    Ok(Some(rendered)) => successful_route_response(route, rendered),
                     Ok(None) => HttpResponse {
                         status: 500,
                         headers: vec![("Content-Type".into(), "text/plain".into())],
@@ -1104,6 +1100,31 @@ impl WebDevServer {
             headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
             body: b"Not found".to_vec(),
         }
+    }
+}
+
+/// Apply compiler-owned response media policy, retaining legacy HTML behavior
+/// when a route does not declare an explicit response contract.
+fn successful_route_response(route: &RuntimeWebRoute, rendered: String) -> HttpResponse {
+    let contract = route.plan.as_ref().and_then(|plan| plan.response.as_ref());
+    match contract {
+        Some(contract) => {
+            let body = if contract.inject_client_runtime {
+                inject_client_runtime_script(&rendered).into_bytes()
+            } else {
+                rendered.into_bytes()
+            };
+            HttpResponse {
+                status: 200,
+                headers: vec![("Content-Type".into(), contract.http_content_type())],
+                body,
+            }
+        }
+        None => HttpResponse {
+            status: 200,
+            headers: vec![("Content-Type".into(), "text/html; charset=utf-8".into())],
+            body: inject_client_runtime_script(&rendered).into_bytes(),
+        },
     }
 }
 
