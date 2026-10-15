@@ -1652,8 +1652,9 @@ fn write_generated_static_manifest(output: &Path, generated: &BTreeSet<String>) 
     let manifest = output.join(GENERATED_STATIC_MANIFEST);
     ensure_static_file_path_is_not_symlink(output, Path::new(GENERATED_STATIC_MANIFEST))?;
     let entries: Vec<&str> = generated.iter().map(String::as_str).collect();
-    let serialized = serde_json::to_string_pretty(&entries)
-        .map_err(|error| generated_static_error(format!("cannot encode generated Web manifest: {error}")))?;
+    let serialized = serde_json::to_string_pretty(&entries).map_err(|error| {
+        generated_static_error(format!("cannot encode generated Web manifest: {error}"))
+    })?;
     std::fs::write(&manifest, serialized).map_err(|error| {
         generated_static_error(format!(
             "cannot write generated Web manifest {}: {error}",
@@ -3343,11 +3344,9 @@ app "stale-static" {
             std::fs::read_to_string(dir.join("dist/unmanaged.txt")).unwrap(),
             "Do not delete me"
         );
-        assert!(
-            std::fs::read_to_string(dir.join("dist/index.html"))
-                .unwrap()
-                .contains("Updated homepage")
-        );
+        assert!(std::fs::read_to_string(dir.join("dist/index.html"))
+            .unwrap()
+            .contains("Updated homepage"));
         let generated: Vec<String> = serde_json::from_str(
             &std::fs::read_to_string(dir.join("dist/.nulang-generated-static.json")).unwrap(),
         )
