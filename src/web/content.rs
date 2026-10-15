@@ -1,5 +1,94 @@
 //! Experimental typed Markdown content metadata.
 //! This module does not register routes or render Markdown.
+
+use serde::Deserialize;
+
+/// One validated content entry. Slugs are stable, leading-slash route paths.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentPage {
+    pub slug: String,
+    pub title: String,
+    pub draft: bool,
+    pub tags: Vec<String>,
+    /// Markdown is intentionally kept as source until a trusted renderer exists.
+    pub body: String,
+}
+
+#[derive(Deserialize)]
+struct FrontMatter {
+    title: String,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+/// Parse a Markdown file's TOML front matter and derive a safe route slug.
+///
+/// Only TOML +++ delimiters and title/draft/tags metadata are supported in
+/// this experimental boundary. No filesystem walking, rendering, publishing,
+/// or implicit route registration occurs here.
+pub fn parse_page(relative_path: &str, source: &str) -> Result<ContentPage, String> {
+    let slug = slug_from_relative_path(relative_path)?;
+    let payload = source
+        .strip_prefix("+++\n")
+        .ok_or_else(|| format!("{relative_path}: expected TOML +++ front matter"))?;
+    let (metadata, body) = payload
+        .split_once("\n+++\n")
+        .ok_or_else(|| format!("{relative_path}: missing closing +++ delimiter"))?;
+    let front: FrontMatter = toml::from_str(metadata)
+        .map_err(|error| format!("{relative_path}: invalid content metadata: {error}"))?;
+    if front.title.trim().is_empty() {
+        return Err(format!("{relative_path}: content title must not be empty"));
+    }
+    if front.tags.iter().any(|tag| tag.trim().is_empty()) {
+        return Err(format!("{relative_path}: content tags must not be empty"));
+    }
+    Ok(ContentPage {
+        slug,
+        title: front.title,
+        draft: front.draft,
+        tags: front.tags,
+        body: body.to_string(),
+    })
+}
+
+fn slug_from_relative_path(path: &str) -> Result<String, String> {
+    if path.starts_with('/') || path.contains('\\') {
+        return Err(format!("unsafe content path: {path}"));
+    }
+    let stem = path
+        .strip_suffix(".md")
+        .ok_or_else(|| format!("content file must end in .md: {path}"))?;
+    let mut components: Vec<&str> = stem.split('/').collect();
+    if components.iter().any(|segment| {
+        segment.is_empty()
+            || !segment
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    }) {
+        // Hugo-style section index is accepted only as the terminal filename.
+        if !(components.last() == Some(&"_index")
+            && components[..components.len() - 1].iter().all(|segment| {
+                !segment.is_empty()
+                    && segment.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                    })
+            }))
+        {
+            return Err(format!("invalid content slug: {path}"));
+        }
+    }
+    if matches!(components.last(), Some(&"index" | &"_index")) {
+        components.pop();
+    }
+    if components.is_empty() {
+        Ok("/".to_string())
+    } else {
+        Ok(format!("/{}", components.join("/")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_page;
