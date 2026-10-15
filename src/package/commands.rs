@@ -1457,7 +1457,7 @@ fn cmd_build_web() -> NuResult<()> {
                 span: Span::default(),
             })?;
         let html = crate::web::reactivity::inject_client_runtime_script(&html);
-        let out_file = route_path_to_output_file(&route.path);
+        let out_file = route_path_to_output_file(&route.path)?;
         let dest = output_dir.join(&out_file);
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|e| NuError::PackageError {
@@ -1513,12 +1513,23 @@ fn cmd_build_web() -> NuResult<()> {
     Ok(())
 }
 
-fn route_path_to_output_file(path: &str) -> PathBuf {
+fn route_path_to_output_file(path: &str) -> NuResult<PathBuf> {
     let trimmed = path.trim_start_matches('/');
-    if trimmed.is_empty() {
+    let artifact = if trimmed.is_empty() {
         PathBuf::from("index.html")
     } else {
         PathBuf::from(trimmed).join("index.html")
+    };
+    if artifact
+        .components()
+        .all(|part| matches!(part, std::path::Component::Normal(_)))
+    {
+        Ok(artifact)
+    } else {
+        Err(NuError::PackageError {
+            msg: format!("unsafe static Web route output path: {path:?}"),
+            span: Span::default(),
+        })
     }
 }
 
@@ -3131,6 +3142,16 @@ app "mixed-routes" {
         assert!(server["artifact"].is_null());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_static_route_output_cannot_escape_staging_root() {
+        assert_eq!(
+            route_path_to_output_file("/blog/post").unwrap(),
+            PathBuf::from("blog/post/index.html")
+        );
+        assert!(route_path_to_output_file("/../secret").is_err());
+        assert!(route_path_to_output_file("/blog/../../secret").is_err());
     }
 
     #[test]
