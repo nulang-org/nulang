@@ -14,7 +14,7 @@
 //!      program, it must agree too (`differential_fuzz_one`). Any
 //!      disagreement is a real bug, not a fuzzer false positive — see
 //!      PLAN.md Phase 1 bullet 1's kill criteria: a divergence touching
-//!      Frozen-tier surface (bytecode/value-layout semantics) is a Sev-1.
+//!      bytecode/value-layout semantics is a Sev-1.
 //!
 //! Uses a built-in xorshift64 RNG, no external fuzzing crate dependency.
 //!
@@ -997,6 +997,33 @@ mod tests {
                 "Differential fuzzer found {} divergence(s)",
                 divergence_count
             );
+        }
+    }
+
+    /// Differential regression cases: known kernels that must agree across
+    /// all backends. Added from nightly fuzz captures (2026-10-10).
+    #[test]
+    fn differential_known_divergence_regressions() {
+        let mut divergent = Vec::new();
+        for src in [
+            "fn main() { 1.0 / 0.0 }",
+            "fn main() { 0.1 + (1.0 / 0.0) }",
+            "fn main() { -(0.1 + (1.0 / 0.0)) }",
+            "fn main() { -fn(x, y) { x + y } }",
+            "fn main() { let x = 0.1; let y = 0.2; -(x + 1.0 / 0.0) }",
+            "fn main() { let x = 0.1; let y = 0.2; -(x + y) }",
+            "fn main() { --(1 + 2,) }",
+        ] {
+            match differential_fuzz_one(src) {
+                Ok(_) => {}
+                Err(e) => divergent.push((src, e)),
+            }
+        }
+        if !divergent.is_empty() {
+            for (src, e) in &divergent {
+                eprintln!("DIVERGENCE: {} -> {}", src, e);
+            }
+            panic!("known divergence regressions present");
         }
     }
 

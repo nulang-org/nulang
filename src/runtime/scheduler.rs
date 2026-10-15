@@ -518,6 +518,19 @@ impl Scheduler {
         }
     }
 
+    /// Whether any task is queued at the given priority band (worker-local
+    /// queues or global injector). Non-destructive peek used to gate LIFO
+    /// handoff slots so a parked actor can never preempt strictly-higher
+    /// priority work.
+    pub fn peek_has_priority_work(&self, priority: ActorPriority) -> bool {
+        if !self.global_for(priority).is_empty() {
+            return true;
+        }
+        self.workers_for(priority)
+            .iter()
+            .any(|worker| !worker.is_empty())
+    }
+
     /// True when any priority queue still contains runnable work.
     ///
     /// Used only for adaptive actor-turn sizing. This is a best-effort
