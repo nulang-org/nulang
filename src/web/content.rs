@@ -363,19 +363,43 @@ mod tests {
     fn collection_preserves_page_and_section_origins_deterministically() {
         use super::ContentKind;
         let fixture = CollectionFixture::new();
-        fixture.write("docs/_index.md", "+++\ntitle = \"Docs\"\n+++\nIntro");
-        fixture.write("docs/guides/getting-started/index.md", "+++\ntitle = \"Start\"\n+++\nStart");
-        fixture.write("docs/guides/_index.md", "+++\ntitle = \"Guides\"\n+++\nGuides");
+        fixture.write(
+            "docs/_index.md",
+            "+++\ntitle = \"Docs\"\n+++\nIntro",
+        );
+        fixture.write(
+            "docs/guides/getting-started/index.md",
+            "+++\ntitle = \"Start\"\n+++\nStart",
+        );
+        fixture.write(
+            "docs/guides/_index.md",
+            "+++\ntitle = \"Guides\"\n+++\nGuides",
+        );
         let entries = super::load_collection(&fixture.0).unwrap();
-        let actual: Vec<_> = entries.iter().map(|entry| {
-            (entry.slug.as_str(), entry.source_path.as_str(), entry.kind)
-        }).collect();
+        let actual: Vec<_> = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.slug.as_str(),
+                    entry.source_path.as_str(),
+                    entry.kind,
+                )
+            })
+            .collect();
         assert_eq!(
             actual,
             vec![
                 ("/docs", "docs/_index.md", ContentKind::Section),
-                ("/docs/guides", "docs/guides/_index.md", ContentKind::Section),
-                ("/docs/guides/getting-started", "docs/guides/getting-started/index.md", ContentKind::Page),
+                (
+                    "/docs/guides",
+                    "docs/guides/_index.md",
+                    ContentKind::Section
+                ),
+                (
+                    "/docs/guides/getting-started",
+                    "docs/guides/getting-started/index.md",
+                    ContentKind::Page
+                ),
             ]
         );
     }
