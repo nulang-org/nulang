@@ -187,7 +187,8 @@ fn default_route_placement(method: &str, path: &str) -> String {
     }
 }
 
-fn route_path_to_artifact(path: &str) -> String {
+/// Canonical static artifact path shared with typed content planning.
+pub(crate) fn route_path_to_artifact(path: &str) -> String {
     let trimmed = path.trim_start_matches('/');
     if trimmed.is_empty() {
         "index.html".to_string()
