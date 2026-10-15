@@ -74,8 +74,8 @@ The integration workflow validates two different runtime layers:
   `examples/web_contract_interop/src` contract, exports its OpenAPI 3.1
   document, launches that package under `nula dev --port 0`, and calls the
   compiler-bound `GET /probe/{id}` endpoint with Python and JavaScript. Both
-  clients assert the `Int` path/query binding result and a structured 400 for
-  invalid query input. The document is not hand-authored or patched by the test.
+  clients assert the `Int` path binding result and a structured 400 for
+  invalid path input. The document is not hand-authored or patched by the test.
 
 The CI workflow discovers the built `nulang` CLI location via
 `cargo metadata --no-deps`; do not assume it is at `./target/debug/nulang`,
