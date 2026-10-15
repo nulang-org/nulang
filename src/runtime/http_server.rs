@@ -1144,6 +1144,45 @@ mod tests {
         }
     }
 
+    // Fail closed on URL parent components and symlinks outside static roots.
+    #[test]
+    fn web_static_file_fallback_cannot_read_parent_directory() {
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fixture = Cleanup(std::env::temp_dir().join(format!(
+            "nulang-static-containment-{}-{suffix}",
+            std::process::id()
+        )));
+        let public = fixture.0.join("public");
+        std::fs::create_dir_all(&public).unwrap();
+        std::fs::write(public.join("hello.txt"), b"public").unwrap();
+        std::fs::write(fixture.0.join("private.txt"), b"private").unwrap();
+
+        let allowed = WebDevServer::serve_static(Some(&public), None, "/hello.txt");
+        assert_eq!(allowed.status, 200);
+        assert_eq!(allowed.body, b"public");
+
+        let escaped = WebDevServer::serve_static(Some(&public), None, "/../private.txt");
+        assert_eq!(escaped.status, 404, "parent traversal must fail closed");
+        assert!(!escaped.body.windows(7).any(|part| part == b"private"));
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("../private.txt", public.join("shortcut.txt")).unwrap();
+            let escaped = WebDevServer::serve_static(Some(&public), None, "/shortcut.txt");
+            assert_eq!(escaped.status, 404, "symlink outside root must fail closed");
+        }
+    }
+
     #[test]
     fn http_request_reassembles_fragmented_headers_and_exact_body() {
         let raw = b"POST /submit HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello";
