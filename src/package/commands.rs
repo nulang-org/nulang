@@ -1472,6 +1472,26 @@ fn cmd_build_web() -> NuResult<()> {
         eprintln!("    {} -> {}", route.path, dest.display());
     }
 
+    // Markdown publishing is opt-in. Validate every source, explicit Web route
+    // and static asset before staging any content HTML. On error, the staged
+    // output is discarded and the previous successful site remains intact.
+    if let Some(content_dir) = manifest.web.content_dir.as_deref() {
+        let count = crate::package::web_content::stage_content(
+            &root,
+            content_dir,
+            &manifest.web.static_dir,
+            &manifest.web.output_dir,
+            &output_dir,
+            &ir,
+            &manifest.package.name,
+        )
+        .map_err(|message| NuError::PackageError {
+            msg: format!("invalid Web Markdown content: {message}"),
+            span: Span::default(),
+        })?;
+        eprintln!("  Staged {count} Markdown content page(s)...");
+    }
+
     let static_dir = root.join(&manifest.web.static_dir);
     if static_dir.is_dir() {
         copy_dir_contents(&static_dir, &output_dir)?;
