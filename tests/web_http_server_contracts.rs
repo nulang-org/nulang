@@ -75,6 +75,56 @@ fn web_main() {
     }
 }
 
+fn typed_json_body_route() -> RuntimeWebRoute {
+    let handler_source = r#"
+type alias Json[T] = String
+fn endpoint(payload: Json[String]) -> Json[String] { payload }
+"#;
+    let (module, function_index) = compile_handler(handler_source, "endpoint");
+
+    let contract_source = r#"
+type alias Json[T] = String
+fn endpoint(payload: Json[String] from body) -> Json[String] { payload }
+
+fn web_main() {
+    perform Web.route("POST", "/echo", endpoint)
+}
+"#;
+    let tokens = Lexer::new(contract_source)
+        .lex()
+        .expect("lex JSON body route contract source");
+    let ast = Parser::new(tokens)
+        .parse_module()
+        .expect("parse JSON body route contract source");
+    let contracts = compile_module_contracts(&ast);
+    assert!(
+        contracts.diagnostics.is_empty(),
+        "{:?}",
+        contracts.diagnostics
+    );
+
+    let plan =
+        compile_runtime_route_plan(&contracts.routes[0]).expect("compile JSON body runtime plan");
+    assert!(plan.direct_call);
+    assert_eq!(
+        plan.bindings[0]
+            .codec
+            .as_ref()
+            .map(|codec| codec.media_type.as_str()),
+        Some("application/json")
+    );
+
+    RuntimeWebRoute {
+        route: WebRoute {
+            method: HttpMethod::Post,
+            path: "/echo".to_string(),
+            handler_module: module,
+            handler_func_idx: function_index,
+        },
+        plan: Some(plan),
+    }
+}
+
 fn legacy_route() -> WebRoute {
     let (module, function_index) =
         compile_handler("fn legacy() -> String { \"legacy\" }", "legacy");
@@ -150,6 +200,67 @@ fn invalid_typed_query_is_problem_json_over_real_http() {
     assert_eq!(problem["code"], "invalid_request_input");
     assert_eq!(problem["source"], "query");
     assert_eq!(problem["source_name"], "limit");
+}
+
+#[test]
+fn typed_json_body_executes_over_real_http() {
+    let server = WebDevServer::bind_runtime(0, None, None, vec![typed_json_body_route()])
+        .expect("bind JSON body WebDevServer");
+
+    let response = send_raw_request(
+        server.port,
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: 7\r\nConnection: close\r\n\r\n\"hello\"",
+    );
+
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("content-type: application/json\r\n"),
+        "{response}"
+    );
+    assert_eq!(response_body(&response), "\"hello\"");
+}
+
+#[test]
+fn typed_json_body_wrong_media_type_is_415_problem_json() {
+    let server = WebDevServer::bind_runtime(0, None, None, vec![typed_json_body_route()])
+        .expect("bind JSON body WebDevServer");
+
+    let response = send_raw_request(
+        server.port,
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Type: text/plain\r\nContent-Length: 7\r\nConnection: close\r\n\r\n\"hello\"",
+    );
+
+    assert!(
+        response.starts_with("HTTP/1.1 415 Unsupported Media Type\r\n"),
+        "{response}"
+    );
+    let problem: serde_json::Value =
+        serde_json::from_str(response_body(&response)).expect("parse media problem JSON");
+    assert_eq!(problem["status"], 415);
+    assert_eq!(problem["code"], "unsupported_request_media_type");
+    assert_eq!(problem["expected_media_type"], "application/json");
+}
+
+#[test]
+fn malformed_typed_json_body_is_400_problem_json() {
+    let server = WebDevServer::bind_runtime(0, None, None, vec![typed_json_body_route()])
+        .expect("bind JSON body WebDevServer");
+
+    let response = send_raw_request(
+        server.port,
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 1\r\nConnection: close\r\n\r\n{",
+    );
+
+    assert!(
+        response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+        "{response}"
+    );
+    let problem: serde_json::Value =
+        serde_json::from_str(response_body(&response)).expect("parse body problem JSON");
+    assert_eq!(problem["status"], 400);
+    assert_eq!(problem["code"], "invalid_request_body");
 }
 
 #[test]
