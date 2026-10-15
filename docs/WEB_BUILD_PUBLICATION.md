@@ -38,6 +38,44 @@ a normal relative path and cannot overlap `src`, `.nula`, `.git`, or the
 configured source asset directory. Symlinked output paths and parents are
 rejected. Static route artifacts cannot contain parent-directory traversal.
 
+## Opt-in Markdown content publishing (experimental)
+
+To include typed Markdown pages and sections in a staged Web build, explicitly
+configure a collection directory in `Nulang.toml`:
+
+```toml
+[web]
+content_dir = "content"
+```
+
+If `content_dir` is omitted, no Markdown is discovered or published and
+existing Web build behavior is unchanged. Each Markdown source must have
+`+++` TOML front matter including `title`; use `draft = true` to
+exclude a page from output. `_index.md` defines a section.
+Source paths map to canonical HTML paths, e.g. `content/blog/post.md`
+produces `dist/blog/post/index.html`.
+
+The initial renderer **only** supports basic headings, paragraphs, unordered
+lists, fenced code, and inline code. It HTML-escapes source content and
+rejects unsupported Markdown syntax, including link/image/emphasis constructs.
+Do not import arbitrary CommonMark documents until a full parser is separately
+validated.
+
+After compiling and rendering explicit static Web routes, content is loaded,
+validated against the already generated compiler Web deployment IR and the
+package's static asset paths, and fully rendered in memory before writing
+any Markdown artifacts into the *same disposable staging directory*. Route,
+content-slug, asset, symlink or template conflicts fail the build without
+replacing the prior published output. The staged publisher subsequently copies
+static assets, writes the deployment IR, checks JS budgets, and promotes the
+complete tree only on success.
+
+`content_dir` must be an existing, real package-relative directory, without
+symlink components, and cannot overlap `src`, `.git`, `.nula`, the output directory or
+the static asset directory. Content-publishing mode refuses static asset
+symlinks. Concurrent filesystem mutation between validation and copy is not
+fully eliminated; keep package sources immutable during builds.
+
 ## Crash and deployment limitations
 
 **This is not a fully crash-atomic switch.** Replacing a nonempty directory
