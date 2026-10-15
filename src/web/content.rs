@@ -363,10 +363,7 @@ mod tests {
     fn collection_preserves_page_and_section_origins_deterministically() {
         use super::ContentKind;
         let fixture = CollectionFixture::new();
-        fixture.write(
-            "docs/_index.md",
-            "+++\ntitle = \"Docs\"\n+++\nIntro",
-        );
+        fixture.write("docs/_index.md", "+++\ntitle = \"Docs\"\n+++\nIntro");
         fixture.write(
             "docs/guides/getting-started/index.md",
             "+++\ntitle = \"Start\"\n+++\nStart",
@@ -384,7 +381,11 @@ mod tests {
             actual,
             vec![
                 ("/docs", "docs/_index.md", ContentKind::Section),
-                ("/docs/guides", "docs/guides/_index.md", ContentKind::Section),
+                (
+                    "/docs/guides",
+                    "docs/guides/_index.md",
+                    ContentKind::Section
+                ),
                 (
                     "/docs/guides/getting-started",
                     "docs/guides/getting-started/index.md",
