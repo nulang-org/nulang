@@ -319,6 +319,60 @@ mod tests {
         assert!(super::load_collection(&fixture.0).is_err());
     }
 
+    #[test]
+    fn section_indexes_are_distinct_from_leaf_and_bundle_pages() {
+        use super::ContentKind;
+
+        let source = "+++\ntitle = \"Docs\"\n+++\nContent";
+        let section = parse_page("docs/_index.md", source).unwrap();
+        let bundle = parse_page("docs/index.md", source).unwrap();
+        let leaf = parse_page("docs.md", source).unwrap();
+        let root_section = parse_page("_index.md", source).unwrap();
+
+        assert_eq!(section.slug, "/docs");
+        assert_eq!(section.kind, ContentKind::Section);
+        assert_eq!(section.source_path, "docs/_index.md");
+        assert_eq!(bundle.slug, "/docs");
+        assert_eq!(bundle.kind, ContentKind::Page);
+        assert_eq!(bundle.source_path, "docs/index.md");
+        assert_eq!(leaf.kind, ContentKind::Page);
+        assert_eq!(leaf.source_path, "docs.md");
+        assert_eq!(root_section.slug, "/");
+        assert_eq!(root_section.kind, ContentKind::Section);
+    }
+
+    #[test]
+    fn collection_preserves_page_and_section_origins_deterministically() {
+        use super::ContentKind;
+        let fixture = CollectionFixture::new();
+        fixture.write("docs/_index.md", "+++\ntitle = \"Docs\"\n+++\nIntro");
+        fixture.write("docs/guides/getting-started/index.md", "+++\ntitle = \"Start\"\n+++\nStart");
+        fixture.write("docs/guides/_index.md", "+++\ntitle = \"Guides\"\n+++\nGuides");
+        let entries = super::load_collection(&fixture.0).unwrap();
+        let actual: Vec<_> = entries.iter().map(|entry| {
+            (entry.slug.as_str(), entry.source_path.as_str(), entry.kind)
+        }).collect();
+        assert_eq!(
+            actual,
+            vec![
+                ("/docs", "docs/_index.md", ContentKind::Section),
+                ("/docs/guides", "docs/guides/_index.md", ContentKind::Section),
+                ("/docs/guides/getting-started", "docs/guides/getting-started/index.md", ContentKind::Page),
+            ]
+        );
+    }
+
+    #[test]
+    fn collection_rejects_page_and_section_claiming_same_slug() {
+        let fixture = CollectionFixture::new();
+        fixture.write("docs.md", "+++\ntitle = \"Page\"\n+++\nPage");
+        fixture.write("docs/_index.md", "+++\ntitle = \"Section\"\n+++\nSection");
+        let error = super::load_collection(&fixture.0).unwrap_err();
+        assert!(error.contains("duplicate content slug /docs"), "{error}");
+        assert!(error.contains("docs.md"), "{error}");
+        assert!(error.contains("docs/_index.md"), "{error}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn collection_rejects_symlinked_pages_and_directories() {
