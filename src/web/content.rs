@@ -89,6 +89,88 @@ fn slug_from_relative_path(path: &str) -> Result<String, String> {
     }
 }
 
+
+/// Discover typed Markdown pages under a collection root, without rendering or
+/// route registration. Both traversal and final output are deterministic.
+///
+/// Symlinks are refused at every level, including non-Markdown assets, so a
+/// future asset pipeline cannot accidentally follow a link outside the root.
+/// All invalid Markdown and duplicate leaf/bundle slugs are build errors.
+pub fn load_collection(root: &std::path::Path) -> Result<Vec<ContentPage>, String> {
+    use std::collections::BTreeMap;
+
+    let root_type = std::fs::symlink_metadata(root)
+        .map_err(|error| format!("cannot inspect content root {}: {error}", root.display()))?
+        .file_type();
+    if root_type.is_symlink() || !root_type.is_dir() {
+        return Err(format!("content root must be a real directory: {}", root.display()));
+    }
+
+    let mut pages = BTreeMap::new();
+    collect_pages(root, root, &mut pages)?;
+    Ok(pages.into_values().map(|(_, page)| page).collect())
+}
+
+fn collect_pages(
+    root: &std::path::Path,
+    directory: &std::path::Path,
+    pages: &mut std::collections::BTreeMap<String, (String, ContentPage)>,
+) -> Result<(), String> {
+    let entries = std::fs::read_dir(directory)
+        .map_err(|error| format!("cannot read content directory {}: {error}", directory.display()))?;
+    let mut entries = entries
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|error| format!("cannot read content entry in {}: {error}", directory.display()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("cannot inspect content path {}: {error}", path.display()))?;
+        if file_type.is_symlink() {
+            return Err(format!("symlinks are not permitted in content: {}", path.display()));
+        }
+        if file_type.is_dir() {
+            collect_pages(root, &path, pages)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            return Err(format!("unsupported content entry: {}", path.display()));
+        }
+        if path.extension().is_none_or(|extension| extension != "md") {
+            // Ordinary image/asset files are not pages. Asset processing is
+            // intentionally deferred to the future typed resource graph.
+            continue;
+        }
+
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|error| format!("content path escaped root: {error}"))?;
+        let segments = relative
+            .components()
+            .map(|component| {
+                component.as_os_str().to_str().ok_or_else(|| {
+                    format!("content path is not UTF-8: {}", path.display())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let relative_name = segments.join("/");
+        let source = std::fs::read_to_string(&path)
+            .map_err(|error| format!("cannot read content file {}: {error}", path.display()))?;
+        let page = parse_page(&relative_name, &source)?;
+        if let Some((existing, _)) = pages.get(&page.slug) {
+            return Err(format!(
+                "duplicate content slug {} from {} and {}",
+                page.slug, existing, relative_name
+            ));
+        }
+        pages.insert(page.slug.clone(), (relative_name, page));
+    }
+    Ok(())
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::parse_page;
