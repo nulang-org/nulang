@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Safe Markdown subset rendering and reusable HTML layout — 2026-10-15
+- **Add a small, explicit Markdown-to-HTML renderer with escaped content and metadata.** Supports ATX headings, paragraphs, unordered lists, fenced code blocks, and inline code; rejects draft rendering, malformed fences, and unsupported link, image, or emphasis syntax. No active raw HTML passes through.
+- **Introduce a reusable document layout** with validated language metadata and escaped site/page titles. This renders in memory only; no asset emission, automatic route registration, or build publication is enabled. Full CommonMark remains a separate dependency decision.
+
 ### Typed Markdown static artifact planning — 2026-10-15
 - **Added read-only artifact reservations for publishable Markdown pages and sections.** Reuses the compiler's route-to-`index.html` mapping, excludes drafts, produces deterministic artifacts, and rejects explicit route or user-managed static asset collisions.
 - **No Markdown parser, HTML renderer, filesystem writes, or publication behavior is introduced.** The planner accepts validated deployment IR and a statically enumerated asset path list; rendering and staged publication remain separate integration tasks.
