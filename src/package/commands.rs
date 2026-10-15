@@ -1360,11 +1360,19 @@ fn cmd_build_web() -> NuResult<()> {
     let nbc_path = build_dir.join("build.nbc");
     let nbc_path_str = nbc_path.to_string_lossy().into_owned();
 
-    let output_dir = root.join(&manifest.web.output_dir);
-    std::fs::create_dir_all(&output_dir).map_err(|e| NuError::PackageError {
-        msg: format!("cannot create {}: {}", output_dir.display(), e),
+    // Build into a new sibling directory. Nothing touches the previous
+    // published site until compile, prerender, assets, IR and budgets succeed.
+    let published_dir = root.join(&manifest.web.output_dir);
+    let staged = crate::package::web_output::StagedWebOutput::new(
+        &root,
+        &manifest.web.output_dir,
+        &manifest.web.static_dir,
+    )
+    .map_err(|e| NuError::PackageError {
+        msg: format!("cannot stage web output {}: {}", published_dir.display(), e),
         span: Span::default(),
     })?;
+    let output_dir = staged.path().to_path_buf();
 
     let client_js_path = output_dir.join("app.client.js");
     let client_js_path_str = client_js_path.to_string_lossy().into_owned();
@@ -1449,7 +1457,7 @@ fn cmd_build_web() -> NuResult<()> {
                 span: Span::default(),
             })?;
         let html = crate::web::reactivity::inject_client_runtime_script(&html);
-        let out_file = route_path_to_output_file(&route.path);
+        let out_file = route_path_to_output_file(&route.path)?;
         let dest = output_dir.join(&out_file);
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|e| NuError::PackageError {
@@ -1495,16 +1503,37 @@ fn cmd_build_web() -> NuResult<()> {
         });
     }
 
-    println!("Web build succeeded: {}", output_dir.display());
+    // A failed build drops the stage and preserves the previous output.
+    // Publication uses same-parent renames with rollback on install errors.
+    staged.publish().map_err(|e| NuError::PackageError {
+        msg: format!(
+            "cannot publish web output {}: {}",
+            published_dir.display(),
+            e
+        ),
+        span: Span::default(),
+    })?;
+    println!("Web build succeeded: {}", published_dir.display());
     Ok(())
 }
 
-fn route_path_to_output_file(path: &str) -> PathBuf {
+fn route_path_to_output_file(path: &str) -> NuResult<PathBuf> {
     let trimmed = path.trim_start_matches('/');
-    if trimmed.is_empty() {
+    let artifact = if trimmed.is_empty() {
         PathBuf::from("index.html")
     } else {
         PathBuf::from(trimmed).join("index.html")
+    };
+    if artifact
+        .components()
+        .all(|part| matches!(part, std::path::Component::Normal(_)))
+    {
+        Ok(artifact)
+    } else {
+        Err(NuError::PackageError {
+            msg: format!("unsafe static Web route output path: {path:?}"),
+            span: Span::default(),
+        })
     }
 }
 
@@ -3115,6 +3144,77 @@ app "mixed-routes" {
             .expect("server route metadata must still be emitted");
         assert_eq!(server["placement"], "server");
         assert!(server["artifact"].is_null());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_static_route_output_cannot_escape_staging_root() {
+        assert_eq!(
+            route_path_to_output_file("/blog/post").unwrap(),
+            PathBuf::from("blog/post/index.html")
+        );
+        assert!(route_path_to_output_file("/../secret").is_err());
+        assert!(route_path_to_output_file("/blog/../../secret").is_err());
+    }
+
+    #[test]
+    fn test_cmd_build_web_failed_budget_preserves_published_site() {
+        let dir =
+            std::env::temp_dir().join(format!("nulang_web_build_preserve_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        scaffold_package(&dir, "budget-site", "web").unwrap();
+        std::fs::create_dir_all(dir.join("dist")).unwrap();
+        std::fs::write(dir.join("dist/nulang-app.ir.json"), "{}").unwrap();
+        std::fs::write(dir.join("dist/index.html"), "previous deploy").unwrap();
+        std::fs::write(dir.join("dist/keep.txt"), "previous file").unwrap();
+
+        let manifest_path = dir.join("Nulang.toml");
+        let manifest = std::fs::read_to_string(&manifest_path).unwrap();
+        std::fs::write(
+            &manifest_path,
+            format!("{manifest}\n[budgets]\ninitial_js = \"1B\"\n"),
+        )
+        .unwrap();
+
+        let _guard = ChangeDir::new(&dir);
+        let error = cmd_build_web().expect_err("oversized client runtime must fail");
+        assert!(
+            format!("{error:?}").contains("performance budget exceeded"),
+            "failure should occur after artifacts are staged: {error:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("dist/index.html")).unwrap(),
+            "previous deploy"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("dist/keep.txt")).unwrap(),
+            "previous file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cmd_build_web_success_removes_obsolete_published_files() {
+        let dir =
+            std::env::temp_dir().join(format!("nulang_web_build_clean_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        scaffold_package(&dir, "clean-site", "web").unwrap();
+        std::fs::create_dir_all(dir.join("dist")).unwrap();
+        std::fs::write(dir.join("dist/nulang-app.ir.json"), "{}").unwrap();
+        std::fs::write(dir.join("dist/obsolete.html"), "no longer in site").unwrap();
+
+        let _guard = ChangeDir::new(&dir);
+        cmd_build_web().expect("static build should replace published tree");
+        assert!(dir.join("dist/index.html").is_file());
+        assert!(dir.join("dist/nulang-app.ir.json").is_file());
+        assert!(
+            !dir.join("dist/obsolete.html").exists(),
+            "stale static artifacts must not survive a successful build"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
