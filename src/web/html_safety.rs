@@ -52,9 +52,7 @@ pub(crate) fn render_element(
 fn safe_identifier(name: &str) -> bool {
     let mut bytes = name.bytes();
     matches!(bytes.next(), Some(first) if first.is_ascii_alphabetic())
-        && bytes.all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':')
-        })
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':'))
 }
 
 fn dangerous_tag(tag: &str) -> bool {
@@ -218,12 +216,7 @@ mod tests {
             );
         }
         assert!(render_element("img", &attrs(&[("srcset", "x.jpg 1x")]), &[]).is_none());
-        assert!(render_element(
-            "button",
-            &attrs(&[("formaction", "javascript:x")]),
-            &[]
-        )
-        .is_none());
+        assert!(render_element("button", &attrs(&[("formaction", "javascript:x")]), &[]).is_none());
     }
 
     #[test]

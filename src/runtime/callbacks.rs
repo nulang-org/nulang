@@ -395,9 +395,8 @@ pub(crate) fn perform_web_builtin(
                 .iter()
                 .filter_map(|attr| {
                     let slots = read_array(callbacks, *attr);
-                    (slots.len() >= 2).then(|| {
-                        (resolve(constants, slots[0]), resolve(constants, slots[1]))
-                    })
+                    (slots.len() >= 2)
+                        .then(|| (resolve(constants, slots[0]), resolve(constants, slots[1])))
                 })
                 .collect();
             let children: Vec<String> = children
