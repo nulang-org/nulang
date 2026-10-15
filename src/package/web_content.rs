@@ -1,6 +1,200 @@
 //! Opt-in Markdown content staging for the existing fail-closed Web publisher.
 //! All generated files remain in the isolated build stage until publication.
 
+use crate::web::content::load_collection;
+use crate::web::content_render::ContentLayout;
+use crate::web::content_site::render_content_site;
+use crate::web::ir::DeploymentIr;
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+
+fn valid_relative(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+fn overlaps(a: &Path, b: &Path) -> bool {
+    a.starts_with(b) || b.starts_with(a)
+}
+
+/// Validate the explicit opt-in content source without following symlinks.
+///
+/// Input directories may not overlap compiler sources, static assets, managed
+/// output, or VCS/cache directories. All paths are package-root-relative.
+fn validate_content_directory(
+    package_root: &Path,
+    content_dir: &str,
+    static_dir: &str,
+    output_dir: &str,
+) -> Result<PathBuf, String> {
+    let relative = Path::new(content_dir);
+    if !valid_relative(relative) {
+        return Err(format!("invalid content_dir path: {content_dir}"));
+    }
+    for reserved in ["src", ".git", ".nula", static_dir, output_dir] {
+        let protected = Path::new(reserved);
+        if !valid_relative(protected) || overlaps(relative, protected) {
+            return Err(format!(
+                "content_dir {content_dir} overlaps protected project input {reserved}"
+            ));
+        }
+    }
+
+    let mut destination = package_root
+        .canonicalize()
+        .map_err(|error| format!("invalid package root: {error}"))?;
+    for part in relative.components() {
+        destination.push(part.as_os_str());
+        let file_type = fs::symlink_metadata(&destination)
+            .map_err(|error| format!("cannot inspect content_dir {}: {error}", destination.display()))?
+            .file_type();
+        if file_type.is_symlink() || !file_type.is_dir() {
+            return Err(format!(
+                "content_dir must contain real directories, no symlinks: {}",
+                destination.display()
+            ));
+        }
+    }
+    Ok(destination)
+}
+
+fn collect_static_asset_names(root: &Path) -> Result<Vec<String>, String> {
+    let kind = match fs::symlink_metadata(root) {
+        Ok(meta) => meta.file_type(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("cannot inspect static root {}: {error}", root.display())),
+    };
+    if kind.is_symlink() || !kind.is_dir() {
+        return Err(format!("static root must be a real directory: {}", root.display()));
+    }
+
+    let mut names = Vec::new();
+    walk_static_assets(root, root, &mut names)?;
+    names.sort();
+    Ok(names)
+}
+
+fn walk_static_assets(
+    root: &Path,
+    dir: &Path,
+    names: &mut Vec<String>,
+) -> Result<(), String> {
+    let items = fs::read_dir(dir)
+        .map_err(|error| format!("cannot read static assets {}: {error}", dir.display()))?;
+    let mut items = items
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|error| format!("cannot read static directory {}: {error}", dir.display()))?;
+    items.sort_by_key(|item| item.file_name());
+
+    for item in items {
+        let path = item.path();
+        let file_type = item
+            .file_type()
+            .map_err(|error| format!("cannot inspect static file {}: {error}", path.display()))?;
+        if file_type.is_symlink() {
+            return Err(format!("static asset symlink forbidden: {}", path.display()));
+        }
+        if file_type.is_dir() {
+            walk_static_assets(root, &path, names)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            return Err(format!("unsupported static asset type: {}", path.display()));
+        }
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|error| format!("static file escaped root: {error}"))?;
+        let segments = relative
+            .components()
+            .map(|part| {
+                part.as_os_str().to_str().ok_or_else(|| {
+                    format!("static file path is not UTF-8: {}", path.display())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        names.push(segments.join("/"));
+    }
+    Ok(())
+}
+
+/// Render and stage opt-in Markdown into an existing isolated Web build stage.
+///
+/// Validation and rendering happen in memory before any writes. A failed write
+/// may leave partial *staged* files, but StagedWebOutput discards the entire
+/// stage rather than promoting an incomplete site. Existing stage files
+/// (including generated Web route artifacts) are never overwritten.
+pub(super) fn stage_content(
+    package_root: &Path,
+    content_dir: &str,
+    static_dir: &str,
+    output_dir: &str,
+    stage: &Path,
+    ir: &DeploymentIr,
+    site_title: &str,
+) -> Result<usize, String> {
+    let root = validate_content_directory(package_root, content_dir, static_dir, output_dir)?;
+    let pages = load_collection(&root)?;
+    let static_files = collect_static_asset_names(&package_root.join(static_dir))?;
+    let static_paths: Vec<&str> = static_files.iter().map(String::as_str).collect();
+    let docs = render_content_site(
+        &pages,
+        ir,
+        &static_paths,
+        &ContentLayout {
+            site_title,
+            language: "en",
+        },
+    )
+    .map_err(|diagnostics| diagnostics.join("\n"))?;
+
+    // Ensure no generated page can overwrite pre-existing stage output.
+    for doc in &docs {
+        let destination = stage.join(&doc.artifact.artifact);
+        if fs::symlink_metadata(&destination).is_ok() {
+            return Err(format!(
+                "content artifact already exists in build stage: {} from {}",
+                doc.artifact.artifact, doc.artifact.source_path
+            ));
+        }
+        let mut ancestor = destination.parent();
+        while let Some(dir) = ancestor {
+            if !dir.starts_with(stage) {
+                break;
+            }
+            match fs::symlink_metadata(dir) {
+                Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                    return Err(format!("unsafe content output ancestor: {}", dir.display()));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("cannot inspect {}: {error}", dir.display())),
+            }
+            ancestor = dir.parent();
+        }
+    }
+
+    let count = docs.len();
+    for doc in docs {
+        let destination = stage.join(&doc.artifact.artifact);
+        if let Some(dir) = destination.parent() {
+            fs::create_dir_all(dir).map_err(|error| {
+                format!("cannot create content output {}: {error}", dir.display())
+            })?;
+        }
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&destination)
+            .map_err(|error| format!("cannot reserve content output {}: {error}", destination.display()))?;
+        file.write_all(doc.html.as_bytes())
+            .map_err(|error| format!("cannot stage content {}: {error}", destination.display()))?;
+    }
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
