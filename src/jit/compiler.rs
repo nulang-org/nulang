@@ -58,7 +58,7 @@ pub fn is_opcode_compilable(op: OpCode) -> bool {
             | OpCode::IMul
             | OpCode::IDiv
             | OpCode::IMod
-            | OpCode::INeg
+            // INeg can raise checked overflow/type errors; JIT lacks an exceptional exit.
             | OpCode::IInc
             | OpCode::IDec
             | OpCode::IPow
@@ -1099,7 +1099,8 @@ mod tests {
     fn test_is_opcode_compilable_conversion() {
         assert!(is_opcode_compilable(OpCode::IToF));
         assert!(is_opcode_compilable(OpCode::FToI));
-        assert!(is_opcode_compilable(OpCode::INeg));
+        // Checked integer negation may throw at INT48_MIN and must not tier without an exception exit.
+        assert!(!is_opcode_compilable(OpCode::INeg));
         assert!(is_opcode_compilable(OpCode::IInc));
         assert!(is_opcode_compilable(OpCode::IDec));
     }

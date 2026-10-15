@@ -1596,7 +1596,6 @@ pub fn is_opcode_supported_typed(op: OpCode) -> bool {
             | OpCode::IMul
             | OpCode::IDiv
             | OpCode::IMod
-            | OpCode::INeg
             | OpCode::IInc
             | OpCode::IDec
             | OpCode::Xor

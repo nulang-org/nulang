@@ -333,6 +333,39 @@ pub extern "C" fn nulang_fmul(a: u64, b: u64) -> u64 {
     Value::float(f64::from_bits(a) * f64::from_bits(b)).as_raw()
 }
 
+/// Float arithmetic that coerces a non-float (nil) operand to 0.0, matching
+/// the interpreter's `F*` opcode handlers (`as_float().unwrap_or(0.0)`).
+/// Used by the AOT backend for operations the bytecode compiler statically
+/// types as Float even when a value (e.g. a division-by-zero nil) is not a
+/// float at runtime.
+fn fval(raw: u64) -> f64 {
+    if is_float_raw(raw) {
+        f64::from_bits(raw)
+    } else {
+        0.0
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn nulang_fadd_nil0(a: u64, b: u64) -> u64 {
+    Value::float(fval(a) + fval(b)).as_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn nulang_fsub_nil0(a: u64, b: u64) -> u64 {
+    Value::float(fval(a) - fval(b)).as_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn nulang_fmul_nil0(a: u64, b: u64) -> u64 {
+    Value::float(fval(a) * fval(b)).as_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn nulang_ineg_nil0(a: u64) -> u64 {
+    Value::float(-fval(a)).as_raw()
+}
+
 #[no_mangle]
 pub extern "C" fn nulang_fdiv(a: u64, b: u64) -> u64 {
     let bv = f64::from_bits(b);
@@ -340,6 +373,15 @@ pub extern "C" fn nulang_fdiv(a: u64, b: u64) -> u64 {
         return Value::nil().as_raw();
     }
     Value::float(f64::from_bits(a) / bv).as_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn nulang_fmod(a: u64, b: u64) -> u64 {
+    let bv = f64::from_bits(b);
+    if bv == 0.0 {
+        return Value::nil().as_raw();
+    }
+    Value::float(f64::from_bits(a) % bv).as_raw()
 }
 
 #[no_mangle]
@@ -446,9 +488,22 @@ thread_local! {
 
 /// Record a runtime error for retrieval by the AOT driver (no-op semantics
 /// for the tiered JIT, which never inspects this slot).
+///
+/// First-write-wins: compiled code cannot unwind, so a helper records the
+/// error and yields its nil/replacement value, and later statements keep
+/// executing and may record *their* own errors. The interpreter aborts at
+/// the FIRST arithmetic/type error, so to stay in lockstep the AOT driver
+/// must surface that first error, not the last one recorded by downstream
+/// statements that ran on the error-replacement value. E.g. `--(1 + 2,)`:
+/// the inner neg fails on the tuple pointer ("got ptr"), yields nil, and the
+/// OUTER neg on nil would otherwise overwrite the slot with "got nil".
 pub fn aot_set_pending_error(msg: String) {
+    // First-write-wins: the interpreter aborts at the FIRST error and never
+    // runs later statements, so that first error is the observable one.
     AOT_PENDING_ERROR.with(|e| {
-        *e.borrow_mut() = Some(msg);
+        if e.borrow().is_none() {
+            *e.borrow_mut() = Some(msg);
+        }
     });
 }
 

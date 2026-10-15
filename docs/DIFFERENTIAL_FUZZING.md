@@ -98,14 +98,24 @@ scripts/difffuzz.sh --seeds 1 --seed-base 0x0000000000001234
 
 # Release build (faster per program, slower to build):
 scripts/difffuzz.sh --release --seeds 50000
+
+# Explicit batch size (default: 800 seeds per subprocess):
+scripts/difffuzz.sh --seeds 10000 --batch-size 400
 ```
 
 Note: the driver loads one JIT/AOT native module per program and resident
 memory grows ~linearly with programs executed (~4 MB/program observed).
 Under a small cgroup memory limit (4 GiB) a single process is OOM-killed
-after roughly 900-1000 programs, so long campaigns must be *sharded*:
-invoke the binary repeatedly with advancing `--seed-base` (e.g. 800 seeds
-per shard). Crashers and stats accumulate across shards.
+after roughly 900-1000 programs. **The `scripts/difffuzz.sh` launcher now
+builds once and runs at most 800 seeds per subprocess by default**, releasing
+per-process native allocations before advancing the deterministic seed range.
+Use `--batch-size` to lower the limit for smaller CI workers. Each batch
+preserves the crasher directory, stops on the first nonzero exit, and prints
+its starting seed so a failed range can be reproduced directly. A `--time`
+limit is shared across the whole launcher campaign (after compilation), not
+reset for each batch. The standalone `nula_difffuzz` binary remains an
+unsharded low-level driver; run it in bounded seed batches for long campaigns.
+Crashers accumulate across batches, while each batch prints its own statistics.
 
 Environment: `CARGO_TARGET_DIR` (default `/tmp/ct-bfuzz`),
 `NULANG_STDLIB` (default `/mnt/agents/nulang/src/stdlib`).

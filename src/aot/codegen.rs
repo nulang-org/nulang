@@ -973,6 +973,22 @@ pub fn is_all_int(func: &mir::Function) -> bool {
             }
         }
     }
+    // Checked integer negation can fail at INT48_MIN. The runtime helper uses
+    // NaN-tagged values; an unboxed native entry point would silently wrap.
+    for block in &func.blocks {
+        for stmt in &block.stmts {
+            if matches!(
+                stmt,
+                mir::Stmt::Assign {
+                    op: mir::RValue::Unary(crate::ast::UnOp::Neg, _),
+                    ..
+                }
+            ) {
+                return false;
+            }
+        }
+    }
+
     // Nil-producing / heap-object operations must stay boxed. An unboxed
     // function tags its raw result, so a nil (div-by-zero, negative int-pow
     // exponent, out-of-bounds array access) would be re-tagged as int 0, and
@@ -1108,6 +1124,12 @@ pub fn compile_mir_function_body(
     let builder_ctx: &mut FunctionBuilderContext = aot.builder_context;
     let local_base = mir::FunctionBuilder::LOCAL_BASE;
     let type_meta = mir_func.type_metadata.clone();
+    // Static float-typedness, mirroring the bytecode compiler's `float_locals`
+    // opcode-selection analysis. The conservative `type_meta` marks nil-capable
+    // values Unknown, losing float-typedness (e.g. `1.0/0.0` → nil); AOT float
+    // arithmetic must still match the interpreter's statically-float `F*`
+    // opcode semantics (nil operand → 0.0), so select helpers from this too.
+    let float_typed = crate::mir_codegen::float_locals(mir_func);
     aot.cap_metadata = CapabilityMetadata::from_mir_function(mir_func);
 
     // Analyze block predecessors.
@@ -1150,6 +1172,10 @@ pub fn compile_mir_function_body(
             "nulang_fsub",
             "nulang_fmul",
             "nulang_fdiv",
+            "nulang_fmod",
+            "nulang_fadd_nil0",
+            "nulang_fsub_nil0",
+            "nulang_fmul_nil0",
             "nulang_fcmp_eq",
             "nulang_fcmp_lt",
             "nulang_fcmp_gt",
@@ -1182,6 +1208,7 @@ pub fn compile_mir_function_body(
             "nulang_itof",
             "nulang_ftoi",
             "nulang_fneg",
+            "nulang_ineg_nil0",
         ];
         for name in unary_helpers {
             let mut h_sig = module.make_signature();
@@ -1778,6 +1805,7 @@ pub fn compile_mir_function_body(
                     &mut builder,
                     stmt,
                     &type_meta,
+                    &float_typed,
                     &h,
                     &call_targets,
                     &mut closure_targets,
@@ -2017,6 +2045,7 @@ fn compile_stmt(
     builder: &mut FunctionBuilder,
     stmt: &mir::Stmt,
     type_meta: &TypeMetadata,
+    float_typed: &[bool],
     helpers: &HashMap<&str, FuncRef>,
     call_targets: &HashMap<usize, FuncRef>,
     closure_targets: &mut HashMap<u32, usize>,
@@ -2244,6 +2273,7 @@ fn compile_stmt(
                 builder,
                 op,
                 type_meta,
+                float_typed,
                 helpers,
                 call_targets,
                 closure_targets,
@@ -2371,6 +2401,7 @@ fn compile_rvalue(
     builder: &mut FunctionBuilder,
     rv: &mir::RValue,
     type_meta: &TypeMetadata,
+    float_typed: &[bool],
     helpers: &HashMap<&str, FuncRef>,
     call_targets: &HashMap<usize, FuncRef>,
     closure_targets: &mut HashMap<u32, usize>,
@@ -2395,11 +2426,11 @@ fn compile_rvalue(
                 .ok_or_else(|| AotCompileError::Internal(format!("uninitialized local {}", id.0)))
         }
         mir::RValue::Binary(op, lhs, rhs) => compile_binary(
-            builder, *op, *lhs, *rhs, type_meta, helpers, local_vals, mode,
+            builder, *op, *lhs, *rhs, type_meta, float_typed, helpers, local_vals, mode,
         ),
 
         mir::RValue::Unary(op, operand) => {
-            compile_unary(builder, *op, *operand, type_meta, helpers, local_vals, mode)
+            compile_unary(builder, *op, *operand, type_meta, float_typed, helpers, local_vals, mode)
         }
 
         mir::RValue::Call { func, args } => {
@@ -2480,50 +2511,48 @@ fn compile_rvalue(
         }
 
         mir::RValue::Closure { func, captures } => {
-            if captures.is_empty() {
-                // Return tagged function index — also register for call resolution.
-                let idx = builder.ins().iconst(types::I64, *func as i64);
-                Ok(emit_tag_int(builder, idx))
-            } else {
-                // Allocate a closure object carrying the captured values and
-                // return it as a TAG_CLOSURE value. The lifted target function
-                // receives the captures as trailing params when dispatched.
-                let fn_val = builder.ins().iconst(types::I64, *func as i64);
-                let cap_vals: Vec<Value> =
-                    captures
-                        .iter()
-                        .map(|id| {
-                            let reg = mir::FunctionBuilder::LOCAL_BASE + id.0;
-                            local_vals.get(&reg).copied().ok_or_else(|| {
-                                AotCompileError::Internal(format!(
-                                    "closure capture local {} uninitialized",
-                                    id.0
-                                ))
-                            })
+            // All closures — including uncaptured ones — materialize as a
+            // TAG_CLOSURE heap object, matching the interpreter's `Closure`
+            // opcode (`Value::closure` + `CapStore`, and the runtime neg/mul/
+            // compare helpers dispatch on the tag). A bare `TAG_INT(fn_index)`
+            // for uncaptured closures made them indistinguishable from a real
+            // Int: `nulang_ineg` negated the index (`-fn(x,y){x+y}` → `-1`)
+            // instead of raising the interpreter's type error.
+            let fn_val = builder.ins().iconst(types::I64, *func as i64);
+            let cap_vals: Vec<Value> =
+                captures
+                    .iter()
+                    .map(|id| {
+                        let reg = mir::FunctionBuilder::LOCAL_BASE + id.0;
+                        local_vals.get(&reg).copied().ok_or_else(|| {
+                            AotCompileError::Internal(format!(
+                                "closure capture local {} uninitialized",
+                                id.0
+                            ))
                         })
-                        .collect::<AotResult<Vec<_>>>()?;
-                let helper_name = match cap_vals.len() {
-                    0 => "nulang_aot_make_closure_0",
-                    1 => "nulang_aot_make_closure_1",
-                    2 => "nulang_aot_make_closure_2",
-                    3 => "nulang_aot_make_closure_3",
-                    4 => "nulang_aot_make_closure_4",
-                    5 => "nulang_aot_make_closure_5",
-                    6 => "nulang_aot_make_closure_6",
-                    7 => "nulang_aot_make_closure_7",
-                    8 => "nulang_aot_make_closure_8",
-                    n => {
-                        return Err(AotCompileError::Unsupported(format!(
-                            "closure with {} captures (max 8 in AOT)",
-                            n
-                        )))
-                    }
-                };
-                let mut call_args = Vec::with_capacity(cap_vals.len() + 1);
-                call_args.push(fn_val);
-                call_args.extend(cap_vals);
-                call_helper(builder, helpers, helper_name, &call_args)
-            }
+                    })
+                    .collect::<AotResult<Vec<_>>>()?;
+            let helper_name = match cap_vals.len() {
+                0 => "nulang_aot_make_closure_0",
+                1 => "nulang_aot_make_closure_1",
+                2 => "nulang_aot_make_closure_2",
+                3 => "nulang_aot_make_closure_3",
+                4 => "nulang_aot_make_closure_4",
+                5 => "nulang_aot_make_closure_5",
+                6 => "nulang_aot_make_closure_6",
+                7 => "nulang_aot_make_closure_7",
+                8 => "nulang_aot_make_closure_8",
+                n => {
+                    return Err(AotCompileError::Unsupported(format!(
+                        "closure with {} captures (max 8 in AOT)",
+                        n
+                    )))
+                }
+            };
+            let mut call_args = Vec::with_capacity(cap_vals.len() + 1);
+            call_args.push(fn_val);
+            call_args.extend(cap_vals);
+            call_helper(builder, helpers, helper_name, &call_args)
         }
 
         mir::RValue::Perform {
@@ -3013,6 +3042,7 @@ fn compile_rvalue(
                     builder,
                     val_rv,
                     type_meta,
+                    &[],
                     helpers,
                     call_targets,
                     closure_targets,
@@ -3198,6 +3228,7 @@ fn compile_binary(
     lhs: mir::LocalId,
     rhs: mir::LocalId,
     type_meta: &TypeMetadata,
+    float_typed: &[bool],
     helpers: &HashMap<&str, FuncRef>,
     local_vals: &HashMap<u32, Value>,
     mode: CompileMode,
@@ -3279,12 +3310,32 @@ fn compile_binary(
                     Ok(emit_tag_int(builder, sum))
                 }
             } else if type_meta.both_known(lhs_reg_usize, rhs_reg_usize, KnownType::Float) {
-                let l = builder.ins().bitcast(types::F64, MemFlags::new(), lhs_val);
-                let r = builder.ins().bitcast(types::F64, MemFlags::new(), rhs_val);
-                let sum = builder.ins().fadd(l, r);
-                Ok(builder.ins().bitcast(types::I64, MemFlags::new(), sum))
+                if mode == CompileMode::Unboxed {
+                    Ok(builder.ins().iadd(lhs_val, rhs_val))
+                } else {
+                    // Statically float-typed op. The interpreter's FAdd coerces
+                    // a runtime nil operand to 0.0 (`as_float().unwrap_or(0.0)`),
+                    // e.g. a nil division-by-zero: `0.1 + (1.0/0.0)` → 0.1. The
+                    // inline `bitcast + fadd` would misread a nil tag as float
+                    // bits, so route through the nil-coercing helper.
+                    call_helper(builder, helpers, "nulang_fadd_nil0", &[lhs_val, rhs_val])
+                }
+            } else if float_typed[lhs.0 as usize] || float_typed[rhs.0 as usize] {
+                // Statically a float op (bytecode emits FAdd), but a runtime
+                // operand may be nil (e.g. `0.1 + (1.0/0.0)` → `0.1 + nil`,
+                // computed as 0.1 by FAdd's nil→0.0 coercion). `type_meta` is
+                // conservative here because nil-capable operands are Unknown;
+                // route through the float-coercing helper to match FAdd.
+                if mode == CompileMode::Unboxed {
+                    return Err(AotCompileError::Internal(
+                        "statically-float Add reached unboxed AOT codegen".into(),
+                    ));
+                }
+                call_helper(builder, helpers, "nulang_fadd_nil0", &[lhs_val, rhs_val])
             } else {
-                // Fall back to runtime helper.
+                // Fall back to runtime helper. Only float when BOTH are float
+                // (matching the interpreter's IAdd); a lone float is coerced
+                // to an int, exactly as the bytecode IAdd would.
                 call_helper(builder, helpers, "nulang_iadd", &[lhs_val, rhs_val])
             }
         }
@@ -3299,10 +3350,18 @@ fn compile_binary(
                     Ok(emit_tag_int(builder, diff))
                 }
             } else if type_meta.both_known(lhs_reg_usize, rhs_reg_usize, KnownType::Float) {
-                let l = builder.ins().bitcast(types::F64, MemFlags::new(), lhs_val);
-                let r = builder.ins().bitcast(types::F64, MemFlags::new(), rhs_val);
-                let diff = builder.ins().fsub(l, r);
-                Ok(builder.ins().bitcast(types::I64, MemFlags::new(), diff))
+                if mode == CompileMode::Unboxed {
+                    Ok(builder.ins().isub(lhs_val, rhs_val))
+                } else {
+                    call_helper(builder, helpers, "nulang_fsub_nil0", &[lhs_val, rhs_val])
+                }
+            } else if float_typed[lhs.0 as usize] || float_typed[rhs.0 as usize] {
+                if mode == CompileMode::Unboxed {
+                    return Err(AotCompileError::Internal(
+                        "statically-float Sub reached unboxed AOT codegen".into(),
+                    ));
+                }
+                call_helper(builder, helpers, "nulang_fsub_nil0", &[lhs_val, rhs_val])
             } else {
                 call_helper(builder, helpers, "nulang_isub", &[lhs_val, rhs_val])
             }
@@ -3318,26 +3377,41 @@ fn compile_binary(
                     Ok(emit_tag_int(builder, prod))
                 }
             } else if type_meta.both_known(lhs_reg_usize, rhs_reg_usize, KnownType::Float) {
-                let l = builder.ins().bitcast(types::F64, MemFlags::new(), lhs_val);
-                let r = builder.ins().bitcast(types::F64, MemFlags::new(), rhs_val);
-                let prod = builder.ins().fmul(l, r);
-                Ok(builder.ins().bitcast(types::I64, MemFlags::new(), prod))
+                if mode == CompileMode::Unboxed {
+                    Ok(builder.ins().imul(lhs_val, rhs_val))
+                } else {
+                    call_helper(builder, helpers, "nulang_fmul_nil0", &[lhs_val, rhs_val])
+                }
+            } else if float_typed[lhs.0 as usize] || float_typed[rhs.0 as usize] {
+                if mode == CompileMode::Unboxed {
+                    return Err(AotCompileError::Internal(
+                        "statically-float Mul reached unboxed AOT codegen".into(),
+                    ));
+                }
+                call_helper(builder, helpers, "nulang_fmul_nil0", &[lhs_val, rhs_val])
             } else {
                 call_helper(builder, helpers, "nulang_imul", &[lhs_val, rhs_val])
             }
         }
         BinOp::Div => {
-            // Route through `nulang_idiv` ALWAYS (not just for unknown/float
-            // operands): it checks for a zero divisor BEFORE dividing and
-            // returns nil, matching the interpreter. The old inline `sdiv` +
-            // `select` computed the division unconditionally, so a zero
-            // divisor TRAPPED (SIGILL) before the select could return nil.
-            call_helper(builder, helpers, "nulang_idiv", &[lhs_val, rhs_val])
+            // Route through the integer div helper UNLESS this is a
+            // statically-float op: FDiv (bytecode) coerces a runtime nil
+            // operand to 0.0 (`1.0/0.0` → nil on the zero divisor; `nil/2.0`
+            // → 0.0). `nulang_idiv` only does float math when BOTH operands
+            // are float, so route statically-float div through `nulang_fdiv`
+            // which the served nil→0.0 already matches.
+            if float_typed[lhs.0 as usize] || float_typed[rhs.0 as usize] {
+                call_helper(builder, helpers, "nulang_fdiv", &[lhs_val, rhs_val])
+            } else {
+                call_helper(builder, helpers, "nulang_idiv", &[lhs_val, rhs_val])
+            }
         }
         BinOp::Mod => {
-            // Route through `nulang_imod` always for the same reason: `srem`
-            // by zero traps, so the division must be guarded in the helper.
-            call_helper(builder, helpers, "nulang_imod", &[lhs_val, rhs_val])
+            if float_typed[lhs.0 as usize] || float_typed[rhs.0 as usize] {
+                call_helper(builder, helpers, "nulang_fmod", &[lhs_val, rhs_val])
+            } else {
+                call_helper(builder, helpers, "nulang_imod", &[lhs_val, rhs_val])
+            }
         }
         BinOp::Eq => {
             if type_meta.both_known(lhs_reg_usize, rhs_reg_usize, KnownType::Int) {
@@ -3525,7 +3599,8 @@ fn compile_unary(
     builder: &mut FunctionBuilder,
     op: crate::ast::UnOp,
     operand: mir::LocalId,
-    type_meta: &TypeMetadata,
+    _type_meta: &TypeMetadata,
+    float_typed: &[bool],
     helpers: &HashMap<&str, FuncRef>,
     local_vals: &HashMap<u32, Value>,
     mode: CompileMode,
@@ -3538,18 +3613,16 @@ fn compile_unary(
     use crate::ast::UnOp;
     match op {
         UnOp::Neg => {
-            if type_meta.is_known(reg as usize, KnownType::Int) {
-                if mode == CompileMode::Unboxed {
-                    Ok(builder.ins().ineg(val))
-                } else {
-                    let payload = emit_sext48(builder, val);
-                    let neg = builder.ins().ineg(payload);
-                    Ok(emit_tag_int(builder, neg))
-                }
-            } else if type_meta.is_known(reg as usize, KnownType::Float) {
-                let f = builder.ins().bitcast(types::F64, MemFlags::new(), val);
-                let neg = builder.ins().fneg(f);
-                Ok(builder.ins().bitcast(types::I64, MemFlags::new(), neg))
+            // Negation can fail dynamically even when source inference says Int.
+            // Every boxed path therefore goes through a checked runtime helper.
+            if mode == CompileMode::Unboxed {
+                return Err(AotCompileError::Internal(
+                    "checked Neg reached unboxed AOT codegen".into(),
+                ));
+            }
+            if float_typed[operand.0 as usize] {
+                // FNeg coerces runtime nil to 0.0, unlike checked integer negation.
+                call_helper(builder, helpers, "nulang_ineg_nil0", &[val])
             } else {
                 call_helper(builder, helpers, "nulang_ineg", &[val])
             }
@@ -3560,7 +3633,6 @@ fn compile_unary(
     }
 }
 
-/// Call a runtime helper function by name.
 fn call_helper(
     builder: &mut FunctionBuilder,
     helpers: &HashMap<&str, FuncRef>,
@@ -3645,6 +3717,45 @@ mod tests {
         builder.terminate(mir::Terminator::Return(Some(tmp)));
         let func = builder.build();
         assert!(is_all_int(&func));
+    }
+
+    #[test]
+    fn test_is_all_int_false_with_checked_negation() {
+        let mut builder = mir::FunctionBuilder::new("checked_neg", Some(crate::types::Type::int()));
+        let x = builder.add_param("x", crate::types::Type::int());
+        let neg = builder.add_temp(crate::types::Type::int());
+        builder.assign(neg, mir::RValue::Unary(crate::ast::UnOp::Neg, x));
+        builder.terminate(mir::Terminator::Return(Some(neg)));
+        assert!(
+            !is_all_int(&builder.build()),
+            "checked Neg cannot use an unboxed native entry point"
+        );
+    }
+
+    #[test]
+    fn test_aot_checked_neg_int48_min_overflow() {
+        let mut builder = mir::FunctionBuilder::new("__main", Some(crate::types::Type::int()));
+        let x = builder.add_temp(crate::types::Type::int());
+        builder.assign(
+            x,
+            mir::RValue::Const(crate::bytecode::Constant::Int(
+                crate::value_layout::INT48_MIN,
+            )),
+        );
+        let neg = builder.add_temp(crate::types::Type::int());
+        builder.assign(neg, mir::RValue::Unary(crate::ast::UnOp::Neg, x));
+        builder.terminate(mir::Terminator::Return(Some(neg)));
+        let mut module = mir::Module::new("checked_neg");
+        module.functions.push(builder.build());
+
+        let aot = crate::aot::AotModule::compile(&module).expect("AOT compile");
+        let err = aot
+            .run()
+            .expect_err("negating INT48_MIN must not silently wrap");
+        assert!(
+            err.to_string().contains("integer overflow"),
+            "unexpected native error: {err}"
+        );
     }
 
     #[test]
@@ -4666,7 +4777,7 @@ mod tests {
         );
     }
 
-    fn aot_compile_source(source: &str) -> crate::aot::AotModule {
+    fn compile_source_mir(source: &str) -> crate::mir::Module {
         use crate::effect_checker::{CapContext, CapabilityAnalyzer, EffectChecker};
         use crate::lexer::Lexer;
         use crate::parser::Parser;
@@ -4685,7 +4796,11 @@ mod tests {
             }
         }
         let hir = crate::hir_lower::lower_module(&ast, &tc.inferred_decl_types);
-        let mir_module = crate::mir_lower::lower_module(&hir).unwrap();
+        crate::mir_lower::lower_module(&hir).unwrap()
+    }
+
+    fn aot_compile_source(source: &str) -> crate::aot::AotModule {
+        let mir_module = compile_source_mir(source);
         crate::aot::AotModule::compile(&mir_module).expect("AOT compile")
     }
 
@@ -5431,5 +5546,35 @@ mod tests {
         builder.terminate(mir::Terminator::Return(Some(tmp)));
         let func = builder.build();
         assert!(is_all_int(&func));
+    }
+
+    #[test]
+    fn test_aot_neg_of_nil_capable_int_matches_interpreter() {
+        // Nightly differential fuzz (2026-10-10) found interpreter/AOT
+        // divergences on unary `neg` of statically-Int values that are NIL at
+        // runtime: `-(1 % 0)` compiled boxed with the nil-producing local
+        // marked `KnownType::Int`, so `Unary Neg` emitted raw
+        // `sext48 → ineg → tag` instead of the checking `nulang_ineg`
+        // helper — nil's zero payload re-tagged as int 0 (Ok("0")). The
+        // interpreter raises a type error. MIR metadata is now conservative
+        // (Div/Mod/Pow results, calls, closures, function values, and
+        // migrated values stay Unknown), so boxed `neg` routes through
+        // `nulang_ineg`, which records the same type error.
+        for src in [
+            r#"fn main() { -(1 % 0) }"#,
+            r#"fn main() { -3 ** -2 }"#,
+            r#"fn main() { let x = 1 % 0; -(x) }"#,
+        ] {
+            let aot = aot_compile_source(src);
+            let err = aot
+                .run()
+                .expect_err("neg of nil must be a type error, matching the interpreter");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("type error") && msg.contains("neg"),
+                "expected neg type error, got: {}",
+                msg
+            );
+        }
     }
 }
