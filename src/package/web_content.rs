@@ -48,7 +48,9 @@ fn validate_content_directory(
     for part in relative.components() {
         destination.push(part.as_os_str());
         let file_type = fs::symlink_metadata(&destination)
-            .map_err(|error| format!("cannot inspect content_dir {}: {error}", destination.display()))?
+            .map_err(|error| {
+                format!("cannot inspect content_dir {}: {error}", destination.display())
+            })?
             .file_type();
         if file_type.is_symlink() || !file_type.is_dir() {
             return Err(format!(
@@ -188,7 +190,9 @@ pub(super) fn stage_content(
             .create_new(true)
             .write(true)
             .open(&destination)
-            .map_err(|error| format!("cannot reserve content output {}: {error}", destination.display()))?;
+            .map_err(|error| {
+                format!("cannot reserve content output {}: {error}", destination.display())
+            })?;
         file.write_all(doc.html.as_bytes())
             .map_err(|error| format!("cannot stage content {}: {error}", destination.display()))?;
     }
