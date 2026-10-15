@@ -174,7 +174,11 @@ fn cli_preflight_roundtrip_rejects_modified_artifact() {
         ])
         .output()
         .unwrap();
-    assert!(pin.status.success(), "{}", String::from_utf8_lossy(&pin.stderr));
+    assert!(
+        pin.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pin.stderr)
+    );
     fs::write(&pin_path, pin.stdout).unwrap();
 
     let verify = || {
