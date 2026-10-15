@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Rustls and Wasmtime security updates — 2026-10-15
+- **Pinned supported TLS and WASM runtime dependencies to patched versions.** Updated rustls 0.23.45 to 0.23.46 and Wasmtime 48.0.5 to 48.0.6 (including compatible Cranelift and runtime lockfile packages) to address October 2026 RustSec advisories.
+- **Documented the remaining legacy rustls 0.22 advisories in the Cargo audit policy.** The affected version is transitive through libsql's hyper-rustls 0.25 path; explicit advisory exceptions are restricted to the documented IDs until the upstream dependency chain is upgraded.
 
 ### Progressive beginner ergonomics — 2026-10-13
 - **Consolidated `nulang doctor`:** a read-only report of the installed CLI, compiled features and local package, with integration tests for correct output, invalid arguments and non-mutation. Supersedes the competing CLI implementation in draft #1557 after validation.
