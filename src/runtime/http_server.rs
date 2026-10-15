@@ -78,6 +78,180 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
 }
 
+/// Framing errors are rejected before executing a user handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpReadError {
+    BadRequest,
+    Timeout,
+    PayloadTooLarge,
+    HeadersTooLarge,
+    ExpectationFailed,
+    NotImplemented,
+}
+
+impl HttpReadError {
+    fn response(self) -> HttpResponse {
+        let (status, message) = match self {
+            Self::BadRequest => (400, "Bad request"),
+            Self::Timeout => (408, "Request timeout"),
+            Self::PayloadTooLarge => (413, "Payload too large"),
+            Self::HeadersTooLarge => (431, "Request headers too large"),
+            Self::ExpectationFailed => (417, "Expectation failed"),
+            Self::NotImplemented => (501, "Unsupported HTTP method or transfer encoding"),
+        };
+        HttpResponse {
+            status,
+            headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
+            body: message.as_bytes().to_vec(),
+        }
+    }
+}
+
+const MAX_HTTP_HEADERS_SIZE: usize = 16 * 1024;
+const MAX_HTTP_BODY_SIZE: usize = 1_048_576;
+
+/// Reads exactly one HTTP/1.x request. Both HTTP listeners use this same
+/// bounded framing boundary, rather than assuming one read contains a request.
+///
+/// Chunked bodies and Expect: 100-continue are rejected explicitly until
+/// supported; silently dispatching a truncated or ambiguously framed body is
+/// unsafe. Neither server currently supports persistent HTTP connections.
+fn read_http_request<R: Read>(reader: &mut R) -> Result<Option<HttpRequest>, HttpReadError> {
+    let mut bytes = Vec::with_capacity(4096);
+    let header_end = loop {
+        let mut header_slots = [httparse::EMPTY_HEADER; 64];
+        let mut request = httparse::Request::new(&mut header_slots);
+        match request.parse(&bytes) {
+            Ok(httparse::Status::Complete(end)) => {
+                if end > MAX_HTTP_HEADERS_SIZE {
+                    return Err(HttpReadError::HeadersTooLarge);
+                }
+                break end;
+            }
+            Ok(httparse::Status::Partial) => {
+                if bytes.len() >= MAX_HTTP_HEADERS_SIZE {
+                    return Err(HttpReadError::HeadersTooLarge);
+                }
+            }
+            Err(httparse::Error::TooManyHeaders) => {
+                return Err(HttpReadError::HeadersTooLarge);
+            }
+            Err(_) => return Err(HttpReadError::BadRequest),
+        }
+
+        let mut chunk = [0u8; 4096];
+        match reader.read(&mut chunk) {
+            Ok(0) if bytes.is_empty() => return Ok(None),
+            Ok(0) => return Err(HttpReadError::BadRequest),
+            Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Err(HttpReadError::Timeout);
+            }
+            Err(_) => return Err(HttpReadError::BadRequest),
+        }
+    };
+
+    let mut header_slots = [httparse::EMPTY_HEADER; 64];
+    let mut parsed = httparse::Request::new(&mut header_slots);
+    if !matches!(
+        parsed.parse(&bytes[..header_end]),
+        Ok(httparse::Status::Complete(_))
+    ) {
+        return Err(HttpReadError::BadRequest);
+    }
+
+    let method = parsed
+        .method
+        .and_then(HttpMethod::from_str)
+        .ok_or(HttpReadError::NotImplemented)?;
+    let path = parsed.path.ok_or(HttpReadError::BadRequest)?.to_string();
+    let headers: Vec<(String, String)> = parsed
+        .headers
+        .iter()
+        .map(|header| {
+            (
+                header.name.to_string(),
+                String::from_utf8_lossy(header.value).to_string(),
+            )
+        })
+        .collect();
+
+    let mut content_length = None;
+    let mut has_transfer_encoding = false;
+    let mut has_expectation = false;
+    for (name, value) in &headers {
+        if name.eq_ignore_ascii_case("content-length") {
+            // Reject even identical duplicates: this is a one-request server,
+            // and accepting ambiguous lengths enables request desynchronization.
+            let value = value.trim();
+            if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(HttpReadError::BadRequest);
+            }
+            let length = value
+                .parse::<usize>()
+                .map_err(|_| HttpReadError::BadRequest)?;
+            if content_length.replace(length).is_some() {
+                return Err(HttpReadError::BadRequest);
+            }
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            has_transfer_encoding = true;
+        } else if name.eq_ignore_ascii_case("expect") {
+            has_expectation = true;
+        }
+    }
+    if has_transfer_encoding && content_length.is_some() {
+        return Err(HttpReadError::BadRequest);
+    }
+    if has_expectation {
+        return Err(HttpReadError::ExpectationFailed);
+    }
+    if has_transfer_encoding {
+        return Err(HttpReadError::NotImplemented);
+    }
+
+    let content_length = content_length.unwrap_or(0);
+    if content_length > MAX_HTTP_BODY_SIZE {
+        return Err(HttpReadError::PayloadTooLarge);
+    }
+
+    // Limit the body to Content-Length even if the first read also contained
+    // the start of a pipelined request. We close after this one request.
+    let buffered_body = &bytes[header_end..];
+    let mut body = Vec::with_capacity(content_length);
+    body.extend_from_slice(&buffered_body[..buffered_body.len().min(content_length)]);
+    while body.len() < content_length {
+        let mut chunk = [0u8; 4096];
+        let remaining = (content_length - body.len()).min(chunk.len());
+        match reader.read(&mut chunk[..remaining]) {
+            Ok(0) => return Err(HttpReadError::BadRequest),
+            Ok(n) => body.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Err(HttpReadError::Timeout);
+            }
+            Err(_) => return Err(HttpReadError::BadRequest),
+        }
+    }
+
+    Ok(Some(HttpRequest {
+        method,
+        path,
+        headers,
+        body,
+    }))
+}
+
 /// Manages the background HTTP listener thread.
 /// Stored on Runtime; `HttpServerState::bind()` spawns the thread.
 pub struct HttpServerState {
@@ -114,8 +288,6 @@ impl Drop for HttpServerState {
 }
 
 impl HttpServerState {
-    const MAX_BODY_SIZE: usize = 1_048_576; // 1 MB
-
     pub fn bind(
         port: u16,
         handler_module: CodeModule,
@@ -171,93 +343,16 @@ impl HttpServerState {
         handler_module: &CodeModule,
         handler_func_idx: usize,
     ) {
-        let mut buf = [0u8; 8192];
-        loop {
-            match stream.read(&mut buf) {
-                Ok(0) => break, // EOF
-                Ok(n) => {
-                    let mut headers = [httparse::EMPTY_HEADER; 64];
-                    let mut req = httparse::Request::new(&mut headers);
-                    match req.parse(&buf[..n]) {
-                        Ok(httparse::Status::Complete(body_offset)) => {
-                            let method = HttpMethod::from_str(req.method.unwrap_or("GET"))
-                                .unwrap_or(HttpMethod::Get);
-                            let path = req.path.unwrap_or("/").to_string();
-
-                            let headers: Vec<(String, String)> = req
-                                .headers
-                                .iter()
-                                .map(|h| {
-                                    (
-                                        h.name.to_string(),
-                                        String::from_utf8_lossy(h.value).to_string(),
-                                    )
-                                })
-                                .collect();
-
-                            let content_length: usize = headers
-                                .iter()
-                                .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-                                .and_then(|(_, v)| v.parse().ok())
-                                .unwrap_or(0);
-
-                            let mut body = Vec::new();
-                            if body_offset < n {
-                                body.extend_from_slice(&buf[body_offset..n]);
-                            }
-                            while body.len() < content_length.min(Self::MAX_BODY_SIZE) {
-                                let mut chunk = [0u8; 4096];
-                                match stream.read(&mut chunk) {
-                                    Ok(0) => break,
-                                    Ok(m) => body.extend_from_slice(&chunk[..m]),
-                                    Err(_) => break,
-                                }
-                            }
-
-                            if content_length > Self::MAX_BODY_SIZE {
-                                Self::write_response(
-                                    &mut stream,
-                                    &HttpResponse {
-                                        status: 413,
-                                        headers: vec![("Content-Type".into(), "text/plain".into())],
-                                        body: b"Payload too large".to_vec(),
-                                    },
-                                );
-                                break;
-                            }
-
-                            let request = HttpRequest {
-                                method,
-                                path,
-                                headers,
-                                body,
-                            };
-                            let response =
-                                Self::dispatch(handler_module, handler_func_idx, &request);
-                            let keep_alive = false; // Phase 1: close after each request
-                            Self::write_response(&mut stream, &response);
-                            if !keep_alive {
-                                break;
-                            }
-                        }
-                        Ok(httparse::Status::Partial) => continue, // need more data
-                        Err(_) => {
-                            Self::write_response(
-                                &mut stream,
-                                &HttpResponse {
-                                    status: 400,
-                                    headers: vec![("Content-Type".into(), "text/plain".into())],
-                                    body: b"Bad request".to_vec(),
-                                },
-                            );
-                            break;
-                        }
-                    }
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(_) => break,
+        let request = match read_http_request(&mut stream) {
+            Ok(Some(request)) => request,
+            Ok(None) => return,
+            Err(error) => {
+                Self::write_response(&mut stream, &error.response());
+                return;
             }
-        }
+        };
+        let response = Self::dispatch(handler_module, handler_func_idx, &request);
+        Self::write_response(&mut stream, &response);
     }
 
     fn write_response(stream: &mut TcpStream, response: &HttpResponse) {
@@ -273,10 +368,14 @@ impl HttpServerState {
             403 => "Forbidden",
             404 => "Not Found",
             405 => "Method Not Allowed",
+            408 => "Request Timeout",
             413 => "Payload Too Large",
+            417 => "Expectation Failed",
             422 => "Unprocessable Entity",
             429 => "Too Many Requests",
+            431 => "Request Header Fields Too Large",
             500 => "Internal Server Error",
+            501 => "Not Implemented",
             502 => "Bad Gateway",
             503 => "Service Unavailable",
             _ => "Unknown",
@@ -284,6 +383,13 @@ impl HttpServerState {
         let mut out = format!("HTTP/1.1 {} {}\r\n", response.status, status_text);
         for (k, v) in &response.headers {
             out.push_str(&format!("{}: {}\r\n", k, v));
+        }
+        if !response
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("connection"))
+        {
+            out.push_str("Connection: close\r\n");
         }
         out.push_str(&format!("Content-Length: {}\r\n", response.body.len()));
         out.push_str("\r\n");
@@ -831,177 +937,87 @@ impl WebDevServer {
         routes: Vec<RuntimeWebRoute>,
         shutdown: Arc<AtomicBool>,
     ) {
-        let mut buf = [0u8; 8192];
-        loop {
-            match stream.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let mut headers = [httparse::EMPTY_HEADER; 64];
-                    let mut req = httparse::Request::new(&mut headers);
-                    match req.parse(&buf[..n]) {
-                        Ok(httparse::Status::Complete(body_offset)) => {
-                            let method = HttpMethod::from_str(req.method.unwrap_or("GET"))
-                                .unwrap_or(HttpMethod::Get);
-                            let path = req.path.unwrap_or("/").to_string();
+        let request = match read_http_request(&mut stream) {
+            Ok(Some(request)) => request,
+            Ok(None) => return,
+            Err(error) => {
+                HttpServerState::write_response(&mut stream, &error.response());
+                return;
+            }
+        };
+        let path = request.path.clone();
 
-                            let headers: Vec<(String, String)> = req
-                                .headers
-                                .iter()
-                                .map(|h| {
-                                    (
-                                        h.name.to_string(),
-                                        String::from_utf8_lossy(h.value).to_string(),
-                                    )
-                                })
-                                .collect();
-
-                            let content_length: usize = headers
-                                .iter()
-                                .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-                                .and_then(|(_, v)| v.parse().ok())
-                                .unwrap_or(0);
-
-                            let mut body = Vec::new();
-                            if body_offset < n {
-                                body.extend_from_slice(&buf[body_offset..n]);
-                            }
-                            while body.len() < content_length.min(Self::MAX_BODY_SIZE) {
-                                let mut chunk = [0u8; 4096];
-                                match stream.read(&mut chunk) {
-                                    Ok(0) => break,
-                                    Ok(m) => body.extend_from_slice(&chunk[..m]),
-                                    Err(_) => break,
-                                }
-                            }
-
-                            if content_length > Self::MAX_BODY_SIZE {
-                                HttpServerState::write_response(
-                                    &mut stream,
-                                    &HttpResponse {
-                                        status: 413,
-                                        headers: vec![("Content-Type".into(), "text/plain".into())],
-                                        body: b"Payload too large".to_vec(),
-                                    },
-                                );
-                                break;
-                            }
-
-                            let request = HttpRequest {
-                                method,
-                                path: path.clone(),
-                                headers,
-                                body,
-                            };
-
-                            let mut response = if path.starts_with(Self::SSE_PATH_PREFIX) {
-                                let room = &path[Self::SSE_PATH_PREFIX.len()..];
-                                Self::serve_sse(room, &mut stream, shutdown.clone());
-                                break;
-                            } else if let Some((route, params)) = routes
-                                .iter()
-                                .filter(|r| r.route.method == request.method)
-                                .find_map(|r| {
-                                    crate::web::dispatch::match_route(r, &request.path)
-                                        .map(|params| (r, params))
-                                })
-                            {
-                                let captured = HttpRequestBindingInputs::capture(
-                                    &request.path,
-                                    &request.headers,
-                                    &request.body,
-                                );
-                                if let Some(response) = invalid_ui_action_response(&captured) {
-                                    response
-                                } else {
-                                    let values = captured.values(&params, &request.headers);
-                                    let ctx = RequestContext {
-                                        request: request.clone(),
-                                        params: params.clone(),
-                                    };
-                                    let rendered = with_request_context(ctx, || {
-                                        match render_direct_request(route, &values) {
-                                            Ok(Some(rendered)) => Ok(Some(rendered)),
-                                            Ok(None) => Ok(render_route_handler(
-                                                &route.route.handler_module,
-                                                route.route.handler_func_idx,
-                                                None,
-                                            )),
-                                            Err(error) => Err(error),
-                                        }
-                                    });
-                                    match rendered {
-                                        Ok(Some(html)) => HttpResponse {
-                                            status: 200,
-                                            headers: vec![(
-                                                "Content-Type".into(),
-                                                "text/html; charset=utf-8".into(),
-                                            )],
-                                            body: inject_client_runtime_script(&html).into_bytes(),
-                                        },
-                                        Ok(None) => HttpResponse {
-                                            status: 500,
-                                            headers: vec![(
-                                                "Content-Type".into(),
-                                                "text/plain".into(),
-                                            )],
-                                            body: b"Internal server error".to_vec(),
-                                        },
-                                        Err(DirectRequestRenderError::Decode(error)) => {
-                                            let problem = request_decode_problem_response(&error);
-                                            HttpResponse {
-                                                status: problem.status,
-                                                headers: problem.headers,
-                                                body: problem.body,
-                                            }
-                                        }
-                                        Err(DirectRequestRenderError::Execution(error)) => {
-                                            eprintln!("typed route dispatch error: {error}");
-                                            HttpResponse {
-                                                status: 500,
-                                                headers: vec![(
-                                                    "Content-Type".into(),
-                                                    "text/plain".into(),
-                                                )],
-                                                body: b"Internal server error".to_vec(),
-                                            }
-                                        }
-                                    }
-                                }
-                            } else {
-                                Self::serve_static(
-                                    static_dir.as_deref(),
-                                    output_dir.as_deref(),
-                                    &request.path,
-                                )
-                            };
-                            for cookie in take_response_cookies() {
-                                response.headers.push(("Set-Cookie".into(), cookie));
-                            }
-                            let middlewares = [Middleware::SecurityHeaders, Middleware::RequestLog];
-                            for m in &middlewares {
-                                m.apply(&request, &mut response);
-                            }
-                            HttpServerState::write_response(&mut stream, &response);
-                            break;
+        let mut response = if path.starts_with(Self::SSE_PATH_PREFIX) {
+            let room = &path[Self::SSE_PATH_PREFIX.len()..];
+            Self::serve_sse(room, &mut stream, shutdown.clone());
+            return;
+        } else if let Some((route, params)) = routes
+            .iter()
+            .filter(|r| r.route.method == request.method)
+            .find_map(|r| {
+                crate::web::dispatch::match_route(r, &request.path).map(|params| (r, params))
+            })
+        {
+            let captured =
+                HttpRequestBindingInputs::capture(&request.path, &request.headers, &request.body);
+            if let Some(response) = invalid_ui_action_response(&captured) {
+                response
+            } else {
+                let values = captured.values(&params, &request.headers);
+                let ctx = RequestContext {
+                    request: request.clone(),
+                    params: params.clone(),
+                };
+                let rendered =
+                    with_request_context(ctx, || match render_direct_request(route, &values) {
+                        Ok(Some(rendered)) => Ok(Some(rendered)),
+                        Ok(None) => Ok(render_route_handler(
+                            &route.route.handler_module,
+                            route.route.handler_func_idx,
+                            None,
+                        )),
+                        Err(error) => Err(error),
+                    });
+                match rendered {
+                    Ok(Some(html)) => HttpResponse {
+                        status: 200,
+                        headers: vec![("Content-Type".into(), "text/html; charset=utf-8".into())],
+                        body: inject_client_runtime_script(&html).into_bytes(),
+                    },
+                    Ok(None) => HttpResponse {
+                        status: 500,
+                        headers: vec![("Content-Type".into(), "text/plain".into())],
+                        body: b"Internal server error".to_vec(),
+                    },
+                    Err(DirectRequestRenderError::Decode(error)) => {
+                        let problem = request_decode_problem_response(&error);
+                        HttpResponse {
+                            status: problem.status,
+                            headers: problem.headers,
+                            body: problem.body,
                         }
-                        Ok(httparse::Status::Partial) => continue,
-                        Err(_) => {
-                            HttpServerState::write_response(
-                                &mut stream,
-                                &HttpResponse {
-                                    status: 400,
-                                    headers: vec![("Content-Type".into(), "text/plain".into())],
-                                    body: b"Bad request".to_vec(),
-                                },
-                            );
-                            break;
+                    }
+                    Err(DirectRequestRenderError::Execution(error)) => {
+                        eprintln!("typed route dispatch error: {error}");
+                        HttpResponse {
+                            status: 500,
+                            headers: vec![("Content-Type".into(), "text/plain".into())],
+                            body: b"Internal server error".to_vec(),
                         }
                     }
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(_) => break,
             }
+        } else {
+            Self::serve_static(static_dir.as_deref(), output_dir.as_deref(), &request.path)
+        };
+        for cookie in take_response_cookies() {
+            response.headers.push(("Set-Cookie".into(), cookie));
         }
+        let middlewares = [Middleware::SecurityHeaders, Middleware::RequestLog];
+        for m in &middlewares {
+            m.apply(&request, &mut response);
+        }
+        HttpServerState::write_response(&mut stream, &response);
     }
 
     fn serve_sse(room: &str, stream: &mut TcpStream, shutdown: Arc<AtomicBool>) {
@@ -1105,6 +1121,112 @@ fn guess_content_type(path: &Path) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A deterministic reader forces TCP-like fragmentation without sleeps.
+    struct FixedChunkReader<'a> {
+        remaining: &'a [u8],
+        max_chunk: usize,
+    }
+
+    impl std::io::Read for FixedChunkReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.remaining.len().min(buf.len()).min(self.max_chunk);
+            buf[..n].copy_from_slice(&self.remaining[..n]);
+            self.remaining = &self.remaining[n..];
+            Ok(n)
+        }
+    }
+
+    fn chunks(input: &[u8], max_chunk: usize) -> FixedChunkReader<'_> {
+        FixedChunkReader {
+            remaining: input,
+            max_chunk,
+        }
+    }
+
+    #[test]
+    fn http_request_reassembles_fragmented_headers_and_exact_body() {
+        let raw = b"POST /submit HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello";
+        let request = read_http_request(&mut chunks(raw, 3)).unwrap().unwrap();
+        assert_eq!(request.method, HttpMethod::Post);
+        assert_eq!(request.path, "/submit");
+        assert_eq!(request.body, b"hello");
+    }
+
+    #[test]
+    fn http_request_rejects_truncated_body_instead_of_dispatching() {
+        let raw = b"POST /submit HTTP/1.1\r\nContent-Length: 9\r\n\r\nhello";
+        assert_eq!(
+            read_http_request(&mut chunks(raw, 2)).unwrap_err(),
+            HttpReadError::BadRequest
+        );
+    }
+
+    #[test]
+    fn http_request_rejects_ambiguous_or_invalid_lengths() {
+        for raw in [
+            &b"POST / HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\nok"[..],
+            &b"POST / HTTP/1.1\r\nContent-Length: nope\r\n\r\n"[..],
+            &b"POST / HTTP/1.1\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\nok"[..],
+        ] {
+            assert_eq!(
+                read_http_request(&mut chunks(raw, 7)).unwrap_err(),
+                HttpReadError::BadRequest
+            );
+        }
+    }
+
+    #[test]
+    fn http_request_rejects_unknown_methods_instead_of_treating_as_get() {
+        assert_eq!(
+            read_http_request(&mut chunks(b"BREW / HTTP/1.1\r\n\r\n", 32)).unwrap_err(),
+            HttpReadError::NotImplemented
+        );
+    }
+
+    #[test]
+    fn http_request_rejects_unsupported_transfer_encoding() {
+        let raw = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+        assert_eq!(
+            read_http_request(&mut chunks(raw, 8)).unwrap_err(),
+            HttpReadError::NotImplemented
+        );
+    }
+
+    #[test]
+    fn http_request_rejects_oversized_payload_from_declared_length() {
+        let raw = b"POST / HTTP/1.1\r\nContent-Length: 1048577\r\n\r\n";
+        assert_eq!(
+            read_http_request(&mut chunks(raw, 32)).unwrap_err(),
+            HttpReadError::PayloadTooLarge
+        );
+    }
+
+    #[test]
+    fn http_request_bounds_headers_even_without_terminator() {
+        let mut raw = b"GET / HTTP/1.1\r\nX-Padding: ".to_vec();
+        raw.extend(vec![b'a'; 17000]);
+        assert_eq!(
+            read_http_request(&mut chunks(&raw, 900)).unwrap_err(),
+            HttpReadError::HeadersTooLarge
+        );
+    }
+
+    #[test]
+    fn http_request_rejects_expect_continue_without_blocking_on_body() {
+        let raw = b"POST / HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 4\r\n\r\n";
+        assert_eq!(
+            read_http_request(&mut chunks(raw, 8)).unwrap_err(),
+            HttpReadError::ExpectationFailed
+        );
+    }
+
+    #[test]
+    fn http_request_does_not_consume_pipelined_bytes_as_body() {
+        let raw = b"POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\nokGET / HTTP/1.1\r\n\r\n";
+        let request = read_http_request(&mut chunks(raw, 128)).unwrap().unwrap();
+        assert_eq!(request.body, b"ok");
+    }
 
     #[test]
     fn test_match_route_exact() {
