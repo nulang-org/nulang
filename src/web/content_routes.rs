@@ -235,15 +235,13 @@ mod tests {
     fn deployment_ir_blocks_content_shadowing_server_get_routes() {
         let input = vec![page("blog/post.md", false)];
         let mut ir = crate::web::ir::DeploymentIr::default();
-        ir.routes = vec![
-            serde_json::from_value(serde_json::json!({
-                "method": "GET",
-                "path": "/blog/:slug",
-                "placement": "server",
-                "artifact": null
-            }))
-            .unwrap(),
-        ];
+        ir.routes = vec![serde_json::from_value(serde_json::json!({
+            "method": "GET",
+            "path": "/blog/:slug",
+            "placement": "server",
+            "artifact": null
+        }))
+        .unwrap()];
         let error = plan_content_routes_from_ir(&input, &ir).unwrap_err();
         assert!(
             error
