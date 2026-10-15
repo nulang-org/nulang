@@ -99,16 +99,14 @@ fn valid_slug(slug: &str) -> bool {
         return true;
     }
     slug.starts_with('/')
-        && slug
-            .strip_prefix('/')
-            .is_some_and(|segments| {
-                segments.split('/').all(|segment| {
-                    !segment.is_empty()
-                        && segment.bytes().all(|byte| {
-                            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
-                        })
-                })
+        && slug.strip_prefix('/').is_some_and(|segments| {
+            segments.split('/').all(|segment| {
+                !segment.is_empty()
+                    && segment.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                    })
             })
+        })
 }
 
 #[cfg(test)]
@@ -176,7 +174,11 @@ mod tests {
         let input = vec![page("blog/post.md", false)];
         let planned = plan_content_routes(
             &input,
-            &[("POST", "/blog/post"), ("GET", "/about"), ("GET", "/blog/about")],
+            &[
+                ("POST", "/blog/post"),
+                ("GET", "/about"),
+                ("GET", "/blog/about"),
+            ],
         )
         .unwrap();
         assert_eq!(planned.len(), 1);
@@ -188,17 +190,24 @@ mod tests {
         let input = vec![page("blog/post.md", false)];
         let error = plan_content_routes(&input, &[("GET", "/blog/{broken")]).unwrap_err();
         assert!(
-            error.iter().any(|message| message.contains("invalid route pattern")),
+            error
+                .iter()
+                .any(|message| message.contains("invalid route pattern")),
             "{error:?}"
         );
     }
 
     #[test]
     fn duplicate_content_slugs_are_rejected_even_for_separate_sources() {
-        let input = vec![page("blog/post.md", false), page("blog/post/index.md", false)];
+        let input = vec![
+            page("blog/post.md", false),
+            page("blog/post/index.md", false),
+        ];
         let error = plan_content_routes(&input, &[]).unwrap_err();
         assert!(
-            error.iter().any(|message| message.contains("duplicate content route")),
+            error
+                .iter()
+                .any(|message| message.contains("duplicate content route")),
             "{error:?}"
         );
     }
