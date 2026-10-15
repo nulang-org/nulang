@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Typed Markdown static artifact planning — 2026-10-15
+- **Added read-only artifact reservations for publishable Markdown pages and sections.** Reuses the compiler's route-to-`index.html` mapping, excludes drafts, produces deterministic artifacts, and rejects explicit route or user-managed static asset collisions.
+- **No Markdown parser, HTML renderer, filesystem writes, or publication behavior is introduced.** The planner accepts validated deployment IR and a statically enumerated asset path list; rendering and staged publication remain separate integration tasks.
+
 ### Rustls and Wasmtime security updates — 2026-10-15
 - **Pinned supported TLS and WASM runtime dependencies to patched versions.** Updated rustls 0.23.45 to 0.23.46 and Wasmtime 48.0.5 to 48.0.6 (including compatible Cranelift and runtime lockfile packages) to address October 2026 RustSec advisories.
 - **Documented the remaining legacy rustls 0.22 advisories in the Cargo audit policy.** The affected version is transitive through libsql's hyper-rustls 0.25 path; explicit advisory exceptions are restricted to the documented IDs until the upstream dependency chain is upgraded.

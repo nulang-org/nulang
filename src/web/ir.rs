@@ -195,7 +195,8 @@ fn default_route_placement(method: &str, path: &str) -> String {
     }
 }
 
-fn route_path_to_artifact(path: &str) -> String {
+/// Canonical route-to-static-artifact mapping shared by Web IR and content planning.
+pub(crate) fn route_path_to_artifact(path: &str) -> String {
     let trimmed = path.trim_start_matches('/');
     if trimmed.is_empty() {
         "index.html".to_string()
