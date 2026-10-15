@@ -3179,6 +3179,64 @@ app "mixed-routes" {
     }
 
     #[test]
+    fn test_cmd_build_web_opt_in_markdown_success_failure_and_pruning() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_web_markdown_e2e_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        scaffold_package(&dir, "markdown-site", "web").unwrap();
+
+        let manifest_path = dir.join("Nulang.toml");
+        let manifest = std::fs::read_to_string(&manifest_path).unwrap();
+        std::fs::write(&manifest_path, format!("{manifest}content_dir = \"content\"\n"))
+            .unwrap();
+        std::fs::create_dir_all(dir.join("content/blog")).unwrap();
+        std::fs::write(
+            dir.join("content/blog/post.md"),
+            "+++\ntitle = \"Post\"\n+++\n# Public content\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("content/blog/draft.md"),
+            "+++\ntitle = \"Private\"\ndraft = true\n+++\n# Hidden\n",
+        )
+        .unwrap();
+
+        let _guard = ChangeDir::new(&dir);
+        cmd_build_web().expect("opted-in Markdown build should succeed");
+        let post_path = dir.join("dist/blog/post/index.html");
+        let initial_post = std::fs::read_to_string(&post_path).unwrap();
+        let initial_home = std::fs::read_to_string(dir.join("dist/index.html")).unwrap();
+        assert!(initial_post.contains("<h1>Public content</h1>"));
+        assert!(!dir.join("dist/blog/draft/index.html").exists());
+        assert!(dir.join("dist/nulang-app.ir.json").is_file());
+
+        std::fs::write(
+            dir.join("content/blog/bad.md"),
+            "+++\ntitle = \"Invalid\"\n+++\n[unsupported](https://example.org)\n",
+        )
+        .unwrap();
+        let error = cmd_build_web().expect_err("bad Markdown must prevent publication");
+        assert!(format!("{error:?}").contains("unsupported"));
+        assert_eq!(std::fs::read_to_string(&post_path).unwrap(), initial_post);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("dist/index.html")).unwrap(),
+            initial_home
+        );
+        assert!(!dir.join("dist/blog/bad/index.html").exists());
+
+        std::fs::remove_file(dir.join("content/blog/bad.md")).unwrap();
+        std::fs::remove_file(dir.join("content/blog/post.md")).unwrap();
+        cmd_build_web().expect("removing content should allow a clean rebuild");
+        assert!(!post_path.exists(), "deleted Markdown must not remain published");
+        assert!(dir.join("dist/index.html").is_file());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_cmd_build_web_failed_budget_preserves_published_site() {
         let dir =
             std::env::temp_dir().join(format!("nulang_web_build_preserve_{}", std::process::id()));
