@@ -246,9 +246,9 @@ version + migration.*
 
 ## Stable tier
 
-### Backend-neutral logical reduction telemetry — 2026-09-23
-- **Interpreter and Cranelift execution now report one comparable logical bytecode-work counter** (`src/vm.rs`): interpreted instructions charge one unit and executed compiled regions charge their static bytecode length. This is telemetry only; actor scheduling/fairness remains unchanged until benchmark-derived budgets are established.
-- **Regression coverage pins both exact interpreter accounting and post-tier-up JIT accounting**, giving scheduler experiments a shared unit without conflating the existing message-turn budget, JIT safepoints, or Cloud Wasmtime fuel.
+### Interpreter-exact and native-approximate reduction telemetry — 2026-10-16
+- **Interpreter execution reports exact dispatched bytecode instructions; Cranelift reports a coarse region-length estimate** (`src/vm.rs`). Native internal loop back-edges can be undercounted and partial exits can be overcounted, so these are not equivalent dynamic work units or safe scheduling budgets.
+- **Regression tests compare hot native-loop estimates to interpreter-only work oracles** for the same inputs, retaining post-tier-up execution proofs. Fair scheduling remains driven by separate VM/JIT preemption mechanisms pending actual dynamic native work metering.
 ### Preserve observable MIR panic through DCE — 2026-09-24
 - **MIR dead-store elimination now treats `RValue::Panic` as observable/divergent** (`src/mir_codegen.rs`), so an unused panic result cannot cause a reachable contract/precondition failure to be optimized away. A focused optimizer regression pins the behavior.
 ### Zero-copy non-reentrant JIT register entry — 2026-09-24
