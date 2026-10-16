@@ -396,4 +396,72 @@ mod tests {
         ));
         assert_eq!(store.latest_sequence(42), 1);
     }
+
+    #[test]
+    fn stale_activation_cannot_redispatch_an_already_prepared_effect() {
+        let mut store = MemoryStore::new();
+        let prepared = spec(
+            42,
+            "turn:prepared",
+            DeliverySemantics::EffectivelyOnceWithDeduplication,
+        );
+        {
+            let mut first = DurableEffectCoordinator::new(&mut store, 42, 1);
+            first.begin(prepared.clone(), b"charge").unwrap();
+        }
+        {
+            let mut next = DurableEffectCoordinator::new(&mut store, 42, 2);
+            next.begin(spec(42, "turn:advance", DeliverySemantics::AtLeastOnce), b"other")
+                .unwrap();
+        }
+        let mut stale = DurableEffectCoordinator::new(&mut store, 42, 1);
+        assert!(matches!(
+            stale.begin(prepared, b"charge"),
+            Err(DurableEffectRuntimeError::Storage(ref error))
+                if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+        assert_eq!(store.latest_sequence(42), 2);
+    }
+
+    #[test]
+    fn unclaimed_future_activation_cannot_redispatch_existing_intent() {
+        let mut store = MemoryStore::new();
+        let prepared = spec(42, "turn:prepared", DeliverySemantics::AtLeastOnce);
+        {
+            let mut original = DurableEffectCoordinator::new(&mut store, 42, 1);
+            original.begin(prepared.clone(), b"request").unwrap();
+        }
+
+        // Epoch 2 has not made a durable claim. It cannot safely assume
+        // that the epoch-1 owner has been fenced away.
+        let mut unclaimed = DurableEffectCoordinator::new(&mut store, 42, 2);
+        assert!(matches!(
+            unclaimed.begin(prepared, b"request"),
+            Err(DurableEffectRuntimeError::Storage(ref error))
+                if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+        assert_eq!(store.latest_sequence(42), 1);
+    }
+
+    #[test]
+    fn completed_result_can_be_read_without_dispatch_from_old_epoch() {
+        let mut store = MemoryStore::new();
+        let prepared = spec(42, "turn:receipt", DeliverySemantics::AtLeastOnce);
+        {
+            let mut first = DurableEffectCoordinator::new(&mut store, 42, 1);
+            first.begin(prepared.clone(), b"request").unwrap();
+            first.complete(prepared.id, b"request", b"receipt".to_vec()).unwrap();
+        }
+        {
+            let mut next = DurableEffectCoordinator::new(&mut store, 42, 2);
+            next.begin(spec(42, "turn:advance", DeliverySemantics::AtLeastOnce), b"other")
+                .unwrap();
+        }
+        let mut old = DurableEffectCoordinator::new(&mut store, 42, 1);
+        assert_eq!(
+            old.begin(prepared, b"request").unwrap(),
+            DurableEffectDispatchDecision::ReplayRecordedResult(b"receipt".to_vec())
+        );
+        assert_eq!(store.latest_sequence(42), 3);
+    }
 }
