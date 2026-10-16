@@ -18,7 +18,10 @@ fn bytecode_actor_preempts_and_completes_without_a_followup_message() {
 
     let mut module = CodeModule::new("preemption");
     let field_idx = module.add_constant(Constant::String("done".to_string()));
-    assert_eq!(field_idx, 0, "StateSet resolves the field from constant slot zero");
+    assert_eq!(
+        field_idx, 0,
+        "StateSet resolves the field from constant slot zero"
+    );
     let one_idx = module.add_constant(Constant::Int(1));
     module.add_behavior(BehaviorTableEntry {
         name: "Busy.run".to_string(),
@@ -104,7 +107,10 @@ fn resumed_bytecode_turn_yields_to_queued_mail_before_next_dispatch() {
 
     let mut module = CodeModule::new("non-reentrant-resume");
     let field_idx = module.add_constant(Constant::String("phase".to_string()));
-    assert_eq!(field_idx, 0, "StateSet resolves the field from constant slot zero");
+    assert_eq!(
+        field_idx, 0,
+        "StateSet resolves the field from constant slot zero"
+    );
     let one_idx = module.add_constant(Constant::Int(1));
     let two_idx = module.add_constant(Constant::Int(2));
     for name in ["Busy.first", "Busy.second"] {
@@ -299,7 +305,10 @@ fn preempted_actor_yields_to_already_runnable_peer() {
     );
     rt.step_actor(peer);
     rt.finish_actor_turn(peer);
-    assert_eq!(rt.actors[&peer].get_state_field("seen"), Some(Value::int(1)));
+    assert_eq!(
+        rt.actors[&peer].get_state_field("seen"),
+        Some(Value::int(1))
+    );
     assert!(
         rt.actors[&busy].jit_yield_pending,
         "the busy continuation must remain pending while the peer executes"
