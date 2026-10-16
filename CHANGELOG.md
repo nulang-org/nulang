@@ -1,9 +1,22 @@
 # Nulang Changelog
+### Web static-root containment — 2026-10-15
+- **Experimental Web static file serving refuses parent traversal and symlinks escaping configured roots.** Canonical candidate paths must remain inside their canonicalized static or output root, and normal in-root files remain serveable.
+- **A filesystem regression verifies parent and symlink escape rejection.** This is a clean current-main successor to draft #1676; it does not change SSE or claim protection from malicious concurrent mutation of a trusted static root.
 
+### Experimental Web HTML host hardening — 2026-10-15
+- **`Web.html` now validates dynamic element and attribute names and URL-bearing attributes before rendering.** Unsafe markup and scriptable URL schemes fail closed; quoted attribute delimiters are escaped while already escaped `Html` text is preserved.
+- **Six focused regression tests cover normal markup, attribute breakouts, event attributes, high-risk elements, obfuscated URLs, and safe relative/HTTP links.** `Web.raw` remains a trusted-only escape hatch; dynamic script/style/SVG and inline style/event attributes are intentionally rejected pending a future typed context-aware API.
+
+### Rustls and Wasmtime security updates — 2026-10-15
+- **Pinned supported TLS and WASM runtime dependencies to patched versions.** Updated rustls 0.23.45 to 0.23.46 and Wasmtime 48.0.5 to 48.0.6 (including compatible Cranelift and runtime lockfile packages) to address October 2026 RustSec advisories.
+- **Documented the remaining legacy rustls 0.22 advisories in the Cargo audit policy.** The affected version is transitive through libsql's hyper-rustls 0.25 path; explicit advisory exceptions are restricted to the documented IDs until the upstream dependency chain is upgraded.
+
+### WASM dynamic string-add parity — 2026-09-25
+- **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
+- **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
 ### Public CLI release portability — 2026-10-11
 - **Public release archives use the `release-cli` feature profile without a Python shared-library ABI dependency.** The ordinary full/default source build retains opt-in Python interoperability; release packaging checks the resulting Linux and macOS binary for Python dependencies.
 - **Release PRs rehearse the full non-publishing four-platform build matrix before tags are created.** The Linux ARM64 cross build explicitly installs target libc development headers and preflights a target-compiler C header probe, avoiding an observed `ring` compile failure when `--no-install-recommends` omits the ARM64 sysroot. Actual cross-build and clean-host portability remain release gates.
-
 ### Runtime soundness and checked negation — native/AOT backend parity — 2026-10-10
 - **AOT no longer claims raw-Int/Float registers for values that can be nil
   at runtime.** Nightly differential fuzz caught interpreter/AOT divergences
@@ -236,6 +249,8 @@ version + migration.*
 ### Backend-neutral logical reduction telemetry — 2026-09-23
 - **Interpreter and Cranelift execution now report one comparable logical bytecode-work counter** (`src/vm.rs`): interpreted instructions charge one unit and executed compiled regions charge their static bytecode length. This is telemetry only; actor scheduling/fairness remains unchanged until benchmark-derived budgets are established.
 - **Regression coverage pins both exact interpreter accounting and post-tier-up JIT accounting**, giving scheduler experiments a shared unit without conflating the existing message-turn budget, JIT safepoints, or Cloud Wasmtime fuel.
+### Preserve observable MIR panic through DCE — 2026-09-24
+- **MIR dead-store elimination now treats `RValue::Panic` as observable/divergent** (`src/mir_codegen.rs`), so an unused panic result cannot cause a reachable contract/precondition failure to be optimized away. A focused optimizer regression pins the behavior.
 ### Zero-copy non-reentrant JIT register entry — 2026-09-24
 - **Cranelift regions that cannot re-enter the VM now execute directly against the active frame's 256-register array**, eliminating the previous 2 KiB snapshot before native entry and 2 KiB copy-back afterward. `Value` is explicitly `repr(transparent)` over `u64` so the native register ABI has a documented layout guarantee.
 - **Compiled-region metadata now records whether native execution may grow or replace the VM frame stack.** Regions containing helper-backed direct calls retain the detached register snapshot because re-entrant interpreter calls may reallocate `VM::frames`; typed, SIMD, and scalar non-call regions use the direct-frame path.
@@ -259,7 +274,6 @@ version + migration.*
 
 ### Complete Python marshal extraction typing — 2026-09-24
 - **Owned Python→Nulang foreign-value conversion now uses explicit PyO3 extraction targets for Int, Float, and String** (`src/python/marshal.rs`), completing the Bool fix from #930. This prevents Rust/CodeQL builds from failing generic `extract` inference one branch at a time without changing conversion semantics.
-
 
 ### Python bool marshal type inference — 2026-09-24
 - **Default-feature builds now make PyO3 boolean extraction explicit with `extract::<bool>()`**, avoiding a compiler inference failure in the Python marshal path without changing conversion semantics.
@@ -1919,6 +1933,8 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### ORCA deferred reclamation scan reduction — 2026-09-21
+- **Deferred ORCA reclamation avoids redundant linear scans.** Foreign-ref reclamation no longer searches the deferred list twice, and `process_deferred` skips the self-removal lookup after it already `swap_remove`s the current header. Recursive child cleanup keeps the defensive removal path.
 ### Cloud control-plane placement foundation — 2026-09-24
 - **Nulang Cloud now has an isolated deterministic control-plane planner** (`crates/nulang-cloud-control`) that turns deployment intent plus node/allocation snapshots into a pure `PlacementPlan` without mutating runtimes or provisioning infrastructure.
 - **Placement separates hard feasibility from soft ranking.** Node state, architecture, region/zone, trust tier, required labels/capabilities, resource availability, and per-node replica limits reject candidates before region-locality, failure-domain spread, node spread, and headroom scoring.
