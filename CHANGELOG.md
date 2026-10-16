@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Fabric sparse-publication performance — 2026-10-16
+- **Fabric publication scores only matching local actor mailboxes instead of snapshotting every local actor's depth and capacity.** This preserves subscriber eligibility, queue-group placement, mailbox backpressure, and delivery behavior while avoiding work proportional to unrelated actor count.
+- **Matched-fixture microbenchmarks isolate unmatched publication, not delivered-message throughput.** Eight paired rounds measured 31.8 ns versus 31.7 ns at zero unrelated actors, 8,652 ns versus 32.0 ns at 1,000, and 97,012 ns versus 32.0 ns at 10,000 (base versus candidate); end-to-end speedups are not claimed.
+
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
