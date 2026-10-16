@@ -24,6 +24,10 @@ use crate::web::reactivity::inject_client_runtime_script;
 use crate::web::request_bindings::percent_decode_form;
 use crate::web::runtime_bindings::RuntimeWebRoute;
 
+// Optional host-owned route interception. Its only public constructor
+// requires an explicit SQLite mount and a trusted identity verifier.
+type NativeHttpDispatcher = dyn Fn(&HttpRequest) -> Option<HttpResponse> + Send + Sync;
+
 /// HTTP method — must match the Nulang-level variant type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpMethod {
@@ -872,6 +876,37 @@ impl WebDevServer {
         output_dir: Option<PathBuf>,
         routes: Vec<RuntimeWebRoute>,
     ) -> std::io::Result<Self> {
+        Self::bind_runtime_inner(port, static_dir, output_dir, routes, None)
+    }
+
+    /// Register an explicit native SQLite route handler, with mandatory
+    /// trusted identity verification before the handler is entered.
+    /// No Web bytecode or existing route becomes database-privileged.
+    #[cfg(feature = "sqlite")]
+    pub fn bind_runtime_with_sqlite(
+        port: u16,
+        static_dir: Option<PathBuf>,
+        output_dir: Option<PathBuf>,
+        routes: Vec<RuntimeWebRoute>,
+        mount: Arc<crate::runtime::WebSqliteHttpMount>,
+    ) -> std::io::Result<Self> {
+        let native: Arc<NativeHttpDispatcher> = Arc::new(move |request| {
+            if mount.handles(&request.path) {
+                Some(mount.dispatch(request))
+            } else {
+                None
+            }
+        });
+        Self::bind_runtime_inner(port, static_dir, output_dir, routes, Some(native))
+    }
+
+    fn bind_runtime_inner(
+        port: u16,
+        static_dir: Option<PathBuf>,
+        output_dir: Option<PathBuf>,
+        routes: Vec<RuntimeWebRoute>,
+        native: Option<Arc<NativeHttpDispatcher>>,
+    ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(("0.0.0.0", port))?;
         let actual_port = listener.local_addr()?.port();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -889,6 +924,7 @@ impl WebDevServer {
                     output_dir_clone,
                     routes_clone,
                     shutdown_clone,
+                    native,
                 );
             })?;
 
@@ -905,6 +941,7 @@ impl WebDevServer {
         output_dir: Option<PathBuf>,
         routes: Vec<RuntimeWebRoute>,
         shutdown: Arc<AtomicBool>,
+        native: Option<Arc<NativeHttpDispatcher>>,
     ) {
         listener.set_nonblocking(true).ok();
         loop {
@@ -918,8 +955,11 @@ impl WebDevServer {
                     let output_dir = output_dir.clone();
                     let routes = routes.clone();
                     let shutdown = shutdown.clone();
+                    let native = native.clone();
                     std::thread::spawn(move || {
-                        Self::handle_connection(stream, static_dir, output_dir, routes, shutdown);
+                        Self::handle_connection(
+                            stream, static_dir, output_dir, routes, shutdown, native,
+                        );
                     });
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -936,6 +976,7 @@ impl WebDevServer {
         output_dir: Option<PathBuf>,
         routes: Vec<RuntimeWebRoute>,
         shutdown: Arc<AtomicBool>,
+        native: Option<Arc<NativeHttpDispatcher>>,
     ) {
         let request = match read_http_request(&mut stream) {
             Ok(Some(request)) => request,
@@ -947,7 +988,10 @@ impl WebDevServer {
         };
         let path = request.path.clone();
 
-        let mut response = if path.starts_with(Self::SSE_PATH_PREFIX) {
+        let mounted = native.as_ref().and_then(|dispatch| dispatch(&request));
+        let mut response = if let Some(response) = mounted {
+            response
+        } else if path.starts_with(Self::SSE_PATH_PREFIX) {
             let room = &path[Self::SSE_PATH_PREFIX.len()..];
             Self::serve_sse(room, &mut stream, shutdown.clone());
             return;
