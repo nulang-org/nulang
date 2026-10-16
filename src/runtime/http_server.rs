@@ -356,6 +356,22 @@ impl HttpServerState {
     }
 
     fn write_response(stream: &mut TcpStream, response: &HttpResponse) {
+        // Never serialize untrusted HTTP header bytes. In particular, a
+        // malformed Set-Cookie or a caller-supplied framing header must not
+        // override the writer's Content-Length or inject a new response.
+        if response
+            .headers
+            .iter()
+            .any(|(name, value)| !safe_response_header(name, value))
+        {
+            let fallback = HttpResponse {
+                status: 500,
+                headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
+                body: b"Internal server error".to_vec(),
+            };
+            return Self::write_response(stream, &fallback);
+        }
+
         let status_text = match response.status {
             200 => "OK",
             201 => "Created",
@@ -534,14 +550,54 @@ where
     result
 }
 
+/// An HTTP field name and an RFC 6265 cookie name both use the token grammar.
+fn http_token(input: &str) -> bool {
+    !input.is_empty()
+        && input.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_|~".contains(&byte) || byte == 0x60
+            // backtick
+        })
+}
+
+/// HTTP field values may contain horizontal tabs and visible/obs-text bytes,
+/// but no CR, LF, DEL, or other control bytes.
+fn safe_response_header(name: &str, value: &str) -> bool {
+    http_token(name)
+        && !name.eq_ignore_ascii_case("content-length")
+        && !name.eq_ignore_ascii_case("transfer-encoding")
+        && value
+            .bytes()
+            .all(|byte| byte == b'\t' || (byte >= 0x20 && byte != 0x7f))
+}
+
+/// RFC 6265 cookie-octet excludes separators, quotes, whitespace and controls.
+/// Never permit a cookie value to introduce a second attribute or header.
+fn cookie_value_is_safe(value: &str) -> bool {
+    value.bytes().all(|byte| {
+        byte == 0x21
+            || (0x23..=0x2b).contains(&byte)
+            || (0x2d..=0x3a).contains(&byte)
+            || (0x3c..=0x5b).contains(&byte)
+            || (0x5d..=0x7e).contains(&byte)
+    })
+}
+
 /// Add a `Set-Cookie` header for the current response.
 pub fn set_cookie(name: &str, value: &str) {
+    // The public Web.set_cookie effect currently returns Unit. Until it can
+    // return a typed error, reject invalid values rather than emitting them.
+    if !http_token(name) || !cookie_value_is_safe(value) {
+        return;
+    }
     let cookie = format!("{}={}; Path=/; HttpOnly; SameSite=Lax", name, value);
     RESPONSE_COOKIES.with(|c| c.borrow_mut().push(cookie));
 }
 
 /// Add a `Set-Cookie` header that clears the named cookie.
 pub fn clear_cookie(name: &str) {
+    if !http_token(name) {
+        return;
+    }
     let cookie = format!("{}=; Path=/; Max-Age=0; SameSite=Lax", name);
     RESPONSE_COOKIES.with(|c| c.borrow_mut().push(cookie));
 }
@@ -1198,6 +1254,66 @@ mod tests {
                 name == "Content-Type" && value == "application/javascript; charset=utf-8"
             }));
         }
+    }
+
+    fn write_test_response(response: HttpResponse) -> String {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind local test listener");
+        let address = listener.local_addr().expect("local listener address");
+        let server = std::thread::spawn(move || {
+            let (mut connection, _) = listener.accept().expect("accept test connection");
+            HttpServerState::write_response(&mut connection, &response);
+        });
+        let mut connection = TcpStream::connect(address).expect("connect test client");
+        let mut output = Vec::new();
+        connection
+            .read_to_end(&mut output)
+            .expect("read HTTP response");
+        server.join().expect("response writer did not panic");
+        String::from_utf8(output).expect("HTTP output is UTF-8")
+    }
+
+    #[test]
+    fn response_writer_rejects_crlf_in_header_names_and_values() {
+        for (name, value) in [
+            ("X-Test\r\nX-Injected", "safe"),
+            ("X-Test", "safe\r\nX-Injected: yes"),
+            ("X-Test", "safe\nX-Injected: yes"),
+            ("Content-Length", "1"),
+            ("Transfer-Encoding", "chunked"),
+        ] {
+            let result = write_test_response(HttpResponse {
+                status: 200,
+                headers: vec![(name.into(), value.into())],
+                body: b"trusted".to_vec(),
+            });
+            assert!(
+                result.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+                "{result}"
+            );
+            assert!(!result.contains("X-Injected"), "{result}");
+            assert!(!result.contains("trusted"), "{result}");
+            assert_eq!(result.matches("Content-Length:").count(), 1, "{result}");
+        }
+    }
+
+    #[test]
+    fn cookie_helpers_reject_header_and_attribute_injection() {
+        let _ = take_response_cookies();
+        set_cookie("session\r\nX-Injected: yes", "token");
+        set_cookie("session", "token\r\nX-Injected: yes");
+        set_cookie("session", "token; SameSite=None");
+        clear_cookie("session\r\nX-Injected: yes");
+        assert!(take_response_cookies().is_empty());
+
+        set_cookie("session", "safe_token-123");
+        clear_cookie("session");
+        let cookies = take_response_cookies();
+        assert_eq!(cookies.len(), 2);
+        assert_eq!(
+            cookies[0],
+            "session=safe_token-123; Path=/; HttpOnly; SameSite=Lax"
+        );
+        assert_eq!(cookies[1], "session=; Path=/; Max-Age=0; SameSite=Lax");
     }
 
     #[test]
