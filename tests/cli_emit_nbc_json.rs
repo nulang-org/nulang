@@ -76,8 +76,8 @@ fn emit_nbc_json_type_error_reports_structured_diagnostics() {
     assert!(!diagnostics.is_empty(), "compiler errors must be reported");
     assert_eq!(diagnostics[0]["code"], "E0202");
     assert_eq!(
-        diagnostics[0]["span"]["file"],
-        source.to_string_lossy().as_ref(),
+        diagnostics[0]["span"]["file"].as_str(),
+        Some(source.to_str().expect("utf8 test source path")),
         "emitter diagnostics must retain the actual source filename"
     );
     assert!(!output.exists(), "failed validation must not emit bytecode");
