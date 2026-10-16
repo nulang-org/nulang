@@ -5,8 +5,7 @@ use nulang::runtime::{Runtime, WorkflowActivationId, WorkflowEvent};
 #[test]
 fn signal_receipt_commits_one_snapshot_and_event_transition() {
     let mut runtime = Runtime::new();
-    let actor_id =
-        runtime.spawn_workflow_actor("AtomicSignal", Box::new(Vec::new), HashMap::new());
+    let actor_id = runtime.spawn_workflow_actor("AtomicSignal", Box::new(Vec::new), HashMap::new());
 
     runtime
         .append_signal_received(actor_id, "approved", Some("yes".into()))
@@ -20,23 +19,24 @@ fn signal_receipt_commits_one_snapshot_and_event_transition() {
     let snapshot = runtime.persistence.load_snapshot(actor_id).unwrap();
 
     assert_eq!(snapshot.sequence, tail.sequence);
-    assert!(runtime.persistence.read_workflow_events(actor_id).iter().any(
-        |event| matches!(
+    assert!(runtime
+        .persistence
+        .read_workflow_events(actor_id)
+        .iter()
+        .any(|event| matches!(
             event,
             WorkflowEvent::SignalReceived {
                 sequence,
                 name,
                 payload: Some(payload)
             } if *sequence == tail.sequence && name == "approved" && payload == "yes"
-        )
-    ));
+        )));
 }
 
 #[test]
 fn intermediate_timer_uses_atomic_history_without_advancing_safe_snapshot() {
     let mut runtime = Runtime::new();
-    let actor_id =
-        runtime.spawn_workflow_actor("AtomicTimer", Box::new(Vec::new), HashMap::new());
+    let actor_id = runtime.spawn_workflow_actor("AtomicTimer", Box::new(Vec::new), HashMap::new());
     let safe_snapshot = runtime.persistence.load_snapshot(actor_id).unwrap();
     let safe_actor_sequence = runtime.actors[&actor_id].sequence;
 
@@ -47,7 +47,9 @@ fn intermediate_timer_uses_atomic_history_without_advancing_safe_snapshot() {
         .unwrap()
         .current_workflow_activation = Some(activation);
 
-    runtime.schedule_workflow_timer(actor_id, "wake", 250).unwrap();
+    runtime
+        .schedule_workflow_timer(actor_id, "wake", 250)
+        .unwrap();
 
     let tail = runtime
         .persistence
@@ -56,17 +58,23 @@ fn intermediate_timer_uses_atomic_history_without_advancing_safe_snapshot() {
         .expect("timer preparation must advance the atomic tail");
     assert!(tail.sequence > safe_snapshot.sequence);
     assert_eq!(
-        runtime.actors[&actor_id].sequence,
-        safe_actor_sequence,
+        runtime.actors[&actor_id].sequence, safe_actor_sequence,
         "intermediate events must not overwrite the live command sequence"
     );
     assert_eq!(
-        runtime.persistence.load_snapshot(actor_id).unwrap().sequence,
+        runtime
+            .persistence
+            .load_snapshot(actor_id)
+            .unwrap()
+            .sequence,
         safe_snapshot.sequence,
         "open activation must preserve the last safe snapshot"
     );
-    assert!(runtime.persistence.read_workflow_events(actor_id).iter().any(
-        |event| matches!(
+    assert!(runtime
+        .persistence
+        .read_workflow_events(actor_id)
+        .iter()
+        .any(|event| matches!(
             event,
             WorkflowEvent::TimerSet {
                 sequence,
@@ -74,8 +82,7 @@ fn intermediate_timer_uses_atomic_history_without_advancing_safe_snapshot() {
                 name,
                 duration_ms: 250,
             } if *sequence == tail.sequence && id.activation == activation && name == "wake"
-        )
-    ));
+        )));
 }
 
 #[test]
@@ -91,7 +98,11 @@ fn fired_timers_and_saga_compensations_commit_atomically() {
         .unwrap()
         .expect("timer fire must advance the atomic tail");
     assert_eq!(
-        runtime.persistence.load_snapshot(actor_id).unwrap().sequence,
+        runtime
+            .persistence
+            .load_snapshot(actor_id)
+            .unwrap()
+            .sequence,
         fired_tail.sequence
     );
 
@@ -103,18 +114,24 @@ fn fired_timers_and_saga_compensations_commit_atomically() {
         .expect("compensation must advance the atomic tail");
     assert!(compensated_tail.sequence > fired_tail.sequence);
     assert_eq!(
-        runtime.persistence.load_snapshot(actor_id).unwrap().sequence,
+        runtime
+            .persistence
+            .load_snapshot(actor_id)
+            .unwrap()
+            .sequence,
         compensated_tail.sequence
     );
-    assert!(runtime.persistence.read_workflow_events(actor_id).iter().any(
-        |event| matches!(
+    assert!(runtime
+        .persistence
+        .read_workflow_events(actor_id)
+        .iter()
+        .any(|event| matches!(
             event,
             WorkflowEvent::SagaCompensated {
                 sequence,
                 step_name
             } if *sequence == compensated_tail.sequence && step_name == "charge"
-        )
-    ));
+        )));
 }
 
 #[test]
@@ -130,7 +147,9 @@ fn signals_during_an_open_activation_do_not_checkpoint_speculative_state() {
         .unwrap()
         .current_workflow_activation = Some(WorkflowActivationId::new(actor_id, 97));
 
-    runtime.append_signal_received(actor_id, "resume", None).unwrap();
+    runtime
+        .append_signal_received(actor_id, "resume", None)
+        .unwrap();
 
     let tail = runtime
         .persistence
@@ -139,7 +158,11 @@ fn signals_during_an_open_activation_do_not_checkpoint_speculative_state() {
         .expect("signal must be committed before wake-up");
     assert!(tail.sequence > safe_snapshot.sequence);
     assert_eq!(
-        runtime.persistence.load_snapshot(actor_id).unwrap().sequence,
+        runtime
+            .persistence
+            .load_snapshot(actor_id)
+            .unwrap()
+            .sequence,
         safe_snapshot.sequence,
         "the unfinished activation must replay from its last completed state"
     );
@@ -168,7 +191,10 @@ fn unsupported_atomic_store_refuses_signal_without_publishing_history() {
         .append_signal_received(actor_id, "resume", None)
         .expect_err("unsupported storage must fail closed before recording the signal");
     assert_eq!(error.kind(), ErrorKind::Unsupported);
-    assert!(runtime.persistence.read_workflow_events(actor_id).is_empty());
+    assert!(runtime
+        .persistence
+        .read_workflow_events(actor_id)
+        .is_empty());
 
     std::fs::remove_dir_all(path).unwrap();
 }
@@ -178,8 +204,7 @@ fn custom_event_in_an_open_activation_is_committed_without_checkpointing() {
     use nulang::vm::Value;
 
     let mut runtime = Runtime::new();
-    let actor_id =
-        runtime.spawn_workflow_actor("AtomicCustom", Box::new(Vec::new), HashMap::new());
+    let actor_id = runtime.spawn_workflow_actor("AtomicCustom", Box::new(Vec::new), HashMap::new());
     let safe_snapshot = runtime.persistence.load_snapshot(actor_id).unwrap();
     runtime
         .actors
@@ -196,11 +221,18 @@ fn custom_event_in_an_open_activation_is_committed_without_checkpointing() {
         .expect("custom event must advance the atomic tail");
     assert!(tail.sequence > safe_snapshot.sequence);
     assert_eq!(
-        runtime.persistence.load_snapshot(actor_id).unwrap().sequence,
+        runtime
+            .persistence
+            .load_snapshot(actor_id)
+            .unwrap()
+            .sequence,
         safe_snapshot.sequence
     );
-    assert!(runtime.persistence.read_workflow_events(actor_id).iter().any(
-        |event| matches!(
+    assert!(runtime
+        .persistence
+        .read_workflow_events(actor_id)
+        .iter()
+        .any(|event| matches!(
             event,
             WorkflowEvent::Custom {
                 sequence,
@@ -208,6 +240,5 @@ fn custom_event_in_an_open_activation_is_committed_without_checkpointing() {
                 name,
                 ..
             } if *sequence == tail.sequence && name == "Created"
-        )
-    ));
+        )));
 }

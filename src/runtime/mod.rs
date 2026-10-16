@@ -668,12 +668,7 @@ pub struct SagaCompensationReceipt {
 /// the compensation corresponding to this exact idempotency key. The runtime
 /// does not infer provider success from a user-supplied receipt string.
 pub trait SagaCompensationReceiptVerifier {
-    fn verify(
-        &self,
-        operation_id: &str,
-        provider: &str,
-        receipt_id: &str,
-    ) -> std::io::Result<()>;
+    fn verify(&self, operation_id: &str, provider: &str, receipt_id: &str) -> std::io::Result<()>;
 }
 
 impl Runtime {
@@ -1739,13 +1734,9 @@ impl Runtime {
         error_message: String,
         behavior_idx: usize,
     ) {
-        if let Err(error) = workflow::commit_step_failed(
-            self,
-            actor_id,
-            activation,
-            step_name,
-            error_message,
-        ) {
+        if let Err(error) =
+            workflow::commit_step_failed(self, actor_id, activation, step_name, error_message)
+        {
             tracing::error!(
                 actor_id,
                 %error,
@@ -1817,11 +1808,7 @@ impl Runtime {
                             actor.set_state_field("step_index", Value::int(n + 1));
                         }
                     }
-                    self.commit_resumed_workflow_success(
-                        actor_id,
-                        suspended.activation,
-                        step_name,
-                    );
+                    self.commit_resumed_workflow_success(actor_id, suspended.activation, step_name);
                 }
             }
             Err(crate::types::NuError::Suspended(_)) => {
@@ -5214,7 +5201,7 @@ impl Runtime {
                             suspended.behavior_idx,
                         );
                     }
-                },
+                }
             }
             // End the VM-execution window only after any suspend-state
             // re-capture above: draining deferred wakes runs other actors
@@ -5526,11 +5513,7 @@ impl Runtime {
     /// A compensation key is bound to the failed step's durable sequence and
     /// the completed step being reversed. Later tail advancement, process
     /// restarts, and receipt reconciliation therefore derive the same key.
-    pub fn saga_compensation_operation_id(
-        &self,
-        actor_id: u64,
-        step_name: &str,
-    ) -> Option<String> {
+    pub fn saga_compensation_operation_id(&self, actor_id: u64, step_name: &str) -> Option<String> {
         let events = self.persistence.read_workflow_events(actor_id);
         let failure_index = events
             .iter()
@@ -5547,9 +5530,7 @@ impl Runtime {
                 } if name == step_name => Some(*sequence),
                 _ => None,
             })?;
-        let execution_key = format!(
-            "saga-failed/{failure_seq}/step-completed/{completed_seq}"
-        );
+        let execution_key = format!("saga-failed/{failure_seq}/step-completed/{completed_seq}");
         Some(
             crate::durable_effect::DurableEffectId::derive(
                 actor_id,
@@ -5583,14 +5564,14 @@ impl Runtime {
                 // Any recorded start is in doubt until proven complete.
                 // Even a malformed/mismatched legacy key must not make an
                 // already-dispatched compensation eligible for redrive.
-                WorkflowEvent::SagaCompensationStarted { step_name: name, .. }
-                    if name == step_name =>
-                {
+                WorkflowEvent::SagaCompensationStarted {
+                    step_name: name, ..
+                } if name == step_name => {
                     status = SagaCompensationRecoveryStatus::OutcomeUnknown;
                 }
-                WorkflowEvent::SagaCompensated { step_name: name, .. }
-                    if name == step_name =>
-                {
+                WorkflowEvent::SagaCompensated {
+                    step_name: name, ..
+                } if name == step_name => {
                     status = SagaCompensationRecoveryStatus::Completed;
                 }
                 WorkflowEvent::SagaCompensationVerified {
@@ -5609,10 +5590,7 @@ impl Runtime {
     /// Inspect saga compensation work after the most recent failure. This
     /// method is read-only: it never dispatches an external compensation on
     /// recovery, and an unacknowledged Started record remains OutcomeUnknown.
-    pub fn saga_compensation_recovery(
-        &self,
-        actor_id: u64,
-    ) -> Vec<SagaCompensationRecoveryItem> {
+    pub fn saga_compensation_recovery(&self, actor_id: u64) -> Vec<SagaCompensationRecoveryItem> {
         let events = self.persistence.read_workflow_events(actor_id);
         let Some(failed_at) = events
             .iter()
@@ -5647,16 +5625,13 @@ impl Runtime {
             SagaCompensationRecoveryStatus::NotStarted => {
                 let operation_id = self
                     .saga_compensation_operation_id(actor_id, step_name)
-                    .ok_or_else(|| std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "compensation requires a recorded failed command and completed step",
-                    ))?;
-                workflow::append_saga_compensation_started(
-                    self,
-                    actor_id,
-                    step_name,
-                    &operation_id,
-                )
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "compensation requires a recorded failed command and completed step",
+                        )
+                    })?;
+                workflow::append_saga_compensation_started(self, actor_id, step_name, &operation_id)
             }
             SagaCompensationRecoveryStatus::OutcomeUnknown => Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
@@ -5690,10 +5665,12 @@ impl Runtime {
         }
         let expected_id = self
             .saga_compensation_operation_id(actor_id, step_name)
-            .ok_or_else(|| std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "cannot derive compensation identity from durable history",
-            ))?;
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "cannot derive compensation identity from durable history",
+                )
+            })?;
         if receipt.operation_id != expected_id {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -5710,18 +5687,20 @@ impl Runtime {
                 "external receipt provider and receipt ID must be nonempty and bounded",
             ));
         }
-        let has_matching_intent = self
-            .persistence
-            .read_workflow_events(actor_id)
-            .iter()
-            .any(|event| matches!(
-                event,
-                WorkflowEvent::SagaCompensationStarted {
-                    step_name: name,
-                    operation_id: Some(id),
-                    ..
-                } if name == step_name && id == &expected_id
-            ));
+        let has_matching_intent =
+            self.persistence
+                .read_workflow_events(actor_id)
+                .iter()
+                .any(|event| {
+                    matches!(
+                        event,
+                        WorkflowEvent::SagaCompensationStarted {
+                            step_name: name,
+                            operation_id: Some(id),
+                            ..
+                        } if name == step_name && id == &expected_id
+                    )
+                });
         if !has_matching_intent {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -5732,11 +5711,7 @@ impl Runtime {
         // This is the explicit external trust boundary. The caller must supply
         // an independently configured provider adapter; there is deliberately
         // no boolean or self-attested success shortcut in the runtime API.
-        verifier.verify(
-            &expected_id,
-            &receipt.provider,
-            &receipt.receipt_id,
-        )?;
+        verifier.verify(&expected_id, &receipt.provider, &receipt.receipt_id)?;
         workflow::append_saga_compensation_verified(
             self,
             actor_id,
