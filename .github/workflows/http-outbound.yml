@@ -47,4 +47,4 @@ jobs:
       - name: Verify exact actor authority grant
         run: cargo test --locked --no-default-features --features ureq actor_http_request_authorizes_url_not_method_and_rejects_other_ports
       - name: Check package compiles under Nulang VM
-        run: cargo run --locked --no-default-features --features ureq --bin nulang -- --check packages/http-client/src/lib.nula
+        run: cargo run --locked --no-default-features --features ureq --bin nulang -- --with net --check packages/http-client/src/lib.nula
