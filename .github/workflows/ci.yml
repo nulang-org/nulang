@@ -112,7 +112,7 @@ jobs:
 
       - name: Compile SSR and verify browser hydration
         env:
-          NULANG_BIN: ${{ github.workspace }}/target/debug/nulang
+          NULANG_BIN: /tmp/cargo-target/debug/nulang
         run: node --test tests/web_reactivity_browser.test.cjs
 
       - name: Test
