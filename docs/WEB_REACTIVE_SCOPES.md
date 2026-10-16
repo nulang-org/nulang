@@ -72,6 +72,33 @@ unsupported `data-nulang-scope` values and nested SSR-local roots are
 rejected before subscriptions are mounted, rather than silently
 mixing global and local reactive state.
 
+## Renderer-neutral binding node identities
+
+The compiler's existing `SignalGraph` now supplies a deterministic
+semantic identity to each node in the `nulang-ui/1` projection. The
+`UiDocument` and `UiPatch` projections use **one identity allocator**,
+so a patch targets the same binding as the corresponding document.
+
+The opaque node ID is based on binding kind, signal or handler, path,
+allowed attribute and action placement, with unambiguous length-prefixed
+segments. Only truly identical occurrences use a per-key ordinal.
+Introducing a different binding earlier in the graph no longer renumbers
+the existing binding. The `app.signals.json` node schema remains
+unchanged and no additional source parsing is performed.
+
+These IDs are graph-semantic IDs, **not yet resolved component-instance
+IDs**. Identical bindings at the same path must still rely on an
+occurrence ordinal, so inserting another *identical* earlier occurrence
+can change that group's identities. Function/module boundaries and
+stable keyed component instances are future binding-IR work.
+
+**Snapshot compatibility:** The `nulang-ui/1` wire schema stays the
+same, but the opaque node ID values change from the earlier
+position-based encoding to `web-binding:v1`. A host retaining
+pre-change documents must request a fresh `UiDocument` snapshot before
+applying patches from a newer compiler. Do not mix snapshots and patches
+produced by different identity algorithms.
+
 ## Limitations
 
 Ordinary document hydration still claims every unowned legacy binding.
