@@ -1666,6 +1666,60 @@ impl Runtime {
         self.draining_receive_wakes = false;
     }
 
+    /// Close a suspended workflow command only after its terminal snapshot
+    /// and event have reached the atomic tail. A failed commit cannot be
+    /// treated as a completed VM turn, even though the VM returned successfully.
+    pub(crate) fn commit_resumed_workflow_success(
+        &mut self,
+        actor_id: u64,
+        activation: Option<WorkflowActivationId>,
+        step_name: String,
+    ) {
+        if let Err(error) = workflow::commit_step_completed(self, actor_id, activation, step_name) {
+            tracing::error!(
+                actor_id,
+                %error,
+                "nulang-workflow: resumed step completion was not durable; unpublishing actor"
+            );
+            self.actors.remove(&actor_id);
+            return;
+        }
+        if let Some(actor) = self.actors.get_mut(&actor_id) {
+            actor.current_workflow_activation = None;
+        }
+    }
+
+    /// A resumed VM error is terminal only when the failure snapshot and
+    /// StepFailed are committed. Run compensation after that boundary.
+    pub(crate) fn commit_resumed_workflow_failure(
+        &mut self,
+        actor_id: u64,
+        activation: Option<WorkflowActivationId>,
+        step_name: String,
+        error_message: String,
+        behavior_idx: usize,
+    ) {
+        if let Err(error) = workflow::commit_step_failed(
+            self,
+            actor_id,
+            activation,
+            step_name,
+            error_message,
+        ) {
+            tracing::error!(
+                actor_id,
+                %error,
+                "nulang-workflow: resumed StepFailed was not durable; unpublishing actor"
+            );
+            self.actors.remove(&actor_id);
+            return;
+        }
+        if let Some(actor) = self.actors.get_mut(&actor_id) {
+            actor.current_workflow_activation = None;
+        }
+        self.run_saga_compensation(actor_id, behavior_idx);
+    }
+
     /// Resume a workflow actor that is suspended waiting for a signal.
     pub(crate) fn resume_suspended_workflow_step(&mut self, actor_id: u64) {
         let suspended = match self.actors.get_mut(&actor_id) {
