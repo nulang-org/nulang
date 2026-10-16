@@ -12,9 +12,12 @@ The optional binary is enabled only with the PostgreSQL Cargo feature:
 Set NULANG_SQL_DATABASE_URL before the prepare command. The URL is read from
 the environment and never written to the cache. The prototype uses the
 existing synchronous postgres crate with NoTls. Accordingly, prepare **refuses
-to connect unless --allow-plaintext is explicitly given**. Use a local
-development PostgreSQL instance or secure local tunnel; never send database
-credentials over an untrusted network. The offline check needs no database,
+to connect unless --allow-plaintext is explicitly given**, and even with that
+flag **rejects non-local TCP hosts and hostaddr overrides**. Use an explicit
+loopback IP (127.0.0.1 or ::1), a local development database, a local SSH
+tunnel, or a Unix socket. Plaintext remote database connections are forbidden.
+Hostnames such as localhost are intentionally rejected to avoid accidentally
+resolving to a remote address. The offline check needs no database,
 credentials, or network connection.
 
 ## Scope
@@ -44,7 +47,8 @@ and the type of literal scalar arguments to cached PostgreSQL metadata.
 Nonliteral bind values are identified as dynamic; their types **are not**
 validated by this prototype. Int, Float, Bool and String literals are
 checked against a deliberately conservative subset of PostgreSQL scalar
-types. The cache is invalidated when a query changes or disappears.
+types. Untyped `nil` binds fail closed because the current PostgreSQL runtime
+does not marshal them into typed SQL NULL values. The cache is invalidated when a query changes or disappears.
 Missing, stale, duplicated, or malformed metadata causes failure.
 
 Run the normal Nulang compiler check in addition to this tool:
@@ -79,10 +83,11 @@ require a running PostgreSQL server):
 
     cargo test --no-default-features --features postgres --bin nula-sql-check
 
-Live PostgreSQL validation should be performed separately with a disposable
-database containing a known table and columns. Verify that preparing a valid
-SELECT succeeds, that an unknown column fails, and that cached offline
-checking fails after the SQL text or parameter count changes.
+The CI workflow now includes a PostgreSQL 16 service and a focused SQL
+contract lane, which exercises real preparation and offline checking, including
+missing-column, changed-query, and bind-count failures. Those checks must pass
+at the **exact PR head** before promotion. The workflow uses loopback TCP only;
+no external database credentials are needed.
 
 This tool should remain Experimental until source diagnostics, type inference,
 multi-file package discovery, and secure production metadata preparation are
