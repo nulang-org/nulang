@@ -81,6 +81,41 @@ attempts of the same named step require a future per-attempt identity model.
 The existing bytecode-module recovery prerequisite still applies when
 executing compensation expressions after a process restart.
 
+## Verified compensation receipt reconciliation (draft)
+
+A new compensation intent carries an idempotency key derived using
+`DurableEffectId::derive` from the actor ID, the durable `StepFailed` sequence,
+the corresponding `StepCompleted` sequence, and the compensation step name.
+This makes the key stable across restarts and journal-tail advancement, but
+different for distinct failure attempts.
+
+The `Runtime::reconcile_saga_compensation` API requires a
+`SagaCompensationReceipt` containing this exact operation ID, a provider
+identifier and an external receipt reference, **plus** a
+`SagaCompensationReceiptVerifier` implemented by a trusted provider adapter.
+The verifier must independently query or verify the provider and establish
+that the receipt proves completion **for the supplied operation ID**.
+
+Only after successful verification does Nulang commit
+`SagaCompensationVerified` as a fenced atomic workflow event and classify
+that compensation as `Completed`. Invalid IDs, missing provider evidence,
+failed verification, unsupported legacy intent identities, stale fencing
+epochs, or duplicate reconciliation all fail without publishing the receipt.
+
+This is a trusted-verifier interface, **not** a built-in connection to any
+provider, signature-validation engine, or automatic refund/retry system. Merely
+constructing a receipt or providing a verifier that unconditionally returns
+success is not trustworthy evidence. Operators must install a provider adapter
+whose authorization, provenance and receipt-validation behavior have been
+reviewed. The runtime intentionally does not automatically retry work in
+`OutcomeUnknown` state.
+
+Existing `SagaCompensationStarted` journal entries without an operation ID
+are still readable, but cannot be externally reconciled through this new
+interface. The separate local `SagaCompensated` marker continues to mean that
+the compensation body returned successfully; it does not independently prove
+that the remote provider applied exactly one mutation.
+
 ## What Nulang can guarantee locally
 
 For one logical durable external effect, the runtime contract is:
