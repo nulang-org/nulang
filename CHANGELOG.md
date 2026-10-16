@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Fabric sparse-publication performance — 2026-10-16
+- **Fabric publication scores only matching local actor mailboxes instead of snapshotting every local actor's depth and capacity.** This preserves subscriber eligibility, queue-group placement, mailbox backpressure, and delivery behavior while avoiding work proportional to unrelated actor count.
+- **Matched-fixture microbenchmarks isolate unmatched publication, not delivered-message throughput.** Eight paired rounds measured 31.8 ns versus 31.7 ns at zero unrelated actors, 8,652 ns versus 32.0 ns at 1,000, and 97,012 ns versus 32.0 ns at 10,000 (base versus candidate); end-to-end speedups are not claimed.
+
 ### Web static-root containment — 2026-10-15
 - **Experimental Web static file serving refuses parent traversal and symlinks escaping configured roots.** Canonical candidate paths must remain inside their canonicalized static or output root, and normal in-root files remain serveable.
 - **A filesystem regression verifies parent and symlink escape rejection.** This is a clean current-main successor to draft #1676; it does not change SSE or claim protection from malicious concurrent mutation of a trusted static root.
