@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Float division/modulo nil parity in native helpers — 2026-10-16
+- **Native JIT/AOT `FDiv` and `FMod` helpers match reference bytecode semantics for tagged operands.** Non-float numerators coerce to `0.0`, non-float divisors to `1.0`, and genuine floating-point zero divisors still return `nil`, avoiding the mismatched result observed with chained division after a zero-divisor operation.
+- **Targeted native-helper regressions cover nil operands and signed zero.** This changes no language syntax, artifact format, or optimization admission policy; additional compiler-backend differential validation remains the release gate.
+
 ### Experimental Web HTML host hardening — 2026-10-15
 - **`Web.html` now validates dynamic element and attribute names and URL-bearing attributes before rendering.** Unsafe markup and scriptable URL schemes fail closed; quoted attribute delimiters are escaped while already escaped `Html` text is preserved.
 - **Six focused regression tests cover normal markup, attribute breakouts, event attributes, high-risk elements, obfuscated URLs, and safe relative/HTTP links.** `Web.raw` remains a trusted-only escape hatch; dynamic script/style/SVG and inline style/event attributes are intentionally rejected pending a future typed context-aware API.
