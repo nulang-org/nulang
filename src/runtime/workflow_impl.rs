@@ -814,6 +814,27 @@ pub(crate) fn append_signal_received(
     )
 }
 
+/// Record a fenced, atomic compensation intent BEFORE executing the
+/// compensation body. A Started entry without a durable completion receipt
+/// leaves an unknown external outcome after a crash and must not be replayed
+/// automatically.
+pub(crate) fn append_saga_compensation_started(
+    rt: &mut Runtime,
+    actor_id: u64,
+    step_name: &str,
+) -> std::io::Result<()> {
+    let seq = next_sequence(rt, actor_id);
+    commit_workflow_event(
+        rt,
+        actor_id,
+        WorkflowEvent::SagaCompensationStarted {
+            sequence: seq,
+            step_name: step_name.to_string(),
+        },
+        true,
+    )
+}
+
 pub(crate) fn append_saga_compensated(
     rt: &mut Runtime,
     actor_id: u64,
