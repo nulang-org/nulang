@@ -17,7 +17,7 @@ use crate::vm::Value;
 /// Core spawn logic shared by infallible compatibility entry points.
 ///
 /// Durable workflow creation should prefer `try_spawn_actor_with_models` so a
-/// failed initial journal/snapshot commit is observable to the caller.
+/// failed atomic workflow start transition is observable to the caller.
 pub(crate) fn spawn_actor_with_models(
     rt: &mut Runtime,
     init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
@@ -202,7 +202,6 @@ fn try_spawn_actor_with_id(
     }
     rt.actors.insert(id, actor);
     if workflow.is_some() {
-        let seq = crate::runtime::workflow::next_sequence(rt, id);
         let state = {
             let actor = rt.actors.get(&id).unwrap();
             let mut state = Vec::new();
@@ -221,34 +220,21 @@ fn try_spawn_actor_with_id(
             }
             state
         };
-        let commit = rt
-            .persistence
-            .append_workflow_event(
-                id,
-                WorkflowEvent::WorkflowStarted {
-                    sequence: seq,
-                    name: workflow_name.as_ref().unwrap().clone(),
-                    state,
-                },
-            )
-            .and_then(|_| crate::runtime::workflow::try_checkpoint_actor(rt, id));
+        let commit = crate::runtime::workflow::commit_workflow_started(
+            rt,
+            id,
+            workflow_name.as_deref().unwrap(),
+            state,
+        );
         if let Err(error) = commit {
             rt.actors.remove(&id);
             if let Some(ref mut mgr) = rt.crdt_manager {
                 mgr.unregister_actor_fields(id);
             }
 
-            // WorkflowStarted may already have committed when the initial
-            // snapshot fails. A failed spawn must not leave that half-created
-            // durable identity behind for later recovery/reconciliation.
-            if let Err(cleanup_error) = rt.persistence.clear(id) {
-                return Err(std::io::Error::new(
-                    error.kind(),
-                    format!(
-                        "{error}; failed to clear partial durable workflow state: {cleanup_error}"
-                    ),
-                ));
-            }
+            // Atomic storage rejects partial creation. Never clear durable
+            // records on a failed acknowledgement: the caller must not erase
+            // an ambiguously committed identity.
             return Err(error);
         }
     }
