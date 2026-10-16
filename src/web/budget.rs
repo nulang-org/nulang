@@ -69,6 +69,83 @@ pub fn check_initial_js_budget(
     }
 }
 
+/// Enforce an optional budget on *all emitted*, uncompressed JavaScript,
+/// including lazily loaded chunks. Unlike `initial_js` this measures the
+/// output footprint, not the bytes required for the first page load.
+///
+/// The generated client runtime and every .js/.mjs file below assets/ count.
+/// Symlinked asset directories/files and unreadable entries fail closed so
+/// missing bytes cannot make a configured budget appear to pass.
+pub fn check_total_js_budget(
+    output_dir: &Path,
+    max_bytes: Option<usize>,
+) -> std::io::Result<Option<BudgetViolation>> {
+    let Some(budget) = max_bytes else {
+        return Ok(None);
+    };
+
+    let mut total = 0usize;
+    let generated_client = output_dir.join("app.client.js");
+    match std::fs::symlink_metadata(&generated_client) {
+        Ok(_) => add_js_file_size(&generated_client, &mut total)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let assets = output_dir.join("assets");
+    match std::fs::symlink_metadata(&assets) {
+        Ok(_) => count_asset_js(&assets, &mut total)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    Ok((total > budget).then(|| BudgetViolation {
+        file: format!("{} (total emitted JavaScript)", output_dir.display()),
+        size: total,
+        budget,
+    }))
+}
+
+fn invalid_js_asset(path: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("invalid or symlinked JavaScript asset path: {}", path.display()),
+    )
+}
+
+fn add_js_file_size(path: &Path, total: &mut usize) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(invalid_js_asset(path));
+    }
+    let bytes = usize::try_from(metadata.len()).map_err(|_| invalid_js_asset(path))?;
+    *total = total.checked_add(bytes).ok_or_else(|| invalid_js_asset(path))?;
+    Ok(())
+}
+
+fn count_asset_js(directory: &Path, total: &mut usize) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(directory)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(invalid_js_asset(directory));
+    }
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(invalid_js_asset(&path));
+        }
+        if file_type.is_dir() {
+            count_asset_js(&path, total)?;
+        } else if file_type.is_file()
+            && matches!(path.extension().and_then(|s| s.to_str()), Some("js" | "mjs"))
+        {
+            add_js_file_size(&path, total)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
