@@ -2669,6 +2669,26 @@ fn connection_read_loop(
     let _ = stream.shutdown();
 }
 
+/// Retire only the connection on which the failed write occurred.
+/// The listener/reader can install a newer generation while the sender is
+/// between its write lock and its cleanup lock.
+#[cfg(feature = "tcp")]
+fn retire_failed_sender_generation(
+    connections: &mut HashMap<NodeId, TcpConnection>,
+    node_id: NodeId,
+    failed_generation: Option<u64>,
+) -> Option<TcpConnection> {
+    let generation = failed_generation?;
+    if connections
+        .get(&node_id)
+        .is_some_and(|conn| conn.generation == generation)
+    {
+        connections.remove(&node_id)
+    } else {
+        None
+    }
+}
+
 /// Sender thread entry point.
 ///
 /// Drains the outgoing queue, looks up (or creates) the TCP connection
@@ -2732,15 +2752,19 @@ fn sender_thread(
         // correlated with the logical operation that produced this packet.
         let bytes = outgoing.packet.to_bytes(outgoing.seq);
 
-        let result = {
+        let (result, attempted_generation) = {
             let mut conns = lock_ignore_poison(&connections);
             if let Some(conn) = conns.get_mut(&outgoing.to_node) {
-                conn.send_packet(&bytes)
+                let generation = conn.generation;
+                (conn.send_packet(&bytes), Some(generation))
             } else {
-                Err(io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    "connection disappeared",
-                ))
+                (
+                    Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "connection disappeared",
+                    )),
+                    None,
+                )
             }
         };
 
@@ -2756,7 +2780,11 @@ fn sender_thread(
                 reason: TransportSendFailureReason::Write,
             });
             let mut conns = lock_ignore_poison(&connections);
-            if let Some(conn) = conns.remove(&outgoing.to_node) {
+            if let Some(conn) = retire_failed_sender_generation(
+                &mut conns,
+                outgoing.to_node,
+                attempted_generation,
+            ) {
                 let _ = conn.stream.shutdown();
             }
         }
