@@ -1,6 +1,6 @@
 # Package CLI build A/B benchmark
 
-Purpose: measure the developer's full \`nula build\` subprocess latency, not isolated
+Purpose: measure the developer's full `nula build` subprocess latency, not isolated
 compiler-stage speed or cold OS page-cache behavior. Use a **single host** and
 two prebuilt compiler binaries from exact Git SHAs.
 
@@ -8,23 +8,23 @@ two prebuilt compiler binaries from exact Git SHAs.
 
 In separate Git worktrees for the base and candidate commits, run:
 
-\`\`\`sh
+```sh
 # In base worktree:
 CARGO_TARGET_DIR=/tmp/nulang-cli-base cargo build --release --bin nulang
 # In candidate worktree:
 CARGO_TARGET_DIR=/tmp/nulang-cli-candidate cargo build --release --bin nulang
-\`\`\`
+```
 
 Then, from the candidate worktree:
 
-\`\`\`sh
+```sh
 python3 scripts/benchmark_package_build.py \
   --base-binary /tmp/nulang-cli-base/release/nulang \
   --candidate-binary /tmp/nulang-cli-candidate/release/nulang \
   --package benchmarks/fixtures/nula-build-smoke \
   --stdlib src/stdlib \
   --rounds 7 --mode both --out /tmp/nulang-cli-build-ab.json
-\`\`\`
+```
 
 The script alternates AB/BA order, uses separate copies of the same fixture,
 excludes Cargo compilation and fixture copying from timed sections, and runs
@@ -41,9 +41,9 @@ self-contained project to estimate production-workflow impact.
 
 ## Harness tests
 
-\`\`\`sh
+```sh
 python3 -m unittest discover -s scripts/tests -p 'test_benchmark_package_build.py' -v
-\`\`\`
+```
 
 Do not treat passing harness tests as evidence that Nulang compilation is
 correct or faster. Run exact-head Rust integration tests and CI separately.
