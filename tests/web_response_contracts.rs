@@ -58,12 +58,12 @@ fn route_with_response(response_type: &str) -> RouteContract {
 fn json_runtime_route() -> RuntimeWebRoute {
     let source = r#"
 type alias Json[T] = String
-fn endpoint() -> Json[String] { "{\"ok\":true}" }
+fn endpoint() -> Json[String] { "\"ok\"" }
 "#;
     let (module, function_index) = compile_handler(source, "endpoint");
     let contract_source = r#"
 type alias Json[T] = String
-fn endpoint() -> Json[String] { "{\"ok\":true}" }
+fn endpoint() -> Json[String] { "\"ok\"" }
 fn web_main() { perform Web.route("GET", "/json", endpoint) }
 "#;
     let contracts = compile_module_contracts(&parse(contract_source));
@@ -126,7 +126,7 @@ fn contract_extraction_preserves_json_wrapper() {
     let contracts = compile_module_contracts(&parse(
         r#"
 type alias Json[T] = String
-fn value() -> Json[String] { "{}" }
+fn value() -> Json[String] { "\"ok\"" }
 fn web_main() { perform Web.route("GET", "/value", value) }
 "#,
     ));
@@ -208,7 +208,7 @@ fn json_response_uses_json_content_type_without_client_runtime_injection() {
             .contains("content-type: application/json\r\n"),
         "{response}"
     );
-    assert_eq!(response_body(&response), "{\"ok\":true}");
+    assert_eq!(response_body(&response), "\"ok\"");
     assert!(!response.contains("app.client.js"), "{response}");
 }
 
