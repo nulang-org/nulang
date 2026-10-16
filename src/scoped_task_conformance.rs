@@ -6,6 +6,246 @@ use crate::scoped_tasks::{
     CancellationCause, CancellationToken, ScopeError, TaskId, TaskOutcome, TaskScope,
 };
 
+// This harness intentionally lives behind #[cfg(test)] in the main crate.
+// It compares two *test hosts* of the same TaskScope contract, not the Nulang
+// VM and WASM backends. Those can add adapters here once they support tasks.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Response {
+    Pending,
+    Success(u32),
+    Failure(&'static str),
+    Stop,
+}
+
+#[derive(Debug, Clone)]
+enum TraceEvent {
+    Submit,
+    Tick(Vec<(usize, Response)>),
+    Cancel(CancellationCause),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct StateSnapshot {
+    running: usize,
+    cancelled: Option<CancellationCause>,
+    quiescent: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TraceRecord {
+    submission: Option<Result<TaskId, ScopeError>>,
+    tick: Option<TickStats>,
+    state: StateSnapshot,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TraceResult {
+    records: Vec<TraceRecord>,
+    outcomes: Vec<TaskOutcome<u32, &'static str>>,
+}
+
+/// A host adapts the same ordered event trace to its own scheduler. Future
+/// bytecode/WASM hosts can implement this without copying the test fixtures.
+trait TraceHost: Sized {
+    fn try_submit(&mut self) -> Result<TaskId, ScopeError>;
+    fn tick(&mut self, responses: &[(usize, Response)]) -> TickStats;
+    fn cancel(&mut self, cause: CancellationCause);
+    fn snapshot(&self) -> StateSnapshot;
+    fn finish(self) -> Result<Vec<TaskOutcome<u32, &'static str>>, ScopeError>;
+}
+
+fn response_for(
+    id: TaskId,
+    responses: &[(usize, Response)],
+    token: &CancellationToken,
+) -> TaskPoll<u32, &'static str> {
+    let response = responses
+        .iter()
+        .find(|(target, _)| *target == id.0)
+        .map(|(_, response)| *response)
+        .unwrap_or(Response::Pending);
+    match response {
+        Response::Pending => TaskPoll::Pending,
+        Response::Success(value) => TaskPoll::Ready(Ok(value)),
+        Response::Failure(error) => TaskPoll::Ready(Err(error)),
+        // A child may only acknowledge cancellation when it has observed
+        // the cooperative flag, never merely because a scripted event says so.
+        Response::Stop if token.is_cancelled() => TaskPoll::Cancelled,
+        Response::Stop => TaskPoll::Pending,
+    }
+}
+
+impl TraceHost for ReferenceExecutor<u32, &'static str> {
+    fn try_submit(&mut self) -> Result<TaskId, ScopeError> {
+        ReferenceExecutor::try_submit(self)
+    }
+
+    fn tick(&mut self, responses: &[(usize, Response)]) -> TickStats {
+        ReferenceExecutor::tick(self, |id, token| response_for(id, responses, token))
+    }
+
+    fn cancel(&mut self, cause: CancellationCause) {
+        ReferenceExecutor::cancel(self, cause);
+    }
+
+    fn snapshot(&self) -> StateSnapshot {
+        StateSnapshot {
+            running: self.in_flight(),
+            cancelled: self.cancellation().copied(),
+            quiescent: self.is_quiescent(),
+        }
+    }
+
+    fn finish(self) -> Result<Vec<TaskOutcome<u32, &'static str>>, ScopeError> {
+        self.into_outcomes()
+    }
+}
+
+/// An independent, intentionally simple test driver that calls TaskScope's
+/// lifecycle API directly. It does not use ReferenceExecutor's tick loop.
+struct DirectScopeHost {
+    scope: TaskScope<u32, &'static str>,
+    running: Vec<TaskId>,
+}
+
+impl DirectScopeHost {
+    fn new(max_in_flight: usize, max_pending: usize) -> Self {
+        Self {
+            scope: TaskScope::new(max_in_flight, max_pending).expect("positive limits"),
+            running: Vec::new(),
+        }
+    }
+}
+
+impl TraceHost for DirectScopeHost {
+    fn try_submit(&mut self) -> Result<TaskId, ScopeError> {
+        self.scope.try_submit()
+    }
+
+    fn cancel(&mut self, cause: CancellationCause) {
+        self.scope.cancel(cause);
+    }
+
+    fn snapshot(&self) -> StateSnapshot {
+        StateSnapshot {
+            running: self.scope.in_flight(),
+            cancelled: self.scope.cancellation().copied(),
+            quiescent: self.scope.is_quiescent(),
+        }
+    }
+
+    fn tick(&mut self, responses: &[(usize, Response)]) -> TickStats {
+        let mut stats = TickStats::default();
+        while let Some(id) = self.scope.admit_next() {
+            self.running.push(id);
+            stats.admitted += 1;
+        }
+        let token = self.scope.cancellation_token();
+        // Iterate a snapshot so removal does not skip the next running task.
+        for id in self.running.clone() {
+            stats.polled += 1;
+            match response_for(id, responses, &token) {
+                TaskPoll::Pending => {}
+                TaskPoll::Ready(result) => {
+                    self.scope.complete(id, result).expect("running child");
+                    self.running.retain(|active| *active != id);
+                    stats.completed += 1;
+                }
+                TaskPoll::Cancelled => {
+                    self.scope.acknowledge_cancelled(id).expect("running child");
+                    self.running.retain(|active| *active != id);
+                    stats.completed += 1;
+                }
+            }
+        }
+        stats
+    }
+
+    fn finish(self) -> Result<Vec<TaskOutcome<u32, &'static str>>, ScopeError> {
+        self.scope.into_outcomes()
+    }
+}
+
+fn run_trace<H: TraceHost>(mut host: H, events: &[TraceEvent]) -> TraceResult {
+    let mut records = Vec::with_capacity(events.len());
+    for event in events {
+        let (submission, tick) = match event {
+            TraceEvent::Submit => (Some(host.try_submit()), None),
+            TraceEvent::Tick(responses) => (None, Some(host.tick(responses))),
+            TraceEvent::Cancel(cause) => {
+                host.cancel(*cause);
+                (None, None)
+            }
+        };
+        records.push(TraceRecord {
+            submission,
+            tick,
+            state: host.snapshot(),
+        });
+    }
+    TraceResult {
+        records,
+        outcomes: host.finish().expect("fixture must end with no running work"),
+    }
+}
+
+fn assert_hosts_conform(
+    max_in_flight: usize,
+    max_pending: usize,
+    events: &[TraceEvent],
+) -> TraceResult {
+    let reference = run_trace(
+        ReferenceExecutor::new(max_in_flight, max_pending).unwrap(),
+        events,
+    );
+    let direct = run_trace(DirectScopeHost::new(max_in_flight, max_pending), events);
+    assert_eq!(
+        reference, direct,
+        "reference and direct TaskScope hosts disagree on an ordered event trace"
+    );
+    reference
+}
+
+/// Vary admission pressure, completion order, and failure timing with a
+/// reproducible seed. Explicit final cancellation plus stop acknowledgements
+/// ensure every generated fixture closes before asserting the final results.
+fn seeded_events(seed: u64) -> Vec<TraceEvent> {
+    let mut rng = crate::dst::DeterministicRng::new(seed);
+    let mut events = vec![
+        TraceEvent::Submit,
+        TraceEvent::Submit,
+        TraceEvent::Tick(vec![
+            (0, Response::Pending),
+            (1, Response::Pending),
+        ]),
+        TraceEvent::Submit,
+    ];
+    for _ in 0..32 {
+        if rng.next() % 5 == 0 {
+            events.push(TraceEvent::Submit);
+        } else {
+            let responses = (0..48)
+                .map(|id| {
+                    let answer = match rng.next() % 13 {
+                        0 => Response::Failure("seeded failure"),
+                        1..=4 => Response::Success(id as u32),
+                        5 => Response::Stop,
+                        _ => Response::Pending,
+                    };
+                    (id, answer)
+                })
+                .collect();
+            events.push(TraceEvent::Tick(responses));
+        }
+    }
+    events.push(TraceEvent::Cancel(CancellationCause::Parent));
+    events.push(TraceEvent::Tick(
+        (0..48).map(|id| (id, Response::Stop)).collect(),
+    ));
+    events
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
