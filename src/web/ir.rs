@@ -88,7 +88,7 @@ impl DeploymentIr {
 /// `routes` are the routes collected by running the compiled entry point.
 /// `signal_graph_path` is the optional path to `app.signals.json` emitted by
 /// the reactivity pass. `src_root` is the package `src/` directory used
-/// for legacy capability/module discovery, not route-contract extraction.
+/// for legacy effect-capability discovery, not module-import discovery.
 /// `budgets` are parsed from `Nulang.toml`. `contracts` must be the
 /// validated package compilation also used to attach runtime route plans.
 /// Do not rediscover contracts here: doing so can diverge from validation.
@@ -151,7 +151,7 @@ pub fn generate_deployment_ir(
     for cap in infer_capabilities(&source_text) {
         capabilities.insert(cap);
     }
-    for cap in infer_module_capabilities(&source_text) {
+    for cap in infer_module_capabilities(&contracts.module_imports) {
         capabilities.insert(cap);
     }
     let capabilities: Vec<String> = capabilities.into_iter().collect();
@@ -161,8 +161,8 @@ pub fn generate_deployment_ir(
         lcp_seconds: budgets.lcp_seconds(),
     };
 
-    let cloud_config = infer_module_cloud_config(&source_text);
-    let middleware = infer_middleware(&source_text);
+    let cloud_config = infer_module_cloud_config(&contracts.module_imports);
+    let middleware = infer_middleware(&contracts.module_imports);
 
     DeploymentIr {
         // This is an additive v1 extension: every new per-route field is
@@ -252,16 +252,13 @@ fn infer_capabilities(source: &str) -> Vec<String> {
 }
 
 /// Infer capabilities contributed by imported `@nulang/*` modules.
-fn infer_module_capabilities(source: &str) -> Vec<String> {
-    let registry = ModuleRegistry::builtin();
-    let imports = collect_nulang_imports(source);
-    registry.collect_capabilities(&imports)
+fn infer_module_capabilities(imports: &[String]) -> Vec<String> {
+    ModuleRegistry::builtin().collect_capabilities(imports)
 }
 
 /// Infer cloud config keys required by imported `@nulang/*` modules.
-fn infer_module_cloud_config(source: &str) -> Vec<CloudConfigEntry> {
+fn infer_module_cloud_config(imports: &[String]) -> Vec<CloudConfigEntry> {
     let registry = ModuleRegistry::builtin();
-    let imports = collect_nulang_imports(source);
     let mut entries = Vec::new();
     for name in imports {
         if let Some(spec) = registry.get(&name) {
@@ -278,32 +275,16 @@ fn infer_module_cloud_config(source: &str) -> Vec<CloudConfigEntry> {
 
 /// Infer default middleware stack, extending it when imported modules
 /// contribute security concerns (e.g., auth sessions).
-fn infer_middleware(source: &str) -> Vec<String> {
+fn infer_middleware(imports: &[String]) -> Vec<String> {
     let mut stack = vec![
         "security_headers".to_string(),
         "request_log".to_string(),
         "csrf".to_string(),
     ];
-    let imports = collect_nulang_imports(source);
     if imports.iter().any(|name| name == "@nulang/auth") {
         stack.push("auth".to_string());
     }
     stack
-}
-
-/// Collect all `@nulang/*` import names from the source text.
-fn collect_nulang_imports(source: &str) -> Vec<String> {
-    let mut imports = Vec::new();
-    for line in source.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("import ") {
-            let name = rest.split_whitespace().next().unwrap_or("");
-            if name.starts_with("@nulang/") && !imports.contains(&name.to_string()) {
-                imports.push(name.to_string());
-            }
-        }
-    }
-    imports
 }
 
 #[cfg(test)]
@@ -379,6 +360,7 @@ fn main() { nil }
             crate::web::contracts::ContractCompilation {
                 routes: vec![contract],
                 diagnostics: Vec::new(),
+                module_imports: Vec::new(),
             },
         )
         .expect("fixture must be a valid compiler-owned contract");
@@ -452,14 +434,8 @@ fn main() { nil }
 
     #[test]
     fn test_infer_module_capabilities_from_imports() {
-        let src = r#"
-            import stdlib::web::html
-            import @nulang/auth
-            import @nulang/postgres
-
-            fn main() {}
-        "#;
-        let caps = infer_module_capabilities(src);
+        let imports = vec!["@nulang/auth".to_string(), "@nulang/postgres".to_string()];
+        let caps = infer_module_capabilities(&imports);
         assert!(caps.contains(&"auth".to_string()));
         assert!(caps.contains(&"DB".to_string()));
         assert!(!caps.contains(&"payments".to_string()));
@@ -467,13 +443,8 @@ fn main() { nil }
 
     #[test]
     fn test_infer_module_cloud_config_from_imports() {
-        let src = r#"
-            import @nulang/auth
-            import @nulang/postgres
-
-            fn main() {}
-        "#;
-        let entries = infer_module_cloud_config(src);
+        let imports = vec!["@nulang/auth".to_string(), "@nulang/postgres".to_string()];
+        let entries = infer_module_cloud_config(&imports);
         let keys: Vec<String> = entries.iter().map(|e| e.key.clone()).collect();
         assert!(keys.contains(&"AUTH_COOKIE_SECRET".to_string()));
         assert!(keys.contains(&"DATABASE_URL".to_string()));
@@ -484,19 +455,12 @@ fn main() { nil }
 
     #[test]
     fn test_infer_middleware_adds_auth_when_imported() {
-        let src = r#"
-            import @nulang/auth
-            fn main() {}
-        "#;
-        let stack = infer_middleware(src);
+        let imports = vec!["@nulang/auth".to_string()];
+        let stack = infer_middleware(&imports);
         assert!(stack.contains(&"auth".to_string()));
         assert!(stack.contains(&"csrf".to_string()));
 
-        let src_no_auth = r#"
-            import stdlib::web::html
-            fn main() {}
-        "#;
-        let stack_no_auth = infer_middleware(src_no_auth);
+        let stack_no_auth = infer_middleware(&[]);
         assert!(!stack_no_auth.contains(&"auth".to_string()));
     }
 }
