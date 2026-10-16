@@ -166,6 +166,22 @@ fn compiled_source_effect_drives_recovery_using_one_stable_operation_id() {
     .expect("formatting preserves semantic site identity");
     assert_eq!(spec, formatted_spec);
     assert_eq!(spec.effect_operation, "Inference.ask");
+    let canonical_site = nulang::semantic_identity::effect_site_id(
+        "effect-site-artifact",
+        nulang::semantic_identity::EffectSiteOwnerKind::Behavior,
+        "Assistant.ask",
+        "Inference.ask",
+        0,
+    );
+    assert_eq!(
+        spec.id,
+        nulang::durable_effect::DurableEffectId::derive_from_site(
+            42,
+            "actor:42:turn:8",
+            canonical_site,
+            0,
+        )
+    );
 
     let request = b"order-42";
     let mut store = MemoryStore::new();
