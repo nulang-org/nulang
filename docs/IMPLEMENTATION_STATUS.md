@@ -89,6 +89,11 @@ The live runtime is sharded and cooperatively scheduled.
 Actors support links, monitors, supervision, process groups, priorities,
 selective receive, timed receive, and actor-local ORCA memory management.
 
+Experimental shard-local read-only `Runtime::actor_info` and bounded
+`actor_info_page` provide payload-free metadata snapshots for diagnostics.
+This does not implement remote Observer tooling or instruction-level preemption;
+see `docs/ACTOR_INSPECTION.md`.
+
 ## Durability and persistence
 
 Nulang exposes durable state, journaling, snapshots, workflow history, recovery,
