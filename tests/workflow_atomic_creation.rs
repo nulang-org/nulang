@@ -52,7 +52,10 @@ fn unsupported_atomic_store_rejects_workflow_creation_without_publishing_actor()
         .expect_err("workflow must not fall back to separate event and snapshot writes");
 
     assert_eq!(error.kind(), ErrorKind::Unsupported);
-    assert!(runtime.actors.is_empty(), "failed actor must not be published");
+    assert!(
+        runtime.actors.is_empty(),
+        "failed actor must not be published"
+    );
     assert!(
         std::fs::read_dir(&directory).unwrap().next().is_none(),
         "no partial durable actor files may survive a rejected atomic creation"
@@ -77,7 +80,11 @@ fn workflow_creation_recovers_from_single_committed_libsql_transition() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        runtime.persistence.load_snapshot(actor_id).unwrap().sequence,
+        runtime
+            .persistence
+            .load_snapshot(actor_id)
+            .unwrap()
+            .sequence,
         tail.sequence
     );
     assert_eq!(
