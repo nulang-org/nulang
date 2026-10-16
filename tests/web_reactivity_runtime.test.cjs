@@ -371,6 +371,7 @@ test('local scopes batch repeated writes and cleanup pending work', () => {
   const api = hydrate([]);
   const root = subtree([first]);
   const scope = api.mount(root, { localSignals: true });
+  const retained = scope.signal('count');
   api.batch(() => {
     scope.signal('count').set('Intermediate');
     scope.signal('count').set('Final');
@@ -385,6 +386,8 @@ test('local scopes batch repeated writes and cleanup pending work', () => {
   assert.equal(first.getAttribute('title'), 'Final');
   assert.deepEqual(first.calls, [['title', 'Final']]);
   assert.throws(() => scope.signal('count'), /disposed scope/);
+  assert.throws(() => retained.get(), /disposed scope/);
+  assert.throws(() => retained.set('Too late'), /disposed scope/);
   const remount = api.mount(root, { localSignals: true });
   assert.notEqual(remount, scope);
   assert.equal(remount.signal('count').get(), 'Final');
