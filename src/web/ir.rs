@@ -56,6 +56,9 @@ pub struct IrRoute {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BudgetsIr {
     pub initial_js_max_bytes: Option<usize>,
+    /// Optional budget on all emitted JavaScript (including lazy chunks).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_js_max_bytes: Option<usize>,
     pub lcp_seconds: Option<f64>,
 }
 
@@ -158,6 +161,7 @@ pub fn generate_deployment_ir(
 
     let budgets_ir = BudgetsIr {
         initial_js_max_bytes: budgets.initial_js_max_bytes(),
+        total_js_max_bytes: budgets.total_js_max_bytes(),
         lcp_seconds: budgets.lcp_seconds(),
     };
 
