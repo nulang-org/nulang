@@ -2532,12 +2532,13 @@ pub struct VM {
     pub handler_stack: Vec<HandlerFrame>,
     /// Step counter (for debugging / limits).
     step_count: usize,
-    /// Backend-neutral logical bytecode work counter.
+    /// Diagnostic bytecode work counter (exact for interpreted dispatches).
     ///
     /// The interpreter charges one unit per executed bytecode instruction.
-    /// JIT execution charges the static bytecode length of each compiled region
-    /// that actually runs. This is telemetry only for now; scheduler policy
-    /// must not depend on it until benchmark-derived budgets are established.
+    /// Native code uses static region lengths per entry, which are NOT exact
+    /// dynamic instruction counts: internal back-edges can undercount work,
+    /// and partial exits can overcount. Do not use this metric to preempt
+    /// actors or compare interpreter/JIT fairness without better metering.
     logical_reduction_count: u64,
     /// Set by try_jit_execute when a JIT safepoint triggers a yield.
     /// Consumed by run_from / resume to return early; reset at start of run_from.
@@ -2905,11 +2906,12 @@ impl VM {
         }
     }
 
-    /// Backend-neutral logical bytecode work executed by this VM.
+    /// Diagnostic count of interpreted instructions and approximate JIT work.
     ///
-    /// Unlike `step_count`, this counter intentionally accounts for JIT
-    /// regions in terms of their source bytecode length so interpreter/JIT
-    /// benchmark runs can compare one common work unit.
+    /// Exact for interpreted instructions. Compiled regions add their static
+    /// length once per native entry, not per dynamically executed loop
+    /// iteration. This can undercount internal loops and overcount short
+    /// branch exits. Not a backend-neutral scheduler fairness budget.
     pub fn logical_reduction_count(&self) -> u64 {
         self.logical_reduction_count
     }
@@ -8165,10 +8167,12 @@ mod vm_tests {
             .map(|j| j.compiled_count())
             .unwrap_or(0);
         assert!(compiled > 0, "loop body must have been JIT-compiled");
+        let exact = reference_vm.logical_reduction_count();
+        let observed = hot_vm.logical_reduction_count();
+        assert!(exact >= 11_000, "interpreter oracle should meter every dispatch");
         assert!(
-            hot_vm.logical_reduction_count() >= 11_000,
-            "JIT regions must contribute backend-neutral logical bytecode work; got {}",
-            hot_vm.logical_reduction_count()
+            observed >= 1_000 && observed <= exact,
+            "compiled-region work estimate ({observed}) must include warm-up              and not exceed the interpreter reference ({exact}) for this loop"
         );
     }
 
@@ -8779,10 +8783,12 @@ mod vm_tests {
             .map(|j| j.compiled_count())
             .unwrap_or(0);
         assert!(compiled > 0, "loop body must have been JIT-compiled");
+        let exact = reference_vm.logical_reduction_count();
+        let observed = vm.logical_reduction_count();
+        assert!(exact >= 11_000, "interpreter oracle should meter every dispatch");
         assert!(
-            vm.logical_reduction_count() >= 11_000,
-            "JIT regions must contribute backend-neutral logical bytecode work; got {}",
-            vm.logical_reduction_count()
+            observed >= 1_000 && observed <= exact,
+            "compiled-region work estimate ({observed}) must include warm-up              and not exceed the interpreter reference ({exact}) for this loop"
         );
     }
 
