@@ -313,4 +313,12 @@ pub enum PlanError {
         evaluation: u64,
         deployment: u64,
     },
+    TenantBudgetExceeded {
+        resource: &'static str,
+        requested: u64,
+        limit: u64,
+    },
+    TenantUsageOverflow {
+        resource: &'static str,
+    },
 }
