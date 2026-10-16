@@ -47,7 +47,7 @@ jobs:
           report = json.loads(Path("fabric-publish-ab.json").read_text())
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
               f.write("## Exact-base sparse Fabric A/B\n\n")
-              f.write(f"Base: \`{report['base_sha']}\` · Candidate: \`{report['candidate_sha']}\`\n\n")
+              f.write(f"Base: `{report['base_sha']}` · Candidate: `{report['candidate_sha']}`\n\n")
               f.write("| Idle actors | Base ns | Candidate ns | Paired speedup |\n")
               f.write("| ---: | ---: | ---: | ---: |\n")
               for count, row in report["comparison"].items():
