@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Actor interpreter fairness and scheduler-scoped continuations — 2026-10-16
+- **Transient actors can cooperatively yield interpreted bytecode and resume without new messages.** Per-dispatch instruction quanta preserve standalone VM run-to-completion and leave durable/workflow turns unchanged pending safe checkpoint semantics.
+- **Scheduler-only preemption preserves synchronous actor contracts.** Direct asks and mailbox flushes cannot expose a partial bytecode result; resumed actor dispatches retain non-blocking timed receive and async effect semantics.
+- **Deterministic scheduling runs yielded continuations to completion.** The seeded ready set includes runnable continuations even when mail is empty, but excludes actors waiting on external completion. Regression tests exercise these boundaries.
+
 ### Web static-root containment — 2026-10-15
 - **Experimental Web static file serving refuses parent traversal and symlinks escaping configured roots.** Canonical candidate paths must remain inside their canonicalized static or output root, and normal in-root files remain serveable.
 - **A filesystem regression verifies parent and symlink escape rejection.** This is a clean current-main successor to draft #1676; it does not change SSE or claim protection from malicious concurrent mutation of a trusted static root.

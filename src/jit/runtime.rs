@@ -600,6 +600,13 @@ pub fn clear_jit_safepoint_ptr() {
     JIT_SAFEPOINT_PTR.with(|cell| cell.set(std::ptr::null_mut()));
 }
 
+/// Install a nested actor's safepoint pointer, returning the previous scope.
+/// Direct synchronous calls install null, then restore the outer scheduler
+/// actor's pointer on return. All pointers are scoped to the owning thread.
+pub fn swap_jit_safepoint_ptr(ptr: *mut u64) -> *mut u64 {
+    JIT_SAFEPOINT_PTR.with(|cell| cell.replace(ptr))
+}
+
 /// Check and decrement the current thread's actor reduction budget.
 /// Returns 1 when the compiled region must yield, otherwise 0.
 #[no_mangle]
@@ -2117,6 +2124,26 @@ pub unsafe extern "C" fn nulang_aot_receive_pop() -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn nested_synchronous_safepoint_scope_preserves_outer_actor_budget() {
+        let mut outer_budget = 2u64;
+        let previous = super::swap_jit_safepoint_ptr(&mut outer_budget);
+        assert_eq!(super::nulang_jit_safepoint_check(0), 0);
+        assert_eq!(outer_budget, 1);
+
+        // An inner direct ask must not charge or yield the outer actor,
+        // yet returning from the ask must restore the outer scheduler budget.
+        let saved_outer = super::swap_jit_safepoint_ptr(std::ptr::null_mut());
+        assert_eq!(super::nulang_jit_safepoint_check(0), 0);
+        assert_eq!(outer_budget, 1);
+        let inner = super::swap_jit_safepoint_ptr(saved_outer);
+        assert!(inner.is_null());
+        assert_eq!(super::nulang_jit_safepoint_check(0), 1);
+        assert_eq!(outer_budget, 0);
+
+        super::swap_jit_safepoint_ptr(previous);
+    }
 
     #[test]
     fn test_jit_status_slots_are_thread_local() {
