@@ -239,6 +239,10 @@ curl -X POST -d 'msg=live' http://127.0.0.1:8080/sign   # in another → SSE cli
 
 The `examples/chat-web` package shows the full pattern: an SSE `<script>` in the page, a POST handler that stores and broadcasts, and a `redirect` back. Treat this layer as minimal — one broadcast op, one SSE transport, in-process delivery.
 
+**Development-server limits:** The in-process SSE implementation limits a process to 128 rooms, eight subscribers per room, eight queued messages per subscriber, 64 replay events and 64 KiB of replay per room, and 8 KiB per message. Slow consumers are disconnected. Subscription failures return HTTP 400 for invalid room names and HTTP 503 at capacity. Periodic SSE comment heartbeats detect abandoned connections. This is not durable, resumable delivery.
+
+**Security:** The built-in SSE endpoint is public and does not authenticate or authorize subscribers. It must not carry private, tenant, or account data until a separate authorization boundary is implemented. Room names are not access-control tokens.
+
 ## Deployment
 
 Two paths, depending on what your app does:

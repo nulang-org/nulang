@@ -1,4 +1,8 @@
 # Nulang Changelog
+
+### Bounded experimental SSE transport — 2026-10-15
+- **Limit in-process realtime replay, room count, subscriber count, message size, and per-subscriber queues.** Slow subscribers are disconnected instead of buffering indefinitely; keepalives let idle connections detect disconnects. This is an SSE-only clean successor to the overlapping, unmergeable #1509 draft; static-root containment remains in #1784.
+- **Do not treat the built-in SSE endpoint as an authenticated or durable transport.** Subscriptions are public; no tenant authorization, resume IDs, cross-node delivery, or production connection isolation is claimed. Focused regression coverage added for resource ceilings and heartbeat framing.
 ### Web static-root containment — 2026-10-15
 - **Experimental Web static file serving refuses parent traversal and symlinks escaping configured roots.** Canonical candidate paths must remain inside their canonicalized static or output root, and normal in-root files remain serveable.
 - **A filesystem regression verifies parent and symlink escape rejection.** This is a clean current-main successor to draft #1676; it does not change SSE or claim protection from malicious concurrent mutation of a trusted static root.
