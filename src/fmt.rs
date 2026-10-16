@@ -57,60 +57,75 @@ pub fn format_source(source: &str) -> Result<String, String> {
 
 /// Recursively format all `.nula` files under `dir`.
 ///
-/// When `check_only` is true files are never modified; an error is returned
-/// on the first file that *would* be reformatted instead.
+/// Preflight the whole directory tree before writing any source. Unsafe
+/// formatting, parse and read failures leave every file unchanged. Filesystem
+/// write failures in the subsequent write phase are not transactional.
 pub fn format_directory(dir: &Path, check_only: bool) -> NuResult<()> {
-    walk_format(dir, check_only)
+    let mut pending = Vec::new();
+    collect_formatted_files(dir, &mut pending)?;
+
+    if check_only {
+        if let Some((path, _)) = pending.first() {
+            return Err(NuError::parse_error(
+                format!("Would reformat {}", path.display()),
+                Span::default(),
+            ));
+        }
+        return Ok(());
+    }
+
+    for (path, formatted) in pending {
+        std::fs::write(&path, formatted.as_bytes()).map_err(|e| {
+            NuError::vm_error(
+                format!("Cannot write '{}': {}", path.display(), e),
+                Span::default(),
+            )
+        })?;
+        println!("Formatted {}", path.display());
+    }
+    Ok(())
 }
 
-fn walk_format(dir: &Path, check_only: bool) -> NuResult<()> {
+fn collect_formatted_files(
+    dir: &Path,
+    pending: &mut Vec<(std::path::PathBuf, String)>,
+) -> NuResult<()> {
     let entries = std::fs::read_dir(dir).map_err(|e| {
         NuError::vm_error(
             format!("Cannot read directory '{}': {}", dir.display(), e),
             Span::default(),
         )
     })?;
+    let mut paths = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|e| {
-            NuError::vm_error(
-                format!("Cannot read entry in '{}': {}", dir.display(), e),
-                Span::default(),
-            )
-        })?;
-        let path = entry.path();
+        paths.push(
+            entry
+                .map_err(|e| {
+                    NuError::vm_error(
+                        format!("Cannot read entry in '{}': {}", dir.display(), e),
+                        Span::default(),
+                    )
+                })?
+                .path(),
+        );
+    }
+    paths.sort();
+
+    for path in paths {
         if path.is_dir() {
-            walk_format(&path, check_only)?;
-        } else if path.extension().map_or(false, |ext| ext == "nula") {
+            collect_formatted_files(&path, pending)?;
+        } else if path.extension().is_some_and(|ext| ext == "nula") {
             let source = std::fs::read_to_string(&path).map_err(|e| {
                 NuError::vm_error(
                     format!("Cannot read '{}': {}", path.display(), e),
                     Span::default(),
                 )
             })?;
-            match format_source(&source) {
-                Ok(formatted) => {
-                    if formatted != source {
-                        if check_only {
-                            return Err(NuError::parse_error(
-                                format!("Would reformat {}", path.display()),
-                                Span::default(),
-                            ));
-                        }
-                        std::fs::write(&path, formatted.as_bytes()).map_err(|e| {
-                            NuError::vm_error(
-                                format!("Cannot write '{}': {}", path.display(), e),
-                                Span::default(),
-                            )
-                        })?;
-                        println!("Formatted {}", path.display());
-                    }
-                }
-                Err(e) => {
-                    return Err(NuError::parse_error(
-                        format!("{}: {}", path.display(), e),
-                        Span::default(),
-                    ));
-                }
+            let formatted = format_source(&source).map_err(|e| {
+                NuError::parse_error(format!("{}: {}", path.display(), e), Span::default())
+            })?;
+            if formatted != source {
+                pending.push((path, formatted));
             }
         }
     }
