@@ -1,0 +1,4 @@
+[package]
+name = "nula-build-smoke"
+version = "0.1.0"
+entry = "src/main.nula"
