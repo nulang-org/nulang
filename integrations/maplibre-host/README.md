@@ -40,3 +40,46 @@ The page must include the Nulang client runtime and contain a hydrated `showSite
 - This is a limited browser integration seam, not a Nulang-native map component or a typed GIS database layer.
 
 Test: `node --test integrations/maplibre-host/test/*.test.mjs` (Node.js 22+).
+
+## Viewport-scoped GeoJSON (stacked follow-up)
+
+Use the optional `./viewport.mjs` observer with a **dedicated GeoJSON source**.
+Create the empty source and layer before attaching it, so the layer is visible
+even before the first request resolves.
+
+```js
+import { observeViewportGeoJson } from './viewport.mjs';
+
+host.dispatch({type:'source.upsert', id:'sites', source:{
+  type:'geojson', data:{type:'FeatureCollection',features:[]}
+}});
+host.dispatch({type:'layer.add', layer:{id:'pins', source:'sites', type:'circle'}});
+
+const stop = observeViewportGeoJson({
+  host, sourceId:'sites', debounceMs:120, maxFeatures:5000,
+  fetchFeatures:async ({bbox, zoom, signal}) => {
+    const params = new URLSearchParams({bbox:bbox.join(','),zoom:String(zoom)});
+    const res = await fetch('/api/sites?' + params, {signal, credentials:'same-origin'});
+    if (!res.ok) throw new Error('Geospatial query failed: ' + res.status);
+    return res.json();
+  },
+  onError:error => console.error('Map query',error),
+});
+// Revalidate after record edits: stop.refresh();
+// On unmount: stop(); host.destroy();
+```
+
+The observer reads `host.viewport()` and issues requests only on settled
+`moveend` events (not during animation frames). It cancels old requests
+immediately, ignores late responses, avoids repeating identical viewports,
+validates the FeatureCollection envelope and limits feature counts. The bbox
+is `[west,south,east,north]` in longitude/latitude; it may cross the
+antimeridian or contain unwrapped longitude values. **The server must validate
+and normalize bounds, enforce tenant/row authorization and query limits**, and
+choose an appropriate GeoJSON response size. This adapter does not implement
+pagination, caching or a spatial index; use MVT for dense layers.
+
+Run focused tests with
+`node --test integrations/maplibre-host/test/*.test.mjs`.
+The separate MapLibre browser-smoke CI workflow installs pinned MapLibre and
+Playwright versions; a docs preview alone does not verify WebGL rendering.
