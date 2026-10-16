@@ -200,12 +200,15 @@ impl<T, E> TaskScope<T, E> {
     /// Consume terminal results in deterministic submission order.
     ///
     /// Call after `is_quiescent`. This consumes the scope even on error.
-    pub fn into_outcomes(self) -> Result<Vec<TaskOutcome<T, E>>, ScopeError> {
+    pub fn into_outcomes(mut self) -> Result<Vec<TaskOutcome<T, E>>, ScopeError> {
         if !self.is_quiescent() {
+            // Consuming an unfinished scope drops it and signals every
+            // outstanding child's cancellation token.
             return Err(ScopeError::NotQuiescent);
         }
-        Ok(self
-            .slots
+        // TaskScope implements Drop. Take terminal slots instead of moving a
+        // field out of a Drop type; the finished scope then drops normally.
+        Ok(std::mem::take(&mut self.slots)
             .into_iter()
             .map(|slot| match slot {
                 TaskSlot::Terminal(outcome) => outcome,
@@ -219,6 +222,20 @@ impl<T, E> TaskScope<T, E> {
             None => Err(ScopeError::UnknownTask(id)),
             Some(TaskSlot::Running) => Ok(()),
             Some(_) => Err(ScopeError::NotRunning(id)),
+        }
+    }
+}
+
+/// Abandoning a non-quiescent lexical scope must signal its children.
+///
+/// This is cooperative notification, not proof that child execution stopped:
+/// an executor must retain ownership, request interruption at safe points,
+/// and join/acknowledge running children before enforcing structured lifetime
+/// guarantees. No blocking work may be performed from Drop.
+impl<T, E> Drop for TaskScope<T, E> {
+    fn drop(&mut self) {
+        if !self.is_quiescent() {
+            self.token.cancelled.store(true, Ordering::Release);
         }
     }
 }
@@ -424,6 +441,60 @@ mod tests {
         first.cancel(CancellationCause::Parent);
         assert!(first_token.is_cancelled());
         assert!(!second_token.is_cancelled());
+    }
+
+    #[test]
+    fn dropping_an_unfinished_scope_signals_running_and_queued_children() {
+        let mut scope = TaskScope::<(), ()>::new(1, 2).unwrap();
+        let running = scope.try_submit().unwrap();
+        let _queued = scope.try_submit().unwrap();
+        assert_eq!(scope.admit_next(), Some(running));
+        let token = scope.cancellation_token();
+        assert!(!token.is_cancelled());
+
+        drop(scope);
+
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn dropping_a_quiescent_scope_does_not_spuriously_cancel_children() {
+        let mut scope = TaskScope::<(), ()>::new(1, 1).unwrap();
+        let running = scope.try_submit().unwrap();
+        assert_eq!(scope.admit_next(), Some(running));
+        scope.complete(running, Ok(())).unwrap();
+        assert!(scope.is_quiescent());
+        let token = scope.cancellation_token();
+
+        drop(scope);
+
+        assert!(!token.is_cancelled());
+    }
+
+    #[test]
+    fn premature_outcome_collection_cancels_the_abandoned_scope() {
+        let mut scope = TaskScope::<(), ()>::new(1, 1).unwrap();
+        let running = scope.try_submit().unwrap();
+        assert_eq!(scope.admit_next(), Some(running));
+        let token = scope.cancellation_token();
+
+        assert_eq!(scope.into_outcomes(), Err(ScopeError::NotQuiescent));
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn successful_outcome_collection_keeps_cancellation_signal_clear() {
+        let mut scope = TaskScope::<usize, ()>::new(1, 1).unwrap();
+        let running = scope.try_submit().unwrap();
+        assert_eq!(scope.admit_next(), Some(running));
+        scope.complete(running, Ok(42)).unwrap();
+        let token = scope.cancellation_token();
+
+        assert_eq!(
+            scope.into_outcomes().unwrap(),
+            vec![TaskOutcome::Completed(Ok(42))]
+        );
+        assert!(!token.is_cancelled());
     }
 
     #[test]
