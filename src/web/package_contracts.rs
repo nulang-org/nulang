@@ -70,7 +70,8 @@ pub fn compile_modules_contracts(modules: &[AstModule]) -> ContractCompilation {
     // diagnostic. Otherwise runtime dispatch and generated OpenAPI can silently
     // disagree about which endpoint owns the route.
     for pair in compiled.routes.windows(2) {
-        let [first, second] = pair else { continue };
+        let first = &pair[0];
+        let second = &pair[1];
         if first.method == second.method && first.path == second.path && first != second {
             compiled.diagnostics.push(format!(
                 "{} {}: conflicting route declarations for handlers '{}' and '{}'",
