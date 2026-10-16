@@ -2,26 +2,29 @@
 const steps = [
 	{
 		step: '01',
-		title: 'Clone',
-		description: 'Get the compiler and runtime source.',
-		command: 'git clone https://github.com/nulang-org/nulang',
+		title: 'Try online',
+		description: 'Run Nulang Core in your browser, no toolchain required.',
+		command: 'nulang.org/playground/',
+		href: '/playground/',
 	},
 	{
 		step: '02',
-		title: 'Build',
-		description: 'Compile the release binary.',
-		command: 'cargo build --release',
+		title: 'Install locally',
+		description: 'Download a checksummed binary for your platform.',
+		command: 'Install a tagged release',
+		href: '/getting-started/installation/',
 	},
 	{
 		step: '03',
-		title: 'Run',
-		description: 'Start the REPL or execute a .nula file.',
-		command: 'cargo run -- --repl',
+		title: 'Run your code',
+		description: 'Use the installed compiler for the full native runtime.',
+		command: 'nulang --repl',
+		href: '/getting-started/quick-start/',
 	},
 ];
 ---
 
-<div class="steps-flow" aria-label="Install Nulang in three steps">
+<div class="steps-flow" aria-label="Three ways to begin using Nulang">
 	{steps.map((step) => (
 		<div class="step">
 			<div class="step-index">{step.step}</div>
@@ -30,7 +33,7 @@ const steps = [
 					<strong>{step.title}</strong>
 					<span>{step.description}</span>
 				</div>
-				<code>{step.command}</code>
+				<a class="step-command" href={step.href}>{step.command}</a>
 			</div>
 		</div>
 	))}
@@ -82,7 +85,7 @@ const steps = [
 		line-height: 1.45;
 	}
 
-	.step code {
+	.step-command {
 		display: block;
 		margin-top: 0.75rem;
 		overflow-x: auto;
@@ -92,6 +95,8 @@ const steps = [
 		font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 		font-size: 0.72rem;
 		white-space: nowrap;
+		text-decoration: underline;
+		text-underline-offset: 3px;
 	}
 
 	@media (max-width: 48rem) {

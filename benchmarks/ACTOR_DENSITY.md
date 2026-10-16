@@ -1,10 +1,11 @@
 # Actor Density Measurement
 
-This track measures the runtime property that remains weak in the current
-Criterion snapshot: actor creation and residency. It is measurement-only
-infrastructure and changes no runtime semantics. It is deliberately separate
-from the default `cargo bench` job because 100k-1M actor measurements require
-a fixed, otherwise-idle host and are not useful when repeated on shared CI.
+This track measures actor creation and residency, a runtime property that is
+not well represented by the default Criterion suite alone. It is
+measurement-only infrastructure and changes no runtime semantics. It is
+deliberately separate from the default `cargo bench` job because 100k-1M actor
+measurements require a fixed, otherwise-idle host and are not useful when
+repeated on shared CI.
 
 ## Current state
 
@@ -17,9 +18,13 @@ Current `main` already avoids the two largest historical eager allocations:
 Do not infer committed heap bytes from `ActorHeap::free_bytes()`: before the
 first allocation it describes configured capacity, not resident memory.
 
-The current rolling Criterion snapshot reports roughly 35.8 ms for
-`actor/spawn_idle/1000`, so the next question is which remaining component
-dominates creation and residency.
+Do not copy a shared-runner `actor/spawn_idle/1000` number into this document as
+if it were a stable current value. The rolling Criterion snapshots under the
+`automation/benchmark-history` branch are drift/regression signals and can move
+materially with shared-runner CPU/cache contention. For optimization decisions,
+use the exact-base same-host actor-density A/B harness below. For publishable
+100k-1M density claims, use the controlled density ladder and record the host
+metadata with the result.
 
 ## Nulang probe
 
