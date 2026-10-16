@@ -2850,6 +2850,58 @@ mod tests {
     #[cfg(feature = "tcp")]
     use std::thread::sleep;
 
+    /// A stale writer failure must never evict a replacement connection.
+    /// This covers the sender-thread gap between writing under the pool lock
+    /// and retiring the failed socket after reacquiring that lock.
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn failed_sender_generation_preserves_replacement_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let dialled = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_accepted, remote_addr) = listener.accept().unwrap();
+        let node_id = NodeId(9_001);
+        let stale_generation = next_connection_generation();
+        let replacement_generation = next_connection_generation();
+        let mut connections = HashMap::new();
+        connections.insert(
+            node_id,
+            TcpConnection {
+                node_id,
+                generation: replacement_generation,
+                addr: remote_addr,
+                stream: TransportStream::Raw(dialled),
+                last_activity: Instant::now(),
+            },
+        );
+
+        assert!(
+            retire_failed_sender_generation(
+                &mut connections,
+                node_id,
+                Some(stale_generation),
+            )
+            .is_none(),
+            "failed write on stale connection must not remove replacement"
+        );
+        assert_eq!(
+            connections.get(&node_id).map(|conn| conn.generation),
+            Some(replacement_generation)
+        );
+        assert!(
+            retire_failed_sender_generation(&mut connections, node_id, None).is_none(),
+            "missing connection during a failed send must not evict a new one"
+        );
+        assert_eq!(connections.len(), 1);
+        let retired = retire_failed_sender_generation(
+            &mut connections,
+            node_id,
+            Some(replacement_generation),
+        )
+        .expect("only the matching failed generation may be retired");
+        assert_eq!(retired.generation, replacement_generation);
+        assert!(connections.is_empty());
+    }
+
     // ------------------------------------------------------------------
     // 1. NodeId hashing
     // ------------------------------------------------------------------
