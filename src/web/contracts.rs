@@ -73,6 +73,11 @@ pub struct RouteContract {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContractCompilation {
     pub routes: Vec<RouteContract>,
+    /// First-party module imports observed in the parsed package AST.
+    /// Only package-wide extraction populates these facts; deployment IR
+    /// consumers must not rediscover them by scanning source text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub module_imports: Vec<String>,
     /// Best-effort source discovery must not make deployment IR generation
     /// panic. Parse and contract-validation failures are retained here so build
     /// tooling can surface them and can become hard errors once the contract

@@ -98,6 +98,7 @@ mod tests {
         let compilation = ContractCompilation {
             routes: vec![contract("/users/{id: UserId}", Vec::new())],
             diagnostics: vec!["malformed route fixture".to_string()],
+            module_imports: Vec::new(),
         };
 
         let diagnostics = validation_diagnostics(&compilation);
@@ -115,6 +116,7 @@ mod tests {
         let compilation = ContractCompilation {
             routes: vec![contract("/users/:id", Vec::new())],
             diagnostics: Vec::new(),
+            module_imports: Vec::new(),
         };
         assert!(validation_diagnostics(&compilation).is_empty());
     }
@@ -132,6 +134,7 @@ mod tests {
                 }],
             )],
             diagnostics: Vec::new(),
+            module_imports: Vec::new(),
         };
         assert!(validation_diagnostics(&compilation).is_empty());
     }
@@ -145,6 +148,7 @@ mod tests {
                 "a diagnostic".to_string(),
                 "z diagnostic".to_string(),
             ],
+            module_imports: Vec::new(),
         };
         assert_eq!(
             validation_diagnostics(&compilation),
@@ -165,6 +169,7 @@ mod tests {
                 }],
             )],
             diagnostics: Vec::new(),
+            module_imports: Vec::new(),
         };
 
         let validated = validate_compilation(compilation.clone()).unwrap();
@@ -176,6 +181,7 @@ mod tests {
         let compilation = ContractCompilation {
             routes: vec![contract("/users/{id: UserId}", Vec::new())],
             diagnostics: Vec::new(),
+            module_imports: Vec::new(),
         };
 
         let diagnostics = validate_compilation(compilation).unwrap_err();
