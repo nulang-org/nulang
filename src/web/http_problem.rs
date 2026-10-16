@@ -118,8 +118,9 @@ mod tests {
         assert_eq!(problem["code"], "ambiguous_request_input");
         assert_eq!(problem["source"], "header");
         assert_eq!(problem["source_name"], "X-Org");
-        assert!(!response.body.windows(8).any(|window| window == b"tenant-a"));
-        assert!(!response.body.windows(8).any(|window| window == b"tenant-b"));
+        let serialized = String::from_utf8_lossy(&response.body);
+        assert!(!serialized.contains("tenant-a"));
+        assert!(!serialized.contains("tenant-b"));
     }
 
     #[test]
