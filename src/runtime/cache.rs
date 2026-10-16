@@ -788,6 +788,32 @@ mod tests {
     }
 
     #[test]
+    fn overdue_expirations_deferred_by_sweep_budget_are_reaped_next_tick() {
+        let mut store = CacheStore::new();
+        store.set_integer(b"first", 1, Some(5), 100);
+        store.set_integer(b"second", 2, Some(5), 100);
+
+        // Both deadlines land in tick 10, but only one can be reclaimed.
+        assert_eq!(store.purge_expired(110, 1), 1);
+        assert_eq!(store.len(), 1);
+
+        // A deferred item must not be lost until the wheel wraps back to tick 10.
+        assert_eq!(store.purge_expired(120, 1), 1);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn zero_budget_does_not_strand_overdue_expirations() {
+        let mut store = CacheStore::new();
+        store.set_integer(b"key", 1, Some(5), 100);
+
+        assert_eq!(store.purge_expired(110, 0), 0);
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.purge_expired(120, 1), 1);
+        assert!(store.is_empty());
+    }
+
+    #[test]
     fn sub_tick_expiry_is_reaped_after_tick_advance() {
         let mut store = CacheStore::new();
         store.set_integer(b"short", 1, Some(5), 100);
