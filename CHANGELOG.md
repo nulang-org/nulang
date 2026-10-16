@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Installed CLI package workflow without Rust toolchain — 2026-10-16
+- **Prebuilt `nulang` executables now resolve themselves before attempting Cargo metadata.** Creating, building, running, and testing a package no longer depends on Rust/Cargo being installed when the normal CLI binary is available.
+- **An integration test exercises the package workflow with an empty external-tool `PATH`.** It removes `CARGO_BIN_EXE_nulang` and checks that build emits bytecode, run executes the entry point, and package tests complete.
+
 ### Web static-root containment — 2026-10-15
 - **Experimental Web static file serving refuses parent traversal and symlinks escaping configured roots.** Canonical candidate paths must remain inside their canonicalized static or output root, and normal in-root files remain serveable.
 - **A filesystem regression verifies parent and symlink escape rejection.** This is a clean current-main successor to draft #1676; it does not change SSE or claim protection from malicious concurrent mutation of a trusted static root.
