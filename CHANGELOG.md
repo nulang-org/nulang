@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Static Web conditional GET — 2026-10-16
+- **Static Web assets emit content-derived strong BLAKE3 ETags and `Cache-Control: no-cache`.** Matching `If-None-Match` validators (including weak validators, validator lists, and `*`) receive an empty `304 Not Modified` response for GET requests only.
+- **No runtime asset cache or new dependency.** Files are still safely resolved and read under the existing root-containment rules and hashed on each request; this reduces repeat response bytes, not disk reads or hashing work. Dynamic routes, mutations, and SSE remain unchanged.
+- **Real-TCP regressions cover fresh loads, revalidation, changes with unchanged file length, nonmatching validators, missing assets, and methods other than GET.** Exact-head Rust/CI validation remains required before promotion.
+
 ### Web static-root containment — 2026-10-15
 - **Experimental Web static file serving refuses parent traversal and symlinks escaping configured roots.** Canonical candidate paths must remain inside their canonicalized static or output root, and normal in-root files remain serveable.
 - **A filesystem regression verifies parent and symlink escape rejection.** This is a clean current-main successor to draft #1676; it does not change SSE or claim protection from malicious concurrent mutation of a trusted static root.
