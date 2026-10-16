@@ -48,6 +48,9 @@ jobs:
       - name: Smoke test browser playground
         run: node playground/web/test/smoke.mjs
 
+      - name: Test generated Web client signal hydration
+        run: node scripts/tests/web_signal_name_safety.mjs
+
       - name: Install docs dependencies
         run: |
           cd docs
