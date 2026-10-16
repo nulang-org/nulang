@@ -277,7 +277,10 @@ impl CodeModule {
         let meta_end = meta_off
             .checked_add(meta_len)
             .ok_or_else(|| FormatError::BodyDecode("metadata body length overflow".into()))?;
-        if bytes.len() < meta_end {
+        // The v1 artifact contains exactly one metadata body. Reject both
+        // truncation and trailing bytes so noncanonical byte sequences cannot
+        // alias the same decoded module.
+        if bytes.len() != meta_end {
             return Err(FormatError::LengthMismatch {
                 declared: meta_len as u32,
                 actual: bytes.len() - meta_off,
