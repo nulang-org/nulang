@@ -2881,7 +2881,7 @@ mod tests {
     /// and retiring the failed socket after reacquiring that lock.
     #[cfg(feature = "tcp")]
     #[test]
-    fn failed_sender_generation_preserves_replacement_connection() {
+    fn test_failed_sender_generation_preserves_replacement_connection() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let dialled = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (_accepted, remote_addr) = listener.accept().unwrap();
