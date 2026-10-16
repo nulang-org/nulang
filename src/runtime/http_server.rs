@@ -1112,10 +1112,8 @@ fn successful_route_response(route: &RuntimeWebRoute, rendered: String) -> HttpR
             // Json[T] is currently a serialized String marker, not a VM value
             // codec. Validate the wire body before advertising application/json.
             // A malformed body is a server invariant failure, not a client 4xx.
-            if matches!(
-                contract.kind,
-                crate::web::response::ResponseBodyKind::Json
-            ) && serde_json::from_str::<serde_json::Value>(&rendered).is_err()
+            if contract.kind == crate::web::response::ResponseBodyKind::Json
+                && serde_json::from_str::<serde_json::Value>(&rendered).is_err()
             {
                 return HttpResponse {
                     status: 500,
