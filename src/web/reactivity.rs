@@ -987,6 +987,15 @@ pub fn generate_client_runtime() -> String {
     const scope = root || document;
     const changed = new Set();
 
+    // SSR emits only the active branch. Its marker is enough to seed the
+    // Boolean signal; no alternate branch is serialized or run in the client.
+    within(scope, '[data-nulang-if]').forEach(function (el) {
+      const name = el.getAttribute('data-nulang-if');
+      const branch = el.getAttribute('data-nulang-branch');
+      if (!name || (branch !== 'then' && branch !== 'else')) return;
+      if (!(name in signals)) signals[name] = branch === 'then';
+    });
+
     within(scope, '[data-signal]').forEach(function (el) {
       if (mountedSignals.has(el)) return;
       const name = el.dataset.signal;
@@ -1112,10 +1121,34 @@ pub fn generate_client_runtime() -> String {
     return next;
   }
 
+  // This is an explicit branch-activation contract for future compiled
+  // renderers. A caller supplies an already-created detached branch; this
+  // code never evaluates hidden Nulang server effects or parses HTML strings.
+  function replaceConditional(current, next) {
+    const name = current && current.getAttribute && current.getAttribute('data-nulang-if');
+    const active = current && current.getAttribute && current.getAttribute('data-nulang-branch');
+    const otherName = next && next.getAttribute && next.getAttribute('data-nulang-if');
+    const branch = next && next.getAttribute && next.getAttribute('data-nulang-branch');
+    if (!name || name !== otherName) {
+      throw new TypeError('nulang: conditional regions must share a signal identity');
+    }
+    if ((active !== 'then' && active !== 'else')
+        || (branch !== 'then' && branch !== 'else') || active === branch) {
+      throw new TypeError('nulang: replacement requires an alternate conditional branch');
+    }
+    // replaceRegion guarantees the DOM and bindings are restored if the
+    // mutation fails. Publish the new signal state only after success.
+    const installed = replaceRegion(current, next);
+    signals[name] = branch === 'then';
+    refreshSignal(name);
+    return installed;
+  }
+
   window.nulang = {
     hydrate: hydrate,
     dispose: dispose,
     replaceRegion: replaceRegion,
+    replaceConditional: replaceConditional,
     signal: function (name) {
       return {
         get: function () { return signals[name]; },
