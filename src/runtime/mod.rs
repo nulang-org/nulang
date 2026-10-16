@@ -5569,6 +5569,34 @@ impl Runtime {
     /// Walks backwards through completed steps and executes each compensation
     /// expression in reverse order, skipping steps already marked compensated.
     fn run_saga_compensation(&mut self, actor_id: u64, _failed_behavior_idx: usize) {
+        // A prior compensation may already have reached an external system.
+        // No later work in this saga may run across that unresolved boundary.
+        if self
+            .saga_compensation_recovery(actor_id)
+            .iter()
+            .any(|item| item.status == SagaCompensationRecoveryStatus::OutcomeUnknown)
+        {
+            tracing::error!(
+                actor_id,
+                "nulang-workflow: refusing saga redispatch while an earlier compensation outcome is unknown"
+            );
+            return;
+        }
+        // A recovered workflow without its verified bytecode module has no
+        // safe compensation executable. The old fallback returned Ok(nil)
+        // and could incorrectly record the absent body as compensated.
+        if !self
+            .actors
+            .get(&actor_id)
+            .is_some_and(|actor| actor.bytecode_module.is_some())
+        {
+            tracing::error!(
+                actor_id,
+                "nulang-workflow: refusing compensation without restored bytecode metadata"
+            );
+            return;
+        }
+
         let step_index = self
             .actors
             .get(&actor_id)
