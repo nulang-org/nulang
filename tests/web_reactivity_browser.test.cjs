@@ -107,6 +107,24 @@ function browserChecks() {
   api.signal('__proto__').set('Updated');
   assert(special.title === 'Updated', 'prototype-safe key');
   assert(link.href === 'https://example.test/unchanged', 'unsafe URL mutated');
+  // A newly inserted view must own only its own bindings, and disposed
+  // bindings must never receive later signal writes, including batch flushes.
+  const dynamic = document.createElement('div');
+  dynamic.innerHTML = '<button id="dynamic" title="Stale" data-nulang-bind-title="status">Dynamic</button>';
+  document.body.appendChild(dynamic);
+  const scope = api.mount(dynamic);
+  const dynamicButton = document.getElementById('dynamic');
+  assert(dynamicButton.title === 'Recovered', 'new mount did not synchronize');
+  api.signal('status').set('Mounted');
+  assert(dynamicButton.title === 'Mounted', 'new binding did not update');
+  api.batch(() => {
+    api.signal('status').set('Disposed');
+    scope.dispose();
+  });
+  assert(dynamicButton.title === 'Mounted', 'disposed binding received pending write');
+  api.mount(dynamic);
+  assert(dynamicButton.title === 'Disposed', 'remount did not synchronize');
+  dynamic.remove();
   return true;
 }
 
