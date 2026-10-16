@@ -28,8 +28,10 @@ fn card() -> Html {
 Only the evaluated SSR branch appears in the HTML. The compiler **does not**
 render the inactive branch, move hidden/server effects to the browser, or
 inject a wrapper that could break table/select/other HTML contexts. An
-unrecognized branch root, missing alternative, non-signal guard, or conflicting
-user-supplied reserved attribute leaves the condition unchanged.
+unrecognized branch root, missing alternative, non-signal guard, locally
+shadowed signal name (including function parameters, local bindings, patterns
+and handler parameters), or conflicting user-supplied reserved attribute leaves
+the condition unchanged.
 
 The static HTML injector loads `/app.client.js` for documents with this
 conditional metadata, even when they have no ordinary text bindings.
