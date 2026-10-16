@@ -531,6 +531,42 @@ mod tests {
     }
 
     #[test]
+    fn rejects_duplicate_slots_before_missing_path_input() {
+        let bindings = vec![
+            binding("id", 0, Some("Int")),
+            binding("other", 0, Some("String")),
+        ];
+        let error = bind_path_arguments(&bindings, 1, &HashMap::new()).unwrap_err();
+        assert!(error.contains("multiple route bindings target handler slot 0"));
+    }
+
+    #[test]
+    fn rejects_incomplete_plan_before_missing_path_input() {
+        let bindings = vec![binding("id", 0, Some("Int"))];
+        let error = bind_path_arguments(&bindings, 2, &HashMap::new()).unwrap_err();
+        assert!(error.contains("handler parameter slot 1 has no request binding"));
+    }
+
+    #[test]
+    fn rejects_invalid_slot_before_missing_path_input() {
+        let bindings = vec![binding("id", 3, Some("Int"))];
+        let error = bind_path_arguments(&bindings, 1, &HashMap::new()).unwrap_err();
+        assert!(error.contains("targets handler slot 3"));
+    }
+
+    #[test]
+    fn rejects_non_path_binding_before_missing_path_input() {
+        let mut wrong_source = binding("id", 0, Some("Int"));
+        wrong_source.source = RouteBindingSource::Query;
+        let bindings = vec![
+            binding("missing", 0, Some("Int")),
+            wrong_source,
+        ];
+        let error = bind_path_arguments(&bindings, 2, &HashMap::new()).unwrap_err();
+        assert!(error.contains("unsupported route binding source"));
+    }
+
+    #[test]
     fn rejects_missing_captured_path_values() {
         let bindings = vec![binding("id", 0, Some("String"))];
         let error = bind_path_arguments(&bindings, 1, &HashMap::new()).unwrap_err();
