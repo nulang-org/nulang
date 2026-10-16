@@ -189,6 +189,24 @@ mod tests {
     }
 
     #[test]
+    fn total_js_budget_counts_root_level_published_scripts() {
+        let dir = std::env::temp_dir().join("nulang_budget_total_root_scripts");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("app.client.js"), "x".repeat(20)).unwrap();
+        std::fs::write(dir.join("analytics.js"), "x".repeat(30)).unwrap();
+
+        assert_eq!(
+            check_total_js_budget(&dir, Some(40))
+                .unwrap()
+                .expect("root-level published script must count")
+                .size,
+            50
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn total_js_budget_counts_nested_modules_but_not_stylesheets() {
         let dir = std::env::temp_dir().join("nulang_budget_total_nested");
         let _ = std::fs::remove_dir_all(&dir);
