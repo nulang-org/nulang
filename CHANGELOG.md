@@ -1,4 +1,8 @@
 # Nulang Changelog
+
+### Bounded experimental SSE transport — 2026-10-15
+- **Limit in-process realtime replay, room count, subscriber count, message size, and per-subscriber queues.** Slow subscribers are disconnected instead of buffering indefinitely; keepalives let idle connections detect disconnects. This is an SSE-only clean successor to the overlapping, unmergeable #1509 draft; static-root containment remains in #1784.
+- **Do not treat the built-in SSE endpoint as an authenticated or durable transport.** Subscriptions are public; no tenant authorization, resume IDs, cross-node delivery, or production connection isolation is claimed. Focused regression coverage added for resource ceilings and heartbeat framing.
 ### Experimental Web HTML host hardening — 2026-10-15
 - **`Web.html` now validates dynamic element and attribute names and URL-bearing attributes before rendering.** Unsafe markup and scriptable URL schemes fail closed; quoted attribute delimiters are escaped while already escaped `Html` text is preserved.
 - **Six focused regression tests cover normal markup, attribute breakouts, event attributes, high-risk elements, obfuscated URLs, and safe relative/HTTP links.** `Web.raw` remains a trusted-only escape hatch; dynamic script/style/SVG and inline style/event attributes are intentionally rejected pending a future typed context-aware API.
