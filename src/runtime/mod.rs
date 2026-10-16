@@ -5303,20 +5303,24 @@ impl Runtime {
 
             (*self_ptr).vm_exec_begin();
 
+            // A native safepoint yield is a scheduler handoff, not a legal
+            // return from synchronous asks or mailbox flushing. Save the
+            // prior thread-local pointer so a nested synchronous ask cannot
+            // silently disable the outer actor's remaining JIT preemption.
             #[cfg(feature = "native-codegen")]
-            {
-                // Safepoint yields are scheduler handoffs. A direct synchronous
-                // ask (or mailbox flush) must run to completion even if its
-                // hot loop tiers up into native code and crosses the budget.
-                if (*self_ptr).suspend_enabled {
+            let previous_jit_safepoint_ptr = {
+                let ptr = if (*self_ptr).suspend_enabled {
                     if let Some(actor) = self.actors.get_mut(&actor_id) {
                         actor.jit_safepoint_counter = crate::backends::JIT_SAFEPOINT_BUDGET;
-                        crate::jit::runtime::set_jit_safepoint_ptr(&mut actor.jit_safepoint_counter);
+                        &mut actor.jit_safepoint_counter as *mut u64
+                    } else {
+                        std::ptr::null_mut()
                     }
                 } else {
-                    crate::jit::runtime::clear_jit_safepoint_ptr();
-                }
-            }
+                    std::ptr::null_mut()
+                };
+                crate::jit::runtime::swap_jit_safepoint_ptr(ptr)
+            };
 
             // Bound interpreted actor work between scheduler turns. JIT
             // regions also honor their existing independent safepoint budget.
@@ -5352,7 +5356,7 @@ impl Runtime {
                     }
                 }
                 #[cfg(feature = "native-codegen")]
-                crate::jit::runtime::clear_jit_safepoint_ptr();
+                let _ = crate::jit::runtime::swap_jit_safepoint_ptr(previous_jit_safepoint_ptr);
                 (*self_ptr).vm_exec_end();
                 return Ok(Value::nil());
             }
@@ -5383,9 +5387,9 @@ impl Runtime {
             // the shared VM, which would clobber the frames an un-captured
             // suspend still needs. Runs on every path, so wakes of other
             // actors are not lost when THIS actor suspends.
-            (*self_ptr).vm_exec_end();
             #[cfg(feature = "native-codegen")]
-            crate::jit::runtime::clear_jit_safepoint_ptr();
+            let _ = crate::jit::runtime::swap_jit_safepoint_ptr(previous_jit_safepoint_ptr);
+            (*self_ptr).vm_exec_end();
             // String-id values index into this runtime VM's constant pool. When
             // the result is returned to a different VM (e.g. the top-level VM
             // that invoked `ask`), the id is meaningless there. Convert string
