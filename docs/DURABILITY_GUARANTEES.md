@@ -50,6 +50,37 @@ ambiguous external effect, and non-workflow event-source writes have
 separate correctness surfaces. These require their own fault-injection and
 restart tests. This draft does not claim end-to-end exactly-once behavior.
 
+## Saga compensation crash boundaries (draft)
+
+Compensation must not be treated as a normal replayable workflow step.
+Before executing a compensation body, the runtime records
+`SagaCompensationStarted` through an atomic, fenced transition. After the
+body succeeds, a separate `SagaCompensated` transition records completion.
+
+The `Runtime::saga_compensation_recovery(actor_id)` inspection API reads the
+full durable workflow journal and reports, in reverse completed-step order:
+
+| State | Durable evidence | Safe response |
+|---|---|---|
+| `NotStarted` | No start or completion record | Eligible for explicit, controlled dispatch |
+| `OutcomeUnknown` | Started but no later completed receipt | Block automatic retry; reconcile with external system |
+| `Completed` | Terminal compensation receipt committed | Do not execute again |
+
+A crash after start-intent commit and before the external call can produce the
+same durable state as a crash after the external call and before receipt.
+Therefore `OutcomeUnknown` is intentionally conservative. Recovery exposes
+the work for operator reconciliation but does **not** automatically redispatch
+it. Nor does it claim exactly-once external mutations. Durable effect IDs,
+provider idempotency and a receipt/reconciliation API are needed for safe
+automatic retries.
+
+Historical `SagaCompensated` records without a corresponding start-intent
+remain readable, and still mean completed. This initial implementation uses
+per-step names as inherited from the existing saga journal; independent repeat
+attempts of the same named step require a future per-attempt identity model.
+The existing bytecode-module recovery prerequisite still applies when
+executing compensation expressions after a process restart.
+
 ## What Nulang can guarantee locally
 
 For one logical durable external effect, the runtime contract is:
