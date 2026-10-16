@@ -56,6 +56,12 @@ jobs:
           BASE_BIN="$RUNNER_TEMP/nulang-cli-ab-target/base/release/nulang"
           CANDIDATE_BIN="$RUNNER_TEMP/nulang-cli-ab-target/candidate/release/nulang"
           ALLOWED_CPU="$(python3 -c 'import os; print(min(os.sched_getaffinity(0)))')"
+          # Warm both binaries and filesystem caches before the measured rounds.
+          taskset -c "$ALLOWED_CPU" python3 scripts/benchmark_package_build.py \
+            --base-binary "$BASE_BIN" --candidate-binary "$CANDIDATE_BIN" \
+            --package benchmarks/fixtures/nula-build-smoke --stdlib src/stdlib \
+            --rounds 2 --mode both --timeout-seconds 120 \
+            --out "$RUNNER_TEMP/package-build-ab-warmup.json"
           taskset -c "$ALLOWED_CPU" python3 scripts/benchmark_package_build.py \
             --base-binary "$BASE_BIN" --candidate-binary "$CANDIDATE_BIN" \
             --package benchmarks/fixtures/nula-build-smoke --stdlib src/stdlib \
