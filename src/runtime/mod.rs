@@ -83,6 +83,8 @@ mod trace;
 mod workflow;
 #[cfg(feature = "sqlite")]
 mod web_sqlite;
+#[cfg(feature = "sqlite")]
+mod web_sqlite_auth_gate;
 pub use trace::TraceContext;
 
 #[cfg(test)]
@@ -124,6 +126,8 @@ pub use orca_cycle::*;
 pub use persistence::*;
 #[cfg(feature = "sqlite")]
 pub use web_sqlite::WebSqliteStore;
+#[cfg(feature = "sqlite")]
+pub use web_sqlite_auth_gate::{AuthorizedWebSqlite, WebSqliteAuthGate, WebTenantTokenVerifier};
 pub use process_groups::*;
 pub use registry::*;
 pub use resp_cache::*;
