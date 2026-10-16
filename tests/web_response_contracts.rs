@@ -169,7 +169,6 @@ fn openapi_uses_semantic_response_media() {
     );
 }
 
-
 #[test]
 fn one_compiled_contract_drives_json_request_and_response_openapi() {
     let contracts = compile_module_contracts(&parse(
