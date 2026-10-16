@@ -1195,6 +1195,24 @@ mod tests {
 
         let server = WebDevServer::bind(0, None, None, vec![]).unwrap();
         let host = format!("localhost:{}", server.port);
+
+        // A cross-origin script can DNS-rebind attacker.example to localhost.
+        // Read-only routes must reject that Host before any page or SSE dispatch.
+        let rebound_read = format!(
+            "GET / HTTP/1.1\\r\\nHost: attacker.example:{}\\r\\n\\r\\n",
+            server.port
+        );
+        assert!(
+            send(server.port, &rebound_read).starts_with("HTTP/1.1 403 Forbidden"),
+            "read routes must reject DNS-rebound hosts"
+        );
+
+        let trusted_read = format!("GET / HTTP/1.1\\r\\nHost: {host}\\r\\n\\r\\n");
+        assert!(
+            send(server.port, &trusted_read).starts_with("HTTP/1.1 404 Not Found"),
+            "valid read requests must reach normal routing"
+        );
+
         let foreign = format!(
             "POST /mutation HTTP/1.1\r\nHost: {host}\r\nOrigin: https://attacker.example\r\nContent-Length: 0\r\n\r\n"
         );
