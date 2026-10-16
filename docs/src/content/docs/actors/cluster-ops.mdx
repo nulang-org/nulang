@@ -73,8 +73,8 @@ By default there is **no quorum logic**: a partition leaves both sides running i
 
 ```bash
 # Both nodes agree on the expected cluster size
-nulang node --listen 127.0.0.1:9000 --expected-nodes 2
-nulang node --listen 127.0.0.1:9001 --seed 127.0.0.1:9000 --expected-nodes 2
+nulang node --listen 127.0.0.1:9000 --expected-nodes 2 --plaintext
+nulang node --listen 127.0.0.1:9001 --seed 127.0.0.1:9000 --expected-nodes 2 --plaintext
 ```
 
 :::note
