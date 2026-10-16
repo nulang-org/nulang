@@ -696,7 +696,7 @@ pub fn rewrite_module(module: &mut AstModule, checker: Option<&EffectChecker>) {
                 &signals,
                 params
                     .iter()
-                    .chain(using_params)
+                    .chain(using_params.iter())
                     .map(|param| param.name.as_str()),
             );
             rewrite_expr(body, false, &visible, checker);
