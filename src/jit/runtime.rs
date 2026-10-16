@@ -2119,6 +2119,42 @@ pub unsafe extern "C" fn nulang_aot_receive_pop() -> u64 {
 mod tests {
 
     #[test]
+    fn test_native_pending_error_preserves_effect_kind_and_first_write() {
+        // The compiled backend keeps executing after a helper records an
+        // error, so a later arithmetic failure must not reclassify the first
+        // unhandled effect.
+        let _ = super::aot_take_pending_native_error();
+        super::aot_set_pending_effect_error(
+            "Unhandled effect: 'non-exhaustive match.raise'".to_string(),
+        );
+        super::aot_set_pending_error("subsequent arithmetic failure".to_string());
+        let pending =
+            super::aot_take_pending_native_error().expect("first error must be recorded");
+        assert!(matches!(
+            pending.into_nu_error(),
+            crate::types::NuError::EffectError { msg, .. }
+                if msg == "Unhandled effect: 'non-exhaustive match.raise'"
+        ));
+        assert!(super::aot_take_pending_native_error().is_none());
+    }
+
+    #[test]
+    fn test_native_pending_error_preserves_runtime_kind_and_first_write() {
+        let _ = super::aot_take_pending_native_error();
+        super::aot_set_pending_error("integer overflow".to_string());
+        super::aot_set_pending_effect_error("later unhandled effect".to_string());
+        let pending =
+            super::aot_take_pending_native_error().expect("first error must be recorded");
+        assert!(matches!(
+            pending.into_nu_error(),
+            crate::types::NuError::RuntimeError { msg, .. }
+                if msg == "integer overflow"
+        ));
+        assert!(super::aot_take_pending_native_error().is_none());
+    }
+
+
+    #[test]
     fn test_jit_status_slots_are_thread_local() {
         let left = std::thread::spawn(|| {
             let mut budget = 1u64;
