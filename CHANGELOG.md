@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Native AOT unhandled-effect error-category parity — 2026-10-16
+- **Native AOT preserves the interpreter's `EffectError` category for unhandled effects.** Its pending native-error slot carries a typed runtime/effect distinction while retaining first-error-wins semantics for operations that continue after a compiled helper reports failure.
+- **Deterministic differential and helper-level regressions cover the observed October 16 mismatch and preserve both error categories.** Standalone and runtime-backed AOT entry points consume the same typed channel; the JIT message-only adapter remains compatible.
+
 ### Web static-root containment — 2026-10-15
 - **Experimental Web static file serving refuses parent traversal and symlinks escaping configured roots.** Canonical candidate paths must remain inside their canonicalized static or output root, and normal in-root files remain serveable.
 - **A filesystem regression verifies parent and symlink escape rejection.** This is a clean current-main successor to draft #1676; it does not change SSE or claim protection from malicious concurrent mutation of a trusted static root.
