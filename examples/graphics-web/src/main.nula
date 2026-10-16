@@ -27,7 +27,7 @@ fn home() -> Html {
                 el("p", [("id", text("backend")), ("role", text("status"))], [text("Initializing renderer")])
             ]),
             // Trusted literal script URL; dynamic script elements are rejected by Web.html.
-            raw("<script type=\\\"module\\\" src=\\\"/demo.js\\\"></script>")
+            raw("<script type=\"module\" src=\"/demo.js\"></script>")
         ])
     )
 }
