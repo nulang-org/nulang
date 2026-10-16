@@ -22,6 +22,34 @@ function scalar(value) {
   return String(value);
 }
 
+function encodeForm(body, mediaType) {
+  if (!mediaType || typeof mediaType !== 'object' || Array.isArray(mediaType)) throw new TypeError('form media type must be an object');
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw new TypeError('form body must be an object');
+  const schema = mediaType.schema;
+  if (schema !== undefined) {
+    if (!schema || typeof schema !== 'object' || Array.isArray(schema)) throw new TypeError('form request schema must be an object');
+    const properties = schema.properties;
+    if (!properties || typeof properties !== 'object' || Array.isArray(properties)) throw new TypeError('form request schema must define object properties');
+    const required = schema.required ?? [];
+    if (!Array.isArray(required) || required.some(name => typeof name !== 'string')) throw new TypeError('form request schema has invalid required fields');
+    for (const name of required) {
+      if (!Object.hasOwn(properties, name)) throw new TypeError('required form field is not declared: ' + name);
+      const value = body[name];
+      if (!Object.hasOwn(body, name) || value === null || value === undefined || (Array.isArray(value) && !value.length)) {
+        throw new TypeError('missing required form field: ' + name);
+      }
+    }
+    for (const name of Object.keys(body)) {
+      if (!Object.hasOwn(properties, name)) throw new TypeError('undeclared form field: ' + name);
+    }
+  }
+  const form = new URLSearchParams();
+  for (const [name, value] of Object.entries(body)) {
+    for (const item of (Array.isArray(value) ? value : [value])) form.append(name, scalar(item));
+  }
+  return form.toString();
+}
+
 export class NulangWebClient {
   constructor({baseUrl, contract, token, timeoutMs = 10000, fetchImpl = globalThis.fetch}) {
     const url = new URL(baseUrl);
@@ -98,12 +126,7 @@ export class NulangWebClient {
     if (body !== undefined && body !== null) {
       const content = requestBody.content || {};
       if ('application/x-www-form-urlencoded' in content) {
-        if (!body || typeof body !== 'object' || Array.isArray(body)) throw new TypeError('form body must be an object');
-        const form = new URLSearchParams();
-        for (const [name, value] of Object.entries(body)) {
-          for (const item of (Array.isArray(value) ? value : [value])) form.append(name, scalar(item));
-        }
-        encodedBody = form.toString();
+        encodedBody = encodeForm(body, content['application/x-www-form-urlencoded']);
         reqHeaders['Content-Type'] = 'application/x-www-form-urlencoded';
       } else if ('application/json' in content) {
         encodedBody = JSON.stringify(body);

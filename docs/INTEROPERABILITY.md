@@ -105,9 +105,12 @@ authentication, TLS, worker supervision, or durable request semantics.
   The host tracer supplies that header, and the Nulang server still needs an
   inbound propagator to attach HTTP and actor spans.
 - Form and JSON request bodies are serialized only when their media type
-  is explicitly declared in OpenAPI. Responses are left as bytes (Python) or
-  the native Fetch Response (JS). On non-2xx status the clients raise
-  `ApiError` and retain the status/body. Network failures remain native errors.
+  is explicitly declared in OpenAPI. Compiler-generated form schemas require
+  every named field, reject unknown fields before network I/O, and encode
+  Boolean values as lowercase `true` or `false`. Responses are left as bytes
+  (Python) or the native Fetch Response (JS). On non-2xx status the clients
+  raise `ApiError` and retain the status/body. Network failures remain native
+  errors.
 - Redirects are not followed, preventing credentials from being forwarded to another origin.
 - Timeouts are bounded. There are **no automatic retries**: retrying a POST
   after a timeout may duplicate an operation that already committed.

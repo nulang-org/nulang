@@ -51,6 +51,36 @@ def _validate_traceparent(value: str) -> None:
     if not _TRACEPARENT.fullmatch(value) or int(value[3:35], 16) == 0 or int(value[36:52], 16) == 0:
         raise ValueError("traceparent must be a valid W3C version-00 trace context")
 
+def _encode_form(body: dict[str, Any], media_type: Mapping[str, Any]) -> bytes:
+    schema = media_type.get("schema")
+    if schema is not None:
+        if not isinstance(schema, Mapping):
+            raise ValueError("form request schema must be an object")
+        properties = schema.get("properties")
+        if not isinstance(properties, Mapping):
+            raise ValueError("form request schema must define object properties")
+        required = schema.get("required", [])
+        if not isinstance(required, list) or not all(isinstance(name, str) for name in required):
+            raise ValueError("form request schema has invalid required fields")
+        for name in required:
+            value = body.get(name)
+            if name not in properties:
+                raise ValueError(f"required form field is not declared: {name}")
+            if name not in body or value is None or (
+                isinstance(value, (list, tuple)) and not value
+            ):
+                raise ValueError(f"missing required form field: {name}")
+        for name in body:
+            if name not in properties:
+                raise ValueError(f"undeclared form field: {name}")
+
+    fields: list[tuple[str, str]] = []
+    for name, value in body.items():
+        for item in value if isinstance(value, (list, tuple)) else [value]:
+            fields.append((name, _param_str(item)))
+    return urlencode(fields).encode("utf-8")
+
+
 
 class _NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -140,8 +170,10 @@ class NulangWebClient:
             if "application/x-www-form-urlencoded" in content:
                 if not isinstance(body, dict):
                     raise ValueError("form body must be a dictionary")
-                payload = urlencode(body, doseq=True).encode("utf-8")
-                req_headers["Content-Type"] = "application/x-www-form-urlencoded"
+                media_type = content["application/x-www-form-urlencoded"]
+                if not isinstance(media_type, Mapping):
+                    raise ValueError("form media type must be an object")
+                payload = _encode_form(body, media_type)
             elif "application/json" in content:
                 payload = json.dumps(body, separators=(",", ":")).encode("utf-8")
                 req_headers["Content-Type"] = "application/json"

@@ -10,6 +10,14 @@ const contract = { openapi:'3.1.0', paths: {
   '/v1/jobs': {post: {operationId:'create_job', requestBody: {required:true, content:{'application/x-www-form-urlencoded':{}}}}}
 }};
 
+const formContract = {openapi:'3.1.0',paths:{
+  '/v1/forms': {post:{operationId:'submit_form',requestBody:{required:true,content:{
+    'application/x-www-form-urlencoded': {schema:{type:'object',properties:{
+      enabled:{type:'boolean'},name:{type:'string'}
+    },required:['enabled','name']}}
+  }}}}
+}};
+
 test('encodes paths/query; forwards auth, headers, W3C trace context', async () => {
   let target, options;
   const fetchImpl = async (url, init) => { target=url; options=init; return new Response('ok', {status:200}); };
@@ -27,6 +35,17 @@ test('form POST uses declared content type and encoding', async () => {
   const fetchImpl=async (_,init)=>{assert.equal(init.method,'POST');assert.equal(init.headers['Content-Type'],'application/x-www-form-urlencoded'); assert.equal(init.body,'name=ma%C3%B1ana');return new Response('',{status:201});};
   const r=await new NulangWebClient({baseUrl:'https://example.com',contract,fetchImpl}).call('create_job',{body:{name:'mañana'}});
   assert.equal(r.status,201);
+});
+
+test('form schema validates fields and encodes booleans', async () => {
+  let calls=0, request;
+  const fetchImpl=async (_,init)=>{calls++;request=init;return new Response('',{status:201});};
+  const client=new NulangWebClient({baseUrl:'https://example.com',contract:formContract,fetchImpl});
+  await client.call('submit_form',{body:{enabled:true,name:'ready'}});
+  assert.equal(request.body,'enabled=true&name=ready');
+  await assert.rejects(()=>client.call('submit_form',{body:{enabled:true}}),/missing required form field: name/);
+  await assert.rejects(()=>client.call('submit_form',{body:{enabled:true,name:'ready',extra:'x'}}),/undeclared form field: extra/);
+  assert.equal(calls,1);
 });
 
 test('does not swallow HTTP failures', async () => {

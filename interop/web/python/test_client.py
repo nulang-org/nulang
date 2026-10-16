@@ -2,6 +2,7 @@ import json
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest import mock
 from urllib.parse import parse_qs
 
 from client import NulangWebClient, ApiError
@@ -17,6 +18,32 @@ CONTRACT = {
           "required": True, "content": {"application/x-www-form-urlencoded": {}}
       }}}
     }
+}
+
+FORM_CONTRACT = {
+    "openapi": "3.1.0",
+    "paths": {
+        "/v1/forms": {
+            "post": {
+                "operationId": "submit_form",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/x-www-form-urlencoded": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "enabled": {"type": "boolean"},
+                                    "name": {"type": "string"},
+                                },
+                                "required": ["enabled", "name"],
+                            }
+                        }
+                    },
+                },
+            }
+        }
+    },
 }
 
 class Handler(BaseHTTPRequestHandler):
@@ -76,6 +103,16 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(response.status, 201)
         self.assertEqual(response.json()["form"], {"name": ["mañana"]})
         self.assertEqual(response.json()["content_type"], "application/x-www-form-urlencoded")
+
+    def test_form_schema_validates_fields_and_encodes_bool(self):
+        client = NulangWebClient(self.base, FORM_CONTRACT)
+        response = client.call("submit_form", body={"enabled": True, "name": "ready"})
+        self.assertEqual(response.json()["form"], {"enabled": ["true"], "name": ["ready"]})
+        with mock.patch.object(client._opener, "open", side_effect=AssertionError("invalid form reached network")):
+            with self.assertRaisesRegex(ValueError, "missing required form field: name"):
+                client.call("submit_form", body={"enabled": True})
+            with self.assertRaisesRegex(ValueError, "undeclared form field: extra"):
+                client.call("submit_form", body={"enabled": True, "name": "ready", "extra": "x"})
 
     def test_http_failure_retains_status(self):
         with self.assertRaises(ApiError) as ex:
