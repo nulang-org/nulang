@@ -1039,8 +1039,9 @@ mod tests {
             "var i = 0.0; var s = 0.0; while i < 100.0 { s = s + i * 2.5/ - i / 3.0; i = i + 1.0; }; s",
             "var i = 0.0; var s = 0.0; while i < 100.0 { s = s + i * 2.5 - i /i 3.0; i = i + 1.0; }; s",
         ] {
-            let outcome = differential_fuzz_one(source)
-                .unwrap_or_else(|error| panic!("October 16 backend divergence for {source:?}: {error}"));
+            let outcome = differential_fuzz_one(source).unwrap_or_else(|error| {
+                panic!("October 16 backend divergence for {source:?}: {error}")
+            });
             assert!(
                 matches!(outcome, DiffOutcome::Agreed { .. }),
                 "regression must compile and compare real backends for {source:?}: {outcome:?}"
