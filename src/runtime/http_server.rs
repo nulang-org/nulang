@@ -1187,6 +1187,16 @@ mod tests {
             std::os::unix::fs::symlink("../private.txt", public.join("shortcut.txt")).unwrap();
             let escaped = WebDevServer::serve_static(Some(&public), None, "/shortcut.txt");
             assert_eq!(escaped.status, 404, "symlink outside root must fail closed");
+
+            // A public extension can differ from a safe in-root symlink target.
+            std::fs::write(public.join("bundle-hash"), b"console.log('ok')").unwrap();
+            std::os::unix::fs::symlink("bundle-hash", public.join("app.js")).unwrap();
+            let script = WebDevServer::serve_static(Some(&public), None, "/app.js");
+            assert_eq!(script.status, 200);
+            assert_eq!(script.body, b"console.log('ok')");
+            assert!(script.headers.iter().any(|(name, value)| {
+                name == "Content-Type" && value == "application/javascript; charset=utf-8"
+            }));
         }
     }
 
