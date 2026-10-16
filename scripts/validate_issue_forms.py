@@ -19,7 +19,22 @@ except ImportError as exc:
 
 
 class StrictLoader(yaml.SafeLoader):
-    """Reject duplicate keys instead of silently replacing earlier values."""
+    """Reject duplicate keys and PyYAML's YAML 1.1 boolean aliases."""
+
+
+# GitHub issue forms use true/false for flags. PyYAML's SafeLoader also treats
+# yes/no/on/off as bool under YAML 1.1, which can silently accept typo-prone
+# strings where GitHub expects a boolean. Override *only* this subclass's
+# implicit resolvers without modifying the global SafeLoader.
+StrictLoader.yaml_implicit_resolvers = {
+    first: [(tag, regex) for tag, regex in resolvers if tag != 'tag:yaml.org,2002:bool']
+    for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+StrictLoader.add_implicit_resolver(
+    'tag:yaml.org,2002:bool',
+    re.compile(r'^(?:true|True|TRUE|false|False|FALSE)$'),
+    list('tTfF'),
+)
 
 
 def _unique_mapping(loader, node):
@@ -66,7 +81,7 @@ def _validate_form(data, location):
             errors.append(f'{prefix}: control must be a mapping')
             continue
         kind = control.get('type')
-        if kind not in CONTROL_TYPES:
+        if not isinstance(kind, str) or kind not in CONTROL_TYPES:
             errors.append(f'{prefix}: unsupported control type {kind!r}')
             continue
         attributes = control.get('attributes')
@@ -115,8 +130,12 @@ def _validate_config(data, location):
         _text(link, 'about', prefix, errors)
         url = _text(link, 'url', prefix, errors)
         if isinstance(url, str):
-            parsed = urlparse(url)
-            if parsed.scheme != 'https' or not parsed.netloc:
+            try:
+                parsed = urlparse(url)
+                valid = parsed.scheme == 'https' and bool(parsed.hostname)
+            except ValueError:  # e.g. an unmatched IPv6 bracket
+                valid = False
+            if not valid:
                 errors.append(f'{prefix}: url must be an absolute https:// URL')
     return errors
 
