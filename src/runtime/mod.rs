@@ -4236,40 +4236,68 @@ impl Runtime {
                 }
             }
             if !processed && self.has_bytecode_handler(actor_id, behavior_idx) {
-                // Compiled workflow turns remain on the legacy path until
-                // custom events, timers/signals, suspension markers, failures,
-                // compensation, and effect replay all share the atomic tail.
+                // Bytecode workflow turns extend the same RFC 0022 fenced
+                // atomic tail as native turns. Recovered commands retain their
+                // original activation instead of entering the journal twice.
                 if self.actor_is_persistent(actor_id) {
-                    let seq = self.next_sequence(actor_id);
                     let payload =
                         self.persist_journal_payload(actor_id, journal_source_actor, &msg.payload);
-                    match self.persistence.append_journal(
-                        actor_id,
-                        JournalEntry {
-                            sequence: seq,
-                            behavior_id: msg.behavior_id,
-                            payload,
-                        },
-                    ) {
-                        Ok(()) => {
-                            if self.actor_is_workflow(actor_id) {
-                                workflow_activation =
-                                    Some(WorkflowActivationId::new(actor_id, seq));
-                                if let Some(actor) = self.actors.get_mut(&actor_id) {
-                                    actor.current_workflow_activation = workflow_activation;
+                    let use_atomic_workflow_turn = self.actor_is_workflow(actor_id)
+                        && !self.is_internal_behavior(actor_id, behavior_idx);
+                    if use_atomic_workflow_turn {
+                        let recovered_activation = self.actors.get(&actor_id).and_then(|actor| {
+                            actor.current_workflow_activation.filter(|activation| {
+                                activation.actor_id == actor_id
+                                    && activation.command_sequence == actor.sequence
+                            })
+                        });
+                        if let Some(activation) = recovered_activation {
+                            workflow_activation = Some(activation);
+                            atomic_workflow_turn = true;
+                        } else {
+                            match workflow::commit_workflow_command(
+                                self,
+                                actor_id,
+                                msg.behavior_id,
+                                payload,
+                            ) {
+                                Ok(activation) => {
+                                    workflow_activation = Some(activation);
+                                    atomic_workflow_turn = true;
+                                }
+                                Err(error) => {
+                                    tracing::error!(
+                                        actor_id,
+                                        %error,
+                                        "nulang-workflow: refusing bytecode command after atomic admission failed"
+                                    );
+                                    self.current_actor = None;
+                                    return;
                                 }
                             }
                         }
-                        Err(error) if self.actor_is_workflow(actor_id) => {
-                            tracing::error!(
-                                actor_id,
-                                %error,
-                                "nulang-workflow: refusing command execution after durable admission failed"
-                            );
-                            self.current_actor = None;
-                            return;
+                    } else {
+                        let seq = self.next_sequence(actor_id);
+                        match self.persistence.append_journal(
+                            actor_id,
+                            JournalEntry {
+                                sequence: seq,
+                                behavior_id: msg.behavior_id,
+                                payload,
+                            },
+                        ) {
+                            Ok(()) => {}
+                            Err(error) if self.actor_is_workflow(actor_id) => {
+                                tracing::error!(
+                                    actor_id,
+                                    %error,
+                                    "nulang-workflow: refusing internal command after journal admission failed"
+                                );
+                                self.current_actor = None;
+                                return;
+                            }
+                            Err(_) => {}
                         }
-                        Err(_) => {}
                     }
                 }
                 let payload = msg.payload.clone();
@@ -4282,7 +4310,9 @@ impl Runtime {
                 self.suspend_enabled = saved_suspend;
                 match result {
                     Ok(_) => {
-                        self.checkpoint_actor(actor_id);
+                        if !atomic_workflow_turn {
+                            self.checkpoint_actor(actor_id);
+                        }
                         processed = true;
                     }
                     Err(crate::types::NuError::Suspended(_)) => {
@@ -4296,25 +4326,56 @@ impl Runtime {
                         processed = false;
                     }
                     Err(e) => {
-                        self.checkpoint_actor(actor_id);
-                        // A workflow step failed: record the failure (durable
-                        // StepFailed event — SPEC2 §10 known-issue #5: step
-                        // failures were silent, exit 0, no diagnostic), then
-                        // run saga compensations for previously completed
-                        // steps in reverse order.
-                        if self.actor_is_workflow(actor_id) {
-                            let seq = self.next_sequence(actor_id);
+                        // A failed workflow step closes its admitted command
+                        // with a *single* atomic snapshot + StepFailed record.
+                        // Never compensate an uncommitted failure.
+                        if atomic_workflow_turn {
                             let step_name = self.step_name_for(actor_id, behavior_idx);
-                            let _ = self.persistence.append_workflow_event(
+                            if let Err(error) = workflow::commit_step_failed(
+                                self,
                                 actor_id,
-                                WorkflowEvent::StepFailed {
-                                    sequence: seq,
-                                    activation: workflow_activation,
-                                    step_name,
-                                    error: format!("{}", e),
-                                },
-                            );
+                                workflow_activation,
+                                step_name,
+                                e.to_string(),
+                            ) {
+                                tracing::error!(
+                                    actor_id,
+                                    %error,
+                                    "nulang-workflow: failed-step commit rejected; recovering original activation"
+                                );
+                                self.actors.remove(&actor_id);
+                                if self.recover_actor(actor_id).is_none() {
+                                    tracing::error!(
+                                        actor_id,
+                                        "nulang-workflow: recovery failed after rejected StepFailed transition"
+                                    );
+                                }
+                                self.current_actor = None;
+                                return;
+                            }
+                            // The command is now terminal. Compensations are
+                            // subsequent independent durable transitions, not
+                            // speculative writes to the failed activation.
+                            if let Some(actor) = self.actors.get_mut(&actor_id) {
+                                actor.current_workflow_activation = None;
+                            }
                             self.run_saga_compensation(actor_id, behavior_idx);
+                        } else {
+                            self.checkpoint_actor(actor_id);
+                            if self.actor_is_workflow(actor_id) {
+                                let seq = self.next_sequence(actor_id);
+                                let step_name = self.step_name_for(actor_id, behavior_idx);
+                                let _ = self.persistence.append_workflow_event(
+                                    actor_id,
+                                    WorkflowEvent::StepFailed {
+                                        sequence: seq,
+                                        activation: workflow_activation,
+                                        step_name,
+                                        error: e.to_string(),
+                                    },
+                                );
+                                self.run_saga_compensation(actor_id, behavior_idx);
+                            }
                         }
                         processed = false;
                     }
@@ -5381,10 +5442,21 @@ impl Runtime {
                 // Compensation failed: do not record it as completed.
                 continue;
             }
-            let _ = self.append_saga_compensated(actor_id, &step_name);
-            if let Some(actor) = self.actors.get_mut(&actor_id) {
-                if !actor.compensated_steps.contains(&step_name) {
-                    actor.compensated_steps.push(step_name);
+            match self.append_saga_compensated(actor_id, &step_name) {
+                Ok(()) => {
+                    if let Some(actor) = self.actors.get_mut(&actor_id) {
+                        if !actor.compensated_steps.contains(&step_name) {
+                            actor.compensated_steps.push(step_name);
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(
+                        actor_id,
+                        %error,
+                        "nulang-workflow: compensation outcome was not durably committed"
+                    );
+                    return;
                 }
             }
         }
