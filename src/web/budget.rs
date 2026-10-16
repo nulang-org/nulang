@@ -13,7 +13,7 @@ pub struct BudgetViolation {
     pub budget: usize,
 }
 
-/// Check the initial JavaScript transfer budget against all `.js` files in
+/// Apply the legacy per-file JavaScript size budget to `.js` files in
 /// `output_dir/assets/` and the generated `app.client.js` in `output_dir`.
 ///
 /// Returns `Ok(())` when there is no budget, no JS files, or all files fit.
