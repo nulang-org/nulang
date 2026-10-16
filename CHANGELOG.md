@@ -1,4 +1,10 @@
 # Nulang Changelog
+### Opt-in bounded NBC artifact admission — 2026-10-16
+- **Embedded hosts can specify admission limits for .nbc artifacts.** `NbcDecodeLimits` bounds total artifact bytes, declared instruction count, and metadata bytes before instruction allocation or JSON deserialization. `CodeModule::from_nbc_with_limits` and `CoreVM::load_nbc_with_limits` expose this policy without modifying the frozen bytecode format.
+- **Malformed length arithmetic fails closed.** Instruction and metadata offsets use checked arithmetic (including on 32-bit targets), and an over-budget artifact cannot be published into `CoreVM`. Existing `from_nbc` / `load_nbc` retain unlimited compatibility behavior; untrusted callers must opt into finite limits. These are admission limits, not total runtime/GC/host-memory or execution isolation guarantees.
+- **The v1 decoder now rejects noncanonical payloads.** Extra trailing bytes and a redundant JSON-embedded instruction vector no longer deserialize as valid bytecode; instructions must appear only in the binary instruction stream. This is a decoder validation change, not a new format version or a signature-verification mechanism.
+- **Regression fixtures cover each bound, exact-limit acceptance, forged instruction counts, and atomic CoreVM rejection.** Exact-head Cargo and CI validation remain required before promotion.
+
 ### Web static-root containment — 2026-10-15
 - **Experimental Web static file serving refuses parent traversal and symlinks escaping configured roots.** Canonical candidate paths must remain inside their canonicalized static or output root, and normal in-root files remain serveable.
 - **A filesystem regression verifies parent and symlink escape rejection.** This is a clean current-main successor to draft #1676; it does not change SSE or claim protection from malicious concurrent mutation of a trusted static root.

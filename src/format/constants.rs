@@ -80,6 +80,12 @@ pub enum FormatError {
     /// minted by a newer runtime that uses an opcode this runtime does not
     /// know is rejected, not misinterpreted.
     UnknownOpcode { opcode: u8 },
+    /// The decoder's caller-specified resource policy rejected an artifact.
+    ResourceLimitExceeded {
+        resource: &'static str,
+        limit: usize,
+        actual: usize,
+    },
     /// The JSON metadata body failed to deserialize.
     BodyDecode(String),
     /// An arithmetic constant could not be represented (e.g. non-finite float).
@@ -106,6 +112,10 @@ impl std::fmt::Display for FormatError {
             ),
             FormatError::UnknownOpcode { opcode } => write!(
                 f, "format error: unknown opcode 0x{opcode:02X} in instruction stream"
+            ),
+            FormatError::ResourceLimitExceeded { resource, limit, actual } => write!(
+                f,
+                "format error: {resource} resource limit {limit} exceeded by {actual}"
             ),
             FormatError::BodyDecode(msg) => write!(f, "format error: metadata body decode failed: {msg}"),
             FormatError::BadConstant(msg) => write!(f, "format error: bad constant: {msg}"),

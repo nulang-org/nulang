@@ -55,6 +55,29 @@ pub struct NbcArtifact {
     pub language_version: u32,
 }
 
+/// Caller-selected admission limits for decoded .nbc artifacts.
+///
+/// These are admission bounds on serialized byte length, encoded instruction
+/// count, and metadata byte length. They do not bound the heap of a running
+/// program or the expansion of arbitrary host effects; those require separate
+/// runtime policies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NbcDecodeLimits {
+    pub max_artifact_bytes: usize,
+    pub max_instructions: usize,
+    pub max_metadata_bytes: usize,
+}
+
+impl NbcDecodeLimits {
+    /// Compatibility behavior for existing trusted callers. Embedders loading
+    /// untrusted artifacts should always specify finite limits explicitly.
+    pub const UNLIMITED: Self = Self {
+        max_artifact_bytes: usize::MAX,
+        max_instructions: usize::MAX,
+        max_metadata_bytes: usize::MAX,
+    };
+}
+
 impl CodeModule {
     fn validate_effect_site_metadata(&self) -> Result<(), FormatError> {
         let mut previous_pc = None;
@@ -147,6 +170,23 @@ impl CodeModule {
     /// version, unknown opcode, body decode failure). The runtime never
     /// guesses at a layout it does not understand.
     pub fn from_nbc(bytes: &[u8]) -> Result<NbcArtifact, FormatError> {
+        Self::from_nbc_with_limits(bytes, NbcDecodeLimits::UNLIMITED)
+    }
+
+    /// Load bytecode while enforcing explicit caller-selected admission limits.
+    /// Limit checks run before allocating an instruction vector or decoding
+    /// potentially large metadata. The frozen .nbc wire format is unchanged.
+    pub fn from_nbc_with_limits(
+        bytes: &[u8],
+        limits: NbcDecodeLimits,
+    ) -> Result<NbcArtifact, FormatError> {
+        if bytes.len() > limits.max_artifact_bytes {
+            return Err(FormatError::ResourceLimitExceeded {
+                resource: "artifact bytes",
+                limit: limits.max_artifact_bytes,
+                actual: bytes.len(),
+            });
+        }
         if bytes.len() < NBC_HEADER_LEN {
             return Err(FormatError::Truncated {
                 need: NBC_HEADER_LEN,
@@ -184,15 +224,64 @@ impl CodeModule {
             Some(source_hash)
         };
         let instr_count = u32::from_be_bytes(bytes[44..48].try_into().unwrap()) as usize;
+        if instr_count > limits.max_instructions {
+            return Err(FormatError::ResourceLimitExceeded {
+                resource: "instructions",
+                limit: limits.max_instructions,
+                actual: instr_count,
+            });
+        }
 
         // --- Instruction stream -----------------------------------------
-        let instr_block = 48..48 + instr_count * 4;
+        let instr_end = instr_count
+            .checked_mul(4)
+            .and_then(|n| NBC_HEADER_LEN.checked_add(n))
+            .ok_or_else(|| FormatError::BodyDecode("instruction stream length overflow".into()))?;
+        let instr_block = NBC_HEADER_LEN..instr_end;
         if bytes.len() < instr_block.end {
             return Err(FormatError::Truncated {
                 need: instr_block.end,
                 have: bytes.len(),
             });
         }
+        // --- Metadata admission ------------------------------------------
+        // Check the declared JSON size and full artifact shape *before*
+        // allocating or decoding the instruction stream. An artifact known
+        // to be over-budget must not consume its independent instruction
+        // allowance first.
+        let meta_len_off = instr_block.end;
+        let meta_off = meta_len_off
+            .checked_add(4)
+            .ok_or_else(|| FormatError::BodyDecode("metadata header length overflow".into()))?;
+        if bytes.len() < meta_off {
+            return Err(FormatError::Truncated {
+                need: meta_off,
+                have: bytes.len(),
+            });
+        }
+        let meta_len =
+            u32::from_be_bytes(bytes[meta_len_off..meta_off].try_into().unwrap()) as usize;
+        if meta_len > limits.max_metadata_bytes {
+            return Err(FormatError::ResourceLimitExceeded {
+                resource: "metadata bytes",
+                limit: limits.max_metadata_bytes,
+                actual: meta_len,
+            });
+        }
+        let meta_end = meta_off
+            .checked_add(meta_len)
+            .ok_or_else(|| FormatError::BodyDecode("metadata body length overflow".into()))?;
+        // The v1 artifact contains exactly one metadata body. Reject both
+        // truncation and trailing bytes so noncanonical byte sequences cannot
+        // alias the same decoded module.
+        if bytes.len() != meta_end {
+            return Err(FormatError::LengthMismatch {
+                declared: meta_len as u32,
+                actual: bytes.len() - meta_off,
+            });
+        }
+
+        // --- Instruction stream -----------------------------------------
         let mut instructions = Vec::with_capacity(instr_count);
         for i in 0..instr_count {
             let off = instr_block.start + i * 4;
@@ -203,26 +292,17 @@ impl CodeModule {
             instructions.push(instr);
         }
 
-        // --- Metadata body ----------------------------------------------
-        let meta_len_off = instr_block.end;
-        if bytes.len() < meta_len_off + 4 {
-            return Err(FormatError::Truncated {
-                need: meta_len_off + 4,
-                have: bytes.len(),
-            });
-        }
-        let meta_len =
-            u32::from_be_bytes(bytes[meta_len_off..meta_len_off + 4].try_into().unwrap()) as usize;
-        let meta_off = meta_len_off + 4;
-        if bytes.len() < meta_off + meta_len {
-            return Err(FormatError::LengthMismatch {
-                declared: meta_len as u32,
-                actual: bytes.len() - meta_off,
-            });
-        }
-        let meta_bytes = &bytes[meta_off..meta_off + meta_len];
+        let meta_bytes = &bytes[meta_off..meta_end];
         let mut module: CodeModule = serde_json::from_slice(meta_bytes)
             .map_err(|e| FormatError::BodyDecode(e.to_string()))?;
+        // The frozen v1 encoding carries executable instructions only in
+        // the binary stream. Reject a redundant JSON vector instead of
+        // silently replacing it with the actual instruction stream.
+        if !module.instructions.is_empty() {
+            return Err(FormatError::BodyDecode(
+                "noncanonical metadata contains duplicate instructions".into(),
+            ));
+        }
         module.instructions = instructions;
         module.validate_effect_site_metadata()?;
 
@@ -331,6 +411,188 @@ mod tests {
                 have: 10
             }
         );
+    }
+
+    #[test]
+    fn bounded_decode_enforces_artifact_instruction_and_metadata_limits() {
+        let module = sample_module();
+        let bytes = module.to_nbc(None).expect("encode fixture");
+        let instructions = module.instructions.len();
+        let metadata = bytes.len() - NBC_HEADER_LEN - instructions * 4 - 4;
+
+        // Exact limits must admit a valid artifact without changing semantics.
+        let exact = NbcDecodeLimits {
+            max_artifact_bytes: bytes.len(),
+            max_instructions: instructions,
+            max_metadata_bytes: metadata,
+        };
+        assert_eq!(
+            CodeModule::from_nbc_with_limits(&bytes, exact)
+                .expect("exact bound must admit artifact")
+                .module,
+            module
+        );
+
+        for (limits, expected_resource) in [
+            (
+                NbcDecodeLimits {
+                    max_artifact_bytes: bytes.len() - 1,
+                    ..exact
+                },
+                "artifact bytes",
+            ),
+            (
+                NbcDecodeLimits {
+                    max_instructions: instructions - 1,
+                    ..exact
+                },
+                "instructions",
+            ),
+            (
+                NbcDecodeLimits {
+                    max_metadata_bytes: metadata - 1,
+                    ..exact
+                },
+                "metadata bytes",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    CodeModule::from_nbc_with_limits(&bytes, limits),
+                    Err(FormatError::ResourceLimitExceeded { resource, .. })
+                        if resource == expected_resource
+                ),
+                "{expected_resource} limit must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_rejects_unexpected_trailing_bytes() {
+        let bytes = sample_module().to_nbc(None).expect("encode fixture");
+        let mut appended = bytes.clone();
+        appended.extend_from_slice(b"junk");
+
+        // The .nbc format declares exactly one instruction stream and one
+        // metadata body. Appending data must not create an alias for the same
+        // artifact, even when it stays within the configured admission budget.
+        let limits = NbcDecodeLimits {
+            max_artifact_bytes: appended.len(),
+            max_instructions: 1_024,
+            max_metadata_bytes: appended.len(),
+        };
+        assert!(matches!(
+            CodeModule::from_nbc(&appended),
+            Err(FormatError::LengthMismatch { .. })
+        ));
+        assert!(matches!(
+            CodeModule::from_nbc_with_limits(&appended, limits),
+            Err(FormatError::LengthMismatch { .. })
+        ));
+        assert_eq!(
+            CodeModule::from_nbc_with_limits(&bytes, limits)
+                .expect("canonical artifact remains valid")
+                .module,
+            sample_module()
+        );
+
+        let mut vm = crate::core_vm::CoreVM::new();
+        assert!(
+            vm.load_nbc_with_limits(&appended, limits).is_err(),
+            "CoreVM must not admit trailing artifact data"
+        );
+        assert!(vm.modules.is_empty(), "rejection must be atomic");
+    }
+
+    #[test]
+    fn decode_rejects_duplicate_instruction_stream_in_metadata() {
+        let module = sample_module();
+        let bytes = module.to_nbc(None).expect("encode fixture");
+        let metadata_header = NBC_HEADER_LEN + module.instructions.len() * 4;
+        let mut forged = bytes[..metadata_header].to_vec();
+        // The v1 wire contract stores instructions only in the fixed-width
+        // stream. Metadata is required to have an empty instructions vector.
+        let redundant_metadata = serde_json::to_vec(&module).unwrap();
+        forged.extend_from_slice(&(redundant_metadata.len() as u32).to_be_bytes());
+        forged.extend_from_slice(&redundant_metadata);
+
+        let limits = NbcDecodeLimits {
+            max_artifact_bytes: forged.len(),
+            max_instructions: module.instructions.len(),
+            max_metadata_bytes: redundant_metadata.len(),
+        };
+        assert!(matches!(
+            CodeModule::from_nbc_with_limits(&forged, limits),
+            Err(FormatError::BodyDecode(_))
+        ));
+        assert!(matches!(
+            CodeModule::from_nbc(&forged),
+            Err(FormatError::BodyDecode(_))
+        ));
+    }
+
+    #[test]
+    fn test_metadata_limit_rejected_before_decoding_instruction_opcodes() {
+        let mut bytes = sample_module().to_nbc(None).expect("encode fixture");
+        // Metadata admission takes precedence over opcode decoding, so an
+        // artifact guaranteed to be rejected never allocates instructions.
+        bytes[NBC_HEADER_LEN] = 0xFF;
+        let policy = NbcDecodeLimits {
+            max_artifact_bytes: bytes.len(),
+            max_instructions: 1024,
+            max_metadata_bytes: 0,
+        };
+        assert!(matches!(
+            CodeModule::from_nbc_with_limits(&bytes, policy),
+            Err(FormatError::ResourceLimitExceeded {
+                resource: "metadata bytes",
+                ..
+            })
+        ));
+        assert!(matches!(
+            CodeModule::from_nbc(&bytes),
+            Err(FormatError::UnknownOpcode { .. })
+        ));
+    }
+
+    #[test]
+    fn bounded_decode_rejects_forged_instruction_count_before_allocating() {
+        let mut bytes = sample_module().to_nbc(None).expect("encode fixture");
+        bytes[44..48].copy_from_slice(&u32::MAX.to_be_bytes());
+        let policy = NbcDecodeLimits {
+            max_artifact_bytes: bytes.len(),
+            max_instructions: 1_024,
+            max_metadata_bytes: bytes.len(),
+        };
+        assert!(matches!(
+            CodeModule::from_nbc_with_limits(&bytes, policy),
+            Err(FormatError::ResourceLimitExceeded {
+                resource: "instructions",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn core_vm_rejects_over_budget_artifact_without_publishing_a_module() {
+        let bytes = sample_module().to_nbc(None).expect("encode fixture");
+        let limits = NbcDecodeLimits {
+            max_artifact_bytes: bytes.len() - 1,
+            max_instructions: usize::MAX,
+            max_metadata_bytes: usize::MAX,
+        };
+        let mut vm = crate::core_vm::CoreVM::new();
+        assert!(vm.load_nbc_with_limits(&bytes, limits).is_err());
+        assert!(
+            vm.modules.is_empty(),
+            "rejected artifact must not be published"
+        );
+
+        let loaded = vm
+            .load_nbc_with_limits(&bytes, NbcDecodeLimits::UNLIMITED)
+            .expect("valid artifact");
+        assert_eq!(loaded, 0);
+        assert_eq!(vm.modules.len(), 1);
     }
 
     #[test]
