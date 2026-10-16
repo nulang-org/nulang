@@ -1,4 +1,8 @@
 # Nulang Changelog
+
+### Compiler Web route ambiguity rejection — 2026-10-16
+- **Compiled Web routes with the same method and runtime path shape now fail validation.** Differently named captures and percent-encoded literal aliases can no longer silently select different dispatch and OpenAPI handlers; distinct methods and unrelated static routes retain their existing behavior.
+- **Focused tests cover route collisions and permitted non-colliding paths.** The validation boundary reuses the existing runtime segment compiler and does not change broader literal-versus-capture precedence.
 ### Experimental Web HTML host hardening — 2026-10-15
 - **`Web.html` now validates dynamic element and attribute names and URL-bearing attributes before rendering.** Unsafe markup and scriptable URL schemes fail closed; quoted attribute delimiters are escaped while already escaped `Html` text is preserved.
 - **Six focused regression tests cover normal markup, attribute breakouts, event attributes, high-risk elements, obfuscated URLs, and safe relative/HTTP links.** `Web.raw` remains a trusted-only escape hatch; dynamic script/style/SVG and inline style/event attributes are intentionally rejected pending a future typed context-aware API.
