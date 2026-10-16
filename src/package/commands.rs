@@ -3082,7 +3082,7 @@ fn add() {}
 fn home() -> Html {
     <div class="card">
         <button action={add}>Add</button>
-        <span>{count}</span>
+        <span class={count} title={count} data-state={count}>{count}</span>
     </div>
 }
 
@@ -3108,6 +3108,18 @@ app "counter" {
             "data-action-placement missing"
         );
         assert!(html.contains("data-signal="), "data-signal missing");
+        assert!(
+            html.contains(r#"data-nulang-bind-class="count""#),
+            "compiled class signal binding missing from SSR: {html}"
+        );
+        assert!(
+            html.contains(r#"data-nulang-bind-title="count""#),
+            "compiled title signal binding missing from SSR: {html}"
+        );
+        assert!(
+            html.contains(r#"data-nulang-bind-data-state="count""#),
+            "compiled hyphenated attribute binding missing from SSR: {html}"
+        );
 
         let js = std::fs::read_to_string(dir.join("dist/app.client.js"))
             .expect("app.client.js should exist");
