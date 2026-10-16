@@ -229,6 +229,55 @@ pub(crate) fn try_checkpoint_actor(rt: &mut Runtime, actor_id: u64) -> std::io::
     Ok(())
 }
 
+/// Atomically create the initial durable workflow identity. The start marker
+/// and the first safe snapshot must share a single committed transition:
+/// recovery must never observe only one of them.
+pub(crate) fn commit_workflow_started(
+    rt: &mut Runtime,
+    actor_id: u64,
+    name: &str,
+    state: Vec<PersistedValue>,
+) -> std::io::Result<()> {
+    let expected_previous_sequence = rt.persistence.latest_sequence(actor_id);
+    let sequence = expected_previous_sequence.checked_add(1).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "workflow initial transition sequence overflow",
+        )
+    })?;
+    let snapshot = build_actor_snapshot_at_sequence(rt, actor_id, sequence)?.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "workflow initialization requires a live persistent actor",
+        )
+    })?;
+
+    rt.persistence.commit_transition(DurableTransition {
+        version: DURABLE_TRANSITION_VERSION,
+        actor_id,
+        activation_epoch: snapshot.activation_epoch,
+        sequence,
+        expected_previous_sequence,
+        command: None,
+        snapshot: Some(snapshot.clone()),
+        workflow_events: vec![WorkflowEvent::WorkflowStarted {
+            sequence,
+            name: name.to_string(),
+            state,
+        }],
+        domain_events: vec![],
+        durable_effects: vec![],
+        outbox: vec![],
+    })?;
+
+    rt.maybe_shadow_replicate(actor_id, &snapshot);
+    if let Some(actor) = rt.actors.get_mut(&actor_id) {
+        actor.sequence = sequence;
+        actor.dirty_fields.clear();
+    }
+    Ok(())
+}
+
 /// Atomically admit one workflow command before executing user code.
 ///
 /// Command acceptance is itself a durable transition so every later workflow
