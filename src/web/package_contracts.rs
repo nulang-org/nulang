@@ -380,6 +380,63 @@ mod tests {
     }
 
     #[test]
+    fn rejects_duplicate_method_and_path_across_modules() {
+        let first = parse(
+            r#"
+fn first() { "first" }
+fn register_first() {
+    perform Web.route("GET", "/health", first)
+}
+"#,
+        );
+        let second = parse(
+            r#"
+fn second() { "second" }
+fn register_second() {
+    perform Web.route("GET", "/health", second)
+}
+"#,
+        );
+
+        let compiled = compile_modules_contracts(&[first, second]);
+        assert_eq!(compiled.routes.len(), 1);
+        assert!(
+            compiled.diagnostics.iter().any(|diagnostic| {
+                diagnostic.contains("duplicate web route GET /health")
+                    && diagnostic.contains("first")
+                    && diagnostic.contains("second")
+            }),
+            "{:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_public_helper_and_direct_registration() {
+        let module = parse(
+            r#"
+import stdlib::web::host
+fn health() { "ok" }
+fn web_main() {
+    route("/health", health)
+    perform Web.route("GET", "/health", health)
+}
+"#,
+        );
+
+        let compiled = compile_modules_contracts(&[module]);
+        assert_eq!(compiled.routes.len(), 1);
+        assert!(
+            compiled.diagnostics.iter().any(|diagnostic| {
+                diagnostic.contains("duplicate web route GET /health")
+                    && diagnostic.contains("health")
+            }),
+            "{:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
     fn resolves_handler_metadata_across_source_modules() {
         let handlers = parse(
             r#"
