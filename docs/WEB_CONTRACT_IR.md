@@ -56,6 +56,18 @@ Bindings are ordered by handler slot rather than URL segment order. The runtime 
 
 The package-level `capabilities` field remains unchanged for compatibility. It is not the same concept as an authorization/resource capability.
 
+Package-wide contract extraction also retains deterministic, deduplicated
+`@nulang/*` import names from parsed import declarations. Deployment IR derives
+module capabilities, required Cloud configuration keys, and module middleware
+from that validated contract compilation rather than searching text for lines
+beginning with `import`. A comment or string mentioning an import cannot
+silently enable a module. Legacy effects-based package capability inference
+still scans source text; migrating it to canonical inferred effect/authority
+metadata is a separate step and is **not** claimed here.
+
+The `DeploymentIr` version remains 1; no new fields are added to that
+published schema.
+
 ## Route path compatibility
 
 The contract parser accepts legacy and contract-first path forms:
