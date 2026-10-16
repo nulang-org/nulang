@@ -29,7 +29,7 @@ is included in default builds (the `lsp` cargo feature, on by default).
 | Document Symbols | Structured outline (functions, actors, behaviors, …) |
 | Rename | With prepareRename |
 | Signature Help | Parameter hints while typing |
-| Formatting | Indentation-based code formatting |
+| Formatting | Canonical CLI formatter with non-destructive refusal for unsupported trivia |
 | Semantic Tokens | Editor-side syntax highlighting |
 | Code Actions | Quick fixes (add type annotations) |
 | Inlay Hints | Inferred types, capabilities, effect rows, return types |
@@ -107,7 +107,10 @@ nulang fmt [--check] [<file>]
 ```
 
 Formats a file in place (or checks formatting with `--check`). The language
-server exposes the same formatter via `textDocument/formatting`.
+server uses the same formatter via `textDocument/formatting`. Both currently
+refuse changes to files containing comments or shebangs, rather than silently
+discarding them. The editor returns no edit when formatting is refused.
+Directory formatting preflights all files before writing any source.
 
 ## Debug Adapter
 
