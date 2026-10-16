@@ -2117,54 +2117,80 @@ fn view() -> Html { <section nulang-scope="global">Static</section> }
         // Inserting unrelated earlier graph entries must not rename a
         // pre-existing binding. Positional read:0/read:1 IDs fail this.
         let mut extended = graph.clone();
-        extended.nodes.splice(0..0, [
-            GraphNode::Signal { name: "other".into() },
-            GraphNode::Read {
-                signal: "other".into(),
-                path: "view > aside".into(),
-            },
-            GraphNode::AttributeRead {
-                signal: "other".into(),
-                path: "view > aside".into(),
-                attribute: "title".into(),
-            },
-            GraphNode::Action {
-                handler: "cancel".into(),
-                path: "view > aside".into(),
-                placement: ActionPlacement::Server,
-            },
-        ]);
+        extended.nodes.splice(
+            0..0,
+            [
+                GraphNode::Signal {
+                    name: "other".into(),
+                },
+                GraphNode::Read {
+                    signal: "other".into(),
+                    path: "view > aside".into(),
+                },
+                GraphNode::AttributeRead {
+                    signal: "other".into(),
+                    path: "view > aside".into(),
+                    attribute: "title".into(),
+                },
+                GraphNode::Action {
+                    handler: "cancel".into(),
+                    path: "view > aside".into(),
+                    placement: ActionPlacement::Server,
+                },
+            ],
+        );
 
         let original = graph.to_ui_document("app", Revision(1));
         let updated = extended.to_ui_document("app", Revision(1));
         original.validate().unwrap();
         updated.validate().unwrap();
 
-        for node in original.nodes.iter().filter(|node| node.kind != "interaction_root") {
-            let matching = updated.nodes.iter().find(|candidate| {
-                candidate.kind == node.kind
-                    && candidate.properties == node.properties
-                    && candidate.actions == node.actions
-            }).expect("unrelated insert must preserve existing semantic node");
-            assert_eq!(node.id, matching.id, "semantic identity cannot depend on unrelated insertion");
+        for node in original
+            .nodes
+            .iter()
+            .filter(|node| node.kind != "interaction_root")
+        {
+            let matching = updated
+                .nodes
+                .iter()
+                .find(|candidate| {
+                    candidate.kind == node.kind
+                        && candidate.properties == node.properties
+                        && candidate.actions == node.actions
+                })
+                .expect("unrelated insert must preserve existing semantic node");
+            assert_eq!(
+                node.id, matching.id,
+                "semantic identity cannot depend on unrelated insertion"
+            );
         }
 
         // Patch IDs must be calculated from the same graph identities as
         // document IDs, including after independent unrelated insertions.
         let mut updated_document = extended.to_ui_document("app", Revision(3));
         let patch = extended
-            .signal_patch("app", Revision(3), Revision(4), "count", WireValue::from("new"))
+            .signal_patch(
+                "app",
+                Revision(3),
+                Revision(4),
+                "count",
+                WireValue::from("new"),
+            )
             .expect("known signal");
         assert_eq!(patch.operations.len(), 3);
         updated_document.apply_patch(&patch).unwrap();
-        let changed = updated_document.nodes.iter()
-            .filter(|node| node.properties.get("name") == Some(&WireValue::from("count"))
-                || node.properties.get("signal") == Some(&WireValue::from("count")))
+        let changed = updated_document
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.properties.get("name") == Some(&WireValue::from("count"))
+                    || node.properties.get("signal") == Some(&WireValue::from("count"))
+            })
             .collect::<Vec<_>>();
         assert_eq!(changed.len(), 3);
-        assert!(changed.iter().all(|node| {
-            node.properties.get("value") == Some(&WireValue::from("new"))
-        }));
+        assert!(changed
+            .iter()
+            .all(|node| { node.properties.get("value") == Some(&WireValue::from("new")) }));
     }
 
     #[test]
@@ -2187,13 +2213,18 @@ fn view() -> Html { <section nulang-scope="global">Static</section> }
         for node in document.nodes.iter() {
             assert!(ids.insert(node.id.as_str()), "node IDs must remain unique");
         }
-        let reads = document.nodes.iter()
+        let reads = document
+            .nodes
+            .iter()
             .filter(|node| node.kind == "signal_read")
             .collect::<Vec<_>>();
         assert_eq!(reads.len(), 4);
-        let repeated_ids = reads.iter()
-            .filter(|node| node.properties.get("signal")
-                == Some(&nulang_ui_protocol::WireValue::from("a:b")))
+        let repeated_ids = reads
+            .iter()
+            .filter(|node| {
+                node.properties.get("signal")
+                    == Some(&nulang_ui_protocol::WireValue::from("a:b"))
+            })
             .map(|node| node.id.as_str())
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(repeated_ids.len(), 3);
