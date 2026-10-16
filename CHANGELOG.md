@@ -3,6 +3,10 @@
 - **HTTP response writer rejects malformed header names/values and caller-owned framing headers.** Invalid responses emit a fixed 500 response instead of permitting CR/LF header injection, duplicate Content-Length, or a conflicting Transfer-Encoding.
 - **Web cookie helpers fail closed on unsafe input.** Cookie names must follow HTTP token syntax and values must be valid cookie octets; malformed cookie inputs are discarded until the public API can return typed errors. Regression tests cover HTTP wire output and cookie attribute/header injection.
 
+### Web static-root containment — 2026-10-15
+- **Experimental Web static file serving refuses parent traversal and symlinks escaping configured roots.** Canonical candidate paths must remain inside their canonicalized static or output root, and normal in-root files remain serveable.
+- **A filesystem regression verifies parent and symlink escape rejection.** This is a clean current-main successor to draft #1676; it does not change SSE or claim protection from malicious concurrent mutation of a trusted static root.
+
 ### Experimental Web HTML host hardening — 2026-10-15
 - **`Web.html` now validates dynamic element and attribute names and URL-bearing attributes before rendering.** Unsafe markup and scriptable URL schemes fail closed; quoted attribute delimiters are escaped while already escaped `Html` text is preserved.
 - **Six focused regression tests cover normal markup, attribute breakouts, event attributes, high-risk elements, obfuscated URLs, and safe relative/HTTP links.** `Web.raw` remains a trusted-only escape hatch; dynamic script/style/SVG and inline style/event attributes are intentionally rejected pending a future typed context-aware API.
