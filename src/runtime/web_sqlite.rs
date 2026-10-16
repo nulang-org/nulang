@@ -37,6 +37,11 @@ impl WebSqliteStore {
             return Err(invalid("WebSqliteStore requires a file-backed database"));
         }
         let db_path = path.to_str().ok_or_else(|| invalid("database path must be UTF-8"))?;
+        // Reject SQLite URI forms, including file::memory:?cache=shared.
+        // A durable host store must never accidentally open ephemeral storage.
+        if db_path.starts_with("file:") {
+            return Err(invalid("SQLite URI paths are not supported by durable web storage"));
+        }
         let runtime = tokio::runtime::Runtime::new().map_err(sql_error)?;
         let database = runtime.block_on(async {
             libsql::Builder::new_local(db_path)
