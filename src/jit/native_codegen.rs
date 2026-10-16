@@ -192,6 +192,37 @@ mod tests {
     use super::*;
     use crate::bytecode::{Instruction, OpCode};
 
+    // Inspection is intentionally test-only: no /proc reads, maps parsing, or
+    // permission probes are introduced into production compilation/execution.
+    #[cfg(target_os = "linux")]
+    fn assert_jit_entry_has_w_x_mapping(ptr: *const u8) {
+        let address = ptr as usize;
+        let maps = std::fs::read_to_string("/proc/self/maps")
+            .expect("Linux /proc/self/maps must be readable for the W^X regression");
+        let permissions = maps
+            .lines()
+            .find_map(|line| {
+                let mut fields = line.split_whitespace();
+                let range = fields.next()?;
+                let perms = fields.next()?;
+                let (start, end) = range.split_once('-')?;
+                let start = usize::from_str_radix(start, 16).ok()?;
+                let end = usize::from_str_radix(end, 16).ok()?;
+                (start <= address && address < end).then_some(perms)
+            })
+            .expect("compiled JIT entry must belong to a mapped page");
+
+        let flags = permissions.as_bytes();
+        assert_eq!(
+            flags.get(2), Some(&b'x'),
+            "compiled JIT entry must be executable, got {permissions}"
+        );
+        assert_ne!(
+            flags.get(1), Some(&b'w'),
+            "compiled JIT entry must not be writable, got {permissions}"
+        );
+    }
+
     #[test]
     fn test_cranelift_codegen_compiles_fast_and_optimized_scalar_requests() {
         let mut codegen = CraneliftCodegen::new().expect("native Cranelift backend");
@@ -200,6 +231,8 @@ mod tests {
             Instruction::new3(OpCode::IAdd, 0, 0, 0),
         ];
         let native_calls = HashMap::new();
+        #[cfg(target_os = "linux")]
+        let mut compiled_entries = Vec::new();
 
         for (symbol, optimization) in [
             ("codegen_fast", CodegenOptimization::Fast),
@@ -218,6 +251,18 @@ mod tests {
                 })
                 .expect("scalar request should compile");
             assert!(!ptr.is_null());
+            #[cfg(target_os = "linux")]
+            {
+                assert_jit_entry_has_w_x_mapping(ptr);
+                compiled_entries.push(ptr);
+            }
+        }
+
+        // Tier-2 compilation must not turn already-published tier-1 pages
+        // writable again. Check both entrypoints after both compilations.
+        #[cfg(target_os = "linux")]
+        for ptr in compiled_entries {
+            assert_jit_entry_has_w_x_mapping(ptr);
         }
     }
 }
