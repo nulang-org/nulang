@@ -1576,6 +1576,40 @@ fn main() {
     }
 
     #[test]
+    fn test_fmt_refuses_export_and_opaque_type_modifiers() {
+        for source in [
+            "pub type Color = Red | Blue",
+            "opaque type Token = String",
+        ] {
+            let tokens = crate::lexer::Lexer::new(source)
+                .lex()
+                .expect("fixture should lex");
+            crate::parser::Parser::new(tokens)
+                .parse_module()
+                .expect("fixture should parse");
+            assert!(
+                format_source(source).is_err(),
+                "formatter must not remove type visibility or opacity: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fmt_refuses_nonlocal_actor_state_model() {
+        let source = "actor Counter {\n  state durable count: Int = 0\n  behavior ping() { 1 }\n}\n";
+        let tokens = crate::lexer::Lexer::new(source)
+            .lex()
+            .expect("fixture should lex");
+        crate::parser::Parser::new(tokens)
+            .parse_module()
+            .expect("fixture should parse");
+        assert!(
+            format_source(source).is_err(),
+            "formatter must not discard durable state metadata"
+        );
+    }
+
+    #[test]
     fn test_fmt_does_not_confuse_url_string_with_comment() {
         let source = "fn main() { perform IO.print(\"https://example.com/test\") }";
         assert!(
