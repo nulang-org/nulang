@@ -2669,6 +2669,26 @@ fn connection_read_loop(
     let _ = stream.shutdown();
 }
 
+/// Retire only the connection on which the failed write occurred.
+/// The listener/reader can install a newer generation while the sender is
+/// between its write lock and its cleanup lock.
+#[cfg(feature = "tcp")]
+fn retire_failed_sender_generation(
+    connections: &mut HashMap<NodeId, TcpConnection>,
+    node_id: NodeId,
+    failed_generation: Option<u64>,
+) -> Option<TcpConnection> {
+    let generation = failed_generation?;
+    if connections
+        .get(&node_id)
+        .is_some_and(|conn| conn.generation == generation)
+    {
+        connections.remove(&node_id)
+    } else {
+        None
+    }
+}
+
 /// Sender thread entry point.
 ///
 /// Drains the outgoing queue, looks up (or creates) the TCP connection
@@ -2732,15 +2752,19 @@ fn sender_thread(
         // correlated with the logical operation that produced this packet.
         let bytes = outgoing.packet.to_bytes(outgoing.seq);
 
-        let result = {
+        let (result, attempted_generation) = {
             let mut conns = lock_ignore_poison(&connections);
             if let Some(conn) = conns.get_mut(&outgoing.to_node) {
-                conn.send_packet(&bytes)
+                let generation = conn.generation;
+                (conn.send_packet(&bytes), Some(generation))
             } else {
-                Err(io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    "connection disappeared",
-                ))
+                (
+                    Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "connection disappeared",
+                    )),
+                    None,
+                )
             }
         };
 
@@ -2756,7 +2780,9 @@ fn sender_thread(
                 reason: TransportSendFailureReason::Write,
             });
             let mut conns = lock_ignore_poison(&connections);
-            if let Some(conn) = conns.remove(&outgoing.to_node) {
+            if let Some(conn) =
+                retire_failed_sender_generation(&mut conns, outgoing.to_node, attempted_generation)
+            {
                 let _ = conn.stream.shutdown();
             }
         }
@@ -2849,6 +2875,54 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     #[cfg(feature = "tcp")]
     use std::thread::sleep;
+
+    /// A stale writer failure must never evict a replacement connection.
+    /// This covers the sender-thread gap between writing under the pool lock
+    /// and retiring the failed socket after reacquiring that lock.
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn test_failed_sender_generation_preserves_replacement_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let dialled = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_accepted, remote_addr) = listener.accept().unwrap();
+        let node_id = NodeId(9_001);
+        let stale_generation = next_connection_generation();
+        let replacement_generation = next_connection_generation();
+        let mut connections = HashMap::new();
+        connections.insert(
+            node_id,
+            TcpConnection {
+                node_id,
+                generation: replacement_generation,
+                addr: remote_addr,
+                stream: TransportStream::Raw(dialled),
+                last_activity: Instant::now(),
+            },
+        );
+
+        assert!(
+            retire_failed_sender_generation(&mut connections, node_id, Some(stale_generation),)
+                .is_none(),
+            "failed write on stale connection must not remove replacement"
+        );
+        assert_eq!(
+            connections.get(&node_id).map(|conn| conn.generation),
+            Some(replacement_generation)
+        );
+        assert!(
+            retire_failed_sender_generation(&mut connections, node_id, None).is_none(),
+            "missing connection during a failed send must not evict a new one"
+        );
+        assert_eq!(connections.len(), 1);
+        let retired = retire_failed_sender_generation(
+            &mut connections,
+            node_id,
+            Some(replacement_generation),
+        )
+        .expect("only the matching failed generation may be retired");
+        assert_eq!(retired.generation, replacement_generation);
+        assert!(connections.is_empty());
+    }
 
     // ------------------------------------------------------------------
     // 1. NodeId hashing
