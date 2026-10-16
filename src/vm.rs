@@ -3732,8 +3732,7 @@ impl VM {
                 // The compiled region entered and made progress before the
                 // re-entrant call failed. Charge a conservative single unit:
                 // exact partial-region accounting is intentionally deferred.
-                self.logical_reduction_count =
-                    self.logical_reduction_count.saturating_add(1);
+                self.logical_reduction_count = self.logical_reduction_count.saturating_add(1);
                 self.jit_pending_error = Some(msg);
                 return true;
             }
@@ -8161,9 +8160,9 @@ mod vm_tests {
             .unwrap_or(0);
         assert!(compiled > 0, "loop body must have been JIT-compiled");
         assert!(
-            vm.logical_reduction_count() >= 11_000,
+            hot_vm.logical_reduction_count() >= 11_000,
             "JIT regions must contribute backend-neutral logical bytecode work; got {}",
-            vm.logical_reduction_count()
+            hot_vm.logical_reduction_count()
         );
     }
 
