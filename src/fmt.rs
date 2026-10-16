@@ -198,8 +198,13 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             name,
             type_params,
             variants,
+            public,
             ..
         } => {
+            if *public {
+                *had_unhandled = true;
+                return;
+            }
             out.push_str(&format!("{}type {}", sp, name));
             if !type_params.is_empty() {
                 out.push_str(&format!("[{}]", type_params.join(", ")));
@@ -220,8 +225,14 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             name,
             type_params,
             body,
+            opaque,
+            public,
             ..
         } => {
+            if *opaque || *public {
+                *had_unhandled = true;
+                return;
+            }
             out.push_str(&format!("{}type {}", sp, name));
             if !type_params.is_empty() {
                 out.push_str(&format!("[{}]", type_params.join(", ")));
@@ -261,6 +272,9 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
                 || *virtual_
                 || !key_params.is_empty()
                 || implements.is_some()
+                || state_fields
+                    .iter()
+                    .any(|(_, model, _, _)| !matches!(model, crate::ast::StateModel::Local))
             {
                 *had_unhandled = true;
                 return;
