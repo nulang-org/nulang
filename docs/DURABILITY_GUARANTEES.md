@@ -14,6 +14,23 @@ The executable contract spans:
 The end-to-end deterministic release gate is
 `tests/durable_effect_failure_matrix.rs`.
 
+## Workflow creation store boundary
+
+A workflow start must atomically persist `WorkflowStarted` and the initial
+snapshot in one `DurableTransition`. This is implemented for stores that
+support `commit_transition` (currently the in-memory and libSQL/SQLite
+implementations). Unsupported stores return `Unsupported` before publishing
+a workflow actor; no fallback to separate start-event and snapshot writes is
+allowed on the strict atomic path.
+
+**CLI compatibility:** the `nula run` durable-store default remains the
+JSON-file backend, which does not implement atomic transitions. This means
+strict atomic workflow creation is not yet usable through that default store.
+Configure a supported atomic backend when embedding the runtime; a CLI store
+selection and migration path are required before treating this contract as a
+production-ready default. Existing JSON snapshots are legacy histories, not
+automatically upgraded atomic transition records.
+
 ## What Nulang can guarantee locally
 
 For one logical durable external effect, the runtime contract is:
