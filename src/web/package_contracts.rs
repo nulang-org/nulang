@@ -406,6 +406,48 @@ fn web_main() {
     }
 
     #[test]
+    fn conflicting_registrations_fail_contract_extraction() {
+        let module = parse(
+            r#"
+fn first() -> String { "first" }
+fn second() -> String { "second" }
+fn web_main() {
+    perform Web.route("GET", "/status", first)
+    perform Web.route("GET", "/status", second)
+}
+"#,
+        );
+
+        let compiled = compile_modules_contracts(&[module]);
+        assert_eq!(compiled.routes.len(), 1);
+        assert!(
+            compiled.diagnostics.iter().any(|diagnostic| {
+                diagnostic.contains("GET /status")
+                    && diagnostic.contains("conflicting route declarations")
+            }),
+            "conflicting duplicate route was silently discarded: {:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn identical_registrations_can_still_be_deduplicated() {
+        let module = parse(
+            r#"
+fn status() -> String { "ok" }
+fn web_main() {
+    perform Web.route("GET", "/status", status)
+    perform Web.route("GET", "/status", status)
+}
+"#,
+        );
+
+        let compiled = compile_modules_contracts(&[module]);
+        assert_eq!(compiled.routes.len(), 1);
+        assert!(compiled.diagnostics.is_empty());
+    }
+
+    #[test]
     fn recognizes_public_route_helper_calls() {
         let module = parse(
             r#"
