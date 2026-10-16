@@ -13,6 +13,24 @@ use crate::types::{NuError, NuResult, Span};
 /// Returns an error if any construct is not yet supported by the formatter
 /// (rather than silently dropping or corrupting it).
 pub fn format_source(source: &str) -> Result<String, String> {
+    // The AST printer cannot round-trip comments or shebangs yet.
+    // Reject rather than silently delete user-authored source text.
+    if source.starts_with("#!") {
+        return Err("formatting refused: shebangs cannot be preserved safely".to_string());
+    }
+    let tokens = crate::lexer::Lexer::new(source)
+        .lex_with_comments()
+        .map_err(|e| e.to_string())?;
+    if tokens.iter().any(|token| {
+        matches!(
+            token.kind,
+            crate::lexer::TokenKind::Comment(_)
+                | crate::lexer::TokenKind::DocComment(_)
+        )
+    }) {
+        return Err("formatting refused: comments cannot be preserved safely".to_string());
+    }
+
     let mut lexer = crate::lexer::Lexer::new(source);
     let tokens = lexer.lex().map_err(|e| e.to_string())?;
     let mut parser = crate::parser::Parser::new(tokens);
