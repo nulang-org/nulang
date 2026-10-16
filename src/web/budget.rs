@@ -111,7 +111,9 @@ fn add_js_file_size(path: &Path, total: &mut usize) -> std::io::Result<()> {
         return Err(invalid_js_asset(path));
     }
     let bytes = usize::try_from(metadata.len()).map_err(|_| invalid_js_asset(path))?;
-    *total = total.checked_add(bytes).ok_or_else(|| invalid_js_asset(path))?;
+    *total = total
+        .checked_add(bytes)
+        .ok_or_else(|| invalid_js_asset(path))?;
     Ok(())
 }
 
