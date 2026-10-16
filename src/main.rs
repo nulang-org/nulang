@@ -1981,22 +1981,24 @@ fn run_source(
                     .decls
                     .iter()
                     .any(|d| matches!(d, nulang::ast::Decl::Workflow { .. }));
-                let has_durable = has_workflow || ast.decls.iter().any(|d| {
-                    matches!(
-                        d,
-                        nulang::ast::Decl::Actor {
-                            persistent: true,
-                            ..
-                        }
-                    )
-                }) || matches!(
-                    ast.decls.iter().find(|d| matches!(d, nulang::ast::Decl::Actor { .. })),
-                    Some(nulang::ast::Decl::Actor { state_fields, .. })
-                        if state_fields.iter().any(|(_, model, _, _)| matches!(
-                            model,
-                            nulang::ast::StateModel::Durable | nulang::ast::StateModel::EventSourced
-                        ))
-                );
+                let has_durable = has_workflow
+                    || ast.decls.iter().any(|d| {
+                        matches!(
+                            d,
+                            nulang::ast::Decl::Actor {
+                                persistent: true,
+                                ..
+                            }
+                        )
+                    })
+                    || matches!(
+                        ast.decls.iter().find(|d| matches!(d, nulang::ast::Decl::Actor { .. })),
+                        Some(nulang::ast::Decl::Actor { state_fields, .. })
+                            if state_fields.iter().any(|(_, model, _, _)| matches!(
+                                model,
+                                nulang::ast::StateModel::Durable | nulang::ast::StateModel::EventSourced
+                            ))
+                    );
                 let configured_store = store_path
                     .map(str::to_owned)
                     .or_else(|| std::env::var("NULANG_STORE_PATH").ok());
@@ -2081,22 +2083,23 @@ fn run_source(
                 .decls
                 .iter()
                 .any(|d| matches!(d, nulang::ast::Decl::Workflow { .. }));
-            let has_durable = has_workflow || ast.decls.iter().any(|d| {
-                matches!(
-                    d,
-                    nulang::ast::Decl::Actor {
-                        persistent: true,
-                        ..
-                    }
-                ) || matches!(
-                    d,
-                    nulang::ast::Decl::Actor { state_fields, .. }
-                    if state_fields.iter().any(|(_, model, _, _)| matches!(
-                        model,
-                        nulang::ast::StateModel::Durable | nulang::ast::StateModel::EventSourced
-                    ))
-                )
-            });
+            let has_durable = has_workflow
+                || ast.decls.iter().any(|d| {
+                    matches!(
+                        d,
+                        nulang::ast::Decl::Actor {
+                            persistent: true,
+                            ..
+                        }
+                    ) || matches!(
+                        d,
+                        nulang::ast::Decl::Actor { state_fields, .. }
+                        if state_fields.iter().any(|(_, model, _, _)| matches!(
+                            model,
+                            nulang::ast::StateModel::Durable | nulang::ast::StateModel::EventSourced
+                        ))
+                    )
+                });
             let configured_store = store_path
                 .map(str::to_owned)
                 .or_else(|| std::env::var("NULANG_STORE_PATH").ok());
@@ -2227,12 +2230,11 @@ fn install_persistence_store(runtime: &mut nulang::runtime::Runtime, uri: &str) 
                     span: Span::default(),
                 });
             }
-            let store = nulang::runtime::LibsqlStore::new(path).map_err(|e| {
-                NuError::RuntimeError {
+            let store =
+                nulang::runtime::LibsqlStore::new(path).map_err(|e| NuError::RuntimeError {
                     msg: format!("failed to open SQLite store at '{}': {}", path, e),
                     span: Span::default(),
-                }
-            })?;
+                })?;
             runtime.persistence = Box::new(store);
             eprintln!("[durable] atomic SQLite persistent store: {}", path);
             Ok(())
@@ -2880,8 +2882,8 @@ mod tests {
             }
         "#;
 
-        let (ast, checker) = run_frontend(source, None, false, &[], false)
-            .expect("workflow fixture must typecheck");
+        let (ast, checker) =
+            run_frontend(source, None, false, &[], false).expect("workflow fixture must typecheck");
         let module = compile_with_new_pipeline(&ast, "test", &checker)
             .expect("workflow fixture must compile");
         let (_value, runtime) = run_with_runtime(module, None, None)
@@ -2932,14 +2934,21 @@ mod tests {
         install_persistence_store(&mut runtime, &uri).unwrap();
 
         let id = runtime
-            .try_spawn_workflow_actor("SqliteCliWorkflow", Box::new(Vec::new), std::collections::HashMap::new())
+            .try_spawn_workflow_actor(
+                "SqliteCliWorkflow",
+                Box::new(Vec::new),
+                std::collections::HashMap::new(),
+            )
             .unwrap();
         let tail = runtime
             .persistence
             .load_durable_tail_position(id)
             .unwrap()
             .expect("CLI SQLite URI must use an atomic-capable store");
-        assert_eq!(runtime.persistence.load_snapshot(id).unwrap().sequence, tail.sequence);
+        assert_eq!(
+            runtime.persistence.load_snapshot(id).unwrap().sequence,
+            tail.sequence
+        );
         drop(runtime);
         let _ = std::fs::remove_file(db_path);
     }
