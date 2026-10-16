@@ -240,7 +240,6 @@ fn external_wait_is_not_requeued_without_a_completion() {
     );
 }
 
-
 #[test]
 fn synchronous_actor_ask_runs_to_completion_past_instruction_quantum() {
     use crate::bytecode::{BehaviorTableEntry, Instruction, OpCode};
