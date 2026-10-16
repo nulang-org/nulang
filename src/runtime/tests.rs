@@ -8940,9 +8940,11 @@ fn saga_compensation_refuses_to_redrive_ambiguous_external_outcome() {
     let mut rt = Runtime::new();
     let mut models = HashMap::new();
     models.insert("step_index".to_owned(), StateModel::Durable);
+    // The native workflow compatibility actor reserves behavior index 0
+    // for __timer_fired; registered steps occupy indices 1 and 2.
     let actor_id = rt.spawn_workflow_actor(
         "AmbiguousSaga",
-        Box::new(|| vec![("step_index".to_owned(), Value::int(2))]),
+        Box::new(|| vec![("step_index".to_owned(), Value::int(3))]),
         models,
     );
     rt.actors.get_mut(&actor_id).unwrap().register_behavior("reserve", |_actor, _| {});
