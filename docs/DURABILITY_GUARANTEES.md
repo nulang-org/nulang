@@ -72,7 +72,9 @@ delegates rather than inferring a stronger guarantee.
 occurrence. It rejects missing site metadata, a non-`PerformAsync` opcode, a
 constant-pool operation mismatch, and a missing execution key. It derives the
 same logical `DurableEffectId` as compiler-owned semantic-site identity rather
-than inventing another effect identifier in every provider integration.
+than inventing another effect identifier in every provider integration. Callers
+must first admit a verified/pinned compiled artifact: checking an opcode and
+constant does not establish semantic-ID provenance from untrusted metadata.
 
 `tests/effect_site_artifact_metadata.rs` now checks this bridge against a
 compiled `.nula` actor behavior, an NBC encode/decode round trip, formatting
