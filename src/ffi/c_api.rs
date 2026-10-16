@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr, CString};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::effect_checker::{CapContext, CapabilityAnalyzer, EffectChecker};
 use crate::lexer::Lexer;
@@ -22,6 +23,20 @@ use crate::vm::{Value, VM};
 // ---------------------------------------------------------------------------
 // Opaque runtime handle
 // ---------------------------------------------------------------------------
+
+/// Opaque value handles are never raw VM bit patterns. IDs are process-unique,
+/// monotonically allocated, and scoped to the runtime that stores them.
+static NEXT_OWNED_HANDLE: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone)]
+enum OwnedHostValue {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    String(String),
+    Nil,
+    Unit,
+}
 
 /// An opaque runtime context that owns compiled modules and error state.
 #[repr(C)]
@@ -40,6 +55,8 @@ pub struct NulangRuntime {
     error_cstring: Option<CString>,
     /// Holds CStrings returned by `nulang_value_to_string`.
     string_cache: Vec<CString>,
+    /// Stable, runtime-owned values independent of VM frames and module pools.
+    owned_values: HashMap<u64, OwnedHostValue>,
 }
 
 impl NulangRuntime {
@@ -54,7 +71,53 @@ impl NulangRuntime {
             last_error: None,
             error_cstring: None,
             string_cache: Vec::new(),
+            owned_values: HashMap::new(),
         }
+    }
+
+    fn store_owned(&mut self, value: OwnedHostValue) -> u64 {
+        match NEXT_OWNED_HANDLE
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        {
+            Ok(id) => {
+                self.owned_values.insert(id, value);
+                id
+            }
+            Err(_) => {
+                self.last_error = Some("Nulang owned-value handle space exhausted".to_string());
+                0
+            }
+        }
+    }
+
+    fn capture_owned(&mut self, module_handle: usize, value: Value) -> u64 {
+        let Some(module_index) = self.module_index_for_handle(module_handle) else {
+            self.last_error = Some("invalid compiled module handle".to_string());
+            return 0;
+        };
+        let owned = if let Some(id) = value.as_string_id() {
+            match self.resolve_module_string(id as usize, Some(module_index)) {
+                Ok(s) => OwnedHostValue::String(s),
+                Err(message) => {
+                    self.last_error = Some(message);
+                    return 0;
+                }
+            }
+        } else if let Some(i) = value.as_int() {
+            OwnedHostValue::Int(i)
+        } else if let Some(f) = value.as_float() {
+            OwnedHostValue::Float(f)
+        } else if let Some(b) = value.as_bool() {
+            OwnedHostValue::Bool(b)
+        } else if value.is_nil() {
+            OwnedHostValue::Nil
+        } else if value.is_unit() {
+            OwnedHostValue::Unit
+        } else {
+            self.last_error = Some("value type is not supported by the owned C ABI".to_string());
+            return 0;
+        };
+        self.store_owned(owned)
     }
 
     fn set_error(&mut self, err: NuError) {
@@ -718,6 +781,274 @@ pub unsafe extern "C" fn nulang_value_to_string_in_module(
     }
 }
 
+/// Copy a value into a runtime-owned opaque handle, retaining string content
+/// independently of the originating module's constant-pool index.
+///
+/// Returns a nonzero handle on success; 0 on error. The supplied module must
+/// belong to this runtime. Arbitrary pointer-tagged values are rejected.
+///
+/// # Safety
+/// `runtime` must be valid and exclusively accessible for the call.
+#[no_mangle]
+pub unsafe extern "C" fn nulang_owned_value_from_module(
+    runtime: *mut NulangRuntime,
+    module_handle: i64,
+    raw: NulangValue,
+) -> u64 {
+    if runtime.is_null() {
+        return 0;
+    }
+    let rt = unsafe { &mut *runtime };
+    rt.clear_error();
+    if module_handle < 0 {
+        rt.last_error = Some("invalid compiled module handle".to_string());
+        return 0;
+    }
+    match value_from_c(raw) {
+        Ok(value) => rt.capture_owned(module_handle as usize, value),
+        Err(message) => {
+            rt.last_error = Some(message.to_string());
+            0
+        }
+    }
+}
+
+/// Run a compiled module and return an opaque owned value (0 on error).
+/// This avoids exporting a raw VM-tagged value to the embedding host.
+///
+/// # Safety
+/// `runtime` must be a valid, exclusively accessed runtime pointer.
+#[no_mangle]
+pub unsafe extern "C" fn nulang_run_owned(runtime: *mut NulangRuntime, module_handle: i64) -> u64 {
+    if runtime.is_null() || module_handle < 0 {
+        return 0;
+    }
+    let rt = unsafe { &mut *runtime };
+    match rt.run(module_handle as usize) {
+        Some(value) => rt.capture_owned(module_handle as usize, value),
+        None => 0,
+    }
+}
+
+/// Construct an owned integer value. Returns 0 on invalid runtime/overflow.
+///
+/// # Safety
+/// `runtime` must be valid and exclusively accessed.
+#[no_mangle]
+pub unsafe extern "C" fn nulang_owned_value_int_new(
+    runtime: *mut NulangRuntime,
+    value: i64,
+) -> u64 {
+    if runtime.is_null() {
+        return 0;
+    }
+    let rt = unsafe { &mut *runtime };
+    rt.clear_error();
+    if Value::int(value).as_int() != Some(value) {
+        rt.last_error = Some("integer is outside Nulang's representable Int range".to_string());
+        return 0;
+    }
+    rt.store_owned(OwnedHostValue::Int(value))
+}
+
+/// Construct an owned string copied from a UTF-8 C string.
+///
+/// # Safety
+/// `runtime` must be valid and exclusively accessed; `value` must be a
+/// valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn nulang_owned_value_string_new(
+    runtime: *mut NulangRuntime,
+    value: *const c_char,
+) -> u64 {
+    if runtime.is_null() {
+        return 0;
+    }
+    let rt = unsafe { &mut *runtime };
+    rt.clear_error();
+    if value.is_null() {
+        rt.last_error = Some("null string pointer".to_string());
+        return 0;
+    }
+    match unsafe { CStr::from_ptr(value).to_str() } {
+        Ok(s) => rt.store_owned(OwnedHostValue::String(s.to_string())),
+        Err(_) => {
+            rt.last_error = Some("invalid UTF-8 string".to_string());
+            0
+        }
+    }
+}
+
+/// Invoke an exported function with runtime-owned handle arguments and return
+/// another runtime-owned handle, without exposing raw VM value bits.
+///
+/// # Safety
+/// `runtime` must be valid/exclusively accessible; `name` a valid C string;
+/// `args` must point to `arg_count` handles, or be null if count is zero.
+#[no_mangle]
+pub unsafe extern "C" fn nulang_call_function_owned(
+    runtime: *mut NulangRuntime,
+    module_handle: i64,
+    name: *const c_char,
+    args: *const u64,
+    arg_count: usize,
+) -> u64 {
+    if runtime.is_null() {
+        return 0;
+    }
+    let rt = unsafe { &mut *runtime };
+    rt.clear_error();
+    if module_handle < 0 || rt.module_index_for_handle(module_handle as usize).is_none() {
+        rt.last_error = Some("invalid compiled module handle".to_string());
+        return 0;
+    }
+    if name.is_null() || (arg_count > 0 && args.is_null()) {
+        rt.last_error = Some("invalid owned call arguments".to_string());
+        return 0;
+    }
+    // A Rust slice cannot contain more than isize::MAX bytes. Check the
+    // caller's untrusted length before from_raw_parts, which would otherwise
+    // have undefined behavior for an impossible argument count.
+    if arg_count > isize::MAX as usize / std::mem::size_of::<u64>() {
+        rt.last_error = Some("owned call argument count exceeds Rust slice limits".to_string());
+        return 0;
+    }
+    let name = match unsafe { CStr::from_ptr(name).to_str() } {
+        Ok(name) => name,
+        Err(_) => {
+            rt.last_error = Some("invalid UTF-8 function name".to_string());
+            return 0;
+        }
+    };
+    let handles = if arg_count == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(args, arg_count) }
+    };
+    // Clone owned values before interning strings so no reference into the
+    // registry aliases a mutable borrow of the target module's constant pool.
+    let mut owned_args = Vec::with_capacity(arg_count);
+    for &handle in handles {
+        let Some(value) = rt.owned_values.get(&handle) else {
+            rt.last_error = Some("invalid or foreign owned-value handle".to_string());
+            return 0;
+        };
+        owned_args.push(value.clone());
+    }
+    let mut raw_args = Vec::with_capacity(arg_count);
+    for value in owned_args {
+        let value = match value {
+            OwnedHostValue::Int(i) => Value::int(i),
+            OwnedHostValue::Float(f) => Value::float(f),
+            OwnedHostValue::Bool(b) => Value::bool(b),
+            OwnedHostValue::Nil => Value::nil(),
+            OwnedHostValue::Unit => Value::unit(),
+            OwnedHostValue::String(s) => match rt.add_module_string(module_handle as usize, &s) {
+                Some(value) => value,
+                None => {
+                    rt.last_error = Some("failed to intern owned string".to_string());
+                    return 0;
+                }
+            },
+        };
+        raw_args.push(NulangValue::from(value));
+    }
+    match rt.call_function(module_handle as usize, name, &raw_args) {
+        Some(value) => rt.capture_owned(module_handle as usize, value),
+        None => {
+            if rt.last_error.is_none() {
+                rt.last_error = Some("unknown exported function or invalid module".to_string());
+            }
+            0
+        }
+    }
+}
+
+/// Return an owned integer through an output pointer, failing closed when the
+/// handle belongs to another runtime or has been released.
+///
+/// # Safety
+/// `runtime` must be valid; `out` must point to writable i64 storage.
+#[no_mangle]
+pub unsafe extern "C" fn nulang_owned_value_int(
+    runtime: *mut NulangRuntime,
+    handle: u64,
+    out: *mut i64,
+) -> bool {
+    if runtime.is_null() || out.is_null() {
+        return false;
+    }
+    let rt = unsafe { &mut *runtime };
+    rt.clear_error();
+    match rt.owned_values.get(&handle) {
+        Some(OwnedHostValue::Int(value)) => {
+            unsafe { *out = *value };
+            true
+        }
+        _ => {
+            rt.last_error = Some("invalid, foreign, or non-integer owned-value handle".to_string());
+            false
+        }
+    }
+}
+
+/// Return a runtime-owned C string for an owned value. The returned pointer
+/// may be released with `nulang_free_string`. Strings containing interior
+/// NUL bytes are rejected instead of truncated.
+///
+/// # Safety
+/// `runtime` must be valid and exclusively accessed.
+#[no_mangle]
+pub unsafe extern "C" fn nulang_owned_value_to_string(
+    runtime: *mut NulangRuntime,
+    handle: u64,
+) -> *const c_char {
+    if runtime.is_null() {
+        return std::ptr::null();
+    }
+    let rt = unsafe { &mut *runtime };
+    rt.clear_error();
+    let Some(value) = rt.owned_values.get(&handle) else {
+        rt.last_error = Some("invalid or foreign owned-value handle".to_string());
+        return std::ptr::null();
+    };
+    let text = match value {
+        OwnedHostValue::String(s) => s.clone(),
+        OwnedHostValue::Int(i) => i.to_string(),
+        OwnedHostValue::Float(f) => f.to_string(),
+        OwnedHostValue::Bool(b) => b.to_string(),
+        OwnedHostValue::Nil => "nil".to_string(),
+        OwnedHostValue::Unit => "()".to_string(),
+    };
+    match CString::new(text) {
+        Ok(cstr) => {
+            let ptr = cstr.as_ptr();
+            rt.string_cache.push(cstr);
+            ptr
+        }
+        Err(_) => {
+            rt.last_error = Some("owned string contains an interior NUL byte".to_string());
+            std::ptr::null()
+        }
+    }
+}
+
+/// Release an owned value handle; false for stale or other-runtime handles.
+///
+/// # Safety
+/// `runtime` must be valid and exclusively accessed.
+#[no_mangle]
+pub unsafe extern "C" fn nulang_owned_value_release(
+    runtime: *mut NulangRuntime,
+    handle: u64,
+) -> bool {
+    if runtime.is_null() || handle == 0 {
+        return false;
+    }
+    let rt = unsafe { &mut *runtime };
+    rt.owned_values.remove(&handle).is_some()
+}
+
 /// Register a native C callback scoped to a single embedded runtime.
 ///
 /// Names registered here cannot be resolved by other embedded runtimes.
@@ -937,6 +1268,172 @@ mod tests {
             nulang_runtime_free(owner);
             nulang_runtime_free(unregistered);
         }
+    }
+
+    #[test]
+    fn test_owned_handles_capture_distinct_module_strings_and_survive_new_compilation() {
+        let rt = nulang_runtime_new();
+        let a = CString::new("1").unwrap();
+        let b = CString::new("2").unwrap();
+        let first = unsafe { nulang_compile(rt, a.as_ptr()) };
+        let second = unsafe { nulang_compile(rt, b.as_ptr()) };
+        assert!(first >= 0 && second >= 0);
+
+        let a = CString::new("first owner").unwrap();
+        let b = CString::new("second owner").unwrap();
+        let first_raw = unsafe { nulang_module_string(rt, first, a.as_ptr()) };
+        let second_raw = unsafe { nulang_module_string(rt, second, b.as_ptr()) };
+        assert_eq!(first_raw.raw, second_raw.raw);
+
+        let first_owned = unsafe { nulang_owned_value_from_module(rt, first, first_raw) };
+        let second_owned = unsafe { nulang_owned_value_from_module(rt, second, second_raw) };
+        assert!(first_owned != 0 && second_owned != 0 && first_owned != second_owned);
+        let more = CString::new("3").unwrap();
+        assert!(unsafe { nulang_compile(rt, more.as_ptr()) } >= 0);
+
+        let first_ptr = unsafe { nulang_owned_value_to_string(rt, first_owned) };
+        let second_ptr = unsafe { nulang_owned_value_to_string(rt, second_owned) };
+        assert!(!first_ptr.is_null() && !second_ptr.is_null());
+        assert_eq!(
+            unsafe { CStr::from_ptr(first_ptr) }.to_str().unwrap(),
+            "first owner"
+        );
+        assert_eq!(
+            unsafe { CStr::from_ptr(second_ptr) }.to_str().unwrap(),
+            "second owner"
+        );
+        assert!(unsafe { nulang_owned_value_release(rt, first_owned) });
+        assert!(unsafe { nulang_owned_value_release(rt, second_owned) });
+        unsafe { nulang_runtime_free(rt) };
+    }
+
+    #[test]
+    fn test_owned_handles_are_instance_scoped_and_cannot_be_reused_after_release() {
+        let first = nulang_runtime_new();
+        let second = nulang_runtime_new();
+        let value = unsafe { nulang_owned_value_int_new(first, 57) };
+        assert_ne!(value, 0);
+        let mut out = 0i64;
+        assert!(!unsafe { nulang_owned_value_int(second, value, &mut out) });
+        assert!(!unsafe { nulang_owned_value_release(second, value) });
+        assert!(unsafe { nulang_owned_value_int(first, value, &mut out) });
+        assert_eq!(out, 57);
+        assert!(unsafe { nulang_owned_value_release(first, value) });
+        assert!(!unsafe { nulang_owned_value_int(first, value, &mut out) });
+        assert!(!unsafe { nulang_owned_value_release(first, value) });
+        unsafe {
+            nulang_runtime_free(first);
+            nulang_runtime_free(second);
+        }
+    }
+
+    #[test]
+    fn test_owned_handles_run_and_call_functions_with_string_inputs() {
+        let rt = nulang_runtime_new();
+        let source = CString::new(
+            "fn greet(name: String) -> String { perform String.concat(\"hello \", name) } greet(\"world\")",
+        )
+        .unwrap();
+        let module = unsafe { nulang_compile(rt, source.as_ptr()) };
+        assert!(module >= 0);
+        let first = unsafe { nulang_run_owned(rt, module) };
+        assert_ne!(first, 0);
+        let first_str = unsafe { nulang_owned_value_to_string(rt, first) };
+        assert_eq!(
+            unsafe { CStr::from_ptr(first_str) }.to_str().unwrap(),
+            "hello world"
+        );
+
+        let name = CString::new("Nulang").unwrap();
+        let input = unsafe { nulang_owned_value_string_new(rt, name.as_ptr()) };
+        assert_ne!(input, 0);
+        let function = CString::new("greet").unwrap();
+        let result =
+            unsafe { nulang_call_function_owned(rt, module, function.as_ptr(), &input, 1) };
+        assert_ne!(result, 0);
+        let s = unsafe { nulang_owned_value_to_string(rt, result) };
+        assert!(!s.is_null());
+        assert_eq!(
+            unsafe { CStr::from_ptr(s) }.to_str().unwrap(),
+            "hello Nulang"
+        );
+
+        assert!(unsafe { nulang_owned_value_release(rt, input) });
+        assert!(unsafe { nulang_owned_value_release(rt, first) });
+        assert!(unsafe { nulang_owned_value_release(rt, result) });
+        unsafe { nulang_runtime_free(rt) };
+    }
+
+    #[test]
+    fn test_owned_integer_constructor_rejects_values_outside_nulang_int_range() {
+        let rt = nulang_runtime_new();
+        assert_eq!(unsafe { nulang_owned_value_int_new(rt, i64::MAX) }, 0);
+        assert!(!unsafe { nulang_last_error(rt) }.is_null());
+        let supported = unsafe { nulang_owned_value_int_new(rt, 1024) };
+        assert_ne!(supported, 0);
+        let mut out = 0;
+        assert!(unsafe { nulang_owned_value_int(rt, supported, &mut out) });
+        assert_eq!(out, 1024);
+        assert!(unsafe { nulang_owned_value_release(rt, supported) });
+        unsafe { nulang_runtime_free(rt) };
+    }
+
+    #[test]
+    fn test_owned_call_rejects_impossible_argument_length_before_slice_creation() {
+        let rt = nulang_runtime_new();
+        let source = CString::new("fn id(x: Int) -> Int { x } id(0)").unwrap();
+        let module = unsafe { nulang_compile(rt, source.as_ptr()) };
+        assert!(module >= 0);
+        let function = CString::new("id").unwrap();
+        let argument = unsafe { nulang_owned_value_int_new(rt, 7) };
+        assert_ne!(argument, 0);
+
+        // The pointer is valid for one handle, but this count cannot describe
+        // a Rust slice. It must be rejected before from_raw_parts is called.
+        let impossible_count = isize::MAX as usize / std::mem::size_of::<u64>() + 1;
+        let result = unsafe {
+            nulang_call_function_owned(rt, module, function.as_ptr(), &argument, impossible_count)
+        };
+        assert_eq!(result, 0);
+        let error = unsafe { nulang_last_error(rt) };
+        assert!(!error.is_null());
+        assert!(
+            unsafe { CStr::from_ptr(error) }
+                .to_string_lossy()
+                .contains("argument count"),
+            "oversized argument count should report an explicit C ABI error"
+        );
+
+        let valid =
+            unsafe { nulang_call_function_owned(rt, module, function.as_ptr(), &argument, 1) };
+        assert_ne!(valid, 0);
+        let mut value = 0;
+        assert!(unsafe { nulang_owned_value_int(rt, valid, &mut value) });
+        assert_eq!(value, 7);
+        assert!(unsafe { nulang_owned_value_release(rt, argument) });
+        assert!(unsafe { nulang_owned_value_release(rt, valid) });
+        unsafe { nulang_runtime_free(rt) };
+    }
+
+    #[test]
+    fn test_owned_handle_rejects_pointer_forgery_and_invalid_module() {
+        let rt = nulang_runtime_new();
+        let source = CString::new("1").unwrap();
+        let module = unsafe { nulang_compile(rt, source.as_ptr()) };
+        assert!(module >= 0);
+        let forged = NulangValue {
+            raw: TAG_PTR | 0x1234,
+        };
+        assert_eq!(
+            unsafe { nulang_owned_value_from_module(rt, module, forged) },
+            0
+        );
+        assert_eq!(
+            unsafe { nulang_owned_value_from_module(rt, -1, nulang_value_int_new(7)) },
+            0
+        );
+        assert!(!unsafe { nulang_last_error(rt) }.is_null());
+        unsafe { nulang_runtime_free(rt) };
     }
 
     #[test]

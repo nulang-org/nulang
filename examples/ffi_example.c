@@ -45,21 +45,28 @@ int main(void) {
     printf("string repr: %s\n", repr ? repr : "(null)");
     nulang_free_string(rt, repr);
 
-    /* Call an exported Nulang function from C. */
-    NulangValue name = nulang_module_string(rt, handle, "world");
-    if (nulang_value_is_nil(name)) {
-        print_error(rt, "string creation error");
+    /* The owned-value API avoids leaking raw NaN-tagged values to the host. */
+    NulangOwnedValueHandle name = nulang_owned_value_string_new(rt, "world");
+    if (!name) {
+        print_error(rt, "owned string creation");
         nulang_runtime_free(rt);
         return 1;
     }
 
-    NulangValue args[] = { name };
-    NulangValue greeting = nulang_call_function(rt, handle, "greet", args, 1);
-    print_error(rt, "call error");
+    NulangOwnedValueHandle greeting =
+        nulang_call_function_owned(rt, handle, "greet", &name, 1);
+    if (!greeting) {
+        print_error(rt, "managed function call");
+        nulang_owned_value_release(rt, name);
+        nulang_runtime_free(rt);
+        return 1;
+    }
 
-    const char *greeting_str = nulang_value_to_string_in_module(rt, handle, greeting);
+    const char *greeting_str = nulang_owned_value_to_string(rt, greeting);
     printf("greet(\"world\") = %s\n", greeting_str ? greeting_str : "(null)");
     nulang_free_string(rt, greeting_str);
+    nulang_owned_value_release(rt, greeting);
+    nulang_owned_value_release(rt, name);
 
     nulang_runtime_free(rt);
     return 0;

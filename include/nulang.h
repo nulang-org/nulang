@@ -153,6 +153,59 @@ const char *nulang_value_to_string(NulangRuntime *runtime, NulangValue value);
 bool nulang_free_string(NulangRuntime *runtime, const char *ptr);
 
 /* -------------------------------------------------------------------------- */
+/* Opaque runtime-owned values (preferred embedding API)                     */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Runtime-owned value identifier (0 is invalid).
+ *
+ * Values are copied into the owning runtime and survive later module calls.
+ * Handles are unique across runtime instances and are never reused.
+ * Release each handle before destroying the runtime.
+ */
+typedef uint64_t NulangOwnedValueHandle;
+
+/** Capture a legacy tagged value with explicit module provenance. */
+NulangOwnedValueHandle nulang_owned_value_from_module(NulangRuntime *runtime,
+                                                      int64_t module_handle,
+                                                      NulangValue raw);
+
+/** Run a module and return a runtime-owned value handle (0 on error). */
+NulangOwnedValueHandle nulang_run_owned(NulangRuntime *runtime,
+                                       int64_t module_handle);
+
+/** Create an integer or UTF-8 C-string owned by the given runtime. */
+NulangOwnedValueHandle nulang_owned_value_int_new(NulangRuntime *runtime,
+                                                  int64_t value);
+NulangOwnedValueHandle nulang_owned_value_string_new(NulangRuntime *runtime,
+                                                     const char *value);
+
+/** Invoke an exported function using only handles from this runtime. */
+NulangOwnedValueHandle nulang_call_function_owned(
+    NulangRuntime *runtime,
+    int64_t module_handle,
+    const char *name,
+    const NulangOwnedValueHandle *args,
+    size_t arg_count);
+
+/** Extract an owned integer (false if stale, foreign-runtime or wrong type). */
+bool nulang_owned_value_int(NulangRuntime *runtime,
+                            NulangOwnedValueHandle handle,
+                            int64_t *out);
+
+/**
+ * Convert an owned value into a runtime-managed C string.
+ * Call nulang_free_string to release its buffer. Returns NULL on error.
+ * Strings containing interior NUL cannot be represented in this interface.
+ */
+const char *nulang_owned_value_to_string(NulangRuntime *runtime,
+                                         NulangOwnedValueHandle handle);
+
+/** Release a value handle (false when stale, unknown, or wrong runtime). */
+bool nulang_owned_value_release(NulangRuntime *runtime,
+                                NulangOwnedValueHandle handle);
+
+/* -------------------------------------------------------------------------- */
 /* Native function registration                                                */
 /* -------------------------------------------------------------------------- */
 
