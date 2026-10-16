@@ -248,7 +248,10 @@ mod tests {
             TaskPoll::Cancelled
         });
         assert!(runner.is_quiescent());
-        assert_eq!(runner.into_outcomes().unwrap(), vec![TaskOutcome::Cancelled]);
+        assert_eq!(
+            runner.into_outcomes().unwrap(),
+            vec![TaskOutcome::Cancelled]
+        );
     }
 
     #[test]
@@ -257,9 +260,13 @@ mod tests {
         let a = runner.try_submit().unwrap();
         let b = runner.try_submit().unwrap();
         runner.tick(|id, _| {
-            if id == a { TaskPoll::Pending }
-            else if id == b { TaskPoll::Ready(Ok(2)) }
-            else { unreachable!() }
+            if id == a {
+                TaskPoll::Pending
+            } else if id == b {
+                TaskPoll::Ready(Ok(2))
+            } else {
+                unreachable!()
+            }
         });
         runner.tick(|id, _| {
             assert_eq!(id, a);
