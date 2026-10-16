@@ -473,16 +473,11 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
                             actor.set_state_field("step_index", Value::int(n + 1));
                         }
                     }
-                    let seq = (*self_ptr).next_sequence(actor_id);
-                    let _ = (*self_ptr).persistence.append_workflow_event(
+                    (*self_ptr).commit_resumed_workflow_success(
                         actor_id,
-                        WorkflowEvent::StepCompleted {
-                            sequence: seq,
-                            activation: suspended.activation,
-                            step_name: suspended.step_name,
-                        },
+                        suspended.activation,
+                        suspended.step_name,
                     );
-                    (*self_ptr).checkpoint_actor(actor_id);
                 }
             }
             Err(crate::types::NuError::Suspended(_)) => {
@@ -508,9 +503,17 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
                     (*self_ptr).maybe_schedule_receive_wait(actor_id, receive_timeout);
                 }
             }
-            // Other errors: the send-path result is discarded anyway,
-            // matching step_actor semantics.
-            Err(_) => {}
+            Err(error) => {
+                if (*self_ptr).actor_is_workflow(actor_id) {
+                    (*self_ptr).commit_resumed_workflow_failure(
+                        actor_id,
+                        suspended.activation,
+                        suspended.step_name,
+                        error.to_string(),
+                        suspended.behavior_idx,
+                    );
+                }
+            }
         }
         // End the VM-execution window only after any suspend-state
         // re-capture above: draining deferred wakes runs other actors

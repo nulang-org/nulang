@@ -388,6 +388,57 @@ pub(crate) fn commit_step_completed(
     Ok(())
 }
 
+/// Close a failed workflow activation with its durable state and StepFailed
+/// record in a single fenced commit. Compensation is intentionally separate:
+/// it must not run unless the failure itself has been durably acknowledged.
+pub(crate) fn commit_step_failed(
+    rt: &mut Runtime,
+    actor_id: u64,
+    activation: Option<WorkflowActivationId>,
+    step_name: String,
+    error: String,
+) -> std::io::Result<()> {
+    let expected_previous_sequence = rt.persistence.latest_sequence(actor_id);
+    let sequence = expected_previous_sequence.checked_add(1).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "workflow failed-step transition sequence overflow",
+        )
+    })?;
+    let snapshot = build_actor_snapshot_at_sequence(rt, actor_id, sequence)?.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "failed workflow step requires a live persistent actor",
+        )
+    })?;
+
+    rt.persistence.commit_transition(DurableTransition {
+        version: DURABLE_TRANSITION_VERSION,
+        actor_id,
+        activation_epoch: snapshot.activation_epoch,
+        sequence,
+        expected_previous_sequence,
+        command: None,
+        snapshot: Some(snapshot.clone()),
+        workflow_events: vec![WorkflowEvent::StepFailed {
+            sequence,
+            activation,
+            step_name,
+            error,
+        }],
+        domain_events: vec![],
+        durable_effects: vec![],
+        outbox: vec![],
+    })?;
+
+    rt.maybe_shadow_replicate(actor_id, &snapshot);
+    if let Some(actor) = rt.actors.get_mut(&actor_id) {
+        actor.sequence = sequence;
+        actor.dirty_fields.clear();
+    }
+    Ok(())
+}
+
 /// Snapshot the durable and CRDT state of a persistent actor.
 ///
 /// This wrapper intentionally preserves the legacy best-effort API for call

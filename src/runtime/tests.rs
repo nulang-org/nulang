@@ -8710,3 +8710,191 @@ fn confirmed_node_removal_forgets_crdt_receiver_knowledge() {
         "a peer that rejoins after confirmed removal must receive full state"
     );
 }
+
+
+#[test]
+fn failed_workflow_step_commits_state_and_terminal_event_on_one_atomic_tail() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("count".to_string(), StateModel::Durable);
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "AtomicFailure",
+            Box::new(|| vec![("count".into(), Value::int(0))]),
+            models,
+        )
+        .unwrap();
+    let activation = workflow::commit_workflow_command(&mut rt, actor_id, 0, vec![]).unwrap();
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .set_state_field("count", Value::int(13));
+
+    workflow::commit_step_failed(
+        &mut rt,
+        actor_id,
+        Some(activation),
+        "charge".to_string(),
+        "provider timeout".to_string(),
+    )
+    .expect("failure record and durable state must commit together");
+
+    let tail = rt
+        .persistence
+        .load_durable_tail_position(actor_id)
+        .unwrap()
+        .unwrap();
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(snapshot.sequence, tail.sequence);
+    assert_eq!(snapshot.state.get("count"), Some(&PersistedValue::Int(13)));
+    let failures: Vec<_> = rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .into_iter()
+        .filter(|event| matches!(event, WorkflowEvent::StepFailed { .. }))
+        .collect();
+    assert_eq!(failures.len(), 1);
+    assert!(matches!(
+        &failures[0],
+        WorkflowEvent::StepFailed {
+            sequence,
+            activation: Some(id),
+            step_name,
+            error
+        } if *sequence == tail.sequence
+            && *id == activation
+            && step_name == "charge"
+            && error == "provider timeout"
+    ));
+}
+
+#[test]
+fn failed_workflow_step_does_not_publish_snapshot_when_atomic_commit_is_rejected() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("count".to_string(), StateModel::Durable);
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "FencedFailure",
+            Box::new(|| vec![("count".into(), Value::int(0))]),
+            models,
+        )
+        .unwrap();
+    let activation = workflow::commit_workflow_command(&mut rt, actor_id, 0, vec![]).unwrap();
+    let initial_snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    let initial_tail = rt
+        .persistence
+        .load_durable_tail_position(actor_id)
+        .unwrap()
+        .unwrap();
+    let valid_epoch = rt.actors[&actor_id].activation_epoch;
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.set_state_field("count", Value::int(17));
+        actor.activation_epoch = 0; // invalid fence: atomic commit must reject all writes
+    }
+
+    assert!(workflow::commit_step_failed(
+        &mut rt,
+        actor_id,
+        Some(activation),
+        "charge".to_string(),
+        "injected failure".to_string(),
+    )
+    .is_err());
+    assert_eq!(
+        rt.persistence.load_snapshot(actor_id).unwrap().sequence,
+        initial_snapshot.sequence
+    );
+    assert_eq!(
+        rt.persistence.load_snapshot(actor_id).unwrap().state,
+        initial_snapshot.state
+    );
+    assert_eq!(
+        rt.persistence
+            .load_durable_tail_position(actor_id)
+            .unwrap()
+            .unwrap()
+            .sequence,
+        initial_tail.sequence
+    );
+    assert!(!rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .iter()
+        .any(|event| matches!(event, WorkflowEvent::StepFailed { .. })));
+
+    rt.actors.get_mut(&actor_id).unwrap().activation_epoch = valid_epoch;
+    workflow::commit_step_failed(
+        &mut rt,
+        actor_id,
+        Some(activation),
+        "charge".to_string(),
+        "injected failure".to_string(),
+    )
+    .expect("retry after rejected transition must succeed");
+    assert_eq!(rt.workflow_failures().len(), 1);
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn failed_workflow_step_survives_sqlite_restart_without_readmitting_command() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "nulang-atomic-failed-step-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("workflow.db");
+    let actor_id = {
+        let mut rt = Runtime::new();
+        rt.persistence = Box::new(LibsqlStore::new(&db_path).unwrap());
+        let mut models = HashMap::new();
+        models.insert("count".to_string(), StateModel::Durable);
+        let actor_id = rt
+            .try_spawn_workflow_actor(
+                "RestartFailure",
+                Box::new(|| vec![("count".into(), Value::int(0))]),
+                models,
+            )
+            .unwrap();
+        let activation = workflow::commit_workflow_command(&mut rt, actor_id, 0, vec![]).unwrap();
+        rt.actors
+            .get_mut(&actor_id)
+            .unwrap()
+            .set_state_field("count", Value::int(23));
+        workflow::commit_step_failed(
+            &mut rt,
+            actor_id,
+            Some(activation),
+            "invoice".to_string(),
+            "declined".to_string(),
+        )
+        .unwrap();
+        actor_id
+    };
+
+    let mut restarted = Runtime::new();
+    restarted.persistence = Box::new(LibsqlStore::new(&db_path).unwrap());
+    assert_eq!(restarted.recover_actor(actor_id), Some(actor_id));
+    assert_eq!(
+        restarted.actors[&actor_id]
+            .get_state_field("count")
+            .and_then(|v| v.as_int()),
+        Some(23)
+    );
+    assert_eq!(
+        restarted.actors[&actor_id].mailbox.len(),
+        0,
+        "terminal failure must not replay an already failed command"
+    );
+    assert_eq!(
+        restarted.workflow_failures(),
+        vec![("invoice".to_string(), "declined".to_string())]
+    );
+    drop(restarted);
+    std::fs::remove_dir_all(dir).unwrap();
+}

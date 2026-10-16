@@ -2863,6 +2863,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn compiled_workflow_failure_closes_atomic_tail_before_reporting_error() {
+        let source = r#"
+            type Maybe[V] = Some(V) | None
+            workflow FailingWf {
+                step charge {
+                    let m: Maybe[Int] = None in
+                    match m {
+                        | Some(x) => x
+                    }
+                }
+            }
+            fn main() {
+                let w = spawn FailingWf {}
+                send w charge()
+            }
+        "#;
+
+        let (ast, checker) = run_frontend(source, None, false, &[], false)
+            .expect("workflow fixture must typecheck");
+        let module = compile_with_new_pipeline(&ast, "test", &checker)
+            .expect("workflow fixture must compile");
+        let (_value, runtime) = run_with_runtime(module, None, None)
+            .expect("workflow execution must return its durable error record");
+        let runtime = runtime.borrow();
+
+        let failures = runtime.workflow_failures();
+        assert_eq!(failures.len(), 1, "compiled failure must be surfaced");
+        let actor_id = *runtime.actors.keys().next().expect("workflow exists");
+        let failed_event = runtime
+            .persistence
+            .read_workflow_events(actor_id)
+            .into_iter()
+            .find(|event| matches!(event, nulang::runtime::WorkflowEvent::StepFailed { .. }))
+            .expect("failure must be durably recorded");
+        let snapshot = runtime.persistence.load_snapshot(actor_id).unwrap();
+        let tail = runtime
+            .persistence
+            .load_durable_tail_position(actor_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed_event.sequence(), tail.sequence);
+        assert_eq!(snapshot.sequence, tail.sequence);
+    }
+
+    #[test]
     fn workflow_cli_requires_explicit_supported_atomic_store() {
         assert!(validate_workflow_store_uri(None).is_err());
         assert!(validate_workflow_store_uri(Some("json:.nulang/store")).is_err());
