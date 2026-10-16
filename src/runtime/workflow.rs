@@ -9,7 +9,7 @@ mod workflow_impl;
 
 pub(crate) use workflow_impl::{
     actor_is_workflow, append_saga_compensated, append_saga_compensation_started,
-    append_signal_received, append_timer_fired,
+    append_saga_compensation_verified, append_signal_received, append_timer_fired,
     checkpoint_actor, commit_step_completed, commit_step_failed, commit_workflow_command,
     commit_workflow_started,
     emit_event, next_sequence,
