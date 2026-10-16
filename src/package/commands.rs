@@ -3086,7 +3086,7 @@ import stdlib::web::types
 
 fn home() -> Html { text("Static homepage") }
 fn submit() -> Html { text("Server response") }
-fn status() -> Json[String] { "{\"ok\":true}" }
+fn status() -> Json[String] { "\"ok\"" }
 
 app "mixed-routes" {
     route "GET" "/" -> home
