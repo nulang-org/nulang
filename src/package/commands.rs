@@ -3163,4 +3163,30 @@ app "counter" {
         // Unknown subcommands should not be intercepted.
         assert!(try_module_subcommand(&["unknown".to_string()]).is_none());
     }
+
+    #[test]
+    fn test_discover_test_functions_ignores_comments_and_strings() {
+        let source = r#"
+            // fn test_comment() {}
+            fn helper() { "fn test_inside_string() {}" }
+            fn test_actual() { 1 }
+        "#;
+        assert_eq!(
+            discover_test_functions(source),
+            vec!["test_actual".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_strip_main_preserves_braces_in_string_literals() {
+        let source = "fn main() {\n  let s = \"}\"\n  perform IO.print(s)\n}\nfn test_ok() { 1 }\n";
+        assert_eq!(strip_main_function(source).trim(), "fn test_ok() { 1 }");
+    }
+
+    #[test]
+    fn test_strip_main_leaves_nonstandard_signature_untouched() {
+        let source = "fn main(x: Int) { x }\nfn test_ok() { 1 }\n";
+        assert_eq!(strip_main_function(source), source);
+    }
+
 }
