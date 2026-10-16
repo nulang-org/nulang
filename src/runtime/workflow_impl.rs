@@ -427,12 +427,14 @@ fn commit_workflow_event(
     if let Some(snapshot) = &snapshot {
         rt.maybe_shadow_replicate(actor_id, snapshot);
     }
-    if let Some(actor) = rt.actors.get_mut(&actor_id) {
-        actor.sequence = sequence;
-        if checkpoint {
+    if checkpoint {
+        if let Some(actor) = rt.actors.get_mut(&actor_id) {
+            actor.sequence = sequence;
             actor.dirty_fields.clear();
         }
     }
+    // An event-only transition advances the storage tail, not the live
+    // command sequence: the open activation must retain its replay identity.
     Ok(())
 }
 
@@ -528,7 +530,11 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                 },
                 checkpoint,
             ) {
-                tracing::error!(actor_id, %error, "nulang-workflow: failed to commit parallel branch progress");
+                tracing::error!(
+                    actor_id,
+                    %error,
+                    "nulang-workflow: failed to commit parallel branch progress"
+                );
             }
         } else {
             let module = rt
@@ -569,7 +575,11 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                         );
                         let appended = committed.is_ok();
                         if let Err(error) = committed {
-                            tracing::error!(actor_id, %error, "nulang-workflow: failed to commit intermediate event");
+                            tracing::error!(
+                                actor_id,
+                                %error,
+                                "nulang-workflow: failed to commit intermediate event"
+                            );
                         }
                         if appended {
                             // This event belongs to an open activation. Keep the
@@ -592,7 +602,11 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                 },
                 true,
             ) {
-                tracing::error!(actor_id, %error, "nulang-workflow: failed to commit custom event");
+                tracing::error!(
+                    actor_id,
+                    %error,
+                    "nulang-workflow: failed to commit custom event"
+                );
             }
         }
     }
