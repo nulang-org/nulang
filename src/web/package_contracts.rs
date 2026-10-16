@@ -445,6 +445,8 @@ fn web_main() {
             "conflicting duplicate route was silently discarded: {:?}",
             compiled.diagnostics
         );
+        let errors = crate::web::validation::validate_compilation(compiled).unwrap_err();
+        assert!(errors.iter().any(|error| error.contains("conflicting route declarations")));
     }
 
     #[test]
