@@ -14,7 +14,7 @@ use crate::effect_checker::EffectChecker;
 use crate::types::{Effect, EffectRow, Span};
 pub use nulang_ui_protocol::ActionPlacement;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// A node in the dependency graph.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -54,6 +54,73 @@ impl SignalGraph {
         serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_string())
     }
 
+    /// Deterministic, collision-free semantic IDs for the existing graph.
+    ///
+    /// Length-prefixed segments disambiguate punctuation in signal names and
+    /// DOM paths. Occurrence numbers distinguish truly identical bindings,
+    /// while unrelated earlier nodes cannot renumber a different binding.
+    /// This is a stable graph-level identity, not a source-level component
+    /// instance ID (which requires resolved component declarations).
+    fn binding_node_ids(&self) -> Vec<nulang_ui_protocol::NodeId> {
+        use nulang_ui_protocol::NodeId;
+
+        fn append_segment(out: &mut String, value: &str) {
+            out.push(':');
+            out.push_str(&value.len().to_string());
+            out.push(':');
+            out.push_str(value);
+        }
+
+        let mut occurrences: HashMap<String, usize> = HashMap::new();
+        self.nodes
+            .iter()
+            .map(|graph_node| {
+                let mut key = String::from("web-binding:v1");
+                match graph_node {
+                    GraphNode::Signal { name } => {
+                        append_segment(&mut key, "signal");
+                        append_segment(&mut key, name);
+                    }
+                    GraphNode::Read { signal, path } => {
+                        append_segment(&mut key, "read");
+                        append_segment(&mut key, signal);
+                        append_segment(&mut key, path);
+                    }
+                    GraphNode::AttributeRead {
+                        signal,
+                        path,
+                        attribute,
+                    } => {
+                        append_segment(&mut key, "attribute");
+                        append_segment(&mut key, signal);
+                        append_segment(&mut key, path);
+                        append_segment(&mut key, attribute);
+                    }
+                    GraphNode::Action {
+                        handler,
+                        path,
+                        placement,
+                    } => {
+                        append_segment(&mut key, "action");
+                        append_segment(&mut key, handler);
+                        append_segment(&mut key, path);
+                        append_segment(
+                            &mut key,
+                            match placement {
+                                ActionPlacement::Client => "client",
+                                ActionPlacement::Server => "server",
+                            },
+                        );
+                    }
+                }
+                let ordinal = occurrences.entry(key.clone()).or_insert(0);
+                let id = NodeId::new(format!("{key}#{}", *ordinal));
+                *ordinal += 1;
+                id
+            })
+            .collect()
+    }
+
     /// Project the compiler-owned interaction graph into the renderer-neutral
     /// nulang-ui/1 protocol. This is intentionally an interaction document,
     /// not a second HTML tree: DOM/SwiftUI/Compose hosts can consume the same
@@ -67,16 +134,9 @@ impl SignalGraph {
 
         let mut root = UiNode::new(NodeId::from("root"), "interaction_root");
         let mut nodes = Vec::with_capacity(self.nodes.len() + 1);
-        let mut signal_index = 0usize;
-        let mut read_index = 0usize;
-        let mut attribute_read_index = 0usize;
-        let mut action_index = 0usize;
-
-        for graph_node in &self.nodes {
+        for (graph_node, id) in self.nodes.iter().zip(self.binding_node_ids()) {
             let node = match graph_node {
                 GraphNode::Signal { name } => {
-                    let id = NodeId::new(format!("signal:{signal_index}:{name}"));
-                    signal_index += 1;
                     let mut node = UiNode::new(id.clone(), "signal");
                     node.properties
                         .insert("name".to_string(), WireValue::from(name.clone()));
@@ -85,8 +145,6 @@ impl SignalGraph {
                     node
                 }
                 GraphNode::Read { signal, path } => {
-                    let id = NodeId::new(format!("read:{read_index}:{signal}"));
-                    read_index += 1;
                     let mut node = UiNode::new(id.clone(), "signal_read");
                     node.properties
                         .insert("signal".to_string(), WireValue::from(signal.clone()));
@@ -101,8 +159,6 @@ impl SignalGraph {
                     path,
                     attribute,
                 } => {
-                    let id = NodeId::new(format!("attribute:{attribute_read_index}:{signal}"));
-                    attribute_read_index += 1;
                     let mut node = UiNode::new(id.clone(), "attribute_read");
                     node.properties
                         .insert("signal".to_string(), WireValue::from(signal.clone()));
@@ -119,8 +175,6 @@ impl SignalGraph {
                     path,
                     placement,
                 } => {
-                    let id = NodeId::new(format!("action:{action_index}:{handler}"));
-                    action_index += 1;
                     let mut node = UiNode::new(id.clone(), "action");
                     node.properties
                         .insert("handler".to_string(), WireValue::from(handler.clone()));
@@ -153,26 +207,22 @@ impl SignalGraph {
         signal: &str,
         value: nulang_ui_protocol::WireValue,
     ) -> Option<nulang_ui_protocol::UiPatch> {
-        use nulang_ui_protocol::{NodeId, PatchOperation, UiPatch};
+        use nulang_ui_protocol::{PatchOperation, UiPatch};
 
         let mut operations = Vec::new();
-        let mut signal_index = 0usize;
-        let mut read_index = 0usize;
-        let mut attribute_read_index = 0usize;
         let mut found_signal = false;
 
-        for graph_node in &self.nodes {
+        for (graph_node, node_id) in self.nodes.iter().zip(self.binding_node_ids()) {
             match graph_node {
                 GraphNode::Signal { name } => {
                     if name == signal {
                         found_signal = true;
                         operations.push(PatchOperation::SetProperty {
-                            node_id: NodeId::new(format!("signal:{signal_index}:{name}")),
+                            node_id,
                             name: "value".to_string(),
                             value: value.clone(),
                         });
                     }
-                    signal_index += 1;
                 }
                 GraphNode::Read {
                     signal: read_signal,
@@ -180,12 +230,11 @@ impl SignalGraph {
                 } => {
                     if read_signal == signal {
                         operations.push(PatchOperation::SetProperty {
-                            node_id: NodeId::new(format!("read:{read_index}:{read_signal}")),
+                            node_id,
                             name: "value".to_string(),
                             value: value.clone(),
                         });
                     }
-                    read_index += 1;
                 }
                 GraphNode::AttributeRead {
                     signal: read_signal,
@@ -193,14 +242,11 @@ impl SignalGraph {
                 } => {
                     if read_signal == signal {
                         operations.push(PatchOperation::SetProperty {
-                            node_id: NodeId::new(format!(
-                                "attribute:{attribute_read_index}:{read_signal}"
-                            )),
+                            node_id,
                             name: "value".to_string(),
                             value: value.clone(),
                         });
                     }
-                    attribute_read_index += 1;
                 }
                 GraphNode::Action { .. } => {}
             }
