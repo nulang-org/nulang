@@ -114,7 +114,14 @@ impl<'a> DurableEffectCoordinator<'a> {
     ) -> Result<DurableEffectDispatchDecision, DurableEffectRuntimeError> {
         if let Some(existing) = self.store.load_durable_effect(self.actor_id, spec.id)? {
             self.validate_existing(&spec, request, existing.effect())?;
-            return Ok(decision(existing.effect()));
+            let recovered = decision(existing.effect());
+            // A completed receipt can be read without provider dispatch.
+            // Prepared effects, however, must never authorize a stale or
+            // unclaimed future activation to retry the external operation.
+            if !matches!(recovered, DurableEffectDispatchDecision::ReplayRecordedResult(_)) {
+                self.require_claimed_activation()?;
+            }
+            return Ok(recovered);
         }
 
         let prepared = DurableEffectRecord::prepare(spec, request);
@@ -154,6 +161,32 @@ impl<'a> DurableEffectCoordinator<'a> {
         };
         self.commit_record(DurableEffectPersistenceRecord::from_effect(completed))?;
         Ok(durable_result)
+    }
+
+    /// A prepared intent may predate an actor's current activation, but
+    /// redispatch is allowed only after the owner's new epoch is durably
+    /// claimed. This read fence does not replace provider-side deduplication
+    /// or prevent a competing claim after the check.
+    fn require_claimed_activation(&self) -> Result<(), DurableEffectRuntimeError> {
+        let tail = self
+            .store
+            .load_durable_tail_position(self.actor_id)?
+            .ok_or_else(|| {
+                DurableEffectRuntimeError::Storage(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "prepared durable effect exists without a committed activation tail",
+                ))
+            })?;
+        if tail.activation_epoch != self.activation_epoch {
+            return Err(DurableEffectRuntimeError::Storage(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "durable effect redispatch epoch {} is not the committed owner epoch {}",
+                    self.activation_epoch, tail.activation_epoch
+                ),
+            )));
+        }
+        Ok(())
     }
 
     fn validate_existing(
