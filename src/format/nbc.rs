@@ -244,17 +244,11 @@ impl CodeModule {
                 have: bytes.len(),
             });
         }
-        let mut instructions = Vec::with_capacity(instr_count);
-        for i in 0..instr_count {
-            let off = instr_block.start + i * 4;
-            let encoded = u32::from_be_bytes(bytes[off..off + 4].try_into().unwrap());
-            let instr = Instruction::decode(encoded).ok_or(FormatError::UnknownOpcode {
-                opcode: (encoded >> 24) as u8,
-            })?;
-            instructions.push(instr);
-        }
-
-        // --- Metadata body ----------------------------------------------
+        // --- Metadata admission ------------------------------------------
+        // Check the declared JSON size and full artifact shape *before*
+        // allocating or decoding the instruction stream. An artifact known
+        // to be over-budget must not consume its independent instruction
+        // allowance first.
         let meta_len_off = instr_block.end;
         let meta_off = meta_len_off
             .checked_add(4)
@@ -286,6 +280,18 @@ impl CodeModule {
                 actual: bytes.len() - meta_off,
             });
         }
+
+        // --- Instruction stream -----------------------------------------
+        let mut instructions = Vec::with_capacity(instr_count);
+        for i in 0..instr_count {
+            let off = instr_block.start + i * 4;
+            let encoded = u32::from_be_bytes(bytes[off..off + 4].try_into().unwrap());
+            let instr = Instruction::decode(encoded).ok_or(FormatError::UnknownOpcode {
+                opcode: (encoded >> 24) as u8,
+            })?;
+            instructions.push(instr);
+        }
+
         let meta_bytes = &bytes[meta_off..meta_end];
         let mut module: CodeModule = serde_json::from_slice(meta_bytes)
             .map_err(|e| FormatError::BodyDecode(e.to_string()))?;
