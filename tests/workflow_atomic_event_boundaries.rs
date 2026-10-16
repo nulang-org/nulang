@@ -38,6 +38,7 @@ fn intermediate_timer_uses_atomic_history_without_advancing_safe_snapshot() {
     let actor_id =
         runtime.spawn_workflow_actor("AtomicTimer", Box::new(Vec::new), HashMap::new());
     let safe_snapshot = runtime.persistence.load_snapshot(actor_id).unwrap();
+    let safe_actor_sequence = runtime.actors[&actor_id].sequence;
 
     let activation = WorkflowActivationId::new(actor_id, 73);
     runtime
@@ -54,6 +55,11 @@ fn intermediate_timer_uses_atomic_history_without_advancing_safe_snapshot() {
         .unwrap()
         .expect("timer preparation must advance the atomic tail");
     assert!(tail.sequence > safe_snapshot.sequence);
+    assert_eq!(
+        runtime.actors[&actor_id].sequence,
+        safe_actor_sequence,
+        "intermediate events must not overwrite the live command sequence"
+    );
     assert_eq!(
         runtime.persistence.load_snapshot(actor_id).unwrap().sequence,
         safe_snapshot.sequence,
