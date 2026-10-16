@@ -9060,3 +9060,253 @@ fn saga_intent_fencing_failure_does_not_publish_started_event() {
         matches!(event, WorkflowEvent::SagaCompensationStarted { .. })
     }));
 }
+
+
+struct TestSagaReceiptVerifier {
+    accepted: bool,
+}
+
+impl SagaCompensationReceiptVerifier for TestSagaReceiptVerifier {
+    fn verify(
+        &self,
+        operation_id: &str,
+        provider: &str,
+        receipt_id: &str,
+    ) -> std::io::Result<()> {
+        if self.accepted
+            && operation_id.len() == 64
+            && provider == "fixture-provider"
+            && receipt_id == "provider-receipt-123"
+        {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "provider could not verify the operation receipt",
+            ))
+        }
+    }
+}
+
+fn saga_receipt_fixture() -> (Runtime, u64) {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_owned(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "VerifiedSaga",
+        Box::new(|| vec![("step_index".to_owned(), Value::int(1))]),
+        models,
+    );
+    workflow::commit_step_completed(&mut rt, actor_id, None, "reserve".into()).unwrap();
+    workflow::commit_step_failed(
+        &mut rt,
+        actor_id,
+        None,
+        "ship".into(),
+        "downstream failure".into(),
+    )
+    .unwrap();
+    (rt, actor_id)
+}
+
+#[test]
+fn saga_operation_id_is_stable_across_intent_and_tail_advancement() {
+    let (mut rt, actor_id) = saga_receipt_fixture();
+    let first = rt
+        .saga_compensation_operation_id(actor_id, "reserve")
+        .expect("completed workflow step must have deterministic compensation ID");
+    assert_eq!(first.len(), 64);
+    rt.append_saga_compensation_started(actor_id, "reserve").unwrap();
+    let after = rt.saga_compensation_operation_id(actor_id, "reserve").unwrap();
+    assert_eq!(first, after, "committing an intent cannot change operation identity");
+    let recorded = rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .into_iter()
+        .find_map(|event| match event {
+            WorkflowEvent::SagaCompensationStarted {
+                step_name,
+                operation_id,
+                ..
+            } if step_name == "reserve" => operation_id,
+            _ => None,
+        })
+        .expect("intent must carry provider-safe idempotency key");
+    assert_eq!(recorded, first);
+    assert_eq!(
+        rt.saga_compensation_recovery(actor_id)[0].operation_id.as_deref(),
+        Some(first.as_str())
+    );
+}
+
+#[test]
+fn saga_reconciliation_rejects_unverified_or_mismatched_receipts_without_writes() {
+    let (mut rt, actor_id) = saga_receipt_fixture();
+    rt.append_saga_compensation_started(actor_id, "reserve").unwrap();
+    let key = rt.saga_compensation_operation_id(actor_id, "reserve").unwrap();
+    let tail = rt.persistence.latest_sequence(actor_id);
+    let valid = SagaCompensationReceipt {
+        operation_id: key.clone(),
+        provider: "fixture-provider".into(),
+        receipt_id: "provider-receipt-123".into(),
+    };
+    let wrong = SagaCompensationReceipt {
+        operation_id: "0".repeat(64),
+        ..valid.clone()
+    };
+
+    assert!(rt
+        .reconcile_saga_compensation(actor_id, "reserve", &wrong, &TestSagaReceiptVerifier { accepted: true })
+        .is_err());
+    assert!(rt
+        .reconcile_saga_compensation(actor_id, "reserve", &valid, &TestSagaReceiptVerifier { accepted: false })
+        .is_err());
+    assert_eq!(rt.persistence.latest_sequence(actor_id), tail);
+    assert_eq!(
+        rt.saga_compensation_recovery(actor_id)[0].status,
+        SagaCompensationRecoveryStatus::OutcomeUnknown
+    );
+    assert!(rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .iter()
+        .all(|event| !matches!(event, WorkflowEvent::SagaCompensationVerified { .. })));
+}
+
+#[test]
+fn saga_provider_verified_receipt_closes_ambiguous_compensation_once() {
+    let (mut rt, actor_id) = saga_receipt_fixture();
+    rt.append_saga_compensation_started(actor_id, "reserve").unwrap();
+    let key = rt.saga_compensation_operation_id(actor_id, "reserve").unwrap();
+    let receipt = SagaCompensationReceipt {
+        operation_id: key.clone(),
+        provider: "fixture-provider".into(),
+        receipt_id: "provider-receipt-123".into(),
+    };
+    rt.reconcile_saga_compensation(
+        actor_id, "reserve", &receipt, &TestSagaReceiptVerifier { accepted: true },
+    ).unwrap();
+
+    let recovery = rt.saga_compensation_recovery(actor_id);
+    assert_eq!(recovery[0].status, SagaCompensationRecoveryStatus::Completed);
+    let tail = rt.persistence.latest_sequence(actor_id);
+    let recorded = rt.persistence.read_workflow_events(actor_id);
+    assert!(recorded.iter().any(|event| matches!(
+        event,
+        WorkflowEvent::SagaCompensationVerified {
+            sequence,
+            step_name,
+            operation_id,
+            provider,
+            receipt_id,
+        } if *sequence == tail
+            && step_name == "reserve"
+            && operation_id == &key
+            && provider == "fixture-provider"
+            && receipt_id == "provider-receipt-123"
+    )));
+    assert!(rt
+        .reconcile_saga_compensation(actor_id, "reserve", &receipt, &TestSagaReceiptVerifier { accepted: true })
+        .is_err());
+    assert_eq!(rt.persistence.latest_sequence(actor_id), tail);
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn verified_saga_receipt_survives_sqlite_process_restart() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "nulang-saga-receipt-{}-{nonce}", std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("workflow.db");
+    let actor_id = {
+        let mut rt = Runtime::new();
+        rt.persistence = Box::new(LibsqlStore::new(&db_path).unwrap());
+        let mut models = HashMap::new();
+        models.insert("step_index".to_string(), StateModel::Durable);
+        let id = rt.spawn_workflow_actor(
+            "VerifiedRestartSaga",
+            Box::new(|| vec![("step_index".to_string(), Value::int(1))]),
+            models,
+        );
+        workflow::commit_step_completed(&mut rt, id, None, "reserve".into()).unwrap();
+        workflow::commit_step_failed(&mut rt, id, None, "ship".into(), "error".into()).unwrap();
+        rt.append_saga_compensation_started(id, "reserve").unwrap();
+        let receipt = SagaCompensationReceipt {
+            operation_id: rt.saga_compensation_operation_id(id, "reserve").unwrap(),
+            provider: "fixture-provider".into(),
+            receipt_id: "provider-receipt-123".into(),
+        };
+        rt.reconcile_saga_compensation(id, "reserve", &receipt, &TestSagaReceiptVerifier { accepted: true }).unwrap();
+        id
+    };
+
+    let mut recovered = Runtime::new();
+    recovered.persistence = Box::new(LibsqlStore::new(&db_path).unwrap());
+    assert_eq!(recovered.recover_actor(actor_id), Some(actor_id));
+    assert_eq!(
+        recovered.saga_compensation_recovery(actor_id)[0].status,
+        SagaCompensationRecoveryStatus::Completed
+    );
+    drop(recovered);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+
+#[test]
+fn saga_operation_id_changes_for_a_new_failure_attempt() {
+    let (mut rt, actor_id) = saga_receipt_fixture();
+    let previous = rt.saga_compensation_operation_id(actor_id, "reserve").unwrap();
+    workflow::commit_step_completed(&mut rt, actor_id, None, "reserve".into()).unwrap();
+    workflow::commit_step_failed(&mut rt, actor_id, None, "ship".into(), "failed again".into())
+        .unwrap();
+    let current = rt.saga_compensation_operation_id(actor_id, "reserve").unwrap();
+    assert_ne!(previous, current, "distinct saga failures must not reuse the same external operation key");
+}
+
+#[test]
+fn legacy_saga_intent_without_operation_id_remains_readable_but_unverifiable() {
+    let legacy = r#"{"tag":"SagaCompensationStarted","value":{"sequence":9,"step_name":"reserve"}}"#;
+    let event: WorkflowEvent = serde_json::from_str(legacy).unwrap();
+    assert!(matches!(
+        event,
+        WorkflowEvent::SagaCompensationStarted {
+            sequence: 9,
+            step_name,
+            operation_id: None
+        } if step_name == "reserve"
+    ));
+}
+
+#[test]
+fn saga_receipt_commit_rejection_does_not_publish_external_verification() {
+    let (mut rt, actor_id) = saga_receipt_fixture();
+    rt.append_saga_compensation_started(actor_id, "reserve").unwrap();
+    let receipt = SagaCompensationReceipt {
+        operation_id: rt.saga_compensation_operation_id(actor_id, "reserve").unwrap(),
+        provider: "fixture-provider".into(),
+        receipt_id: "provider-receipt-123".into(),
+    };
+    let previous_tail = rt.persistence.latest_sequence(actor_id);
+    rt.actors.get_mut(&actor_id).unwrap().activation_epoch = 0;
+    assert!(rt
+        .reconcile_saga_compensation(
+            actor_id,
+            "reserve",
+            &receipt,
+            &TestSagaReceiptVerifier { accepted: true },
+        )
+        .is_err());
+    assert_eq!(rt.persistence.latest_sequence(actor_id), previous_tail);
+    assert_eq!(
+        rt.saga_compensation_recovery(actor_id)[0].status,
+        SagaCompensationRecoveryStatus::OutcomeUnknown
+    );
+    assert!(!rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .iter()
+        .any(|event| matches!(event, WorkflowEvent::SagaCompensationVerified { .. })));
+}
