@@ -84,6 +84,17 @@ def measure_change(repo: Path, base_sha: str, head_sha: str) -> dict[str, Any]:
         raise ValueError(f"repository must name git root, got {repo} instead of {root}")
     _check_commit(repo, base_sha)
     _check_commit(repo, head_sha)
+    if base_sha.lower() == head_sha.lower():
+        raise ValueError("baseline and candidate commits must be distinct")
+    ancestry = subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", base_sha, head_sha],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+    if ancestry.returncode == 1:
+        raise ValueError("base_sha must be an ancestor of head_sha")
+    if ancestry.returncode != 0:
+        detail = ancestry.stderr.decode("utf-8", errors="replace").strip()
+        raise ValueError(f"git merge-base failed: {detail}")
     data = _git(
         repo, "diff", "--numstat", "-z", "--find-renames",
         "--no-ext-diff", "--no-textconv", base_sha, head_sha, "--",
@@ -101,6 +112,8 @@ def measure_change(repo: Path, base_sha: str, head_sha: str) -> dict[str, Any]:
                 raise ValueError(f"malformed git numstat counts for {path!r}")
             lines_added += int(added)
             lines_deleted += int(deleted)
+    if not changed_paths:
+        raise ValueError("baseline and candidate contain no changes for the task")
     manifests_changed = [
         p for p in changed_paths if Path(p).name in DEPENDENCY_MANIFESTS
     ]
