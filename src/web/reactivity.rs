@@ -783,8 +783,20 @@ fn data_attr(name: &str, value: &str, span: Span) -> Expr {
 /// `data-signal` and `data-action` attributes emitted by the compiler.
 pub fn generate_client_runtime() -> String {
     r#"(function () {
-  const signals = {};
+  const signals = Object.create(null);
   const signalBindings = Object.create(null);
+  // Lazily allocated: pages without subscriptions retain the old fast path.
+  const signalListeners = Object.create(null);
+
+  function notifySignal(name, value) {
+    const listeners = signalListeners[name];
+    if (!listeners) return;
+    listeners.slice().forEach(function (listener) {
+      try { listener(value); } catch (error) {
+        console.error('nulang: signal subscriber failed', error);
+      }
+    });
+  }
 
   function refreshSignal(name) {
     const bindings = signalBindings[name];
@@ -899,6 +911,22 @@ pub fn generate_client_runtime() -> String {
         set: function (value) {
           signals[name] = value;
           refreshSignal(name);
+          notifySignal(name, value);
+        },
+        subscribe: function (listener) {
+          if (typeof listener !== 'function') {
+            throw new TypeError('signal subscriber must be a function');
+          }
+          const listeners = signalListeners[name] || (signalListeners[name] = []);
+          listeners.push(listener);
+          let active = true;
+          return function unsubscribe() {
+            if (!active) return;
+            active = false;
+            const index = listeners.indexOf(listener);
+            if (index !== -1) listeners.splice(index, 1);
+            if (listeners.length === 0) delete signalListeners[name];
+          };
         }
       };
     }
@@ -1101,6 +1129,7 @@ fn view() -> Html {
         let js = generate_client_runtime();
         assert!(js.contains("hydrate"), "hydrate not found");
         assert!(js.contains("window.nulang"), "nulang global not found");
+        assert!(js.contains("subscribe: function (listener)"), "signal subscriptions missing");
         assert!(js.contains("data-signal"), "data-signal selector not found");
         assert!(js.contains("data-action"), "data-action selector not found");
         assert!(

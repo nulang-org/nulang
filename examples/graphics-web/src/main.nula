@@ -1,0 +1,33 @@
+import stdlib::web::html
+import stdlib::web::types
+
+app "graphics-web" {
+    route "GET" "/" -> home
+}
+
+@placement(static)
+fn home() -> Html {
+    document(
+        head([
+            title("Nulang Browser Graphics Interop"),
+            el("meta", [("name", text("viewport")), ("content", text("width=device-width, initial-scale=1"))], []),
+            el("link", [("rel", text("stylesheet")), ("href", text("/style.css"))], [])
+        ]),
+        body([
+            el("main", [], [
+                el("h1", [], [text("GPU point visualization")]),
+                el("p", [], [text("An optional browser graphics adapter: WebGL 2 with Canvas 2D fallback. The page uses ordinary Nulang HTML.")]),
+                el("label", [("for", text("density"))], [text("Points: "),
+                    el("output", [("for", text("density"))], [
+                        el("span", [("data-signal", text("pointCount")), ("id", text("point-count"))], [text("10000")])
+                    ])
+                ]),
+                el("input", [("id", text("density")), ("type", text("range")), ("min", text("1000")), ("max", text("10000")), ("step", text("1000")), ("value", text("10000"))], []),
+                el("canvas", [("id", text("plot")), ("role", text("img")), ("aria-label", text("Scatter plot with the selected number of points"))], []),
+                el("p", [("id", text("backend")), ("role", text("status"))], [text("Initializing renderer")])
+            ]),
+            // Trusted literal script URL; dynamic script elements are rejected by Web.html.
+            raw("<script type=\"module\" src=\"/demo.js\"></script>")
+        ])
+    )
+}
