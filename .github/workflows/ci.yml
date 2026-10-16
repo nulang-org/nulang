@@ -51,6 +51,9 @@ jobs:
       - name: Smoke test generated Nulang Web client runtime
         run: node scripts/tests/web_client_runtime.mjs
 
+      - name: Smoke test Nulang Web scoped hydration
+        run: node scripts/tests/web_scoped_lifecycle.mjs
+
       - name: Install docs dependencies
         run: |
           cd docs
