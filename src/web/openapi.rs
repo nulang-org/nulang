@@ -343,6 +343,7 @@ mod tests {
             &ContractCompilation {
                 routes: vec![route()],
                 diagnostics: Vec::new(),
+                module_imports: Vec::new(),
             },
             "Example API",
             "1.0.0",
