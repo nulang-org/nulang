@@ -48,6 +48,9 @@ jobs:
       - name: Smoke test browser playground
         run: node playground/web/test/smoke.mjs
 
+      - name: Regression — Web form action dispatch
+        run: node --test tests/web_form_action_events.test.cjs
+
       - name: Install docs dependencies
         run: |
           cd docs
