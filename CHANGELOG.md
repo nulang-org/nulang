@@ -1,4 +1,9 @@
 # Nulang Changelog
+
+### TCP sender connection-generation fencing — 2026-10-16
+- **A failed TCP writer can no longer retire a newer replacement connection for the same peer.** Sender cleanup now checks the generation of the connection that actually failed, preserving replacements installed while the sender was between write and cleanup locks. An absent original connection cannot evict a subsequently established one.
+- **Deterministic regression covers stale, absent, and matching connection generations.** Packet retry and acknowledgement semantics are unchanged. This fixes a connection-lifecycle race but does not yet establish the cause of the intermittent five-node post-heal delivery failure tracked in #1246.
+
 ### Web static-root containment — 2026-10-15
 - **Experimental Web static file serving refuses parent traversal and symlinks escaping configured roots.** Canonical candidate paths must remain inside their canonicalized static or output root, and normal in-root files remain serveable.
 - **A filesystem regression verifies parent and symlink escape rejection.** This is a clean current-main successor to draft #1676; it does not change SSE or claim protection from malicious concurrent mutation of a trusted static root.
