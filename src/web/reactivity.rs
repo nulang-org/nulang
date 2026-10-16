@@ -1392,6 +1392,45 @@ fn view(visible: Bool) -> Html {
     }
 
     #[test]
+    fn test_rewrite_does_not_bind_shadowed_function_parameter() {
+        let mut module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+signal visible: Bool = true
+
+fn view(visible: Bool) -> Html {
+    if visible then <section>Shown</section> else <aside>Hidden</aside>
+}
+"#,
+        );
+        rewrite_module(&mut module, None);
+        let html = format!("{:?}", find_function_body(&module, "view"));
+        assert!(!html.contains("data-nulang-if"), "{html}");
+    }
+
+    #[test]
+    fn test_rewrite_does_not_bind_shadowed_let_variable() {
+        let mut module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+signal visible: Bool = true
+
+fn view() -> Html {
+    let visible = false
+    if visible then <section>Shown</section> else <aside>Hidden</aside>
+}
+"#,
+        );
+        rewrite_module(&mut module, None);
+        let html = format!("{:?}", find_function_body(&module, "view"));
+        assert!(!html.contains("data-nulang-if"), "{html}");
+    }
+
+    #[test]
     fn test_rewrite_does_not_mark_unserializable_branch() {
         let mut module = parse(
             r#"
