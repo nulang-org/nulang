@@ -18,7 +18,7 @@ const stages = [
     label: 'Runtime state',
     status: 'Implemented',
     title: 'Durable actors',
-    detail: 'snapshots · journals · restart hydration · pluggable stores',
+    detail: 'opt-in snapshots · journals · configured durable stores',
     tone: 'implemented',
   },
 ];
@@ -30,8 +30,9 @@ const stages = [
     <h2 id="architecture-title">One model from source code to recovery.</h2>
     <p>
       Nulang keeps the resilient-systems primitives close together: typed effects
-      describe what code may do, actors isolate state and failure, supervisors
-      coordinate recovery, and persistent actors can hydrate durable state after restart.
+      describe what code may do, actors isolate state and failure, and supervisors
+      apply restart policy while transient actors restart from their template.
+      Persistent state hydration is separate and requires configured durable storage.
     </p>
     <a href="/actors/overview/" class="architecture-link">
       Explore the actor runtime
@@ -67,9 +68,9 @@ const stages = [
       </div>
       <div class="recovery-line" aria-hidden="true"></div>
       <div class="recovery-action">
-        supervisor restart
+        supervisor policy
         <span aria-hidden="true">→</span>
-        hydrate durable state
+        restart from template
       </div>
     </div>
 
