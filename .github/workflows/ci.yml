@@ -109,6 +109,14 @@ jobs:
         # nextest intentionally does not execute rustdoc tests.
         run: cargo test --locked --doc
 
+      - name: Setup Node.js for Web IR client tests
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Test Web IR TypeScript client generator
+        run: node --test scripts/tests/nulang_ts_client.test.mjs
+
       - name: Test benchmark harness scripts
         run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 
