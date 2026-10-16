@@ -107,6 +107,23 @@ source tree
        -> tests / tooling
 ```
 
+## Ambiguous route admission
+
+The authoritative validation boundary rejects two route contracts with the
+same HTTP method when their compiled runtime path-segment patterns have
+identical literal and capture positions. Capture names and source-level
+parameter types do not distinguish HTTP paths: for example,
+`GET /users/{id: Int}` and `GET /users/:user_id` both match
+`GET /users/42`. Literal segments are compared after the same percent-decoding
+used by runtime matching, so `/users/%6De` and `/users/me` also collide.
+
+These diagnostics fail package build/dev validation before route attachment,
+static publishing or OpenAPI generation can silently select a different
+handler. Distinct HTTP methods remain valid, and a literal route such as
+`/users/me` does not by itself collide with the parameterized
+`/users/{id}` shape. Partial static/parameter overlaps and precedence are
+not declared equivalent by this conservative validation rule.
+
 ## Runtime binding and dispatch
 
 Runtime registration remains method/path/module/function. Compiler metadata is attached as a sidecar so the low-level `Web.route` host effect does not need source-level type information.
