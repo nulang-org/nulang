@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Transient scoped cancellation contract — 2026-10-16
+- **Introduce opt-in thread-safe cancellation tokens for transient scoped work.** Cancellation propagates from parents to children, child-local requests do not affect siblings, and monotonic deadlines cannot extend an inherited deadline.
+- **Deterministic tests cover deadline boundaries, explicit cancellation, worker-thread propagation, and parent-handle lifetime.** This contract does not interrupt active actors, wake mailbox waiters, or persist durable workflow cancellation.
+
 ### Web static-root containment — 2026-10-15
 - **Experimental Web static file serving refuses parent traversal and symlinks escaping configured roots.** Canonical candidate paths must remain inside their canonicalized static or output root, and normal in-root files remain serveable.
 - **A filesystem regression verifies parent and symlink escape rejection.** This is a clean current-main successor to draft #1676; it does not change SSE or claim protection from malicious concurrent mutation of a trusted static root.

@@ -20,6 +20,7 @@ pub mod cache_pipeline;
 pub mod cache_routing;
 #[cfg(feature = "cache-server")]
 pub mod cache_server;
+mod cancellation;
 mod foreign_call;
 mod foreign_executor;
 mod gc;
@@ -103,6 +104,7 @@ pub use cache_routing::*;
 pub use cache_server::*;
 pub use callbacks::RuntimeVmCallbacks;
 pub(crate) use callbacks::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks};
+pub use cancellation::{CancellationReason, CancellationToken};
 pub use cluster::*;
 pub use crdt::*;
 pub use crdt_manager::*;
