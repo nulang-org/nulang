@@ -354,4 +354,90 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn modeled_break_even_uses_full_first_run_cost() {
+        let compiled = JitCompileStats {
+            fast_compiles: 1,
+            ..Default::default()
+        };
+        // 300 + (N - 1) * 50 <= N * 100 first holds at N = 5.
+        assert_eq!(
+            modeled_break_even_total_runs(
+                Duration::from_nanos(100),
+                Duration::from_nanos(300),
+                Duration::from_nanos(50),
+                compiled,
+                compiled,
+            ),
+            Some(5)
+        );
+        // Include the ceiling: a one-nanosecond larger debt needs six runs.
+        assert_eq!(
+            modeled_break_even_total_runs(
+                Duration::from_nanos(100),
+                Duration::from_nanos(301),
+                Duration::from_nanos(50),
+                compiled,
+                compiled,
+            ),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn modeled_break_even_refuses_unsupported_extrapolation() {
+        let compiled = JitCompileStats {
+            fast_compiles: 1,
+            ..Default::default()
+        };
+        let promoted_on_warm = JitCompileStats {
+            optimized_compiles: 1,
+            ..compiled
+        };
+        // No native compilation on the first run; no JIT payoff to model.
+        assert_eq!(
+            modeled_break_even_total_runs(
+                Duration::from_nanos(100),
+                Duration::from_nanos(300),
+                Duration::from_nanos(50),
+                JitCompileStats::default(),
+                JitCompileStats::default(),
+            ),
+            None
+        );
+        // The supposed warm run includes another compiler tier.
+        assert_eq!(
+            modeled_break_even_total_runs(
+                Duration::from_nanos(100),
+                Duration::from_nanos(300),
+                Duration::from_nanos(50),
+                compiled,
+                promoted_on_warm,
+            ),
+            None
+        );
+        // Warm code that cannot outperform the interpreter never repays debt.
+        assert_eq!(
+            modeled_break_even_total_runs(
+                Duration::from_nanos(100),
+                Duration::from_nanos(300),
+                Duration::from_nanos(100),
+                compiled,
+                compiled,
+            ),
+            None
+        );
+        // Already faster on the first invocation and sustainable thereafter.
+        assert_eq!(
+            modeled_break_even_total_runs(
+                Duration::from_nanos(100),
+                Duration::from_nanos(80),
+                Duration::from_nanos(50),
+                compiled,
+                compiled,
+            ),
+            Some(1)
+        );
+    }
+
 }
