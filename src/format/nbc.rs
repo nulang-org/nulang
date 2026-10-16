@@ -478,7 +478,10 @@ mod tests {
         };
         let mut vm = crate::core_vm::CoreVM::new();
         assert!(vm.load_nbc_with_limits(&bytes, limits).is_err());
-        assert!(vm.modules.is_empty(), "rejected artifact must not be published");
+        assert!(
+            vm.modules.is_empty(),
+            "rejected artifact must not be published"
+        );
 
         let loaded = vm
             .load_nbc_with_limits(&bytes, NbcDecodeLimits::UNLIMITED)
