@@ -1750,14 +1750,22 @@ fn cmd_test(filter: Option<&str>, verbose: bool, json: bool) -> NuResult<()> {
     }
 
     let mut tests: Vec<TestCase> = Vec::new();
-    let temp_dir = std::env::temp_dir().join("nula_test");
-    let _ = std::fs::create_dir_all(&temp_dir);
+    // Isolate generated entry points across concurrent test runs.
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp_dir = std::env::temp_dir().join(format!("nula_test_{}_{}", std::process::id(), nonce));
+    std::fs::create_dir(&temp_dir).map_err(|e| NuError::PackageError {
+        msg: format!("cannot create generated test directory {}: {}", temp_dir.display(), e),
+        span: Span::default(),
+    })?;
 
     for file in &test_files {
-        let content = match std::fs::read_to_string(file) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
+        let content = std::fs::read_to_string(file).map_err(|e| NuError::PackageError {
+            msg: format!("cannot read test source {}: {}", file.display(), e),
+            span: Span::default(),
+        })?;
         let test_fns = discover_test_functions(&content);
         let relative = file
             .strip_prefix(&tests_dir.parent().unwrap_or(&tests_dir))
@@ -1784,10 +1792,11 @@ fn cmd_test(filter: Option<&str>, verbose: bool, json: bool) -> NuResult<()> {
                     if stripped.ends_with('\n') { "" } else { "\n" },
                     fn_name
                 );
-                let temp_path = temp_dir.join(format!("test_{}.nula", fn_name));
-                if std::fs::write(&temp_path, &wrapper).is_err() {
-                    continue;
-                }
+                let temp_path = temp_dir.join(format!("test_{}_{}.nula", tests.len(), fn_name));
+                std::fs::write(&temp_path, &wrapper).map_err(|e| NuError::PackageError {
+                    msg: format!("cannot write generated test {}: {}", temp_path.display(), e),
+                    span: Span::default(),
+                })?;
                 tests.push(TestCase {
                     display: fn_name.clone(),
                     file_to_run: temp_path,
@@ -1916,55 +1925,137 @@ fn cmd_test_watch(filter: Option<&str>, verbose: bool) -> NuResult<()> {
     }
 }
 
-/// Find all `fn test_*` function names in a source string.
+/// Discover only actual top-level test functions in parsed source.
+/// Invalid source is executed as a whole file so the compiler reports its error.
 fn discover_test_functions(source: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut rest = source;
-    while let Some(pos) = rest.find("fn test_") {
-        let start = pos + 3; // skip "fn "
-        let after_fn = &rest[start..];
-        // Find end of identifier: whitespace or '('
-        let end = after_fn
-            .find(|c: char| c.is_whitespace() || c == '(')
-            .unwrap_or(after_fn.len());
-        let name = after_fn[..end].trim().to_string();
-        if !name.is_empty() {
-            names.push(name);
-        }
-        rest = &after_fn[end..];
-    }
-    names
+    let tokens = match crate::lexer::Lexer::new(source).lex() {
+        Ok(tokens) => tokens,
+        Err(_) => return Vec::new(),
+    };
+    let module = match crate::parser::Parser::new(tokens).parse_module() {
+        Ok(module) => module,
+        Err(_) => return Vec::new(),
+    };
+    module
+        .decls
+        .into_iter()
+        .filter_map(|decl| match decl {
+            crate::ast::Decl::Function { name, .. } if name.starts_with("test_") => Some(name),
+            _ => None,
+        })
+        .collect()
 }
 
-/// Strip the `fn main() { ... }` block from source, keeping everything else.
+/// Remove only a top-level, unannotated, argument-free, block-bodied
+/// `fn main() { ... }`. Lexer spans keep braces in strings and comments inert.
+/// Any unsupported form stays intact and fails normally on duplicate main.
 fn strip_main_function(source: &str) -> String {
-    if let Some(pos) = source.find("fn main") {
-        // Find the opening brace after "fn main"
-        if let Some(brace_start) = source[pos..].find('{') {
-            let abs_brace = pos + brace_start;
-            // Count braces to find matching close
-            let mut depth = 0;
-            let mut end = abs_brace;
-            for (i, ch) in source[abs_brace..].char_indices() {
-                match ch {
-                    '{' => depth += 1,
-                    '}' => {
+    use crate::lexer::TokenKind;
+
+    let tokens = match crate::lexer::Lexer::new(source).lex() {
+        Ok(tokens) => tokens,
+        Err(_) => return source.to_owned(),
+    };
+    let module = match crate::parser::Parser::new(tokens.clone()).parse_module() {
+        Ok(module) => module,
+        Err(_) => return source.to_owned(),
+    };
+    let eligible_starts: Vec<_> = module
+        .decls
+        .iter()
+        .filter_map(|decl| match decl {
+            crate::ast::Decl::Function {
+                name,
+                type_params,
+                params,
+                using_params,
+                ret_type,
+                error_type,
+                effect,
+                cap,
+                requires,
+                ensures,
+                annotations,
+                public,
+                body: crate::ast::Expr::Block { .. },
+                span,
+                ..
+            } if name == "main"
+                && type_params.is_empty()
+                && params.is_empty()
+                && using_params.is_empty()
+                && ret_type.is_none()
+                && error_type.is_none()
+                && effect.is_none()
+                && cap.is_none()
+                && requires.is_empty()
+                && ensures.is_empty()
+                && annotations.is_empty()
+                && !*public =>
+            {
+                Some(span.start)
+            }
+            _ => None,
+        })
+        .collect();
+    if eligible_starts.len() != 1 {
+        return source.to_owned();
+    }
+
+    let significant: Vec<_> = tokens
+        .iter()
+        .filter(|token| {
+            !matches!(
+                &token.kind,
+                TokenKind::Newline | TokenKind::DocComment(_) | TokenKind::Eof
+            )
+        })
+        .collect();
+    for window in significant.windows(5) {
+        if window[0].span.start != eligible_starts[0]
+            || !matches!(&window[0].kind, TokenKind::Fn)
+            || !matches!(&window[1].kind, TokenKind::Ident(name) if name == "main")
+            || !matches!(&window[2].kind, TokenKind::LParen)
+            || !matches!(&window[3].kind, TokenKind::RParen)
+            || !matches!(&window[4].kind, TokenKind::LBrace)
+        {
+            continue;
+        }
+
+        let start = window[0].span.start as usize;
+        let mut depth = 0_usize;
+        let open_pos = significant
+            .iter()
+            .position(|token| token.span.start == window[4].span.start);
+        if let Some(open_pos) = open_pos {
+            for token in &significant[open_pos..] {
+                match &token.kind {
+                    TokenKind::LBrace => depth += 1,
+                    TokenKind::RBrace => {
+                        if depth == 0 {
+                            return source.to_owned();
+                        }
                         depth -= 1;
                         if depth == 0 {
-                            end = abs_brace + i + 1;
-                            break;
+                            let end = token.span.end as usize;
+                            if start <= end
+                                && end <= source.len()
+                                && source.is_char_boundary(start)
+                                && source.is_char_boundary(end)
+                            {
+                                return format!("{}{}", &source[..start], &source[end..]);
+                            }
+                            return source.to_owned();
                         }
                     }
                     _ => {}
                 }
             }
-            let before = &source[..pos];
-            let after = &source[end..];
-            return format!("{}{}", before, after);
         }
     }
-    source.to_string()
+    source.to_owned()
 }
+
 /// Run a test file via `nulang`, capturing stderr so error messages appear
 /// after the test name (avoiding interleaved output).
 /// Returns `Ok(())` on success, `Err(stderr_string)` on failure.
@@ -3163,4 +3254,30 @@ app "counter" {
         // Unknown subcommands should not be intercepted.
         assert!(try_module_subcommand(&["unknown".to_string()]).is_none());
     }
+
+    #[test]
+    fn test_discover_test_functions_ignores_comments_and_strings() {
+        let source = r#"
+            // fn test_comment() {}
+            fn helper() { "fn test_inside_string() {}" }
+            fn test_actual() { 1 }
+        "#;
+        assert_eq!(
+            discover_test_functions(source),
+            vec!["test_actual".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_strip_main_preserves_braces_in_string_literals() {
+        let source = "fn main() {\n  let s = \"}\"\n  perform IO.print(s)\n}\nfn test_ok() { 1 }\n";
+        assert_eq!(strip_main_function(source).trim(), "fn test_ok() { 1 }");
+    }
+
+    #[test]
+    fn test_strip_main_leaves_nonstandard_signature_untouched() {
+        let source = "fn main(x: Int) { x }\nfn test_ok() { 1 }\n";
+        assert_eq!(strip_main_function(source), source);
+    }
+
 }

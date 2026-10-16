@@ -157,11 +157,12 @@ is testable from the start.
   }
   ```
 
-:::caution
-Discovery is a simple textual scan for `fn test_`. A comment containing
-that literal (e.g. `` `fn test_*` ``) is picked up as a test name too, and
-the resulting wrapper fails to compile. Avoid writing `fn test_` in test
-file comments.
+:::note
+Discovery parses actual top-level `fn test_*` declarations, so function-like
+text in comments and strings does not create tests. Generated test entry points
+use per-run temporary directories and distinct filenames. The runner only
+removes an ordinary block-bodied `fn main()` when it can identify the function
+safely; unsupported signatures remain intact and produce compiler errors.
 :::
 
 ### Flags

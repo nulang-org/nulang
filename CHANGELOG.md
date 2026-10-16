@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Fail-closed formatting and reliable package tests — 2026-10-16
+- **Source formatting now refuses edits that the current AST printer cannot preserve.** Comments, shebangs, unsupported function modifiers, durable actor metadata, and type visibility/opacity cause a clear refusal rather than silent source loss; LSP formatting uses the same safety boundary.
+- **Package test discovery uses parsed declarations instead of matching source text.** Generated per-function entry points are isolated between runs, and directory formatting validates all source files before writing any of them. Runtime/compiler semantics remain unchanged.
+
 ### Web static-root containment — 2026-10-15
 - **Experimental Web static file serving refuses parent traversal and symlinks escaping configured roots.** Canonical candidate paths must remain inside their canonicalized static or output root, and normal in-root files remain serveable.
 - **A filesystem regression verifies parent and symlink escape rejection.** This is a clean current-main successor to draft #1676; it does not change SSE or claim protection from malicious concurrent mutation of a trusted static root.

@@ -13,6 +13,24 @@ use crate::types::{NuError, NuResult, Span};
 /// Returns an error if any construct is not yet supported by the formatter
 /// (rather than silently dropping or corrupting it).
 pub fn format_source(source: &str) -> Result<String, String> {
+    // The AST printer cannot round-trip comments or shebangs yet.
+    // Reject rather than silently delete user-authored source text.
+    if source.starts_with("#!") {
+        return Err("formatting refused: shebangs cannot be preserved safely".to_string());
+    }
+    let tokens = crate::lexer::Lexer::new(source)
+        .lex_with_comments()
+        .map_err(|e| e.to_string())?;
+    if tokens.iter().any(|token| {
+        matches!(
+            &token.kind,
+            crate::lexer::TokenKind::Comment(_)
+                | crate::lexer::TokenKind::DocComment(_)
+        )
+    }) {
+        return Err("formatting refused: comments cannot be preserved safely".to_string());
+    }
+
     let mut lexer = crate::lexer::Lexer::new(source);
     let tokens = lexer.lex().map_err(|e| e.to_string())?;
     let mut parser = crate::parser::Parser::new(tokens);
@@ -29,7 +47,7 @@ pub fn format_source(source: &str) -> Result<String, String> {
         fmt_decl(&mut out, decl, 0, &mut had_unhandled);
     }
     if had_unhandled {
-        return Err("file contains constructs not yet supported by the formatter (e.g. workflow, agent, let-binding, class, impl). The file was not modified.".to_string());
+        return Err("formatting refused: at least one construct or modifier cannot be preserved safely; the file was not modified".to_string());
     }
     if !out.ends_with('\n') {
         out.push('\n');
@@ -39,60 +57,75 @@ pub fn format_source(source: &str) -> Result<String, String> {
 
 /// Recursively format all `.nula` files under `dir`.
 ///
-/// When `check_only` is true files are never modified; an error is returned
-/// on the first file that *would* be reformatted instead.
+/// Preflight the whole directory tree before writing any source. Unsafe
+/// formatting, parse and read failures leave every file unchanged. Filesystem
+/// write failures in the subsequent write phase are not transactional.
 pub fn format_directory(dir: &Path, check_only: bool) -> NuResult<()> {
-    walk_format(dir, check_only)
+    let mut pending = Vec::new();
+    collect_formatted_files(dir, &mut pending)?;
+
+    if check_only {
+        if let Some((path, _)) = pending.first() {
+            return Err(NuError::parse_error(
+                format!("Would reformat {}", path.display()),
+                Span::default(),
+            ));
+        }
+        return Ok(());
+    }
+
+    for (path, formatted) in pending {
+        std::fs::write(&path, formatted.as_bytes()).map_err(|e| {
+            NuError::vm_error(
+                format!("Cannot write '{}': {}", path.display(), e),
+                Span::default(),
+            )
+        })?;
+        println!("Formatted {}", path.display());
+    }
+    Ok(())
 }
 
-fn walk_format(dir: &Path, check_only: bool) -> NuResult<()> {
+fn collect_formatted_files(
+    dir: &Path,
+    pending: &mut Vec<(std::path::PathBuf, String)>,
+) -> NuResult<()> {
     let entries = std::fs::read_dir(dir).map_err(|e| {
         NuError::vm_error(
             format!("Cannot read directory '{}': {}", dir.display(), e),
             Span::default(),
         )
     })?;
+    let mut paths = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|e| {
-            NuError::vm_error(
-                format!("Cannot read entry in '{}': {}", dir.display(), e),
-                Span::default(),
-            )
-        })?;
-        let path = entry.path();
+        paths.push(
+            entry
+                .map_err(|e| {
+                    NuError::vm_error(
+                        format!("Cannot read entry in '{}': {}", dir.display(), e),
+                        Span::default(),
+                    )
+                })?
+                .path(),
+        );
+    }
+    paths.sort();
+
+    for path in paths {
         if path.is_dir() {
-            walk_format(&path, check_only)?;
-        } else if path.extension().map_or(false, |ext| ext == "nula") {
+            collect_formatted_files(&path, pending)?;
+        } else if path.extension().is_some_and(|ext| ext == "nula") {
             let source = std::fs::read_to_string(&path).map_err(|e| {
                 NuError::vm_error(
                     format!("Cannot read '{}': {}", path.display(), e),
                     Span::default(),
                 )
             })?;
-            match format_source(&source) {
-                Ok(formatted) => {
-                    if formatted != source {
-                        if check_only {
-                            return Err(NuError::parse_error(
-                                format!("Would reformat {}", path.display()),
-                                Span::default(),
-                            ));
-                        }
-                        std::fs::write(&path, formatted.as_bytes()).map_err(|e| {
-                            NuError::vm_error(
-                                format!("Cannot write '{}': {}", path.display(), e),
-                                Span::default(),
-                            )
-                        })?;
-                        println!("Formatted {}", path.display());
-                    }
-                }
-                Err(e) => {
-                    return Err(NuError::parse_error(
-                        format!("{}: {}", path.display(), e),
-                        Span::default(),
-                    ));
-                }
+            let formatted = format_source(&source).map_err(|e| {
+                NuError::parse_error(format!("{}: {}", path.display(), e), Span::default())
+            })?;
+            if formatted != source {
+                pending.push((path, formatted));
             }
         }
     }
@@ -108,8 +141,36 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             ret_type,
             body,
             effect,
+            type_params,
+            type_param_constraints,
+            default_values,
+            using_params,
+            error_type,
+            cap,
+            requires,
+            ensures,
+            annotations,
+            public,
             ..
         } => {
+            // The AST printer currently omits several source-level modifiers.
+            // Refuse the entire file rather than silently changing its API,
+            // effect/ownership contracts, or runtime pre/postconditions.
+            if *public
+                || !type_params.is_empty()
+                || !type_param_constraints.is_empty()
+                || default_values.iter().any(Option::is_some)
+                || !using_params.is_empty()
+                || error_type.is_some()
+                || cap.is_some()
+                || !requires.is_empty()
+                || !ensures.is_empty()
+                || !annotations.is_empty()
+                || params.iter().any(|param| param.cap.is_some())
+            {
+                *had_unhandled = true;
+                return;
+            }
             out.push_str(&format!("{}fn {}(", sp, name));
             for (i, p) in params.iter().enumerate() {
                 let pn = &p.name;
@@ -137,8 +198,13 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             name,
             type_params,
             variants,
+            public,
             ..
         } => {
+            if *public {
+                *had_unhandled = true;
+                return;
+            }
             out.push_str(&format!("{}type {}", sp, name));
             if !type_params.is_empty() {
                 out.push_str(&format!("[{}]", type_params.join(", ")));
@@ -159,8 +225,14 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             name,
             type_params,
             body,
+            opaque,
+            public,
             ..
         } => {
+            if *opaque || *public {
+                *had_unhandled = true;
+                return;
+            }
             out.push_str(&format!("{}type {}", sp, name));
             if !type_params.is_empty() {
                 out.push_str(&format!("[{}]", type_params.join(", ")));
@@ -171,8 +243,42 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             name,
             behaviors,
             state_fields,
+            type_params,
+            persistent,
+            init,
+            backend,
+            initializer,
+            version,
+            events,
+            apply_handlers,
+            migrations,
+            is_organization,
+            virtual_,
+            key_params,
+            implements,
             ..
         } => {
+            // Actor/entity provenance and durability are not yet printed.
+            if *persistent
+                || !type_params.is_empty()
+                || !init.is_empty()
+                || backend.is_some()
+                || initializer.is_some()
+                || *version != 1
+                || !events.is_empty()
+                || !apply_handlers.is_empty()
+                || !migrations.is_empty()
+                || *is_organization
+                || *virtual_
+                || !key_params.is_empty()
+                || implements.is_some()
+                || state_fields
+                    .iter()
+                    .any(|(_, model, _, _)| !matches!(model, crate::ast::StateModel::Local))
+            {
+                *had_unhandled = true;
+                return;
+            }
             out.push_str(&format!("{}actor {} {{\n", sp, name));
             for (fnm, _, fty, fdef) in state_fields {
                 out.push_str(&format!("{}    state {}: {}", sp, fnm, fmt_type(fty)));
@@ -1214,7 +1320,7 @@ fn op_sym_unary(op: crate::ast::UnOp) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::format_source;
+    use super::{format_directory, format_source};
 
     /// Formatting must be idempotent: formatting the formatted output is a
     /// no-op (returns the same text), so repeated `fmt` runs converge.
@@ -1396,4 +1502,134 @@ fn main() {
         assert!(out.contains("emit Event(1)"), "got: {out}");
         assert_idempotent(src);
     }
+
+    #[test]
+    fn test_fmt_rejects_comment_loss_instead_of_rewriting_source() {
+        let cases = [
+            "fn main() {\n  // keep this explanation\n  perform IO.print(\"hello\")\n}\n",
+            "/// public API documentation\nfn greet() { 1 }\n",
+            "fn main() { /* keep block comment */ 1 }\n",
+            "#!/usr/bin/env nulang\nfn main() { 1 }\n",
+        ];
+        for source in cases {
+            assert!(
+                format_source(source).is_err(),
+                "formatter must refuse a lossy rewrite: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fmt_directory_preflights_every_file_before_rewriting_any() {
+        let root = std::env::temp_dir().join(format!(
+            "nulang_fmt_preflight_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).expect("create test directory");
+        let safe = root.join("a.nula");
+        let unsafe_file = root.join("z.nula");
+        let original = "import Foo::Bar";
+        std::fs::write(&safe, original).expect("write safe file");
+        std::fs::write(
+            &unsafe_file,
+            "fn main() { // must keep this comment\n  1\n}\n",
+        )
+        .expect("write unsafe file");
+
+        let result = format_directory(&root, false);
+        assert!(result.is_err(), "unsafe file should abort the directory operation");
+        assert_eq!(
+            std::fs::read_to_string(&safe).expect("read source"),
+            original,
+            "preflight failure must not change previously visited files"
+        );
+        assert!(
+            std::fs::read_to_string(&unsafe_file)
+                .expect("read unsafe source")
+                .contains("// must keep this comment")
+        );
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn test_fmt_refuses_public_generic_and_defaulted_functions() {
+        for source in [
+            "pub fn identity[T](value: T) -> T { value }",
+            "fn greet(name: String = \"world\") -> String { name }",
+        ] {
+            let tokens = crate::lexer::Lexer::new(source)
+                .lex()
+                .expect("fixture should lex");
+            crate::parser::Parser::new(tokens)
+                .parse_module()
+                .expect("fixture should parse: regression must test an actual source loss");
+            assert!(
+                format_source(source).is_err(),
+                "formatter must not discard function signature semantics: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fmt_refuses_persistent_actor_semantics() {
+        let source = "persistent actor Counter {\n  state count: Int = 0\n  behavior ping() { 1 }\n}\n";
+        let tokens = crate::lexer::Lexer::new(source)
+            .lex()
+            .expect("fixture should lex");
+        crate::parser::Parser::new(tokens)
+            .parse_module()
+            .expect("fixture should parse: regression must test an actual source loss");
+        assert!(
+            format_source(source).is_err(),
+            "formatter must not turn a persistent actor into a transient actor"
+        );
+    }
+
+    #[test]
+    fn test_fmt_refuses_export_and_opaque_type_modifiers() {
+        for source in [
+            "pub type Color = Red | Blue",
+            "opaque type Token = String",
+        ] {
+            let tokens = crate::lexer::Lexer::new(source)
+                .lex()
+                .expect("fixture should lex");
+            crate::parser::Parser::new(tokens)
+                .parse_module()
+                .expect("fixture should parse");
+            assert!(
+                format_source(source).is_err(),
+                "formatter must not remove type visibility or opacity: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fmt_refuses_nonlocal_actor_state_model() {
+        let source = "actor Counter {\n  state durable count: Int = 0\n  behavior ping() { 1 }\n}\n";
+        let tokens = crate::lexer::Lexer::new(source)
+            .lex()
+            .expect("fixture should lex");
+        crate::parser::Parser::new(tokens)
+            .parse_module()
+            .expect("fixture should parse");
+        assert!(
+            format_source(source).is_err(),
+            "formatter must not discard durable state metadata"
+        );
+    }
+
+    #[test]
+    fn test_fmt_does_not_confuse_url_string_with_comment() {
+        let source = "fn main() { perform IO.print(\"https://example.com/test\") }";
+        assert!(
+            format_source(source).is_ok(),
+            "a URL string is not a source comment"
+        );
+    }
+
 }

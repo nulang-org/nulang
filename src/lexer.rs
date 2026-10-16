@@ -363,9 +363,19 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// Run the lexer, producing a vector of tokens. Newlines are preserved
-    /// for semicolon insertion logic but comments are filtered out.
+    /// Run the lexer, producing tokens for the parser. Newlines and
+    /// documentation comments are kept, ordinary comments are filtered.
     pub fn lex(&mut self) -> NuResult<Vec<Token>> {
+        self.lex_impl(false)
+    }
+
+    /// Include ordinary comments for tools that must not discard source trivia.
+    /// Parser-facing lex() retains its original behavior.
+    pub fn lex_with_comments(&mut self) -> NuResult<Vec<Token>> {
+        self.lex_impl(true)
+    }
+
+    fn lex_impl(&mut self, preserve_comments: bool) -> NuResult<Vec<Token>> {
         let mut tokens = Vec::new();
         loop {
             let tok = self.next_token()?;
@@ -374,10 +384,7 @@ impl<'a> Lexer<'a> {
                     tokens.push(tok);
                     break;
                 }
-                // Filter out regular comments, keep doc comments as tokens
-                TokenKind::Comment(_) => {
-                    // skip regular comments
-                }
+                TokenKind::Comment(_) if !preserve_comments => {}
                 _ => tokens.push(tok),
             }
         }
@@ -1353,6 +1360,33 @@ mod tests {
         assert_eq!(
             kinds,
             vec![TokenKind::Newline, TokenKind::IntLit(42), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn test_lex_with_comments_preserves_trivia_without_changing_parser_tokens() {
+        let source = "/// documentation\nfn f() { // ordinary comment\n  1\n}\n";
+        let parser_tokens = Lexer::new(source).lex().expect("parser tokenization");
+        let tooling_tokens = Lexer::new(source)
+            .lex_with_comments()
+            .expect("tooling tokenization");
+        assert!(
+            !parser_tokens
+                .iter()
+                .any(|token| matches!(&token.kind, TokenKind::Comment(_))),
+            "normal compilation must still filter ordinary comments"
+        );
+        assert!(
+            tooling_tokens
+                .iter()
+                .any(|token| matches!(&token.kind, TokenKind::Comment(_))),
+            "source tooling needs regular comments"
+        );
+        assert!(
+            tooling_tokens
+                .iter()
+                .any(|token| matches!(&token.kind, TokenKind::DocComment(_))),
+            "source tooling needs documentation comments"
         );
     }
 
