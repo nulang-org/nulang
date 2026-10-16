@@ -4495,7 +4495,13 @@ impl Runtime {
                     return;
                 }
             };
-            actor.current_workflow_activation = None;
+            // A suspended bytecode turn still owns its admitted command.
+            // Retain its activation until the resumed VM commits a terminal
+            // result: intermediate signals/timers must not snapshot speculative
+            // state or lose the replay-stable command identity.
+            if actor.suspended_execution.is_none() {
+                actor.current_workflow_activation = None;
+            }
             actor.increment_reductions(1);
             // Turn ownership now lives in finish_actor_turn. Keep reductions
             // live across the whole batch so should_yield observes cumulative
