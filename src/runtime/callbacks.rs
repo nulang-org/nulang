@@ -3047,4 +3047,128 @@ mod host_authority_tests {
             authorize_actor_host_effect(&rt, None, "FS", Some("read"), &constants, &regs,).is_ok()
         );
     }
+
+    #[test]
+    fn top_level_runtime_callbacks_preserve_env_system_and_fs_builtins() {
+        use crate::vm::{resolve_value_string, ActorVmCallbacks};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let expected_path = std::env::var("PATH").expect("test environment must provide PATH");
+        let file = std::env::temp_dir().join(format!(
+            "nulang-host-parity-{}-{}.txt",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(&file, "first").unwrap();
+
+        let mut module = crate::bytecode::CodeModule::new("host-stdlib-parity");
+        module.add_constant(Constant::String("PATH".into())); // r0
+        module.add_constant(Constant::String(file.to_string_lossy().into_owned())); // r1
+        module.add_constant(Constant::String("-second".into())); // r2
+        let runtime = Rc::new(RefCell::new(Runtime::new()));
+        let mut callbacks = super::RuntimeVmCallbacks::new(runtime);
+
+        let env = callbacks
+            .perform_builtin_effect_in_module("Env", Some("get"), &module, &[Value::string(0)])
+            .expect("Env.get must be handled");
+        assert_eq!(resolve_value_string(&module.constants, env), expected_path);
+
+        let arg = callbacks
+            .perform_builtin_effect_in_module("System", Some("arg"), &module, &[Value::int(0)])
+            .expect("System.arg must be handled");
+        assert!(!resolve_value_string(&module.constants, arg).is_empty());
+
+        let exists = callbacks
+            .perform_builtin_effect_in_module("FS", Some("exists"), &module, &[Value::string(1)])
+            .expect("FS.exists must be handled");
+        assert_eq!(exists.as_bool(), Some(true));
+
+        let read = callbacks
+            .perform_builtin_effect_in_module("FS", Some("read"), &module, &[Value::string(1)])
+            .expect("FS.read must be handled");
+        assert_eq!(resolve_value_string(&module.constants, read), "first");
+
+        let appended = callbacks
+            .perform_builtin_effect_in_module(
+                "FS",
+                Some("append"),
+                &module,
+                &[Value::string(1), Value::string(2)],
+            )
+            .expect("FS.append must be handled");
+        assert_eq!(appended, Value::unit());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "first-second");
+
+        let written = callbacks
+            .perform_builtin_effect_in_module(
+                "FS",
+                Some("write"),
+                &module,
+                &[Value::string(1), Value::string(2)],
+            )
+            .expect("FS.write must be handled");
+        assert_eq!(written, Value::unit());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "-second");
+        std::fs::remove_file(file).unwrap();
+    }
+
+    #[test]
+    fn actor_host_file_access_requires_exact_grant_for_both_callback_paths() {
+        use crate::vm::{resolve_value_string, ActorVmCallbacks};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let file = std::env::temp_dir().join(format!(
+            "nulang-actor-fs-grant-{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&file, "guarded").unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let mut module = crate::bytecode::CodeModule::new("actor-host-fs");
+        module.add_constant(Constant::String(path.clone()));
+        module.add_constant(Constant::String("overwrite".into()));
+        let actor_id = 800_014;
+        let runtime = Rc::new(RefCell::new(Runtime::new()));
+        {
+            let mut rt = runtime.borrow_mut();
+            rt.actors.insert(actor_id, Actor::new(actor_id, "actor-host-fs", 8));
+            rt.current_actor = Some(actor_id);
+        }
+        let mut top = super::RuntimeVmCallbacks::new(runtime.clone());
+        let denied = top
+            .perform_builtin_effect_in_module(
+                "FS", Some("write"), &module, &[Value::string(0), Value::string(1)],
+            )
+            .expect("denied host effect must fail closed");
+        assert!(denied.is_nil());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "guarded");
+
+        let denied_read = top
+            .perform_builtin_effect_in_module("FS", Some("read"), &module, &[Value::string(0)])
+            .expect("denied read must fail closed");
+        assert!(denied_read.is_nil());
+
+        {
+            let mut rt = runtime.borrow_mut();
+            let token = format!("Fs::Read({path})");
+            let manifest = AuthorityManifest::from_tokens([token.as_str()]).unwrap();
+            rt.actors.get_mut(&actor_id).unwrap().install_authority_manifest(&manifest);
+        }
+        let read = top
+            .perform_builtin_effect_in_module("FS", Some("read"), &module, &[Value::string(0)])
+            .expect("granted read must be handled");
+        assert_eq!(resolve_value_string(&module.constants, read), "guarded");
+
+        let mut rt = runtime.borrow_mut();
+        let mut actor_callback = super::BytecodeRuntimeCallbacks::new(&mut *rt, actor_id);
+        let read = actor_callback
+            .perform_builtin_effect_in_module("FS", Some("read"), &module, &[Value::string(0)])
+            .expect("scheduler callback must dispatch granted read");
+        assert_eq!(resolve_value_string(&module.constants, read), "guarded");
+        drop(actor_callback);
+        drop(rt);
+        std::fs::remove_file(file).unwrap();
+    }
+
 }
