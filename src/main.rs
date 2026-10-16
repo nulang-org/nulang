@@ -1285,7 +1285,9 @@ fn validate_node_security_mode(
         return Ok(());
     }
     if !(has_cert && has_key && has_ca) {
-        return Err("node requires --tls-cert, --tls-key and --tls-ca (or explicit loopback --plaintext)");
+        return Err(
+            "node requires --tls-cert, --tls-key and --tls-ca (or explicit loopback --plaintext)",
+        );
     }
     Ok(())
 }
