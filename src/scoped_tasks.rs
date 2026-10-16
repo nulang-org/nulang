@@ -106,7 +106,7 @@ impl<T, E> TaskScope<T, E> {
             return None;
         }
         let id = self.pending.pop_front()?;
-        debug_assert!(matches!(self.slots[id.0], TaskSlot::Pending));
+        debug_assert!(matches!(self.slots.get(id.0), Some(TaskSlot::Pending)));
         self.slots[id.0] = TaskSlot::Running;
         self.in_flight += 1;
         Some(id)
@@ -305,9 +305,41 @@ mod tests {
         scope.admit_next();
         scope.cancel(CancellationCause::DeadlineExceeded);
         scope.acknowledge_cancelled(a).unwrap();
-        assert_eq!(scope.acknowledge_cancelled(a), Err(ScopeError::NotRunning(a)));
+        assert_eq!(
+            scope.acknowledge_cancelled(a),
+            Err(ScopeError::NotRunning(a))
+        );
         assert!(scope.is_quiescent());
         assert_eq!(scope.into_outcomes().unwrap(), vec![TaskOutcome::Cancelled]);
+    }
+
+    #[test]
+    fn cancellation_before_admission_terminalizes_all_pending_children() {
+        let mut scope = TaskScope::<usize, &'static str>::new(2, 2).unwrap();
+        scope.try_submit().unwrap();
+        scope.try_submit().unwrap();
+        scope.cancel(CancellationCause::DeadlineExceeded);
+        assert_eq!(scope.admit_next(), None);
+        assert_eq!(scope.in_flight(), 0);
+        assert!(scope.is_quiescent());
+        assert_eq!(
+            scope.into_outcomes().unwrap(),
+            vec![TaskOutcome::Cancelled, TaskOutcome::Cancelled]
+        );
+    }
+
+    #[test]
+    fn later_failures_do_not_overwrite_initial_parent_cancellation() {
+        let mut scope = TaskScope::<usize, &'static str>::new(2, 2).unwrap();
+        let a = scope.try_submit().unwrap();
+        let b = scope.try_submit().unwrap();
+        scope.admit_next();
+        scope.admit_next();
+        scope.cancel(CancellationCause::Parent);
+        scope.complete(b, Err("late")).unwrap();
+        assert_eq!(scope.cancellation(), Some(&CancellationCause::Parent));
+        scope.acknowledge_cancelled(a).unwrap();
+        assert!(scope.is_quiescent());
     }
 
     #[test]
