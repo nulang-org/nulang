@@ -1396,4 +1396,30 @@ fn main() {
         assert!(out.contains("emit Event(1)"), "got: {out}");
         assert_idempotent(src);
     }
+
+    #[test]
+    fn test_fmt_rejects_comment_loss_instead_of_rewriting_source() {
+        let cases = [
+            "fn main() {\n  // keep this explanation\n  perform IO.print(\"hello\")\n}\n",
+            "/// public API documentation\nfn greet() { 1 }\n",
+            "fn main() { /* keep block comment */ 1 }\n",
+            "#!/usr/bin/env nulang\nfn main() { 1 }\n",
+        ];
+        for source in cases {
+            assert!(
+                format_source(source).is_err(),
+                "formatter must refuse a lossy rewrite: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fmt_does_not_confuse_url_string_with_comment() {
+        let source = "fn main() { perform IO.print(\"https://example.com/test\") }";
+        assert!(
+            format_source(source).is_ok(),
+            "a URL string is not a source comment"
+        );
+    }
+
 }
