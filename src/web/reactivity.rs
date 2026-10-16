@@ -1112,20 +1112,57 @@ pub fn generate_client_runtime() -> String {
   const elementOwners = new WeakMap();
   const mountedRoots = new WeakMap();
 
-  function mount(root) {
+  function mount(root, options) {
     if (!root || typeof root.querySelectorAll !== 'function') {
       throw new TypeError('nulang.mount requires a root with querySelectorAll');
     }
+    // Scope-local identity is represented by a Symbol, never by a prefixed
+    // string that could collide with a user-defined global signal name.
+    const localSignals = Boolean(options && options.localSignals === true);
     const existing = mountedRoots.get(root);
-    if (existing) return existing;
+    if (existing) {
+      if (existing.localSignals !== localSignals) {
+        throw new Error('nulang: root already mounted with a different signal mode');
+      }
+      return existing;
+    }
 
     const cleanups = [];
+    const localKeys = new Map();
+    function signalKey(name) {
+      if (!localSignals) return name;
+      if (!localKeys.has(name)) localKeys.set(name, Symbol(name));
+      return localKeys.get(name);
+    }
+
     const scope = {
+      localSignals: localSignals,
+      signal: function (name) {
+        if (mountedRoots.get(root) !== scope) {
+          throw new Error('nulang: disposed scope');
+        }
+        const key = signalKey(name);
+        return {
+          get: function () {
+            if (mountedRoots.get(root) !== scope) throw new Error('nulang: disposed scope');
+            return signals[key];
+          },
+          set: function (value) {
+            if (mountedRoots.get(root) !== scope) throw new Error('nulang: disposed scope');
+            setSignal(key, value);
+          }
+        };
+      },
       dispose: function () {
         if (mountedRoots.get(root) !== scope) return;
         mountedRoots.delete(root);
         for (let i = cleanups.length - 1; i >= 0; i--) cleanups[i]();
         cleanups.length = 0;
+        for (const key of localKeys.values()) {
+          dirtySignals.delete(key);
+          delete signals[key];
+        }
+        localKeys.clear();
       }
     };
     mountedRoots.set(root, scope);
@@ -1140,7 +1177,11 @@ pub fn generate_client_runtime() -> String {
 
     function claim(el) {
       const current = elementOwners.get(el);
-      if (current) return current === scope;
+      if (current) {
+        if (current === scope) return true;
+        if (localSignals) throw new Error('nulang: element already owned by another scope');
+        return false;
+      }
       elementOwners.set(el, scope);
       cleanups.push(function () {
         if (elementOwners.get(el) === scope) elementOwners.delete(el);
@@ -1167,11 +1208,12 @@ pub fn generate_client_runtime() -> String {
       select('[data-signal]').forEach(function (el) {
         const name = el.dataset.signal;
         if (!name || !claim(el)) return;
-        if (!(name in signals)) signals[name] = el.textContent;
-        else if (el.textContent !== String(signals[name])) {
-          el.textContent = signals[name];
+        const key = signalKey(name);
+        if (!(key in signals)) signals[key] = el.textContent;
+        else if (el.textContent !== String(signals[key])) {
+          el.textContent = signals[key];
         }
-        subscribe(signalBindings, name, el);
+        subscribe(signalBindings, key, el);
       });
 
       safeAttributes.forEach(function (entry) {
@@ -1180,11 +1222,12 @@ pub fn generate_client_runtime() -> String {
         select('[' + marker + ']').forEach(function (el) {
           const name = el.getAttribute(marker);
           if (!name || !claim(el)) return;
-          if (!(name in signals)) signals[name] = el.getAttribute(attribute);
-          else if (el.getAttribute(attribute) !== String(signals[name])) {
-            el.setAttribute(attribute, String(signals[name]));
+          const key = signalKey(name);
+          if (!(key in signals)) signals[key] = el.getAttribute(attribute);
+          else if (el.getAttribute(attribute) !== String(signals[key])) {
+            el.setAttribute(attribute, String(signals[key]));
           }
-          subscribe(attributeBindings, name, { el: el, attribute: attribute });
+          subscribe(attributeBindings, key, { el: el, attribute: attribute });
         });
       });
 
