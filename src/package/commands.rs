@@ -1991,7 +1991,7 @@ fn strip_main_function(source: &str) -> String {
                 && requires.is_empty()
                 && ensures.is_empty()
                 && annotations.is_empty()
-                && !public =>
+                && !*public =>
             {
                 Some(span.start)
             }
