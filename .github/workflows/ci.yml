@@ -30,6 +30,9 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Regression — Web action payload field names
+        run: node --test tests/web_action_payload.test.cjs
+
       - name: Enable corepack
         run: corepack enable
 
