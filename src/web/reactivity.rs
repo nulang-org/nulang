@@ -9,7 +9,7 @@
 //! by `nula build --web` and `nula dev`. It is intentionally conservative:
 //! it only reports dependencies that are statically visible in the same module.
 
-use crate::ast::{AstModule, Decl, Expr, Literal};
+use crate::ast::{AstModule, Decl, Expr, Literal, Pattern};
 use crate::effect_checker::EffectChecker;
 use crate::types::{Effect, EffectRow, Span};
 pub use nulang_ui_protocol::ActionPlacement;
@@ -517,6 +517,7 @@ pub fn inject_client_runtime_script(html: &str) -> String {
     if !html.contains("data-signal=")
         && !html.contains("data-action=")
         && !html.contains("data-nulang-bind=")
+        && !html.contains("data-nulang-if=")
     {
         return html.to_string();
     }
@@ -545,8 +546,14 @@ pub fn rewrite_module(module: &mut AstModule, checker: Option<&EffectChecker>) {
         }
     }
     for decl in &mut module.decls {
-        if let Decl::Function { body, .. } = decl {
-            rewrite_expr(body, false, &signals, checker);
+        if let Decl::Function { body, params, .. } = decl {
+            // Parameter names shadow module-level signals. Fail closed rather
+            // than synthesizing browser bindings to an unrelated global value.
+            let mut visible_signals = signals.clone();
+            for param in params {
+                visible_signals.remove(&param.name);
+            }
+            rewrite_expr(body, false, &visible_signals, checker);
         }
     }
 }
@@ -632,16 +639,34 @@ fn rewrite_expr(
         }
 
         // Recurse through other expression forms.
-        Expr::Lambda { body, .. } => rewrite_expr(body, in_html, signals, checker),
+        Expr::Lambda { body, params, .. } => {
+            let mut visible_signals = signals.clone();
+            for param in params {
+                visible_signals.remove(&param.name);
+            }
+            rewrite_expr(body, in_html, &visible_signals, checker);
+        },
         Expr::App { func, args, .. } => {
             rewrite_expr(func, in_html, signals, checker);
             for arg in args.iter_mut() {
                 rewrite_expr(arg, in_html, signals, checker);
             }
         }
-        Expr::Let { value, body, .. } | Expr::LetRec { value, body, .. } => {
+        Expr::Let { name, value, body, .. } => {
             rewrite_expr(value, in_html, signals, checker);
-            rewrite_expr(body, in_html, signals, checker);
+            let mut visible_signals = signals.clone();
+            visible_signals.remove(name);
+            rewrite_expr(body, in_html, &visible_signals, checker);
+        }
+        Expr::LetRec { name, params, value, body, .. } => {
+            let mut visible_signals = signals.clone();
+            visible_signals.remove(name);
+            let mut function_signals = visible_signals.clone();
+            for param in params {
+                function_signals.remove(&param.name);
+            }
+            rewrite_expr(value, in_html, &function_signals, checker);
+            rewrite_expr(body, in_html, &visible_signals, checker);
         }
         Expr::If {
             cond,
@@ -649,21 +674,39 @@ fn rewrite_expr(
             else_branch,
             ..
         } => {
+            // A conditional can participate in future browser-side branch
+            // replacement only when its guard is a declared signal and both
+            // alternatives render a single, statically identifiable HTML root.
+            // No branch is pre-rendered, serialized or evaluated on the client.
+            let signal = match cond.as_ref() {
+                Expr::Var(name, _) if signals.contains(name) => Some(name.clone()),
+                _ => None,
+            };
             rewrite_expr(cond, in_html, signals, checker);
             rewrite_expr(then_branch, in_html, signals, checker);
-            if let Some(else_branch) = else_branch {
-                rewrite_expr(else_branch, in_html, signals, checker);
+            if let Some(other) = else_branch.as_mut() {
+                rewrite_expr(other, in_html, signals, checker);
+            }
+            if let (Some(signal), Some(other)) = (signal, else_branch.as_mut()) {
+                if can_mark_conditional_root(then_branch)
+                    && can_mark_conditional_root(other)
+                {
+                    mark_conditional_root(then_branch, &signal, "then");
+                    mark_conditional_root(other, &signal, "else");
+                }
             }
         }
         Expr::Match {
             scrutinee, arms, ..
         } => {
             rewrite_expr(scrutinee, in_html, signals, checker);
-            for (_, guard, body) in arms {
+            for (pattern, guard, body) in arms {
+                let mut visible_signals = signals.clone();
+                hide_pattern_signals(pattern, &mut visible_signals);
                 if let Some(guard) = guard {
-                    rewrite_expr(guard, in_html, signals, checker);
+                    rewrite_expr(guard, in_html, &visible_signals, checker);
                 }
-                rewrite_expr(body, in_html, signals, checker);
+                rewrite_expr(body, in_html, &visible_signals, checker);
             }
         }
         Expr::Block { exprs, .. } | Expr::Par { exprs, .. } => {
@@ -699,9 +742,11 @@ fn rewrite_expr(
             rewrite_expr(left, in_html, signals, checker);
             rewrite_expr(right, in_html, signals, checker);
         }
-        Expr::For { iterable, body, .. } => {
+        Expr::For { var, iterable, body, .. } => {
             rewrite_expr(iterable, in_html, signals, checker);
-            rewrite_expr(body, in_html, signals, checker);
+            let mut visible_signals = signals.clone();
+            visible_signals.remove(var);
+            rewrite_expr(body, in_html, &visible_signals, checker);
         }
         Expr::While { cond, body, .. } => {
             rewrite_expr(cond, in_html, signals, checker);
@@ -730,7 +775,11 @@ fn rewrite_expr(
         Expr::Handle { body, handlers, .. } => {
             rewrite_expr(body, in_html, signals, checker);
             for h in handlers.iter_mut() {
-                rewrite_expr(&mut h.body, in_html, signals, checker);
+                let mut visible_signals = signals.clone();
+                for param in &h.params {
+                    visible_signals.remove(param);
+                }
+                rewrite_expr(&mut h.body, in_html, &visible_signals, checker);
             }
         }
         Expr::Perform { args, .. } => {
@@ -758,11 +807,15 @@ fn rewrite_expr(
             }
         }
         Expr::Receive { arms, after, .. } => {
-            for (_, _, guard, body) in arms {
-                if let Some(guard) = guard {
-                    rewrite_expr(guard, in_html, signals, checker);
+            for (_, patterns, guard, body) in arms {
+                let mut visible_signals = signals.clone();
+                for pattern in patterns {
+                    hide_pattern_signals(pattern, &mut visible_signals);
                 }
-                rewrite_expr(body, in_html, signals, checker);
+                if let Some(guard) = guard {
+                    rewrite_expr(guard, in_html, &visible_signals, checker);
+                }
+                rewrite_expr(body, in_html, &visible_signals, checker);
             }
             if let Some((t, b)) = after {
                 rewrite_expr(t, in_html, signals, checker);
@@ -777,6 +830,65 @@ fn rewrite_expr(
         }
 
         _ => {}
+    }
+}
+
+/// Pattern binders shadow same-named module signals inside a match/receive
+/// arm. Avoid inventing reactive global bindings for a lexical variable.
+fn hide_pattern_signals(pattern: &Pattern, visible: &mut HashSet<String>) {
+    match pattern {
+        Pattern::Var(name) => {
+            visible.remove(name);
+        }
+        Pattern::Tuple(parts) => {
+            for part in parts {
+                hide_pattern_signals(part, visible);
+            }
+        }
+        Pattern::Record(fields) => {
+            for (_, part) in fields {
+                hide_pattern_signals(part, visible);
+            }
+        }
+        Pattern::Variant(_, Some(inner)) => hide_pattern_signals(inner, visible),
+        Pattern::Alias(name, inner) => {
+            visible.remove(name);
+            hide_pattern_signals(inner, visible);
+        }
+        Pattern::Wild | Pattern::Lit(_) | Pattern::Variant(_, None) => {}
+    }
+}
+
+/// Only direct element roots receive conditional markers. Wrapping arbitrary
+/// Html values here would insert invalid spans in table/select contexts and
+/// would evaluate both branches, changing server-rendering semantics.
+fn can_mark_conditional_root(expr: &Expr) -> bool {
+    let Expr::App { func, args, .. } = expr else {
+        return false;
+    };
+    if !is_var(func, "el") || args.len() != 3 {
+        return false;
+    }
+    let Expr::Array(attrs, _) = &args[1] else {
+        return false;
+    };
+    !attrs.iter().any(|attr| match attr {
+        Expr::Tuple(parts, _) if parts.len() == 2 => {
+            matches!(
+                string_literal(&parts[0]).as_deref(),
+                Some("data-nulang-if" | "data-nulang-branch")
+            )
+        }
+        _ => false,
+    })
+}
+
+fn mark_conditional_root(expr: &mut Expr, signal: &str, branch: &str) {
+    if let Expr::App { args, span, .. } = expr {
+        if let Expr::Array(attrs, _) = &mut args[1] {
+            attrs.push(data_attr("data-nulang-if", signal, *span));
+            attrs.push(data_attr("data-nulang-branch", branch, *span));
+        }
     }
 }
 
@@ -937,6 +1049,15 @@ pub fn generate_client_runtime() -> String {
     const scope = root || document;
     const changed = new Set();
 
+    // SSR emits only the active branch. Its marker is enough to seed the
+    // Boolean signal; no alternate branch is serialized or run in the client.
+    within(scope, '[data-nulang-if]').forEach(function (el) {
+      const name = el.getAttribute('data-nulang-if');
+      const branch = el.getAttribute('data-nulang-branch');
+      if (!name || (branch !== 'then' && branch !== 'else')) return;
+      if (!(name in signals)) signals[name] = branch === 'then';
+    });
+
     within(scope, '[data-signal]').forEach(function (el) {
       if (mountedSignals.has(el)) return;
       const name = el.dataset.signal;
@@ -1062,10 +1183,34 @@ pub fn generate_client_runtime() -> String {
     return next;
   }
 
+  // This is an explicit branch-activation contract for future compiled
+  // renderers. A caller supplies an already-created detached branch; this
+  // code never evaluates hidden Nulang server effects or parses HTML strings.
+  function replaceConditional(current, next) {
+    const name = current && current.getAttribute && current.getAttribute('data-nulang-if');
+    const active = current && current.getAttribute && current.getAttribute('data-nulang-branch');
+    const otherName = next && next.getAttribute && next.getAttribute('data-nulang-if');
+    const branch = next && next.getAttribute && next.getAttribute('data-nulang-branch');
+    if (!name || name !== otherName) {
+      throw new TypeError('nulang: conditional regions must share a signal identity');
+    }
+    if ((active !== 'then' && active !== 'else')
+        || (branch !== 'then' && branch !== 'else') || active === branch) {
+      throw new TypeError('nulang: replacement requires an alternate conditional branch');
+    }
+    // replaceRegion guarantees the DOM and bindings are restored if the
+    // mutation fails. Publish the new signal state only after success.
+    const installed = replaceRegion(current, next);
+    signals[name] = branch === 'then';
+    refreshSignal(name);
+    return installed;
+  }
+
   window.nulang = {
     hydrate: hydrate,
     dispose: dispose,
     replaceRegion: replaceRegion,
+    replaceConditional: replaceConditional,
     signal: function (name) {
       return {
         get: function () { return signals[name]; },
@@ -1267,6 +1412,110 @@ fn view() -> Html {
             html.contains("data-action-placement"),
             "data-action-placement not found"
         );
+    }
+
+    #[test]
+    fn test_rewrite_marks_direct_signal_condition_branches() {
+        let mut module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+signal visible: Bool = true
+
+fn view() -> Html {
+    if visible then <section>Shown</section> else <aside>Hidden</aside>
+}
+"#,
+        );
+        rewrite_module(&mut module, None);
+        let html = format!("{:?}", find_function_body(&module, "view"));
+        assert_eq!(html.matches("data-nulang-if").count(), 2, "{html}");
+        assert!(html.contains("data-nulang-branch"), "{html}");
+        assert!(html.contains("then"), "{html}");
+        assert!(html.contains("else"), "{html}");
+    }
+
+    #[test]
+    fn test_rewrite_does_not_mark_non_signal_conditional() {
+        let mut module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+fn view(visible: Bool) -> Html {
+    if visible then <section>Shown</section> else <aside>Hidden</aside>
+}
+"#,
+        );
+        rewrite_module(&mut module, None);
+        let html = format!("{:?}", find_function_body(&module, "view"));
+        assert!(!html.contains("data-nulang-if"), "{html}");
+    }
+
+    #[test]
+    fn test_rewrite_does_not_bind_shadowed_function_parameter() {
+        let mut module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+signal visible: Bool = true
+
+fn view(visible: Bool) -> Html {
+    if visible then <section>Shown</section> else <aside>Hidden</aside>
+}
+"#,
+        );
+        rewrite_module(&mut module, None);
+        let html = format!("{:?}", find_function_body(&module, "view"));
+        assert!(!html.contains("data-nulang-if"), "{html}");
+    }
+
+    #[test]
+    fn test_rewrite_does_not_bind_shadowed_let_variable() {
+        let mut module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+signal visible: Bool = true
+
+fn view() -> Html {
+    let visible = false
+    if visible then <section>Shown</section> else <aside>Hidden</aside>
+}
+"#,
+        );
+        rewrite_module(&mut module, None);
+        let html = format!("{:?}", find_function_body(&module, "view"));
+        assert!(!html.contains("data-nulang-if"), "{html}");
+    }
+
+    #[test]
+    fn test_rewrite_does_not_mark_unserializable_branch() {
+        let mut module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+signal visible: Bool = true
+
+fn view() -> Html {
+    if visible then text("Shown") else <aside>Hidden</aside>
+}
+"#,
+        );
+        rewrite_module(&mut module, None);
+        let html = format!("{:?}", find_function_body(&module, "view"));
+        assert!(!html.contains("data-nulang-if"), "{html}");
+    }
+
+    #[test]
+    fn test_only_conditional_marker_injects_client_runtime() {
+        let html = r#"<section data-nulang-if="visible" data-nulang-branch="then">Shown</section>"#;
+        let out = inject_client_runtime_script(html);
+        assert!(out.contains(r#"<script src="/app.client.js"></script>"#));
     }
 
     #[test]
