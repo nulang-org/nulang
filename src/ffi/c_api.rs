@@ -1404,9 +1404,8 @@ mod tests {
             "oversized argument count should report an explicit C ABI error"
         );
 
-        let valid = unsafe {
-            nulang_call_function_owned(rt, module, function.as_ptr(), &argument, 1)
-        };
+        let valid =
+            unsafe { nulang_call_function_owned(rt, module, function.as_ptr(), &argument, 1) };
         assert_ne!(valid, 0);
         let mut value = 0;
         assert!(unsafe { nulang_owned_value_int(rt, valid, &mut value) });
