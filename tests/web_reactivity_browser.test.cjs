@@ -138,3 +138,111 @@ test('real Chromium DOM hydration, batching, and safe attributes', { timeout: 25
     fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
+
+
+test('compiler-generated SSR hydrates in Chromium', {
+  timeout: 90000,
+  skip: !process.env.NULANG_BIN
+}, async () => {
+  // The Build & Test CI job explicitly supplies NULANG_BIN. A local run
+  // without a compiler checks the emitted-JS fixture in the preceding test.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nulang-compiled-web-'));
+  let chrome;
+  let cdp;
+  try {
+    fs.mkdirSync(path.join(dir, 'src'));
+    fs.writeFileSync(path.join(dir, 'Nulang.toml'), [
+      '[package]',
+      'name = "reactive-browser-smoke"',
+      'version = "0.1.0"',
+      'entry = "src/main.nula"',
+      '',
+      '[web]',
+      'port = 8787',
+      'static_dir = "static"',
+      'output_dir = "dist"',
+      ''
+    ].join('\n'));
+    fs.writeFileSync(path.join(dir, 'src/main.nula'), [
+      'import stdlib::web::html',
+      'import stdlib::web::types',
+      '',
+      'signal status: Html = text("Initial")',
+      'signal __proto__: Html = text("Safe")',
+      '',
+      'app "reactive-browser-smoke" {',
+      '    route "GET" "/" -> home',
+      '}',
+      '',
+      'fn home() -> Html {',
+      '    document(',
+      '        head([title("Reactive browser smoke")]),',
+      '        body([',
+      '            el("span", [("id", text("state"))], [status]),',
+      '            el("button", [',
+      '                ("id", text("button")),',
+      '                ("title", status),',
+      '                ("aria-label", status)',
+      '            ], [text("Static")]),',
+      '            el("a", [',
+      '                ("id", text("link")),',
+      '                ("href", text("https://example.test/unchanged"))',
+      '            ], [text("Link")]),',
+      '            el("span", [',
+      '                ("id", text("special")),',
+      '                ("title", __proto__)',
+      '            ], [])',
+      '        ])',
+      '    )',
+      '}',
+      ''
+    ].join('\n'));
+    const built = spawnSync(path.resolve(process.env.NULANG_BIN), [
+      'nula', 'build', '--web'
+    ], {
+      cwd: dir,
+      encoding: 'utf8',
+      timeout: 65000,
+      maxBuffer: 2 * 1024 * 1024
+    });
+    assert.equal(built.status, 0,
+      'Nulang web build failed:\n' + (built.stderr || '') + (built.stdout || ''));
+    const out = path.join(dir, 'dist');
+    let html = fs.readFileSync(path.join(out, 'index.html'), 'utf8');
+    const js = fs.readFileSync(path.join(out, 'app.client.js'), 'utf8');
+    assert.match(html, /data-signal=["']status["']/);
+    assert.match(html, /data-nulang-bind-title=["']status["']/);
+    assert.match(html, /data-nulang-bind-aria-label=["']status["']/);
+    assert.match(html, /data-nulang-bind-title=["']__proto__["']/);
+    assert.match(html, /<script src=["']\/app\.client\.js["']><\/script>/);
+    assert.ok(!js.toLowerCase().includes('</script'), 'client JS must not close its script');
+    // Keep every SSR node as emitted by Nulang; replace only the generated
+    // script URL because the isolated CDP document has no HTTP asset server.
+    html = html.replace(/<script src=["']\/app\.client\.js["']><\/script>/,
+      '<script>' + js + '</script>');
+    const portDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nulang-cdp-'));
+    try {
+      chrome = spawn(chromeBinary(), [
+        '--headless=new', '--no-sandbox', '--disable-gpu',
+        '--disable-dev-shm-usage', '--disable-background-networking',
+        '--remote-debugging-port=0', '--user-data-dir=' + portDir, 'about:blank'
+      ], { stdio: 'ignore' });
+      cdp = await connect(await devtoolsPort(portDir, chrome));
+      await cdp.eval('document.open(); document.write(' + JSON.stringify(html) +
+        '); document.close();');
+      assert.equal(await cdp.eval('(' + browserChecks.toString() + ')()'), true);
+    } finally {
+      fs.rmSync(portDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+  } finally {
+    cdp?.close();
+    chrome?.kill('SIGTERM');
+    if (chrome && chrome.exitCode === null) {
+      await Promise.race([
+        new Promise(resolve => chrome.once('exit', resolve)),
+        new Promise(resolve => setTimeout(resolve, 1000))
+      ]);
+    }
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
