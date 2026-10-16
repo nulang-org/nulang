@@ -164,8 +164,52 @@ fn delta(after: JitCompileStats, before: JitCompileStats) -> JitCompileStats {
     }
 }
 
+/// Model the first total invocation count where JIT cumulative wall time is
+/// no worse than interpreting every invocation: first + (n - 1)*warm <= n*interp.
+///
+/// This is diagnostic only, not a tiering policy. The model requires native
+/// compilation on the first run and no additional compilation on the warm run.
+/// It extrapolates a *single* warm sample; later tier changes, noise, and
+/// memory/CPU costs are not represented.
+fn modeled_break_even_total_runs(
+    interpreter_run: Duration,
+    first_run: Duration,
+    warm_run: Duration,
+    first_stats: JitCompileStats,
+    warm_stats: JitCompileStats,
+) -> Option<u64> {
+    if first_stats.total_compiles() == 0
+        || warm_stats.total_compiles() != first_stats.total_compiles()
+    {
+        return None;
+    }
+
+    let interp = interpreter_run.as_nanos();
+    let first = first_run.as_nanos();
+    let warm = warm_run.as_nanos();
+    if warm >= interp {
+        return None;
+    }
+    if first <= interp {
+        return Some(1);
+    }
+
+    let debt = first - interp;
+    let saved_per_additional_run = interp - warm;
+    let additional_runs = debt / saved_per_additional_run
+        + u128::from(debt % saved_per_additional_run != 0);
+    u64::try_from(additional_runs.checked_add(1)?).ok()
+}
+
 fn emit(measurement: &Measurement, iteration: u32, format: OutputFormat) {
     let warm_delta = delta(measurement.warm_stats, measurement.first_stats);
+    let modeled_break_even = modeled_break_even_total_runs(
+        measurement.interpreter_run,
+        measurement.first_run,
+        measurement.warm_run,
+        measurement.first_stats,
+        measurement.warm_stats,
+    );
     match format {
         OutputFormat::Human => {
             println!(
@@ -192,6 +236,10 @@ fn emit(measurement: &Measurement, iteration: u32, format: OutputFormat) {
                 warm_delta.optimized_compiles,
                 warm_delta.optimized_compile_ns as f64 / 1_000_000.0,
             );
+            match modeled_break_even {
+                Some(runs) => println!("  modeled break-even: {runs} total invocations"),
+                None => println!("  modeled break-even: unavailable (not sustained/steady JIT)"),
+            }
         }
         OutputFormat::Jsonl => {
             println!(
@@ -210,6 +258,7 @@ fn emit(measurement: &Measurement, iteration: u32, format: OutputFormat) {
                         .expect("warm run duration must fit in u64"),
                     "compiled_regions": measurement.compiled_regions,
                     "typed_regions": measurement.typed_regions,
+                    "modeled_break_even_total_runs": modeled_break_even,
                     "first_compile": {
                         "fast_compiles": measurement.first_stats.fast_compiles,
                         "fast_compile_ns": measurement.first_stats.fast_compile_ns,
