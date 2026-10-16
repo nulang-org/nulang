@@ -514,7 +514,10 @@ fn path_with_tag(path: &[String], tag: &str) -> String {
 /// client-side signal micro-runtime can hydrate the page. The tag is placed
 /// just before `</body>` when present, otherwise appended at the end.
 pub fn inject_client_runtime_script(html: &str) -> String {
-    if !html.contains("data-signal=") && !html.contains("data-action=") {
+    if !html.contains("data-signal=")
+        && !html.contains("data-action=")
+        && !html.contains("data-nulang-bind=")
+    {
         return html.to_string();
     }
     let script = r#"<script src="/app.client.js"></script>"#;
@@ -562,8 +565,9 @@ fn rewrite_expr(
             rewrite_expr(&mut args[2], true, signals, checker);
 
             let mut data_attrs: Vec<Expr> = Vec::new();
+            let mut has_attribute_bindings = false;
 
-            // Inspect attrs array for action={fn} attributes.
+            // Inspect attrs for actions and safe, direct signal-backed values.
             if let Expr::Array(attrs, _) = &mut args[1] {
                 for attr in attrs.iter_mut() {
                     if let Expr::Tuple(parts, _) = attr {
@@ -580,10 +584,25 @@ fn rewrite_expr(
                                         ));
                                     }
                                 }
+                                if is_safe_reactive_attribute(&name) {
+                                    if let Expr::Var(signal, _) = &parts[1] {
+                                        if signals.contains(signal) {
+                                            data_attrs.push(data_attr(
+                                                &format!("data-nulang-bind-{name}"),
+                                                signal,
+                                                *span,
+                                            ));
+                                            has_attribute_bindings = true;
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
                 }
+            }
+            if has_attribute_bindings {
+                data_attrs.push(data_attr("data-nulang-bind", "true", *span));
             }
 
             // Wrap direct signal reads in children with <span data-signal="...">.
@@ -761,6 +780,25 @@ fn rewrite_expr(
     }
 }
 
+/// Only text-like, non-executable attributes support direct signal mutation.
+/// URL attributes, event handlers, styles and boolean attributes need explicit
+/// validation/semantics before they can be updated safely.
+fn is_safe_reactive_attribute(name: &str) -> bool {
+    if matches!(name, "class" | "title" | "placeholder") {
+        return true;
+    }
+    let rest = name.strip_prefix("aria-").or_else(|| {
+        name.strip_prefix("data-")
+            .filter(|suffix| !suffix.starts_with("nulang-"))
+    });
+    rest.is_some_and(|suffix| {
+        !suffix.is_empty()
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    })
+}
+
 fn action_placement_str(placement: ActionPlacement) -> &'static str {
     match placement {
         ActionPlacement::Client => "client",
@@ -783,15 +821,36 @@ fn data_attr(name: &str, value: &str, span: Span) -> Expr {
 /// `data-signal` and `data-action` attributes emitted by the compiler.
 pub fn generate_client_runtime() -> String {
     r#"(function () {
-  const signals = {};
+  const signals = Object.create(null);
   const signalBindings = Object.create(null);
+  const attributeBindings = Object.create(null);
+
+  function isBindableAttribute(attribute) {
+    if (attribute === 'class' || attribute === 'title' || attribute === 'placeholder') {
+      return true;
+    }
+    if (attribute.indexOf('data-nulang-') === 0) return false;
+    return /^(aria-|data-)[a-z0-9-]+$/.test(attribute);
+  }
 
   function refreshSignal(name) {
     const bindings = signalBindings[name];
-    if (!bindings) return;
-    bindings.forEach(function (el) {
-      el.textContent = signals[name];
-    });
+    if (bindings) {
+      bindings.forEach(function (el) {
+        el.textContent = signals[name];
+      });
+    }
+    const attrs = attributeBindings[name];
+    if (attrs) {
+      attrs.forEach(function (binding) {
+        const value = signals[name];
+        if (value === null || value === undefined) {
+          binding.el.removeAttribute(binding.attribute);
+        } else {
+          binding.el.setAttribute(binding.attribute, String(value));
+        }
+      });
+    }
   }
 
   function runClientAction(handler) {
@@ -870,6 +929,22 @@ pub fn generate_client_runtime() -> String {
         signalBindings[name] = [];
       }
       signalBindings[name].push(el);
+    });
+
+    document.querySelectorAll('[data-nulang-bind]').forEach(function (el) {
+      Array.from(el.attributes).forEach(function (attr) {
+        const prefix = 'data-nulang-bind-';
+        if (attr.name.indexOf(prefix) !== 0) return;
+        const attribute = attr.name.slice(prefix.length);
+        if (!isBindableAttribute(attribute)) return;
+        const name = attr.value;
+        if (!name) return;
+        if (!(name in signals)) {
+          signals[name] = el.getAttribute(attribute);
+        }
+        if (!attributeBindings[name]) attributeBindings[name] = [];
+        attributeBindings[name].push({ el: el, attribute: attribute });
+      });
     });
 
     document.querySelectorAll('[data-action]').forEach(function (el) {
