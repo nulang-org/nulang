@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Native AOT unhandled-effect error-category parity — 2026-10-16
+- **Native AOT preserves the interpreter's `EffectError` category for unhandled effects.** Its pending native-error slot carries a typed runtime/effect distinction while retaining first-error-wins semantics for operations that continue after a compiled helper reports failure.
+- **Deterministic differential and helper-level regressions cover the observed October 16 mismatch and preserve both error categories.** Standalone and runtime-backed AOT entry points consume the same typed channel; the JIT message-only adapter remains compatible.
+
 ### Canonicalize managed floating-point NaNs — 2026-10-30
 - Canonicalize all NaNs at `Value::float` construction, including ordinary native FFI F64 returns, so adversarial NaN payload bits cannot impersonate Nulang pointer, integer, or other value tags.
 - Add regression coverage for raw FFI conversion and a native C-ABI float return. Existing finite floats preserve their original bit patterns. The JIT/AOT/WASM differential matrix still requires hosted exact-head verification.
