@@ -200,6 +200,9 @@ test('compiler-generated SSR hydrates in Chromium', {
     const built = spawnSync(path.resolve(process.env.NULANG_BIN), [
       'nula', 'build', '--web'
     ], {
+      // The fixture's cwd is a temporary project. The contract parser must
+      // still resolve imported opaque web types from the checked-in stdlib.
+      env: { ...process.env, NULANG_STDLIB: path.resolve(__dirname, '../src/stdlib') },
       cwd: dir,
       encoding: 'utf8',
       timeout: 65000,
