@@ -379,13 +379,24 @@ impl TimerWheel {
 
     /// Earliest fire time among active (non-cancelled) timers.
     ///
-    /// Returns `None` when no active timer is scheduled. O(n) over the
-    /// wheel; intended for the scheduler's drain path, not the hot loop.
+    /// O(1) when the heap head is active. If the head was lazily cancelled,
+    /// fall back to an O(n) scan without mutating timer or cancellation state.
+    /// This keeps the ordinary scheduler sleep decision independent of the
+    /// number of pending timers.
     pub fn next_deadline(&self) -> Option<Instant> {
         let timers = match self.timers.read() {
             Ok(t) => t,
             Err(_) => return None,
         };
+        // The heap is ordered by fire_at. A live head is necessarily the
+        // earliest active timer; no need to inspect the other entries.
+        let head = timers.peek()?;
+        if !head.cancelled.load(Ordering::SeqCst) {
+            return Some(head.fire_at);
+        }
+
+        // Cancellation is lazy and does not remove heap entries until tick.
+        // The cancelled head may precede live timers deeper in the heap.
         timers
             .iter()
             .filter(|e| !e.cancelled.load(Ordering::SeqCst))
