@@ -5,10 +5,12 @@
 //! effect identity for callers: the caller must provide a replay-stable
 //! `DurableEffectSpec` derived from semantic execution identity.
 
+use crate::bytecode::CodeModule;
 use crate::durable_effect::{
-    DurableEffectId, DurableEffectRecord, DurableEffectRecoveryAction,
+    CompiledEffectSpecError, DurableEffectId, DurableEffectRecord, DurableEffectRecoveryAction,
     DurableEffectRequestMismatch, DurableEffectSpec,
 };
+use crate::primitives::{DeliverySemantics, EffectBoundary};
 use crate::durable_effect_persistence::DurableEffectPersistenceRecord;
 use crate::runtime::{
     DurableCommit, DurableTransition, PersistenceStore, DURABLE_TRANSITION_VERSION,
@@ -82,6 +84,45 @@ impl From<DurableEffectRequestMismatch> for DurableEffectRuntimeError {
     }
 }
 
+/// Failure while dispatching one compiled external effect through a durable
+/// intent/receipt boundary. A provider error leaves the prepared record intact
+/// because the remote operation may have committed before its reply was lost.
+#[derive(Debug)]
+pub enum DurableAsyncDispatchError {
+    InvalidSite(CompiledEffectSpecError),
+    Recovery(DurableEffectRuntimeError),
+    Provider(io::Error),
+    UnexpectedDecision,
+}
+
+impl fmt::Display for DurableAsyncDispatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidSite(error) => error.fmt(f),
+            Self::Recovery(error) => error.fmt(f),
+            Self::Provider(error) => write!(f, "durable effect provider error: {error}"),
+            Self::UnexpectedDecision => write!(
+                f,
+                "compiled idempotent external effect returned incompatible dispatch semantics"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DurableAsyncDispatchError {}
+
+impl From<CompiledEffectSpecError> for DurableAsyncDispatchError {
+    fn from(error: CompiledEffectSpecError) -> Self {
+        Self::InvalidSite(error)
+    }
+}
+
+impl From<DurableEffectRuntimeError> for DurableAsyncDispatchError {
+    fn from(error: DurableEffectRuntimeError) -> Self {
+        Self::Recovery(error)
+    }
+}
+
 /// Coordinates one actor/entity/workflow's durable external effects.
 ///
 /// `activation_epoch` is supplied by the owning runtime/placement layer. A
@@ -129,6 +170,53 @@ impl<'a> DurableEffectCoordinator<'a> {
             prepared.clone(),
         ))?;
         Ok(decision(&prepared))
+    }
+
+    /// Execute a compiler-identified external operation with an idempotent
+    /// provider, journaling Prepared before the provider and Completed after
+    /// a successful receipt. A completed effect replays without dispatch.
+    ///
+    /// The caller MUST supply a verified/pinned CodeModule, a durable and
+    /// replay-stable execution key, and the same occurrence index on retry.
+    /// The provider MUST honor the supplied stable idempotency key. A provider
+    /// timeout or error leaves Prepared intact for a future deduplicated retry.
+    ///
+    /// This does not itself attach the VM's PerformAsync callback, enforce
+    /// external authority, or provide a distributed lease. Callers must enforce
+    /// authority and ownership before invoking this method, and the persisted
+    /// activation epoch must still match on retries. A competing owner can
+    /// advance the epoch after a read fence; provider dedup remains necessary.
+    pub fn execute_compiled_async_with_deduplication<F>(
+        &mut self,
+        module: &CodeModule,
+        pc: usize,
+        execution_key: &str,
+        occurrence_index: u32,
+        request: &[u8],
+        dispatch: F,
+    ) -> Result<Vec<u8>, DurableAsyncDispatchError>
+    where
+        F: FnOnce(&str, &[u8]) -> io::Result<Vec<u8>>,
+    {
+        let spec = DurableEffectSpec::from_compiled_async_site(
+            module,
+            pc,
+            self.actor_id,
+            execution_key,
+            occurrence_index,
+            EffectBoundary::External,
+            DeliverySemantics::EffectivelyOnceWithDeduplication,
+        )?;
+
+        match self.begin(spec, request)? {
+            DurableEffectDispatchDecision::ReplayRecordedResult(receipt) => Ok(receipt),
+            DurableEffectDispatchDecision::DispatchWithDeduplication { operation_id } => {
+                let key = operation_id.idempotency_key();
+                let receipt = dispatch(&key, request).map_err(DurableAsyncDispatchError::Provider)?;
+                Ok(self.complete(operation_id, request, receipt)?)
+            }
+            _ => Err(DurableAsyncDispatchError::UnexpectedDecision),
+        }
     }
 
     /// Persist the terminal result for a previously prepared effect.
