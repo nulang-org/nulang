@@ -169,6 +169,30 @@ fn openapi_uses_semantic_response_media() {
     );
 }
 
+
+#[test]
+fn one_compiled_contract_drives_json_request_and_response_openapi() {
+    let contracts = compile_module_contracts(&parse(
+        r#"
+type alias Json[T] = String
+fn echo(payload: Json[String] from body) -> Json[String] { payload }
+fn web_main() { perform Web.route("POST", "/echo", echo) }
+"#,
+    ));
+    assert!(contracts.diagnostics.is_empty(), "{:?}", contracts.diagnostics);
+    let document = generate_openapi(&contracts, "Round-trip API", "1.0.0");
+    let operation = &document["paths"]["/echo"]["post"];
+
+    let request = &operation["requestBody"];
+    assert_eq!(request["required"], true);
+    assert_eq!(request["content"]["application/json"]["schema"]["type"], "string");
+    assert_eq!(request["content"]["application/json"]["x-nulang-codec"], "json");
+
+    let response = &operation["responses"]["200"];
+    assert_eq!(response["content"]["application/json"]["schema"]["type"], "string");
+    assert_eq!(response["x-nulang-response-type"], "Json[String]");
+}
+
 #[test]
 fn json_response_uses_json_content_type_without_client_runtime_injection() {
     let server = WebDevServer::bind_runtime(0, None, None, vec![json_runtime_route()])
