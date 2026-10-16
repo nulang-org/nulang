@@ -292,6 +292,34 @@ fn write_cache(path: &Path, cache: &QueryCache) -> Result<(), String> {
     fs::rename(&tmp, path).map_err(|e| format!("cache rename: {e}"))
 }
 
+/// The prototype has no TLS connector. Do not allow an opt-in plaintext
+/// connection to silently target a remote server, including via hostaddr.
+/// Use an explicit loopback IP, a local tunnel, or a Unix socket.
+fn require_local_plaintext(config: &postgres::Config) -> Result<(), String> {
+    use postgres::config::Host;
+    use std::net::IpAddr;
+
+    let hosts = config.get_hosts();
+    let hostaddrs = config.get_hostaddrs();
+    let has_endpoint = !hosts.is_empty() || !hostaddrs.is_empty();
+    let local_hosts = hosts.iter().all(|host| match host {
+        Host::Tcp(address) => address
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback()),
+        #[cfg(unix)]
+        Host::Unix(_) => true,
+    });
+    let local_addresses = hostaddrs.iter().all(IpAddr::is_loopback);
+
+    if !has_endpoint || !local_hosts || !local_addresses {
+        return Err(
+            "NoTls SQL preparation requires an explicit loopback IP or local Unix socket; remote hosts and hostaddr overrides are forbidden"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 fn main_impl() -> Result<(), String> {
     let mut args = env::args().skip(1);
     let mode = args.next().ok_or_else(|| "expected prepare or check".to_owned())?;
@@ -328,7 +356,12 @@ fn main_impl() -> Result<(), String> {
         }
         let url = env::var("NULANG_SQL_DATABASE_URL")
             .map_err(|_| "set NULANG_SQL_DATABASE_URL for prepare".to_owned())?;
-        let mut client = Client::connect(&url, NoTls)
+        let config: postgres::Config = url
+            .parse()
+            .map_err(|_| "invalid PostgreSQL connection configuration".to_owned())?;
+        require_local_plaintext(&config)?;
+        let mut client = config
+            .connect(NoTls)
             .map_err(|_| "PostgreSQL connection failed (credentials and URI hidden)".to_owned())?;
         let cache = prepare_queries(&calls, &mut client)?;
         write_cache(&cache_path, &cache)?;
