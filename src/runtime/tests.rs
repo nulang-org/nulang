@@ -6000,7 +6000,21 @@ fn test_five_node_cluster_split_brain_detects_and_heals() {
         });
     }
     let target = ActorAddress::remote(ids[0], actor_id);
+    // Capture the admission boundary at the actual send. The membership
+    // snapshot at timeout alone cannot tell whether the sender rejected the
+    // message before enqueue, or whether the peer later became Failed.
+    let e_status_at_send = cluster_status(&nodes[4], ids[0]);
+    let resolver_before = nodes[4]
+        .distributed
+        .resolver
+        .as_ref()
+        .map(|resolver| resolver.stats());
     nodes[4].send_distributed(target, "store", &[Value::int(44)]);
+    let resolver_after = nodes[4]
+        .distributed
+        .resolver
+        .as_ref()
+        .map(|resolver| resolver.stats());
     let deadline = Instant::now() + Duration::from_secs(20);
     let delivered = loop {
         nodes[0].process_network();
@@ -6021,7 +6035,10 @@ fn test_five_node_cluster_split_brain_detects_and_heals() {
     };
     assert!(
         delivered,
-        "remote delivery across healed 5-node boundary failed: E_sees_A={:?}, A_sees_E={:?}, E_cluster_addr_for_A={:?}, A_cluster_addr_for_E={:?}, E_connection_to_A={:?}, A_connection_to_E={:?}, actor_mailbox_depth={:?}, actor_received={:?}",
+        "remote delivery across healed 5-node boundary failed: E_status_at_send={:?}, E_resolver_before={:?}, E_resolver_after={:?}, E_sees_A={:?}, A_sees_E={:?}, E_cluster_addr_for_A={:?}, A_cluster_addr_for_E={:?}, E_connection_to_A={:?}, A_connection_to_E={:?}, actor_mailbox_depth={:?}, actor_received={:?}",
+        e_status_at_send,
+        resolver_before,
+        resolver_after,
         cluster_status(&nodes[4], ids[0]),
         cluster_status(&nodes[0], ids[4]),
         nodes[4]
