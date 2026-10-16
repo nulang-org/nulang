@@ -13,12 +13,15 @@ export function createMapHost({ maplibregl, container, style, ...options }) {
   const visibility = new Map();
   const listeners = new Set();
   let destroyed = false;
+  // isStyleLoaded() includes outstanding source/tile work. It is not a
+  // reliable indicator of whether source/layer style mutations are allowed.
+  let styleReady = Boolean(map.isStyleLoaded());
 
   function ensureAlive() {
     if (destroyed) throw new Error('Map host is destroyed');
   }
   function ready() {
-    return map.isStyleLoaded();
+    return styleReady;
   }
 
   // Restore host-managed declarations after MapLibre style reloads.
@@ -33,8 +36,12 @@ export function createMapHost({ maplibregl, container, style, ...options }) {
     }
   }
 
-  map.on('style.load', reconcile);
-  map.on('load', reconcile);
+  function onStyleLoaded() {
+    styleReady = true;
+    reconcile();
+  }
+  map.on('style.load', onStyleLoaded);
+  map.on('load', onStyleLoaded);
 
   function dispatch(command) {
     ensureAlive();
@@ -140,8 +147,8 @@ export function createMapHost({ maplibregl, container, style, ...options }) {
     destroyed = true;
     for (const { event, callback } of listeners) map.off(event, callback);
     listeners.clear();
-    map.off('style.load', reconcile);
-    map.off('load', reconcile);
+    map.off('style.load', onStyleLoaded);
+    map.off('load', onStyleLoaded);
     map.remove();
     sources.clear();
     layers.clear();
