@@ -885,9 +885,12 @@ pub fn generate_client_runtime() -> String {
           runClientAction(handler);
         }
       };
-      el.addEventListener('click', listener);
+      // A form submit button fires a bubbling click followed by submit.
+      // Register only submit on the form to avoid two server mutations.
       if (el.tagName === 'FORM') {
         el.addEventListener('submit', listener);
+      } else {
+        el.addEventListener('click', listener);
       }
     });
   }
