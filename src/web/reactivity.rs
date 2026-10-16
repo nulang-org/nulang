@@ -1089,8 +1089,7 @@ fn view() -> Html {
 "#,
         );
 
-        // The parser populates ordinary parameters in the source test above.
-        // Model a contextual/using parameter explicitly to exercise both
+        // Construct a contextual/using parameter explicitly to exercise both
         // immutable graph analysis and mutable AST rewriting on the same input.
         let view = module
             .decls
