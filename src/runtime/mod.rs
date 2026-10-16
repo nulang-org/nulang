@@ -1777,16 +1777,11 @@ impl Runtime {
                             actor.set_state_field("step_index", Value::int(n + 1));
                         }
                     }
-                    let seq = self.next_sequence(actor_id);
-                    let _ = self.persistence.append_workflow_event(
+                    self.commit_resumed_workflow_success(
                         actor_id,
-                        WorkflowEvent::StepCompleted {
-                            sequence: seq,
-                            activation: suspended.activation,
-                            step_name,
-                        },
+                        suspended.activation,
+                        step_name,
                     );
-                    self.checkpoint_actor(actor_id);
                 }
             }
             Err(crate::types::NuError::Suspended(_)) => {
@@ -1827,10 +1822,15 @@ impl Runtime {
                     self.maybe_schedule_receive_wait(actor_id, receive_timeout);
                 }
             }
-            Err(_) => {
-                // Step failed after resumption: run saga compensations.
+            Err(error) => {
                 if self.actor_is_workflow(actor_id) {
-                    self.run_saga_compensation(actor_id, behavior_idx);
+                    self.commit_resumed_workflow_failure(
+                        actor_id,
+                        suspended.activation,
+                        step_name,
+                        error.to_string(),
+                        behavior_idx,
+                    );
                 }
             }
         }
@@ -5007,16 +5007,11 @@ impl Runtime {
                                 actor.set_state_field("step_index", Value::int(n + 1));
                             }
                         }
-                        let seq = (*self_ptr).next_sequence(actor_id);
-                        let _ = (*self_ptr).persistence.append_workflow_event(
+                        (*self_ptr).commit_resumed_workflow_success(
                             actor_id,
-                            crate::runtime::WorkflowEvent::StepCompleted {
-                                sequence: seq,
-                                activation: suspended.activation,
-                                step_name: suspended.step_name.clone(),
-                            },
+                            suspended.activation,
+                            suspended.step_name.clone(),
                         );
-                        (*self_ptr).checkpoint_actor(actor_id);
                     }
                 }
                 Err(crate::types::NuError::Suspended(_)) => {
@@ -5039,6 +5034,15 @@ impl Runtime {
                     tracing::warn!("Timer.sleep resume error for actor {}: {:?}", actor_id, e);
                     if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
                         actor.suspended_execution = None;
+                    }
+                    if (*self_ptr).actor_is_workflow(actor_id) {
+                        (*self_ptr).commit_resumed_workflow_failure(
+                            actor_id,
+                            suspended.activation,
+                            suspended.step_name.clone(),
+                            e.to_string(),
+                            suspended.behavior_idx,
+                        );
                     }
                 }
             }
@@ -5103,16 +5107,11 @@ impl Runtime {
                                 actor.set_state_field("step_index", Value::int(n + 1));
                             }
                         }
-                        let seq = (*self_ptr).next_sequence(actor_id);
-                        let _ = (*self_ptr).persistence.append_workflow_event(
+                        (*self_ptr).commit_resumed_workflow_success(
                             actor_id,
-                            WorkflowEvent::StepCompleted {
-                                sequence: seq,
-                                activation: suspended.activation,
-                                step_name: suspended.step_name,
-                            },
+                            suspended.activation,
+                            suspended.step_name,
                         );
-                        (*self_ptr).checkpoint_actor(actor_id);
                     }
                 }
                 Err(crate::types::NuError::Suspended(VmSuspension::ReceiveWait)) => {
@@ -5158,7 +5157,18 @@ impl Runtime {
                 }
                 // Other errors: the wait is over; the send-path result is
                 // discarded anyway, matching step_actor semantics.
-                Err(_) => (*self_ptr).clear_receive_wait(actor_id),
+                Err(error) => {
+                    (*self_ptr).clear_receive_wait(actor_id);
+                    if (*self_ptr).actor_is_workflow(actor_id) {
+                        (*self_ptr).commit_resumed_workflow_failure(
+                            actor_id,
+                            suspended.activation,
+                            suspended.step_name,
+                            error.to_string(),
+                            suspended.behavior_idx,
+                        );
+                    }
+                },
             }
             // End the VM-execution window only after any suspend-state
             // re-capture above: draining deferred wakes runs other actors
