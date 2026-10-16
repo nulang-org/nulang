@@ -14,11 +14,7 @@ fn populated_wheel(count: usize, cancel_earliest: bool) -> TimerWheel {
     let wheel = TimerWheel::new();
     let now = Instant::now();
     for offset in 1..=count {
-        let id = wheel.timer_sleep_wake_at(
-            now,
-            Duration::from_millis(offset as u64),
-            42,
-        );
+        let id = wheel.timer_sleep_wake_at(now, Duration::from_millis(offset as u64), 42);
         if offset == 1 && cancel_earliest {
             assert!(wheel.cancel(id));
         }
