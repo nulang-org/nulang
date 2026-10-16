@@ -73,8 +73,9 @@ pub fn check_initial_js_budget(
 /// including lazily loaded chunks. Unlike `initial_js` this measures the
 /// output footprint, not the bytes required for the first page load.
 ///
-/// The generated client runtime and every .js/.mjs file below assets/ count.
-/// Symlinked asset directories/files and unreadable entries fail closed so
+/// Every .js/.mjs file anywhere in the published output tree counts,
+/// including the generated client runtime, root-level static scripts, and lazy
+/// chunks. Symlinked paths and unreadable entries fail closed so
 /// missing bytes cannot make a configured budget appear to pass.
 pub fn check_total_js_budget(
     output_dir: &Path,
@@ -85,19 +86,7 @@ pub fn check_total_js_budget(
     };
 
     let mut total = 0usize;
-    let generated_client = output_dir.join("app.client.js");
-    match std::fs::symlink_metadata(&generated_client) {
-        Ok(_) => add_js_file_size(&generated_client, &mut total)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-
-    let assets = output_dir.join("assets");
-    match std::fs::symlink_metadata(&assets) {
-        Ok(_) => count_asset_js(&assets, &mut total)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
+    count_asset_js(output_dir, &mut total)?;
 
     Ok((total > budget).then(|| BudgetViolation {
         file: format!("{} (total emitted JavaScript)", output_dir.display()),
