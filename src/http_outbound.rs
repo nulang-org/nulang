@@ -127,3 +127,57 @@ pub fn request_text(
     }))
     .map_err(|e| format!("Http.request: failed to serialize response: {e}"))
 }
+
+#[cfg(test)]
+mod response_header_limit_tests {
+    use super::*;
+    
+    #[test]
+    fn rejects_aggregate_response_headers_above_limit() {
+        let mut headers = BTreeMap::new();
+        let mut used = 0usize;
+        for i in 0..8 {
+            insert_bounded_response_header(
+                &mut headers,
+                &mut used,
+                &format!("x-long-{i}"),
+                &"a".repeat(8192 - 8),
+            )
+            .expect("within response-header budget");
+        }
+        let error = insert_bounded_response_header(
+            &mut headers,
+            &mut used,
+            "x-over",
+            "one more header",
+        )
+        .expect_err("aggregate response-header bytes must be bounded");
+        assert!(error.contains("response headers exceed"));
+    }
+
+    #[test]
+    fn rejects_a_single_oversized_response_header() {
+        let mut headers = BTreeMap::new();
+        let mut used = 0usize;
+        let error = insert_bounded_response_header(
+            &mut headers,
+            &mut used,
+            "x-large",
+            &"a".repeat(MAX_HEADER_BYTES + 1),
+        )
+        .expect_err("over-limit response header must be rejected");
+        assert!(error.contains("response headers exceed"));
+        assert_eq!(used, 0);
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn preserves_small_response_headers_and_normalizes_names() {
+        let mut headers = BTreeMap::new();
+        let mut used = 0usize;
+        insert_bounded_response_header(&mut headers, &mut used, "X-Request-Id", "req-123")
+            .expect("normal response header");
+        assert_eq!(headers.get("x-request-id").map(String::as_str), Some("req-123"));
+        assert_eq!(used, "X-Request-Id".len() + "req-123".len());
+    }
+}
