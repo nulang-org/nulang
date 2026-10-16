@@ -90,7 +90,9 @@ impl CancellationToken {
 
     /// Create a child with a deadline no later than its parent's.
     pub fn child_with_deadline(&self, deadline: Instant) -> Self {
-        let effective = self.deadline().map_or(deadline, |parent| parent.min(deadline));
+        let effective = self
+            .deadline()
+            .map_or(deadline, |parent| parent.min(deadline));
         self.linked_child(Some(effective))
     }
 
@@ -170,7 +172,10 @@ mod tests {
         let token = CancellationToken::new();
         let cloned = token.clone();
         let now = Instant::now();
-        assert!(cloned.cancel(), "first request transitions the shared scope");
+        assert!(
+            cloned.cancel(),
+            "first request transitions the shared scope"
+        );
         assert!(!token.cancel(), "repeated request is a no-op");
         assert_eq!(token.check_at(now), Err(CancellationReason::Requested));
         assert_eq!(cloned.check_at(now), Err(CancellationReason::Requested));
@@ -201,7 +206,10 @@ mod tests {
         let child = root.child_with_deadline(now + Duration::from_secs(30));
 
         assert_eq!(child.deadline(), Some(parent_deadline));
-        assert_eq!(child.check_at(parent_deadline), Err(CancellationReason::DeadlineExceeded));
+        assert_eq!(
+            child.check_at(parent_deadline),
+            Err(CancellationReason::DeadlineExceeded)
+        );
     }
 
     #[test]
@@ -212,7 +220,10 @@ mod tests {
         let sibling = root.child();
         let at = now + Duration::from_secs(5);
         assert_eq!(child.deadline(), Some(at));
-        assert_eq!(child.check_at(at), Err(CancellationReason::DeadlineExceeded));
+        assert_eq!(
+            child.check_at(at),
+            Err(CancellationReason::DeadlineExceeded)
+        );
         assert_eq!(root.check_at(at), Ok(()));
         assert_eq!(sibling.check_at(at), Ok(()));
     }
@@ -223,7 +234,10 @@ mod tests {
         let deadline = now + Duration::from_secs(7);
         let token = CancellationToken::with_deadline(deadline);
         assert_eq!(token.check_at(now + Duration::from_secs(6)), Ok(()));
-        assert_eq!(token.check_at(deadline), Err(CancellationReason::DeadlineExceeded));
+        assert_eq!(
+            token.check_at(deadline),
+            Err(CancellationReason::DeadlineExceeded)
+        );
         assert_eq!(
             token.check_at(now + Duration::from_secs(8)),
             Err(CancellationReason::DeadlineExceeded)
