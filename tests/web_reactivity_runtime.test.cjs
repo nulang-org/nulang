@@ -416,3 +416,69 @@ test('mount mode is immutable for an already mounted root', () => {
   const global = api.mount(root);
   assert.equal(global.signal('state').get(), 'Ready');
 });
+
+
+test('SSR local island owns its bindings before document-wide hydration', () => {
+  const global = element({ textContent: 'Global', attributes: { 'data-signal': 'status' } });
+  const local = element({ textContent: 'Local', attributes: { 'data-signal': 'status' } });
+  const island = element({ attributes: { 'data-nulang-scope': 'local' } });
+  island.querySelectorAll = (selector) =>
+    subtree([local]).querySelectorAll(selector);
+  island.contains = (node) => node === local;
+  const api = hydrate([island, global, local]);
+  const scope = api.mount(island, { localSignals: true });
+  assert.equal(scope.signal('status').get(), 'Local');
+  assert.equal(api.signal('status').get(), 'Global');
+  scope.signal('status').set('Inside');
+  assert.equal(local.textContent, 'Inside');
+  assert.equal(global.textContent, 'Global');
+  api.signal('status').set('Outside');
+  assert.equal(global.textContent, 'Outside');
+  assert.equal(local.textContent, 'Inside');
+  scope.dispose();
+  api.signal('status').set('Again');
+  assert.equal(local.textContent, 'Inside');
+});
+
+test('SSR scoped client action receives its owner scope, not global state', () => {
+  const local = element({ textContent: 'Before', attributes: { 'data-signal': 'status' } });
+  const click = element({
+    tagName: 'BUTTON',
+    attributes: { 'data-action': 'change', 'data-action-placement': 'client' }
+  });
+  click.dataset.action = 'change';
+  click.dataset.actionPlacement = 'client';
+  const listeners = new Set();
+  click.addEventListener = (event, listener) => {
+    if (event === 'click') listeners.add(listener);
+  };
+  click.removeEventListener = (event, listener) => listeners.delete(listener);
+  const island = element({ attributes: { 'data-nulang-scope': 'local' } });
+  island.querySelectorAll = (selector) =>
+    subtree([local, click]).querySelectorAll(selector);
+  island.contains = (node) => node === local || node === click;
+  const api = hydrate([island, local, click], {
+    change(owner) { owner.signal('status').set('After'); }
+  });
+  const scope = api.mount(island, { localSignals: true });
+  assert.equal(listeners.size, 1);
+  for (const listener of listeners) listener({ preventDefault() {} });
+  assert.equal(local.textContent, 'After');
+  assert.equal(scope.signal('status').get(), 'After');
+  assert.equal(api.signal('status').get(), undefined);
+  scope.dispose();
+  assert.equal(listeners.size, 0);
+});
+
+test('invalid and nested SSR scopes fail before document hydration', () => {
+  const invalid = element({ attributes: { 'data-nulang-scope': 'unexpected' } });
+  assert.throws(() => hydrate([invalid]), /unsupported SSR scope/);
+
+  const parent = element({ attributes: { 'data-nulang-scope': 'local' } });
+  const child = element({ attributes: { 'data-nulang-scope': 'local' } });
+  parent.querySelectorAll = () => [child];
+  child.querySelectorAll = () => [];
+  parent.contains = (node) => node === child;
+  child.contains = () => false;
+  assert.throws(() => hydrate([parent, child]), /nested SSR scope/);
+});
