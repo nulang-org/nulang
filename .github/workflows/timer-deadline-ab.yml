@@ -41,6 +41,7 @@ jobs:
 
       - name: Publish measurements and provenance
         run: |
+          cat timer-deadline-ab.json
           python3 - <<'PY'
           import json
           import os
