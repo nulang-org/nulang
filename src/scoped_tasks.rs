@@ -200,12 +200,15 @@ impl<T, E> TaskScope<T, E> {
     /// Consume terminal results in deterministic submission order.
     ///
     /// Call after `is_quiescent`. This consumes the scope even on error.
-    pub fn into_outcomes(self) -> Result<Vec<TaskOutcome<T, E>>, ScopeError> {
+    pub fn into_outcomes(mut self) -> Result<Vec<TaskOutcome<T, E>>, ScopeError> {
         if !self.is_quiescent() {
+            // Consuming an unfinished scope drops it and signals every
+            // outstanding child's cancellation token.
             return Err(ScopeError::NotQuiescent);
         }
-        Ok(self
-            .slots
+        // TaskScope implements Drop. Take terminal slots instead of moving a
+        // field out of a Drop type; the finished scope then drops normally.
+        Ok(std::mem::take(&mut self.slots)
             .into_iter()
             .map(|slot| match slot {
                 TaskSlot::Terminal(outcome) => outcome,
@@ -219,6 +222,20 @@ impl<T, E> TaskScope<T, E> {
             None => Err(ScopeError::UnknownTask(id)),
             Some(TaskSlot::Running) => Ok(()),
             Some(_) => Err(ScopeError::NotRunning(id)),
+        }
+    }
+}
+
+/// Abandoning a non-quiescent lexical scope must signal its children.
+///
+/// This is cooperative notification, not proof that child execution stopped:
+/// an executor must retain ownership, request interruption at safe points,
+/// and join/acknowledge running children before enforcing structured lifetime
+/// guarantees. No blocking work may be performed from Drop.
+impl<T, E> Drop for TaskScope<T, E> {
+    fn drop(&mut self) {
+        if !self.is_quiescent() {
+            self.token.cancelled.store(true, Ordering::Release);
         }
     }
 }
