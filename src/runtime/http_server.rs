@@ -1109,6 +1109,23 @@ fn successful_route_response(route: &RuntimeWebRoute, rendered: String) -> HttpR
     let contract = route.plan.as_ref().and_then(|plan| plan.response.as_ref());
     match contract {
         Some(contract) => {
+            // Json[T] is currently a serialized String marker, not a VM value
+            // codec. Validate the wire body before advertising application/json.
+            // A malformed body is a server invariant failure, not a client 4xx.
+            if matches!(
+                contract.kind,
+                crate::web::response::ResponseBodyKind::Json
+            ) && serde_json::from_str::<serde_json::Value>(&rendered).is_err()
+            {
+                return HttpResponse {
+                    status: 500,
+                    headers: vec![
+                        ("Content-Type".into(), "text/plain".into()),
+                        ("Cache-Control".into(), "no-store".into()),
+                    ],
+                    body: b"Internal server error".to_vec(),
+                };
+            }
             let body = if contract.inject_client_runtime {
                 inject_client_runtime_script(&rendered).into_bytes()
             } else {
