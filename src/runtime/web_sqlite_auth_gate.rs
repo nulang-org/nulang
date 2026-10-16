@@ -73,7 +73,8 @@ impl<'a> WebSqliteAuthGate<'a> {
         // caller-controlled tenant IDs, including inputs in other headers.
         let tenant_id = self
             .verifier
-            .verified_tenant(token)?
+            .verified_tenant(token)
+            .map_err(|_| io::Error::other("web tenant verification unavailable"))?
             .ok_or_else(denied)?;
 
         if tenant_id.is_empty()
