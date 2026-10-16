@@ -311,6 +311,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn deployment_ir_uses_parsed_package_imports_without_source_rescanning() {
+        // The deployment path has no files: the contract compiler must retain
+        // imports discovered from the parsed package, not search source text.
+        let source = r#"
+import @nulang/auth
+import @nulang/postgres
+
+fn main() { nil }
+"#;
+        let tokens = crate::lexer::Lexer::new(source).lex().unwrap();
+        let module = crate::parser::Parser::new(tokens).parse_module().unwrap();
+        let contracts = crate::web::validation::validate_compilation(
+            crate::web::package_contracts::compile_modules_contracts(&[module]),
+        )
+        .unwrap();
+        let unavailable_root = std::env::temp_dir().join(format!(
+            "nulang_web_ir_no_source_files_{}",
+            std::process::id()
+        ));
+        let ir = generate_deployment_ir(
+            &[],
+            None,
+            &unavailable_root,
+            &BudgetsSection::default(),
+            &contracts,
+        );
+
+        assert!(ir.capabilities.contains(&"auth".to_string()));
+        assert!(ir.capabilities.contains(&"DB".to_string()));
+        assert!(ir.middleware.contains(&"auth".to_string()));
+        assert!(ir.cloud_config.iter().any(|entry|
+            entry.key == "AUTH_COOKIE_SECRET" && entry.required_by == "@nulang/auth"
+        ));
+        assert!(ir.cloud_config.iter().any(|entry|
+            entry.key == "DATABASE_URL" && entry.required_by == "@nulang/postgres"
+        ));
+    }
+
+    #[test]
     fn deployment_ir_and_runtime_use_the_same_validated_contract() {
         // The source root intentionally has no Nulang files. Deployment
         // metadata must come from the validated compilation, not a reparse.
