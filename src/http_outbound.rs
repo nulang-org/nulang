@@ -10,6 +10,30 @@ const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 
+// Limit the response metadata exposed to Nulang, not just the outbound
+// request headers. Check before cloning any potentially large header value.
+// The underlying HTTP parser must independently enforce wire-level limits.
+fn insert_bounded_response_header(
+    headers: &mut BTreeMap<String, String>,
+    used_bytes: &mut usize,
+    name: &str,
+    value: &str,
+) -> Result<(), String> {
+    let total = used_bytes
+        .checked_add(name.len())
+        .and_then(|n| n.checked_add(value.len()))
+        .ok_or_else(|| "Http.request: response headers exceed 64 KiB limit".to_string())?;
+    if total > MAX_HEADER_BYTES {
+        return Err("Http.request: response headers exceed 64 KiB limit".to_string());
+    }
+    if headers.len() >= 100 && !headers.contains_key(&name.to_ascii_lowercase()) {
+        return Err("Http.request: too many response headers".to_string());
+    }
+    headers.insert(name.to_ascii_lowercase(), value.to_string());
+    *used_bytes = total;
+    Ok(())
+}
+
 /// Execute a single outbound request and return a UTF-8 JSON response:
 /// {"status": integer, "ok": boolean, "headers": object, "body": string}.
 ///
@@ -103,9 +127,15 @@ pub fn request_text(
 
     let status = response.status();
     let mut headers = BTreeMap::new();
+    let mut response_header_bytes = 0usize;
     for name in response.headers_names() {
         if let Some(value) = response.header(&name) {
-            headers.insert(name.to_ascii_lowercase(), value.to_string());
+            insert_bounded_response_header(
+                &mut headers,
+                &mut response_header_bytes,
+                &name,
+                value,
+            )?;
         }
     }
     let mut bytes = Vec::new();
