@@ -190,8 +190,10 @@ fn default_route_placement(
     response: Option<&ResponseContract>,
 ) -> String {
     let dynamic_path = path.contains(':') || (path.contains('{') && path.contains('}'));
-    let transport_requires_server =
-        matches!(response.map(|contract| contract.kind), Some(ResponseBodyKind::Json));
+    let transport_requires_server = matches!(
+        response.map(|contract| contract.kind),
+        Some(ResponseBodyKind::Json)
+    );
     if dynamic_path || transport_requires_server || !matches!(method, "GET" | "HEAD") {
         "server".to_string()
     } else {
@@ -408,9 +410,15 @@ mod tests {
         );
         assert_eq!(default_route_placement("POST", "/users", None), "server");
         let json = response_contract(Some("Json[User]")).unwrap();
-        assert_eq!(default_route_placement("GET", "/api/status", Some(&json)), "server");
+        assert_eq!(
+            default_route_placement("GET", "/api/status", Some(&json)),
+            "server"
+        );
         let html = response_contract(Some("Html")).unwrap();
-        assert_eq!(default_route_placement("GET", "/about", Some(&html)), "static");
+        assert_eq!(
+            default_route_placement("GET", "/about", Some(&html)),
+            "static"
+        );
     }
 
     #[test]
