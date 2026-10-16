@@ -471,12 +471,7 @@ impl JitSession {
         self.tier2_counters.clear();
     }
 
-    fn cache_native_leaf_call(
-        &mut self,
-        module_idx: usize,
-        func_idx: usize,
-        call: NativeLeafCall,
-    ) {
+    fn cache_native_leaf_call(&mut self, module_idx: usize, func_idx: usize, call: NativeLeafCall) {
         if self.native_leaf_calls.contains_key(&(module_idx, func_idx)) {
             return;
         }
