@@ -256,7 +256,10 @@ pub fn bind_path_arguments(
         ));
     }
 
-    let mut slots: Vec<Option<BoundRouteArgument>> = vec![None; handler_param_count];
+    // Reject malformed compiler plans before reading request-controlled path
+    // values. Without preflight, missing input could mask duplicate, invalid,
+    // unsupported, or incomplete handler binding metadata.
+    let mut occupied = vec![false; handler_param_count];
     for binding in bindings {
         if binding.source != RouteBindingSource::Path {
             return Err(format!(
@@ -270,13 +273,22 @@ pub fn bind_path_arguments(
                 binding.handler_param, binding.handler_index, handler_param_count
             ));
         }
-        if slots[binding.handler_index].is_some() {
+        if occupied[binding.handler_index] {
             return Err(format!(
                 "multiple route bindings target handler slot {}",
                 binding.handler_index
             ));
         }
+        occupied[binding.handler_index] = true;
+    }
+    if let Some(index) = occupied.iter().position(|bound| !bound) {
+        return Err(format!(
+            "handler parameter slot {index} has no request binding"
+        ));
+    }
 
+    let mut slots: Vec<Option<BoundRouteArgument>> = vec![None; handler_param_count];
+    for binding in bindings {
         let raw = path_params.get(&binding.source_name).ok_or_else(|| {
             format!(
                 "missing captured path parameter '{}' for handler parameter '{}'",
