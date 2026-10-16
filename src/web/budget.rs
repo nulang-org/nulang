@@ -127,7 +127,10 @@ fn count_asset_js(directory: &Path, total: &mut usize) -> std::io::Result<()> {
         if file_type.is_dir() {
             count_asset_js(&path, total)?;
         } else if file_type.is_file()
-            && matches!(path.extension().and_then(|s| s.to_str()), Some("js" | "mjs"))
+            && matches!(
+                path.extension().and_then(|s| s.to_str()),
+                Some("js" | "mjs")
+            )
         {
             add_js_file_size(&path, total)?;
         }
@@ -156,7 +159,6 @@ mod tests {
         std::fs::write(dir.join("app.client.js"), "x".repeat(100)).unwrap();
         assert!(check_initial_js_budget(&dir, Some(200)).is_ok());
     }
-
 
     #[test]
     fn total_js_budget_rejects_combined_split_bundles() {
@@ -216,12 +218,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn total_js_budget_does_not_silently_ignore_unreadable_asset_roots() {
-        let dir = std::env::temp_dir().join("nulang_budget_total_bad_assets");
+    fn total_js_budget_rejects_symlinked_output_entries() {
+        let dir = std::env::temp_dir().join("nulang_budget_total_symlink");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("assets"), "not a directory").unwrap();
+        std::os::unix::fs::symlink("outside-root", dir.join("assets")).unwrap();
 
         let err = check_total_js_budget(&dir, Some(100)).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
