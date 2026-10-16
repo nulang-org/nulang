@@ -1352,4 +1352,95 @@ mod tests {
         let (history, _rx) = realtime_subscribe(room);
         assert_eq!(history, vec!["hello"]);
     }
+
+    #[test]
+    fn test_realtime_room_replay_and_slow_subscribers_are_bounded() {
+        let mut registry = RealtimeRegistry::default();
+        let (_id, _history, slow) = registry.subscribe("unit:bounded").unwrap();
+        for n in 0..(MAX_REALTIME_HISTORY_MESSAGES + MAX_REALTIME_SUBSCRIBER_BACKLOG + 4) {
+            registry
+                .broadcast("unit:bounded", &format!("event-{n}"))
+                .unwrap();
+        }
+        let room = registry.rooms.get("unit:bounded").unwrap();
+        assert_eq!(room.messages.len(), MAX_REALTIME_HISTORY_MESSAGES);
+        assert!(room.replay_bytes <= MAX_REALTIME_HISTORY_BYTES);
+        assert!(
+            room.listeners.is_empty(),
+            "slow client must be disconnected, not buffered forever"
+        );
+        assert!(slow.try_iter().count() <= MAX_REALTIME_SUBSCRIBER_BACKLOG);
+
+        let (_id, replay, _live) = registry.subscribe("unit:bounded").unwrap();
+        assert_eq!(replay.len(), MAX_REALTIME_HISTORY_MESSAGES);
+        let latest = format!(
+            "event-{}",
+            MAX_REALTIME_HISTORY_MESSAGES + MAX_REALTIME_SUBSCRIBER_BACKLOG + 3
+        );
+        assert_eq!(replay.last().map(String::as_str), Some(latest.as_str()));
+        assert!(registry
+            .broadcast("unit:bounded", &"x".repeat(MAX_REALTIME_MESSAGE_BYTES + 1))
+            .is_err());
+    }
+
+    #[test]
+    fn test_realtime_history_is_bounded_by_bytes_as_well_as_event_count() {
+        let mut registry = RealtimeRegistry::default();
+        for n in 0..32 {
+            registry
+                .broadcast(
+                    "unit:bytes",
+                    &format!("{n:02}{}", "x".repeat(MAX_REALTIME_MESSAGE_BYTES - 2)),
+                )
+                .unwrap();
+        }
+        let room = registry.rooms.get("unit:bytes").unwrap();
+        assert!(room.replay_bytes <= MAX_REALTIME_HISTORY_BYTES);
+        assert!(room.messages.len() <= MAX_REALTIME_HISTORY_BYTES / MAX_REALTIME_MESSAGE_BYTES);
+    }
+
+    #[test]
+    fn test_sse_heartbeat_is_a_comment_and_not_an_application_message() {
+        let mut wire = Vec::new();
+        WebDevServer::write_sse_keepalive(&mut wire).unwrap();
+        assert_eq!(wire.as_slice(), b": keep-alive\n\n");
+    }
+
+    #[test]
+    fn test_realtime_registry_preserves_active_rooms_at_capacity() {
+        let mut registry = RealtimeRegistry::default();
+        let mut active = Vec::new();
+        for n in 0..MAX_REALTIME_ROOMS {
+            let (_, _, receiver) = registry.subscribe(&format!("active:{n}")).unwrap();
+            active.push(receiver);
+        }
+        assert_eq!(registry.rooms.len(), MAX_REALTIME_ROOMS);
+        assert_eq!(
+            registry.broadcast("active:new", "message"),
+            Err(RealtimeLimitError::RoomCapacity)
+        );
+        assert_eq!(registry.rooms.len(), MAX_REALTIME_ROOMS);
+    }
+
+    #[test]
+    fn test_realtime_registry_bounds_rooms_and_subscribers() {
+        let mut registry = RealtimeRegistry::default();
+        for n in 0..MAX_REALTIME_ROOMS {
+            registry.broadcast(&format!("unit:{n}"), "initial").unwrap();
+        }
+        registry.broadcast("unit:new", "recent").unwrap();
+        assert_eq!(registry.rooms.len(), MAX_REALTIME_ROOMS);
+        assert!(
+            !registry.rooms.contains_key("unit:0"),
+            "oldest room without subscribers is evicted"
+        );
+
+        let mut subscriptions = Vec::new();
+        for _ in 0..MAX_REALTIME_SUBSCRIBERS_PER_ROOM {
+            let (_, _, receiver) = registry.subscribe("unit:new").unwrap();
+            subscriptions.push(receiver);
+        }
+        assert!(registry.subscribe("unit:new").is_err());
+        assert!(registry.subscribe("../unsafe").is_err());
+    }
 }
