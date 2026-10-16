@@ -65,6 +65,22 @@ pub fn compile_modules_contracts(modules: &[AstModule]) -> ContractCompilation {
     compiled
         .routes
         .sort_by(|a, b| (&a.method, &a.path).cmp(&(&b.method, &b.path)));
+    // Keep the historical idempotent registration behavior, but never discard
+    // a different handler contract for the same method/path without a
+    // diagnostic. Otherwise runtime dispatch and generated OpenAPI can silently
+    // disagree about which endpoint owns the route.
+    for pair in compiled.routes.windows(2) {
+        let [first, second] = pair else { continue };
+        if first.method == second.method && first.path == second.path && first != second {
+            compiled.diagnostics.push(format!(
+                "{} {}: conflicting route declarations for handlers '{}' and '{}'",
+                first.method,
+                first.path,
+                first.handler.as_deref().unwrap_or("<unknown>"),
+                second.handler.as_deref().unwrap_or("<unknown>")
+            ));
+        }
+    }
     compiled
         .routes
         .dedup_by(|a, b| a.method == b.method && a.path == b.path);
