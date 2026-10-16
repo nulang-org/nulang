@@ -1270,6 +1270,71 @@ fn view() -> Html {
     }
 
     #[test]
+    fn test_rewrite_marks_direct_signal_condition_branches() {
+        let mut module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+signal visible: Bool = true
+
+fn view() -> Html {
+    if visible then <section>Shown</section> else <aside>Hidden</aside>
+}
+"#,
+        );
+        rewrite_module(&mut module, None);
+        let html = format!("{:?}", find_function_body(&module, "view"));
+        assert_eq!(html.matches("data-nulang-if").count(), 2, "{html}");
+        assert!(html.contains("data-nulang-branch"), "{html}");
+        assert!(html.contains("then"), "{html}");
+        assert!(html.contains("else"), "{html}");
+    }
+
+    #[test]
+    fn test_rewrite_does_not_mark_non_signal_conditional() {
+        let mut module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+fn view(visible: Bool) -> Html {
+    if visible then <section>Shown</section> else <aside>Hidden</aside>
+}
+"#,
+        );
+        rewrite_module(&mut module, None);
+        let html = format!("{:?}", find_function_body(&module, "view"));
+        assert!(!html.contains("data-nulang-if"), "{html}");
+    }
+
+    #[test]
+    fn test_rewrite_does_not_mark_unserializable_branch() {
+        let mut module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+signal visible: Bool = true
+
+fn view() -> Html {
+    if visible then text("Shown") else <aside>Hidden</aside>
+}
+"#,
+        );
+        rewrite_module(&mut module, None);
+        let html = format!("{:?}", find_function_body(&module, "view"));
+        assert!(!html.contains("data-nulang-if"), "{html}");
+    }
+
+    #[test]
+    fn test_only_conditional_marker_injects_client_runtime() {
+        let html = r#"<section data-nulang-if="visible" data-nulang-branch="then">Shown</section>"#;
+        let out = inject_client_runtime_script(html);
+        assert!(out.contains(r#"<script src="/app.client.js"></script>"#));
+    }
+
+    #[test]
     fn test_rewrite_marks_safe_signal_attributes_for_live_updates() {
         let mut module = parse(
             r#"
