@@ -203,9 +203,12 @@ fn verify_queries(calls: &[QueryCall], cache: &QueryCache) -> Result<usize, Stri
     let mut used = BTreeSet::new();
     for call in calls {
         let hash = fingerprint(&call.sql);
-        let entry = entries
-            .get(hash.as_str())
-            .ok_or_else(|| format!("line {}, column {}: SQL not present in cache; run prepare", call.line, call.column))?;
+        let entry = entries.get(hash.as_str()).ok_or_else(|| {
+            format!(
+                "line {}, column {}: SQL not present in cache; run prepare",
+                call.line, call.column
+            )
+        })?;
         if entry.parameter_type_oids.len() != call.args.len() {
             return Err(format!(
                 "line {}, column {}: SQL expects {} bind parameters, but call has {}",
@@ -370,7 +373,8 @@ fn main_impl() -> Result<(), String> {
         if allow_plaintext {
             return Err("--allow-plaintext is only valid with prepare".into());
         }
-        let bytes = fs::read(&cache_path).map_err(|_| "SQL cache missing; run prepare".to_owned())?;
+        let bytes =
+            fs::read(&cache_path).map_err(|_| "SQL cache missing; run prepare".to_owned())?;
         let cache: QueryCache =
             serde_json::from_slice(&bytes).map_err(|e| format!("invalid SQL cache: {e}"))?;
         let count = verify_queries(&calls, &cache)?;
@@ -436,7 +440,8 @@ mod tests {
 
     #[test]
     fn offline_cache_rejects_changed_sql_and_parameter_count() {
-        let calls = extract_queries(r#"fn f() { perform DB.query("SELECT $1::int8", 5) }"#).unwrap();
+        let calls =
+            extract_queries(r#"fn f() { perform DB.query("SELECT $1::int8", 5) }"#).unwrap();
         assert!(verify_queries(&calls, &cache_for("SELECT $2::int8", vec![20])).is_err());
         assert!(verify_queries(&calls, &cache_for("SELECT $1::int8", vec![20, 20]))
             .unwrap_err()
