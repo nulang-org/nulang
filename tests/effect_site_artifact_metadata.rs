@@ -152,7 +152,7 @@ fn compiled_source_effect_drives_recovery_using_one_stable_operation_id() {
     .expect("compiler-produced effect site should be accepted");
 
     let formatted = compile_module(
-        "// whitespace\\nactor Assistant {\n  behavior ask(prompt: String) {\n    perform Inference.ask(prompt)\n  }\n}\n",
+        "// whitespace\nactor Assistant {\n  behavior ask(prompt: String) {\n    perform Inference.ask(prompt)\n  }\n}\n",
     );
     let formatted_spec = DurableEffectSpec::from_compiled_async_site(
         &formatted,
