@@ -85,6 +85,8 @@ mod workflow;
 mod web_sqlite;
 #[cfg(feature = "sqlite")]
 mod web_sqlite_auth_gate;
+#[cfg(feature = "sqlite")]
+mod web_sqlite_http;
 pub use trace::TraceContext;
 
 #[cfg(test)]
@@ -117,7 +119,10 @@ pub use foreign_executor::*;
 pub use gc::{ForeignRefOp, GcStats, OrcaCoordinator, OrcaGc, OrcaHeap};
 pub use grain::*;
 pub use heap::*;
-pub use http_server::{render_route_handler, HttpMethod, HttpServerState, WebDevServer, WebRoute};
+pub use http_server::{
+    render_route_handler, HttpMethod, HttpRequest, HttpResponse, HttpServerState, WebDevServer,
+    WebRoute,
+};
 pub use mailbox::*;
 pub use network::NetworkTransport;
 pub use network::*;
@@ -128,6 +133,8 @@ pub use persistence::*;
 pub use web_sqlite::WebSqliteStore;
 #[cfg(feature = "sqlite")]
 pub use web_sqlite_auth_gate::{AuthorizedWebSqlite, WebSqliteAuthGate, WebTenantTokenVerifier};
+#[cfg(feature = "sqlite")]
+pub use web_sqlite_http::{WebSqliteHttpMount, WebSqliteNativeHandler, WEB_SQLITE_HTTP_PREFIX};
 pub use process_groups::*;
 pub use registry::*;
 pub use resp_cache::*;
