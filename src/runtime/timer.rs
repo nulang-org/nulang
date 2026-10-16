@@ -518,6 +518,51 @@ mod tests {
     }
 
     #[test]
+    fn test_next_deadline_returns_earliest_live_timer() {
+        let wheel = TimerWheel::new();
+        let now = Instant::now();
+        wheel.timer_sleep_wake_at(now, Duration::from_secs(30), 42);
+        wheel.timer_sleep_wake_at(now, Duration::from_secs(5), 42);
+        wheel.timer_sleep_wake_at(now, Duration::from_secs(10), 42);
+
+        assert_eq!(wheel.next_deadline(), Some(now + Duration::from_secs(5)));
+        assert_eq!(wheel.len(), 3);
+    }
+
+    #[test]
+    fn test_next_deadline_skips_cancelled_heap_head() {
+        let wheel = TimerWheel::new();
+        let now = Instant::now();
+        let earliest = wheel.timer_sleep_wake_at(now, Duration::from_secs(1), 42);
+        wheel.timer_sleep_wake_at(now, Duration::from_secs(3), 42);
+        let last = wheel.timer_sleep_wake_at(now, Duration::from_secs(8), 42);
+
+        assert!(wheel.cancel(earliest));
+        assert_eq!(wheel.next_deadline(), Some(now + Duration::from_secs(3)));
+        assert_eq!(wheel.len(), 2);
+
+        assert!(wheel.cancel(last));
+        assert_eq!(wheel.next_deadline(), Some(now + Duration::from_secs(3)));
+        assert_eq!(wheel.tick(now + Duration::from_secs(10)).len(), 1);
+        assert_eq!(wheel.next_deadline(), None);
+    }
+
+    #[test]
+    fn test_next_deadline_none_when_empty_or_all_cancelled() {
+        let wheel = TimerWheel::new();
+        assert_eq!(wheel.next_deadline(), None);
+
+        let now = Instant::now();
+        let first = wheel.timer_sleep_wake_at(now, Duration::from_secs(1), 42);
+        let second = wheel.timer_sleep_wake_at(now, Duration::from_secs(2), 42);
+        assert!(wheel.cancel(first));
+        assert!(wheel.cancel(second));
+
+        assert_eq!(wheel.next_deadline(), None);
+        assert!(wheel.is_empty());
+    }
+
+    #[test]
     fn test_virtual_clock_advance_accumulates() {
         let mut clock = VirtualClock::new();
         clock.advance(Duration::from_millis(100));
