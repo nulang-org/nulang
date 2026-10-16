@@ -1491,8 +1491,7 @@ fn cmd_build_web() -> NuResult<()> {
     let total_js_budget = manifest.budgets.total_js_max_bytes();
     if manifest.budgets.total_js.is_some() && total_js_budget.is_none() {
         return Err(NuError::PackageError {
-            msg: "invalid [budgets].total_js: expected a byte size such as \"150KB\""
-                .to_string(),
+            msg: "invalid [budgets].total_js: expected a byte size such as \"150KB\"".to_string(),
             span: Span::default(),
         });
     }
