@@ -517,6 +517,7 @@ pub fn inject_client_runtime_script(html: &str) -> String {
     if !html.contains("data-signal=")
         && !html.contains("data-action=")
         && !html.contains("data-nulang-bind=")
+        && !html.contains("data-nulang-if=")
     {
         return html.to_string();
     }
@@ -649,10 +650,26 @@ fn rewrite_expr(
             else_branch,
             ..
         } => {
+            // A conditional can participate in future browser-side branch
+            // replacement only when its guard is a declared signal and both
+            // alternatives render a single, statically identifiable HTML root.
+            // No branch is pre-rendered, serialized or evaluated on the client.
+            let signal = match cond.as_ref() {
+                Expr::Var(name, _) if signals.contains(name) => Some(name.clone()),
+                _ => None,
+            };
             rewrite_expr(cond, in_html, signals, checker);
             rewrite_expr(then_branch, in_html, signals, checker);
-            if let Some(else_branch) = else_branch {
-                rewrite_expr(else_branch, in_html, signals, checker);
+            if let Some(other) = else_branch.as_mut() {
+                rewrite_expr(other, in_html, signals, checker);
+            }
+            if let (Some(signal), Some(other)) = (signal, else_branch.as_mut()) {
+                if can_mark_conditional_root(then_branch)
+                    && can_mark_conditional_root(other)
+                {
+                    mark_conditional_root(then_branch, &signal, "then");
+                    mark_conditional_root(other, &signal, "else");
+                }
             }
         }
         Expr::Match {
@@ -777,6 +794,39 @@ fn rewrite_expr(
         }
 
         _ => {}
+    }
+}
+
+/// Only direct element roots receive conditional markers. Wrapping arbitrary
+/// Html values here would insert invalid spans in table/select contexts and
+/// would evaluate both branches, changing server-rendering semantics.
+fn can_mark_conditional_root(expr: &Expr) -> bool {
+    let Expr::App { func, args, .. } = expr else {
+        return false;
+    };
+    if !is_var(func, "el") || args.len() != 3 {
+        return false;
+    }
+    let Expr::Array(attrs, _) = &args[1] else {
+        return false;
+    };
+    !attrs.iter().any(|attr| match attr {
+        Expr::Tuple(parts, _) if parts.len() == 2 => {
+            matches!(
+                string_literal(&parts[0]).as_deref(),
+                Some("data-nulang-if" | "data-nulang-branch")
+            )
+        }
+        _ => false,
+    })
+}
+
+fn mark_conditional_root(expr: &mut Expr, signal: &str, branch: &str) {
+    if let Expr::App { args, span, .. } = expr {
+        if let Expr::Array(attrs, _) = &mut args[1] {
+            attrs.push(data_attr("data-nulang-if", signal, *span));
+            attrs.push(data_attr("data-nulang-branch", branch, *span));
+        }
     }
 }
 
