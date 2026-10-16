@@ -55,6 +55,29 @@ pub struct NbcArtifact {
     pub language_version: u32,
 }
 
+/// Caller-selected admission limits for decoded .nbc artifacts.
+///
+/// These are admission bounds on serialized byte length, encoded instruction
+/// count, and metadata byte length. They do not bound the heap of a running
+/// program or the expansion of arbitrary host effects; those require separate
+/// runtime policies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NbcDecodeLimits {
+    pub max_artifact_bytes: usize,
+    pub max_instructions: usize,
+    pub max_metadata_bytes: usize,
+}
+
+impl NbcDecodeLimits {
+    /// Compatibility behavior for existing trusted callers. Embedders loading
+    /// untrusted artifacts should always specify finite limits explicitly.
+    pub const UNLIMITED: Self = Self {
+        max_artifact_bytes: usize::MAX,
+        max_instructions: usize::MAX,
+        max_metadata_bytes: usize::MAX,
+    };
+}
+
 impl CodeModule {
     fn validate_effect_site_metadata(&self) -> Result<(), FormatError> {
         let mut previous_pc = None;
@@ -147,6 +170,23 @@ impl CodeModule {
     /// version, unknown opcode, body decode failure). The runtime never
     /// guesses at a layout it does not understand.
     pub fn from_nbc(bytes: &[u8]) -> Result<NbcArtifact, FormatError> {
+        Self::from_nbc_with_limits(bytes, NbcDecodeLimits::UNLIMITED)
+    }
+
+    /// Load bytecode while enforcing explicit caller-selected admission limits.
+    /// Limit checks run before allocating an instruction vector or decoding
+    /// potentially large metadata. The frozen .nbc wire format is unchanged.
+    pub fn from_nbc_with_limits(
+        bytes: &[u8],
+        limits: NbcDecodeLimits,
+    ) -> Result<NbcArtifact, FormatError> {
+        if bytes.len() > limits.max_artifact_bytes {
+            return Err(FormatError::ResourceLimitExceeded {
+                resource: "artifact bytes",
+                limit: limits.max_artifact_bytes,
+                actual: bytes.len(),
+            });
+        }
         if bytes.len() < NBC_HEADER_LEN {
             return Err(FormatError::Truncated {
                 need: NBC_HEADER_LEN,
@@ -184,9 +224,20 @@ impl CodeModule {
             Some(source_hash)
         };
         let instr_count = u32::from_be_bytes(bytes[44..48].try_into().unwrap()) as usize;
+        if instr_count > limits.max_instructions {
+            return Err(FormatError::ResourceLimitExceeded {
+                resource: "instructions",
+                limit: limits.max_instructions,
+                actual: instr_count,
+            });
+        }
 
         // --- Instruction stream -----------------------------------------
-        let instr_block = 48..48 + instr_count * 4;
+        let instr_end = instr_count
+            .checked_mul(4)
+            .and_then(|n| NBC_HEADER_LEN.checked_add(n))
+            .ok_or_else(|| FormatError::BodyDecode("instruction stream length overflow".into()))?;
+        let instr_block = NBC_HEADER_LEN..instr_end;
         if bytes.len() < instr_block.end {
             return Err(FormatError::Truncated {
                 need: instr_block.end,
@@ -205,22 +256,34 @@ impl CodeModule {
 
         // --- Metadata body ----------------------------------------------
         let meta_len_off = instr_block.end;
-        if bytes.len() < meta_len_off + 4 {
+        let meta_off = meta_len_off
+            .checked_add(4)
+            .ok_or_else(|| FormatError::BodyDecode("metadata header length overflow".into()))?;
+        if bytes.len() < meta_off {
             return Err(FormatError::Truncated {
-                need: meta_len_off + 4,
+                need: meta_off,
                 have: bytes.len(),
             });
         }
         let meta_len =
-            u32::from_be_bytes(bytes[meta_len_off..meta_len_off + 4].try_into().unwrap()) as usize;
-        let meta_off = meta_len_off + 4;
-        if bytes.len() < meta_off + meta_len {
+            u32::from_be_bytes(bytes[meta_len_off..meta_off].try_into().unwrap()) as usize;
+        if meta_len > limits.max_metadata_bytes {
+            return Err(FormatError::ResourceLimitExceeded {
+                resource: "metadata bytes",
+                limit: limits.max_metadata_bytes,
+                actual: meta_len,
+            });
+        }
+        let meta_end = meta_off
+            .checked_add(meta_len)
+            .ok_or_else(|| FormatError::BodyDecode("metadata body length overflow".into()))?;
+        if bytes.len() < meta_end {
             return Err(FormatError::LengthMismatch {
                 declared: meta_len as u32,
                 actual: bytes.len() - meta_off,
             });
         }
-        let meta_bytes = &bytes[meta_off..meta_off + meta_len];
+        let meta_bytes = &bytes[meta_off..meta_end];
         let mut module: CodeModule = serde_json::from_slice(meta_bytes)
             .map_err(|e| FormatError::BodyDecode(e.to_string()))?;
         module.instructions = instructions;
