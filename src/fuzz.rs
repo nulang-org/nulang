@@ -1029,6 +1029,25 @@ mod tests {
         );
     }
 
+    /// October 16 nightly differential fuzz (run 38869103591, shards 1 and 3)
+    /// observed warmed JIT returning nil for numerical loop results returned
+    /// as floats by the interpreter. Preserve the *exact* mutated programs:
+    /// unusual token adjacency is part of the observed compiler input.
+    #[test]
+    fn differential_fuzz_oct16_float_loop_backedge_agrees() {
+        for source in [
+            "var i = 0.0; var s = 0.0; while i < 100.0 { s = s + i * 2.5/ - i / 3.0; i = i + 1.0; }; s",
+            "var i = 0.0; var s = 0.0; while i < 100.0 { s = s + i * 2.5 - i /i 3.0; i = i + 1.0; }; s",
+        ] {
+            let outcome = differential_fuzz_one(source)
+                .unwrap_or_else(|error| panic!("October 16 backend divergence for {source:?}: {error}"));
+            assert!(
+                matches!(outcome, DiffOutcome::Agreed { .. }),
+                "regression must compile and compare real backends for {source:?}: {outcome:?}"
+            );
+        }
+    }
+
     /// Differential regression cases: known kernels that must agree across
     /// all backends. Added from nightly fuzz captures (2026-10-10).
     #[test]
