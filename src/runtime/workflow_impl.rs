@@ -355,6 +355,78 @@ pub(crate) fn checkpoint_actor(rt: &mut Runtime, actor_id: u64) {
     }
 }
 
+/// Commit a workflow event through the same fenced atomic tail used by commands
+/// and terminal step results. Open-activation preparations persist only the
+/// event: checkpointing their speculative state would skip replay after a crash.
+fn commit_workflow_event(
+    rt: &mut Runtime,
+    actor_id: u64,
+    event: WorkflowEvent,
+    checkpoint: bool,
+) -> std::io::Result<()> {
+    let expected_previous_sequence = rt.persistence.latest_sequence(actor_id);
+    let sequence = expected_previous_sequence.checked_add(1).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "workflow event transition sequence overflow",
+        )
+    })?;
+    if event.sequence() != sequence {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "workflow event sequence does not match the next atomic transition",
+        ));
+    }
+    let activation_epoch = rt
+        .actors
+        .get(&actor_id)
+        .filter(|actor| actor.persistent)
+        .map(|actor| actor.activation_epoch)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "workflow event transition requires a live persistent actor",
+            )
+        })?;
+    let snapshot = if checkpoint {
+        Some(
+            build_actor_snapshot_at_sequence(rt, actor_id, sequence)?.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "workflow event checkpoint requires a live persistent actor",
+                )
+            })?,
+        )
+    } else {
+        None
+    };
+
+    rt.persistence.commit_transition(DurableTransition {
+        version: DURABLE_TRANSITION_VERSION,
+        actor_id,
+        activation_epoch,
+        sequence,
+        expected_previous_sequence,
+        command: None,
+        snapshot: snapshot.clone(),
+        workflow_events: vec![event],
+        domain_events: vec![],
+        durable_effects: vec![],
+        outbox: vec![],
+    })?;
+
+    if let Some(snapshot) = &snapshot {
+        rt.maybe_shadow_replicate(actor_id, snapshot);
+    }
+    if let Some(actor) = rt.actors.get_mut(&actor_id) {
+        actor.sequence = sequence;
+        if checkpoint {
+            actor.dirty_fields.clear();
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Event emission
 // ---------------------------------------------------------------------------
@@ -429,12 +501,6 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
             let parallel_step_name =
                 resolve_string_constant(rt, actor_id, &args[0]).unwrap_or_default();
             let branch_name = resolve_string_constant(rt, actor_id, &args[1]).unwrap_or_default();
-            let _ = rt.persistence.append_parallel_branch_completed(
-                actor_id,
-                seq,
-                parallel_step_name,
-                branch_name,
-            );
             if let Some(actor) = rt.actors.get_mut(&actor_id) {
                 let current = actor
                     .get_state_field("parallel_progress")
@@ -442,7 +508,18 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                     .unwrap_or(0);
                 actor.set_state_field("parallel_progress", Value::int(current + 1));
             }
-            checkpoint_actor(rt, actor_id);
+            if let Err(error) = commit_workflow_event(
+                rt,
+                actor_id,
+                WorkflowEvent::ParallelBranchCompleted {
+                    sequence: seq,
+                    parallel_step_name,
+                    branch_name,
+                },
+                true,
+            ) {
+                tracing::error!(actor_id, %error, "nulang-workflow: failed to commit parallel branch progress");
+            }
         } else {
             let module = rt
                 .actors
@@ -453,7 +530,6 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                 .map(|v| PersistedValue::from_value_resolved(v, module))
                 .collect();
             let replay_id = current_workflow_replay_id(rt, actor_id);
-            let mut should_checkpoint = false;
             if let Some(replay_id) = replay_id {
                 match custom_event_replay_disposition(rt, actor_id, replay_id, event, &payload) {
                     ReplayDisposition::Consume => {
@@ -470,18 +546,21 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                         );
                     }
                     ReplayDisposition::Append => {
-                        let appended = rt
-                            .persistence
-                            .append_workflow_event(
-                                actor_id,
-                                WorkflowEvent::Custom {
-                                    sequence: seq,
-                                    replay_id: Some(replay_id),
-                                    name: event.to_string(),
-                                    args: payload,
-                                },
-                            )
-                            .is_ok();
+                        let committed = commit_workflow_event(
+                            rt,
+                            actor_id,
+                            WorkflowEvent::Custom {
+                                sequence: seq,
+                                replay_id: Some(replay_id),
+                                name: event.to_string(),
+                                args: payload,
+                            },
+                            false,
+                        );
+                        let appended = committed.is_ok();
+                        if let Err(error) = committed {
+                            tracing::error!(actor_id, %error, "nulang-workflow: failed to commit intermediate event");
+                        }
                         if appended {
                             // This event belongs to an open activation. Keep the
                             // last completed snapshot unchanged so recovery can
@@ -492,22 +571,18 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                         }
                     }
                 }
-            } else {
-                should_checkpoint = rt
-                    .persistence
-                    .append_workflow_event(
-                        actor_id,
-                        WorkflowEvent::Custom {
-                            sequence: seq,
-                            replay_id: None,
-                            name: event.to_string(),
-                            args: payload,
-                        },
-                    )
-                    .is_ok();
-            }
-            if should_checkpoint {
-                checkpoint_actor(rt, actor_id);
+            } else if let Err(error) = commit_workflow_event(
+                rt,
+                actor_id,
+                WorkflowEvent::Custom {
+                    sequence: seq,
+                    replay_id: None,
+                    name: event.to_string(),
+                    args: payload,
+                },
+                true,
+            ) {
+                tracing::error!(actor_id, %error, "nulang-workflow: failed to commit custom event");
             }
         }
     }
@@ -542,7 +617,8 @@ pub(crate) fn append_timer_set(
             }
             ReplayDisposition::Append => {
                 let seq = next_sequence(rt, actor_id);
-                rt.persistence.append_workflow_event(
+                commit_workflow_event(
+                    rt,
                     actor_id,
                     WorkflowEvent::TimerSet {
                         sequence: seq,
@@ -550,6 +626,7 @@ pub(crate) fn append_timer_set(
                         name: name.to_string(),
                         duration_ms,
                     },
+                    false,
                 )?;
                 // TimerSet is an intermediate record for an open activation.
                 // Keep the last completed snapshot unchanged so crash recovery
@@ -561,9 +638,17 @@ pub(crate) fn append_timer_set(
     }
 
     let seq = next_sequence(rt, actor_id);
-    rt.persistence
-        .append_timer_set(actor_id, seq, name.to_string(), duration_ms)?;
-    try_checkpoint_actor(rt, actor_id)?;
+    commit_workflow_event(
+        rt,
+        actor_id,
+        WorkflowEvent::TimerSet {
+            sequence: seq,
+            replay_id: None,
+            name: name.to_string(),
+            duration_ms,
+        },
+        true,
+    )?;
     Ok(true)
 }
 
@@ -573,10 +658,15 @@ pub(crate) fn append_timer_fired(
     name: &str,
 ) -> std::io::Result<()> {
     let seq = next_sequence(rt, actor_id);
-    rt.persistence
-        .append_timer_fired(actor_id, seq, name.to_string())?;
-    try_checkpoint_actor(rt, actor_id)?;
-    Ok(())
+    commit_workflow_event(
+        rt,
+        actor_id,
+        WorkflowEvent::TimerFired {
+            sequence: seq,
+            name: name.to_string(),
+        },
+        true,
+    )
 }
 
 pub(crate) fn append_signal_received(
@@ -586,10 +676,16 @@ pub(crate) fn append_signal_received(
     payload: Option<String>,
 ) -> std::io::Result<()> {
     let seq = next_sequence(rt, actor_id);
-    rt.persistence
-        .append_signal_received(actor_id, seq, name.to_string(), payload)?;
-    try_checkpoint_actor(rt, actor_id)?;
-    Ok(())
+    commit_workflow_event(
+        rt,
+        actor_id,
+        WorkflowEvent::SignalReceived {
+            sequence: seq,
+            name: name.to_string(),
+            payload,
+        },
+        true,
+    )
 }
 
 pub(crate) fn append_saga_compensated(
@@ -598,10 +694,15 @@ pub(crate) fn append_saga_compensated(
     step_name: &str,
 ) -> std::io::Result<()> {
     let seq = next_sequence(rt, actor_id);
-    rt.persistence
-        .append_saga_compensated(actor_id, seq, step_name.to_string())?;
-    try_checkpoint_actor(rt, actor_id)?;
-    Ok(())
+    commit_workflow_event(
+        rt,
+        actor_id,
+        WorkflowEvent::SagaCompensated {
+            sequence: seq,
+            step_name: step_name.to_string(),
+        },
+        true,
+    )
 }
 
 // ---------------------------------------------------------------------------
