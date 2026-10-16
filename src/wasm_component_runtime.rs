@@ -22,11 +22,46 @@ use bindings::Actor;
 pub fn component_config() -> Config {
     let mut config = Config::new();
     config.wasm_component_model(true);
+    config.consume_fuel(true);
     config.memory_reservation(4 << 30);
     config.memory_guard_size(128 << 20);
     config.cranelift_opt_level(OptLevel::Speed);
     config.wasm_simd(true);
     config
+}
+
+/// Resource policy applied independently to every component instance.
+#[cfg(feature = "wasm-backend")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ComponentLimits {
+    /// Fuel replenished before every exported guest call.
+    pub fuel_per_call: u64,
+    /// Maximum linear-memory bytes available to one component instance.
+    pub memory_bytes: usize,
+    /// Maximum number of core instances created inside one store.
+    pub max_store_instances: usize,
+    /// Maximum number of linear memories created inside one store.
+    pub max_memories: usize,
+    /// Maximum number of tables created inside one store.
+    pub max_tables: usize,
+    /// Maximum number of idle instances retained by this runtime. The secure
+    /// default is zero because a component without an explicit reset contract
+    /// may retain guest state between calls.
+    pub max_idle_instances: usize,
+}
+
+#[cfg(feature = "wasm-backend")]
+impl Default for ComponentLimits {
+    fn default() -> Self {
+        Self {
+            fuel_per_call: 10_000_000,
+            memory_bytes: 64 << 20,
+            max_store_instances: 64,
+            max_memories: 8,
+            max_tables: 16,
+            max_idle_instances: 0,
+        }
+    }
 }
 
 /// Capability controls for the WASM component host.
@@ -57,6 +92,7 @@ impl Default for Capabilities {
 pub struct HostState {
     caps: Capabilities,
     log_messages: Vec<String>,
+    limits: StoreLimits,
 }
 
 #[cfg(feature = "wasm-backend")]
@@ -96,6 +132,7 @@ pub struct ComponentRuntime {
     component: Component,
     linker: wasmtime::component::Linker<HostState>,
     caps: Capabilities,
+    limits: ComponentLimits,
     pool: std::sync::Mutex<Vec<PooledInstance>>,
 }
 
@@ -106,6 +143,26 @@ impl ComponentRuntime {
     }
 
     pub fn new_with_caps(wasm_bytes: &[u8], caps: Capabilities) -> NuResult<Self> {
+        Self::new_with_policy(wasm_bytes, caps, ComponentLimits::default())
+    }
+
+    pub fn new_with_policy(
+        wasm_bytes: &[u8],
+        caps: Capabilities,
+        limits: ComponentLimits,
+    ) -> NuResult<Self> {
+        if limits.fuel_per_call == 0 {
+            return Err(NuError::VMError {
+                msg: "component fuel_per_call must be greater than zero".into(),
+                span: Span::default(),
+            });
+        }
+        if limits.memory_bytes == 0 {
+            return Err(NuError::VMError {
+                msg: "component memory_bytes must be greater than zero".into(),
+                span: Span::default(),
+            });
+        }
         let config = component_config();
         let engine = Engine::new(&config).map_err(|e| NuError::VMError {
             msg: format!("wasmtime engine: {}", e),
@@ -121,6 +178,7 @@ impl ComponentRuntime {
             component,
             linker,
             caps,
+            limits,
             pool: std::sync::Mutex::new(Vec::new()),
         })
     }
@@ -186,17 +244,44 @@ impl ComponentRuntime {
 
     /// Acquire a store+instance pair, creating a fresh one if the pool is empty.
     fn checkout(&self) -> NuResult<PooledInstance> {
-        if let Some(mut pooled) = self.pool.lock().unwrap().pop() {
+        if let Some(mut pooled) = self
+            .pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop()
+        {
             pooled.store.data_mut().log_messages.clear();
+            pooled
+                .store
+                .set_fuel(self.limits.fuel_per_call)
+                .map_err(|e| NuError::VMError {
+                    msg: format!("wasmtime fuel reset: {}", e),
+                    span: Span::default(),
+                })?;
             return Ok(pooled);
         }
+        let store_limits = StoreLimitsBuilder::new()
+            .memory_size(self.limits.memory_bytes)
+            .instances(self.limits.max_store_instances)
+            .memories(self.limits.max_memories)
+            .tables(self.limits.max_tables)
+            .trap_on_grow_failure(true)
+            .build();
         let mut store = Store::new(
             &self.engine,
             HostState {
                 caps: self.caps,
                 log_messages: Vec::new(),
+                limits: store_limits,
             },
         );
+        store.limiter(|state| &mut state.limits);
+        store
+            .set_fuel(self.limits.fuel_per_call)
+            .map_err(|e| NuError::VMError {
+                msg: format!("wasmtime fuel: {}", e),
+                span: Span::default(),
+            })?;
         let instance = self
             .linker
             .instantiate(&mut store, &self.component)
@@ -209,7 +294,13 @@ impl ComponentRuntime {
 
     /// Return a store+instance pair to the pool for reuse.
     fn checkin(&self, pooled: PooledInstance) {
-        self.pool.lock().unwrap().push(pooled);
+        let mut pool = self
+            .pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pool.len() < self.limits.max_idle_instances {
+            pool.push(pooled);
+        }
     }
 
     fn with_actor<F, R>(&self, f: F) -> NuResult<R>
@@ -223,7 +314,11 @@ impl ComponentRuntime {
                 span: Span::default(),
             })?;
         let result = f(&mut pooled.store, &actor);
-        self.checkin(pooled);
+        // A trap may leave guest state partially mutated. Never return that
+        // instance to another actor invocation.
+        if result.is_ok() {
+            self.checkin(pooled);
+        }
         result
     }
 
@@ -292,6 +387,7 @@ mod tests {
             HostState {
                 caps: rt.caps,
                 log_messages: Vec::new(),
+                limits: StoreLimitsBuilder::new().build(),
             },
         );
         let linker = ComponentRuntime::build_linker(&engine, rt.caps).expect("linker");
@@ -327,6 +423,7 @@ mod tests {
             HostState {
                 caps: rt.caps,
                 log_messages: Vec::new(),
+                limits: StoreLimitsBuilder::new().build(),
             },
         );
         let linker = ComponentRuntime::build_linker(&engine, rt.caps).expect("linker");
@@ -334,5 +431,86 @@ mod tests {
         let _instance = linker
             .instantiate(&mut store, &component)
             .expect("should succeed with log capability");
+    }
+
+    #[test]
+    fn test_component_config_fuel_traps_runaway_guest() {
+        let engine = Engine::new(&component_config()).expect("engine");
+        let module = Module::new(
+            &engine,
+            r#"(module
+                (func (export "spin")
+                    (loop $forever
+                        br $forever)))"#,
+        )
+        .expect("module");
+        let mut store = Store::new(
+            &engine,
+            HostState {
+                caps: Capabilities::default(),
+                log_messages: Vec::new(),
+                limits: StoreLimitsBuilder::new().build(),
+            },
+        );
+        store.set_fuel(1_000).expect("fuel");
+        let instance = wasmtime::Instance::new(&mut store, &module, &[]).expect("instance");
+        let spin = instance
+            .get_typed_func::<(), ()>(&mut store, "spin")
+            .expect("spin");
+
+        let err = spin
+            .call(&mut store, ())
+            .expect_err("runaway guest must exhaust fuel");
+        assert!(
+            err.to_string().contains("fuel"),
+            "trap should identify fuel exhaustion: {err}"
+        );
+    }
+
+    #[test]
+    fn test_component_store_limits_memory_growth() {
+        let engine = Engine::new(&component_config()).expect("engine");
+        let module = Module::new(&engine, r#"(module (memory 2))"#).expect("module");
+        let mut store = Store::new(
+            &engine,
+            HostState {
+                caps: Capabilities::default(),
+                log_messages: Vec::new(),
+                limits: StoreLimitsBuilder::new().memory_size(64 << 10).build(),
+            },
+        );
+        store.limiter(|state| &mut state.limits);
+
+        wasmtime::Instance::new(&mut store, &module, &[])
+            .err()
+            .expect("two-page memory must exceed the one-page store limit");
+    }
+
+    #[test]
+    fn test_component_policy_rejects_zero_resource_limits() {
+        let wasm = wat::parse_str("(component)").expect("parse WAT");
+        let err = ComponentRuntime::new_with_policy(
+            &wasm,
+            Capabilities::default(),
+            ComponentLimits {
+                fuel_per_call: 0,
+                ..ComponentLimits::default()
+            },
+        )
+        .err()
+        .expect("zero fuel must be rejected");
+        assert!(err.to_string().contains("fuel_per_call"));
+
+        let err = ComponentRuntime::new_with_policy(
+            &wasm,
+            Capabilities::default(),
+            ComponentLimits {
+                memory_bytes: 0,
+                ..ComponentLimits::default()
+            },
+        )
+        .err()
+        .expect("zero memory limit must be rejected");
+        assert!(err.to_string().contains("memory_bytes"));
     }
 }
