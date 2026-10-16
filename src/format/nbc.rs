@@ -334,6 +334,74 @@ mod tests {
     }
 
     #[test]
+    fn bounded_decode_enforces_artifact_instruction_and_metadata_limits() {
+        let module = sample_module();
+        let bytes = module.to_nbc(None).expect("encode fixture");
+        let instructions = module.instructions.len();
+        let metadata = bytes.len() - NBC_HEADER_LEN - instructions * 4 - 4;
+
+        // Exact limits must admit a valid artifact without changing semantics.
+        let exact = NbcDecodeLimits {
+            max_artifact_bytes: bytes.len(),
+            max_instructions: instructions,
+            max_metadata_bytes: metadata,
+        };
+        assert_eq!(
+            CodeModule::from_nbc_with_limits(&bytes, exact)
+                .expect("exact bound must admit artifact")
+                .module,
+            module
+        );
+
+        for (limits, expected_resource) in [
+            (
+                NbcDecodeLimits {
+                    max_artifact_bytes: bytes.len() - 1,
+                    ..exact
+                },
+                "artifact bytes",
+            ),
+            (
+                NbcDecodeLimits {
+                    max_instructions: instructions - 1,
+                    ..exact
+                },
+                "instructions",
+            ),
+            (
+                NbcDecodeLimits {
+                    max_metadata_bytes: metadata - 1,
+                    ..exact
+                },
+                "metadata bytes",
+            ),
+        ] {
+            assert!(matches!(
+                CodeModule::from_nbc_with_limits(&bytes, limits),
+                Err(FormatError::ResourceLimitExceeded { resource, .. }) if resource == expected_resource
+            ), "{expected_resource} limit must fail closed");
+        }
+    }
+
+    #[test]
+    fn bounded_decode_rejects_forged_instruction_count_before_allocating() {
+        let mut bytes = sample_module().to_nbc(None).expect("encode fixture");
+        bytes[44..48].copy_from_slice(&u32::MAX.to_be_bytes());
+        let policy = NbcDecodeLimits {
+            max_artifact_bytes: bytes.len(),
+            max_instructions: 1_024,
+            max_metadata_bytes: bytes.len(),
+        };
+        assert!(matches!(
+            CodeModule::from_nbc_with_limits(&bytes, policy),
+            Err(FormatError::ResourceLimitExceeded {
+                resource: "instructions",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn test_nbc_rejects_bad_magic() {
         let mut bytes = sample_module().to_nbc(None).unwrap();
         bytes[0] = b'X';
