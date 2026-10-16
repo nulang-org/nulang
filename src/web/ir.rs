@@ -400,7 +400,7 @@ import stdlib::web::html
 import stdlib::web::types
 
 fn home() -> Html { text("Static homepage") }
-fn status() -> Json[String] { "{\\"ok\\":true}" }
+fn status() -> Json[String] { "{\"ok\":true}" }
 
 app "mixed-routes" {
     route "GET" "/" -> home
@@ -420,10 +420,10 @@ app "mixed-routes" {
         assert_eq!(json_contract.handler.as_deref(), Some("status"));
         assert_eq!(json_contract.response_type.as_deref(), Some("Json[String]"));
 
-        let routes = [("/", crate::runtime::HttpMethod::Get), (
-            "/api/status",
-            crate::runtime::HttpMethod::Get,
-        )]
+        let routes = [
+            ("/", crate::runtime::HttpMethod::Get),
+            ("/api/status", crate::runtime::HttpMethod::Get),
+        ]
         .into_iter()
         .map(|(path, method)| WebRoute {
             method,
