@@ -546,8 +546,14 @@ pub fn rewrite_module(module: &mut AstModule, checker: Option<&EffectChecker>) {
         }
     }
     for decl in &mut module.decls {
-        if let Decl::Function { body, .. } = decl {
-            rewrite_expr(body, false, &signals, checker);
+        if let Decl::Function { body, params, .. } = decl {
+            // Parameter names shadow module-level signals. Fail closed rather
+            // than synthesizing browser bindings to an unrelated global value.
+            let mut visible_signals = signals.clone();
+            for param in params {
+                visible_signals.remove(&param.name);
+            }
+            rewrite_expr(body, false, &visible_signals, checker);
         }
     }
 }
@@ -633,16 +639,34 @@ fn rewrite_expr(
         }
 
         // Recurse through other expression forms.
-        Expr::Lambda { body, .. } => rewrite_expr(body, in_html, signals, checker),
+        Expr::Lambda { body, params, .. } => {
+            let mut visible_signals = signals.clone();
+            for param in params {
+                visible_signals.remove(&param.name);
+            }
+            rewrite_expr(body, in_html, &visible_signals, checker);
+        },
         Expr::App { func, args, .. } => {
             rewrite_expr(func, in_html, signals, checker);
             for arg in args.iter_mut() {
                 rewrite_expr(arg, in_html, signals, checker);
             }
         }
-        Expr::Let { value, body, .. } | Expr::LetRec { value, body, .. } => {
+        Expr::Let { name, value, body, .. } => {
             rewrite_expr(value, in_html, signals, checker);
-            rewrite_expr(body, in_html, signals, checker);
+            let mut visible_signals = signals.clone();
+            visible_signals.remove(name);
+            rewrite_expr(body, in_html, &visible_signals, checker);
+        }
+        Expr::LetRec { name, params, value, body, .. } => {
+            let mut visible_signals = signals.clone();
+            visible_signals.remove(name);
+            let mut function_signals = visible_signals.clone();
+            for param in params {
+                function_signals.remove(&param.name);
+            }
+            rewrite_expr(value, in_html, &function_signals, checker);
+            rewrite_expr(body, in_html, &visible_signals, checker);
         }
         Expr::If {
             cond,
@@ -716,9 +740,11 @@ fn rewrite_expr(
             rewrite_expr(left, in_html, signals, checker);
             rewrite_expr(right, in_html, signals, checker);
         }
-        Expr::For { iterable, body, .. } => {
+        Expr::For { var, iterable, body, .. } => {
             rewrite_expr(iterable, in_html, signals, checker);
-            rewrite_expr(body, in_html, signals, checker);
+            let mut visible_signals = signals.clone();
+            visible_signals.remove(var);
+            rewrite_expr(body, in_html, &visible_signals, checker);
         }
         Expr::While { cond, body, .. } => {
             rewrite_expr(cond, in_html, signals, checker);
