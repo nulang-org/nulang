@@ -46,7 +46,7 @@ fn intermediate_timer_uses_atomic_history_without_advancing_safe_snapshot() {
         .unwrap()
         .current_workflow_activation = Some(activation);
 
-    assert!(runtime.append_timer_set(actor_id, "wake", 250).unwrap());
+    runtime.schedule_workflow_timer(actor_id, "wake", 250).unwrap();
 
     let tail = runtime
         .persistence
