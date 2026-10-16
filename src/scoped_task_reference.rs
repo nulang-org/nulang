@@ -103,14 +103,14 @@ impl<T, E> ReferenceExecutor<T, E> {
                     self.scope
                         .complete(id, result)
                         .expect("reference executor only polls running task IDs");
-                    self.active.remove(index);
+                    let _ = self.active.remove(index);
                     stats.completed += 1;
                 }
                 TaskPoll::Cancelled => {
                     self.scope
                         .acknowledge_cancelled(id)
                         .expect("reference executor only polls running task IDs");
-                    self.active.remove(index);
+                    let _ = self.active.remove(index);
                     stats.completed += 1;
                 }
             }
