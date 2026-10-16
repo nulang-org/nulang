@@ -600,6 +600,13 @@ pub fn clear_jit_safepoint_ptr() {
     JIT_SAFEPOINT_PTR.with(|cell| cell.set(std::ptr::null_mut()));
 }
 
+/// Install a nested actor's safepoint pointer, returning the previous scope.
+/// Direct synchronous calls install null, then restore the outer scheduler
+/// actor's pointer on return. All pointers are scoped to the owning thread.
+pub fn swap_jit_safepoint_ptr(ptr: *mut u64) -> *mut u64 {
+    JIT_SAFEPOINT_PTR.with(|cell| cell.replace(ptr))
+}
+
 /// Check and decrement the current thread's actor reduction budget.
 /// Returns 1 when the compiled region must yield, otherwise 0.
 #[no_mangle]
