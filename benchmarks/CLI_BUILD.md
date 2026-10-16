@@ -23,14 +23,15 @@ python3 scripts/benchmark_package_build.py \
   --candidate-binary /tmp/nulang-cli-candidate/release/nulang \
   --package benchmarks/fixtures/nula-build-smoke \
   --stdlib src/stdlib \
-  --rounds 7 --mode both --out /tmp/nulang-cli-build-ab.json
+  --rounds 7 --mode both --timeout-seconds 120 \
+  --out /tmp/nulang-cli-build-ab.json
 ```
 
 The script alternates AB/BA order, uses separate copies of the same fixture,
 excludes Cargo compilation and fixture copying from timed sections, and runs
 both fresh-project and repeat-in-place builds. It checks that bytecode and
 behavior-sidecar bytes are identical across both binaries and across rebuilds;
-mismatches or compiler failures **invalidate the measurement**.
+mismatches, compiler failures, or per-build timeouts **invalidate the measurement**. The timeout is configurable for larger projects (default 120 seconds).
 
 Fresh-project means a new package directory, **not** a cold kernel filesystem
 cache. The output is a median of round-paired speedup ratios, plus raw per-round
