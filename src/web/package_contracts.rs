@@ -15,6 +15,7 @@ use crate::lexer::Lexer;
 use crate::parser::Parser;
 use crate::types::Span;
 use crate::web::contracts::{compile_module_contracts, ContractCompilation};
+use std::collections::BTreeSet;
 use std::path::Path;
 
 /// Compile web contracts from every `.nula` file below `src_root` using one
@@ -62,6 +63,11 @@ pub fn compile_modules_contracts(modules: &[AstModule]) -> ContractCompilation {
     }
 
     let mut compiled = compile_module_contracts(&combined);
+    let mut imports = BTreeSet::new();
+    for module in modules {
+        collect_first_party_imports(&module.decls, &mut imports);
+    }
+    compiled.module_imports = imports.into_iter().collect();
     compiled
         .routes
         .sort_by(|a, b| (&a.method, &a.path).cmp(&(&b.method, &b.path)));
@@ -116,6 +122,20 @@ fn collect_modules_recursive(
     match Parser::new(tokens).parse_module() {
         Ok(module) => modules.push(module),
         Err(error) => diagnostics.push(format!("{}: parser error: {error}", path.display())),
+    }
+}
+
+/// Collect module imports from the actual parsed declarations, not source
+/// lines that may contain commented-out imports or user string literals.
+fn collect_first_party_imports(decls: &[Decl], imports: &mut BTreeSet<String>) {
+    for decl in decls {
+        match decl {
+            Decl::Import { path, .. } if path.starts_with("@nulang/") => {
+                imports.insert(path.clone());
+            }
+            Decl::Module { decls, .. } => collect_first_party_imports(decls, imports),
+            _ => {}
+        }
     }
 }
 
@@ -377,6 +397,29 @@ mod tests {
     fn parse(source: &str) -> AstModule {
         let tokens = Lexer::new(source).lex().unwrap();
         Parser::new(tokens).parse_module().unwrap()
+    }
+
+    #[test]
+    fn records_only_parsed_first_party_imports_in_stable_order() {
+        let first = parse(
+            r#"
+import @nulang/postgres
+// import @nulang/stripe
+fn main() { "import @nulang/ai" }
+"#,
+        );
+        let second = parse(
+            r#"
+import @nulang/auth
+import @nulang/postgres
+"#,
+        );
+
+        let compiled = compile_modules_contracts(&[first, second]);
+        assert_eq!(
+            compiled.module_imports,
+            vec!["@nulang/auth".to_string(), "@nulang/postgres".to_string()]
+        );
     }
 
     #[test]
