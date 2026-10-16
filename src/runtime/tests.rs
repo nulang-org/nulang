@@ -306,6 +306,69 @@ fn preempted_actor_yields_to_already_runnable_peer() {
     );
 }
 
+/// Synchronous callers must run to completion even after the loop tiers up
+/// into Cranelift and exceeds the native actor safepoint budget.
+#[cfg(feature = "native-codegen")]
+#[test]
+fn synchronous_actor_ask_does_not_yield_from_a_hot_jit_loop() {
+    use crate::bytecode::{BehaviorTableEntry, Instruction, OpCode};
+
+    let mut module = CodeModule::new("synchronous-ask-jit-quantum");
+    let limit_idx = module.add_constant(Constant::Int(5_000));
+    module.add_behavior(BehaviorTableEntry {
+        name: "Busy.count".to_string(),
+        param_count: 0,
+        code_offset: 0,
+        local_count: 4,
+        effect_mask: 0,
+        compensate_offset: None,
+        content_hash: None,
+        source_location: None,
+        parallel_branches: None,
+    });
+    module.emit(Instruction::new1(OpCode::Const0, 0));
+    module.emit(Instruction::new3(
+        OpCode::ConstU,
+        ((limit_idx >> 8) & 0xFF) as u8,
+        (limit_idx & 0xFF) as u8,
+        1,
+    ));
+    module.emit(Instruction::new1(OpCode::IInc, 0));
+    module.emit(Instruction::new3(OpCode::ICmpLt, 0, 1, 2));
+    // Jump from pc 4 to the loop head at pc 2.
+    let back: i16 = -3;
+    module.emit(Instruction::new3(
+        OpCode::JmpT,
+        2,
+        ((back as u16) >> 8) as u8,
+        (back as u16 & 0xFF) as u8,
+    ));
+    module.emit(Instruction::new1(OpCode::RetVal, 0));
+
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(Vec::new));
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.max_reductions = 4;
+        actor.bytecode_module = Some(Box::new(module.clone()));
+        actor.bytecode_offsets = vec![0];
+        actor.compensation_offsets = vec![None];
+    }
+    rt.register_recovery_module(actor_id, module, vec![0], vec![None]);
+
+    assert_eq!(
+        rt.ask_actor_sync(actor_id, 0, &[]).unwrap(),
+        Value::int(5_000),
+        "a synchronous ask must not expose a partial native JIT continuation"
+    );
+    assert!(
+        rt.vm.as_ref().is_some_and(|vm| vm.jit_compiled_count() > 0),
+        "the loop must tier up so the assertion actually exercises native execution"
+    );
+    assert!(!rt.actors[&actor_id].jit_yield_pending);
+    assert!(rt.actors[&actor_id].suspended_execution.is_none());
+}
+
 #[test]
 fn synchronous_actor_ask_runs_to_completion_past_instruction_quantum() {
     use crate::bytecode::{BehaviorTableEntry, Instruction, OpCode};
