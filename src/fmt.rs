@@ -23,7 +23,7 @@ pub fn format_source(source: &str) -> Result<String, String> {
         .map_err(|e| e.to_string())?;
     if tokens.iter().any(|token| {
         matches!(
-            token.kind,
+            &token.kind,
             crate::lexer::TokenKind::Comment(_)
                 | crate::lexer::TokenKind::DocComment(_)
         )
