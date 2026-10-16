@@ -1039,7 +1039,10 @@ mod tests {
     fn assert_last_error_contains(rt: *mut NulangRuntime, expected: &str) {
         // SAFETY: every caller passes a live runtime.
         let ptr = unsafe { nulang_last_error(rt) };
-        assert!(!ptr.is_null(), "expected C API error containing {expected:?}");
+        assert!(
+            !ptr.is_null(),
+            "expected C API error containing {expected:?}"
+        );
         // SAFETY: nulang_last_error returns a runtime-owned NUL-terminated string.
         let actual = unsafe { CStr::from_ptr(ptr) }.to_string_lossy();
         assert!(
@@ -1119,7 +1122,8 @@ mod tests {
         }));
         assert_last_error_contains(rt, "unknown function");
 
-        let result = unsafe { nulang_call_function(rt, handle, name.as_ptr(), std::ptr::null(), 0) };
+        let result =
+            unsafe { nulang_call_function(rt, handle, name.as_ptr(), std::ptr::null(), 0) };
         assert_eq!(nulang_value_int(result), 42);
         assert!(unsafe { nulang_last_error(rt) }.is_null());
 
