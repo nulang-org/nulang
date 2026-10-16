@@ -636,6 +636,23 @@ impl crate::backends::ForeignInterop for NoOpForeignInterop {
     }
 }
 
+/// Recovery disposition for a saga compensation. OutcomeUnknown means
+/// the compensation may have reached an external system and must be reconciled
+/// instead of automatically executed a second time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SagaCompensationRecoveryStatus {
+    NotStarted,
+    OutcomeUnknown,
+    Completed,
+}
+
+/// Durable reconciliation view of one previously completed workflow step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SagaCompensationRecoveryItem {
+    pub step_name: String,
+    pub status: SagaCompensationRecoveryStatus,
+}
+
 impl Runtime {
     pub fn new() -> Self {
         Runtime {
@@ -5483,6 +5500,71 @@ impl Runtime {
         }
     }
 
+    /// Read recovery status using the complete durable event journal, not the
+    /// in-memory compensated_steps cache (which is not part of actor snapshots).
+    fn saga_compensation_step_status(
+        &self,
+        actor_id: u64,
+        step_name: &str,
+    ) -> SagaCompensationRecoveryStatus {
+        let mut status = SagaCompensationRecoveryStatus::NotStarted;
+        for event in self.persistence.read_workflow_events(actor_id) {
+            match event {
+                WorkflowEvent::SagaCompensationStarted { step_name: name, .. }
+                    if name == step_name =>
+                {
+                    status = SagaCompensationRecoveryStatus::OutcomeUnknown;
+                }
+                WorkflowEvent::SagaCompensated { step_name: name, .. }
+                    if name == step_name =>
+                {
+                    status = SagaCompensationRecoveryStatus::Completed;
+                }
+                _ => {}
+            }
+        }
+        status
+    }
+
+    /// Inspect saga compensation work after the most recent failure. This
+    /// method is read-only: it never dispatches an external compensation on
+    /// recovery, and an unacknowledged Started record remains OutcomeUnknown.
+    pub fn saga_compensation_recovery(
+        &self,
+        actor_id: u64,
+    ) -> Vec<SagaCompensationRecoveryItem> {
+        let events = self.persistence.read_workflow_events(actor_id);
+        let Some(failed_at) = events
+            .iter()
+            .rposition(|event| matches!(event, WorkflowEvent::StepFailed { .. }))
+        else {
+            return Vec::new();
+        };
+
+        let mut steps = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for event in events[..failed_at].iter().rev() {
+            if let WorkflowEvent::StepCompleted { step_name, .. } = event {
+                if seen.insert(step_name.clone()) {
+                    steps.push(SagaCompensationRecoveryItem {
+                        step_name: step_name.clone(),
+                        status: self.saga_compensation_step_status(actor_id, step_name),
+                    });
+                }
+            }
+        }
+        steps
+    }
+
+    /// Durably prepare a compensation before invoking its body.
+    pub fn append_saga_compensation_started(
+        &mut self,
+        actor_id: u64,
+        step_name: &str,
+    ) -> std::io::Result<()> {
+        workflow::append_saga_compensation_started(self, actor_id, step_name)
+    }
+
     /// Run saga compensations for a workflow step that failed.
     /// Walks backwards through completed steps and executes each compensation
     /// expression in reverse order, skipping steps already marked compensated.
@@ -5494,23 +5576,40 @@ impl Runtime {
             .unwrap_or(0) as usize;
 
         for behavior_idx in (0..step_index).rev() {
-            let already_compensated = {
-                let actor = match self.actors.get(&actor_id) {
-                    Some(a) => a,
-                    None => return,
-                };
-                let step_name = self.step_name_for(actor_id, behavior_idx);
-                actor.compensated_steps.contains(&step_name)
-            };
-            if already_compensated {
-                continue;
+            let step_name = self.step_name_for(actor_id, behavior_idx);
+            match self.saga_compensation_step_status(actor_id, &step_name) {
+                SagaCompensationRecoveryStatus::Completed => continue,
+                SagaCompensationRecoveryStatus::OutcomeUnknown => {
+                    tracing::error!(
+                        actor_id,
+                        %step_name,
+                        "nulang-workflow: compensation outcome unknown; manual reconciliation required"
+                    );
+                    return;
+                }
+                SagaCompensationRecoveryStatus::NotStarted => {}
             }
 
-            let result = self.run_compensation(actor_id, behavior_idx);
-            let step_name = self.step_name_for(actor_id, behavior_idx);
-            if result.is_err() {
-                // Compensation failed: do not record it as completed.
-                continue;
+            // Once this intent is committed, execution must not be repeated
+            // blindly after a crash; even a returned error may have made an
+            // irreversible remote mutation.
+            if let Err(error) = self.append_saga_compensation_started(actor_id, &step_name) {
+                tracing::error!(
+                    actor_id,
+                    %step_name,
+                    %error,
+                    "nulang-workflow: refusing compensation whose intent was not durable"
+                );
+                return;
+            }
+            if let Err(error) = self.run_compensation(actor_id, behavior_idx) {
+                tracing::error!(
+                    actor_id,
+                    %step_name,
+                    %error,
+                    "nulang-workflow: compensation failed; outcome requires reconciliation"
+                );
+                return;
             }
             match self.append_saga_compensated(actor_id, &step_name) {
                 Ok(()) => {
@@ -6564,6 +6663,9 @@ impl Runtime {
                 // parallel-progress counter.
                 actor.set_state_field("parallel_progress", Value::int(0));
             }
+            // The intent record documents an external side-effect boundary;
+            // it does not mark the side effect completed during recovery.
+            WorkflowEvent::SagaCompensationStarted { .. } => {}
             WorkflowEvent::SagaCompensated { step_name, .. } => {
                 // Replay marks the step as already compensated so the runtime
                 // does not run its compensation expression again.
