@@ -40,12 +40,12 @@ class ResultContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             for n in mod.COUNTS:
-                path = root / "criterion" / "actor" / "fabric_publish_unmatched" / str(n) / "new" / "estimates.json"
+                path = root / "criterion" / "actor_fabric_publish_unmatched" / str(n) / "new" / "estimates.json"
                 path.parent.mkdir(parents=True)
                 path.write_text(json.dumps({"mean": {"point_estimate": float(n + 1)}}))
             result = mod.read_estimates(root)
             self.assertEqual(set(result), {"0", "1000", "10000"})
-            (root / "criterion" / "actor" / "fabric_publish_unmatched" / "1000" / "new" / "estimates.json").unlink()
+            (root / "criterion" / "actor_fabric_publish_unmatched" / "1000" / "new" / "estimates.json").unlink()
             with self.assertRaisesRegex(RuntimeError, "missing"):
                 mod.read_estimates(root)
 

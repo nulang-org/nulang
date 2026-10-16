@@ -23,6 +23,9 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 BENCH_FILE = Path("benches/actor_bench.rs")
 COUNTS = (0, 1000, 10000)
+BENCHMARK_GROUP = "actor/fabric_publish_unmatched"
+# Criterion replaces group-name path separators in report directory names.
+CRITERION_GROUP_DIR = BENCHMARK_GROUP.replace("/", "_")
 START = "/// Cost of publishing to an unmatched Fabric topic as unrelated idle actors"
 GROUP = "criterion_group!(\n    benches,"
 CANDIDATE_GROUP_TAIL = "    bench_selective_receive,\n    bench_fabric_publish_unmatched\n);"
@@ -48,8 +51,8 @@ def read_estimates(target_dir: Path) -> dict[str, float]:
     results: dict[str, float] = {}
     for count in COUNTS:
         path = (
-            target_dir / "criterion" / "actor" / "fabric_publish_unmatched"
-            / str(count) / "new" / "estimates.json"
+            target_dir / "criterion" / CRITERION_GROUP_DIR / str(count)
+            / "new" / "estimates.json"
         )
         if not path.is_file():
             raise RuntimeError(f"Criterion report missing: {path}")
@@ -142,7 +145,7 @@ def main() -> int:
                 print(f"[{'warmup' if i < args.warmup else 'sample'} {i + 1}] {name}", flush=True)
                 execute(
                     ["cargo", "bench", "--locked", "--no-default-features",
-                     "--bench", "bench_main", "--", "actor/fabric_publish_unmatched",
+                     "--bench", "bench_main", "--", BENCHMARK_GROUP,
                      "--sample-size", "10", "--warm-up-time", "0.2",
                      "--measurement-time", "1", "--noplot"], variants[name], envs[name], cpu,
                 )
