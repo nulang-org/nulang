@@ -88,6 +88,41 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_bound_header_becomes_client_problem_response() {
+        let empty = HashMap::new();
+        let headers = vec![
+            ("X-Org".to_string(), "tenant-a".to_string()),
+            ("x-org".to_string(), "tenant-b".to_string()),
+        ];
+        let values = RequestBindingValues {
+            path: &empty,
+            query: &empty,
+            headers: &headers,
+            cookies: &empty,
+            body: None,
+            form: &empty,
+        };
+        let binding = RouteBindingContract {
+            source: RouteBindingSource::Header,
+            source_name: "X-Org".to_string(),
+            handler_param: "org".to_string(),
+            handler_index: 0,
+            ty: Some("String".to_string()),
+        };
+        let error = bind_request_arguments(&[binding], 1, &values).unwrap_err();
+        assert_eq!(error.kind, RequestDecodeErrorKind::AmbiguousInput);
+
+        let response = request_decode_problem_response(&error);
+        assert_eq!(response.status, 400);
+        let problem: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(problem["code"], "ambiguous_request_input");
+        assert_eq!(problem["source"], "header");
+        assert_eq!(problem["source_name"], "X-Org");
+        assert!(!response.body.windows(8).any(|window| window == b"tenant-a"));
+        assert!(!response.body.windows(8).any(|window| window == b"tenant-b"));
+    }
+
+    #[test]
     fn binding_plan_failure_stays_server_problem_response() {
         let error = RequestDecodeError {
             kind: RequestDecodeErrorKind::IncompleteBindingPlan,
