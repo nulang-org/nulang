@@ -741,6 +741,7 @@ fn main() {
                 .unwrap_or_else(|| "out.nbc".to_string());
             if let Err(e) = compile_source_to_nbc(
                 &code,
+                None,
                 &out,
                 opts.rewrite_signals.as_deref(),
                 &opts.with_capabilities,
@@ -748,6 +749,7 @@ fn main() {
                 opts.emit_behavior_manifest.as_deref(),
                 opts.behavior_package_name.as_deref(),
                 opts.behavior_package_version.as_deref(),
+                false,
             ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
@@ -913,10 +915,10 @@ fn main() {
             return;
         }
 
-        // `--emit-nbc`: compile to a `.nbc` artifact and write it, don't run.
+        // Compile and validate in one frontend pass. JSON emission is also
+        // used by the package CLI, avoiding a redundant --check subprocess.
         if opts.emit_nbc {
             let out = opts.out_file.clone().unwrap_or_else(|| {
-                // foo.nula -> foo.nbc; anything else -> <path>.nbc
                 if let Some(stem) = path.strip_suffix(".nula") {
                     format!("{stem}.nbc")
                 } else {
@@ -925,6 +927,7 @@ fn main() {
             });
             if let Err(e) = compile_source_to_nbc(
                 &source,
+                Some(path),
                 &out,
                 opts.rewrite_signals.as_deref(),
                 &opts.with_capabilities,
@@ -932,9 +935,25 @@ fn main() {
                 opts.emit_behavior_manifest.as_deref(),
                 opts.behavior_package_name.as_deref(),
                 opts.behavior_package_version.as_deref(),
+                opts.json,
             ) {
-                print_error(&e, use_color);
-                std::process::exit(exit_code(&e));
+                let code = exit_code(&e);
+                if opts.json {
+                    let report = nulang::json_diagnostics::JsonReport::new(
+                        "build",
+                        Some(path.clone()),
+                        nulang::json_diagnostics::diagnostics_from_error(&e),
+                    );
+                    print!("{}", report.to_json_string());
+                } else {
+                    print_error(&e, use_color);
+                }
+                std::process::exit(code);
+            }
+            if opts.json {
+                let report =
+                    nulang::json_diagnostics::JsonReport::new("build", Some(path.clone()), Vec::new());
+                print!("{}", report.to_json_string());
             }
             return;
         }
@@ -2440,6 +2459,7 @@ fn compile_with_new_pipeline(
 /// (supply-chain integrity). Does not execute the module.
 fn compile_source_to_nbc(
     source: &str,
+    file_path: Option<&str>,
     out_path: &str,
     rewrite_signals: Option<&str>,
     with_capabilities: &[String],
@@ -2447,9 +2467,10 @@ fn compile_source_to_nbc(
     behavior_manifest_path: Option<&str>,
     behavior_package_name: Option<&str>,
     behavior_package_version: Option<&str>,
+    quiet: bool,
 ) -> NuResult<()> {
     let (mut ast, type_checker) =
-        run_frontend(source, None, false, with_capabilities, deny_warnings)?;
+        run_frontend(source, file_path, false, with_capabilities, deny_warnings)?;
 
     // Optional web-framework pass: rewrite HTML for signals/actions and emit the
     // generic client-side micro-runtime. This runs after effect checking so
@@ -2535,20 +2556,24 @@ fn compile_source_to_nbc(
                 span: Span::default(),
             }
         })?;
+        if !quiet {
+            println!(
+                "Wrote {manifest_path} ({}, {})",
+                behavior_manifest.schema,
+                behavior_manifest
+                    .digest()
+                    .unwrap_or_else(|_| "digest-unavailable".to_string())
+            );
+        }
+    }
+    if !quiet {
         println!(
-            "Wrote {manifest_path} ({}, {})",
-            behavior_manifest.schema,
-            behavior_manifest
-                .digest()
-                .unwrap_or_else(|_| "digest-unavailable".to_string())
+            "Wrote {out_path} ({} bytes, .nbc format v{}, language v{})",
+            bytes.len(),
+            nulang::format::constants::BYTECODE_VERSION,
+            nulang::format::constants::LANGUAGE_VERSION,
         );
     }
-    println!(
-        "Wrote {out_path} ({} bytes, .nbc format v{}, language v{})",
-        bytes.len(),
-        nulang::format::constants::BYTECODE_VERSION,
-        nulang::format::constants::LANGUAGE_VERSION,
-    );
     Ok(())
 }
 
