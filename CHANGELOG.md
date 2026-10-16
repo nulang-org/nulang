@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### Registry cache source integrity — 2026-10-13
+- **Offline registry dependencies now require strong source IDs pinned in `Nulang.lock`.** The lockfile records a canonical digest of every file in each available extracted registry package; `--locked` and `--offline` reject missing identities, altered assets, absent caches, and invalid package metadata without repairing or rewriting the cache.
+- **This is lockfile-relative integrity, not publisher authentication.** Cached package content is hashed at initial lock time. Authentic registry signatures and published-archive attestations are future work.
+
 ### Limited cache-only Nula resolution — 2026-10-13
 - **`nula --offline`-mode package commands resolve local paths and clean cached Git commits without network access.** `--offline` implies `--locked` and fails on missing/stale pins, dirty/missing Git caches, or registry packages without verified integrity; it does not overwrite cached sources.
 

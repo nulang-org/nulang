@@ -202,8 +202,11 @@ and never rewritten. This is currently a **fail-closed, limited mode**:
 - Git dependencies require an existing cached checkout at the exact locked
   commit, a matching cache commit marker, and a clean tracked/untracked worktree.
   No `git fetch`, clone, reset, or automatic repair is performed.
-- Registry dependencies are rejected until the registry cache can validate
-  cryptographic source identities against a committed lockfile.
+- Registry dependencies use an existing extracted cache at the exact locked
+  version. `Nulang.lock` must record a strong `source_id` calculated over
+  **every regular file** in that extracted tree, including static assets.
+  Missing hashes, missing caches, modified files, and symlinks fail closed.
+  No network request or automatic repair is performed.
 - Native builds still require their normal compiler toolchain and the Nulang
   compiler; offline mode controls package resolution, not arbitrary effects
   performed by executed applications.
@@ -213,16 +216,26 @@ nulang nula build --offline
 nulang nula test --offline
 ```
 
-First perform an ordinary online build to populate the Git cache and record
-pins, then commit `Nulang.lock`. Offline mode deliberately reports a missing
-or dirty cache rather than silently reaching the network.
+First perform an ordinary online build to populate Git/registry caches and
+record pins, then commit `Nulang.lock`. Online lockfile writes automatically
+record a strong identity for each available extracted registry cache. Offline
+mode deliberately reports a missing or changed cache rather than reaching
+the network. Registry entries in older lockfiles without `source_id` must be
+re-pinned by an online build before they can be used offline.
 
-**`--locked` is not `--offline`.** Git and registry resolution may still
-contact remote servers. Older lockfiles without `source_id` metadata cannot
-prove the current contents of path dependencies. The legacy `content_hash`
-is preserved rather than reinterpreted as a strong source identity.
-Registry package integrity and complete offline dependency resolution remain
-separate hardening work.
+**Integrity versus authenticity:** Registry `source_id` is a cryptographic
+digest of the locally extracted package tree. It detects changes **relative
+to the committed lockfile**, but does not establish that the first downloaded
+archive was published by a trusted registry author. Cryptographic publisher
+signatures and authenticated registry checksums remain separate work. Lockfile
+updates are a trust-sensitive operation; review dependency changes before
+committing them.
+
+**`--locked` is not `--offline`.** Non-offline locked resolution may still
+contact remote Git/registry servers, but now checks available registry cache
+contents against recorded strong identities. Older path-source pins without
+`source_id` cannot detect every source change. The legacy `content_hash`
+retains its original meaning and is not treated as a strong identity.
 
 `nulang nula list` prints the locked dependencies:
 

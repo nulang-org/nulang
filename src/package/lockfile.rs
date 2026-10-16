@@ -22,13 +22,14 @@
 //! ```
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
 use crate::content_identity::{SemanticId, SourceId};
-use crate::package::identity::source_id_for_package_dir;
+use crate::package::identity::{registry_tree_id_for_package_dir, source_id_for_package_dir};
+use crate::package::manifest::Manifest;
 use crate::types::{NuError, NuResult, Span};
 
 /// Lockfile name, written next to the root package's manifest.
@@ -132,6 +133,29 @@ where
             ),
             span: Span::default(),
         })
+}
+
+/// Cache paths must never be constructible from arbitrary path components
+/// supplied by manifests or a modified lockfile.
+pub fn registry_cache_dir(root: &Path, name: &str, version: &str) -> NuResult<PathBuf> {
+    let safe = |part: &str| {
+        !part.is_empty()
+            && part != "."
+            && part != ".."
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b'+'))
+    };
+    if !safe(name) || !safe(version) {
+        return Err(NuError::PackageError {
+            msg: format!("unsafe registry package cache key '{}-{}'", name, version),
+            span: Span::default(),
+        });
+    }
+    Ok(root
+        .join(".nula")
+        .join("registry")
+        .join(format!("{}-{}", name, version)))
 }
 
 impl Lockfile {
@@ -241,6 +265,104 @@ impl Lockfile {
         Ok(())
     }
 
+    /// Enrich cached registry pins with a digest of the complete extracted
+    /// package tree, including non-Nulang assets. Missing caches remain unpinned
+    /// and therefore cannot be used in fail-closed offline mode.
+    pub fn populate_cached_registry_source_identities(&mut self, root: &Path) -> NuResult<()> {
+        for package in self.package.clone() {
+            if !package.source.starts_with("reg+") {
+                continue;
+            }
+            let path = registry_cache_dir(root, &package.name, &package.version)?;
+            if !path.exists() {
+                continue;
+            }
+            let source_id = registry_tree_id_for_package_dir(&path).map_err(|e| {
+                NuError::PackageError {
+                    msg: format!(
+                        "cannot identify registry cache for '{}' {} at {}: {}",
+                        package.name, package.version, path.display(), e
+                    ),
+                    span: Span::default(),
+                }
+            })?;
+            let semantic_id = self
+                .package_identity(&package.name, &package.version, &package.source)
+                .map(LockedPackageIdentity::parsed_semantic_id)
+                .transpose()?
+                .flatten();
+            self.set_package_identity(
+                &package.name,
+                &package.version,
+                &package.source,
+                Some(source_id),
+                semantic_id,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Verify every registry pin against its exact cached contents.
+    /// Missing identities, altered non-.nula files, symlinks, missing caches,
+    /// and changed package metadata fail closed without modifying the cache.
+    pub fn verify_cached_registry_source_identities(&self, root: &Path) -> NuResult<()> {
+        for package in &self.package {
+            if !package.source.starts_with("reg+") {
+                continue;
+            }
+            let identity = self
+                .package_identity(&package.name, &package.version, &package.source)
+                .ok_or_else(|| NuError::PackageError {
+                    msg: format!(
+                        "registry package '{}' {} has no strong source identity in Nulang.lock",
+                        package.name, package.version
+                    ),
+                    span: Span::default(),
+                })?;
+            let expected = identity.parsed_source_id()?.ok_or_else(|| NuError::PackageError {
+                msg: format!(
+                    "registry package '{}' {} has an empty source identity in Nulang.lock",
+                    package.name, package.version
+                ),
+                span: Span::default(),
+            })?;
+            let path = registry_cache_dir(root, &package.name, &package.version)?;
+            let cached = Manifest::load(&path).map_err(|e| NuError::PackageError {
+                msg: format!(
+                    "registry cache missing or invalid for '{}' {} at {}: {}",
+                    package.name, package.version, path.display(), e
+                ),
+                span: Span::default(),
+            })?;
+            if cached.package.name != package.name || cached.package.version != package.version {
+                return Err(NuError::PackageError {
+                    msg: format!(
+                        "registry cache metadata differs from locked package '{}' {}",
+                        package.name, package.version
+                    ),
+                    span: Span::default(),
+                });
+            }
+            let actual = registry_tree_id_for_package_dir(&path).map_err(|e| NuError::PackageError {
+                msg: format!(
+                    "cannot verify registry cache for '{}' {}: {}",
+                    package.name, package.version, e
+                ),
+                span: Span::default(),
+            })?;
+            if actual != expected {
+                return Err(NuError::PackageError {
+                    msg: format!(
+                        "registry cache integrity mismatch for '{}' {}: cache differs from Nulang.lock",
+                        package.name, package.version
+                    ),
+                    span: Span::default(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Return a clone enriched with every source identity that can be computed
     /// from currently available path dependencies.
     pub fn with_available_source_identities(&self) -> NuResult<Self> {
@@ -321,7 +443,8 @@ impl Lockfile {
     /// retain their existing values.
     pub fn save(&self, dir: &Path) -> NuResult<()> {
         let path = dir.join(LOCKFILE_FILE);
-        let enriched = self.with_available_source_identities()?;
+        let mut enriched = self.with_available_source_identities()?;
+        enriched.populate_cached_registry_source_identities(dir)?;
         std::fs::write(&path, enriched.to_toml()?).map_err(|e| NuError::PackageError {
             msg: format!("cannot write {}: {}", path.display(), e),
             span: Span::default(),
@@ -364,6 +487,77 @@ mod tests {
             ],
             identity: Vec::new(),
         }
+    }
+
+    #[test]
+    fn registry_integrity_save_records_full_cached_tree_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "nula_registry_identity_save_{}", std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let registry_dir = root.join(".nula/registry/util-0.1.0");
+        std::fs::create_dir_all(&registry_dir).unwrap();
+        std::fs::write(
+            registry_dir.join("Nulang.toml"),
+            "[package]\nname = \"util\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(registry_dir.join("module.nula"), "fn main() { 1 }").unwrap();
+        std::fs::write(registry_dir.join("icon.svg"), "<svg/>").unwrap();
+
+        let mut lock = Lockfile::new();
+        lock.package.push(LockedPackage {
+            name: "util".to_string(),
+            version: "0.1.0".to_string(),
+            source: "reg+https://registry.test".to_string(),
+            content_hash: String::new(),
+            commit: String::new(),
+        });
+        lock.save(&root).unwrap();
+        let persisted = Lockfile::load(&root).unwrap();
+        let pin = persisted
+            .package_identity("util", "0.1.0", "reg+https://registry.test")
+            .expect("registry cache must have a strong identity");
+        assert!(pin.parsed_source_id().unwrap().is_some());
+        persisted
+            .verify_cached_registry_source_identities(&root)
+            .expect("unchanged cached registry package must verify");
+
+        std::fs::write(registry_dir.join("icon.svg"), "<svg>modified</svg>").unwrap();
+        assert!(
+            persisted.verify_cached_registry_source_identities(&root).is_err(),
+            "non-.nula assets must also be part of the registry integrity digest"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn registry_integrity_missing_identity_fails_closed() {
+        let root = std::env::temp_dir().join(format!(
+            "nula_registry_identity_absent_{}", std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let registry_dir = root.join(".nula/registry/util-0.1.0");
+        std::fs::create_dir_all(&registry_dir).unwrap();
+        std::fs::write(
+            registry_dir.join("Nulang.toml"),
+            "[package]\nname = \"util\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let mut legacy_lock = Lockfile::new();
+        legacy_lock.package.push(LockedPackage {
+            name: "util".to_string(),
+            version: "0.1.0".to_string(),
+            source: "reg+https://registry.test".to_string(),
+            content_hash: String::new(),
+            commit: String::new(),
+        });
+        assert!(
+            legacy_lock.verify_cached_registry_source_identities(&root).is_err(),
+            "a legacy registry lockfile without an identity must not be trusted offline"
+        );
+        assert!(registry_dir.join("Nulang.toml").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::package::lockfile::{LockedPackage, Lockfile};
+use crate::package::lockfile::{registry_cache_dir, LockedPackage, Lockfile};
 use crate::package::manifest::{Dependency, DependencyDetail, Manifest, MANIFEST_FILE};
 use crate::types::{NuError, NuResult, Span};
 
@@ -183,6 +183,9 @@ pub fn resolve_offline(
     manifest: &Manifest,
     lockfile: &Lockfile,
 ) -> NuResult<Resolution> {
+    // Validate each cached registry pin before traversing any dependency graph.
+    // Nothing in this check fetches, extracts, or repairs source code.
+    lockfile.verify_cached_registry_source_identities(root_dir)?;
     let resolution = resolve_with_lock(root_dir, manifest, Some(lockfile.clone()))?;
     if resolution.to_lockfile().package != lockfile.package {
         return Err(NuError::PackageError {
@@ -328,17 +331,12 @@ impl Resolver {
     ) -> NuResult<()> {
         let (dep_dir, source) = match dep {
             Dependency::Version(req) => {
-                if self.offline_lock.is_some() {
-                    return Err(NuError::PackageError {
-                        msg: format!(
-                            "offline registry dependency '{}' is unsupported until cached artifact integrity is verified",
-                            dep_name
-                        ),
-                        span: Span::default(),
-                    });
-                }
                 let registry_url = self.resolve_dependency_registry(parent_dir)?;
-                let (dir, _ver) = self.fetch_registry(dep_name, req, &registry_url)?;
+                let (dir, _ver) = if let Some(lockfile) = &self.offline_lock {
+                    self.fetch_registry_offline(dep_name, req, &registry_url, lockfile)?
+                } else {
+                    self.fetch_registry(dep_name, req, &registry_url)?
+                };
                 (dir, PackageSource::Registry(registry_url))
             }
             Dependency::Detailed(detail) => {
@@ -668,6 +666,52 @@ impl Resolver {
         })
     }
 
+    /// Resolve an already-verified registry cache at the exact lockfile pin.
+    /// The full cached tree was checked by resolve_offline before traversal;
+    /// this method only selects a matching package without a remote request.
+    fn fetch_registry_offline(
+        &self,
+        dep_name: &str,
+        requirement: &str,
+        registry_url: &str,
+        lockfile: &Lockfile,
+    ) -> NuResult<(PathBuf, String)> {
+        let source = format!("reg+{}", registry_url);
+        let matches = lockfile
+            .package
+            .iter()
+            .filter(|package| package.name == dep_name && package.source == source)
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err(NuError::PackageError {
+                msg: format!(
+                    "offline registry dependency '{}' requires one exact package pin from {} in Nulang.lock",
+                    dep_name, registry_url
+                ),
+                span: Span::default(),
+            });
+        }
+        let pinned = matches[0];
+        if !version_satisfies(requirement, &pinned.version)? {
+            return Err(NuError::PackageError {
+                msg: format!(
+                    "offline registry dependency '{}' requires version {} but lockfile pins {}",
+                    dep_name, requirement, pinned.version
+                ),
+                span: Span::default(),
+            });
+        }
+        let cached = registry_cache_dir(&self.root_dir, dep_name, &pinned.version)?;
+        let path = std::fs::canonicalize(&cached).map_err(|e| NuError::PackageError {
+            msg: format!(
+                "offline registry cache missing for '{}' {} at {}: {}",
+                dep_name, pinned.version, cached.display(), e
+            ),
+            span: Span::default(),
+        })?;
+        Ok((path, pinned.version.clone()))
+    }
+
     /// Fetch a package from the registry, extract it to
     /// `<root>/.nula/registry/<name>-<version>/`, and return its directory.
     fn fetch_registry(
@@ -922,11 +966,90 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn offline_registry_fixture(tag: &str) -> (PathBuf, PathBuf, Manifest, Lockfile) {
+        let dir = fresh_dir(tag);
+        let app = dir.join("app");
+        write_manifest(&app, "app", "1.0.0", "util = \"0.1.0\"\n");
+        std::fs::write(
+            app.join(MANIFEST_FILE),
+            "[package]\nname = \"app\"\nversion = \"1.0.0\"\nregistry = \"https://registry.test\"\n\n[dependencies]\nutil = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let cached = app.join(".nula/registry/util-0.1.0");
+        std::fs::create_dir_all(&cached).unwrap();
+        write_manifest(&cached, "util", "0.1.0", "");
+        std::fs::write(cached.join("module.nula"), "fn main() { 1 }").unwrap();
+        std::fs::write(cached.join("static.json"), "{\"ok\":true}").unwrap();
+
+        let mut lock = Lockfile::new();
+        lock.package.push(LockedPackage {
+            name: "util".to_string(),
+            version: "0.1.0".to_string(),
+            source: "reg+https://registry.test".to_string(),
+            content_hash: String::new(),
+            commit: String::new(),
+        });
+        lock.save(&app).unwrap();
+        (dir, app.clone(), Manifest::load(&app).unwrap(), Lockfile::load(&app).unwrap())
+    }
+
+    #[test]
+    fn registry_integrity_offline_uses_matching_pinned_cache_without_network() {
+        let (dir, app, manifest, lock) = offline_registry_fixture("registry_verified");
+        let expected_lock = lock.to_toml().unwrap();
+        let offline = resolve_offline(&app, &manifest, &lock)
+            .expect("a verified cached registry package should resolve offline");
+        assert_eq!(offline.to_lockfile().package, lock.package);
+        assert_eq!(Lockfile::load(&app).unwrap().to_toml().unwrap(), expected_lock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn registry_integrity_offline_rejects_tampering_without_repair() {
+        let (dir, app, manifest, lock) = offline_registry_fixture("registry_tamper");
+        let cached = app.join(".nula/registry/util-0.1.0");
+        let asset = cached.join("static.json");
+        std::fs::write(&asset, "{\"ok\":false}").unwrap();
+        let before = std::fs::read_to_string(&asset).unwrap();
+        assert!(
+            resolve_offline(&app, &manifest, &lock).is_err(),
+            "cached registry content changes must be detected before load"
+        );
+        assert_eq!(std::fs::read_to_string(&asset).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn registry_integrity_offline_rejects_missing_cache_or_changed_version() {
+        let (dir, app, manifest, lock) = offline_registry_fixture("registry_missing");
+        let cached = app.join(".nula/registry/util-0.1.0");
+        std::fs::remove_dir_all(&cached).unwrap();
+        assert!(
+            resolve_offline(&app, &manifest, &lock).is_err(),
+            "missing cache must not trigger network download"
+        );
+        assert!(!cached.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (dir, app, manifest, mut lock) = offline_registry_fixture("registry_wrong_pin");
+        lock.package[0].version = "0.2.0".to_string();
+        assert!(
+            resolve_offline(&app, &manifest, &lock).is_err(),
+            "a stale version pin cannot select some other version from cache"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn offline_registry_dependency_fails_closed_before_network() {
         let dir = fresh_dir("offline_registry");
         let app = dir.join("app");
         write_manifest(&app, "app", "1.0.0", "util = \"0.1.0\"\n");
+        std::fs::write(
+            app.join(MANIFEST_FILE),
+            "[package]\nname = \"app\"\nversion = \"1.0.0\"\nregistry = \"https://registry.test\"\n\n[dependencies]\nutil = \"0.1.0\"\n",
+        )
+        .unwrap();
         let manifest = Manifest::load(&app).unwrap();
         let lock = Lockfile::new();
         let error = resolve_offline(&app, &manifest, &lock)
