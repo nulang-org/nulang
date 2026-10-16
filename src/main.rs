@@ -1274,6 +1274,7 @@ fn validate_node_security_mode(
     has_key: bool,
     has_ca: bool,
     bind_addr: std::net::SocketAddr,
+    seed_addr: Option<std::net::SocketAddr>,
 ) -> Result<(), &'static str> {
     if plaintext {
         if has_cert || has_key || has_ca {
@@ -1281,6 +1282,9 @@ fn validate_node_security_mode(
         }
         if !bind_addr.ip().is_loopback() {
             return Err("--plaintext is only permitted on loopback addresses");
+        }
+        if seed_addr.is_some_and(|seed| !seed.ip().is_loopback()) {
+            return Err("--plaintext cannot connect to a non-loopback seed address");
         }
         return Ok(());
     }
@@ -1389,12 +1393,24 @@ fn run_node_cmd(args: &[String]) -> NuResult<()> {
             span: Span::default(),
         })?;
 
+    let seed_socket = seed_addr
+        .as_deref()
+        .map(|seed| {
+            seed.parse::<std::net::SocketAddr>()
+                .map_err(|e| NuError::RuntimeError {
+                    msg: format!("invalid seed address: {e}"),
+                    span: Span::default(),
+                })
+        })
+        .transpose()?;
+
     validate_node_security_mode(
         plaintext,
         tls_cert.is_some(),
         tls_key.is_some(),
         tls_ca.is_some(),
         bind_addr,
+        seed_socket,
     )
     .map_err(|msg| NuError::RuntimeError {
         msg: msg.to_string(),
@@ -1444,12 +1460,7 @@ fn run_node_cmd(args: &[String]) -> NuResult<()> {
         });
     }
 
-    if let Some(seed) = seed_addr {
-        let seed_socket: std::net::SocketAddr =
-            seed.parse().map_err(|e| NuError::RuntimeError {
-                msg: format!("invalid seed address: {e}"),
-                span: Span::default(),
-            })?;
+    if let Some(seed_socket) = seed_socket {
         runtime.join_cluster(seed_socket);
     }
 
@@ -2940,9 +2951,9 @@ mod tests {
     #[test]
     fn test_node_rejects_missing_or_partial_tls_material() {
         let loopback = "127.0.0.1:9000".parse().unwrap();
-        assert!(validate_node_security_mode(false, false, false, false, loopback).is_err());
-        assert!(validate_node_security_mode(false, true, true, false, loopback).is_err());
-        assert!(validate_node_security_mode(false, true, true, true, loopback).is_ok());
+        assert!(validate_node_security_mode(false, false, false, false, loopback, None).is_err());
+        assert!(validate_node_security_mode(false, true, true, false, loopback, None).is_err());
+        assert!(validate_node_security_mode(false, true, true, true, loopback, None).is_ok());
     }
 
     #[cfg(feature = "tcp")]
@@ -2950,9 +2961,9 @@ mod tests {
     fn test_node_plaintext_requires_explicit_loopback_only_opt_in() {
         let loopback = "127.0.0.1:9000".parse().unwrap();
         let wildcard = "0.0.0.0:9000".parse().unwrap();
-        assert!(validate_node_security_mode(true, false, false, false, loopback).is_ok());
-        assert!(validate_node_security_mode(true, false, false, false, wildcard).is_err());
-        assert!(validate_node_security_mode(true, true, true, true, loopback).is_err());
+        assert!(validate_node_security_mode(true, false, false, false, loopback, None).is_ok());
+        assert!(validate_node_security_mode(true, false, false, false, wildcard, None).is_err());
+        assert!(validate_node_security_mode(true, true, true, true, loopback, None).is_err());
     }
 
     #[cfg(feature = "tcp")]
