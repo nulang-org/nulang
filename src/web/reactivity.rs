@@ -326,12 +326,20 @@ fn scan_expr(
                 scan_expr(arg, path, in_html, signals, graph, checker);
             }
         }
-        Expr::Let { name, value, body, .. } => {
+        Expr::Let {
+            name, value, body, ..
+        } => {
             scan_expr(value, path, in_html, signals, graph, checker);
             let visible = without_bindings(signals, std::iter::once(name.as_str()));
             scan_expr(body, path, in_html, &visible, graph, checker);
         }
-        Expr::LetRec { name, params, value, body, .. } => {
+        Expr::LetRec {
+            name,
+            params,
+            value,
+            body,
+            ..
+        } => {
             let visible = without_bindings(signals, std::iter::once(name.as_str()));
             let recursive = without_bindings(&visible, params.iter().map(|p| p.name.as_str()));
             scan_expr(value, path, in_html, &recursive, graph, checker);
@@ -396,7 +404,12 @@ fn scan_expr(
             scan_expr(left, path, in_html, signals, graph, checker);
             scan_expr(right, path, in_html, signals, graph, checker);
         }
-        Expr::For { var, iterable, body, .. } => {
+        Expr::For {
+            var,
+            iterable,
+            body,
+            ..
+        } => {
             scan_expr(iterable, path, in_html, signals, graph, checker);
             let visible = without_bindings(signals, std::iter::once(var.as_str()));
             scan_expr(body, path, in_html, &visible, graph, checker);
@@ -705,12 +718,20 @@ fn rewrite_expr(
                 rewrite_expr(arg, in_html, signals, checker);
             }
         }
-        Expr::Let { name, value, body, .. } => {
+        Expr::Let {
+            name, value, body, ..
+        } => {
             rewrite_expr(value, in_html, signals, checker);
             let visible = without_bindings(signals, std::iter::once(name.as_str()));
             rewrite_expr(body, in_html, &visible, checker);
         }
-        Expr::LetRec { name, params, value, body, .. } => {
+        Expr::LetRec {
+            name,
+            params,
+            value,
+            body,
+            ..
+        } => {
             let visible = without_bindings(signals, std::iter::once(name.as_str()));
             let recursive = without_bindings(&visible, params.iter().map(|p| p.name.as_str()));
             rewrite_expr(value, in_html, &recursive, checker);
@@ -775,7 +796,12 @@ fn rewrite_expr(
             rewrite_expr(left, in_html, signals, checker);
             rewrite_expr(right, in_html, signals, checker);
         }
-        Expr::For { var, iterable, body, .. } => {
+        Expr::For {
+            var,
+            iterable,
+            body,
+            ..
+        } => {
             rewrite_expr(iterable, in_html, signals, checker);
             let visible = without_bindings(signals, std::iter::once(var.as_str()));
             rewrite_expr(body, in_html, &visible, checker);
