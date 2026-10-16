@@ -8172,7 +8172,7 @@ mod vm_tests {
         assert!(exact >= 11_000, "interpreter oracle should meter every dispatch");
         assert!(
             observed >= 1_000 && observed <= exact,
-            "compiled-region work estimate ({observed}) must include warm-up              and not exceed the interpreter reference ({exact}) for this loop"
+            "compiled-region work estimate ({observed}) must include warm-up and not exceed the interpreter reference ({exact}) for this loop"
         );
     }
 
@@ -8788,7 +8788,7 @@ mod vm_tests {
         assert!(exact >= 11_000, "interpreter oracle should meter every dispatch");
         assert!(
             observed >= 1_000 && observed <= exact,
-            "compiled-region work estimate ({observed}) must include warm-up              and not exceed the interpreter reference ({exact}) for this loop"
+            "compiled-region work estimate ({observed}) must include warm-up and not exceed the interpreter reference ({exact}) for this loop"
         );
     }
 
