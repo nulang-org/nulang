@@ -156,7 +156,10 @@ pub fn bind_request_arguments(
         });
     }
 
-    let mut slots = vec![None; handler_param_count];
+    // Verify compiler/runtime invariants before inspecting request-controlled
+    // data. An invalid binding plan must never be masked by a missing or
+    // malformed request value and misreported as a client-side HTTP 400.
+    let mut occupied = vec![false; handler_param_count];
     for binding in bindings {
         if binding.handler_index >= handler_param_count {
             return Err(error(
@@ -168,7 +171,7 @@ pub fn bind_request_arguments(
                 ),
             ));
         }
-        if slots[binding.handler_index].is_some() {
+        if occupied[binding.handler_index] {
             return Err(error(
                 binding,
                 RequestDecodeErrorKind::DuplicateHandlerSlot,
@@ -178,7 +181,22 @@ pub fn bind_request_arguments(
                 ),
             ));
         }
+        occupied[binding.handler_index] = true;
+    }
+    if let Some(index) = occupied.iter().position(|bound| !bound) {
+        return Err(RequestDecodeError {
+            kind: RequestDecodeErrorKind::IncompleteBindingPlan,
+            source: None,
+            source_name: None,
+            handler_param: None,
+            handler_index: Some(index),
+            expected_type: None,
+            message: format!("handler parameter slot {index} has no request binding"),
+        });
+    }
 
+    let mut slots = vec![None; handler_param_count];
+    for binding in bindings {
         let raw = lookup(binding, values).ok_or_else(|| {
             error(
                 binding,
