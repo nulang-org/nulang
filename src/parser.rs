@@ -4399,20 +4399,50 @@ impl Parser {
 
     fn expect_html_ident(&mut self, msg: &str) -> NuResult<String> {
         let span = self.current_span();
-        match self.peek_kind().clone() {
+        let mut name = match self.peek_kind().clone() {
             TokenKind::Ident(s) | TokenKind::UpperIdent(s) => {
                 self.advance();
-                Ok(s)
+                s
             }
             other if Self::is_keyword_token(&other) => {
                 self.advance();
-                Ok(other.to_string())
+                other.to_string()
             }
-            other => Err(NuError::parse_error(
-                format!("Expected {}, found {}", msg, other),
-                span,
-            )),
+            other => {
+                return Err(NuError::parse_error(
+                    format!("Expected {}, found {}", msg, other),
+                    span,
+                ));
+            }
+        };
+        // HTML tag and attribute names may contain hyphens (custom-element,
+        // aria-label, data-state). Keep this contextual: Nulang identifiers and
+        // arithmetic expressions still tokenize '-' as subtraction.
+        while self.consume_if(&TokenKind::Minus) {
+            let part = match self.peek_kind().clone() {
+                TokenKind::Ident(s) | TokenKind::UpperIdent(s) => {
+                    self.advance();
+                    s
+                }
+                TokenKind::IntLit(n) if n >= 0 => {
+                    self.advance();
+                    n.to_string()
+                }
+                other if Self::is_keyword_token(&other) => {
+                    self.advance();
+                    other.to_string()
+                }
+                other => {
+                    return Err(NuError::parse_error(
+                        format!("Expected {} segment after '-', found {}", msg, other),
+                        self.current_span(),
+                    ));
+                }
+            };
+            name.push('-');
+            name.push_str(&part);
         }
+        Ok(name)
     }
 
     /// Parse a JSX/HTML element: `<tag attrs>children</tag>` or `<tag attrs />`.
@@ -6930,6 +6960,26 @@ mod tests {
         let tokens = lexer.lex()?;
         let mut parser = Parser::new(tokens);
         parser.parse_expr()
+    }
+
+    #[test]
+    fn test_html_attribute_and_custom_element_hyphens() {
+        let parsed = parse_expr(
+            "<custom-widget aria-label={label} data-state={label} class={label}></custom-widget>",
+        )
+        .expect("hyphenated HTML names should parse");
+        let ast = format!("{parsed:?}");
+        for name in ["custom-widget", "aria-label", "data-state", "class"] {
+            assert!(ast.contains(name), "missing {name} in {ast}");
+        }
+    }
+
+    #[test]
+    fn test_html_hyphen_parsing_preserves_expression_subtraction() {
+        let parsed = parse_expr("<span title={left - right}>ok</span>")
+            .expect("minus inside braces must remain a binary operator");
+        let ast = format!("{parsed:?}");
+        assert!(ast.contains("Binary"), "missing subtraction expression: {ast}");
     }
 
     #[test]
