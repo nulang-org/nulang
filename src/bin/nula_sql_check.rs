@@ -430,6 +430,19 @@ mod tests {
     }
 
     #[test]
+    fn rejects_untyped_nil_bind_instead_of_claiming_postgres_null_compatibility() {
+        // The existing PostgreSQL DB effect does not marshal nil into a typed
+        // SQL NULL; it currently takes the fallback string-binding path.
+        let calls = extract_queries(
+            r#"fn f() { perform DB.query("SELECT $1::int8", nil) }"#,
+        )
+        .unwrap();
+        assert!(verify_queries(&calls, &cache_for("SELECT $1::int8", vec![20]))
+            .unwrap_err()
+            .contains("incompatible"));
+    }
+
+    #[test]
     fn rejects_old_and_unreferenced_cache_entries() {
         let calls = extract_queries(r#"fn f() { perform DB.query("SELECT 1") }"#).unwrap();
         let mut cache = cache_for("SELECT 1", vec![]);
