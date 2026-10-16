@@ -98,7 +98,10 @@ pub fn check_total_js_budget(
 fn invalid_js_asset(path: &Path) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidData,
-        format!("invalid or symlinked JavaScript asset path: {}", path.display()),
+        format!(
+            "invalid or symlinked JavaScript asset path: {}",
+            path.display()
+        ),
     )
 }
 
