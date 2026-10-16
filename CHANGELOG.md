@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Timer deadline heap-head fast path — 2026-10-16
+- **`TimerWheel::next_deadline()` now returns the live heap head directly instead of scanning all pending timers.** The active-head lookup becomes O(1); lazily cancelled heads retain the previous read-only O(n) fallback, preserving cancellation, firing, and scheduling behavior.
+- **Added deterministic deadline/cancellation tests and a same-host matched-fixture Criterion A/B workflow.** Performance gains remain unclaimed until exact-head Rust checks and paired measurements complete.
+
 ### Web static-root containment — 2026-10-15
 - **Experimental Web static file serving refuses parent traversal and symlinks escaping configured roots.** Canonical candidate paths must remain inside their canonicalized static or output root, and normal in-root files remain serveable.
 - **A filesystem regression verifies parent and symlink escape rejection.** This is a clean current-main successor to draft #1676; it does not change SSE or claim protection from malicious concurrent mutation of a trusted static root.
