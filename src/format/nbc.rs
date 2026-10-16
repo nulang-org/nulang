@@ -451,6 +451,36 @@ mod tests {
     }
 
     #[test]
+    fn decode_rejects_unexpected_trailing_bytes() {
+        let bytes = sample_module().to_nbc(None).expect("encode fixture");
+        let mut appended = bytes.clone();
+        appended.extend_from_slice(b"junk");
+
+        // The .nbc format declares exactly one instruction stream and one
+        // metadata body. Appending data must not create an alias for the same
+        // artifact, even when it stays within the configured admission budget.
+        let limits = NbcDecodeLimits {
+            max_artifact_bytes: appended.len(),
+            max_instructions: 1_024,
+            max_metadata_bytes: appended.len(),
+        };
+        assert!(matches!(
+            CodeModule::from_nbc(&appended),
+            Err(FormatError::LengthMismatch { .. })
+        ));
+        assert!(matches!(
+            CodeModule::from_nbc_with_limits(&appended, limits),
+            Err(FormatError::LengthMismatch { .. })
+        ));
+        assert_eq!(
+            CodeModule::from_nbc_with_limits(&bytes, limits)
+                .expect("canonical artifact remains valid")
+                .module,
+            sample_module()
+        );
+    }
+
+    #[test]
     fn bounded_decode_rejects_forged_instruction_count_before_allocating() {
         let mut bytes = sample_module().to_nbc(None).expect("encode fixture");
         bytes[44..48].copy_from_slice(&u32::MAX.to_be_bytes());
