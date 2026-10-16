@@ -48,8 +48,17 @@ jobs:
         run: cargo test --locked --no-default-features --features ureq actor_http_request_authorizes_url_not_method_and_rejects_other_ports
       - name: Verify bounded response-header metadata
         run: cargo test --locked --no-default-features --features ureq response_header_limit_tests
-      - name: Check package compiles under Nulang VM
-        run: cargo run --locked --no-default-features --features ureq --bin nulang -- --check packages/http-client/src/lib.nula
+      - name: Ensure outbound HTTP requires an explicit net capability
+        shell: bash
+        run: |
+          set -euo pipefail
+          if cargo run --locked --no-default-features --features ureq --bin nulang -- --check packages/http-client/src/lib.nula > /tmp/http-no-net.log 2>&1; then
+            echo "Unexpected success without network capability" >&2
+            exit 1
+          fi
+          grep -F "requires resource capability 'net'" /tmp/http-no-net.log
+      - name: Check HTTP package with explicit net authority
+        run: cargo run --locked --no-default-features --features ureq --bin nulang -- --with net --check packages/http-client/src/lib.nula
       - name: Execute JSON exponent-sign regression
         shell: bash
         run: |
