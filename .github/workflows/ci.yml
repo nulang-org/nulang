@@ -57,6 +57,9 @@ jobs:
       - name: Smoke test Nulang Web DOM region replacement
         run: node scripts/tests/web_region_replacement.mjs
 
+      - name: Smoke test Nulang Web conditional regions
+        run: node scripts/tests/web_conditional_regions.mjs
+
       - name: Install docs dependencies
         run: |
           cd docs
