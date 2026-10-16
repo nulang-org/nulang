@@ -822,6 +822,7 @@ pub(crate) fn append_saga_compensation_started(
     rt: &mut Runtime,
     actor_id: u64,
     step_name: &str,
+    operation_id: &str,
 ) -> std::io::Result<()> {
     let seq = next_sequence(rt, actor_id);
     commit_workflow_event(
@@ -830,6 +831,33 @@ pub(crate) fn append_saga_compensation_started(
         WorkflowEvent::SagaCompensationStarted {
             sequence: seq,
             step_name: step_name.to_string(),
+            operation_id: Some(operation_id.to_string()),
+        },
+        true,
+    )
+}
+
+/// Record provider-verified compensation completion after a caller-supplied
+/// trusted adapter has established external proof. Unlike a local successful
+/// compensation body, this event retains the receipt provenance.
+pub(crate) fn append_saga_compensation_verified(
+    rt: &mut Runtime,
+    actor_id: u64,
+    step_name: &str,
+    operation_id: &str,
+    provider: &str,
+    receipt_id: &str,
+) -> std::io::Result<()> {
+    let seq = next_sequence(rt, actor_id);
+    commit_workflow_event(
+        rt,
+        actor_id,
+        WorkflowEvent::SagaCompensationVerified {
+            sequence: seq,
+            step_name: step_name.to_string(),
+            operation_id: operation_id.to_string(),
+            provider: provider.to_string(),
+            receipt_id: receipt_id.to_string(),
         },
         true,
     )
