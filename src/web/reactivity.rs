@@ -886,9 +886,10 @@ pub fn generate_client_runtime() -> String {
           runClientAction(handler);
         }
       };
-      el.addEventListener('click', listener);
       if (el.tagName === 'FORM') {
         el.addEventListener('submit', listener);
+      } else {
+        el.addEventListener('click', listener);
       }
     });
   }
