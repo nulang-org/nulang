@@ -1213,6 +1213,21 @@ mod tests {
             "valid read requests must reach normal routing"
         );
 
+        let rebound_sse = format!(
+            "GET /__nulang/sse/room HTTP/1.1\\r\\nHost: attacker.example:{}\\r\\n\\r\\n",
+            server.port
+        );
+        assert!(
+            send(server.port, &rebound_sse).starts_with("HTTP/1.1 403 Forbidden"),
+            "SSE must reject an untrusted Host before subscribing"
+        );
+
+        let missing_host = "GET / HTTP/1.1\\r\\nConnection: close\\r\\n\\r\\n";
+        assert!(
+            send(server.port, missing_host).starts_with("HTTP/1.1 403 Forbidden"),
+            "HTTP reads without Host must fail closed"
+        );
+
         let foreign = format!(
             "POST /mutation HTTP/1.1\r\nHost: {host}\r\nOrigin: https://attacker.example\r\nContent-Length: 0\r\n\r\n"
         );
