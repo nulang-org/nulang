@@ -303,7 +303,23 @@ pub enum WorkflowEvent {
     /// Durable intent recorded before executing a compensation. If no later
     /// SagaCompensated event exists, its external outcome is UNKNOWN and must
     /// not be silently dispatched again during recovery.
-    SagaCompensationStarted { sequence: u64, step_name: String },
+    SagaCompensationStarted {
+        sequence: u64,
+        step_name: String,
+        /// Provider idempotency key derived from workflow and step history.
+        /// Legacy intent records omit this and cannot be auto-reconciled.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
+    },
+    /// Provider-attested external compensation completion, accepted only after
+    /// a trusted adapter has matched the provider receipt to the operation ID.
+    SagaCompensationVerified {
+        sequence: u64,
+        step_name: String,
+        operation_id: String,
+        provider: String,
+        receipt_id: String,
+    },
     /// A saga step was compensated after failure.
     SagaCompensated { sequence: u64, step_name: String },
     /// A branch of a synthetic parallel step completed.
@@ -349,6 +365,7 @@ impl WorkflowEvent {
             | WorkflowEvent::TimerFired { sequence, .. }
             | WorkflowEvent::SignalReceived { sequence, .. }
             | WorkflowEvent::SagaCompensationStarted { sequence, .. }
+            | WorkflowEvent::SagaCompensationVerified { sequence, .. }
             | WorkflowEvent::SagaCompensated { sequence, .. }
             | WorkflowEvent::ParallelBranchCompleted { sequence, .. }
             | WorkflowEvent::StepFailed { sequence, .. }
