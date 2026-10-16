@@ -72,3 +72,19 @@ test('command line tool writes output to explicit file', async () => {
   const code = await readFile(output, 'utf8');
   assert.match(code, /export class NulangClient/);
 });
+
+test('rejects paths that could escape the configured origin or carry unsafe URL syntax', () => {
+  for (const badPath of ['//attacker.example/steal', '/\\attacker.example/steal', '/items?token=secret', '/items#fragment']) {
+    assert.throws(() => generateClient({ version: 1, routes: [
+      { method: 'GET', path: badPath, handler: 'fetch_item', bindings: [] },
+    ] }), /invalid|unsafe|path/i, badPath);
+  }
+});
+
+test('rejects operation names conflicting with generated client internals', () => {
+  for (const name of ['baseUrl', 'transport', 'constructor', 'then']) {
+    assert.throws(() => generateClient({ version: 1, routes: [
+      { method: 'GET', path: '/ping', handler: name, bindings: [] },
+    ] }), /unsupported|reserved|conflict/i, name);
+  }
+});
