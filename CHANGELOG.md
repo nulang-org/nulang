@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Experimental browser graphics interop pilot — 2026-10-16
+- **Nulang's client signal bridge now supports cancellable browser-side subscriptions.** Subscribers observe local signal updates without a server action or actor message; unsubscribing is idempotent and listener exceptions do not abort other notifications.
+- **An opt-in WebGL 2 points example falls back to Canvas 2D.** The DOM continues handling controls and accessibility, GPU resources are released on disposal, context restoration reinitializes buffers, and redraws are frame-coalesced. This is an example adapter, not a new core language or graphics API.
+- **Node adapter tests and the Nulang example build are added to CI.** Real-GPU/device benchmarking and end-to-end runtime verification remain required before any claim of production graphics readiness.
+
 ### Web static-root containment — 2026-10-15
 - **Experimental Web static file serving refuses parent traversal and symlinks escaping configured roots.** Canonical candidate paths must remain inside their canonicalized static or output root, and normal in-root files remain serveable.
 - **A filesystem regression verifies parent and symlink escape rejection.** This is a clean current-main successor to draft #1676; it does not change SSE or claim protection from malicious concurrent mutation of a trusted static root.
