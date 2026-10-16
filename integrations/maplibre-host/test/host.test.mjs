@@ -194,3 +194,26 @@ test('reads typed bounds and zoom from the retained map', () => {
   host.destroy();
   assert.throws(() => host.viewport(), /destroyed/);
 });
+
+test('style.load installs retained layers while source tiles remain pending', () => {
+  const fake = fixture({ loaded: false });
+  const host = createMapHost({ maplibregl: fake.maplibregl, container: {}, style: 'sample-style' });
+  host.dispatch({ type: 'source.upsert', id: 'sites', source: { type: 'geojson', data: point } });
+  host.dispatch({ type: 'layer.add', layer: { id: 'pins', type: 'circle', source: 'sites' } });
+  fake.maps[0].emit('style.load');
+  assert.ok(fake.maps[0].sources.has('sites'), 'source should be installed at style.load');
+  assert.ok(fake.maps[0].layers.has('pins'), 'layer should be installed before tile completion');
+  host.destroy();
+});
+
+test('adding a new source does not block a subsequent layer while its data is pending', () => {
+  const fake = fixture({ loaded: true });
+  const host = createMapHost({ maplibregl: fake.maplibregl, container: {}, style: 'sample-style' });
+  const map = fake.maps[0];
+  const originalAddSource = map.addSource.bind(map);
+  map.addSource = (id, source) => { originalAddSource(id, source); map.loaded = false; };
+  host.dispatch({ type: 'source.upsert', id: 'sites', source: { type: 'geojson', data: point } });
+  host.dispatch({ type: 'layer.add', layer: { id: 'pins', type: 'circle', source: 'sites' } });
+  assert.ok(map.layers.has('pins'), 'layer must be installed when existing style is initialized');
+  host.destroy();
+});
