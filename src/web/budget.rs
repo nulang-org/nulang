@@ -91,6 +91,65 @@ mod tests {
         assert!(check_initial_js_budget(&dir, Some(200)).is_ok());
     }
 
+
+    #[test]
+    fn total_js_budget_rejects_combined_split_bundles() {
+        let dir = std::env::temp_dir().join("nulang_budget_total_split");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        std::fs::write(dir.join("app.client.js"), "x".repeat(40)).unwrap();
+        std::fs::write(dir.join("assets/first.js"), "x".repeat(90)).unwrap();
+        std::fs::write(dir.join("assets/second.js"), "x".repeat(90)).unwrap();
+
+        // The legacy per-file budget deliberately keeps its existing semantics.
+        assert!(check_initial_js_budget(&dir, Some(200)).is_ok());
+        let violation = check_total_js_budget(&dir, Some(200))
+            .unwrap()
+            .expect("combined JavaScript must exceed 200 bytes");
+        assert_eq!(violation.size, 220);
+        assert_eq!(violation.budget, 200);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn total_js_budget_counts_nested_modules_but_not_stylesheets() {
+        let dir = std::env::temp_dir().join("nulang_budget_total_nested");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("assets/chunks")).unwrap();
+        std::fs::write(dir.join("app.client.js"), "x".repeat(10)).unwrap();
+        std::fs::write(dir.join("assets/main.js"), "x".repeat(50)).unwrap();
+        std::fs::write(dir.join("assets/chunks/lazy.mjs"), "x".repeat(90)).unwrap();
+        std::fs::write(dir.join("assets/chunks/styles.css"), "x".repeat(999)).unwrap();
+
+        assert!(check_total_js_budget(&dir, Some(150)).unwrap().is_none());
+        assert_eq!(
+            check_total_js_budget(&dir, Some(149))
+                .unwrap()
+                .expect("must count nested .mjs")
+                .size,
+            150
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn total_js_budget_does_not_silently_ignore_unreadable_asset_roots() {
+        let dir = std::env::temp_dir().join("nulang_budget_total_bad_assets");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("assets"), "not a directory").unwrap();
+
+        let err = check_total_js_budget(&dir, Some(100)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn total_js_budget_opt_out_does_not_access_missing_output() {
+        let dir = std::env::temp_dir().join("nulang_budget_total_unconfigured");
+        assert!(check_total_js_budget(&dir, None).unwrap().is_none());
+    }
+
     #[test]
     fn test_over_budget_fails() {
         let dir = std::env::temp_dir().join("nulang_budget_fail");
