@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -1063,31 +1063,12 @@ impl WebDevServer {
     ) -> HttpResponse {
         let trimmed = path.trim_start_matches('/');
         let file_path = static_dir
-            .map(|d| {
-                let p = d.join(trimmed);
-                if trimmed.is_empty() || p.is_dir() {
-                    d.join("index.html")
-                } else {
-                    p
-                }
-            })
-            .filter(|p| p.is_file())
-            .or_else(|| {
-                output_dir
-                    .map(|d| {
-                        let p = d.join(trimmed);
-                        if trimmed.is_empty() || p.is_dir() {
-                            d.join("index.html")
-                        } else {
-                            p
-                        }
-                    })
-                    .filter(|p| p.is_file())
-            });
+            .and_then(|root| contained_static_file(root, trimmed))
+            .or_else(|| output_dir.and_then(|root| contained_static_file(root, trimmed)));
 
-        if let Some(p) = file_path {
-            if let Ok(data) = std::fs::read(&p) {
-                let content_type = guess_content_type(&p);
+        if let Some((canonical, requested)) = file_path {
+            if let Ok(data) = std::fs::read(&canonical) {
+                let content_type = guess_content_type(&requested);
                 return HttpResponse {
                     status: 200,
                     headers: vec![("Content-Type".into(), content_type.into())],
@@ -1100,6 +1081,32 @@ impl WebDevServer {
             headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
             body: b"Not found".to_vec(),
         }
+    }
+}
+
+/// Resolve files only inside the configured static root. Resolve symlinks
+/// before checking containment; do not trust the URL's path components.
+/// Does not protect a concurrently mutated, hostile filesystem root.
+fn contained_static_file(root: &Path, relative: &str) -> Option<(PathBuf, PathBuf)> {
+    if !Path::new(relative)
+        .components()
+        .all(|part| matches!(part, Component::Normal(_)))
+    {
+        return None;
+    }
+
+    let root = root.canonicalize().ok()?;
+    let joined = root.join(relative);
+    let candidate = if relative.is_empty() || joined.is_dir() {
+        root.join("index.html")
+    } else {
+        joined
+    };
+    let canonical = candidate.canonicalize().ok()?;
+    if canonical.starts_with(&root) && canonical.is_file() {
+        Some((canonical, candidate))
+    } else {
+        None
     }
 }
 
@@ -1177,6 +1184,55 @@ mod tests {
         FixedChunkReader {
             remaining: input,
             max_chunk,
+        }
+    }
+
+    // Fail closed on URL parent components and symlinks outside static roots.
+    #[test]
+    fn web_static_file_fallback_cannot_read_parent_directory() {
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fixture = Cleanup(std::env::temp_dir().join(format!(
+            "nulang-static-containment-{}-{suffix}",
+            std::process::id()
+        )));
+        let public = fixture.0.join("public");
+        std::fs::create_dir_all(&public).unwrap();
+        std::fs::write(public.join("hello.txt"), b"public").unwrap();
+        std::fs::write(fixture.0.join("private.txt"), b"private").unwrap();
+
+        let allowed = WebDevServer::serve_static(Some(&public), None, "/hello.txt");
+        assert_eq!(allowed.status, 200);
+        assert_eq!(allowed.body, b"public");
+
+        let escaped = WebDevServer::serve_static(Some(&public), None, "/../private.txt");
+        assert_eq!(escaped.status, 404, "parent traversal must fail closed");
+        assert!(!escaped.body.windows(7).any(|part| part == b"private"));
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("../private.txt", public.join("shortcut.txt")).unwrap();
+            let escaped = WebDevServer::serve_static(Some(&public), None, "/shortcut.txt");
+            assert_eq!(escaped.status, 404, "symlink outside root must fail closed");
+
+            // A public extension can differ from a safe in-root symlink target.
+            std::fs::write(public.join("bundle-hash"), b"console.log('ok')").unwrap();
+            std::os::unix::fs::symlink("bundle-hash", public.join("app.js")).unwrap();
+            let script = WebDevServer::serve_static(Some(&public), None, "/app.js");
+            assert_eq!(script.status, 200);
+            assert_eq!(script.body, b"console.log('ok')");
+            assert!(script.headers.iter().any(|(name, value)| {
+                name == "Content-Type" && value == "application/javascript; charset=utf-8"
+            }));
         }
     }
 
