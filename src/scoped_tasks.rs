@@ -14,6 +14,28 @@
 //! This module is experimental and does not alter source language semantics.
 
 use std::collections::VecDeque;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
+/// Read-only cooperative cancellation signal shared by all children of a scope.
+///
+/// It is initially clear and becomes permanently set on the first scope
+/// cancellation. Executors must arrange for running children to check it at
+/// cancellation-safe points and acknowledge actual termination separately.
+/// Clones share the same flag; distinct scopes never share a flag.
+#[derive(Debug, Clone, Default)]
+pub struct CancellationToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancellationToken {
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
 
 /// Stable identity within a single parent scope, in submission order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -69,6 +91,7 @@ pub struct TaskScope<T, E> {
     slots: Vec<TaskSlot<T, E>>,
     in_flight: usize,
     cancellation: Option<CancellationCause>,
+    token: CancellationToken,
 }
 
 impl<T, E> TaskScope<T, E> {
@@ -83,6 +106,7 @@ impl<T, E> TaskScope<T, E> {
             slots: Vec::new(),
             in_flight: 0,
             cancellation: None,
+            token: CancellationToken::default(),
         })
     }
 
@@ -141,12 +165,19 @@ impl<T, E> TaskScope<T, E> {
             return;
         }
         self.cancellation = Some(cause);
+        self.token.cancelled.store(true, Ordering::Release);
         for slot in &mut self.slots {
             if matches!(slot, TaskSlot::Pending) {
                 *slot = TaskSlot::Terminal(TaskOutcome::Cancelled);
             }
         }
         self.pending.clear();
+    }
+
+    /// Obtain a cheap clone to pass into a child or executor-managed task.
+    /// This is a cooperative signal, not an operating-system interruption.
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.token.clone()
     }
 
     pub fn cancellation(&self) -> Option<&CancellationCause> {
