@@ -1,6 +1,8 @@
 /** Minimal structural interface for the MapLibre GL JS functions used by this host. */
 export interface MapLibreNamespace {
-  Map: new (options: Record<string, unknown>) => MapLibreMap;
+  // MapLibre's MapOptions is narrower than Record<string, unknown>.
+  // Keep this injected constructor permissive; MapCommand remains typed.
+  Map: new (options: any) => any;
 }
 export interface MapLibreMap {
   isStyleLoaded(): boolean;
