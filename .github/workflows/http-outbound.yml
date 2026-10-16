@@ -46,5 +46,20 @@ jobs:
         run: cargo test --locked --no-default-features --features ureq --test http_outbound_request
       - name: Verify exact actor authority grant
         run: cargo test --locked --no-default-features --features ureq actor_http_request_authorizes_url_not_method_and_rejects_other_ports
+      - name: Verify bounded response-header metadata
+        run: cargo test --locked --no-default-features --features ureq response_header_limit_tests
       - name: Check package compiles under Nulang VM
         run: cargo run --locked --no-default-features --features ureq --bin nulang -- --check packages/http-client/src/lib.nula
+      - name: Execute JSON exponent-sign regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run --locked --no-default-features --features ureq --bin nulang -- conformance/behavior/json_11_exponent_signs.nula > /tmp/json-exponents-output.txt
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          expected = json.loads(Path("conformance/behavior/json_11_exponent_signs.json").read_text())
+          actual = Path("/tmp/json-exponents-output.txt").read_text().strip()
+          if expected["exit_code"] != 0 or actual != expected["stdout"].strip():
+              raise SystemExit(f"JSON exponent conformance mismatch: expected {expected['stdout']!r}, got {actual!r}")
+          PY
