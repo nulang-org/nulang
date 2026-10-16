@@ -2566,6 +2566,9 @@ pub struct VM {
     ffi_sandbox: bool,
     /// Set of library paths allowed when `ffi_sandbox` is true.
     ffi_allowlist: std::collections::HashSet<String>,
+    /// Optional host-owned native registry. Standalone VMs retain the legacy
+    /// global registry unless the embedding host explicitly installs one.
+    ffi_registry: Option<std::sync::Arc<std::sync::Mutex<crate::ffi::native::FfiRegistry>>>,
     /// Name of the signal that caused the most recent workflow suspension.
     /// Filled by `SignalWait` and consumed by the runtime after `run`/`run_from`
     /// returns a suspend error.
@@ -2753,6 +2756,7 @@ impl VM {
             gossip_log: Vec::new(),
             ffi_sandbox: false,
             ffi_allowlist: std::collections::HashSet::new(),
+            ffi_registry: None,
             suspended_signal_name: None,
             suspended_receive_timeout: None,
             distributed_callbacks: None,
@@ -2934,6 +2938,18 @@ impl VM {
         let idx = self.current_frame_idx?;
         let f = self.frames.get(idx)?;
         self.modules.get(f.module_idx).and_then(|m| m.line_at(f.pc))
+    }
+
+    /// Supply a host-owned FFI registry instead of the process-global registry.
+    ///
+    /// This controls bytecode `FFICall` dispatch for this VM. Native AOT and
+    /// WASM import helpers have independent registry wiring and are not
+    /// covered by this setter.
+    pub fn set_ffi_registry(
+        &mut self,
+        registry: std::sync::Arc<std::sync::Mutex<crate::ffi::native::FfiRegistry>>,
+    ) {
+        self.ffi_registry = Some(registry);
     }
 
     /// Enable FFI sandboxing, restricting calls to the given library paths.
@@ -3834,8 +3850,11 @@ impl VM {
         let func = {
             // SAFETY: caller ensures the named library is a valid shared
             // library. Do not hold the lock across the native call.
-            let registry = FFI_REGISTRY
-                .get_or_init(|| std::sync::Mutex::new(crate::ffi::native::FfiRegistry::new()));
+            let registry = match self.ffi_registry.as_deref() {
+                Some(scoped) => scoped,
+                None => FFI_REGISTRY
+                    .get_or_init(|| std::sync::Mutex::new(crate::ffi::native::FfiRegistry::new())),
+            };
             let mut reg = registry.lock().map_err(|e| NuError::VMError {
                 msg: format!("FFI registry lock failed: {}", e),
                 span: Span::default(),

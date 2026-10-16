@@ -157,7 +157,29 @@ bool nulang_free_string(NulangRuntime *runtime, const char *ptr);
 /* -------------------------------------------------------------------------- */
 
 /**
- * Register a native C function so it can be called from Nulang.
+ * Register a native C callback for this embedding runtime only.
+ *
+ * The function pointer and its code must remain valid until runtime teardown.
+ * The signature types must match the pointed-to C function exactly.
+ * Use extern "__nulang_registered__" { ... } in Nulang code.
+ *
+ * Separate NulangRuntime instances have separate callback namespaces.
+ * Returns 0 on success, or -1 and nulang_last_error on failure.
+ */
+int nulang_runtime_register_native_function(NulangRuntime *runtime,
+                                            const char *name,
+                                            const void *ptr,
+                                            const NulangCType *params,
+                                            size_t param_count,
+                                            NulangCType ret);
+
+/**
+ * Legacy process-global registration for standalone VMs.
+ *
+ * Embedded NulangRuntime instances use their own registry and do not consult
+ * the process-global callbacks. Use nulang_runtime_register_native_function
+ * when embedding.
+ *
  *
  * Use `"__nulang_registered__"` as the library name in the Nulang `extern`
  * block when the function was registered this way. Returns 0 on success,

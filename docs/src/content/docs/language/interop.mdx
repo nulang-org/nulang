@@ -152,7 +152,9 @@ For untrusted programs, the CLI offers an allowlist: `--ffi-sandbox --ffi-allow 
 
 The module-qualified API is an incremental safety improvement, **not** a fully provenance-checked value-handle system: a caller supplying the wrong valid module handle can still resolve the same raw id to a different string. Treat cross-module string passing as unsupported until an owned value-handle API is introduced.
 
-**Embedding limitations:** This C interface currently compiles and invokes modules through individual VM instances; it does not expose a persistent actor scheduler, durability lifecycle, or per-runtime native FFI registry. The `nulang_register_native_function` registry is process-global. Do not assume tenant isolation or sandboxing from separate `NulangRuntime` instances; use process isolation for untrusted native code.
+**Native callback ownership:** For embedded C applications, register callbacks with `nulang_runtime_register_native_function(runtime, name, ptr, params, count, ret)`. Each `NulangRuntime` owns its own registry, including dynamically loaded libraries; callbacks registered in one embedding instance are not visible to another during bytecode VM execution. The older `nulang_register_native_function` is process-global and remains available to standalone VMs, but does not register callbacks for C embedding instances. Registered callback signatures are checked against Nulang extern declarations before invocation.
+
+**Embedding limitations:** The C interface still creates a fresh bytecode VM for each run/call; it does not expose a persistent actor scheduler or durability lifecycle. Scoped callback registries do not turn unsafe native code into a sandbox: loaded libraries and pointers execute inside the host process, and AOT/WASM native helpers are not covered by this bytecode VM-scoped registry. Do not treat distinct `NulangRuntime` handles as complete tenant security boundaries; use process isolation for untrusted native code.
 
 ## See also
 

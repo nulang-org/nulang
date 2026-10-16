@@ -212,10 +212,25 @@ impl FfiRegistry {
         signature: Signature,
     ) -> Result<NativeFunction, String> {
         if let Some(func) = self.resolve(Some(library), symbol) {
+            if func.signature != signature {
+                return Err(format!("FFI signature mismatch for {library}::{symbol}"));
+            }
             return Ok(func);
         }
         if let Some(func) = self.resolve(None, symbol) {
+            if func.signature != signature {
+                return Err(format!(
+                    "FFI signature mismatch for registered callback {symbol}"
+                ));
+            }
             return Ok(func);
+        }
+        // The sentinel is reserved for host-registered callbacks; resolving a
+        // missing entry must never fall through to dlopen of an arbitrary path.
+        if library == "__nulang_registered__" {
+            return Err(format!(
+                "FFI callback {symbol} not registered in this runtime"
+            ));
         }
         let lib = self.load_library(library)?;
         let symbol_name = symbol.to_string();
@@ -294,6 +309,44 @@ mod tests {
         let registry = FfiRegistry::new();
         assert!(registry.functions.is_empty());
         assert!(registry.libraries.is_empty());
+    }
+
+    #[test]
+    fn test_missing_registered_callback_never_falls_back_to_library_loading() {
+        let mut registry = FfiRegistry::new();
+        let err = unsafe {
+            registry.resolve_or_load(
+                "__nulang_registered__",
+                "callback_missing_in_this_runtime",
+                Signature::new(vec![], CType::I64),
+            )
+        }
+        .unwrap_err();
+        assert!(err.contains("not registered"), "{err}");
+    }
+
+    #[test]
+    fn test_registered_callback_rejects_incompatible_declared_signature() {
+        let mut registry = FfiRegistry::new();
+        let function = unsafe {
+            NativeFunction::new(
+                std::ptr::null::<c_void>(),
+                Signature::new(vec![], CType::I64),
+                None,
+                "scoped_signature_test".to_string(),
+            )
+        };
+        registry.register(function);
+
+        let err = unsafe {
+            registry.resolve_or_load(
+                "__nulang_registered__",
+                "scoped_signature_test",
+                Signature::new(vec![], CType::F64),
+            )
+        }
+        .unwrap_err();
+        assert!(err.contains("signature mismatch"), "{err}");
     }
 
     #[test]
