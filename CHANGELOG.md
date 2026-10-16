@@ -1,4 +1,8 @@
 # Nulang Changelog
+
+### Single-dispatch browser form actions — 2026-10-16
+- **Forms with a `data-action` now dispatch only on `submit`, not both bubbling `click` and `submit`.** This prevents a normal submit-button click from accidentally sending two server-action POSTs with different idempotency keys. Non-form action elements retain click dispatch.
+- **A generated-JavaScript regression test covers form submission and ordinary buttons.** This fixes one browser-level duplicate dispatch path; authoritative server actions must still enforce authorization and durable idempotency.
 ### Web static-root containment — 2026-10-15
 - **Experimental Web static file serving refuses parent traversal and symlinks escaping configured roots.** Canonical candidate paths must remain inside their canonicalized static or output root, and normal in-root files remain serveable.
 - **A filesystem regression verifies parent and symlink escape rejection.** This is a clean current-main successor to draft #1676; it does not change SSE or claim protection from malicious concurrent mutation of a trusted static root.
