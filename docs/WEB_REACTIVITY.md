@@ -58,3 +58,43 @@ remain future work. This change does not alter Native UI or desktop lowering.
 This slice must be validated against rendered HTML, emitted JavaScript,
 compiler IR/patch semantics, accessibility behavior, and the project's
 exact-head CI before it is considered production ready.
+
+
+## Explicit synchronous update batches
+
+The experimental browser micro-runtime supports `window.nulang.batch(callback)`
+to coalesce synchronous signal writes without introducing scheduled rendering or
+changing the behavior of ordinary calls to `signal(name).set(value)`.
+
+```javascript
+const status = window.nulang.signal('status');
+window.nulang.batch(() => {
+  status.set('saving');
+  status.set('saved');
+  // status.get() === 'saved', while the DOM still has its prior value.
+});
+// Bound DOM text/attributes now show 'saved', after one refresh for 'status'.
+```
+
+- Signal reads observe the latest value immediately.
+- Outside a batch, writes still update bound DOM nodes synchronously.
+- Within a batch, only the final value of each changed signal is rendered, once
+  at the outermost batch boundary; nested batches do not flush early.
+- Assigning the same value by `Object.is` does not trigger a DOM write.
+- The callback's result is returned. A thrown callback error is propagated
+  **after** the queued DOM updates are flushed.
+- The callback must be a **synchronous function**. An asynchronous callback
+  cannot extend the batch across `await`; subsequent writes after suspension
+  execute outside the batch.
+- Batching does not add reactive expression evaluation, permission changes,
+  or new DOM sinks. Attribute updates remain restricted to the explicit safe
+  allowlist described above.
+
+Run the dependency-free behavioral test with:
+
+```sh
+node --test tests/web_reactivity_runtime.test.cjs
+```
+
+This VM-based test does not replace actual browser, Rust compiler, SSR, or
+end-to-end conformance verification.
