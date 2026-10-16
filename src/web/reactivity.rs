@@ -783,7 +783,7 @@ fn data_attr(name: &str, value: &str, span: Span) -> Expr {
 /// `data-signal` and `data-action` attributes emitted by the compiler.
 pub fn generate_client_runtime() -> String {
     r#"(function () {
-  const signals = {};
+  const signals = Object.create(null);
   const signalBindings = Object.create(null);
   // Lazily allocated: pages without subscriptions retain the old fast path.
   const signalListeners = Object.create(null);
