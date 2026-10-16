@@ -115,7 +115,7 @@ fn default_output_dir() -> String {
 /// The `[budgets]` section of a Nulang Web manifest.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct BudgetsSection {
-    /// Maximum initial JavaScript transfer size, e.g. "20KB" or "1.5MB".
+    /// Legacy per-file JavaScript size budget (not aggregate first-load bytes).
     #[serde(default)]
     pub initial_js: Option<String>,
     /// Maximum sum of all published, uncompressed .js and .mjs files.
