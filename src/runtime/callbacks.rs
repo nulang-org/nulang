@@ -301,6 +301,36 @@ pub(crate) fn authorize_actor_ffi(
 
 /// Shared Web effect host implementation for all runtime callback types.
 /// Mirrors the standalone VM dispatch in `src/vm.rs`.
+/// Reject scriptable schemes and malformed redirect targets before composing
+/// a meta-refresh document. Relative and absolute HTTP(S) URLs are supported.
+fn render_web_redirect(url: &str) -> Option<String> {
+    if url.is_empty() || url != url.trim() || url.chars().any(char::is_control) {
+        return None;
+    }
+
+    if let Some(colon) = url.find(':') {
+        let prefix = &url[..colon];
+        let looks_like_scheme = prefix
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic())
+            && prefix
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'));
+        if looks_like_scheme
+            && !prefix.eq_ignore_ascii_case("http")
+            && !prefix.eq_ignore_ascii_case("https")
+        {
+            return None;
+        }
+    }
+
+    Some(format!(
+        "<html><head><meta http-equiv=\"refresh\" content=\"0;url={}\"></head></html>",
+        html_escape(url)
+    ))
+}
+
 pub(crate) fn perform_web_builtin(
     callbacks: &mut dyn crate::vm::ActorVmCallbacks,
     op_name: Option<&str>,
@@ -419,11 +449,13 @@ pub(crate) fn perform_web_builtin(
         Some("route") => Some(crate::vm::Value::unit()),
         Some("redirect") => {
             let url = resolve(constants, *regs.first()?);
-            let out = format!(
-                "<html><head><meta http-equiv=\"refresh\" content=\"0;url={}\"></head></html>",
-                url
-            );
-            Some(callbacks.alloc_string(&out))
+            match render_web_redirect(&url) {
+                Some(out) => {
+                    crate::runtime::http_server::note_web_redirect(&url, &out);
+                    Some(callbacks.alloc_string(&out))
+                }
+                None => Some(crate::vm::Value::nil()),
+            }
         }
         Some("serve_static") => {
             let path = resolve(constants, *regs.first()?);
@@ -2628,6 +2660,35 @@ mod migration_authority_tests {
             migration_authority_tokens(&actor),
             Err(RuntimeAuthorityError::InvalidManifest(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod web_redirect_security_tests {
+    use super::render_web_redirect;
+
+    #[test]
+    fn redirects_escape_attribute_breakout_payloads() {
+        let html = render_web_redirect("/next?name=\" onload=\"alert(1)").unwrap();
+        assert!(html.contains("url=/next?name=&quot; onload=&quot;alert(1)"));
+        assert!(!html.contains("url=/next?name=\" onload="));
+        assert!(render_web_redirect("/dashboard").is_some());
+        assert!(render_web_redirect("https://example.com/path").is_some());
+    }
+
+    #[test]
+    fn rejects_scriptable_schemes_and_control_characters() {
+        for target in [
+            "",
+            "javascript:alert(1)",
+            "JaVaScRiPt:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "vbscript:msgbox(1)",
+            "/next\r\nSet-Cookie: leaked=1",
+            " https://example.com",
+        ] {
+            assert!(render_web_redirect(target).is_none(), "accepted {target:?}");
+        }
     }
 }
 
