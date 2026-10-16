@@ -99,8 +99,8 @@ lcp = "1.5s"                 # Largest Contentful Paint target
 `initial_js` currently checks individual `.js` files in `assets/` and the
 generated `app.client.js`; it is **not** an aggregate initial-load transfer
 measurement. `total_js` is an independent, opt-in cap on uncompressed bytes
-across `app.client.js` and recursive `assets/**/*.js` / `assets/**/*.mjs`,
-including lazily loaded chunks. It is a total output-footprint budget, **not**
+across every `.js` and `.mjs` file under `output_dir`, including root-level
+scripts, generated `app.client.js`, and lazy chunks. It is a total output-footprint budget, **not**
 a first-load or network-compressed transfer budget. A configured `total_js`
 fails closed when asset traversal or metadata inspection fails.
 :::
