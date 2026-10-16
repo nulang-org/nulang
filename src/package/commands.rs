@@ -2760,6 +2760,43 @@ mod tests {
     }
 
     #[test]
+    fn test_generate_resource_cli_dispatch_and_no_overwrite() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_generate_resource_cli_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create test package directory");
+        let _guard = ChangeDir::new(&dir);
+        scaffold_package(&dir, "resource-pkg", "web").expect("scaffold web package");
+
+        let args = [
+            "generate",
+            "resource",
+            "Billboard",
+            "--field",
+            "name:String",
+            "--field",
+            "daily_rate:Float",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<_>>();
+
+        run(&args).expect("generator is reachable from nula command dispatcher");
+        let generated = dir.join("src/resources/billboard.nula");
+        assert!(generated.is_file());
+        let original = std::fs::read_to_string(&generated).expect("read resource source");
+        assert!(original.contains("pub type Billboard = {"));
+        assert!(original.contains("can_write_billboard"));
+
+        let duplicate = run(&args).expect_err("rerunning must never overwrite source");
+        assert!(duplicate.to_string().contains("without overwriting"));
+        assert_eq!(std::fs::read_to_string(&generated).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_print_usage_does_not_panic() {
         print_usage();
     }
