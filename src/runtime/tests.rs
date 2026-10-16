@@ -290,6 +290,7 @@ fn deterministic_scheduler_resumes_interpreter_without_another_message() {
     use crate::bytecode::{BehaviorTableEntry, Instruction, OpCode};
 
     let mut module = CodeModule::new("deterministic-quantum");
+    module.add_constant(Constant::String("result".to_string()));
     let answer_idx = module.add_constant(Constant::Int(42));
     module.add_behavior(BehaviorTableEntry {
         name: "Busy.answer".to_string(),
@@ -411,7 +412,8 @@ fn deterministic_picker_excludes_actors_waiting_on_external_completion() {
     rt.send_message_by_id(actor_id, 0, &[]);
     let mut vm = crate::vm::VM::new_without_jit();
     vm.set_current_frame(Frame::new(None, 0));
-    rt.actors.get_mut(&actor_id).unwrap().suspended_execution = Some(SuspendedExecution {
+    let actor = rt.actors.get_mut(&actor_id).unwrap();
+    actor.suspended_execution = Some(SuspendedExecution {
         vm_state: vm.take_suspended_state().unwrap(),
         behavior_idx: 0,
         activation: None,
