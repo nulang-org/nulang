@@ -115,9 +115,13 @@ fn default_output_dir() -> String {
 /// The `[budgets]` section of a Nulang Web manifest.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct BudgetsSection {
-    /// Maximum initial JavaScript transfer size, e.g. "20KB" or "1.5MB".
+    /// Legacy per-file JavaScript size budget (not aggregate first-load bytes).
     #[serde(default)]
     pub initial_js: Option<String>,
+    /// Maximum sum of all published, uncompressed .js and .mjs files.
+    /// Unlike initial_js, includes root scripts and lazily loaded chunks.
+    #[serde(default)]
+    pub total_js: Option<String>,
     /// Largest Contentful Paint target, e.g. "1.5s".
     #[serde(default)]
     pub lcp: Option<String>,
@@ -127,6 +131,11 @@ impl BudgetsSection {
     /// Parse `initial_js` into a byte budget if declared.
     pub fn initial_js_max_bytes(&self) -> Option<usize> {
         self.initial_js.as_ref().and_then(|s| parse_size(s))
+    }
+
+    /// Parse the optional total emitted JavaScript budget into bytes.
+    pub fn total_js_max_bytes(&self) -> Option<usize> {
+        self.total_js.as_ref().and_then(|s| parse_size(s))
     }
 
     /// Parse `lcp` into a seconds target if declared.
@@ -210,6 +219,31 @@ impl Manifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_manifest_total_js_budget_is_optional_and_parses_units() {
+        let source = r#"
+            [package]
+            name = "web"
+            version = "0.1.0"
+
+            [budgets]
+            initial_js = "20KB"
+            total_js = "150KB"
+        "#;
+        let manifest = Manifest::parse(source).unwrap();
+        assert_eq!(manifest.budgets.initial_js_max_bytes(), Some(20 * 1024));
+        assert_eq!(manifest.budgets.total_js_max_bytes(), Some(150 * 1024));
+
+        let old = Manifest::parse(
+            r#"[package]
+name = "web"
+version = "0.1.0"
+"#,
+        )
+        .unwrap();
+        assert_eq!(old.budgets.total_js_max_bytes(), None);
+    }
 
     #[test]
     fn test_manifest_parse_minimal() {

@@ -1485,6 +1485,35 @@ fn cmd_build_web() -> NuResult<()> {
         });
     }
 
+    // A separate, opt-in budget covers the complete emitted JavaScript
+    // footprint, including nested/lazy chunks. It does not redefine the
+    // legacy per-file `initial_js` check.
+    let total_js_budget = manifest.budgets.total_js_max_bytes();
+    if manifest.budgets.total_js.is_some() && total_js_budget.is_none() {
+        return Err(NuError::PackageError {
+            msg: "invalid [budgets].total_js: expected a byte size such as \"150KB\"".to_string(),
+            span: Span::default(),
+        });
+    }
+    match crate::web::budget::check_total_js_budget(&output_dir, total_js_budget) {
+        Ok(None) => {}
+        Ok(Some(violation)) => {
+            return Err(NuError::PackageError {
+                msg: format!(
+                    "performance budget exceeded: {} is {} bytes (budget {} bytes)",
+                    violation.file, violation.size, violation.budget
+                ),
+                span: Span::default(),
+            });
+        }
+        Err(error) => {
+            return Err(NuError::PackageError {
+                msg: format!("cannot verify total JavaScript budget: {error}"),
+                span: Span::default(),
+            });
+        }
+    }
+
     println!("Web build succeeded: {}", output_dir.display());
     Ok(())
 }

@@ -90,9 +90,20 @@ static_dir = "static"        # static assets, relative to the package root
 output_dir = "dist"          # static-site output directory
 
 [budgets]                    # optional; performance budgets for web builds
-initial_js = "20KB"          # max initial JS transfer size
+initial_js = "20KB"          # legacy per-file JS size limit
+total_js = "150KB"           # optional sum of all emitted JS (including lazy chunks)
 lcp = "1.5s"                 # Largest Contentful Paint target
 ```
+
+:::note
+`initial_js` currently checks individual `.js` files in `assets/` and the
+generated `app.client.js`; it is **not** an aggregate initial-load transfer
+measurement. `total_js` is an independent, opt-in cap on uncompressed bytes
+across every `.js` and `.mjs` file under `output_dir`, including root-level
+scripts, generated `app.client.js`, and lazy chunks. It is a total output-footprint budget, **not**
+a first-load or network-compressed transfer budget. A configured `total_js`
+fails closed when asset traversal or metadata inspection fails.
+:::
 
 :::note
 `language` pins the package to a toolchain: `nula build`, `nula test`, and
