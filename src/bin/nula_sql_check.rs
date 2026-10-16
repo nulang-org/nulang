@@ -120,9 +120,6 @@ fn parse_arguments(tokens: &[Token], start: usize) -> Result<Vec<ArgumentType>, 
     Err("unterminated SQL query call".into())
 }
 
-/// Only explicitly written DB effects with a literal first argument are checked.
-/// The Nulang lexer excludes comments and treats string content as one token.
-/// Dynamic SQL fails closed, instead of being mislabeled as checked SQL.
 fn source_position(source: &str, offset: usize) -> (usize, usize) {
     let prefix = &source[..offset];
     let line = prefix.bytes().filter(|b| *b == b'\n').count() + 1;
@@ -130,6 +127,9 @@ fn source_position(source: &str, offset: usize) -> (usize, usize) {
     (line, column)
 }
 
+/// Only explicitly written DB effects with a literal first argument are checked.
+/// The Nulang lexer excludes comments and treats string content as one token.
+/// Dynamic SQL fails closed, instead of being mislabeled as checked SQL.
 fn extract_queries(source: &str) -> Result<Vec<QueryCall>, String> {
     let tokens = Lexer::new(source)
         .lex()
