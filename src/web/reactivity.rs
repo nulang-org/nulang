@@ -1128,7 +1128,7 @@ signal count: Html = text("global")
 
 fn view() -> Html {
     let earlier = <p>{count}</p>
-    let count = text("local")
+    let count = text("local");
     <span>{count}</span>
 }
 "#,
