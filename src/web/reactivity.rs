@@ -630,6 +630,20 @@ fn reactive_attribute_marker(name: &str) -> Option<&'static str> {
     }
 }
 
+/// Recognize only a statically declared SSR-local boundary. Dynamic mode
+/// expressions cannot safely select a hydration ownership policy.
+fn is_local_ssr_scope(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(Literal::String(mode), _) => mode == "local",
+        Expr::App { func, args, .. }
+            if (is_var(func, "text") || is_var(func, "txt")) && args.len() == 1 =>
+        {
+            matches!(&args[0], Expr::Literal(Literal::String(mode), _) if mode == "local")
+        }
+        _ => false,
+    }
+}
+
 fn action_handler_name(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Var(name, ..) => Some(name.clone()),
@@ -738,6 +752,11 @@ fn rewrite_expr(
                                             data_attrs.push(data_attr(marker, signal, *span));
                                         }
                                     }
+                                }
+                                // Explicit source-level opt-in lowers into a
+                                // compiler-owned SSR hydration boundary.
+                                if name == "nulang-scope" && is_local_ssr_scope(&parts[1]) {
+                                    data_attrs.push(data_attr("data-nulang-scope", "local", *span));
                                 }
                                 if name == "action" {
                                     if let Some(handler) = action_handler_name(&parts[1]) {
@@ -1040,9 +1059,10 @@ pub fn generate_client_runtime() -> String {
     }
   }
 
-  function runClientAction(handler) {
+  function runClientAction(handler, scope) {
     if (window.nulangActions && typeof window.nulangActions[handler] === 'function') {
-      window.nulangActions[handler]();
+      // Extra argument is backwards-compatible with zero-argument handlers.
+      window.nulangActions[handler](scope);
     } else {
       console.warn('nulang: missing client action handler', handler);
     }
@@ -1242,7 +1262,7 @@ pub fn generate_client_runtime() -> String {
               console.error('nulang: server action failed', err);
             });
           } else {
-            runClientAction(handler);
+            runClientAction(handler, scope);
           }
         };
         listen(el, 'click', listener);
@@ -1256,6 +1276,28 @@ pub fn generate_client_runtime() -> String {
   }
 
   function hydrate() {
+    // Compiler-marked SSR islands take ownership before the legacy document
+    // mount. The marker conveys reactive lifetime, never execution authority.
+    const roots = Array.from(document.querySelectorAll('[data-nulang-scope]'));
+    roots.forEach(function (root) {
+      if (root.getAttribute('data-nulang-scope') !== 'local') {
+        throw new Error('nulang: unsupported SSR scope mode');
+      }
+      if (typeof root.querySelectorAll !== 'function') {
+        throw new Error('nulang: invalid SSR scope root');
+      }
+    });
+    // Nested island semantics are not implemented yet. Reject the complete
+    // layout before claiming any bindings instead of mixing ownership.
+    for (let i = 0; i < roots.length; i++) {
+      for (let j = 0; j < roots.length; j++) {
+        if (i !== j && typeof roots[i].contains === 'function'
+            && roots[i].contains(roots[j])) {
+          throw new Error('nulang: nested SSR scope is unsupported');
+        }
+      }
+    }
+    roots.forEach(function (root) { mount(root, { localSignals: true }); });
     mount(document);
   }
 
