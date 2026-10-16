@@ -9,7 +9,7 @@
 //! by `nula build --web` and `nula dev`. It is intentionally conservative:
 //! it only reports dependencies that are statically visible in the same module.
 
-use crate::ast::{AstModule, Decl, Expr, Literal};
+use crate::ast::{AstModule, Decl, Expr, Literal, Pattern};
 use crate::effect_checker::EffectChecker;
 use crate::types::{Effect, EffectRow, Span};
 pub use nulang_ui_protocol::ActionPlacement;
@@ -700,11 +700,13 @@ fn rewrite_expr(
             scrutinee, arms, ..
         } => {
             rewrite_expr(scrutinee, in_html, signals, checker);
-            for (_, guard, body) in arms {
+            for (pattern, guard, body) in arms {
+                let mut visible_signals = signals.clone();
+                hide_pattern_signals(pattern, &mut visible_signals);
                 if let Some(guard) = guard {
-                    rewrite_expr(guard, in_html, signals, checker);
+                    rewrite_expr(guard, in_html, &visible_signals, checker);
                 }
-                rewrite_expr(body, in_html, signals, checker);
+                rewrite_expr(body, in_html, &visible_signals, checker);
             }
         }
         Expr::Block { exprs, .. } | Expr::Par { exprs, .. } => {
@@ -773,7 +775,11 @@ fn rewrite_expr(
         Expr::Handle { body, handlers, .. } => {
             rewrite_expr(body, in_html, signals, checker);
             for h in handlers.iter_mut() {
-                rewrite_expr(&mut h.body, in_html, signals, checker);
+                let mut visible_signals = signals.clone();
+                for param in &h.params {
+                    visible_signals.remove(param);
+                }
+                rewrite_expr(&mut h.body, in_html, &visible_signals, checker);
             }
         }
         Expr::Perform { args, .. } => {
@@ -801,11 +807,15 @@ fn rewrite_expr(
             }
         }
         Expr::Receive { arms, after, .. } => {
-            for (_, _, guard, body) in arms {
-                if let Some(guard) = guard {
-                    rewrite_expr(guard, in_html, signals, checker);
+            for (_, patterns, guard, body) in arms {
+                let mut visible_signals = signals.clone();
+                for pattern in patterns {
+                    hide_pattern_signals(pattern, &mut visible_signals);
                 }
-                rewrite_expr(body, in_html, signals, checker);
+                if let Some(guard) = guard {
+                    rewrite_expr(guard, in_html, &visible_signals, checker);
+                }
+                rewrite_expr(body, in_html, &visible_signals, checker);
             }
             if let Some((t, b)) = after {
                 rewrite_expr(t, in_html, signals, checker);
@@ -820,6 +830,32 @@ fn rewrite_expr(
         }
 
         _ => {}
+    }
+}
+
+/// Pattern binders shadow same-named module signals inside a match/receive
+/// arm. Avoid inventing reactive global bindings for a lexical variable.
+fn hide_pattern_signals(pattern: &Pattern, visible: &mut HashSet<String>) {
+    match pattern {
+        Pattern::Var(name) => {
+            visible.remove(name);
+        }
+        Pattern::Tuple(parts) => {
+            for part in parts {
+                hide_pattern_signals(part, visible);
+            }
+        }
+        Pattern::Record(fields) => {
+            for (_, part) in fields {
+                hide_pattern_signals(part, visible);
+            }
+        }
+        Pattern::Variant(_, Some(inner)) => hide_pattern_signals(inner, visible),
+        Pattern::Alias(name, inner) => {
+            visible.remove(name);
+            hide_pattern_signals(inner, visible);
+        }
+        Pattern::Wild | Pattern::Lit(_) | Pattern::Variant(_, None) => {}
     }
 }
 
