@@ -48,6 +48,9 @@ jobs:
       - name: Smoke test browser playground
         run: node playground/web/test/smoke.mjs
 
+      - name: Test optional browser graphics adapter
+        run: npm test --prefix examples/graphics-web
+
       - name: Install docs dependencies
         run: |
           cd docs
@@ -204,6 +207,17 @@ jobs:
 
       - name: Run nula test
         run: cd test-pkg && ../target/release/nulang nula test
+
+      - name: Build browser graphics Nulang example
+        run: |
+          cd examples/graphics-web
+          ../../target/release/nulang nula build --web
+          test -s dist/index.html
+          test -s dist/app.client.js
+          test -s dist/demo.js
+          test -s dist/graphics.js
+          grep -F 'data-signal="pointCount"' dist/index.html
+          grep -F '/demo.js' dist/index.html
 
       - name: Test documentation example discovery
         run: bash scripts/test_verify_doc_examples.sh
