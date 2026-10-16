@@ -61,8 +61,9 @@ export function createMapHost({ maplibregl, container, style, ...options }) {
             else reconcile();
           }
         } else {
+          if (ready() && map.getSource(id)) throw new Error(`Source ID already exists in basemap: ${id}`);
           sources.set(id, source);
-          reconcile();
+          try { reconcile(); } catch (error) { sources.delete(id); throw error; }
         }
         break;
       }
@@ -85,8 +86,9 @@ export function createMapHost({ maplibregl, container, style, ...options }) {
           throw new TypeError('Invalid map layer');
         }
         if (layers.has(layer.id)) throw new Error(`Layer already declared: ${layer.id}`);
+        if (ready() && map.getLayer(layer.id)) throw new Error(`Layer ID already exists in basemap: ${layer.id}`);
         layers.set(layer.id, layer);
-        reconcile();
+        try { reconcile(); } catch (error) { layers.delete(layer.id); throw error; }
         break;
       }
       case 'layer.remove':

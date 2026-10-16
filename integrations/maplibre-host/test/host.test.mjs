@@ -131,3 +131,27 @@ test('recreates declared sources and layers after style reload without remountin
   assert.deepEqual(map.actions.at(-1), ['layout', 'pins', 'visibility', 'none']);
   host.destroy();
 });
+
+
+test('rejects collisions with basemap-owned source and layer IDs', () => {
+  const fake = fixture();
+  const host = createMapHost({ maplibregl: fake.maplibregl, container: {}, style: 'sample-style' });
+  const map = fake.maps[0];
+  map.sources.set('basemap', { type: 'vector' });
+  map.layers.set('basemap-labels', { id: 'basemap-labels' });
+  assert.throws(() => host.dispatch({ type: 'source.upsert', id: 'basemap', source: { type: 'geojson', data: point } }), /already exists/);
+  assert.throws(() => host.dispatch({ type: 'layer.add', layer: { id: 'basemap-labels', type: 'circle', source: 'basemap' } }), /already exists/);
+  host.destroy();
+});
+
+test('failed layer addition does not poison a later valid command', () => {
+  const fake = fixture();
+  const host = createMapHost({ maplibregl: fake.maplibregl, container: {}, style: 'sample-style' });
+  const map = fake.maps[0];
+  host.dispatch({ type: 'source.upsert', id: 'sites', source: { type: 'geojson', data: point } });
+  const original = map.addLayer.bind(map);
+  map.addLayer = layer => { if (layer.type === 'invalid') throw new Error('invalid layer'); else original(layer); };
+  assert.throws(() => host.dispatch({ type: 'layer.add', layer: { id: 'pins', type: 'invalid', source: 'sites' } }), /invalid layer/);
+  assert.doesNotThrow(() => host.dispatch({ type: 'layer.add', layer: { id: 'pins', type: 'circle', source: 'sites' } }));
+  host.destroy();
+});
