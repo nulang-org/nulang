@@ -224,9 +224,18 @@ mod tests {
 
         let diagnostics = validate_compilation(compilation).unwrap_err();
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-        assert!(diagnostics[0].contains("ambiguous route GET"), "{diagnostics:?}");
-        assert!(diagnostics[0].contains("/users/{id: Int}"), "{diagnostics:?}");
-        assert!(diagnostics[0].contains("/users/:user_id"), "{diagnostics:?}");
+        assert!(
+            diagnostics[0].contains("ambiguous route GET"),
+            "{diagnostics:?}"
+        );
+        assert!(
+            diagnostics[0].contains("/users/{id: Int}"),
+            "{diagnostics:?}"
+        );
+        assert!(
+            diagnostics[0].contains("/users/:user_id"),
+            "{diagnostics:?}"
+        );
     }
 
     #[test]
@@ -241,7 +250,10 @@ mod tests {
 
         let diagnostics = validation_diagnostics(&compilation);
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-        assert!(diagnostics[0].contains("ambiguous route GET"), "{diagnostics:?}");
+        assert!(
+            diagnostics[0].contains("ambiguous route GET"),
+            "{diagnostics:?}"
+        );
     }
 
     #[test]
