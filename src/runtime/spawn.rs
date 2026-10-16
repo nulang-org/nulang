@@ -636,6 +636,21 @@ mod authority_tests {
     }
 
     impl crate::runtime::persistence::PersistenceStore for RecordingStore {
+        fn commit_transition(
+            &mut self,
+            transition: crate::runtime::persistence::DurableTransition,
+        ) -> std::io::Result<crate::runtime::persistence::DurableCommit> {
+            self.last_actor_id
+                .store(transition.actor_id, std::sync::atomic::Ordering::Relaxed);
+            if self.fail_snapshot && transition.snapshot.is_some() {
+                return Err(std::io::Error::other("injected atomic snapshot failure"));
+            }
+            if self.fail_workflow_event && !transition.workflow_events.is_empty() {
+                return Err(std::io::Error::other("injected atomic event failure"));
+            }
+            self.inner.lock().unwrap().commit_transition(transition)
+        }
+
         fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> std::io::Result<()> {
             self.last_actor_id
                 .store(snapshot.actor_id, std::sync::atomic::Ordering::Relaxed);
@@ -762,7 +777,7 @@ mod authority_tests {
         assert!(probe.load_snapshot(actor_id).is_none());
         assert!(
             probe.read_workflow_events(actor_id).is_empty(),
-            "failed initial workflow creation must remove the committed start event"
+            "failed atomic creation must never persist a start event"
         );
     }
 
