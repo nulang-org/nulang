@@ -232,6 +232,16 @@ test('compiler-generated SSR hydrates in Chromium', {
         '); document.close();');
       assert.equal(await cdp.eval('(' + browserChecks.toString() + ')()'), true);
     } finally {
+      cdp?.close();
+      chrome?.kill('SIGTERM');
+      if (chrome && chrome.exitCode === null) {
+        await Promise.race([
+          new Promise(resolve => chrome.once('exit', resolve)),
+          new Promise(resolve => setTimeout(resolve, 1000))
+        ]);
+      }
+      cdp = undefined;
+      chrome = undefined;
       fs.rmSync(portDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   } finally {
