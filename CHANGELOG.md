@@ -1,6 +1,7 @@
 # Nulang Changelog
 ### Criterion paired-confirmation report-path matching — 2026-10-16
-- **CI now maps Criterion report-directory underscores to either literal underscores or display-name path separators when replaying a historical alert.** Paired confirmation can measure `persist/checkpoint_json_encode/*` from the persisted `persist_checkpoint_json_encode/*` history entries instead of failing before it emits estimates.
+- **CI now reads Criterion's `new/benchmark.json` metadata to map a historical `directory_name` to the exact `full_id` accepted by the CLI filter.** Paired confirmation can measure `persist/checkpoint_json_encode/*` from persisted `persist_checkpoint_json_encode/*` history entries without guessing where directory sanitization replaced slashes.
+- **Round-trip coverage protects underscore-bearing group IDs.** A report path such as `actor_selective_receive_depth/64` resolves only to `actor/selective_receive_depth/64`, never a differently segmented group ID.
 
 ### Experimental Web HTML host hardening — 2026-10-15
 - **`Web.html` now validates dynamic element and attribute names and URL-bearing attributes before rendering.** Unsafe markup and scriptable URL schemes fail closed; quoted attribute delimiters are escaped while already escaped `Html` text is preserved.
