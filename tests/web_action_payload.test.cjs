@@ -141,3 +141,87 @@ test('server form action serializes prototype-named fields into the actual POST 
   }
   assert.equal(reloads, 1);
 });
+
+test('form actions run on submit, never on ordinary clicks inside the form', async () => {
+  const listeners = Object.create(null);
+  const requests = [];
+  let reloadCount = 0;
+  const form = {
+    dataset: { action: 'update', actionPlacement: 'server' },
+    tagName: 'FORM',
+    closest(selector) {
+      assert.equal(selector, 'form');
+      return this;
+    },
+    addEventListener(event, callback) {
+      listeners[event] = callback;
+    }
+  };
+  class FakeFormData {
+    constructor(element) { assert.equal(element, form); }
+    forEach(callback) { callback('update', 'operation'); }
+  }
+  const win = {
+    location: {
+      href: 'https://example.test/items',
+      reload() { reloadCount++; }
+    }
+  };
+  vm.runInNewContext(emittedRuntime(), {
+    window: win,
+    URLSearchParams,
+    FormData: FakeFormData,
+    document: {
+      readyState: 'complete',
+      querySelectorAll(selector) {
+        return selector === '[data-action]' ? [form] : [];
+      }
+    },
+    fetch: async (url, options) => {
+      requests.push({ url, options });
+      return { ok: true };
+    },
+    console: { warn() {}, error(error) { throw error; } }
+  });
+
+  // A click on an input, label or other child bubbles to the form.
+  // The form must not listen for clicks, or merely focusing an input posts data.
+  assert.equal(listeners.click, undefined, 'form clicks must not trigger server actions');
+  assert.equal(requests.length, 0);
+  assert.equal(typeof listeners.submit, 'function');
+  let prevented = false;
+  listeners.submit({ preventDefault() { prevented = true; } });
+  for (let i = 0; i < 4; i++) await Promise.resolve();
+  assert.equal(prevented, true);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].options.method, 'POST');
+  assert.equal(reloadCount, 1);
+});
+
+test('non-form action elements retain click handling', () => {
+  const listeners = Object.create(null);
+  let calls = 0;
+  const button = {
+    dataset: { action: 'open', actionPlacement: 'client' },
+    tagName: 'BUTTON',
+    addEventListener(event, callback) {
+      listeners[event] = callback;
+    }
+  };
+  vm.runInNewContext(emittedRuntime(), {
+    window: {
+      nulangActions: { open() { calls++; } }
+    },
+    document: {
+      readyState: 'complete',
+      querySelectorAll(selector) {
+        return selector === '[data-action]' ? [button] : [];
+      }
+    },
+    console: { warn() {}, error(error) { throw error; } }
+  });
+  assert.equal(typeof listeners.click, 'function');
+  assert.equal(listeners.submit, undefined);
+  listeners.click({ preventDefault() {} });
+  assert.equal(calls, 1);
+});
