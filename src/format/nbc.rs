@@ -484,6 +484,33 @@ mod tests {
     }
 
     #[test]
+    fn decode_rejects_duplicate_instruction_stream_in_metadata() {
+        let module = sample_module();
+        let bytes = module.to_nbc(None).expect("encode fixture");
+        let metadata_header = NBC_HEADER_LEN + module.instructions.len() * 4;
+        let mut forged = bytes[..metadata_header].to_vec();
+        // The v1 wire contract stores instructions only in the fixed-width
+        // stream. Metadata is required to have an empty instructions vector.
+        let redundant_metadata = serde_json::to_vec(&module).unwrap();
+        forged.extend_from_slice(&(redundant_metadata.len() as u32).to_be_bytes());
+        forged.extend_from_slice(&redundant_metadata);
+
+        let limits = NbcDecodeLimits {
+            max_artifact_bytes: forged.len(),
+            max_instructions: module.instructions.len(),
+            max_metadata_bytes: redundant_metadata.len(),
+        };
+        assert!(matches!(
+            CodeModule::from_nbc_with_limits(&forged, limits),
+            Err(FormatError::BodyDecode(_))
+        ));
+        assert!(matches!(
+            CodeModule::from_nbc(&forged),
+            Err(FormatError::BodyDecode(_))
+        ));
+    }
+
+    #[test]
     fn bounded_decode_rejects_forged_instruction_count_before_allocating() {
         let mut bytes = sample_module().to_nbc(None).expect("encode fixture");
         bytes[44..48].copy_from_slice(&u32::MAX.to_be_bytes());
