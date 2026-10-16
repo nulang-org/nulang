@@ -1142,6 +1142,27 @@ mod tests {
         assert!(result.is_err(), "invalid WASM should fail to parse");
     }
 
+    // Regression: malformed guest input must never be dumped to a shared,
+    // predictable /tmp path. This source-level guard is safe to run on the
+    // vulnerable revision: executing that revision would clobber the path.
+    #[test]
+    fn invalid_wasm_has_no_shared_diagnostic_dump_path() {
+        let source = include_str!("wasm_runtime.rs");
+        let legacy_dump = ["/tmp/failed_", "module.wasm"].concat();
+        assert!(
+            !source.contains(&legacy_dump),
+            "failed guest modules must not be written to a shared tmp path"
+        );
+    }
+
+    #[test]
+    fn invalid_wasm_returns_a_compile_error() {
+        let result = WasmRuntime::new(b"not a wasm module", None);
+        assert!(result.is_err(), "malformed WASM should return an error");
+        let err = result.err().expect("error");
+        assert!(err.to_string().contains("wasmtime"));
+    }
+
     #[test]
     fn test_wasm_runtime_rejects_empty_bytes() {
         let config = default_wasm_config();
