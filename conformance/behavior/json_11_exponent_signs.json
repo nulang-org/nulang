@@ -1,0 +1,5 @@
+{
+  "exit_code": 0,
+  "stdout": "positive=100\nnegative=1\nunsigned=100",
+  "stderr": ""
+}
