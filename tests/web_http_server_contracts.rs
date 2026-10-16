@@ -178,7 +178,10 @@ fn static_asset_etags_support_revalidation_over_real_http() {
         }
     }
 
-    let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let root = StaticRoot(std::env::temp_dir().join(format!(
         "nulang-web-etag-{}-{nonce}",
         std::process::id()
@@ -195,13 +198,19 @@ fn static_asset_etags_support_revalidation_over_real_http() {
     assert_eq!(response_body(&initial), "first");
     let etag = response_header(&initial, "etag").expect("strong ETag on static asset");
     assert!(etag.starts_with('"') && etag.ends_with('"'), "{etag}");
-    assert_eq!(response_header(&initial, "cache-control"), Some("no-cache"));
+    assert_eq!(
+        response_header(&initial, "cache-control"),
+        Some("no-cache")
+    );
 
     let revalidated = send_raw_request(
         server.port,
         &format!("GET /app.js HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: {etag}\r\n\r\n"),
     );
-    assert!(revalidated.starts_with("HTTP/1.1 304 Not Modified\r\n"), "{revalidated}");
+    assert!(
+        revalidated.starts_with("HTTP/1.1 304 Not Modified\r\n"),
+        "{revalidated}"
+    );
     assert_eq!(response_body(&revalidated), "");
     assert_eq!(response_header(&revalidated, "etag"), Some(etag));
     assert_eq!(response_header(&revalidated, "content-length"), Some("0"));
@@ -212,7 +221,25 @@ fn static_asset_etags_support_revalidation_over_real_http() {
             "GET /app.js HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: \"not-this\", W/{etag}\r\n\r\n"
         ),
     );
-    assert!(weak_and_list.starts_with("HTTP/1.1 304 Not Modified\r\n"), "{weak_and_list}");
+    assert!(
+        weak_and_list.starts_with("HTTP/1.1 304 Not Modified\r\n"),
+        "{weak_and_list}"
+    );
+
+    let any_existing = send_raw_request(
+        server.port,
+        "GET /app.js HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: *\r\n\r\n",
+    );
+    assert!(
+        any_existing.starts_with("HTTP/1.1 304 Not Modified\r\n"),
+        "{any_existing}"
+    );
+
+    let missing = send_raw_request(
+        server.port,
+        "GET /missing.js HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: *\r\n\r\n",
+    );
+    assert!(missing.starts_with("HTTP/1.1 404 Not Found\r\n"), "{missing}");
 
     let non_matching = send_raw_request(
         server.port,
