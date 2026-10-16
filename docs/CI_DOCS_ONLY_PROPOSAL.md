@@ -12,7 +12,7 @@ Locally validate this component with:
 python3 -m unittest discover -s scripts/tests -p 'test_classify_pr_paths.py' -v
 ```
 
-The draft also includes `scripts/validate_issue_forms.py`, a conservative GitHub issue-form YAML validator. It uses pinned PyYAML 6.0.3, rejects duplicate keys/unsafe YAML tags, checks required form fields/control IDs, and returns a nonzero exit on invalid forms. Local validation:
+The draft also includes `scripts/validate_issue_forms.py`, a conservative GitHub issue-form YAML validator. It uses pinned PyYAML 6.0.3, rejects duplicate keys/unsafe YAML tags, checks required form fields/control IDs, interprets only literal `true`/`false` as booleans (not YAML 1.1's `yes`/`on` aliases), and returns actionable nonzero errors for malformed controls/URLs. Local validation:
 
 ```bash
 python3 -m pip install PyYAML==6.0.3
