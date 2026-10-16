@@ -391,29 +391,22 @@ pub(crate) fn perform_web_builtin(
             let tag = resolve(constants, *regs.first()?);
             let attrs = read_array(callbacks, *regs.get(1)?);
             let children = read_array(callbacks, *regs.get(2)?);
-            let mut out = String::new();
-            out.push('<');
-            out.push_str(&tag);
-            for attr in &attrs {
-                let slots = read_array(callbacks, *attr);
-                if slots.len() >= 2 {
-                    let name = resolve(constants, slots[0]);
-                    let value = resolve(constants, slots[1]);
-                    out.push(' ');
-                    out.push_str(&name);
-                    out.push_str("=\"");
-                    out.push_str(&value);
-                    out.push('\"');
-                }
+            let attrs: Vec<(String, String)> = attrs
+                .iter()
+                .filter_map(|attr| {
+                    let slots = read_array(callbacks, *attr);
+                    (slots.len() >= 2)
+                        .then(|| (resolve(constants, slots[0]), resolve(constants, slots[1])))
+                })
+                .collect();
+            let children: Vec<String> = children
+                .iter()
+                .map(|child| resolve(constants, *child))
+                .collect();
+            match crate::web::html_safety::render_element(&tag, &attrs, &children) {
+                Some(html) => Some(callbacks.alloc_string(&html)),
+                None => Some(crate::vm::Value::nil()),
             }
-            out.push('>');
-            for child in &children {
-                out.push_str(&resolve(constants, *child));
-            }
-            out.push_str("</");
-            out.push_str(&tag);
-            out.push('>');
-            Some(callbacks.alloc_string(&out))
         }
         Some("text") => {
             let s = resolve(constants, *regs.first()?);

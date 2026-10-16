@@ -1,28 +1,93 @@
 ---
 title: Installation
-description: Build Nulang from source and set up your development environment.
+description: Try Nulang in the browser or install a checksummed release binary, with source-build instructions for contributors.
 ---
 import CopyMarkdown from '../../../components/CopyMarkdown.astro';
 
-## Prerequisites
+## Try Nulang without installing
 
-<CopyMarkdown />
+The [browser playground](/playground/) runs the **Nulang Core subset** locally in WebAssembly. It does not support actors, networking, FFI, JIT, or the full native runtime. For those capabilities, install a binary.
 
-- **Rust** 1.95.0 (pinned by `rust-toolchain.toml`; [rustup](https://rustup.rs))
-- **Python 3** development headers (for PyO3 interop)
-- **Linux** or **macOS**. Windows is not supported yet — use
-  [WSL](https://learn.microsoft.com/windows/wsl/) and build inside a Linux environment.
-- A C compiler and linker (GCC/Clang + GNU `bfd` linker on Linux)
+## Install a tagged release (recommended)
 
-## Building from Source
+Tagged releases publish checksummed archives on [GitHub Releases](https://github.com/nulang-org/nulang/releases). **A release asset is available only after its release workflow has completed successfully.** You do not need Rust or the Nulang source tree to install a published binary.
+
+| Platform | Release archive |
+| --- | --- |
+| Linux x86_64 | `nulang-linux-x86_64.tar.gz` |
+| Linux aarch64 | `nulang-linux-aarch64.tar.gz` |
+| macOS Apple Silicon | `nulang-macos-aarch64.tar.gz` |
+| Windows x86_64 | `nulang-windows-x86_64.tar.gz` |
+
+Download the archive **and matching `.sha256` file** from the same tagged release. Choose the archive for your operating system and CPU architecture.
+
+### Linux example (x86_64)
+
+From the directory containing the downloaded files:
+
+```bash
+sha256sum -c nulang-linux-x86_64.tar.gz.sha256
+tar xzf nulang-linux-x86_64.tar.gz
+mkdir -p "$HOME/.local/bin"
+install -m 0755 nulang-linux-x86_64 "$HOME/.local/bin/nulang"
+"$HOME/.local/bin/nulang" --eval 'perform IO.print("Hello, Nulang!")'
+```
+
+Add `$HOME/.local/bin` to `PATH` if it is not already there. For Linux aarch64, replace `linux-x86_64` with `linux-aarch64` in the commands.
+
+### macOS (Apple Silicon)
+
+After downloading both release files:
+
+```bash
+shasum -a 256 -c nulang-macos-aarch64.tar.gz.sha256
+tar xzf nulang-macos-aarch64.tar.gz
+mkdir -p "$HOME/.local/bin"
+install -m 0755 nulang-macos-aarch64 "$HOME/.local/bin/nulang"
+"$HOME/.local/bin/nulang" --eval 'perform IO.print("Hello, Nulang!")'
+```
+
+Add `$HOME/.local/bin` to `PATH` if needed. A macOS Intel binary is not currently part of the release matrix; building from source is an alternative on supported systems.
+
+### Windows (x86_64)
+
+Download the two `nulang-windows-x86_64` release files. On PowerShell, compare the SHA-256 digest returned by `Get-FileHash .\nulang-windows-x86_64.tar.gz -Algorithm SHA256` with the value in the downloaded `.sha256` file **before** extracting.
+
+```powershell
+tar -xzf .\nulang-windows-x86_64.tar.gz
+Rename-Item .\nulang-windows-x86_64 nulang.exe
+.\nulang.exe --eval 'perform IO.print("Hello, Nulang!")'
+```
+
+The release archive contains a platform-qualified executable that must be renamed `nulang.exe`. Move it to a dedicated folder on your `PATH` if you want to invoke `nulang` from other directories.
+
+**Platform library requirements:** The prebuilt archives contain an executable, not an isolated runtime with every shared library bundled. In an actual October 11, 2026 Linux x86_64 release-build artifact, `readelf -d nulang` identified dependencies on `libpython3.12.so.1.0`, `libssl.so.3`, and `libcrypto.so.3`. On a Linux installation with only Python 3.13, the executable failed to start with `libpython3.12.so.1.0: cannot open shared object file`. Check dependencies before assuming a downloaded binary is portable:
+
+```bash
+ldd "$HOME/.local/bin/nulang" | grep -E 'python|ssl|crypto|not found'
+```
+
+For a missing dependency, install the matching **system-provided, ABI-compatible** shared library where available, or build Nulang from source for your distribution. **Do not** symlink an incompatible Python library version (for example, Python 3.13 to a Python 3.12 SONAME). For a compiler/runtime build without the Python integration and its linkage, use `cargo build --locked --release --no-default-features`, recognizing that optional features will be unavailable. The specific shared-library dependencies of macOS and Windows archives may differ; test those binaries on clean supported machines before considering their portability verified.
+
+**Support boundary:** Releases are CI-built for the listed platforms, not guaranteed to start on every distribution or OS revision. Nulang is alpha software, not yet a production compatibility guarantee.
+
+## Build from source (contributors and custom profiles)
+
+A source build requires:
+
+- **Rust 1.95.0**, pinned by `rust-toolchain.toml` ([rustup](https://rustup.rs))
+- **Python 3** development headers for the default PyO3 interop feature
+- A native C compiler and linker (plus other native dependencies of enabled features)
+- Linux or macOS. On Windows, the documented source-build route is **WSL**; the Windows prebuilt executable above is separate.
 
 ```bash
 git clone https://github.com/nulang-org/nulang.git
 cd nulang
-cargo build --release
+cargo build --locked --release
+./target/release/nulang --eval 'perform IO.print("Hello, Nulang!")'
 ```
 
-The release build uses `opt-level=3`, LTO, and single codegen-unit for maximum performance. A debug build (`cargo build`) is faster to compile but runs ~10x slower.
+Source builds with all default features can be costly. For a smaller compiler/runtime build, use `--no-default-features`; this changes which optional integrations are available.
 
 ### Feature Flags
 
@@ -58,7 +123,7 @@ cargo build --release --all-features
 | `otel` | Off | OpenTelemetry observability |
 | `difffuzz` | Off | Differential fuzzing driver binary |
 
-## Verifying the Build
+## Verify a source build
 
 ```bash
 # Run the test suite
@@ -68,7 +133,7 @@ cargo test
 cargo run -- --repl
 
 # Run a Nulang program
-cargo run -- examples/fibonacci.nula
+cargo run -- examples/01_hello.nula
 ```
 
 ## System-Specific Notes
@@ -93,4 +158,4 @@ brew install python@3.14
 
 ## Next Steps
 
-Now that Nulang is installed, follow the [Quick Start](/getting-started/quick-start/) guide to write your first program, and set up your editor with the [VS Code extension](/getting-started/editor-setup/) or the [language server](/tooling/language-server/).
+After installing Nulang, follow the [Quick Start](/getting-started/quick-start/) guide to write your first program, and set up your editor with the [VS Code extension](/getting-started/editor-setup/) or the [language server](/tooling/language-server/).
