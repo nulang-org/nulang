@@ -152,7 +152,13 @@ fn compiled_source_effect_drives_recovery_using_one_stable_operation_id() {
     .expect("compiler-produced effect site should be accepted");
 
     let formatted = compile_module(
-        "// whitespace\nactor Assistant {\n  behavior ask(prompt: String) {\n    perform Inference.ask(prompt)\n  }\n}\n",
+        r#"// whitespace
+actor Assistant {
+  behavior ask(prompt: String) {
+    perform Inference.ask(prompt)
+  }
+}
+"#,
     );
     let formatted_spec = DurableEffectSpec::from_compiled_async_site(
         &formatted,
@@ -308,7 +314,12 @@ fn compiled_async_effect_rejects_missing_turn_identity_and_distinguishes_occurre
     use nulang::primitives::{DeliverySemantics, EffectBoundary};
 
     let module = compile_module(
-        "actor Assistant { behavior ask(prompt: String) { perform Inference.ask(prompt)\n perform Inference.ask(prompt) } }",
+        r#"actor Assistant {
+            behavior ask(prompt: String) {
+                perform Inference.ask(prompt)
+                perform Inference.ask(prompt)
+            }
+        }"#,
     );
     let build = |pc, key, occurrence| {
         DurableEffectSpec::from_compiled_async_site(
@@ -326,5 +337,8 @@ fn compiled_async_effect_rejects_missing_turn_identity_and_distinguishes_occurre
     let repeated = build(module.effect_sites[0].pc, "turn:1", 1).unwrap();
     assert_ne!(first.id, second.id);
     assert_ne!(first.id, repeated.id);
-    assert_eq!(first.id, build(module.effect_sites[0].pc, "turn:1", 0).unwrap().id);
+    assert_eq!(
+        first.id,
+        build(module.effect_sites[0].pc, "turn:1", 0).unwrap().id
+    );
 }
