@@ -1117,6 +1117,25 @@ fn successful_route_response(route: &RuntimeWebRoute, rendered: String) -> HttpR
     let contract = route.plan.as_ref().and_then(|plan| plan.response.as_ref());
     match contract {
         Some(contract) => {
+            // Json[T] is currently serialized text. Use the same compiler-owned
+            // codec as typed request bodies, so response media and primitive
+            // payload shapes cannot drift from the declared contract.
+            if contract.kind == crate::web::response::ResponseBodyKind::Json {
+                let valid = contract.payload_type.as_ref().is_some_and(|payload| {
+                    let codec = crate::web::codec::BodyCodecContract::json(payload.clone());
+                    crate::web::codec::validate_encoded_body(&codec, &rendered).is_ok()
+                });
+                if !valid {
+                    return HttpResponse {
+                        status: 500,
+                        headers: vec![
+                            ("Content-Type".into(), "text/plain".into()),
+                            ("Cache-Control".into(), "no-store".into()),
+                        ],
+                        body: b"Internal server error".to_vec(),
+                    };
+                }
+            }
             let body = if contract.inject_client_runtime {
                 inject_client_runtime_script(&rendered).into_bytes()
             } else {

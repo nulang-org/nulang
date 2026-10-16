@@ -408,7 +408,7 @@ import stdlib::web::html
 import stdlib::web::types
 
 fn home() -> Html { text("Static homepage") }
-fn status() -> Json[String] { "{\"ok\":true}" }
+fn status() -> Json[String] { "\"ok\"" }
 
 app "mixed-routes" {
     route "GET" "/" -> home

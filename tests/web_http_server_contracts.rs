@@ -264,6 +264,60 @@ fn malformed_typed_json_body_is_400_problem_json() {
 }
 
 #[test]
+fn typed_json_request_response_round_trip_rejects_primitive_output_mismatch() {
+    // The input decoder accepts Json[String], but the handler returns a
+    // syntactically valid JSON number rather than a JSON string.
+    // Output validation must enforce the same primitive wire shape.
+    let mut route = typed_json_body_route();
+    let (module, function_index) = compile_handler(
+        "type alias Json[T] = String\nfn endpoint(payload: Json[String]) -> Json[String] { \"42\" }",
+        "endpoint",
+    );
+    route.route.handler_module = module;
+    route.route.handler_func_idx = function_index;
+
+    let server = WebDevServer::bind_runtime(0, None, None, vec![route])
+        .expect("bind typed JSON round-trip WebDevServer");
+
+    let valid_input = send_raw_request(
+        server.port,
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 7\r\nConnection: close\r\n\r\n\"hello\"",
+    );
+    assert!(
+        valid_input.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+        "{valid_input}"
+    );
+    assert!(
+        valid_input
+            .to_ascii_lowercase()
+            .contains("content-type: text/plain\r\n"),
+        "{valid_input}"
+    );
+    assert!(
+        valid_input
+            .to_ascii_lowercase()
+            .contains("cache-control: no-store\r\n"),
+        "{valid_input}"
+    );
+    assert_eq!(response_body(&valid_input), "Internal server error");
+    assert!(!valid_input.contains("app.client.js"), "{valid_input}");
+
+    // Input errors must be reported before invoking the handler and
+    // consequently before checking its intentionally invalid response.
+    let invalid_input = send_raw_request(
+        server.port,
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 1\r\nConnection: close\r\n\r\n{",
+    );
+    assert!(
+        invalid_input.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+        "{invalid_input}"
+    );
+    let problem: serde_json::Value =
+        serde_json::from_str(response_body(&invalid_input)).expect("parse problem JSON");
+    assert_eq!(problem["code"], "invalid_request_body");
+}
+
+#[test]
 fn legacy_route_still_falls_back_over_real_http() {
     let server =
         WebDevServer::bind(0, None, None, vec![legacy_route()]).expect("bind legacy WebDevServer");
