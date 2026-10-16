@@ -53,8 +53,11 @@ impl WebSqliteHttpMount {
         }
     }
 
-    pub(crate) fn handles(&self, path: &str) -> bool {
-        path.starts_with(WEB_SQLITE_HTTP_PREFIX)
+    pub(crate) fn handles(&self, target: &str) -> bool {
+        // HTTP request-target includes the query. Reserve the exact root
+        // and its subtree before regular Nulang/static route dispatch.
+        let path = target.split('?').next().unwrap_or(target);
+        path == "/__nulang/sqlite" || path.starts_with(WEB_SQLITE_HTTP_PREFIX)
     }
 
     /// Auth errors are handled inside this boundary, never by a permissive
