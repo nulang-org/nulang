@@ -30,6 +30,12 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Verify emitted signal runtime (Node VM)
+        run: node --test tests/web_reactivity_runtime.test.cjs
+
+      - name: Verify signal hydration in real Chromium
+        run: node --test tests/web_reactivity_browser.test.cjs
+
       - name: Enable corepack
         run: corepack enable
 
