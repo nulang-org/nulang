@@ -182,7 +182,11 @@ fn literal_compatible(argument: ArgumentType, oid: u32) -> bool {
         ArgumentType::Float => oid == 701, // float8
         ArgumentType::Bool => oid == 16, // bool
         ArgumentType::Text => matches!(oid, 25 | 1043), // text, varchar
-        ArgumentType::Null | ArgumentType::Dynamic => true,
+        // The legacy DB host callback marshals nil through its string
+        // fallback rather than a typed SQL NULL. Fail closed until the
+        // actual runtime binder supports nullable parameters.
+        ArgumentType::Null => false,
+        ArgumentType::Dynamic => true,
     }
 }
 
