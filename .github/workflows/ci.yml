@@ -109,8 +109,19 @@ jobs:
         # nextest intentionally does not execute rustdoc tests.
         run: cargo test --locked --doc
 
-      - name: Test benchmark harness scripts
+      - name: Setup Python for CI validators
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install issue form validator dependencies
+        run: python3 -m pip install PyYAML==6.0.3
+
+      - name: Test Python CI helpers
         run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+
+      - name: Validate GitHub issue form YAML
+        run: python3 scripts/validate_issue_forms.py
 
       - name: Install cargo-llvm-cov
         if: env.CODECOV_TOKEN != ''
