@@ -300,6 +300,10 @@ pub enum WorkflowEvent {
         name: String,
         payload: Option<String>,
     },
+    /// Durable intent recorded before executing a compensation. If no later
+    /// SagaCompensated event exists, its external outcome is UNKNOWN and must
+    /// not be silently dispatched again during recovery.
+    SagaCompensationStarted { sequence: u64, step_name: String },
     /// A saga step was compensated after failure.
     SagaCompensated { sequence: u64, step_name: String },
     /// A branch of a synthetic parallel step completed.
@@ -344,6 +348,7 @@ impl WorkflowEvent {
             | WorkflowEvent::TimerSet { sequence, .. }
             | WorkflowEvent::TimerFired { sequence, .. }
             | WorkflowEvent::SignalReceived { sequence, .. }
+            | WorkflowEvent::SagaCompensationStarted { sequence, .. }
             | WorkflowEvent::SagaCompensated { sequence, .. }
             | WorkflowEvent::ParallelBranchCompleted { sequence, .. }
             | WorkflowEvent::StepFailed { sequence, .. }
