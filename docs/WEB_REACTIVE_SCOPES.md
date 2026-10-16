@@ -37,13 +37,47 @@ Identity is represented by a JavaScript `Symbol` scoped to the mount,
 **not a string prefix**, avoiding collisions with global names or
 `__proto__`-like keys.
 
+## Explicit SSR-local hydration
+
+The experimental web compiler recognizes the **static** HTML attribute
+`nulang-scope="local"` on an element and emits
+`data-nulang-scope="local"` alongside its existing reactive binding
+markers. On page load, the client runtime mounts these roots using
+`localSignals: true` **before** mounting ordinary document-level
+bindings.
+
+```nulang
+// Illustration using an existing global signal declaration.
+signal status: Html = text("Ready")
+
+fn view() -> Html {
+    <section nulang-scope="local"><span>{status}</span></section>
+}
+```
+
+Repeating the rendered section creates independently owned browser signal
+instances, initialized from each island's server-rendered markup. The
+scope remains available from `window.nulang.mount(element,
+{ localSignals: true })`, which returns the already-mounted scope.
+
+Existing client-side action functions may accept the mount scope as
+their first argument, so they can read or update the island's signals.
+Zero-argument handlers remain compatible. This scope parameter
+**does not** change the effect-checked client/server action placement.
+
+Only the static literal `"local"` (or an equivalent static
+`text("local")` construction) is recognized by the compiler. Dynamic
+scope-mode expressions are not lowered. On the browser side,
+unsupported `data-nulang-scope` values and nested SSR-local roots are
+rejected before subscriptions are mounted, rather than silently
+mixing global and local reactive state.
+
 ## Limitations
 
-Automatic document hydration continues to register the existing global
-bindings. Component-local scopes currently work on explicitly mounted,
-unowned subtrees; there is no compiler-generated component scope marker
-or automatic nested-scope discovery yet. A component's local scope must
-therefore be mounted before another scope claims its elements.
+Ordinary document hydration still claims every unowned legacy binding.
+Client-side dynamically inserted islands still require an explicit
+`mount(root, { localSignals: true })`; no DOM mutation observer is added.
+Automatic nested scopes and keyed reconciliation are not implemented.
 
 The compiler's existing graph still refers to source signal names.
 This PR does **not** implement compiler-resolved per-component signal
