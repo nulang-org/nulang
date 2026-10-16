@@ -263,7 +263,6 @@ fn malformed_typed_json_body_is_400_problem_json() {
     assert_eq!(problem["code"], "invalid_request_body");
 }
 
-
 #[test]
 fn typed_json_request_response_round_trip_rejects_primitive_output_mismatch() {
     // The input decoder accepts Json[String], but the handler returns a
