@@ -253,10 +253,12 @@ impl DurableEffectSpec {
     /// declared operation matches the opcode constant. The static site ID and
     /// caller's replay-stable turn key/occurrence identify the logical call.
     ///
-    /// This **does not dispatch or journal the effect**. Callers must pass the
-    /// returned spec to the coordinator before any provider call, and must
-    /// supply truthful boundary/delivery semantics. In particular, an
-    /// effectively-once claim still requires real provider-side deduplication.
+    /// This **does not dispatch or journal the effect**, or authenticate its
+    /// semantic-site hash. Use only an artifact admitted through the verified
+    /// compilation/artifact-pin path; opcode/constant agreement alone cannot
+    /// prove provenance. Callers must pass the spec to the coordinator before
+    /// provider dispatch and supply truthful boundary/delivery semantics.
+    /// Effectively-once still requires real provider-side deduplication.
     pub fn from_compiled_async_site(
         module: &CodeModule,
         pc: usize,
