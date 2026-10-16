@@ -969,6 +969,8 @@ pub fn generate_client_runtime() -> String {
   const signals = Object.create(null);
   const signalBindings = Object.create(null);
   const attributeBindings = Object.create(null);
+  const dirtySignals = new Set();
+  let batchDepth = 0;
   const safeAttributes = [
     ['title', 'data-nulang-bind-title'],
     ['aria-label', 'data-nulang-bind-aria-label']
@@ -986,6 +988,35 @@ pub fn generate_client_runtime() -> String {
       attributes.forEach(function (binding) {
         binding.el.setAttribute(binding.attribute, String(signals[name]));
       });
+    }
+  }
+
+  // Retain synchronous single updates, but coalesce repeated DOM writes inside
+  // explicit batches. Signal reads always observe the latest assigned value.
+  function setSignal(name, value) {
+    if (Object.is(signals[name], value)) return;
+    signals[name] = value;
+    if (batchDepth > 0) {
+      dirtySignals.add(name);
+    } else {
+      refreshSignal(name);
+    }
+  }
+
+  function batch(callback) {
+    if (typeof callback !== 'function') {
+      throw new TypeError('nulang.batch requires a function');
+    }
+    batchDepth += 1;
+    try {
+      return callback();
+    } finally {
+      batchDepth -= 1;
+      if (batchDepth === 0) {
+        const pending = Array.from(dirtySignals);
+        dirtySignals.clear();
+        pending.forEach(refreshSignal);
+      }
     }
   }
 
@@ -1104,12 +1135,12 @@ pub fn generate_client_runtime() -> String {
   }
 
   window.nulang = {
+    batch: batch,
     signal: function (name) {
       return {
         get: function () { return signals[name]; },
         set: function (value) {
-          signals[name] = value;
-          refreshSignal(name);
+          setSignal(name, value);
         }
       };
     }
