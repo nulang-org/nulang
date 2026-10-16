@@ -6,7 +6,7 @@ const component = readFileSync(new URL('../src/components/NativeActorDemo.astro'
 const homepage = readFileSync(new URL('../src/content/docs/index.mdx', import.meta.url), 'utf8');
 const architecture = readFileSync(new URL('../src/components/ArchitectureMap.astro', import.meta.url), 'utf8');
 const hero = readFileSync(new URL('../src/components/Hero.astro', import.meta.url), 'utf8');
-const canonical = readFileSync(new URL('../../../examples/worker_pool.nula', import.meta.url), 'utf8');
+const canonical = readFileSync(new URL('../../examples/worker_pool.nula', import.meta.url), 'utf8');
 
 test('native demo contains the checked-in executable worker-pool program', () => {
   const displayed = component.match(/const demoSource = String\.raw\x60([\s\S]*?)\x60;/);
