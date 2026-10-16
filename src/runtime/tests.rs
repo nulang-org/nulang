@@ -9002,3 +9002,49 @@ fn saga_ambiguous_compensation_status_survives_process_restart() {
     drop(recovered);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+
+#[test]
+fn saga_refuses_unverified_compensation_code_after_recovery() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_owned(), StateModel::Durable);
+    let id = rt.spawn_workflow_actor(
+        "MissingCompensationCode",
+        Box::new(|| vec![("step_index".to_owned(), Value::int(1))]),
+        models,
+    );
+    workflow::commit_step_completed(&mut rt, id, None, "reserve".into()).unwrap();
+    workflow::commit_step_failed(&mut rt, id, None, "ship".into(), "failed".into()).unwrap();
+
+    assert!(rt.actors[&id].bytecode_module.is_none());
+    rt.run_saga_compensation(id, 1);
+    assert!(
+        !rt.persistence.read_workflow_events(id).iter().any(|event| {
+            matches!(
+                event,
+                WorkflowEvent::SagaCompensationStarted { .. }
+                    | WorkflowEvent::SagaCompensated { .. }
+            )
+        }),
+        "a missing compensation body must not be accepted as an executed recovery"
+    );
+}
+
+#[test]
+fn saga_intent_fencing_failure_does_not_publish_started_event() {
+    let mut rt = Runtime::new();
+    let id = rt.spawn_workflow_actor(
+        "FencedSaga",
+        Box::new(Vec::new),
+        HashMap::new(),
+    );
+    let current_tail = rt.persistence.latest_sequence(id);
+    rt.actors.get_mut(&id).unwrap().activation_epoch = 0;
+
+    assert!(rt.append_saga_compensation_started(id, "reserve").is_err());
+    assert_eq!(rt.persistence.latest_sequence(id), current_tail);
+    assert!(!rt.persistence.read_workflow_events(id).iter().any(|event| {
+        matches!(event, WorkflowEvent::SagaCompensationStarted { .. })
+    }));
+}
