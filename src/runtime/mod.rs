@@ -1353,8 +1353,14 @@ impl Runtime {
                 crate::jit::runtime::set_jit_safepoint_ptr(&mut actor.jit_safepoint_counter);
             }
 
+            // The first scheduler dispatch restores this flag on return.
+            // Continuations must preserve scheduler-only asynchronous waits,
+            // or receive-after/LLM operations incorrectly run synchronously.
+            let saved_suspend = (*self_ptr).suspend_enabled;
+            (*self_ptr).suspend_enabled = true;
             (*self_ptr).vm_exec_begin();
             let result = vm.resume();
+            (*self_ptr).suspend_enabled = saved_suspend;
             vm.set_cooperative_instruction_budget(None);
             #[cfg(feature = "native-codegen")]
             crate::jit::runtime::clear_jit_safepoint_ptr();
@@ -3303,7 +3309,13 @@ impl Runtime {
         let mut ready: Vec<u64> = self
             .actors
             .iter()
-            .filter(|(_, a)| !a.mailbox.is_empty())
+            .filter(|(_, actor)| {
+                matches!(
+                    actor.state,
+                    ActorState::Running | ActorState::Created | ActorState::Waiting
+                ) && ((actor.jit_yield_pending && actor.suspended_execution.is_some())
+                    || (!actor.mailbox.is_empty() && actor.suspended_execution.is_none()))
+            })
             .map(|(id, _)| *id)
             .collect();
         if ready.is_empty() {
@@ -5304,9 +5316,16 @@ impl Runtime {
             // regions also honor their existing independent safepoint budget.
             // Until durable completion is coupled to resumptions, keep
             // interpreter-quantum suspension limited to transient actors.
-            let instruction_budget = (*self_ptr).actors.get(&actor_id).and_then(|actor| {
-                (!actor.persistent && !actor.is_workflow).then_some(actor.max_reductions)
-            });
+            // Direct synchronous asks and mailbox flushes must finish the
+            // invoked behavior before returning to their caller. Only the
+            // scheduler-driven entry path enables cooperative dispatch.
+            let instruction_budget = if (*self_ptr).suspend_enabled {
+                (*self_ptr).actors.get(&actor_id).and_then(|actor| {
+                    (!actor.persistent && !actor.is_workflow).then_some(actor.max_reductions)
+                })
+            } else {
+                None
+            };
             vm.set_cooperative_instruction_budget(instruction_budget);
             let result = vm.run_from(module_idx, code_offset);
             vm.set_cooperative_instruction_budget(None);
