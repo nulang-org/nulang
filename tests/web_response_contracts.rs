@@ -187,3 +187,37 @@ fn json_response_uses_json_content_type_without_client_runtime_injection() {
     assert_eq!(response_body(&response), "{\"ok\":true}");
     assert!(!response.contains("app.client.js"), "{response}");
 }
+
+#[test]
+fn declared_json_response_rejects_invalid_serialized_body_over_real_http() {
+    // The response wrapper is compiler-visible, but the current VM body is a
+    // String. A malformed serialized value must not masquerade as JSON.
+    let mut route = json_runtime_route();
+    let (module, function_index) = compile_handler(
+        "type alias Json[T] = String\nfn endpoint() -> Json[String] { \"not-valid-json\" }",
+        "endpoint",
+    );
+    route.route.handler_module = module;
+    route.route.handler_func_idx = function_index;
+
+    let server = WebDevServer::bind_runtime(0, None, None, vec![route])
+        .expect("bind response-aware WebDevServer");
+    let response = send_raw_request(
+        server.port,
+        "GET /json HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+
+    assert!(
+        response.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+        "{response}"
+    );
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("content-type: text/plain\r\n"),
+        "{response}"
+    );
+    assert_eq!(response_body(&response), "Internal server error");
+    assert!(!response.contains("not-valid-json"), "{response}");
+    assert!(!response.contains("app.client.js"), "{response}");
+}

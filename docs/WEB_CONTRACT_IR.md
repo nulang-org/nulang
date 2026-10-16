@@ -277,7 +277,7 @@ The first explicit response-body contracts are now:
 - `Json[T]` -> `application/json`, with `T` retained as compiler-owned payload-schema metadata and browser-runtime injection disabled.
 - unwrapped `String` and arbitrary domain return types keep the legacy HTML-oriented behavior; the framework does not guess a media type.
 
-`Json[T]` is currently an already-serialized string marker, not an implicit serializer. This keeps transport semantics explicit while serialization/value codecs evolve independently. The same response contract is lowered into runtime route plans and Deployment IR and is reused by OpenAPI.
+`Json[T]` is currently an already-serialized string marker, not an implicit serializer. The HTTP response adapter verifies that the serialized body is syntactically valid JSON before publishing it as `application/json`; malformed output fails closed with a generic HTTP 500, with no response-body leak or browser-runtime injection. This does **not** validate the body against the declared payload type `T` (that requires a real codec/schema contract). The same response contract is lowered into runtime route plans and Deployment IR and is reused by OpenAPI.
 
 ## Remaining implementation priorities
 
