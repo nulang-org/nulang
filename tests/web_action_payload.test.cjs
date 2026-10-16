@@ -225,3 +225,63 @@ test('non-form action elements retain click handling', () => {
   listeners.click({ preventDefault() {} });
   assert.equal(calls, 1);
 });
+
+test('rapid duplicate submits share one in-flight action and failure permits retry', async () => {
+  const listeners = Object.create(null);
+  const pending = [];
+  const errors = [];
+  let reloads = 0;
+  const form = {
+    tagName: 'FORM',
+    dataset: { action: 'create', actionPlacement: 'server' },
+    closest(selector) {
+      assert.equal(selector, 'form');
+      return this;
+    },
+    addEventListener(event, listener) {
+      listeners[event] = listener;
+    }
+  };
+  class FakeFormData {
+    constructor(element) { assert.equal(element, form); }
+    forEach(callback) { callback('draft', 'title'); }
+  }
+
+  vm.runInNewContext(emittedRuntime(), {
+    window: {
+      location: {
+        href: 'https://example.test/records',
+        reload() { reloads++; }
+      }
+    },
+    URLSearchParams,
+    FormData: FakeFormData,
+    document: {
+      readyState: 'complete',
+      querySelectorAll(selector) {
+        return selector === '[data-action]' ? [form] : [];
+      }
+    },
+    fetch: (_url, options) => new Promise((resolve) => {
+      pending.push({ resolve, options });
+    }),
+    console: { warn() {}, error(error) { errors.push(error); } }
+  });
+
+  const event = { preventDefault() {} };
+  listeners.submit(event);
+  listeners.submit(event);
+  assert.equal(pending.length, 1,
+    'a second submit while the first POST is unresolved must not post again');
+
+  // A server rejection must unblock the form so that the user can retry.
+  pending[0].resolve({ ok: false, status: 409 });
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  assert.equal(errors.length, 1);
+  assert.equal(reloads, 0);
+  listeners.submit(event);
+  assert.equal(pending.length, 2, 'form must be retryable after a failed POST');
+  pending[1].resolve({ ok: true });
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  assert.equal(reloads, 1);
+});
