@@ -44,8 +44,8 @@ function element(initial) {
   };
 }
 
-function hydrate(elements) {
-  const window = {};
+function hydrate(elements, actions) {
+  const window = { nulangActions: actions };
   const document = {
     readyState: 'complete',
     querySelectorAll(selector) {
@@ -198,4 +198,119 @@ test('a throwing batch flushes the final state and propagates the error', () => 
 test('batch rejects non-function callbacks', () => {
   const api = hydrate([]);
   assert.throws(() => api.batch(null), /batch requires a function/);
+});
+
+
+function subtree(elements) {
+  return {
+    querySelectorAll(selector) {
+      const match = /^\[([a-z-]+)\]$/.exec(selector);
+      assert.ok(match, 'unexpected selector: ' + selector);
+      return elements.filter((el) => el.getAttribute(match[1]) !== null);
+    }
+  };
+}
+
+test('mount synchronizes new DOM bindings and dispose prevents stale writes', () => {
+  const api = hydrate([]);
+  api.signal('status').set('Live');
+  const text = element({ textContent: 'Stale', attributes: { 'data-signal': 'status' } });
+  const button = element({
+    attributes: { title: 'Stale', 'data-nulang-bind-title': 'status' }
+  });
+  const root = subtree([text, button]);
+  const owner = api.mount(root);
+  assert.equal(text.textContent, 'Live');
+  assert.equal(button.getAttribute('title'), 'Live');
+  api.signal('status').set('First');
+  assert.equal(text.textContent, 'First');
+  assert.equal(button.getAttribute('title'), 'First');
+
+  owner.dispose();
+  owner.dispose(); // Disposal is idempotent.
+  const prior = button.calls.length;
+  api.signal('status').set('Second');
+  assert.equal(text.textContent, 'First');
+  assert.equal(button.getAttribute('title'), 'First');
+  assert.equal(button.calls.length, prior);
+
+  api.mount(root);
+  assert.equal(text.textContent, 'Second');
+  assert.equal(button.getAttribute('title'), 'Second');
+  api.signal('status').set('Third');
+  assert.equal(button.calls.filter(([name, value]) =>
+    name === 'title' && value === 'Third').length, 1);
+});
+
+test('repeated or overlapping mounts never double-subscribe an element', () => {
+  const button = element({
+    attributes: { title: 'Initial', 'data-nulang-bind-title': 'status' }
+  });
+  const api = hydrate([button]); // Document hydration already owns button.
+  const root = subtree([button]);
+  const mounted = api.mount(root);
+  assert.equal(api.mount(root), mounted);
+  api.signal('status').set('Next');
+  assert.deepEqual(button.calls, [['title', 'Next']]);
+  mounted.dispose(); // Must not dispose the document-owned binding.
+  api.signal('status').set('Last');
+  assert.deepEqual(button.calls, [['title', 'Next'], ['title', 'Last']]);
+});
+
+test('disposing during a batch suppresses pending writes to the detached scope', () => {
+  const button = element({
+    attributes: { title: 'Before', 'data-nulang-bind-title': 'status' }
+  });
+  const api = hydrate([]);
+  const root = subtree([button]);
+  const owner = api.mount(root);
+  api.batch(() => {
+    api.signal('status').set('During');
+    owner.dispose();
+  });
+  assert.equal(button.getAttribute('title'), 'Before');
+  assert.equal(button.calls.length, 0);
+  api.mount(root);
+  assert.equal(button.getAttribute('title'), 'During');
+});
+
+test('disposed scope removes action listeners and can be mounted again', () => {
+  let clicked = 0;
+  const api = hydrate([], { increment() { clicked += 1; } });
+  const action = element({
+    tagName: 'BUTTON',
+    attributes: { 'data-action': 'increment', 'data-action-placement': 'client' }
+  });
+  action.dataset.action = 'increment';
+  action.dataset.actionPlacement = 'client';
+  const listeners = new Map();
+  action.addEventListener = (type, fn) => {
+    if (!listeners.has(type)) listeners.set(type, new Set());
+    listeners.get(type).add(fn);
+  };
+  action.removeEventListener = (type, fn) => listeners.get(type)?.delete(fn);
+  function click() {
+    for (const fn of listeners.get('click') || []) fn({ preventDefault() {} });
+  }
+  const root = subtree([action]);
+  const owner = api.mount(root);
+  click();
+  assert.equal(clicked, 1);
+  owner.dispose();
+  assert.equal(listeners.get('click').size, 0);
+  click();
+  assert.equal(clicked, 1);
+
+  api.mount(root);
+  click();
+  assert.equal(clicked, 2);
+  assert.equal(listeners.get('click').size, 1);
+});
+
+test('mount rejects invalid roots without changing reactive state', () => {
+  const api = hydrate([]);
+  assert.throws(() => api.mount(null), /mount requires a root/);
+  assert.throws(() => api.mount({}), /mount requires a root/);
+  api.signal('value').set('Still usable');
+  assert.equal(api.signal('value').get(), 'Still usable');
 });

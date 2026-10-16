@@ -1106,56 +1106,119 @@ pub fn generate_client_runtime() -> String {
     window.location.reload();
   }
 
-  function hydrate() {
-    document.querySelectorAll('[data-signal]').forEach(function (el) {
-      const name = el.dataset.signal;
-      if (!(name in signals)) {
-        signals[name] = el.textContent;
-      }
-      if (!signalBindings[name]) {
-        signalBindings[name] = [];
-      }
-      signalBindings[name].push(el);
-    });
+  // Each DOM binding belongs to a mount scope. Disposing removes it from the
+  // signal index as well as removing any listeners. The WeakMaps prevent
+  // overlapping mounts from registering the same element twice.
+  const elementOwners = new WeakMap();
+  const mountedRoots = new WeakMap();
 
-    safeAttributes.forEach(function (entry) {
-      const attribute = entry[0];
-      const marker = entry[1];
-      document.querySelectorAll('[' + marker + ']').forEach(function (el) {
-        const name = el.getAttribute(marker);
-        if (!name) return;
-        if (!(name in signals)) {
-          signals[name] = el.getAttribute(attribute);
-        }
-        if (!attributeBindings[name]) {
-          attributeBindings[name] = [];
-        }
-        attributeBindings[name].push({ el: el, attribute: attribute });
+  function mount(root) {
+    if (!root || typeof root.querySelectorAll !== 'function') {
+      throw new TypeError('nulang.mount requires a root with querySelectorAll');
+    }
+    const existing = mountedRoots.get(root);
+    if (existing) return existing;
+
+    const cleanups = [];
+    const scope = {
+      dispose: function () {
+        if (mountedRoots.get(root) !== scope) return;
+        mountedRoots.delete(root);
+        for (let i = cleanups.length - 1; i >= 0; i--) cleanups[i]();
+        cleanups.length = 0;
+      }
+    };
+    mountedRoots.set(root, scope);
+
+    function select(selector) {
+      const nodes = Array.from(root.querySelectorAll(selector));
+      if (typeof root.matches === 'function' && root.matches(selector)) {
+        nodes.unshift(root);
+      }
+      return nodes;
+    }
+
+    function claim(el) {
+      const current = elementOwners.get(el);
+      if (current) return current === scope;
+      elementOwners.set(el, scope);
+      cleanups.push(function () {
+        if (elementOwners.get(el) === scope) elementOwners.delete(el);
       });
-    });
+      return true;
+    }
 
-    document.querySelectorAll('[data-action]').forEach(function (el) {
-      const handler = el.dataset.action;
-      const placement = el.dataset.actionPlacement;
-      const listener = function (e) {
-        e.preventDefault();
-        if (placement === 'server') {
-          runServerAction(handler, el).catch(function (err) {
-            console.error('nulang: server action failed', err);
-          });
-        } else {
-          runClientAction(handler);
+    function subscribe(index, name, binding) {
+      let bindings = index[name];
+      if (!bindings) bindings = index[name] = new Set();
+      bindings.add(binding);
+      cleanups.push(function () {
+        bindings.delete(binding);
+        if (bindings.size === 0) delete index[name];
+      });
+    }
+
+    function listen(el, event, handler) {
+      el.addEventListener(event, handler);
+      cleanups.push(function () { el.removeEventListener(event, handler); });
+    }
+
+    try {
+      select('[data-signal]').forEach(function (el) {
+        const name = el.dataset.signal;
+        if (!name || !claim(el)) return;
+        if (!(name in signals)) signals[name] = el.textContent;
+        else if (el.textContent !== String(signals[name])) {
+          el.textContent = signals[name];
         }
-      };
-      el.addEventListener('click', listener);
-      if (el.tagName === 'FORM') {
-        el.addEventListener('submit', listener);
-      }
-    });
+        subscribe(signalBindings, name, el);
+      });
+
+      safeAttributes.forEach(function (entry) {
+        const attribute = entry[0];
+        const marker = entry[1];
+        select('[' + marker + ']').forEach(function (el) {
+          const name = el.getAttribute(marker);
+          if (!name || !claim(el)) return;
+          if (!(name in signals)) signals[name] = el.getAttribute(attribute);
+          else if (el.getAttribute(attribute) !== String(signals[name])) {
+            el.setAttribute(attribute, String(signals[name]));
+          }
+          subscribe(attributeBindings, name, { el: el, attribute: attribute });
+        });
+      });
+
+      select('[data-action]').forEach(function (el) {
+        const handler = el.dataset.action;
+        if (!handler || !claim(el)) return;
+        const placement = el.dataset.actionPlacement;
+        const listener = function (e) {
+          e.preventDefault();
+          if (placement === 'server') {
+            runServerAction(handler, el).catch(function (err) {
+              console.error('nulang: server action failed', err);
+            });
+          } else {
+            runClientAction(handler);
+          }
+        };
+        listen(el, 'click', listener);
+        if (el.tagName === 'FORM') listen(el, 'submit', listener);
+      });
+    } catch (error) {
+      scope.dispose();
+      throw error;
+    }
+    return scope;
+  }
+
+  function hydrate() {
+    mount(document);
   }
 
   window.nulang = {
     batch: batch,
+    mount: mount,
     signal: function (name) {
       return {
         get: function () { return signals[name]; },
