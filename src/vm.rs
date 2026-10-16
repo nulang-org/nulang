@@ -6378,6 +6378,161 @@ mod vm_tests {
         assert_eq!(vm.frames[0].pc, 1, "ReadyValue must not rewind the PC");
     }
 
+    /// An opted-in runtime callback must see the executing bytecode site,
+    /// not a source location or a guessed ordinal. Suspension replays the
+    /// same site after the VM rewinds the PC.
+    #[derive(Debug)]
+    struct SiteAwareEffectCallbacks {
+        heap_callbacks: ReadyValueCallbacks,
+        sites: std::rc::Rc<std::cell::RefCell<Vec<(usize, [u8; 32], String)>>>,
+        pending_once: bool,
+    }
+
+    impl ActorVmCallbacks for SiteAwareEffectCallbacks {
+        fn alloc(&mut self, size: usize, tag: HeapTypeTag) -> Option<*mut u8> {
+            self.heap_callbacks.alloc(size, tag)
+        }
+
+        fn drop_ref(&mut self, ptr: *mut u8) {
+            self.heap_callbacks.drop_ref(ptr);
+        }
+
+        fn retain_ref(&mut self, ptr: *mut u8) {
+            self.heap_callbacks.retain_ref(ptr);
+        }
+
+        fn array_len(&self, ptr: *mut u8) -> Option<usize> {
+            self.heap_callbacks.array_len(ptr)
+        }
+
+        fn spawn_actor(
+            &mut self,
+            _module: &CodeModule,
+            _spawn_pc: usize,
+            _behavior_idx: usize,
+            _init: Vec<(String, Value)>,
+        ) -> Value {
+            Value::actor_ref(0)
+        }
+
+        fn send_message(&mut self, _target: Value, _behavior_id: u16, _args: &[Value]) {}
+
+        fn perform_async_in_module(
+            &mut self,
+            module: &CodeModule,
+            pc: usize,
+            effect_op: &str,
+            _args: &[Value],
+        ) -> PerformAsyncResult {
+            let site = module.effect_site_at(pc).expect("exact compiler site");
+            assert_eq!(site.effect_operation, effect_op);
+            self.sites
+                .borrow_mut()
+                .push((pc, site.id, effect_op.to_string()));
+            if self.pending_once {
+                self.pending_once = false;
+                PerformAsyncResult::Pending
+            } else {
+                PerformAsyncResult::ReadyValue(Value::int(74))
+            }
+        }
+    }
+
+    #[test]
+    fn perform_async_passes_exact_compiled_site_across_pending_and_resume() {
+        use crate::bytecode::EffectSiteMetadata;
+
+        let sites = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut vm = VM::new_without_jit();
+        let mut module = CodeModule::new("async_site_resume");
+        let constant = module.add_string_constant("Inference.ask");
+        let instr = Instruction::new3(
+            OpCode::PerformAsync,
+            (constant >> 8) as u8,
+            constant as u8,
+            7,
+        );
+        module.emit(instr);
+        module.effect_sites.push(EffectSiteMetadata {
+            pc: 0,
+            id: [7; 32],
+            effect_operation: "Inference.ask".to_string(),
+        });
+        vm.load_module(module);
+        vm.set_actor_callbacks(Box::new(SiteAwareEffectCallbacks {
+            heap_callbacks: ReadyValueCallbacks::new(),
+            sites: sites.clone(),
+            pending_once: true,
+        }));
+
+        let mut frame = Frame::new(None, 0);
+        frame.pc = 1; // The fetch loop has advanced beyond opcode 0.
+        vm.frames.push(frame);
+        vm.current_frame_idx = Some(0);
+
+        assert!(matches!(
+            vm.step_perform_async(0, 0, instr),
+            Err(NuError::Suspended(VmSuspension::PerformAsync))
+        ));
+        assert_eq!(vm.frames[0].pc, 0);
+        vm.frames[0].pc = 1; // Simulate the next fetch of the same opcode.
+        vm.step_perform_async(0, 0, instr).unwrap();
+        assert_eq!(vm.frames[0].regs[7].as_int(), Some(74));
+        assert_eq!(
+            sites.borrow().as_slice(),
+            &[
+                (0, [7; 32], "Inference.ask".to_string()),
+                (0, [7; 32], "Inference.ask".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn perform_async_preserves_distinct_site_ids_for_identical_operations() {
+        use crate::bytecode::EffectSiteMetadata;
+
+        let sites = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut vm = VM::new_without_jit();
+        let mut module = CodeModule::new("async_distinct_sites");
+        let constant = module.add_string_constant("Inference.ask");
+        let instr = Instruction::new3(
+            OpCode::PerformAsync,
+            (constant >> 8) as u8,
+            constant as u8,
+            7,
+        );
+        module.emit(instr);
+        module.emit(instr);
+        for (pc, id) in [(0, [11; 32]), (1, [22; 32])] {
+            module.effect_sites.push(EffectSiteMetadata {
+                pc,
+                id,
+                effect_operation: "Inference.ask".to_string(),
+            });
+        }
+        vm.load_module(module);
+        vm.set_actor_callbacks(Box::new(SiteAwareEffectCallbacks {
+            heap_callbacks: ReadyValueCallbacks::new(),
+            sites: sites.clone(),
+            pending_once: false,
+        }));
+
+        let mut frame = Frame::new(None, 0);
+        frame.pc = 1;
+        vm.frames.push(frame);
+        vm.current_frame_idx = Some(0);
+        vm.step_perform_async(0, 0, instr).unwrap();
+        vm.frames[0].pc = 2;
+        vm.step_perform_async(0, 0, instr).unwrap();
+        assert_eq!(
+            sites.borrow().as_slice(),
+            &[
+                (0, [11; 32], "Inference.ask".to_string()),
+                (1, [22; 32], "Inference.ask".to_string()),
+            ]
+        );
+    }
+
     /// A NULL C string return (nil from cstr_to_value) must pass through
     /// instead of erroring on the missing pointer.
     #[test]
