@@ -427,6 +427,60 @@ mod tests {
     }
 
     #[test]
+    fn dropping_an_unfinished_scope_signals_running_and_queued_children() {
+        let mut scope = TaskScope::<(), ()>::new(1, 2).unwrap();
+        let running = scope.try_submit().unwrap();
+        let _queued = scope.try_submit().unwrap();
+        assert_eq!(scope.admit_next(), Some(running));
+        let token = scope.cancellation_token();
+        assert!(!token.is_cancelled());
+
+        drop(scope);
+
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn dropping_a_quiescent_scope_does_not_spuriously_cancel_children() {
+        let mut scope = TaskScope::<(), ()>::new(1, 1).unwrap();
+        let running = scope.try_submit().unwrap();
+        assert_eq!(scope.admit_next(), Some(running));
+        scope.complete(running, Ok(())).unwrap();
+        assert!(scope.is_quiescent());
+        let token = scope.cancellation_token();
+
+        drop(scope);
+
+        assert!(!token.is_cancelled());
+    }
+
+    #[test]
+    fn premature_outcome_collection_cancels_the_abandoned_scope() {
+        let mut scope = TaskScope::<(), ()>::new(1, 1).unwrap();
+        let running = scope.try_submit().unwrap();
+        assert_eq!(scope.admit_next(), Some(running));
+        let token = scope.cancellation_token();
+
+        assert_eq!(scope.into_outcomes(), Err(ScopeError::NotQuiescent));
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn successful_outcome_collection_keeps_cancellation_signal_clear() {
+        let mut scope = TaskScope::<usize, ()>::new(1, 1).unwrap();
+        let running = scope.try_submit().unwrap();
+        assert_eq!(scope.admit_next(), Some(running));
+        scope.complete(running, Ok(42)).unwrap();
+        let token = scope.cancellation_token();
+
+        assert_eq!(
+            scope.into_outcomes().unwrap(),
+            vec![TaskOutcome::Completed(Ok(42))]
+        );
+        assert!(!token.is_cancelled());
+    }
+
+    #[test]
     fn completion_does_not_mean_parent_scope_can_close_with_queued_children() {
         let mut scope = TaskScope::<usize, ()>::new(1, 2).unwrap();
         let a = scope.try_submit().unwrap();
