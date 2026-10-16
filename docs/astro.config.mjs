@@ -153,7 +153,10 @@ export default defineConfig({
           label: 'Why Nulang?',
           collapsed: false,
           items: [
+            { label: 'Performance Benchmarks', link: 'benchmarks/' },
             { label: 'Comparisons & Philosophy', link: 'blog/' },
+            { label: 'Compare Languages & Frameworks', link: 'comparisons/' },
+            { label: 'Reduce Infrastructure Services', link: 'infrastructure/' },
           ],
         },
         {

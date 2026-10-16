@@ -119,6 +119,77 @@ fn bench_orca_foreign_ref_send(c: &mut Criterion) {
     group.finish();
 }
 
+/// Baseline for actor-local small-object allocation under today's ORCA
+/// header and size classes. Construction of the empty heap happens outside
+/// the measured section; the timed operation allocates 512 fresh objects
+/// without freeing them, then verifies the live-object count.
+fn bench_actor_heap_small_alloc(c: &mut Criterion) {
+    use nulang::runtime::ActorHeap;
+
+    const OBJECTS: usize = 512;
+    let mut group = c.benchmark_group("gc/actor_heap_small_alloc");
+    group.throughput(Throughput::Elements(OBJECTS as u64));
+
+    for payload_bytes in [8usize, 16, 32, 64, 128] {
+        group.bench_function(format!("payload_{}", payload_bytes), |b| {
+            b.iter_batched(
+                || ActorHeap::new(64 * 1024),
+                |mut heap| {
+                    for _ in 0..OBJECTS {
+                        let ptr = heap
+                            .alloc(payload_bytes, TypeTag::Raw)
+                            .expect("benchmark heap allocation");
+                        black_box(ptr);
+                    }
+                    assert_eq!(heap.live_count(), OBJECTS);
+                    black_box(heap.used());
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
+/// Measure ORCA's local allocation + last-reference reclamation path
+/// separately from the raw heap allocator. Unlike the preceding benchmark,
+/// objects are immediately released and may reuse the same size-class block.
+fn bench_orca_local_alloc_drop(c: &mut Criterion) {
+    use nulang::runtime::{ActorHeap, OrcaGc};
+
+    const OPERATIONS: usize = 512;
+    let mut group = c.benchmark_group("gc/orca_local_alloc_drop");
+    group.throughput(Throughput::Elements(OPERATIONS as u64));
+
+    for payload_bytes in [8usize, 16, 32, 64, 128] {
+        group.bench_function(format!("payload_{}", payload_bytes), |b| {
+            b.iter_batched(
+                || {
+                    let mut heap = ActorHeap::new(64 * 1024);
+                    heap.set_actor_id(1);
+                    (heap, OrcaGc::new(1))
+                },
+                |(mut heap, mut gc)| {
+                    for _ in 0..OPERATIONS {
+                        let ptr = gc
+                            .alloc_object(&mut heap, payload_bytes, TypeTag::Raw)
+                            .expect("benchmark ORCA allocation");
+                        // SAFETY: this is a live local reference on actor 1
+                        // created immediately above; no other references exist.
+                        unsafe {
+                            assert!(gc.drop_local_ref(&mut heap, ptr));
+                        }
+                    }
+                    assert_eq!(heap.live_count(), 0);
+                    black_box((heap, gc));
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
 fn bench_cycle_detection(c: &mut Criterion) {
     c.bench_function("gc/cycle_detection", |b| {
         b.iter(|| {
