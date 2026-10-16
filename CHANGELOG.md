@@ -3,6 +3,10 @@
 ### Compiler Web route ambiguity rejection — 2026-10-16
 - **Compiled Web routes with the same method and runtime path shape now fail validation.** Differently named captures and percent-encoded literal aliases can no longer silently select different dispatch and OpenAPI handlers; distinct methods and unrelated static routes retain their existing behavior.
 - **Focused tests cover route collisions and permitted non-colliding paths.** The validation boundary reuses the existing runtime segment compiler and does not change broader literal-versus-capture precedence.
+### Web static-root containment — 2026-10-15
+- **Experimental Web static file serving refuses parent traversal and symlinks escaping configured roots.** Canonical candidate paths must remain inside their canonicalized static or output root, and normal in-root files remain serveable.
+- **A filesystem regression verifies parent and symlink escape rejection.** This is a clean current-main successor to draft #1676; it does not change SSE or claim protection from malicious concurrent mutation of a trusted static root.
+
 ### Experimental Web HTML host hardening — 2026-10-15
 - **`Web.html` now validates dynamic element and attribute names and URL-bearing attributes before rendering.** Unsafe markup and scriptable URL schemes fail closed; quoted attribute delimiters are escaped while already escaped `Html` text is preserved.
 - **Six focused regression tests cover normal markup, attribute breakouts, event attributes, high-risk elements, obfuscated URLs, and safe relative/HTTP links.** `Web.raw` remains a trusted-only escape hatch; dynamic script/style/SVG and inline style/event attributes are intentionally rejected pending a future typed context-aware API.
