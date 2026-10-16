@@ -13,6 +13,12 @@ function element(attributes, text = '') {
   const values = new Map(Object.entries(attributes));
   return {
     textContent: text,
+    // Mirror HTMLElement.dataset, which generated hydration reads directly.
+    get dataset() {
+      return { signal: values.get('data-signal'),
+        action: values.get('data-action'),
+        actionPlacement: values.get('data-action-placement') };
+    },
     get attributes() {
       return [...values].map(([name, value]) => ({ name, value }));
     },
