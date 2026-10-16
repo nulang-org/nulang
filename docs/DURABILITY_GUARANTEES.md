@@ -31,6 +31,25 @@ than a silent store replacement: existing JSON snapshots are legacy histories
 and are not automatically upgraded to atomic SQLite records. Production
 migration/backup guidance remains required before converting existing users.
 
+## Atomic workflow failure boundary (draft implementation)
+
+The bytecode workflow step path now admits user commands using the fenced
+`DurableTransition` tail and records `StepFailed` together with the final
+durable actor snapshot in **one** transaction. Failure to persist the terminal
+result must stop saga compensation and discard the uncommitted live activation.
+Compensation records remain subsequent commits: an arbitrary remote
+compensation cannot be made exactly-once by a local transaction.
+
+Signal, timer-sleep, receive-wait, and LLM continuation paths use the same
+atomic terminal success/failure helpers. A suspended command retains its
+activation until its final result has committed.
+
+**Not yet fully covered:** internal workflow behaviors, the legacy
+suspension-marker snapshot update, compensation-retry recovery after an
+ambiguous external effect, and non-workflow event-source writes have
+separate correctness surfaces. These require their own fault-injection and
+restart tests. This draft does not claim end-to-end exactly-once behavior.
+
 ## What Nulang can guarantee locally
 
 For one logical durable external effect, the runtime contract is:
