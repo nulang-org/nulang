@@ -30,7 +30,10 @@ and types are validated before creating any directories or files. Fields are
 emitted alphabetically, so reordering command flags does not change the output.
 
 Generation **never overwrites** an existing resource file. There is no
-`--force` option. Review and edit the generated source explicitly.
+`--force` option. It also rejects symlinked `src/` or `src/resources/` output
+parents and verifies the resolved output directory remains inside the package.
+These safeguards are not intended as a sandbox against concurrent filesystem
+mutation. Review and edit the generated source explicitly.
 
 ## Security and integration boundary
 
@@ -65,4 +68,5 @@ cargo test
 
 The focused tests cover generated source parsing/typechecking, default-deny
 policies, canonical output, invalid/duplicate inputs, manifest requirements,
-and non-destructive reruns.
+non-destructive reruns, and symlinked output rejection on Unix. An additional
+CLI dispatch regression test verifies end-to-end command wiring.
