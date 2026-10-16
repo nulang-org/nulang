@@ -205,9 +205,10 @@ fn binding_parameter(binding: &RouteBindingContract) -> Option<Value> {
 /// Explicit whole-body codecs take precedence. URL-encoded form bindings remain
 /// supported when no typed whole-body contract is present.
 fn request_body(bindings: &[RouteBindingContract]) -> Option<Value> {
-    if let Some(binding) = bindings.iter().find(|binding| {
-        binding.source == RouteBindingSource::Body && binding.codec.is_some()
-    }) {
+    if let Some(binding) = bindings
+        .iter()
+        .find(|binding| binding.source == RouteBindingSource::Body && binding.codec.is_some())
+    {
         let codec = binding.codec.as_ref()?;
         let schema = json_payload_schema(codec.payload_type.as_deref());
         let mut content = Map::new();

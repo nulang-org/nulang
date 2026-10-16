@@ -108,10 +108,7 @@ fn send_raw_request(port: u16, request: &str) -> String {
 }
 
 fn response_body(response: &str) -> &str {
-    response
-        .split_once("\r\n\r\n")
-        .expect("HTTP separator")
-        .1
+    response.split_once("\r\n\r\n").expect("HTTP separator").1
 }
 
 #[test]

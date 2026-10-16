@@ -11,8 +11,8 @@
 //! require a same-named handler parameter and produce a diagnostic when one is
 //! missing.
 
-pub use crate::web::contracts::RequestParamSource as RouteBindingSource;
 use crate::web::codec::{body_codec_for_type, BodyCodecContract};
+pub use crate::web::contracts::RequestParamSource as RouteBindingSource;
 use crate::web::contracts::RouteContract;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -130,9 +130,10 @@ pub fn compile_route_bindings(contract: &RouteContract) -> BindingCompilation {
         });
     }
 
-    let typed_body = out.bindings.iter().find(|binding| {
-        binding.source == RouteBindingSource::Body && binding.codec.is_some()
-    });
+    let typed_body = out
+        .bindings
+        .iter()
+        .find(|binding| binding.source == RouteBindingSource::Body && binding.codec.is_some());
     if let Some(body) = typed_body {
         if out
             .bindings
@@ -323,7 +324,11 @@ mod tests {
         }];
 
         let compiled = compile_route_bindings(&contract);
-        assert!(compiled.diagnostics.is_empty(), "{:?}", compiled.diagnostics);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{:?}",
+            compiled.diagnostics
+        );
         let body = &compiled.bindings[0];
         let codec = body.codec.as_ref().expect("typed body codec");
         assert_eq!(codec.media_type, "application/json");

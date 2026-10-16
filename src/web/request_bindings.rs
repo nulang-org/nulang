@@ -67,7 +67,10 @@ impl RequestDecodeError {
                 RequestDecodeErrorKind::Missing
                     | RequestDecodeErrorKind::InvalidType
                     | RequestDecodeErrorKind::InvalidBody
-            ) => 400,
+            ) =>
+            {
+                400
+            }
             _ => 500,
         }
     }
@@ -537,7 +540,10 @@ mod tests {
         assert_eq!(error.kind, RequestDecodeErrorKind::InvalidBody);
         assert_eq!(error.http_status(), 400);
         assert_eq!(error.code(), "invalid_request_body");
-        assert_eq!(error.problem_details()["expected_media_type"], "application/json");
+        assert_eq!(
+            error.problem_details()["expected_media_type"],
+            "application/json"
+        );
     }
 
     #[test]
@@ -563,7 +569,10 @@ mod tests {
         assert_eq!(error.kind, RequestDecodeErrorKind::UnsupportedMediaType);
         assert_eq!(error.http_status(), 415);
         assert_eq!(error.code(), "unsupported_request_media_type");
-        assert_eq!(error.problem_details()["expected_media_type"], "application/json");
+        assert_eq!(
+            error.problem_details()["expected_media_type"],
+            "application/json"
+        );
     }
 
     #[test]

@@ -98,10 +98,7 @@ mod tests {
         let json = response_contract(Some("Json[Result[User, ApiError]]")).unwrap();
         assert_eq!(json.kind, ResponseBodyKind::Json);
         assert_eq!(json.http_content_type(), "application/json");
-        assert_eq!(
-            json.payload_type.as_deref(),
-            Some("Result[User, ApiError]")
-        );
+        assert_eq!(json.payload_type.as_deref(), Some("Result[User, ApiError]"));
         assert!(!json.inject_client_runtime);
     }
 

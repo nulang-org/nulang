@@ -56,6 +56,17 @@ Bindings are ordered by handler slot rather than URL segment order. The runtime 
 
 The package-level `capabilities` field remains unchanged for compatibility. It is not the same concept as an authorization/resource capability.
 
+### Static publishing requires a compiler contract
+
+A runtime-registered route without a matching validated compiler contract is
+emitted with `placement: "server"` and no static `artifact`, even for GET.
+Method and URL alone do not prove that a handler produces public HTML: it
+could produce JSON, personalized data, or side effects. Such routes remain
+available through server dispatch, but dynamic runtime registrations no longer
+implicitly publish prerendered HTML. To get static output, register a route
+with statically discoverable handler metadata and a valid static placement.
+
+
 ## Route path compatibility
 
 The contract parser accepts legacy and contract-first path forms:

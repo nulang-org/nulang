@@ -3100,20 +3100,21 @@ app "mixed-routes" {
         let _guard = ChangeDir::new(&dir);
         cmd_build_web().expect("mixed static/server Web build should succeed");
 
+        let ir: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("dist/nulang-app.ir.json")).unwrap(),
+        )
+        .unwrap();
         assert!(dir.join("dist/index.html").is_file());
         assert!(
             !dir.join("dist/api/status/index.html").exists(),
-            "GET Json[T] routes must not be prerendered as public HTML"
+            "GET Json[T] routes must not be prerendered as public HTML; route IR: {}",
+            ir["routes"]
         );
         assert!(
             !dir.join("dist/submit/index.html").exists(),
             "POST server routes must not be prerendered as public static pages"
         );
 
-        let ir: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(dir.join("dist/nulang-app.ir.json")).unwrap(),
-        )
-        .unwrap();
         let routes = ir["routes"].as_array().unwrap();
         let server = routes
             .iter()
