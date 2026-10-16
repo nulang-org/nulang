@@ -69,6 +69,18 @@ class PackageBuildBenchmarkTests(unittest.TestCase):
         with self.assertRaisesRegex(benchmark.BenchmarkError, "compiler exited"):
             benchmark.benchmark_packages(base, candidate, self.package, rounds=1, modes=("normal",))
 
+    def test_rejects_hanging_compiler_without_hanging_benchmark(self):
+        compiler = self.root / "slow.py"
+        compiler.write_text(
+            "#!/usr/bin/env python3\nimport time\ntime.sleep(10)\n"
+        )
+        compiler.chmod(0o755)
+        with self.assertRaisesRegex(benchmark.BenchmarkError, "timed out"):
+            benchmark.benchmark_packages(
+                compiler, compiler, self.package,
+                rounds=1, modes=("normal",), timeout_seconds=0.05,
+            )
+
     def test_requires_nonempty_source_package(self):
         base = self.fake_compiler("base.py")
         with self.assertRaisesRegex(benchmark.BenchmarkError, "Nulang.toml"):
