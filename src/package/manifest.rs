@@ -235,7 +235,13 @@ mod tests {
         assert_eq!(manifest.budgets.initial_js_max_bytes(), Some(20 * 1024));
         assert_eq!(manifest.budgets.total_js_max_bytes(), Some(150 * 1024));
 
-        let old = Manifest::parse("[package]\\nname = \\"web\\"\\nversion = \\"0.1.0\\"").unwrap();
+        let old = Manifest::parse(
+            r#"[package]
+name = "web"
+version = "0.1.0"
+"#,
+        )
+        .unwrap();
         assert_eq!(old.budgets.total_js_max_bytes(), None);
     }
 
