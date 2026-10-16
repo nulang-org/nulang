@@ -23,13 +23,13 @@ implementations). Unsupported stores return `Unsupported` before publishing
 a workflow actor; no fallback to separate start-event and snapshot writes is
 allowed on the strict atomic path.
 
-**CLI compatibility:** the `nula run` durable-store default remains the
-JSON-file backend, which does not implement atomic transitions. This means
-strict atomic workflow creation is not yet usable through that default store.
-Configure a supported atomic backend when embedding the runtime; a CLI store
-selection and migration path are required before treating this contract as a
-production-ready default. Existing JSON snapshots are legacy histories, not
-automatically upgraded atomic transition records.
+**CLI compatibility:** the default JSON-file store does not implement atomic
+transitions. The CLI now provides `--store sqlite:<path>` (or
+`NULANG_STORE_PATH=sqlite:<path>`) for workflow execution and rejects missing
+or unsupported workflow store selections. This is an explicit opt-in rather
+than a silent store replacement: existing JSON snapshots are legacy histories
+and are not automatically upgraded to atomic SQLite records. Production
+migration/backup guidance remains required before converting existing users.
 
 ## What Nulang can guarantee locally
 
