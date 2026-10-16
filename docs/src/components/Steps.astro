@@ -1,112 +1,175 @@
 ---
-const steps = [
-	{
-		step: '01',
-		title: 'Try online',
-		description: 'Run Nulang Core in your browser, no toolchain required.',
-		command: 'nulang.org/playground/',
-		href: '/playground/',
-	},
-	{
-		step: '02',
-		title: 'Install locally',
-		description: 'Download a checksummed binary for your platform.',
-		command: 'Install a tagged release',
-		href: '/getting-started/installation/',
-	},
-	{
-		step: '03',
-		title: 'Run your code',
-		description: 'Use the installed compiler for the full native runtime.',
-		command: 'nulang --repl',
-		href: '/getting-started/quick-start/',
-	},
+const paths = [
+  {
+    kind: 'No installation',
+    runtime: 'CoreVM · in your browser',
+    title: 'Explore the language core',
+    description: 'Write functions, use typed effects, and run examples locally in WebAssembly. No account or toolchain required.',
+    boundary: 'Actors, networking, and durable state are not available in the browser.',
+    action: 'Open the browser playground',
+    href: '/playground/',
+  },
+  {
+    kind: 'Local installation',
+    runtime: 'Native compiler and runtime',
+    title: 'Try actors and recovery',
+    description: 'Install a checksummed release to explore concurrency, supervision, and opt-in persistent state.',
+    boundary: 'Nulang is alpha software. Validate recovery and deployment guarantees for your use case.',
+    action: 'Install the native runtime',
+    href: '/getting-started/installation/',
+  },
 ];
 ---
 
-<div class="steps-flow" aria-label="Three ways to begin using Nulang">
-	{steps.map((step) => (
-		<div class="step">
-			<div class="step-index">{step.step}</div>
-			<div class="step-copy">
-				<div class="step-heading">
-					<strong>{step.title}</strong>
-					<span>{step.description}</span>
-				</div>
-				<a class="step-command" href={step.href}>{step.command}</a>
-			</div>
-		</div>
-	))}
-</div>
+<section class="start-paths" aria-label="Choose how to get started with Nulang">
+  <div class="start-path-grid">
+    {paths.map((path) => (
+      <article class="start-path-card">
+        <div class="start-path-meta">
+          <span class="start-path-kind">{path.kind}</span>
+          <span class="start-path-runtime">{path.runtime}</span>
+        </div>
+        <h3>{path.title}</h3>
+        <p class="start-path-description">{path.description}</p>
+        <p class="start-path-boundary">{path.boundary}</p>
+        <a class="start-path-action" href={path.href}>
+          {path.action}
+          <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M5 12h14" /><path d="m12 5 7 7-7 7" />
+          </svg>
+        </a>
+      </article>
+    ))}
+  </div>
+  <p class="start-path-next">
+    Already installed? <a href="/getting-started/quick-start/">Run your first local project <span aria-hidden="true">↗</span></a>
+  </p>
+</section>
 
 <style>
-	.steps-flow {
-		display: grid;
-		grid-template-columns: repeat(3, minmax(0, 1fr));
-		border-top: 1px solid var(--nu-border);
-		border-bottom: 1px solid var(--nu-border);
-	}
+  .start-path-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: clamp(0.85rem, 2vw, 1.35rem);
+  }
 
-	.step {
-		display: grid;
-		grid-template-columns: auto 1fr;
-		gap: 0.9rem;
-		padding: 1.4rem 1.25rem;
-	}
+  .start-path-card {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    padding: clamp(1.3rem, 2.5vw, 2rem);
+    border: 1px solid var(--nu-border);
+    border-radius: 0.95rem;
+    background: var(--nu-surface);
+  }
 
-	.step + .step {
-		border-left: 1px solid var(--nu-border);
-	}
+  .start-path-meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem 1rem;
+    margin-bottom: 1.45rem;
+  }
 
-	.step-index {
-		color: var(--nu-blue);
-		font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-		font-size: 0.76rem;
-		font-weight: 800;
-	}
+  .start-path-kind {
+    color: var(--nu-accent-high);
+    font-size: 0.72rem;
+    font-weight: 800;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
 
-	.step-copy {
-		min-width: 0;
-	}
+  .start-path-runtime {
+    color: var(--nu-text-secondary);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.72rem;
+  }
 
-	.step-heading {
-		display: grid;
-		gap: 0.15rem;
-	}
+  .start-path-card h3 {
+    margin: 0 0 0.7rem;
+    color: var(--nu-text);
+    font-size: clamp(1.3rem, 2vw, 1.65rem);
+    line-height: 1.22;
+    letter-spacing: -0.025em;
+  }
 
-	.step-heading strong {
-		color: var(--nu-text);
-		font-size: 0.95rem;
-	}
+  .start-path-description {
+    margin: 0;
+    color: var(--nu-text-secondary);
+    font-size: 0.95rem;
+    line-height: 1.65;
+  }
 
-	.step-heading span {
-		color: var(--nu-text-secondary);
-		font-size: 0.8rem;
-		line-height: 1.45;
-	}
+  .start-path-boundary {
+    margin: 1rem 0 1.45rem;
+    color: var(--nu-text-secondary);
+    font-size: 0.83rem;
+    line-height: 1.55;
+  }
 
-	.step-command {
-		display: block;
-		margin-top: 0.75rem;
-		overflow-x: auto;
-		padding: 0;
-		background: transparent;
-		color: var(--nu-text);
-		font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-		font-size: 0.72rem;
-		white-space: nowrap;
-		text-decoration: underline;
-		text-underline-offset: 3px;
-	}
+  .start-path-action {
+    display: inline-flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    min-height: 2.75rem;
+    margin-top: auto;
+    padding: 0.7rem 0.9rem;
+    border: 1px solid var(--nu-border);
+    border-radius: 0.55rem;
+    background: var(--nu-border-subtle);
+    color: var(--nu-text);
+    font-size: 0.87rem;
+    font-weight: 750;
+    text-decoration: none;
+    transition: border-color 150ms ease, background-color 150ms ease;
+  }
 
-	@media (max-width: 48rem) {
-		.steps-flow {
-			grid-template-columns: 1fr;
-		}
+  .start-path-action svg {
+    width: 1rem;
+    height: 1rem;
+    flex-shrink: 0;
+  }
 
-		.step + .step {
-			border-left: 0;
-			border-top: 1px solid var(--nu-border);
-		}
-	}
+  .start-path-action:hover {
+    border-color: var(--nu-accent-high);
+    background: var(--nu-surface);
+  }
+
+  .start-path-action:focus-visible,
+  .start-path-next a:focus-visible {
+    outline: 2px solid var(--nu-accent-high);
+    outline-offset: 3px;
+  }
+
+  .start-path-next {
+    margin: 1.1rem 0 0;
+    color: var(--nu-text-secondary);
+    font-size: 0.88rem;
+    line-height: 1.5;
+    text-align: center;
+  }
+
+  .start-path-next a {
+    color: var(--nu-accent-high);
+    font-weight: 650;
+    text-underline-offset: 3px;
+  }
+
+  @media (max-width: 48rem) {
+    .start-path-grid {
+      grid-template-columns: 1fr;
+    }
+
+    .start-path-meta {
+      margin-bottom: 1rem;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .start-path-action {
+      transition: none;
+    }
+  }
 </style>
