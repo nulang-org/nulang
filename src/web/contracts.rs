@@ -76,7 +76,7 @@ pub struct ContractCompilation {
     /// First-party module imports observed in the parsed package AST.
     /// Only package-wide extraction populates these facts; deployment IR
     /// consumers must not rediscover them by scanning source text.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub module_imports: Vec<String>,
     /// Best-effort source discovery must not make deployment IR generation
     /// panic. Parse and contract-validation failures are retained here so build
