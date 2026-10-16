@@ -296,8 +296,8 @@ impl CodeModule {
         let mut module: CodeModule = serde_json::from_slice(meta_bytes)
             .map_err(|e| FormatError::BodyDecode(e.to_string()))?;
         // The frozen v1 encoding carries executable instructions only in
-        // the binary stream. Never allocate and silently discard a second
-        // instruction vector supplied through untrusted JSON metadata.
+        // the binary stream. Reject a redundant JSON vector instead of
+        // silently replacing it with the actual instruction stream.
         if !module.instructions.is_empty() {
             return Err(FormatError::BodyDecode(
                 "noncanonical metadata contains duplicate instructions".into(),
@@ -495,6 +495,13 @@ mod tests {
                 .module,
             sample_module()
         );
+
+        let mut vm = crate::core_vm::CoreVM::new();
+        assert!(
+            vm.load_nbc_with_limits(&appended, limits).is_err(),
+            "CoreVM must not admit trailing artifact data"
+        );
+        assert!(vm.modules.is_empty(), "rejection must be atomic");
     }
 
     #[test]
