@@ -1004,7 +1004,8 @@ mod tests {
     fn differential_fuzz_direct_call_runtime_error_has_one_prefix() {
         // October 15 nightly repro: warmed JIT must not wrap a callee's
         // formatted RuntimeError in another RuntimeError prefix.
-        let source = "fn cond(c, a, b) { if- c then a else b }; cond(true, 1, 2) + cond(false, 10, 20)";
+        let source =
+            "fn cond(c, a, b) { if- c then a else b }; cond(true, 1, 2) + cond(false, 10, 20)";
         let outcome = differential_fuzz_one(source)
             .expect("JIT direct-call runtime error must match interpreter formatting");
         assert!(
