@@ -78,6 +78,10 @@ function browserChecks() {
   const button = document.getElementById('button');
   const link = document.getElementById('link');
   const special = document.getElementById('special');
+  const ssrIsland = document.getElementById('ssr-island');
+  const ssrIslandText = document.getElementById('ssr-island-state');
+  const islandScope = api.mount(ssrIsland, { localSignals: true });
+  assert(islandScope.signal('status').get() === 'Local', 'SSR island initialization');
   assert(api.signal('status').get() === 'Initial', 'SSR text state');
   assert(api.signal('__proto__').get() === 'Safe', 'special key');
   const writes = [];
@@ -104,6 +108,10 @@ function browserChecks() {
   catch (error) { thrown = true; assert(error.message === 'expected', 'exception propagation'); }
   assert(thrown, 'callback exception was swallowed');
   assert(span.textContent === 'Recovered', 'exception flush');
+  assert(ssrIslandText.textContent === 'Local', 'global update leaked into SSR island');
+  islandScope.signal('status').set('Island changed');
+  assert(ssrIslandText.textContent === 'Island changed', 'island update missing');
+  assert(span.textContent === 'Recovered', 'island update leaked into global content');
   api.signal('__proto__').set('Updated');
   assert(special.title === 'Updated', 'prototype-safe key');
   assert(link.href === 'https://example.test/unchanged', 'unsafe URL mutated');
@@ -162,6 +170,8 @@ test('real Chromium DOM hydration, batching, and safe attributes', { timeout: 25
       '<button id="button" title="Initial" aria-label="Initial" data-nulang-bind-title="status" data-nulang-bind-aria-label="status">Static</button>' +
       '<a id="link" href="https://example.test/unchanged">Link</a>' +
       '<span id="special" title="Safe" data-nulang-bind-title="__proto__"></span>' +
+      '<section id="ssr-island" data-nulang-scope="local">' +
+      '<span id="ssr-island-state" data-signal="status">Local</span></section>' +
       '<script>' + js + '</script>';
     chrome = spawn(chromeBinary(), [ '--headless=new', '--no-sandbox', '--disable-gpu',
       '--disable-dev-shm-usage', '--disable-background-networking',
