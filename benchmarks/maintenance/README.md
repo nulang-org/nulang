@@ -6,6 +6,13 @@ runtime behavior; this benchmark measures change amplification across *one
 independently verified application task*. The tool never runs commands from
 submitted manifests.
 
+## First matched maintenance task
+
+The proposed [crash-safe order payment study](ORDER_RETRY_STUDY.md) defines
+observable API behavior, deterministic failure points, and a source-level
+Nulang release gate. No application has passed it yet; do not publish a
+maintenance advantage from the collector alone.
+
 ## Protocol
 
 1. Implement the same **production-like task** in independent Nulang, Rust, and
