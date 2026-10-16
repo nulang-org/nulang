@@ -1,7 +1,7 @@
 # Nulang Changelog
 
 ### Optional total emitted JavaScript budget — 2026-10-15
-- **Add opt-in `[budgets].total_js` to `nula build --web`.** Sum generated `app.client.js` plus nested `.js`/`.mjs` assets, reject over-budget or unreadable/symlinked assets, and expose the optional limit in Deployment IR. Existing `initial_js` manifests retain their per-file behavior.
+- **Add opt-in `[budgets].total_js` to `nula build --web`.** Sum all published `.js`/`.mjs` files under the output directory, reject over-budget or unreadable/symlinked assets, and expose the optional limit in Deployment IR. Existing `initial_js` manifests retain their per-file behavior.
 
 ### Experimental Web HTML host hardening — 2026-10-15
 - **`Web.html` now validates dynamic element and attribute names and URL-bearing attributes before rendering.** Unsafe markup and scriptable URL schemes fail closed; quoted attribute delimiters are escaped while already escaped `Html` text is preserved.
