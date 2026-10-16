@@ -4424,7 +4424,13 @@ impl VM {
         // The execution loop has already advanced the frame PC past this
         // instruction. On Pending it rewinds, so a resumed execution obtains
         // the same exact bytecode PC and compiler-owned semantic site.
-        let pc = self.frames[frame_idx].pc - 1;
+        let pc = self.frames[frame_idx]
+            .pc
+            .checked_sub(1)
+            .ok_or_else(|| NuError::VMError {
+                msg: "PerformAsync requires an already-fetched bytecode PC".into(),
+                span: Span::default(),
+            })?;
         let module = &self.modules[module_idx];
         match self
             .actor_callbacks
