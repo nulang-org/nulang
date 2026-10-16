@@ -13,8 +13,14 @@ extern "C" fn inspect_active_native_leaf_table(regs: *mut u64, _constants: *cons
     // only the first four slots to export the observed TLS dispatch keys.
     unsafe {
         *regs.add(0) = table.len() as u64;
-        *regs.add(1) = table.first().map(|entry| entry.0 as u64).unwrap_or(u64::MAX);
-        *regs.add(2) = table.first().map(|entry| entry.1 as u64).unwrap_or(u64::MAX);
+        *regs.add(1) = table
+            .first()
+            .map(|entry| entry.0 as u64)
+            .unwrap_or(u64::MAX);
+        *regs.add(2) = table
+            .first()
+            .map(|entry| entry.1 as u64)
+            .unwrap_or(u64::MAX);
         *regs.add(3) = table.get(1).map(|entry| entry.0 as u64).unwrap_or(u64::MAX);
     }
 }
@@ -53,10 +59,7 @@ fn test_native_leaf_dispatch_table_is_cached_by_module() {
     jit.cache_native_leaf_call(1, 3, second);
     jit.cache_native_leaf_call(0, 8, second);
 
-    assert_eq!(
-        jit.native_leaf_table(0),
-        &[(3, ptr, 7, 2), (8, ptr, 9, 1)]
-    );
+    assert_eq!(jit.native_leaf_table(0), &[(3, ptr, 7, 2), (8, ptr, 9, 1)]);
     assert_eq!(jit.native_leaf_table(1), &[(3, ptr, 9, 1)]);
     assert!(jit.native_leaf_table(2).is_empty());
     assert_eq!(jit.native_leaf_calls.len(), 3);
@@ -69,10 +72,7 @@ fn test_native_leaf_dispatch_table_is_cached_by_module() {
     // Observe actual thread-local dispatch while executing the compiled
     // region; verify the table is scoped to the selected module and cleared
     // immediately afterward. The old test only ran a no-op native function.
-    for (module_idx, expected) in [
-        (0usize, [2u64, 3, 7, 8]),
-        (1usize, [1u64, 3, 9, u64::MAX]),
-    ] {
+    for (module_idx, expected) in [(0usize, [2u64, 3, 7, 8]), (1usize, [1u64, 3, 9, u64::MAX])] {
         jit.store_compiled_with_metadata(
             module_idx,
             0,
@@ -85,13 +85,7 @@ fn test_native_leaf_dispatch_table_is_cached_by_module() {
         );
         let mut regs = [0u64; 256];
         assert_eq!(
-            crate::backends::JitBackend::execute_compiled(
-                &mut jit,
-                module_idx,
-                0,
-                &mut regs,
-                &[],
-            ),
+            crate::backends::JitBackend::execute_compiled(&mut jit, module_idx, 0, &mut regs, &[],),
             crate::backends::TieredAction::RanJit
         );
         assert_eq!(&regs[..4], &expected);
