@@ -241,6 +241,7 @@ mod tests {
             ],
             bindings,
             handler_param_count,
+            response: None,
             direct_call: false,
         }
     }

@@ -12,6 +12,7 @@ use crate::web::contracts::{
     ContractCompilation, HandlerParamContract, RouteContract, RouteParamContract,
 };
 use crate::web::modules::ModuleRegistry;
+use crate::web::response::{response_contract, ResponseBodyKind, ResponseContract};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -40,6 +41,9 @@ pub struct IrRoute {
     pub bindings: Vec<RouteBindingContract>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_type: Option<String>,
+    /// Compiler-owned response media policy, additive in Deployment IR v1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<ResponseContract>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_type: Option<String>,
     /// Declared handler effect row. These are semantic effects, not middleware
@@ -112,9 +116,18 @@ pub fn generate_deployment_ir(
             .get(&(method.clone(), route.path.clone()))
             .copied();
         let binding_compilation = contract.map(compile_route_bindings);
-        let placement = contract
-            .and_then(|contract| contract.placement.clone())
-            .unwrap_or_else(|| default_route_placement(&method, &route.path));
+        let response = contract.and_then(|c| response_contract(c.response_type.as_deref()));
+        // A runtime-only registration has no compiler-validated return type.
+        // Do not assume it is safe to publish as HTML just because it is GET:
+        // the handler may return JSON, user-specific content, or other data.
+        // Such legacy routes remain executable by the server, but are never
+        // prerendered until a compiler contract proves static placement.
+        let placement = match contract {
+            Some(contract) => contract.placement.clone().unwrap_or_else(|| {
+                default_route_placement(&method, &route.path, response.as_ref())
+            }),
+            None => "server".to_string(),
+        };
         let artifact = if placement == "static" {
             Some(route_path_to_artifact(&route.path))
         } else {
@@ -135,6 +148,7 @@ pub fn generate_deployment_ir(
                 .map(|compilation| compilation.bindings)
                 .unwrap_or_default(),
             response_type: contract.and_then(|c| c.response_type.clone()),
+            response,
             error_type: contract.and_then(|c| c.error_type.clone()),
             effects: contract.map(|c| c.effects.clone()).unwrap_or_default(),
             reference_capability: contract.and_then(|c| c.reference_capability.clone()),
@@ -178,9 +192,17 @@ pub fn generate_deployment_ir(
     }
 }
 
-fn default_route_placement(method: &str, path: &str) -> String {
+fn default_route_placement(
+    method: &str,
+    path: &str,
+    response: Option<&ResponseContract>,
+) -> String {
     let dynamic_path = path.contains(':') || (path.contains('{') && path.contains('}'));
-    if dynamic_path || !matches!(method, "GET" | "HEAD") {
+    let transport_requires_server = matches!(
+        response.map(|contract| contract.kind),
+        Some(ResponseBodyKind::Json)
+    );
+    if dynamic_path || transport_requires_server || !matches!(method, "GET" | "HEAD") {
         "server".to_string()
     } else {
         "static".to_string()
@@ -377,6 +399,98 @@ mod tests {
     }
 
     #[test]
+    fn app_route_json_response_stays_server_in_deployment_ir() {
+        use crate::lexer::Lexer;
+        use crate::parser::Parser;
+
+        let source = r#"
+import stdlib::web::html
+import stdlib::web::types
+
+fn home() -> Html { text("Static homepage") }
+fn status() -> Json[String] { "{\"ok\":true}" }
+
+app "mixed-routes" {
+    route "GET" "/" -> home
+    route "GET" "/api/status" -> status
+}
+"#;
+        let module = Parser::new(Lexer::new(source).lex().expect("lex"))
+            .parse_module()
+            .expect("parse");
+        let compiled = crate::web::package_contracts::compile_modules_contracts(&[module]);
+        assert!(compiled.diagnostics.is_empty(), "{:?}", compiled.diagnostics);
+        let json_contract = compiled
+            .routes
+            .iter()
+            .find(|route| route.method == "GET" && route.path == "/api/status")
+            .expect("compiler must extract app-syntax JSON route");
+        assert_eq!(json_contract.handler.as_deref(), Some("status"));
+        assert_eq!(json_contract.response_type.as_deref(), Some("Json[String]"));
+
+        let routes = [
+            ("/", crate::runtime::HttpMethod::Get),
+            ("/api/status", crate::runtime::HttpMethod::Get),
+        ]
+        .into_iter()
+        .map(|(path, method)| WebRoute {
+            method,
+            path: path.to_string(),
+            handler_module: crate::bytecode::CodeModule::new("ir-test"),
+            handler_func_idx: 0,
+        })
+        .collect::<Vec<_>>();
+        let source_root = std::env::temp_dir().join(format!(
+            "nulang_web_ir_app_routes_{}",
+            std::process::id()
+        ));
+        let ir = generate_deployment_ir(
+            &routes,
+            None,
+            &source_root,
+            &BudgetsSection::default(),
+            &compiled,
+        );
+        let html = ir.routes.iter().find(|route| route.path == "/").unwrap();
+        assert_eq!(html.placement, "static");
+        let json = ir
+            .routes
+            .iter()
+            .find(|route| route.path == "/api/status")
+            .unwrap();
+        assert_eq!(json.placement, "server");
+        assert!(json.artifact.is_none());
+        assert_eq!(json.response.as_ref().unwrap().media_type, "application/json");
+    }
+
+    #[test]
+    fn unmatched_runtime_get_route_is_not_published_as_static_html() {
+        let route = WebRoute {
+            method: crate::runtime::HttpMethod::Get,
+            path: "/undiscovered".to_string(),
+            handler_module: crate::bytecode::CodeModule::new("ir-test"),
+            handler_func_idx: 0,
+        };
+        let empty_contracts = ContractCompilation::default();
+        let src_root = std::env::temp_dir().join(format!(
+            "nulang_web_ir_no_contract_{}",
+            std::process::id()
+        ));
+        let ir = generate_deployment_ir(
+            &[route],
+            None,
+            &src_root,
+            &BudgetsSection::default(),
+            &empty_contracts,
+        );
+
+        assert_eq!(ir.routes.len(), 1);
+        assert_eq!(ir.routes[0].placement, "server");
+        assert!(ir.routes[0].artifact.is_none());
+        assert!(ir.routes[0].response.is_none());
+    }
+
+    #[test]
     fn test_route_path_to_artifact() {
         assert_eq!(route_path_to_artifact("/"), "index.html");
         assert_eq!(route_path_to_artifact("/about"), "about/index.html");
@@ -387,14 +501,24 @@ mod tests {
     }
 
     #[test]
-    fn test_default_route_placement_understands_typed_params() {
-        assert_eq!(default_route_placement("GET", "/about"), "static");
-        assert_eq!(default_route_placement("GET", "/users/:id"), "server");
+    fn test_default_route_placement_understands_typed_params_and_response_media() {
+        assert_eq!(default_route_placement("GET", "/about", None), "static");
+        assert_eq!(default_route_placement("GET", "/users/:id", None), "server");
         assert_eq!(
-            default_route_placement("GET", "/users/{id: UserId}"),
+            default_route_placement("GET", "/users/{id: UserId}", None),
             "server"
         );
-        assert_eq!(default_route_placement("POST", "/users"), "server");
+        assert_eq!(default_route_placement("POST", "/users", None), "server");
+        let json = response_contract(Some("Json[User]")).unwrap();
+        assert_eq!(
+            default_route_placement("GET", "/api/status", Some(&json)),
+            "server"
+        );
+        let html = response_contract(Some("Html")).unwrap();
+        assert_eq!(
+            default_route_placement("GET", "/about", Some(&html)),
+            "static"
+        );
     }
 
     #[test]
