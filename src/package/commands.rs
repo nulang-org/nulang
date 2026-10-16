@@ -880,6 +880,17 @@ fn capability_args() -> Vec<String> {
 /// standalone binary is available (e.g. during `cargo test --lib` where only
 /// the test harness exists).
 fn try_find_existing_nulang_binary() -> Option<PathBuf> {
+    // A prebuilt public CLI must find itself without Rust or Cargo installed.
+    // Check this *before* asking Cargo for workspace metadata; the test harness
+    // has a different executable name (e.g. cli_json-<hash>), so it still uses
+    // the existing Cargo/test discovery paths below.
+    let current_exe = std::env::current_exe().ok();
+    if let Some(p) = current_exe.as_ref() {
+        if p.file_stem() == Some(std::ffi::OsStr::new("nulang")) && p.is_file() {
+            return Some(p.clone());
+        }
+    }
+
     // 1. Cargo-provided binary path (integration tests / examples).
     if let Some(p) = std::env::var_os("CARGO_BIN_EXE_nulang") {
         let p = PathBuf::from(p);
@@ -889,7 +900,6 @@ fn try_find_existing_nulang_binary() -> Option<PathBuf> {
     }
 
     // 2. Binary next to the current test harness: target/<profile>/nulang.
-    let current_exe = std::env::current_exe().ok();
     if let Some(p) = current_exe.as_ref().and_then(|p| {
         p.parent()
             .and_then(|deps| deps.parent())
@@ -915,13 +925,6 @@ fn try_find_existing_nulang_binary() -> Option<PathBuf> {
         let candidate = std::path::Path::new(td).join(profile).join("nulang");
         if candidate.is_file() {
             return Some(candidate);
-        }
-    }
-
-    // 4. If the current process is itself the `nulang` CLI, use it.
-    if let Some(p) = current_exe {
-        if p.file_stem() == Some(std::ffi::OsStr::new("nulang")) && p.is_file() {
-            return Some(p);
         }
     }
 
