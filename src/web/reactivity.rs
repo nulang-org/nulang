@@ -785,6 +785,7 @@ pub fn generate_client_runtime() -> String {
     r#"(function () {
   const signals = {};
   const signalBindings = Object.create(null);
+  const pendingServerActions = new WeakSet();
 
   function refreshSignal(name) {
     const bindings = signalBindings[name];
@@ -850,15 +851,24 @@ pub fn generate_client_runtime() -> String {
 
   async function runServerAction(handler, el) {
     const form = el.closest('form');
-    const body = formBody(form);
-    const message = createActionMessage(handler, 'server', body);
-    body.append('__nulang_action', handler);
-    body.append('__nulang_ui_message', JSON.stringify(message));
-    const response = await fetch(window.location.href, { method: 'POST', body: body });
-    if (!response.ok) {
-      throw new Error('server action failed: ' + response.status);
+    const owner = form || el;
+    // Guard accidental double submissions while the previous request is
+    // unresolved. The server must still enforce its own idempotency keys.
+    if (pendingServerActions.has(owner)) return;
+    pendingServerActions.add(owner);
+    try {
+      const body = formBody(form);
+      const message = createActionMessage(handler, 'server', body);
+      body.append('__nulang_action', handler);
+      body.append('__nulang_ui_message', JSON.stringify(message));
+      const response = await fetch(window.location.href, { method: 'POST', body: body });
+      if (!response.ok) {
+        throw new Error('server action failed: ' + response.status);
+      }
+      window.location.reload();
+    } finally {
+      pendingServerActions.delete(owner);
     }
-    window.location.reload();
   }
 
   function hydrate() {
