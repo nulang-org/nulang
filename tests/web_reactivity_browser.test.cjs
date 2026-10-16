@@ -125,6 +125,29 @@ function browserChecks() {
   api.mount(dynamic);
   assert(dynamicButton.title === 'Disposed', 'remount did not synchronize');
   dynamic.remove();
+  // Two independently mounted component instances may reuse the same signal
+  // name. Their state and DOM subscriptions must never cross scope boundaries.
+  const first = document.createElement('section');
+  const second = document.createElement('section');
+  first.innerHTML = '<span data-signal="shared">First</span>';
+  second.innerHTML = '<span data-signal="shared">Second</span>';
+  document.body.append(first, second);
+  const firstScope = api.mount(first, { localSignals: true });
+  const secondScope = api.mount(second, { localSignals: true });
+  assert(firstScope.signal('shared').get() === 'First', 'first local SSR value');
+  assert(secondScope.signal('shared').get() === 'Second', 'second local SSR value');
+  firstScope.signal('shared').set('Only first');
+  assert(first.querySelector('span').textContent === 'Only first', 'first local update');
+  assert(second.querySelector('span').textContent === 'Second', 'cross-instance write');
+  secondScope.signal('shared').set('Only second');
+  assert(first.querySelector('span').textContent === 'Only first', 'reverse cross-instance write');
+  assert(second.querySelector('span').textContent === 'Only second', 'second local update');
+  firstScope.dispose();
+  first.remove();
+  secondScope.signal('shared').set('Still active');
+  assert(second.querySelector('span').textContent === 'Still active', 'sibling disposal');
+  secondScope.dispose();
+  second.remove();
   return true;
 }
 

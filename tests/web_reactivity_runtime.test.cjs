@@ -314,3 +314,105 @@ test('mount rejects invalid roots without changing reactive state', () => {
   api.signal('value').set('Still usable');
   assert.equal(api.signal('value').get(), 'Still usable');
 });
+
+
+test('two local scopes isolate identical signal names and preserve the global signal', () => {
+  const firstText = element({ textContent: 'One', attributes: { 'data-signal': 'status' } });
+  const secondText = element({ textContent: 'Two', attributes: { 'data-signal': 'status' } });
+  const firstAttr = element({
+    attributes: { title: 'One', 'data-nulang-bind-title': 'status' }
+  });
+  const secondAttr = element({
+    attributes: { title: 'Two', 'data-nulang-bind-title': 'status' }
+  });
+  const api = hydrate([]);
+  api.signal('status').set('Global');
+  const first = api.mount(subtree([firstText, firstAttr]), { localSignals: true });
+  const second = api.mount(subtree([secondText, secondAttr]), { localSignals: true });
+
+  assert.equal(first.signal('status').get(), 'One');
+  assert.equal(second.signal('status').get(), 'Two');
+  assert.equal(api.signal('status').get(), 'Global');
+  first.signal('status').set('Updated one');
+  assert.equal(firstText.textContent, 'Updated one');
+  assert.equal(firstAttr.getAttribute('title'), 'Updated one');
+  assert.equal(secondText.textContent, 'Two');
+  assert.equal(secondAttr.getAttribute('title'), 'Two');
+  second.signal('status').set('Updated two');
+  assert.equal(secondText.textContent, 'Updated two');
+  assert.equal(firstText.textContent, 'Updated one');
+  assert.equal(api.signal('status').get(), 'Global');
+});
+
+test('local signals do not collide with legacy names or inherited properties', () => {
+  const one = element({
+    attributes: { title: 'One', 'data-nulang-bind-title': '__proto__' }
+  });
+  const two = element({
+    attributes: { title: 'Two', 'data-nulang-bind-title': '__proto__' }
+  });
+  const api = hydrate([]);
+  api.signal('__proto__').set('Global');
+  const a = api.mount(subtree([one]), { localSignals: true });
+  const b = api.mount(subtree([two]), { localSignals: true });
+  a.signal('__proto__').set('A');
+  assert.equal(one.getAttribute('title'), 'A');
+  assert.equal(two.getAttribute('title'), 'Two');
+  b.signal('__proto__').set('B');
+  assert.equal(api.signal('__proto__').get(), 'Global');
+  assert.equal(a.signal('__proto__').get(), 'A');
+  assert.equal(b.signal('__proto__').get(), 'B');
+});
+
+test('local scopes batch repeated writes and cleanup pending work', () => {
+  const first = element({
+    attributes: { title: 'Original', 'data-nulang-bind-title': 'count' }
+  });
+  const api = hydrate([]);
+  const root = subtree([first]);
+  const scope = api.mount(root, { localSignals: true });
+  const retained = scope.signal('count');
+  api.batch(() => {
+    scope.signal('count').set('Intermediate');
+    scope.signal('count').set('Final');
+    assert.equal(scope.signal('count').get(), 'Final');
+    assert.equal(first.getAttribute('title'), 'Original');
+  });
+  assert.deepEqual(first.calls, [['title', 'Final']]);
+  api.batch(() => {
+    scope.signal('count').set('Unrendered');
+    scope.dispose();
+  });
+  assert.equal(first.getAttribute('title'), 'Final');
+  assert.deepEqual(first.calls, [['title', 'Final']]);
+  assert.throws(() => scope.signal('count'), /disposed scope/);
+  assert.throws(() => retained.get(), /disposed scope/);
+  assert.throws(() => retained.set('Too late'), /disposed scope/);
+  const remount = api.mount(root, { localSignals: true });
+  assert.notEqual(remount, scope);
+  assert.equal(remount.signal('count').get(), 'Final');
+  remount.signal('count').set('Fresh');
+  assert.equal(first.getAttribute('title'), 'Fresh');
+});
+
+test('local scope rejects ownership collisions instead of silently using globals', () => {
+  const button = element({
+    attributes: { title: 'Owned', 'data-nulang-bind-title': 'status' }
+  });
+  const api = hydrate([button]);
+  assert.throws(() => api.mount(subtree([button]), { localSignals: true }), /already owned/);
+  api.signal('status').set('Still global');
+  assert.equal(button.getAttribute('title'), 'Still global');
+});
+
+test('mount mode is immutable for an already mounted root', () => {
+  const text = element({ textContent: 'Ready', attributes: { 'data-signal': 'state' } });
+  const root = subtree([text]);
+  const api = hydrate([]);
+  const local = api.mount(root, { localSignals: true });
+  assert.equal(api.mount(root, { localSignals: true }), local);
+  assert.throws(() => api.mount(root), /different signal mode/);
+  local.dispose();
+  const global = api.mount(root);
+  assert.equal(global.signal('state').get(), 'Ready');
+});
