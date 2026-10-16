@@ -17,6 +17,86 @@ env:
 
 jobs:
   # -----------------------------------------------------------------------
+  # PostgreSQL SQL contract preflight — isolated optional developer tool
+  # -----------------------------------------------------------------------
+  sql-contract:
+    name: PostgreSQL SQL contract preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: nulang
+          POSTGRES_PASSWORD: nulang
+          POSTGRES_DB: nulang
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U nulang -d nulang"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      NULANG_SQL_DATABASE_URL: postgresql://nulang:nulang@127.0.0.1:5432/nulang
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Focused unit tests
+        run: cargo test --locked --no-default-features --features postgres --bin nula-sql-check
+
+      - name: Compile standalone checker
+        run: cargo check --locked --no-default-features --features postgres --bin nula-sql-check
+
+      - name: Verify live preparation and offline failures
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/sql-valid.nula" <<'NULA'
+          fn example() {
+              perform DB.query("SELECT $1::int8 AS id", 42)
+          }
+          NULA
+          check=(cargo run --quiet --locked --no-default-features --features postgres --bin nula-sql-check --)
+          cache="$RUNNER_TEMP/sql-cache.json"
+          "${check[@]}" prepare "$RUNNER_TEMP/sql-valid.nula" --cache "$cache" --allow-plaintext
+          "${check[@]}" check "$RUNNER_TEMP/sql-valid.nula" --cache "$cache"
+
+          # A changed query must be rejected by cached offline validation.
+          cat > "$RUNNER_TEMP/sql-unknown-column.nula" <<'NULA'
+          fn example() {
+              perform DB.query("SELECT column_that_does_not_exist FROM pg_catalog.pg_class")
+          }
+          NULA
+          if "${check[@]}" prepare "$RUNNER_TEMP/sql-unknown-column.nula" --cache "$RUNNER_TEMP/bad-cache.json" --allow-plaintext; then
+            echo "::error::PostgreSQL accepted a nonexistent column"
+            exit 1
+          fi
+          if "${check[@]}" check "$RUNNER_TEMP/sql-unknown-column.nula" --cache "$cache"; then
+            echo "::error::Offline cache accepted changed SQL"
+            exit 1
+          fi
+
+          # The SQL text can be unchanged yet the bind count must still fail.
+          cat > "$RUNNER_TEMP/sql-missing-bind.nula" <<'NULA'
+          fn example() {
+              perform DB.query("SELECT $1::int8 AS id")
+          }
+          NULA
+          if "${check[@]}" check "$RUNNER_TEMP/sql-missing-bind.nula" --cache "$cache"; then
+            echo "::error::Offline cache accepted incorrect bind arity"
+            exit 1
+          fi
+
+  # -----------------------------------------------------------------------
   # Documentation site + zero-install browser playground
   # -----------------------------------------------------------------------
   docs-site:
