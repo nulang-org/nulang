@@ -15,7 +15,9 @@ submitted manifests.
    dependencies for each language; do not artificially penalize a baseline.
 2. Complete a working baseline in each repository and record its **full 40-digit
    Git commit SHA**. Finish the same subsequent maintenance change (such as
-   adding an idempotent retry boundary) and record another full SHA.
+   adding an idempotent retry boundary) and record another full SHA. The base
+   must be an ancestor of the candidate, and the range must change files;
+   equal, reversed, divergent, and empty commit ranges are rejected.
 3. Run application-specific verification against each candidate revision,
    including forced crashes and replay consistency where relevant. Link to a
    retained test log or CI run; record `failed` or `not_run` honestly. Capture
