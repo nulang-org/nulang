@@ -119,6 +119,31 @@ the VM's ordinary `.nula` `PerformAsync` host callback uses the helper
 or that process restarts, multi-owner race conditions, external authority and
 transactional actor-turn completion have been validated.
 
+## VM async effect-site context (experimental)
+
+The bytecode VM now calls `ActorVmCallbacks::perform_async_in_module` with
+the actual executing `CodeModule`, exact bytecode PC, and staged arguments.
+Adapters can inspect `module.effect_site_at(pc)` and pass that metadata to
+`DurableEffectSpec::from_compiled_async_site`. The PC remains the same when
+the VM suspends and re-executes a `PerformAsync` instruction. Calls without a
+valid previously fetched PC reject before reaching any callback.
+
+The default method delegates to the older `perform_async` signature and
+preserves existing runtime and standalone VM behavior. Existing callbacks,
+including the standard actor runtime callback, do **not** thereby gain
+durable intent/receipt semantics automatically. In particular, simply knowing
+a static bytecode PC does not supply an actor's replay-stable execution key,
+dynamic invocation count, verified artifact pin, activation ownership, or
+authorized provider-idempotency implementation.
+
+To implement the real production adapter, the runtime must first persist and
+restore the owning turn/execution key and per-site occurrence index; validate
+authority and verified artifact provenance; and call
+`execute_compiled_async_with_deduplication` before an external request.
+Receipt completion must be atomic with the owning actor/workflow transition.
+The existing Rust helper, VM callback hook, and synthetic tests do not
+establish full cross-process or multi-owner crash safety.
+
 ## What is not yet a production-wide guarantee
 
 Passing this gate does **not** prove that every `perform`, workflow activity,
