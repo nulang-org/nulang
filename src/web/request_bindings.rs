@@ -451,6 +451,76 @@ mod tests {
     }
 
     #[test]
+    fn malformed_slot_preempts_missing_query_input() {
+        let empty = HashMap::new();
+        let headers = Vec::new();
+        let values = RequestBindingValues {
+            path: &empty,
+            query: &empty,
+            headers: &headers,
+            cookies: &empty,
+            body: None,
+            form: &empty,
+        };
+        let err = bind_request_arguments(
+            &[binding(RouteBindingSource::Query, "missing", 2, "Int")],
+            1,
+            &values,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, RequestDecodeErrorKind::InvalidHandlerSlot);
+        assert_eq!(err.http_status(), 500);
+    }
+
+    #[test]
+    fn duplicate_slot_preempts_missing_query_input() {
+        let empty = HashMap::new();
+        let headers = Vec::new();
+        let values = RequestBindingValues {
+            path: &empty,
+            query: &empty,
+            headers: &headers,
+            cookies: &empty,
+            body: None,
+            form: &empty,
+        };
+        let err = bind_request_arguments(
+            &[
+                binding(RouteBindingSource::Query, "missing", 0, "Int"),
+                binding(RouteBindingSource::Header, "X-Trace", 0, "String"),
+            ],
+            1,
+            &values,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, RequestDecodeErrorKind::DuplicateHandlerSlot);
+        assert_eq!(err.http_status(), 500);
+    }
+
+    #[test]
+    fn incomplete_slot_preempts_missing_query_input() {
+        let empty = HashMap::new();
+        let headers = Vec::new();
+        let values = RequestBindingValues {
+            path: &empty,
+            query: &empty,
+            headers: &headers,
+            cookies: &empty,
+            body: None,
+            form: &empty,
+        };
+        let err = bind_request_arguments(
+            &[binding(RouteBindingSource::Query, "missing", 0, "Int")],
+            2,
+            &values,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, RequestDecodeErrorKind::IncompleteBindingPlan);
+        assert_eq!(err.handler_index, Some(1));
+        assert_eq!(err.http_status(), 500);
+    }
+
+    #[test]
     fn binding_plan_failures_are_server_errors() {
         let empty = HashMap::new();
         let headers = Vec::new();
