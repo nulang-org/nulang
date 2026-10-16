@@ -2185,7 +2185,6 @@ mod tests {
         assert!(super::aot_take_pending_native_error().is_none());
     }
 
-
     #[test]
     fn test_jit_status_slots_are_thread_local() {
         let left = std::thread::spawn(|| {
