@@ -268,6 +268,73 @@ fn authorize_actor_host_effect(
         .map_err(|error| error.to_string())
 }
 
+/// Host-side standard effects shared by the top-level and scheduler-driven
+/// bytecode callbacks. Call only *after* authorize_actor_host_effect succeeds:
+/// this helper performs real filesystem and environment I/O.
+fn perform_host_stdlib_builtin(
+    callbacks: &mut dyn crate::vm::ActorVmCallbacks,
+    effect_name: &str,
+    op_name: Option<&str>,
+    constants: &[crate::bytecode::Constant],
+    regs: &[crate::vm::Value],
+) -> Option<crate::vm::Value> {
+    use crate::vm::{resolve_value_string, Value};
+
+    let string_arg = |idx: usize| {
+        regs.get(idx)
+            .map(|v| resolve_value_string(constants, *v))
+            .unwrap_or_default()
+    };
+
+    match (effect_name, op_name) {
+        ("Env", Some("get")) => Some(
+            std::env::var(string_arg(0))
+                .map(|s| callbacks.alloc_string(&s))
+                .unwrap_or(Value::nil()),
+        ),
+        ("System", Some("arg")) => {
+            let index = regs
+                .first()
+                .and_then(|v| v.as_int())
+                .and_then(|n| usize::try_from(n).ok());
+            Some(
+                index
+                    .and_then(|n| std::env::args().nth(n))
+                    .map(|s| callbacks.alloc_string(&s))
+                    .unwrap_or(Value::nil()),
+            )
+        }
+        ("FS", Some("read")) => Some(
+            std::fs::read_to_string(string_arg(0))
+                .map(|s| callbacks.alloc_string(&s))
+                .unwrap_or(Value::nil()),
+        ),
+        ("FS", Some("write")) => Some(
+            if std::fs::write(string_arg(0), string_arg(1)).is_ok() {
+                Value::unit()
+            } else {
+                Value::nil()
+            },
+        ),
+        ("FS", Some("append")) => {
+            use std::io::Write;
+            let path = string_arg(0);
+            let content = string_arg(1);
+            let succeeded = std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(path)
+                .and_then(|mut file| file.write_all(content.as_bytes()))
+                .is_ok();
+            Some(if succeeded { Value::unit() } else { Value::nil() })
+        }
+        ("FS", Some("exists")) => Some(Value::bool(
+            std::path::Path::new(&string_arg(0)).exists(),
+        )),
+        _ => None,
+    }
+}
+
 /// Enforce an exact actor-backed foreign-function authority grant.
 ///
 /// The grant argument includes both library and symbol so permission to call
@@ -1071,6 +1138,15 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
                 );
                 return Some(crate::vm::Value::nil());
             }
+        }
+                if matches!(effect_name, "Env" | "System" | "FS") {
+            return perform_host_stdlib_builtin(
+                self,
+                effect_name,
+                op_name,
+                &module.constants,
+                regs,
+            );
         }
         if effect_name == "Otp" {
             let mut rt = self.runtime.borrow_mut();
@@ -1890,6 +1966,15 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
                     "denying actor-backed host effect"
                 );
                 return Some(crate::vm::Value::nil());
+            }
+                        if matches!(effect_name, "Env" | "System" | "FS") {
+                return perform_host_stdlib_builtin(
+                    self,
+                    effect_name,
+                    op_name,
+                    &module.constants,
+                    regs,
+                );
             }
             if effect_name == "Otp" {
                 return (*self.runtime).perform_otp_builtin(op_name, module, regs);
@@ -3058,7 +3143,7 @@ mod host_authority_tests {
         let file = std::env::temp_dir().join(format!(
             "nulang-host-parity-{}-{}.txt",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            "top-level"
         ));
         std::fs::write(&file, "first").unwrap();
 
@@ -3166,7 +3251,6 @@ mod host_authority_tests {
             .perform_builtin_effect_in_module("FS", Some("read"), &module, &[Value::string(0)])
             .expect("scheduler callback must dispatch granted read");
         assert_eq!(resolve_value_string(&module.constants, read), "guarded");
-        drop(actor_callback);
         drop(rt);
         std::fs::remove_file(file).unwrap();
     }
