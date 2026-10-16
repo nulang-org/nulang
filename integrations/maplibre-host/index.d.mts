@@ -6,6 +6,8 @@ export interface MapLibreNamespace {
 }
 export interface MapLibreMap {
   isStyleLoaded(): boolean;
+  getBounds(): { getWest(): number; getSouth(): number; getEast(): number; getNorth(): number };
+  getZoom(): number;
   on(event: string, cb: (event: unknown) => void): void;
   off(event: string, cb: (event: unknown) => void): void;
   getSource(id: string): MapLibreSource | undefined;
@@ -40,7 +42,12 @@ export type MapCommand =
   | { type: 'layer.visibility'; id: string; visible: boolean }
   | { type: 'feature-state.set'; target: FeatureTarget; state: Record<string, unknown> }
   | { type: 'feature-state.remove'; target: FeatureTarget; key?: string };
+export interface MapViewport {
+  bbox: [number, number, number, number];
+  zoom: number;
+}
 export interface MapHost {
+  viewport(): MapViewport;
   dispatch(command: MapCommand): void;
   on(event: string, cb: (event: unknown) => void): () => void;
   destroy(): void;

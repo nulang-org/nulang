@@ -154,7 +154,15 @@ export function createMapHost({ maplibregl, container, style, ...options }) {
     layers.clear();
     visibility.clear();
   }
-  return Object.freeze({ dispatch, on, destroy });
+  function viewport() {
+    ensureAlive();
+    const bounds = map.getBounds();
+    return {
+      bbox: [bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth()],
+      zoom: map.getZoom(),
+    };
+  }
+  return Object.freeze({ dispatch, on, viewport, destroy });
 }
 
 /** Bind a client Nulang signal to a typed map command; return an unsubscribe. */

@@ -184,6 +184,17 @@ test('failed in-place GeoJSON update preserves retained data', () => {
   host.destroy();
 });
 
+test('reads typed bounds and zoom from the retained map', () => {
+  const fake = fixture();
+  const host = createMapHost({ maplibregl: fake.maplibregl, container: {}, style: 'sample-style' });
+  fake.maps[0].getBounds = () => ({ getWest: () => -48, getSouth: () => -16, getEast: () => -47, getNorth: () => -15 });
+  fake.maps[0].getZoom = () => 9;
+  assert.deepEqual(host.viewport(), { bbox: [-48, -16, -47, -15], zoom: 9 });
+  assert.equal(fake.maps.length, 1);
+  host.destroy();
+  assert.throws(() => host.viewport(), /destroyed/);
+});
+
 test('style.load installs retained layers while source tiles remain pending', () => {
   const fake = fixture({ loaded: false });
   const host = createMapHost({ maplibregl: fake.maplibregl, container: {}, style: 'sample-style' });

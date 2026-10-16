@@ -3,6 +3,17 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "exports": { ".": { "types": "./index.d.mts", "default": "./index.mjs" } },
-  "scripts": { "test": "node --test test/*.test.mjs" }
+  "exports": {
+    ".": {
+      "types": "./index.d.mts",
+      "default": "./index.mjs"
+    },
+    "./viewport": {
+      "types": "./viewport.d.mts",
+      "default": "./viewport.mjs"
+    }
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
 }
