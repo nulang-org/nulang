@@ -2808,6 +2808,43 @@ fn levenshtein_distance(a: &str, b: &str) -> usize {
 mod tests {
     use super::*;
 
+    #[test]
+    fn workflow_cli_requires_explicit_supported_atomic_store() {
+        assert!(validate_workflow_store_uri(None).is_err());
+        assert!(validate_workflow_store_uri(Some("json:.nulang/store")).is_err());
+        assert!(validate_workflow_store_uri(Some("rocksdb:/tmp/store")).is_err());
+        assert!(validate_workflow_store_uri(Some("sqlite:")).is_err());
+        assert!(validate_workflow_store_uri(Some("sqlite:/tmp/nulang-workflow.db")).is_ok());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn cli_sqlite_uri_can_commit_an_atomic_workflow_start() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let db_path = std::env::temp_dir().join(format!(
+            "nulang-atomic-cli-store-{}-{unique}.db",
+            std::process::id()
+        ));
+        let mut runtime = nulang::runtime::Runtime::new();
+        let uri = format!("sqlite:{}", db_path.display());
+        install_persistence_store(&mut runtime, &uri).unwrap();
+
+        let id = runtime
+            .try_spawn_workflow_actor("SqliteCliWorkflow", Box::new(Vec::new), std::collections::HashMap::new())
+            .unwrap();
+        let tail = runtime
+            .persistence
+            .load_durable_tail_position(id)
+            .unwrap()
+            .expect("CLI SQLite URI must use an atomic-capable store");
+        assert_eq!(runtime.persistence.load_snapshot(id).unwrap().sequence, tail.sequence);
+        drop(runtime);
+        let _ = std::fs::remove_file(db_path);
+    }
+
     /// An actor program run through the CLI path must create real actors
     /// and deliver sent messages: with the bare standalone VM the stub
     /// spawn/send callbacks would leave the counter at 0.
