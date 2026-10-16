@@ -2780,11 +2780,9 @@ fn sender_thread(
                 reason: TransportSendFailureReason::Write,
             });
             let mut conns = lock_ignore_poison(&connections);
-            if let Some(conn) = retire_failed_sender_generation(
-                &mut conns,
-                outgoing.to_node,
-                attempted_generation,
-            ) {
+            if let Some(conn) =
+                retire_failed_sender_generation(&mut conns, outgoing.to_node, attempted_generation)
+            {
                 let _ = conn.stream.shutdown();
             }
         }
@@ -2903,12 +2901,8 @@ mod tests {
         );
 
         assert!(
-            retire_failed_sender_generation(
-                &mut connections,
-                node_id,
-                Some(stale_generation),
-            )
-            .is_none(),
+            retire_failed_sender_generation(&mut connections, node_id, Some(stale_generation),)
+                .is_none(),
             "failed write on stale connection must not remove replacement"
         );
         assert_eq!(
