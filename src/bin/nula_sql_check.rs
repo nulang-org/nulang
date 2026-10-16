@@ -24,7 +24,8 @@ enum ArgumentType {
 #[derive(Debug)]
 struct QueryCall {
     sql: String,
-    offset: usize,
+    line: usize,
+    column: usize,
     args: Vec<ArgumentType>,
 }
 
@@ -122,6 +123,13 @@ fn parse_arguments(tokens: &[Token], start: usize) -> Result<Vec<ArgumentType>, 
 /// Only explicitly written DB effects with a literal first argument are checked.
 /// The Nulang lexer excludes comments and treats string content as one token.
 /// Dynamic SQL fails closed, instead of being mislabeled as checked SQL.
+fn source_position(source: &str, offset: usize) -> (usize, usize) {
+    let prefix = &source[..offset];
+    let line = prefix.bytes().filter(|b| *b == b'\n').count() + 1;
+    let column = prefix.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+    (line, column)
+}
+
 fn extract_queries(source: &str) -> Result<Vec<QueryCall>, String> {
     let tokens = Lexer::new(source)
         .lex()
@@ -142,21 +150,22 @@ fn extract_queries(source: &str) -> Result<Vec<QueryCall>, String> {
             continue;
         }
         let offset = tokens[i].span.start as usize;
+        let (line, column) = source_position(source, offset);
         let sql = match tokens.get(i + 5).map(|t| &t.kind) {
             Some(TokenKind::StringLit(value)) => value.clone(),
             _ => {
                 return Err(format!(
-                    "byte {offset}: DB query SQL must be a literal string to be checked"
+                    "line {line}, column {column}: DB query SQL must be a literal string to be checked"
                 ));
             }
         };
         let args = match tokens.get(i + 6).map(|t| &t.kind) {
             Some(TokenKind::RParen) => Vec::new(),
             Some(TokenKind::Comma) => parse_arguments(&tokens, i + 7)
-                .map_err(|e| format!("byte {offset}: {e}"))?,
-            _ => return Err(format!("byte {offset}: malformed DB query call")),
+                .map_err(|e| format!("line {line}, column {column}: {e}"))?,
+            _ => return Err(format!("line {line}, column {column}: malformed DB query call")),
         };
-        queries.push(QueryCall { sql, offset, args });
+        queries.push(QueryCall { sql, line, column, args });
     }
     Ok(queries)
 }
@@ -192,11 +201,12 @@ fn verify_queries(calls: &[QueryCall], cache: &QueryCache) -> Result<usize, Stri
         let hash = fingerprint(&call.sql);
         let entry = entries
             .get(hash.as_str())
-            .ok_or_else(|| format!("byte {}: SQL not present in cache; run prepare", call.offset))?;
+            .ok_or_else(|| format!("line {}, column {}: SQL not present in cache; run prepare", call.line, call.column))?;
         if entry.parameter_type_oids.len() != call.args.len() {
             return Err(format!(
-                "byte {}: SQL expects {} bind parameters, but call has {}",
-                call.offset,
+                "line {}, column {}: SQL expects {} bind parameters, but call has {}",
+                call.line,
+                call.column,
                 entry.parameter_type_oids.len(),
                 call.args.len()
             ));
@@ -209,8 +219,9 @@ fn verify_queries(calls: &[QueryCall], cache: &QueryCache) -> Result<usize, Stri
         {
             if !literal_compatible(*argument, *oid) {
                 return Err(format!(
-                    "byte {}: parameter {} has incompatible literal type for PostgreSQL OID {}",
-                    call.offset,
+                    "line {}, column {}: parameter {} has incompatible literal type for PostgreSQL OID {}",
+                    call.line,
+                    call.column,
                     i + 1,
                     oid
                 ));
@@ -235,7 +246,12 @@ fn prepare_queries(calls: &[QueryCall], client: &mut Client) -> Result<QueryCach
         // does not execute the statement, including writes. No user arguments
         // are sent to the database during contract preparation.
         let statement = client.prepare(&call.sql).map_err(|e| {
-            format!("byte {}: PostgreSQL rejected SQL ({:?})", call.offset, e.code())
+            format!(
+                "line {}, column {}: PostgreSQL rejected SQL ({:?})",
+                call.line,
+                call.column,
+                e.code()
+            )
         })?;
         queries.insert(
             hash.clone(),
@@ -363,6 +379,8 @@ mod tests {
         let calls = extract_queries(src).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].sql, "SELECT $1::int8");
+        assert!(calls[0].line > 1);
+        assert!(calls[0].column > 1);
         assert_eq!(calls[0].args, vec![ArgumentType::Int]);
     }
 
