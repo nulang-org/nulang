@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Parsed Web module import metadata — 2026-10-16
+- **Web deployment metadata now uses package AST import declarations for `@nulang/*` module capabilities, middleware, and required Cloud config names**, rather than rescanning raw source lines. Repeated imports are normalized deterministically; text inside comments and string literals cannot become a deployment module requirement.
+- **Regression tests cover source-free deployment IR generation and package import extraction.** Legacy effect-capability source scanning is unchanged and requires a separate compiler-semantic migration before removal.
+
 ### Web static-root containment — 2026-10-15
 - **Experimental Web static file serving refuses parent traversal and symlinks escaping configured roots.** Canonical candidate paths must remain inside their canonicalized static or output root, and normal in-root files remain serveable.
 - **A filesystem regression verifies parent and symlink escape rejection.** This is a clean current-main successor to draft #1676; it does not change SSE or claim protection from malicious concurrent mutation of a trusted static root.
