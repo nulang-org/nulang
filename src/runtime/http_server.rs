@@ -1070,9 +1070,9 @@ impl WebDevServer {
             .and_then(|root| contained_static_file(root, trimmed))
             .or_else(|| output_dir.and_then(|root| contained_static_file(root, trimmed)));
 
-        if let Some(p) = file_path {
-            if let Ok(data) = std::fs::read(&p) {
-                let content_type = guess_content_type(&p);
+        if let Some((canonical, requested)) = file_path {
+            if let Ok(data) = std::fs::read(&canonical) {
+                let content_type = guess_content_type(&requested);
                 return HttpResponse {
                     status: 200,
                     headers: vec![("Content-Type".into(), content_type.into())],
@@ -1091,7 +1091,7 @@ impl WebDevServer {
 /// Resolve files only inside the configured static root. Resolve symlinks
 /// before checking containment; do not trust the URL's path components.
 /// Does not protect a concurrently mutated, hostile filesystem root.
-fn contained_static_file(root: &Path, relative: &str) -> Option<PathBuf> {
+fn contained_static_file(root: &Path, relative: &str) -> Option<(PathBuf, PathBuf)> {
     if !Path::new(relative)
         .components()
         .all(|part| matches!(part, Component::Normal(_)))
@@ -1108,7 +1108,7 @@ fn contained_static_file(root: &Path, relative: &str) -> Option<PathBuf> {
     };
     let canonical = candidate.canonicalize().ok()?;
     if canonical.starts_with(&root) && canonical.is_file() {
-        Some(canonical)
+        Some((canonical, candidate))
     } else {
         None
     }
