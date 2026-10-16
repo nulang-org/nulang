@@ -27,6 +27,26 @@ npm test
 
 CI also runs the Node suite and builds this example with the Nulang release CLI, checking that the generated HTML and static assets exist.
 
+### Strict WebGL 2 browser verification
+
+Run on a machine with Chromium and WebGL 2 support **after** `nula build --web`:
+
+```sh
+npm install --no-save --package-lock=false playwright-core
+CHROMIUM_EXECUTABLE=/usr/bin/chromium npm run test:browser:webgl
+```
+
+Set `CHROMIUM_EXECUTABLE` to your actual browser binary. This diagnostic serves
+the compiler-produced `dist/` output, verifies Nulang signal hydration and
+slider updates, requires a **real WebGL 2 browser context** (Canvas 2D fallback
+is a failure), and checks for graphics and console errors. It is deliberately
+optional: CI runs the headless-independent unit tests and Nulang build while
+hardware-specific GPU validation remains an explicit review gate. Headless
+Chromium or sandboxed hosts may expose no WebGL 2 context; report this as
+*not verified*, not a passing GPU test. This is a functional smoke test, not a
+GPU benchmark or a guarantee of hardware acceleration.
+
+
 Requires Node 20+. These tests exercise WebGL 2 mock lifecycle, context
 loss/restoration, Canvas 2D fallback, frame coalescing, GPU resource cleanup,
 invalid geometry, and the actual generated client-signal JavaScript embedded
