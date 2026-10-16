@@ -1,5 +1,127 @@
 //! Deterministic, single-thread reference executor for the experimental
 //! scoped-task protocol. Does not alter the `par` execution path.
+//!
+//! This executor is an executable reference for the event ordering and
+//! cancellation contract defined by `TaskScope`. Callers supply a cooperative
+//! callback that performs **at most one nonblocking step** of each admitted
+//! task. No threads are spawned; a blocking callback would block this runner.
+//!
+//! A scheduler can compare its trace/outcomes against this reference for
+//! equivalent ordered events, but this is not VM or WASM integration.
+
+use crate::scoped_tasks::{
+    CancellationCause, CancellationToken, ScopeError, TaskId, TaskOutcome, TaskScope,
+};
+
+/// Result of a single cooperative task step.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TaskPoll<T, E> {
+    /// The task is still executing and must be polled again in a later tick.
+    Pending,
+    /// The task has terminated normally or with an error.
+    Ready(Result<T, E>),
+    /// The task has actually terminated without producing a result.
+    ///
+    /// This must not be returned merely because cancellation was requested.
+    Cancelled,
+}
+
+/// Actions applied by one bounded tick.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TickStats {
+    pub admitted: usize,
+    pub polled: usize,
+    pub completed: usize,
+}
+
+/// Reference host for the bounded scope contract.
+///
+/// It admits children in FIFO order and polls each active task once in
+/// submission order per tick. A failure cancels pending children and signals
+/// already-running siblings in the same tick. Results join in submission
+/// order. The host never automatically acknowledges running-task cancellation.
+#[derive(Debug)]
+pub struct ReferenceExecutor<T, E> {
+    scope: TaskScope<T, E>,
+    active: Vec<TaskId>,
+}
+
+impl<T, E> ReferenceExecutor<T, E> {
+    pub fn new(max_in_flight: usize, max_pending: usize) -> Result<Self, ScopeError> {
+        Ok(Self {
+            scope: TaskScope::new(max_in_flight, max_pending)?,
+            active: Vec::new(),
+        })
+    }
+
+    pub fn try_submit(&mut self) -> Result<TaskId, ScopeError> {
+        self.scope.try_submit()
+    }
+
+    pub fn cancel(&mut self, reason: CancellationCause) {
+        self.scope.cancel(reason);
+    }
+
+    pub fn cancellation(&self) -> Option<&CancellationCause> {
+        self.scope.cancellation()
+    }
+
+    pub fn in_flight(&self) -> usize {
+        self.scope.in_flight()
+    }
+
+    pub fn is_quiescent(&self) -> bool {
+        self.scope.is_quiescent()
+    }
+
+    /// Execute exactly one finite cooperative scheduling tick.
+    ///
+    /// This function does not loop waiting for asynchronous progress. Callers
+    /// are responsible for the number of ticks, virtual clock/deadlines, and
+    /// for ensuring the supplied callback never blocks indefinitely.
+    ///
+    /// Newly available admission slots are refilled on the **next** tick,
+    /// avoiding order changes based on callback completion timings.
+    pub fn tick<F>(&mut self, mut poll: F) -> TickStats
+    where
+        F: FnMut(TaskId, &CancellationToken) -> TaskPoll<T, E>,
+    {
+        let mut stats = TickStats::default();
+        while let Some(id) = self.scope.admit_next() {
+            self.active.push(id);
+            stats.admitted += 1;
+        }
+
+        let token = self.scope.cancellation_token();
+        let mut index = 0;
+        while index < self.active.len() {
+            let id = self.active[index];
+            stats.polled += 1;
+            match poll(id, &token) {
+                TaskPoll::Pending => index += 1,
+                TaskPoll::Ready(result) => {
+                    self.scope
+                        .complete(id, result)
+                        .expect("reference executor only polls running task IDs");
+                    self.active.remove(index);
+                    stats.completed += 1;
+                }
+                TaskPoll::Cancelled => {
+                    self.scope
+                        .acknowledge_cancelled(id)
+                        .expect("reference executor only polls running task IDs");
+                    self.active.remove(index);
+                    stats.completed += 1;
+                }
+            }
+        }
+        stats
+    }
+
+    pub fn into_outcomes(self) -> Result<Vec<TaskOutcome<T, E>>, ScopeError> {
+        self.scope.into_outcomes()
+    }
+}
 
 #[cfg(test)]
 mod tests {
