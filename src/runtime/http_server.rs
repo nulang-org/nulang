@@ -1191,7 +1191,6 @@ fn guess_content_type(path: &Path) -> &'static str {
 mod tests {
     use super::*;
 
-
     #[test]
     fn if_none_match_comparison_respects_quoted_commas_and_weak_tags() {
         let etag = "\"abc\"";
