@@ -1053,7 +1053,8 @@ mod bounded_admission_conformance_tests {
         mb.push(msg(1, MessagePriority::Normal)).unwrap();
         assert!(mb.receive_match(&[1]).is_some());
         assert!(mb.push(msg(2, MessagePriority::Normal)).is_err());
-        mb.commit_receive_match().expect("commit matched normal message");
+        mb.commit_receive_match()
+            .expect("commit matched normal message");
         mb.push(msg(2, MessagePriority::Normal))
             .expect("commit releases the reserved normal credit");
     }
