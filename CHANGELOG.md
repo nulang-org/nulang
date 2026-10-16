@@ -1,4 +1,7 @@
 # Nulang Changelog
+### WASM invalid-input diagnostic hardening — 2026-10-15
+- **Malformed WASM modules no longer write guest-provided bytes to a predictable `/tmp` filename.** Compilation failures return their existing typed Wasmtime error without host-file clobbering or an I/O `unwrap` panic. Added a non-destructive regression guard and an invalid-module error test.
+
 ### Experimental Web HTML host hardening — 2026-10-15
 - **`Web.html` now validates dynamic element and attribute names and URL-bearing attributes before rendering.** Unsafe markup and scriptable URL schemes fail closed; quoted attribute delimiters are escaped while already escaped `Html` text is preserved.
 - **Six focused regression tests cover normal markup, attribute breakouts, event attributes, high-risk elements, obfuscated URLs, and safe relative/HTTP links.** `Web.raw` remains a trusted-only escape hatch; dynamic script/style/SVG and inline style/event attributes are intentionally rejected pending a future typed context-aware API.

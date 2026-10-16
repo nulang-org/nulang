@@ -104,11 +104,9 @@ impl WasmRuntime {
         let config = config.unwrap_or_else(default_wasm_config);
         let engine = Engine::new(&config).map_err(map_wasmtime_err)?;
 
-        let res = Module::new(&engine, wasm_bytes);
-        if let Err(_) = &res {
-            std::fs::write("/tmp/failed_module.wasm", wasm_bytes).unwrap();
-        }
-        let module = res.map_err(map_wasmtime_err)?;
+        // Invalid guest modules are untrusted input: report a typed error without
+        // writing their bytes to a predictable host filesystem path.
+        let module = Module::new(&engine, wasm_bytes).map_err(map_wasmtime_err)?;
 
         let mut store = Store::new(&engine, HostState::default());
 
@@ -1140,6 +1138,27 @@ mod tests {
         let invalid_wasm = vec![0x00, 0x00, 0x00, 0x00];
         let result = Module::new(&engine, &invalid_wasm);
         assert!(result.is_err(), "invalid WASM should fail to parse");
+    }
+
+    // Regression: malformed guest input must never be dumped to a shared,
+    // predictable /tmp path. This source-level guard is safe to run on the
+    // vulnerable revision: executing that revision would clobber the path.
+    #[test]
+    fn invalid_wasm_has_no_shared_diagnostic_dump_path() {
+        let source = include_str!("wasm_runtime.rs");
+        let legacy_dump = ["/tmp/failed_", "module.wasm"].concat();
+        assert!(
+            !source.contains(&legacy_dump),
+            "failed guest modules must not be written to a shared tmp path"
+        );
+    }
+
+    #[test]
+    fn invalid_wasm_returns_a_compile_error() {
+        let result = WasmRuntime::new(b"not a wasm module", None);
+        assert!(result.is_err(), "malformed WASM should return an error");
+        let err = result.err().expect("error");
+        assert!(err.to_string().contains("wasmtime"));
     }
 
     #[test]
