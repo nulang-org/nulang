@@ -116,7 +116,17 @@ impl CoreVM {
     }
 
     pub fn load_nbc(&mut self, data: &[u8]) -> Result<usize, String> {
-        let artifact = <crate::bytecode::CodeModule>::from_nbc(data)
+        self.load_nbc_with_limits(data, crate::format::nbc::NbcDecodeLimits::UNLIMITED)
+    }
+
+    /// Admit a decoded .nbc artifact only if it fits the host's explicit
+    /// resource policy. Failure never publishes a partial module.
+    pub fn load_nbc_with_limits(
+        &mut self,
+        data: &[u8],
+        limits: crate::format::nbc::NbcDecodeLimits,
+    ) -> Result<usize, String> {
+        let artifact = <crate::bytecode::CodeModule>::from_nbc_with_limits(data, limits)
             .map_err(|e| format!("Failed to load .nbc: {e}"))?;
         let module_idx = self.modules.len();
         self.modules.push(artifact.module);
