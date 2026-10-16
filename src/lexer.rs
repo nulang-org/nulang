@@ -1364,6 +1364,33 @@ mod tests {
     }
 
     #[test]
+    fn test_lex_with_comments_preserves_trivia_without_changing_parser_tokens() {
+        let source = "/// documentation\nfn f() { // ordinary comment\n  1\n}\n";
+        let parser_tokens = Lexer::new(source).lex().expect("parser tokenization");
+        let tooling_tokens = Lexer::new(source)
+            .lex_with_comments()
+            .expect("tooling tokenization");
+        assert!(
+            !parser_tokens
+                .iter()
+                .any(|token| matches!(&token.kind, TokenKind::Comment(_))),
+            "normal compilation must still filter ordinary comments"
+        );
+        assert!(
+            tooling_tokens
+                .iter()
+                .any(|token| matches!(&token.kind, TokenKind::Comment(_))),
+            "source tooling needs regular comments"
+        );
+        assert!(
+            tooling_tokens
+                .iter()
+                .any(|token| matches!(&token.kind, TokenKind::DocComment(_))),
+            "source tooling needs documentation comments"
+        );
+    }
+
+    #[test]
     fn test_string_escapes() {
         let kinds = lex(r#""a\nb\tc\"d""#);
         assert_eq!(
