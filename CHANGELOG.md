@@ -1,4 +1,20 @@
 # Nulang Changelog
+### Transient scoped cancellation contract — 2026-10-16
+- **Introduce opt-in thread-safe cancellation tokens for transient scoped work.** Cancellation propagates from parents to children, child-local requests do not affect siblings, and monotonic deadlines cannot extend an inherited deadline.
+- **Deterministic tests cover deadline boundaries, explicit cancellation, worker-thread propagation, and parent-handle lifetime.** This contract does not interrupt active actors, wake mailbox waiters, or persist durable workflow cancellation.
+
+### Web static-root containment — 2026-10-15
+- **Experimental Web static file serving refuses parent traversal and symlinks escaping configured roots.** Canonical candidate paths must remain inside their canonicalized static or output root, and normal in-root files remain serveable.
+- **A filesystem regression verifies parent and symlink escape rejection.** This is a clean current-main successor to draft #1676; it does not change SSE or claim protection from malicious concurrent mutation of a trusted static root.
+
+### Experimental Web HTML host hardening — 2026-10-15
+- **`Web.html` now validates dynamic element and attribute names and URL-bearing attributes before rendering.** Unsafe markup and scriptable URL schemes fail closed; quoted attribute delimiters are escaped while already escaped `Html` text is preserved.
+- **Six focused regression tests cover normal markup, attribute breakouts, event attributes, high-risk elements, obfuscated URLs, and safe relative/HTTP links.** `Web.raw` remains a trusted-only escape hatch; dynamic script/style/SVG and inline style/event attributes are intentionally rejected pending a future typed context-aware API.
+
+### Rustls and Wasmtime security updates — 2026-10-15
+- **Pinned supported TLS and WASM runtime dependencies to patched versions.** Updated rustls 0.23.45 to 0.23.46 and Wasmtime 48.0.5 to 48.0.6 (including compatible Cranelift and runtime lockfile packages) to address October 2026 RustSec advisories.
+- **Documented the remaining legacy rustls 0.22 advisories in the Cargo audit policy.** The affected version is transitive through libsql's hyper-rustls 0.25 path; explicit advisory exceptions are restricted to the documented IDs until the upstream dependency chain is upgraded.
+
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
