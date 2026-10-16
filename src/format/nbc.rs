@@ -519,6 +519,30 @@ mod tests {
     }
 
     #[test]
+    fn test_metadata_limit_rejected_before_decoding_instruction_opcodes() {
+        let mut bytes = sample_module().to_nbc(None).expect("encode fixture");
+        // Metadata admission takes precedence over opcode decoding, so an
+        // artifact guaranteed to be rejected never allocates instructions.
+        bytes[NBC_HEADER_LEN] = 0xFF;
+        let policy = NbcDecodeLimits {
+            max_artifact_bytes: bytes.len(),
+            max_instructions: 1024,
+            max_metadata_bytes: 0,
+        };
+        assert!(matches!(
+            CodeModule::from_nbc_with_limits(&bytes, policy),
+            Err(FormatError::ResourceLimitExceeded {
+                resource: "metadata bytes",
+                ..
+            })
+        ));
+        assert!(matches!(
+            CodeModule::from_nbc(&bytes),
+            Err(FormatError::UnknownOpcode { .. })
+        ));
+    }
+
+    #[test]
     fn bounded_decode_rejects_forged_instruction_count_before_allocating() {
         let mut bytes = sample_module().to_nbc(None).expect("encode fixture");
         bytes[44..48].copy_from_slice(&u32::MAX.to_be_bytes());
