@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Web mutation-origin provenance — 2026-10-15
+- **The experimental Web dev-server rejects cross-origin and missing-origin state-changing requests before route dispatch.** The policy uses unambiguous Host/Origin/Referer and Fetch Metadata checks from the existing #1510 validation module, integrated on top of merged bounded HTTP framing (#1672).
+- **A real-TCP regression covers rejected foreign/missing provenance and admitted same-origin mutations**, while standalone low-level Http.serve remains outside this Web-specific gate. This is not session authentication or tenant authorization; HTTPS proxies configure NULANG_WEB_PUBLIC_ORIGIN.
+
 ### Web static-root containment — 2026-10-15
 - **Experimental Web static file serving refuses parent traversal and symlinks escaping configured roots.** Canonical candidate paths must remain inside their canonicalized static or output root, and normal in-root files remain serveable.
 - **A filesystem regression verifies parent and symlink escape rejection.** This is a clean current-main successor to draft #1676; it does not change SSE or claim protection from malicious concurrent mutation of a trusted static root.

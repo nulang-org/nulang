@@ -202,9 +202,11 @@ nulang nula dev            # serves on the [web] port (or: nula dev --port 8080)
 
 `nula dev` compiles the package, starts the web server, serves each registered route dynamically, falls back to `static_dir` for unclaimed paths (e.g. `/style.css`), and injects the client runtime script into pages. Try it:
 
+Unsafe methods (POST, PUT, PATCH, DELETE) are admitted only with matching same-origin `Origin` or `Referer` provenance. Duplicate provenance headers, cross-site Fetch Metadata, missing provenance, and untrusted `Host` values fail closed with HTTP 403 before handler execution. Browser forms supply their own provenance; manual `curl` requests must include `Origin`. For a trusted HTTPS reverse proxy, set `NULANG_WEB_PUBLIC_ORIGIN=https://your-domain.example` and forward the actual public `Host` unchanged. Do not trust arbitrary client-supplied `X-Forwarded-*` headers. This gate is **not** authentication, tenant authorization, or a substitute for CSRF tokens in a broader security design; it applies to the routed experimental Web server, not the standalone `Http.serve` transport.
+
 ```bash
 curl http://127.0.0.1:8080/hello/david      # <h1>Hello, david!</h1>
-curl -X POST -d 'msg=hi' http://127.0.0.1:8080/sign
+curl -X POST -H 'Origin: http://127.0.0.1:8080' -d 'msg=hi' http://127.0.0.1:8080/sign
 curl http://127.0.0.1:8080/last             # "Last message: hi"
 ```
 
@@ -234,7 +236,7 @@ Subscribers connect to the built-in Server-Sent Events endpoint `/<room-prefix>/
 
 ```bash
 curl -N http://127.0.0.1:8080/__nulang/sse/signs   # in one terminal
-curl -X POST -d 'msg=live' http://127.0.0.1:8080/sign   # in another → SSE client receives it
+curl -X POST -H 'Origin: http://127.0.0.1:8080' -d 'msg=live' http://127.0.0.1:8080/sign   # in another → SSE client receives it
 ```
 
 The `examples/chat-web` package shows the full pattern: an SSE `<script>` in the page, a POST handler that stores and broadcasts, and a `redirect` back. Treat this layer as minimal — one broadcast op, one SSE transport, in-process delivery.
