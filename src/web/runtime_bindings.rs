@@ -282,9 +282,7 @@ pub fn bind_path_arguments(
         occupied[binding.handler_index] = true;
     }
     if let Some(index) = occupied.iter().position(|bound| !bound) {
-        return Err(format!(
-            "handler parameter slot {index} has no request binding"
-        ));
+        return Err(format!("handler parameter slot {index} has no request binding"));
     }
 
     let mut slots: Vec<Option<BoundRouteArgument>> = vec![None; handler_param_count];
