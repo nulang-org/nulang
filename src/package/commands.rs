@@ -1415,8 +1415,34 @@ fn cmd_build_web() -> NuResult<()> {
         span: Span::default(),
     })?;
 
-    eprintln!("  Rendering {} route(s)...", routes.len());
-    for route in &routes {
+    // Emit compile-time signal graph if the entry uses `signal` declarations.
+    let signals_path = output_dir.join("app.signals.json");
+    nulang_exe(&[
+        "--emit-signals",
+        &signals_path.to_string_lossy(),
+        &entry_str,
+    ])?;
+
+    // Generate deployment IR consumed by adapters and Nulang Cloud.
+    let ir = crate::web::ir::generate_deployment_ir(
+        &routes,
+        Some(&signals_path),
+        &src_root,
+        &manifest.budgets,
+        &validated_contracts,
+    );
+    let static_count = ir
+        .routes
+        .iter()
+        .filter(|route| route.placement == "static")
+        .count();
+    eprintln!("  Rendering {} static route(s)...", static_count);
+    // IR routes are generated in the same order as the registered routes.
+    // Server-only handlers must never run during static artifact generation.
+    for (route, ir_route) in routes.iter().zip(&ir.routes) {
+        if ir_route.placement != "static" {
+            continue;
+        }
         let html = render_route_handler(&route.handler_module, route.handler_func_idx, None)
             .ok_or_else(|| NuError::PackageError {
                 msg: format!("failed to render route {:?} {}", route.method, route.path),
@@ -1443,22 +1469,6 @@ fn cmd_build_web() -> NuResult<()> {
         copy_dir_contents(&static_dir, &output_dir)?;
     }
 
-    // Emit compile-time signal graph if the entry uses `signal` declarations.
-    let signals_path = output_dir.join("app.signals.json");
-    nulang_exe(&[
-        "--emit-signals",
-        &signals_path.to_string_lossy(),
-        &entry_str,
-    ])?;
-
-    // Generate deployment IR consumed by adapters and Nulang Cloud.
-    let ir = crate::web::ir::generate_deployment_ir(
-        &routes,
-        Some(&signals_path),
-        &src_root,
-        &manifest.budgets,
-        &validated_contracts,
-    );
     let ir_path = output_dir.join("nulang-app.ir.json");
     let ir_json = ir.to_json();
     std::fs::write(&ir_path, ir_json).map_err(|e| NuError::PackageError {
@@ -3056,6 +3066,55 @@ mod tests {
                 msg
             );
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cmd_build_web_does_not_render_server_routes_as_static_artifacts() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_build_web_static_placement_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        scaffold_package(&dir, "mixed-routes", "web").expect("web scaffold should succeed");
+        std::fs::write(
+            dir.join("src/main.nula"),
+            r#"import stdlib::web::html
+import stdlib::web::types
+
+fn home() -> Html { text("Static homepage") }
+fn submit() -> Html { text("Server response") }
+
+app "mixed-routes" {
+    route "GET" "/" -> home
+    route "POST" "/submit" -> submit
+}
+"#,
+        )
+        .unwrap();
+
+        let _guard = ChangeDir::new(&dir);
+        cmd_build_web().expect("mixed static/server Web build should succeed");
+
+        assert!(dir.join("dist/index.html").is_file());
+        assert!(
+            !dir.join("dist/submit/index.html").exists(),
+            "POST server routes must not be prerendered as public static pages"
+        );
+
+        let ir: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("dist/nulang-app.ir.json")).unwrap(),
+        )
+        .unwrap();
+        let routes = ir["routes"].as_array().unwrap();
+        let server = routes
+            .iter()
+            .find(|route| route["method"] == "POST" && route["path"] == "/submit")
+            .expect("server route metadata must still be emitted");
+        assert_eq!(server["placement"], "server");
+        assert!(server["artifact"].is_null());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
