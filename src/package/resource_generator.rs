@@ -173,10 +173,50 @@ pub fn run(args: &[String], root: &Path) -> NuResult<PathBuf> {
     }
     Manifest::load(root)?;
 
-    let dest_dir = root.join("src").join("resources");
+    let source_dir = root.join("src");
+    let dest_dir = source_dir.join("resources");
     let output = dest_dir.join(format!("{}.nula", resource.file_stem()));
+    // A pre-existing src/ or src/resources/ symlink can redirect generation
+    // outside the package. Reject it instead of following it implicitly.
+    for dir in [&source_dir, &dest_dir] {
+        match fs::symlink_metadata(dir) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(invalid(format!(
+                    "cannot generate resources through symlinked directory {}",
+                    dir.display()
+                )));
+            }
+            Ok(meta) if !meta.is_dir() => {
+                return Err(invalid(format!(
+                    "resource output parent {} is not a directory",
+                    dir.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(invalid(format!(
+                    "cannot inspect resource output directory {}: {error}",
+                    dir.display()
+                )));
+            }
+        }
+    }
     fs::create_dir_all(&dest_dir)
         .map_err(|error| invalid(format!("cannot create {}: {error}", dest_dir.display())))?;
+    // Defense in depth: verify the effective directory is still inside the
+    // package root after it has been created. This is not a concurrent-write
+    // sandbox, but it prevents ordinary pre-existing redirect mistakes.
+    let canonical_root = fs::canonicalize(root)
+        .map_err(|error| invalid(format!("cannot resolve {}: {error}", root.display())))?;
+    let canonical_dest = fs::canonicalize(&dest_dir)
+        .map_err(|error| invalid(format!("cannot resolve {}: {error}", dest_dir.display())))?;
+    if !canonical_dest.starts_with(&canonical_root) {
+        return Err(invalid(format!(
+            "resource output directory {} resolves outside the package",
+            dest_dir.display()
+        )));
+    }
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
