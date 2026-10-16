@@ -2235,6 +2235,17 @@ mod tests {
     }
 
     #[test]
+    fn test_native_pending_error_legacy_message_consumer() {
+        let _ = super::aot_take_pending_native_error();
+        super::aot_set_pending_effect_error("Unhandled effect: 'Ghost.vanish'".to_string());
+        assert_eq!(
+            super::aot_take_pending_error().as_deref(),
+            Some("Unhandled effect: 'Ghost.vanish'")
+        );
+        assert!(super::aot_take_pending_native_error().is_none());
+    }
+
+    #[test]
     fn test_jit_status_slots_are_thread_local() {
         let left = std::thread::spawn(|| {
             let mut budget = 1u64;
