@@ -1075,6 +1075,50 @@ fn view(count: Html) -> Html {
     }
 
     #[test]
+    fn test_using_parameter_shadows_global_signal_in_graph_and_rewrite() {
+        let mut module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+signal count: Html = text("global")
+
+fn view() -> Html {
+    <span>{count}</span>
+}
+"#,
+        );
+
+        // The parser populates ordinary parameters in the source test above.
+        // Model a contextual/using parameter explicitly to exercise both
+        // immutable graph analysis and mutable AST rewriting on the same input.
+        let view = module
+            .decls
+            .iter_mut()
+            .find(|decl| matches!(decl, Decl::Function { name, .. } if name == "view"))
+            .expect("view function");
+        if let Decl::Function { using_params, .. } = view {
+            using_params.push(crate::ast::Param::new("count", None));
+        }
+
+        let graph = analyze_module(&module, None);
+        assert!(
+            !graph
+                .nodes
+                .iter()
+                .any(|node| matches!(node, GraphNode::Read { signal, .. } if signal == "count")),
+            "using parameter must shadow the global signal"
+        );
+
+        rewrite_module(&mut module, None);
+        let html = format!("{:?}", find_function_body(&module, "view"));
+        assert!(
+            !html.contains("data-signal"),
+            "a using parameter must not produce a hydration marker"
+        );
+    }
+
+    #[test]
     fn test_local_binding_shadows_signal_only_in_its_body() {
         let mut module = parse(
             r#"
