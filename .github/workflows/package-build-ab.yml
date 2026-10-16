@@ -1,0 +1,91 @@
+name: Package build exact-base A/B
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/package-build-ab.yml'
+      - 'scripts/benchmark_package_build.py'
+      - 'scripts/tests/test_benchmark_package_build.py'
+      - 'benchmarks/CLI_BUILD.md'
+      - 'benchmarks/fixtures/nula-build-smoke/**'
+      - 'src/main.rs'
+      - 'src/package/commands.rs'
+      - 'tests/cli_emit_nbc_json.rs'
+
+concurrency:
+  group: package-build-ab-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  paired:
+    name: Matched-binary nula build A/B
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify CLI benchmark contracts
+        run: python3 -m unittest discover -s scripts/tests -p 'test_benchmark_package_build.py' -v
+
+      - name: Build two exact-revision release binaries
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          BASE_WORKTREE="$RUNNER_TEMP/nulang-cli-ab-base"
+          mkdir -p "$RUNNER_TEMP/nulang-cli-ab-target"
+          git worktree add --detach "$BASE_WORKTREE" "$BASE_SHA"
+          echo "BASE_SHA=$(git -C "$BASE_WORKTREE" rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "CANDIDATE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/nulang-cli-ab-target/base" \
+            cargo build --locked --release --bin nulang --manifest-path "$BASE_WORKTREE/Cargo.toml"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/nulang-cli-ab-target/candidate" \
+            cargo build --locked --release --bin nulang
+          test -x "$RUNNER_TEMP/nulang-cli-ab-target/base/release/nulang"
+          test -x "$RUNNER_TEMP/nulang-cli-ab-target/candidate/release/nulang"
+
+      - name: Counterbalanced package build measurements
+        run: |
+          set -euo pipefail
+          BASE_BIN="$RUNNER_TEMP/nulang-cli-ab-target/base/release/nulang"
+          CANDIDATE_BIN="$RUNNER_TEMP/nulang-cli-ab-target/candidate/release/nulang"
+          ALLOWED_CPU="$(python3 -c 'import os; print(min(os.sched_getaffinity(0)))')"
+          taskset -c "$ALLOWED_CPU" python3 scripts/benchmark_package_build.py \
+            --base-binary "$BASE_BIN" --candidate-binary "$CANDIDATE_BIN" \
+            --package benchmarks/fixtures/nula-build-smoke --stdlib src/stdlib \
+            --rounds 8 --mode both --timeout-seconds 120 \
+            --out package-build-ab.json
+          sha256sum "$BASE_BIN" "$CANDIDATE_BIN"
+          cat package-build-ab.json
+
+      - name: Publish exact-head measurement summary
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          data = json.loads(Path('package-build-ab.json').read_text())
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write('## Exact-base package build A/B\n\n')
+              f.write(f"Base: {os.environ['BASE_SHA']} · Candidate: {os.environ['CANDIDATE_SHA']}\n\n")
+              f.write('| Mode | Build phase | Median paired speedup |\n')
+              f.write('| --- | --- | ---: |\n')
+              for mode, phases in data['paired_speedup_x'].items():
+                  for phase, value in phases.items():
+                      f.write(f'| {mode} | {phase} | {value:.3f}× |\n')
+              f.write('\nFull subprocess wall-time, binary and artifact digest comparisons; '
+                      'not a cold OS-cache or compiler-only microbenchmark.\n')
+          PY
+
+      - name: Archive raw A/B measurements
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-build-ab
+          path: package-build-ab.json
+          if-no-files-found: error
