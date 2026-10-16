@@ -197,5 +197,5 @@ test('a throwing batch flushes the final state and propagates the error', () => 
 
 test('batch rejects non-function callbacks', () => {
   const api = hydrate([]);
-  assert.throws(() => api.batch(null), TypeError);
+  assert.throws(() => api.batch(null), /batch requires a function/);
 });
