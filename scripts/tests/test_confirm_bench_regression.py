@@ -22,6 +22,54 @@ class CriterionFilterTests(unittest.TestCase):
         self.assertEqual(r"^(?:group/a\+b|scheduler/foo/1000)$", value)
 
 
+    def test_filter_preserves_exact_criterion_id(self):
+        pattern = confirm.criterion_filter(["persist/checkpoint_json_encode/1kb"])
+        self.assertRegex("persist/checkpoint_json_encode/1kb", pattern)
+        self.assertNotRegex("persist_checkpoint_json_encode/1kb", pattern)
+
+    def test_report_metadata_round_trip_preserves_group_underscores(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            criterion_dir = pathlib.Path(tmp) / "criterion"
+            metadata_path = (
+                criterion_dir
+                / "actor_selective_receive_depth"
+                / "64"
+                / "new"
+                / "benchmark.json"
+            )
+            metadata_path.parent.mkdir(parents=True)
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "directory_name": "actor_selective_receive_depth/64",
+                        "full_id": "actor/selective_receive_depth/64",
+                    }
+                )
+            )
+
+            report_benchmark_ids = confirm.benchmark_ids_for_reports(
+                criterion_dir, ["actor_selective_receive_depth/64"]
+            )
+
+        self.assertEqual(
+            {
+                "actor_selective_receive_depth/64": (
+                    "actor/selective_receive_depth/64"
+                )
+            },
+            report_benchmark_ids,
+        )
+        pattern = confirm.criterion_filter(list(report_benchmark_ids.values()))
+        self.assertRegex("actor/selective_receive_depth/64", pattern)
+        self.assertNotRegex("actor/selective/receive/depth/64", pattern)
+
+    def test_metadata_lookup_rejects_unmapped_report_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(RuntimeError, "did not map historical"):
+                confirm.benchmark_ids_for_reports(
+                    pathlib.Path(tmp), ["persist_checkpoint_json_encode/1kb"]
+                )
+
 class ManifestValidationTests(unittest.TestCase):
     def test_rejects_non_object_regression_rows(self):
         with tempfile.TemporaryDirectory() as tmp:

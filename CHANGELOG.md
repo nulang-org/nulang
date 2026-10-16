@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Criterion paired-confirmation report-path matching — 2026-10-16
+- **CI now reads Criterion's `new/benchmark.json` metadata to map a historical `directory_name` to the exact `full_id` accepted by the CLI filter.** Paired confirmation can measure `persist/checkpoint_json_encode/*` from persisted `persist_checkpoint_json_encode/*` history entries without guessing where directory sanitization replaced slashes.
+- **Round-trip coverage protects underscore-bearing group IDs.** A report path such as `actor_selective_receive_depth/64` resolves only to `actor/selective_receive_depth/64`, never a differently segmented group ID.
+
 ### Web static-root containment — 2026-10-15
 - **Experimental Web static file serving refuses parent traversal and symlinks escaping configured roots.** Canonical candidate paths must remain inside their canonicalized static or output root, and normal in-root files remain serveable.
 - **A filesystem regression verifies parent and symlink escape rejection.** This is a clean current-main successor to draft #1676; it does not change SSE or claim protection from malicious concurrent mutation of a trusted static root.
