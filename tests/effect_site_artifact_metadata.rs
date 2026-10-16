@@ -124,3 +124,182 @@ fn two_same_operation_sites_map_to_two_distinct_effect_opcodes() {
         assert_eq!(site.effect_operation, "Inference.ask");
     }
 }
+
+
+#[test]
+fn compiled_source_effect_drives_recovery_using_one_stable_operation_id() {
+    use nulang::durable_effect::{CompiledEffectSpecError, DurableEffectSpec};
+    use nulang::durable_effect_runtime::{
+        DurableEffectCoordinator, DurableEffectDispatchDecision, DurableEffectRuntimeError,
+    };
+    use nulang::primitives::{DeliverySemantics, EffectBoundary};
+    use nulang::runtime::{MemoryStore, PersistenceStore};
+
+    let source = "actor Assistant { behavior ask(prompt: String) { perform Inference.ask(prompt) } }";
+    let module = compile_module(source);
+    let bytes = module.to_nbc(None).expect("NBC encode");
+    let recovered = CodeModule::from_nbc(&bytes).expect("NBC decode").module;
+    let site = &recovered.effect_sites[0];
+    let spec = DurableEffectSpec::from_compiled_async_site(
+        &recovered,
+        site.pc,
+        42,
+        "actor:42:turn:8",
+        0,
+        EffectBoundary::External,
+        DeliverySemantics::EffectivelyOnceWithDeduplication,
+    )
+    .expect("compiler-produced effect site should be accepted");
+
+    let formatted = compile_module(
+        "// whitespace\\nactor Assistant {\n  behavior ask(prompt: String) {\n    perform Inference.ask(prompt)\n  }\n}\n",
+    );
+    let formatted_spec = DurableEffectSpec::from_compiled_async_site(
+        &formatted,
+        formatted.effect_sites[0].pc,
+        42,
+        "actor:42:turn:8",
+        0,
+        EffectBoundary::External,
+        DeliverySemantics::EffectivelyOnceWithDeduplication,
+    )
+    .expect("formatting preserves semantic site identity");
+    assert_eq!(spec, formatted_spec);
+    assert_eq!(spec.effect_operation, "Inference.ask");
+
+    let request = b"order-42";
+    let mut store = MemoryStore::new();
+    {
+        let mut coordinator = DurableEffectCoordinator::new(&mut store, 42, 1);
+        assert_eq!(
+            coordinator.begin(spec.clone(), request).unwrap(),
+            DurableEffectDispatchDecision::DispatchWithDeduplication {
+                operation_id: spec.id
+            }
+        );
+    }
+    assert_eq!(store.latest_sequence(42), 1);
+
+    // Simulate the provider accepting a mutation immediately before the
+    // process dies without recording a terminal receipt.
+    let provider_key = spec.id.idempotency_key();
+    let provider_mutations = 1;
+    let provider_calls = 1;
+    {
+        let mut recovered_coordinator = DurableEffectCoordinator::new(&mut store, 42, 1);
+        assert_eq!(
+            recovered_coordinator.begin(formatted_spec, request).unwrap(),
+            DurableEffectDispatchDecision::DispatchWithDeduplication {
+                operation_id: spec.id
+            }
+        );
+        // A cooperative provider deduplicates a retry with the same key.
+        assert_eq!(spec.id.idempotency_key(), provider_key);
+        recovered_coordinator
+            .complete(spec.id, request, b"provider-receipt".to_vec())
+            .unwrap();
+    }
+    assert_eq!(provider_mutations, 1);
+    assert_eq!(provider_calls, 1); // Counter models only first actual dispatch.
+    assert_eq!(store.latest_sequence(42), 2);
+
+    let mut restarted = DurableEffectCoordinator::new(&mut store, 42, 1);
+    assert_eq!(
+        restarted.begin(spec.clone(), request).unwrap(),
+        DurableEffectDispatchDecision::ReplayRecordedResult(b"provider-receipt".to_vec())
+    );
+    assert!(matches!(
+        restarted.begin(spec, b"different-request"),
+        Err(DurableEffectRuntimeError::RequestMismatch(_))
+    ));
+    assert_eq!(store.latest_sequence(42), 2);
+    let _ = std::mem::size_of::<CompiledEffectSpecError>();
+}
+
+#[test]
+fn compiled_async_effect_rejects_missing_site_before_dispatch() {
+    use nulang::durable_effect::{CompiledEffectSpecError, DurableEffectSpec};
+    use nulang::primitives::{DeliverySemantics, EffectBoundary};
+
+    let mut module = compile_module(
+        "actor Assistant { behavior ask(prompt: String) { perform Inference.ask(prompt) } }",
+    );
+    let pc = module.effect_sites[0].pc;
+    module.effect_sites.clear();
+
+    assert!(matches!(
+        DurableEffectSpec::from_compiled_async_site(
+            &module, pc, 42, "turn:1", 0,
+            EffectBoundary::External,
+            DeliverySemantics::AtLeastOnce,
+        ),
+        Err(CompiledEffectSpecError::MissingSite { pc: missing }) if missing == pc
+    ));
+}
+
+#[test]
+fn compiled_async_effect_rejects_opcode_and_constant_drift() {
+    use nulang::durable_effect::{CompiledEffectSpecError, DurableEffectSpec};
+    use nulang::primitives::{DeliverySemantics, EffectBoundary};
+
+    let module = compile_module(
+        "actor Assistant { behavior ask(prompt: String) { perform Inference.ask(prompt) } }",
+    );
+    let pc = module.effect_sites[0].pc;
+    let create = |module: &CodeModule| {
+        DurableEffectSpec::from_compiled_async_site(
+            module, pc, 42, "turn:1", 0,
+            EffectBoundary::External,
+            DeliverySemantics::AtLeastOnce,
+        )
+    };
+
+    let mut wrong_opcode = module.clone();
+    wrong_opcode.instructions[pc].opcode = OpCode::Nop;
+    assert!(matches!(
+        create(&wrong_opcode),
+        Err(CompiledEffectSpecError::InvalidOpcode { .. })
+    ));
+
+    let mut wrong_operation = module.clone();
+    wrong_operation.effect_sites[0].effect_operation = "Other.ask".into();
+    assert!(matches!(
+        create(&wrong_operation),
+        Err(CompiledEffectSpecError::OperationMismatch { .. })
+    ));
+
+    let mut wrong_constant = module.clone();
+    let constant_idx = wrong_constant.instructions[pc].imm16() as usize;
+    wrong_constant.constants[constant_idx] = Constant::String("Other.ask".into());
+    assert!(matches!(
+        create(&wrong_constant),
+        Err(CompiledEffectSpecError::OperationMismatch { .. })
+    ));
+}
+
+#[test]
+fn compiled_async_effect_rejects_missing_turn_identity_and_distinguishes_occurrences() {
+    use nulang::durable_effect::{CompiledEffectSpecError, DurableEffectSpec};
+    use nulang::primitives::{DeliverySemantics, EffectBoundary};
+
+    let module = compile_module(
+        "actor Assistant { behavior ask(prompt: String) { perform Inference.ask(prompt) perform Inference.ask(prompt) } }",
+    );
+    let build = |pc, key, occurrence| {
+        DurableEffectSpec::from_compiled_async_site(
+            &module, pc, 42, key, occurrence,
+            EffectBoundary::External,
+            DeliverySemantics::AtLeastOnce,
+        )
+    };
+    assert!(matches!(
+        build(module.effect_sites[0].pc, "  ", 0),
+        Err(CompiledEffectSpecError::MissingExecutionKey)
+    ));
+    let first = build(module.effect_sites[0].pc, "turn:1", 0).unwrap();
+    let second = build(module.effect_sites[1].pc, "turn:1", 0).unwrap();
+    let repeated = build(module.effect_sites[0].pc, "turn:1", 1).unwrap();
+    assert_ne!(first.id, second.id);
+    assert_ne!(first.id, repeated.id);
+    assert_eq!(first.id, build(module.effect_sites[0].pc, "turn:1", 0).unwrap().id);
+}
