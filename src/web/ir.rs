@@ -117,9 +117,17 @@ pub fn generate_deployment_ir(
             .copied();
         let binding_compilation = contract.map(compile_route_bindings);
         let response = contract.and_then(|c| response_contract(c.response_type.as_deref()));
-        let placement = contract
-            .and_then(|contract| contract.placement.clone())
-            .unwrap_or_else(|| default_route_placement(&method, &route.path, response.as_ref()));
+        // A runtime-only registration has no compiler-validated return type.
+        // Do not assume it is safe to publish as HTML just because it is GET:
+        // the handler may return JSON, user-specific content, or other data.
+        // Such legacy routes remain executable by the server, but are never
+        // prerendered until a compiler contract proves static placement.
+        let placement = match contract {
+            Some(contract) => contract.placement.clone().unwrap_or_else(|| {
+                default_route_placement(&method, &route.path, response.as_ref())
+            }),
+            None => "server".to_string(),
+        };
         let artifact = if placement == "static" {
             Some(route_path_to_artifact(&route.path))
         } else {
@@ -453,6 +461,33 @@ app "mixed-routes" {
         assert_eq!(json.placement, "server");
         assert!(json.artifact.is_none());
         assert_eq!(json.response.as_ref().unwrap().media_type, "application/json");
+    }
+
+    #[test]
+    fn unmatched_runtime_get_route_is_not_published_as_static_html() {
+        let route = WebRoute {
+            method: crate::runtime::HttpMethod::Get,
+            path: "/undiscovered".to_string(),
+            handler_module: crate::bytecode::CodeModule::new("ir-test"),
+            handler_func_idx: 0,
+        };
+        let empty_contracts = ContractCompilation::default();
+        let src_root = std::env::temp_dir().join(format!(
+            "nulang_web_ir_no_contract_{}",
+            std::process::id()
+        ));
+        let ir = generate_deployment_ir(
+            &[route],
+            None,
+            &src_root,
+            &BudgetsSection::default(),
+            &empty_contracts,
+        );
+
+        assert_eq!(ir.routes.len(), 1);
+        assert_eq!(ir.routes[0].placement, "server");
+        assert!(ir.routes[0].artifact.is_none());
+        assert!(ir.routes[0].response.is_none());
     }
 
     #[test]
