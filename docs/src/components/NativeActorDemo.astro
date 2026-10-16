@@ -1,0 +1,172 @@
+---
+const demoSource = String.raw`actor PoolWorker {
+    state count: Int = 0
+    behavior work(x) { self.count = self.count + x }
+    behavior die() { perform Actor.exit(1) }
+}
+
+fn main() {
+    let sup = perform Otp.create_supervisor("pool", 3)
+    let t = perform Otp.set_template(sup, "PoolWorker")
+    let w1 = perform Otp.start_child(sup)
+    let w2 = perform Otp.start_child(sup)
+    w1 ! work(1)
+    w2 ! work(2)
+    // Crash w1: the supervisor restarts it from the template, so its
+    // count goes back to 0 with a fresh actor id. w2 keeps its count.
+    w1 ! die()
+    0
+}`;
+---
+
+<section class="native-example" aria-labelledby="native-example-heading">
+  <div class="native-example-copy">
+    <span class="native-example-kicker">Native runtime · supervised actors</span>
+    <h2 id="native-example-heading">See what happens when a worker fails.</h2>
+    <p>
+      An abnormal worker exit is handled by its supervisor. The other worker
+      keeps running; a transient worker restarts with a new actor identity and default state.
+    </p>
+    <p class="native-example-boundary">
+      This example runs with the installed Nulang CLI, not the browser CoreVM.
+      Supervisor restart is not the same as recovering prior state: durable recovery is separate
+      and requires a configured persistent store and application-level validation.
+    </p>
+    <div class="native-example-links">
+      <a class="native-example-primary" href="/getting-started/installation/">Install Nulang <span aria-hidden="true">→</span></a>
+      <a href="/actors/supervision/">How supervision works <span aria-hidden="true">↗</span></a>
+    </div>
+  </div>
+  <div class="native-example-code">
+    <div class="native-example-bar">
+      <span>examples/worker_pool.nula</span>
+      <span>Source example · native only</span>
+    </div>
+    <pre tabindex="0" aria-label="Source code for the native supervised worker pool"><code>{demoSource}</code></pre>
+    <div class="native-example-foot">
+      <code>nulang examples/worker_pool.nula</code>
+      <a href="https://github.com/nulang-org/nulang/blob/main/examples/worker_pool.nula" target="_blank" rel="noopener noreferrer">View source <span aria-hidden="true">↗</span><span class="native-example-sr"> (opens in new tab)</span></a>
+    </div>
+  </div>
+</section>
+
+<style>
+  .native-example {
+    display: grid;
+    grid-template-columns: minmax(0, 0.84fr) minmax(0, 1.16fr);
+    gap: clamp(1.4rem, 4vw, 3.5rem);
+    align-items: center;
+    padding: clamp(1rem, 2vw, 1.5rem) 0;
+  }
+  .native-example-kicker {
+    color: var(--nu-blue);
+    font-size: 0.73rem;
+    font-weight: 750;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .native-example-copy h2 {
+    margin: 0.85rem 0 1rem;
+    color: var(--nu-text);
+    font-size: clamp(1.8rem, 3.4vw, 2.8rem);
+    line-height: 1.12;
+    letter-spacing: -0.04em;
+  }
+  .native-example-copy p {
+    margin: 0.75rem 0;
+    color: var(--nu-text-secondary);
+    font-size: 0.97rem;
+    line-height: 1.7;
+  }
+  .native-example-copy .native-example-boundary {
+    font-size: 0.85rem;
+    line-height: 1.62;
+  }
+  .native-example-links {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.7rem 1.2rem;
+    margin-top: 1.4rem;
+  }
+  .native-example-links a {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+    min-height: 2.75rem;
+    color: var(--nu-accent-high);
+    font-size: 0.87rem;
+    font-weight: 700;
+    text-decoration: none;
+  }
+  .native-example-links .native-example-primary {
+    padding: 0.6rem 0.9rem;
+    border: 1px solid var(--nu-border);
+    border-radius: 0.5rem;
+    background: var(--nu-border-subtle);
+    color: var(--nu-text);
+  }
+  .native-example-code {
+    min-width: 0;
+    overflow: hidden;
+    border: 1px solid rgba(148, 163, 184, 0.26);
+    border-radius: 0.9rem;
+    background: #090d14;
+    box-shadow: 0 16px 46px rgba(15, 23, 42, 0.12);
+  }
+  .native-example-bar, .native-example-foot {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.45rem 1rem;
+    padding: 0.8rem 1rem;
+    color: #cbd5e1;
+    font-size: 0.72rem;
+  }
+  .native-example-bar {
+    border-bottom: 1px solid #273244;
+    background: #111827;
+  }
+  .native-example-bar > span:last-child { color: #94a3b8; }
+  .native-example-code pre {
+    overflow-x: auto;
+    margin: 0;
+    padding: 1.1rem 1rem;
+    color: #e2e8f0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.75rem;
+    line-height: 1.7;
+    tab-size: 4;
+  }
+  .native-example-code pre:focus-visible, .native-example-links a:focus-visible, .native-example-foot a:focus-visible {
+    outline: 2px solid #93c5fd;
+    outline-offset: -3px;
+  }
+  .native-example-foot {
+    border-top: 1px solid #273244;
+    background: #111827;
+  }
+  .native-example-foot code {
+    color: #cbd5e1;
+    font-size: 0.72rem;
+    overflow-wrap: anywhere;
+  }
+  .native-example-foot a {
+    color: #93c5fd;
+    text-decoration: underline;
+    text-underline-offset: 3px;
+  }
+  .native-example-sr {
+    position: absolute;
+    width: 1px; height: 1px; padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap;
+  }
+  @media (max-width: 58rem) {
+    .native-example { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 36rem) {
+    .native-example-bar > span:last-child { display: none; }
+    .native-example-code pre { font-size: 0.7rem; }
+  }
+</style>
