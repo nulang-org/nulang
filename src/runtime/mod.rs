@@ -81,6 +81,8 @@ pub(crate) use spawn::spawn_from_module_with_authority;
 mod timer;
 mod trace;
 mod workflow;
+#[cfg(feature = "sqlite")]
+mod web_sqlite;
 pub use trace::TraceContext;
 
 #[cfg(test)]
@@ -120,6 +122,8 @@ pub use network::*;
 pub use object_store::*;
 pub use orca_cycle::*;
 pub use persistence::*;
+#[cfg(feature = "sqlite")]
+pub use web_sqlite::WebSqliteStore;
 pub use process_groups::*;
 pub use registry::*;
 pub use resp_cache::*;
