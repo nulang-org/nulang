@@ -6555,6 +6555,40 @@ mod vm_tests {
         );
     }
 
+    #[test]
+    fn perform_async_rejects_missing_fetched_pc_before_host_dispatch() {
+        let sites = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut vm = VM::new_without_jit();
+        let mut module = CodeModule::new("invalid_async_pc");
+        let constant = module.add_string_constant("Inference.ask");
+        let instr = Instruction::new3(
+            OpCode::PerformAsync,
+            (constant >> 8) as u8,
+            constant as u8,
+            7,
+        );
+        module.emit(instr);
+        vm.load_module(module);
+        vm.set_actor_callbacks(Box::new(SiteAwareEffectCallbacks {
+            heap_callbacks: ReadyValueCallbacks::new(),
+            sites: sites.clone(),
+            pending_once: false,
+        }));
+
+        let mut frame = Frame::new(None, 0);
+        frame.pc = 0; // No opcode fetch has taken place.
+        vm.frames.push(frame);
+        vm.current_frame_idx = Some(0);
+        assert!(matches!(
+            vm.step_perform_async(0, 0, instr),
+            Err(NuError::VMError { .. })
+        ));
+        assert!(
+            sites.borrow().is_empty(),
+            "invalid executing PC must fail before invoking the host"
+        );
+    }
+
     /// A NULL C string return (nil from cstr_to_value) must pass through
     /// instead of erroring on the missing pointer.
     #[test]
