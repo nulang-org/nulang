@@ -7,6 +7,7 @@ on:
       - 'src/lib.rs'
       - 'src/vm.rs'
       - 'src/stdlib.rs'
+      - 'src/stdlib/json.nula'
       - 'src/runtime/callbacks.rs'
       - 'packages/http-client/**'
       - 'tests/http_outbound_request.rs'
@@ -18,6 +19,7 @@ on:
       - 'src/lib.rs'
       - 'src/vm.rs'
       - 'src/stdlib.rs'
+      - 'src/stdlib/json.nula'
       - 'src/runtime/callbacks.rs'
       - 'packages/http-client/**'
       - 'tests/http_outbound_request.rs'
@@ -44,5 +46,29 @@ jobs:
         run: cargo test --locked --no-default-features --features ureq --test http_outbound_request
       - name: Verify exact actor authority grant
         run: cargo test --locked --no-default-features --features ureq actor_http_request_authorizes_url_not_method_and_rejects_other_ports
-      - name: Check package compiles under Nulang VM
-        run: cargo run --locked --no-default-features --features ureq --bin nulang -- --check packages/http-client/src/lib.nula
+      - name: Verify bounded response-header metadata
+        run: cargo test --locked --no-default-features --features ureq response_header_limit_tests
+      - name: Ensure outbound HTTP requires an explicit net capability
+        shell: bash
+        run: |
+          set -euo pipefail
+          if cargo run --locked --no-default-features --features ureq --bin nulang -- --check packages/http-client/src/lib.nula > /tmp/http-no-net.log 2>&1; then
+            echo "Unexpected success without network capability" >&2
+            exit 1
+          fi
+          grep -F "requires resource capability 'net'" /tmp/http-no-net.log
+      - name: Check HTTP package with explicit net authority
+        run: cargo run --locked --no-default-features --features ureq --bin nulang -- --with net --check packages/http-client/src/lib.nula
+      - name: Execute JSON exponent-sign regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run --locked --no-default-features --features ureq --bin nulang -- conformance/behavior/json_11_exponent_signs.nula > /tmp/json-exponents-output.txt
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          expected = json.loads(Path("conformance/behavior/json_11_exponent_signs.json").read_text())
+          actual = Path("/tmp/json-exponents-output.txt").read_text().strip()
+          if expected["exit_code"] != 0 or actual != expected["stdout"].strip():
+              raise SystemExit(f"JSON exponent conformance mismatch: expected {expected['stdout']!r}, got {actual!r}")
+          PY
