@@ -130,3 +130,72 @@ test('signal keys do not collide with inherited Object properties', () => {
   api.signal('__proto__').set('B');
   assert.equal(button.getAttribute('title'), 'B');
 });
+
+test('unchanged signal values do not write to DOM and ordinary updates remain synchronous', () => {
+  const button = element({
+    attributes: { title: 'Ready', 'data-nulang-bind-title': 'status' }
+  });
+  const api = hydrate([button]);
+  api.signal('status').set('Ready');
+  assert.deepEqual(button.calls, []);
+  api.signal('status').set('Updated');
+  assert.equal(button.getAttribute('title'), 'Updated');
+  assert.deepEqual(button.calls, [['title', 'Updated']]);
+});
+
+test('batch coalesces repeated writes while signal reads remain immediate', () => {
+  const text = element({ textContent: 'Initial', attributes: { 'data-signal': 'status' } });
+  const button = element({
+    attributes: { title: 'Initial', 'data-nulang-bind-title': 'status' }
+  });
+  const api = hydrate([text, button]);
+  const result = api.batch(() => {
+    api.signal('status').set('First');
+    api.signal('status').set('Second');
+    assert.equal(api.signal('status').get(), 'Second');
+    assert.equal(text.textContent, 'Initial');
+    assert.equal(button.getAttribute('title'), 'Initial');
+    assert.deepEqual(button.calls, []);
+    return 42;
+  });
+  assert.equal(result, 42);
+  assert.equal(text.textContent, 'Second');
+  assert.equal(button.getAttribute('title'), 'Second');
+  assert.deepEqual(button.calls, [['title', 'Second']]);
+});
+
+test('nested batches flush only after the outermost scope exits', () => {
+  const button = element({
+    attributes: { title: 'Zero', 'data-nulang-bind-title': 'count' }
+  });
+  const api = hydrate([button]);
+  api.batch(() => {
+    api.signal('count').set('One');
+    api.batch(() => {
+      api.signal('count').set('Two');
+      assert.deepEqual(button.calls, []);
+    });
+    assert.deepEqual(button.calls, []);
+  });
+  assert.equal(button.getAttribute('title'), 'Two');
+  assert.deepEqual(button.calls, [['title', 'Two']]);
+});
+
+test('a throwing batch flushes the final state and propagates the error', () => {
+  const button = element({
+    attributes: { title: 'Before', 'data-nulang-bind-title': 'status' }
+  });
+  const api = hydrate([button]);
+  assert.throws(() => api.batch(() => {
+    api.signal('status').set('After');
+    throw new Error('callback failed');
+  }), /callback failed/);
+  assert.equal(button.getAttribute('title'), 'After');
+  api.signal('status').set('Later');
+  assert.equal(button.getAttribute('title'), 'Later');
+});
+
+test('batch rejects non-function callbacks', () => {
+  const api = hydrate([]);
+  assert.throws(() => api.batch(null), /batch requires a function/);
+});
