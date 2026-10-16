@@ -8898,3 +8898,105 @@ fn failed_workflow_step_survives_sqlite_restart_without_readmitting_command() {
     drop(restarted);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+
+#[test]
+fn saga_recovery_distinguishes_unstarted_in_doubt_and_completed_compensations() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_owned(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "RecoverableSaga",
+        Box::new(|| vec![("step_index".to_owned(), Value::int(2))]),
+        models,
+    );
+    rt.actors.get_mut(&actor_id).unwrap().register_behavior("reserve", |_actor, _| {});
+    rt.actors.get_mut(&actor_id).unwrap().register_behavior("charge", |_actor, _| {});
+    workflow::commit_step_completed(&mut rt, actor_id, None, "reserve".into()).unwrap();
+    workflow::commit_step_completed(&mut rt, actor_id, None, "charge".into()).unwrap();
+    workflow::commit_step_failed(
+        &mut rt, actor_id, None, "ship".into(), "failed".into()
+    ).unwrap();
+
+    let pending = rt.saga_compensation_recovery(actor_id);
+    assert_eq!(pending.len(), 2);
+    assert_eq!(pending[0].step_name, "charge");
+    assert_eq!(pending[0].status, SagaCompensationRecoveryStatus::NotStarted);
+    assert_eq!(pending[1].step_name, "reserve");
+    assert_eq!(pending[1].status, SagaCompensationRecoveryStatus::NotStarted);
+
+    rt.append_saga_compensation_started(actor_id, "charge").unwrap();
+    let in_doubt = rt.saga_compensation_recovery(actor_id);
+    assert_eq!(in_doubt[0].status, SagaCompensationRecoveryStatus::OutcomeUnknown);
+    assert_eq!(in_doubt[1].status, SagaCompensationRecoveryStatus::NotStarted);
+    rt.append_saga_compensated(actor_id, "charge").unwrap();
+    let completed = rt.saga_compensation_recovery(actor_id);
+    assert_eq!(completed[0].status, SagaCompensationRecoveryStatus::Completed);
+    assert_eq!(completed[1].status, SagaCompensationRecoveryStatus::NotStarted);
+}
+
+#[test]
+fn saga_compensation_refuses_to_redrive_ambiguous_external_outcome() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_owned(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "AmbiguousSaga",
+        Box::new(|| vec![("step_index".to_owned(), Value::int(2))]),
+        models,
+    );
+    rt.actors.get_mut(&actor_id).unwrap().register_behavior("reserve", |_actor, _| {});
+    rt.actors.get_mut(&actor_id).unwrap().register_behavior("charge", |_actor, _| {});
+    workflow::commit_step_completed(&mut rt, actor_id, None, "reserve".into()).unwrap();
+    workflow::commit_step_completed(&mut rt, actor_id, None, "charge".into()).unwrap();
+    workflow::commit_step_failed(&mut rt, actor_id, None, "ship".into(), "failed".into()).unwrap();
+    rt.append_saga_compensation_started(actor_id, "charge").unwrap();
+
+    rt.run_saga_compensation(actor_id, 2);
+    assert!(
+        !rt.persistence.read_workflow_events(actor_id).iter().any(|event| {
+            matches!(event, WorkflowEvent::SagaCompensated { .. })
+        }),
+        "no compensation may be re-dispatched or marked completed across an unknown receipt"
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn saga_ambiguous_compensation_status_survives_process_restart() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "nulang-saga-restart-{}-{nonce}", std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("workflow.db");
+    let actor_id = {
+        let mut rt = Runtime::new();
+        rt.persistence = Box::new(LibsqlStore::new(&db_path).unwrap());
+        let mut models = HashMap::new();
+        models.insert("step_index".to_owned(), StateModel::Durable);
+        let id = rt.spawn_workflow_actor(
+            "RestartSaga",
+            Box::new(|| vec![("step_index".to_owned(), Value::int(2))]),
+            models,
+        );
+        workflow::commit_step_completed(&mut rt, id, None, "reserve".into()).unwrap();
+        workflow::commit_step_completed(&mut rt, id, None, "charge".into()).unwrap();
+        workflow::commit_step_failed(&mut rt, id, None, "ship".into(), "failed".into()).unwrap();
+        rt.append_saga_compensation_started(id, "charge").unwrap();
+        id
+    };
+
+    let mut recovered = Runtime::new();
+    recovered.persistence = Box::new(LibsqlStore::new(&db_path).unwrap());
+    assert_eq!(recovered.recover_actor(actor_id), Some(actor_id));
+    let status = recovered.saga_compensation_recovery(actor_id);
+    assert_eq!(status.len(), 2);
+    assert_eq!(status[0].step_name, "charge");
+    assert_eq!(status[0].status, SagaCompensationRecoveryStatus::OutcomeUnknown);
+    assert_eq!(status[1].step_name, "reserve");
+    assert_eq!(status[1].status, SagaCompensationRecoveryStatus::NotStarted);
+    drop(recovered);
+    std::fs::remove_dir_all(dir).unwrap();
+}
