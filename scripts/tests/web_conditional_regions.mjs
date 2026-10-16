@@ -69,9 +69,9 @@ assert.equal(window.nulang.replaceConditional(on, off), off);
 assert.equal(root.children[1], off);
 assert.equal(window.nulang.signal('visible').get(), false, 'successful switch updates Bool');
 assert.equal(on.children[0].listenerCount('click'), 0, 'inactive branch action disposed');
-assert.equal(off.children[2].listenerCount('click'), 1);
+assert.equal(off.children[1].listenerCount('click'), 1);
 on.children[0].dispatch('click');
-off.children[2].dispatch('click');
+off.children[1].dispatch('click');
 assert.deepEqual(invoked, ['tap']);
 
 const foreign = element({ 'data-nulang-if': 'other', 'data-nulang-branch': 'then' });
@@ -88,7 +88,7 @@ assert.equal(root.children[1], off);
 const back = element({ 'data-nulang-if': 'visible', 'data-nulang-branch': 'then' });
 assert.equal(window.nulang.replaceConditional(off, back), back);
 assert.equal(window.nulang.signal('visible').get(), true);
-assert.equal(off.children[2].listenerCount('click'), 0);
+assert.equal(off.children[1].listenerCount('click'), 0);
 assert.equal(root.children[1], back);
 
 const fail = element({ 'data-nulang-if': 'visible', 'data-nulang-branch': 'else' });
