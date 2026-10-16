@@ -166,6 +166,12 @@ mod tests {
                 validate_mutation_origin(method, &trusted, Some(loopback()), None),
                 Ok(())
             );
+            // Existing Web HTTP smoke fixtures use this loopback-only form.
+            let legacy = headers(&[("Host", "localhost")]);
+            assert_eq!(
+                validate_mutation_origin(method, &legacy, Some(loopback()), None),
+                Ok(())
+            );
             assert_eq!(
                 validate_mutation_origin(method, &[], Some(loopback()), None),
                 Err(OriginCheckError::MissingHost)
