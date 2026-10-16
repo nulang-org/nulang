@@ -1970,6 +1970,40 @@ fn view() -> Html {
             .is_none());
     }
     #[test]
+    fn test_compiler_emits_explicit_local_ssr_scope_marker() {
+        let mut module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+signal status: Html = text("Ready")
+
+fn view() -> Html {
+    <section nulang-scope="local"><span>{status}</span></section>
+}
+"#,
+        );
+        rewrite_module(&mut module, None);
+        let html = format!("{:?}", find_function_body(&module, "view"));
+        assert!(html.contains("data-nulang-scope"), "compiler must emit a scoped hydration boundary");
+        assert!(html.contains("data-signal"), "nested bindings must remain available");
+    }
+
+    #[test]
+    fn test_compiler_rejects_unrecognized_scope_modes() {
+        let mut module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+fn view() -> Html { <section nulang-scope="global">Static</section> }
+"#,
+        );
+        rewrite_module(&mut module, None);
+        let html = format!("{:?}", find_function_body(&module, "view"));
+        assert!(!html.contains("data-nulang-scope"), "unsupported scope mode is not emitted");
+    }
+
+    #[test]
     fn test_client_runtime_emits_canonical_ui_action_message() {
         let js = generate_client_runtime();
         assert!(js.contains("__nulang_ui_message"));
