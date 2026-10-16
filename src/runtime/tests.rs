@@ -241,6 +241,70 @@ fn external_wait_is_not_requeued_without_a_completion() {
 }
 
 #[test]
+fn preempted_actor_yields_to_already_runnable_peer() {
+    use crate::bytecode::{BehaviorTableEntry, Instruction, OpCode};
+
+    fn mark_peer_run(actor: &mut Actor, _args: &[Value]) {
+        actor.set_state_field("seen", Value::int(1));
+    }
+
+    let mut busy_module = CodeModule::new("fairness-peer");
+    busy_module.add_behavior(BehaviorTableEntry {
+        name: "Busy.spin".to_string(),
+        param_count: 0,
+        code_offset: 0,
+        local_count: 4,
+        effect_mask: 0,
+        compensate_offset: None,
+        content_hash: None,
+        source_location: None,
+        parallel_branches: None,
+    });
+    for _ in 0..24 {
+        busy_module.emit(Instruction::new0(OpCode::Nop));
+    }
+    busy_module.emit(Instruction::new1(OpCode::RetVal, 0));
+
+    let mut rt = Runtime::new();
+    let busy = rt.spawn_actor(Box::new(Vec::new));
+    let peer = rt.spawn_actor(Box::new(|| vec![("seen".to_string(), Value::int(0))]));
+    {
+        let actor = rt.actors.get_mut(&busy).unwrap();
+        actor.max_reductions = 4;
+        actor.bytecode_module = Some(Box::new(busy_module.clone()));
+        actor.bytecode_offsets = vec![0];
+        actor.compensation_offsets = vec![None];
+    }
+    rt.register_recovery_module(busy, busy_module, vec![0], vec![None]);
+    rt.actors
+        .get_mut(&peer)
+        .unwrap()
+        .register_behavior("Probe.mark", mark_peer_run);
+
+    // A is queued first. Its cooperative requeue must not jump in front
+    // of an already runnable same-priority peer.
+    rt.send_message_by_id(busy, 0, &[]);
+    rt.send_message_by_id(peer, 0, &[]);
+    assert_eq!(rt.claim_next_ready_actor(), Some(busy));
+    rt.step_actor(busy);
+    assert!(rt.actors[&busy].jit_yield_pending);
+    rt.finish_actor_turn(busy);
+
+    assert_eq!(
+        rt.claim_next_ready_actor(),
+        Some(peer),
+        "a yielding CPU-bound actor must yield its next turn to a ready peer"
+    );
+    rt.step_actor(peer);
+    rt.finish_actor_turn(peer);
+    assert_eq!(rt.actors[&peer].get_state_field("seen"), Some(Value::int(1)));
+    assert!(
+        rt.actors[&busy].jit_yield_pending,
+        "the busy continuation must remain pending while the peer executes"
+    );
+}
+
+#[test]
 fn synchronous_actor_ask_runs_to_completion_past_instruction_quantum() {
     use crate::bytecode::{BehaviorTableEntry, Instruction, OpCode};
 
