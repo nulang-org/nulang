@@ -26,7 +26,8 @@ fn home() -> Html {
                 el("canvas", [("id", text("plot")), ("role", text("img")), ("aria-label", text("Scatter plot with the selected number of points"))], []),
                 el("p", [("id", text("backend")), ("role", text("status"))], [text("Initializing renderer")])
             ]),
-            el("script", [("type", text("module")), ("src", text("/demo.js"))], [])
+            // Trusted literal script URL; dynamic script elements are rejected by Web.html.
+            raw("<script type=\\\"module\\\" src=\\\"/demo.js\\\"></script>")
         ])
     )
 }
