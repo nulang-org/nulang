@@ -91,3 +91,18 @@ fn web_sqlite_rejects_empty_scope_and_unbounded_list() {
     drop(store);
     remove_db(&path);
 }
+
+#[test]
+fn web_sqlite_refuses_ephemeral_sqlite_uri_and_oversized_values() {
+    assert!(WebSqliteStore::open(":memory:").is_err());
+    assert!(WebSqliteStore::open("file::memory:?cache=shared").is_err());
+
+    let path = fresh_db("bounds");
+    let store = WebSqliteStore::open(&path).unwrap();
+    assert!(store.put("tenant", "item", &"x".repeat(1_048_577)).is_err());
+    assert!(store.put("tenant", &"k".repeat(1025), "value").is_err());
+    assert!(store.put(&"t".repeat(257), "item", "value").is_err());
+    assert!(store.list("tenant", 1).unwrap().is_empty());
+    drop(store);
+    remove_db(&path);
+}
