@@ -228,6 +228,7 @@ mod tests {
             handler_param: format!("arg_{handler_index}"),
             handler_index,
             ty: Some("String".to_string()),
+            codec: None,
         }
     }
 

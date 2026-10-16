@@ -370,6 +370,7 @@ impl HttpServerState {
             405 => "Method Not Allowed",
             408 => "Request Timeout",
             413 => "Payload Too Large",
+            415 => "Unsupported Media Type",
             417 => "Expectation Failed",
             422 => "Unprocessable Entity",
             429 => "Too Many Requests",
