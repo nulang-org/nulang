@@ -54,6 +54,9 @@ jobs:
       - name: Smoke test Nulang Web scoped hydration
         run: node scripts/tests/web_scoped_lifecycle.mjs
 
+      - name: Smoke test Nulang Web DOM region replacement
+        run: node scripts/tests/web_region_replacement.mjs
+
       - name: Install docs dependencies
         run: |
           cd docs
