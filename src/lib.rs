@@ -90,6 +90,8 @@ pub mod registry;
 pub mod repl;
 pub mod resolver;
 pub mod runtime;
+#[cfg(test)]
+mod scoped_task_conformance;
 pub mod scoped_task_reference;
 pub mod scoped_tasks;
 pub mod semantic_identity;
