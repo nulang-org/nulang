@@ -355,6 +355,27 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
         PerformAsyncResult::Ready(None)
     }
 
+    /// Execute a generic async effect with its exact compiled source-site
+    /// context. `pc` is the current instruction's index in `module`; the
+    /// module contains compiler-owned `effect_sites` metadata. A durable host
+    /// adapter can use this context to validate and derive an effect identity.
+    ///
+    /// This does NOT supply replay-stable dynamic execution identity, durable
+    /// storage, or authority by itself. Adapters must fail closed when those
+    /// inputs are missing before making an external call.
+    ///
+    /// Existing callbacks retain their behavior through the default
+    /// implementation, which delegates to `perform_async`.
+    fn perform_async_in_module(
+        &mut self,
+        module: &CodeModule,
+        _pc: usize,
+        effect_op: &str,
+        args: &[Value],
+    ) -> PerformAsyncResult {
+        self.perform_async(effect_op, &module.constants, args)
+    }
+
     /// Try to receive a message from the current actor's mailbox.
     /// Returns `Some((behavior_id, value))` if a message is available,
     /// or `None` if the mailbox is empty. Default returns `None`.
@@ -4381,7 +4402,8 @@ impl VM {
     /// Generic async effect dispatch (`PerformAsync` opcode).
     ///
     /// Reads the effect_op string from the constant pool, collects arguments
-    /// from registers r0..rN, and calls `ActorVmCallbacks::perform_async`.
+    /// from registers r0..rN, and calls
+    /// `ActorVmCallbacks::perform_async_in_module` with the exact effect PC.
     /// On `Ready(value)` the result is written to the destination register
     /// and execution continues. On `Pending` the PC is decremented so the
     /// instruction re-executes on resume, and the VM returns a
@@ -4399,14 +4421,14 @@ impl VM {
         // Pass the full frame register slice and the module's constant pool
         // so the callback can resolve string-id arguments from registers.
         let args = &self.frames[frame_idx].regs;
-        let constants = self
-            .modules
-            .get(module_idx)
-            .map(|m| &m.constants[..])
-            .unwrap_or(&[]);
+        // The execution loop has already advanced the frame PC past this
+        // instruction. On Pending it rewinds, so a resumed execution obtains
+        // the same exact bytecode PC and compiler-owned semantic site.
+        let pc = self.frames[frame_idx].pc - 1;
+        let module = &self.modules[module_idx];
         match self
             .actor_callbacks
-            .perform_async(&effect_op, constants, args)
+            .perform_async_in_module(module, pc, &effect_op, args)
         {
             PerformAsyncResult::Ready(result) => {
                 let value = match result {
