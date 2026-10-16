@@ -592,6 +592,69 @@ mod tests {
     }
 
     #[test]
+    fn indexed_actor_state_mutation_is_rejected() {
+        let branches = vec![
+            Expr::Assign {
+                target: Box::new(Expr::Index {
+                    arr: Box::new(Expr::FieldAccess {
+                        expr: Box::new(Expr::SelfRef(sp())),
+                        field: "items".to_string(),
+                        span: sp(),
+                    }),
+                    idx: Box::new(int(0)),
+                    span: sp(),
+                }),
+                value: Box::new(int(1)),
+                span: sp(),
+            },
+            int(2),
+        ];
+        let err = validate_parallel_branches(&branches, sp()).unwrap_err();
+        assert!(err.to_string().contains("mutates actor state"));
+    }
+
+    #[test]
+    fn consuming_actor_state_is_rejected() {
+        let branches = vec![
+            Expr::Consume {
+                expr: Box::new(Expr::FieldAccess {
+                    expr: Box::new(Expr::SelfRef(sp())),
+                    field: "items".to_string(),
+                    span: sp(),
+                }),
+                span: sp(),
+            },
+            int(2),
+        ];
+        let err = validate_parallel_branches(&branches, sp()).unwrap_err();
+        assert!(err.to_string().contains("mutates actor state"));
+    }
+
+    #[test]
+    fn nested_actor_state_index_effect_is_summarized() {
+        let branch = Expr::FieldAccess {
+            expr: Box::new(Expr::Index {
+                arr: Box::new(Expr::FieldAccess {
+                    expr: Box::new(Expr::SelfRef(sp())),
+                    field: "items".to_string(),
+                    span: sp(),
+                }),
+                idx: Box::new(Expr::Perform {
+                    effect: "IO".to_string(),
+                    op: "read".to_string(),
+                    args: vec![],
+                    span: sp(),
+                }),
+                span: sp(),
+            }),
+            field: "value".to_string(),
+            span: sp(),
+        };
+        let summary = summarize_branch(0, &branch);
+        assert!(summary.effects.contains("IO.read"));
+    }
+
+    #[test]
     fn effects_and_authority_are_summarized() {
         let branch = Expr::Spawn {
             actor_type: Box::new(var("Worker")),
