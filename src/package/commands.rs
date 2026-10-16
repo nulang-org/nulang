@@ -1113,7 +1113,8 @@ fn cmd_build(json: bool) -> NuResult<()> {
         let parsed = serde_json::from_slice::<serde_json::Value>(&compile.stdout)
             .ok()
             .filter(|report| {
-                report["schema_version"] == crate::json_diagnostics::SCHEMA_VERSION
+                report["schema_version"].as_u64()
+                    == Some(crate::json_diagnostics::SCHEMA_VERSION as u64)
                     && report["command"] == "build"
                     && report["diagnostics"].is_array()
                     && report["ok"].as_bool() == Some(compile.status.success())
@@ -1172,6 +1173,18 @@ fn nulang_exe_output(args: &[&str]) -> NuResult<std::process::Output> {
                 }
             }
         }
+    }
+    // Match the ordinary compiler invocation's locked dependency search path.
+    // Without this, JSON builds can resolve different imports from normal builds.
+    let mut module_path = std::env::var("NULANG_MODULE_PATH").unwrap_or_default();
+    if let Some(computed) = build_module_path() {
+        if !module_path.is_empty() {
+            module_path.push(';');
+        }
+        module_path.push_str(&computed);
+    }
+    if !module_path.is_empty() {
+        cmd.env("NULANG_MODULE_PATH", &module_path);
     }
     cmd.output().map_err(|e| NuError::PackageError {
         msg: format!("failed to run nulang ({}): {}", exe.display(), e),
