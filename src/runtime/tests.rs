@@ -8926,12 +8926,24 @@ fn saga_recovery_distinguishes_unstarted_in_doubt_and_completed_compensations() 
     assert_eq!(pending[1].status, SagaCompensationRecoveryStatus::NotStarted);
 
     rt.append_saga_compensation_started(actor_id, "charge").unwrap();
+    assert_eq!(
+        rt.append_saga_compensation_started(actor_id, "charge")
+            .expect_err("unknown external outcome must not admit a second execution")
+            .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
     let in_doubt = rt.saga_compensation_recovery(actor_id);
     assert_eq!(in_doubt[0].status, SagaCompensationRecoveryStatus::OutcomeUnknown);
     assert_eq!(in_doubt[1].status, SagaCompensationRecoveryStatus::NotStarted);
     rt.append_saga_compensated(actor_id, "charge").unwrap();
     let completed = rt.saga_compensation_recovery(actor_id);
     assert_eq!(completed[0].status, SagaCompensationRecoveryStatus::Completed);
+    assert_eq!(
+        rt.append_saga_compensation_started(actor_id, "charge")
+            .expect_err("completed compensation must not be readmitted")
+            .kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
     assert_eq!(completed[1].status, SagaCompensationRecoveryStatus::NotStarted);
 }
 
