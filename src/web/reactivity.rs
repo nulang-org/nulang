@@ -1097,6 +1097,69 @@ fn view() -> Html {
     }
 
     #[test]
+    fn test_rewrite_marks_safe_signal_attributes_for_live_updates() {
+        let mut module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+signal status: Html = text("active")
+
+fn view() -> Html {
+    <div class={status} title={status} aria-label={status} data-state={status}>Status</div>
+}
+"#,
+        );
+        rewrite_module(&mut module, None);
+        let html = format!("{:?}", find_function_body(&module, "view"));
+        for attr in [
+            "data-nulang-bind-class",
+            "data-nulang-bind-title",
+            "data-nulang-bind-aria-label",
+            "data-nulang-bind-data-state",
+        ] {
+            assert!(html.contains(attr), "missing {attr} in {html}");
+        }
+    }
+
+    #[test]
+    fn test_rewrite_does_not_bind_scriptable_or_url_attributes() {
+        let mut module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+signal target: Html = text("example")
+
+fn view() -> Html {
+    <a href={target} onclick={target} title={target}>Link</a>
+}
+"#,
+        );
+        rewrite_module(&mut module, None);
+        let html = format!("{:?}", find_function_body(&module, "view"));
+        assert!(html.contains("data-nulang-bind-title"));
+        assert!(!html.contains("data-nulang-bind-href"));
+        assert!(!html.contains("data-nulang-bind-onclick"));
+    }
+
+    #[test]
+    fn test_attribute_only_interaction_injects_client_runtime() {
+        let html = r#"<div class="active" data-nulang-bind-class="status"></div>"#;
+        let out = inject_client_runtime_script(html);
+        assert!(out.contains(r#"<script src="/app.client.js"></script>"#));
+    }
+
+    #[test]
+    fn test_client_runtime_updates_dynamic_attributes() {
+        let js = generate_client_runtime();
+        assert!(js.contains("attributeBindings"), "attribute bindings index missing");
+        assert!(js.contains("data-nulang-bind-"), "attribute metadata missing");
+        assert!(js.contains("setAttribute("), "attribute updates missing");
+        assert!(js.contains("removeAttribute("), "attribute clearing missing");
+    }
+
+    #[test]
     fn test_client_runtime_contains_hydrate_and_signal_api() {
         let js = generate_client_runtime();
         assert!(js.contains("hydrate"), "hydrate not found");
