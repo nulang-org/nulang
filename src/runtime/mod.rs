@@ -5562,7 +5562,19 @@ impl Runtime {
         actor_id: u64,
         step_name: &str,
     ) -> std::io::Result<()> {
-        workflow::append_saga_compensation_started(self, actor_id, step_name)
+        match self.saga_compensation_step_status(actor_id, step_name) {
+            SagaCompensationRecoveryStatus::NotStarted => {
+                workflow::append_saga_compensation_started(self, actor_id, step_name)
+            }
+            SagaCompensationRecoveryStatus::OutcomeUnknown => Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "saga compensation outcome is unknown; reconcile before retrying",
+            )),
+            SagaCompensationRecoveryStatus::Completed => Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "saga compensation already has a durable completion receipt",
+            )),
+        }
     }
 
     /// Run saga compensations for a workflow step that failed.
