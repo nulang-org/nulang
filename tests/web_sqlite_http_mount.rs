@@ -178,6 +178,14 @@ fn mounted_http_rejects_credentials_before_invoking_native_handler() {
     assert!(!down.contains("secret upstream"), "provider error must be sanitized");
     assert_eq!(calls.load(Ordering::SeqCst), 0, "must reject before dispatch");
 
+    // Reserve the exact root and query-bearing prefix as well, to prevent
+    // fallthrough to ordinary Web routes or public static content.
+    for protected in ["/__nulang/sqlite", "/__nulang/sqlite?format=json"] {
+        let response = send(server.port, "GET", protected, &[], "");
+        assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
     let prefix_collision = send(
         server.port,
         "GET",
