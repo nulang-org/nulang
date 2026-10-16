@@ -145,6 +145,31 @@ class MaintenanceBenchTests(unittest.TestCase):
         self.assertEqual(2, metrics["files_changed"])
         self.assertEqual(2, metrics["lines_added"])
 
+    def test_rejects_diverged_commits_even_when_both_revisions_exist(self):
+        left = commit(self.repo, {"src/app.nula": "let a = 2\n"}, "left change")
+        git(self.repo, "checkout", "-q", self.base)
+        right = commit(self.repo, {"src/app.nula": "let a = 3\n"}, "right change")
+        with self.assertRaisesRegex(ValueError, "ancestor"):
+            maintenance_bench.evaluate(self.manifest([
+                self.implementation(right, base_sha=left),
+            ]))
+
+    def test_rejects_reverse_direction_maintenance_change(self):
+        head = commit(self.repo, {"src/app.nula": "let a = 3\n"}, "change")
+        with self.assertRaisesRegex(ValueError, "ancestor"):
+            maintenance_bench.measure_change(self.repo, head, self.base)
+
+    def test_rejects_equal_base_and_head_without_a_change(self):
+        with self.assertRaisesRegex(ValueError, "distinct"):
+            maintenance_bench.measure_change(self.repo, self.base, self.base)
+
+    def test_rejects_unrelated_same_content_commit(self):
+        # An empty commit is not a meaningful task and should not appear as zero effort.
+        subprocess.run(["git", "-C", str(self.repo), "commit", "--allow-empty", "-qm", "empty"], check=True)
+        head = git(self.repo, "rev-parse", "HEAD")
+        with self.assertRaisesRegex(ValueError, "no changes"):
+            maintenance_bench.measure_change(self.repo, self.base, head)
+
     def test_cli_reports_invalid_input_without_creating_output(self):
         head = commit(self.repo, {"src/app.nula": "let a = 2\n"}, "change")
         manifest = self.manifest([self.implementation(head, head_sha="main")])
