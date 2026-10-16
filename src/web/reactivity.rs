@@ -1028,9 +1028,44 @@ pub fn generate_client_runtime() -> String {
     });
   }
 
+  // Replace one owned DOM subtree without losing sibling order or signal
+  // state. Only already-created, detached nodes are accepted; interpreting
+  // untrusted HTML strings is deliberately outside this primitive.
+  function replaceRegion(current, next) {
+    if (!current || !current.parentNode) {
+      throw new TypeError('nulang: current region must have an attached parent');
+    }
+    if (!next || next.parentNode || typeof next.querySelectorAll !== 'function') {
+      throw new TypeError('nulang: replacement region must be a detached element');
+    }
+    const parent = current.parentNode;
+    if (typeof parent.replaceChild !== 'function') {
+      throw new TypeError('nulang: current region parent cannot replace children');
+    }
+
+    // No DOM write or subscription change is made before all preconditions
+    // have been checked. The old root remains available for failure recovery.
+    dispose(current);
+    try {
+      parent.replaceChild(next, current);
+      hydrate(next);
+    } catch (error) {
+      // If attaching or hydrating the new subtree fails, detach its partial
+      // bindings and restore the previously active subtree.
+      dispose(next);
+      if (next.parentNode === parent) {
+        parent.replaceChild(current, next);
+      }
+      hydrate(current);
+      throw error;
+    }
+    return next;
+  }
+
   window.nulang = {
     hydrate: hydrate,
     dispose: dispose,
+    replaceRegion: replaceRegion,
     signal: function (name) {
       return {
         get: function () { return signals[name]; },
