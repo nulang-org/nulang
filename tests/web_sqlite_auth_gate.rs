@@ -105,7 +105,14 @@ fn verifier_errors_fail_closed_without_mutating_storage() {
     let store = database();
     let verifier = TestVerifier;
     let gate = WebSqliteAuthGate::new(&store, &verifier);
-    assert!(gate.authorize_headers(&headers("Bearer verifier-error", "tenant-a")).is_err());
+    let error = match gate.authorize_headers(&headers("Bearer verifier-error", "tenant-a")) {
+        Ok(_) => panic!("verification infrastructure failure must not authorize"),
+        Err(error) => error,
+    };
+    assert!(
+        !error.to_string().contains("identity provider offline"),
+        "raw verifier diagnostics must not escape to an HTTP adapter"
+    );
     assert_eq!(store.list("tenant-a", 10).unwrap(), vec![]);
 }
 
