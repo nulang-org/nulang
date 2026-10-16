@@ -355,6 +355,15 @@ pub(crate) fn checkpoint_actor(rt: &mut Runtime, actor_id: u64) {
     }
 }
 
+/// An unfinished activation must always recover from its last completed
+/// snapshot and replay the committed intermediate events in order.
+fn workflow_has_open_activation(rt: &Runtime, actor_id: u64) -> bool {
+    rt.actors
+        .get(&actor_id)
+        .and_then(|actor| actor.current_workflow_activation)
+        .is_some()
+}
+
 /// Commit a workflow event through the same fenced atomic tail used by commands
 /// and terminal step results. Open-activation preparations persist only the
 /// event: checkpointing their speculative state would skip replay after a crash.
@@ -508,6 +517,7 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                     .unwrap_or(0);
                 actor.set_state_field("parallel_progress", Value::int(current + 1));
             }
+            let checkpoint = !workflow_has_open_activation(rt, actor_id);
             if let Err(error) = commit_workflow_event(
                 rt,
                 actor_id,
@@ -516,7 +526,7 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                     parallel_step_name,
                     branch_name,
                 },
-                true,
+                checkpoint,
             ) {
                 tracing::error!(actor_id, %error, "nulang-workflow: failed to commit parallel branch progress");
             }
@@ -658,6 +668,7 @@ pub(crate) fn append_timer_fired(
     name: &str,
 ) -> std::io::Result<()> {
     let seq = next_sequence(rt, actor_id);
+    let checkpoint = !workflow_has_open_activation(rt, actor_id);
     commit_workflow_event(
         rt,
         actor_id,
@@ -665,7 +676,7 @@ pub(crate) fn append_timer_fired(
             sequence: seq,
             name: name.to_string(),
         },
-        true,
+        checkpoint,
     )
 }
 
@@ -676,6 +687,7 @@ pub(crate) fn append_signal_received(
     payload: Option<String>,
 ) -> std::io::Result<()> {
     let seq = next_sequence(rt, actor_id);
+    let checkpoint = !workflow_has_open_activation(rt, actor_id);
     commit_workflow_event(
         rt,
         actor_id,
@@ -684,7 +696,7 @@ pub(crate) fn append_signal_received(
             name: name.to_string(),
             payload,
         },
-        true,
+        checkpoint,
     )
 }
 
@@ -694,6 +706,7 @@ pub(crate) fn append_saga_compensated(
     step_name: &str,
 ) -> std::io::Result<()> {
     let seq = next_sequence(rt, actor_id);
+    let checkpoint = !workflow_has_open_activation(rt, actor_id);
     commit_workflow_event(
         rt,
         actor_id,
@@ -701,7 +714,7 @@ pub(crate) fn append_saga_compensated(
             sequence: seq,
             step_name: step_name.to_string(),
         },
-        true,
+        checkpoint,
     )
 }
 
