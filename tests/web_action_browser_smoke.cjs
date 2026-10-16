@@ -20,7 +20,7 @@ function clientRuntime() {
   const close = source.indexOf('"#', open + 3);
   assert.ok(open !== -1 && close > open, 'Web micro-runtime raw string not found');
   const runtime = source.slice(open + 3, close);
-  assert.ok(!/<\\/script/i.test(runtime), 'unsafe closing script tag in emitted JS');
+  assert.ok(!runtime.toLowerCase().includes('</script'), 'unsafe closing script tag in emitted JS');
   return runtime;
 }
 
@@ -122,7 +122,7 @@ try {
   if (result.error) throw result.error;
   assert.equal(result.status, 0,
     `Browser failed: ${(result.stderr || '').slice(-1200)}`);
-  const body = result.stdout.match(/<body\\b[^>]*>/i)?.[0] || '';
+  const body = result.stdout.match(/<body[^>]*>/i)?.[0] || '';
   assert.match(body, /data-web-action-smoke="PASS"/i,
     `Web action browser smoke failed: ${body.slice(0, 800)}`);
   console.log('PASS Web action browser smoke (input/label, submit, requestSubmit, client click)');
