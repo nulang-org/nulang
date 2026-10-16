@@ -31,6 +31,7 @@ pub struct WebSqliteAuthGate<'a> {
 
 /// A request-scoped capability. No caller-selected tenant parameter exists on
 /// its CRUD surface, and the underlying store reference/tenant are private.
+/// Its borrow is tied to the parsed request headers and the authentication gate.
 pub struct AuthorizedWebSqlite<'a> {
     store: &'a WebSqliteStore,
     tenant_id: String,
@@ -47,10 +48,10 @@ impl<'a> WebSqliteAuthGate<'a> {
     /// concatenation that loses duplicate Authorization fields.
     /// Tenant-selection headers are intentionally ignored, including
     /// X-Tenant-ID and X-Forwarded-Tenant.
-    pub fn authorize_headers(
-        &self,
-        headers: &[(String, String)],
-    ) -> io::Result<AuthorizedWebSqlite<'a>> {
+    pub fn authorize_headers<'request>(
+        &'request self,
+        headers: &'request [(String, String)],
+    ) -> io::Result<AuthorizedWebSqlite<'request>> {
         let mut authorization = None;
         for (name, value) in headers {
             if name.eq_ignore_ascii_case("authorization") {
