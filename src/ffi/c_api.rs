@@ -906,6 +906,13 @@ pub unsafe extern "C" fn nulang_call_function_owned(
         rt.last_error = Some("invalid owned call arguments".to_string());
         return 0;
     }
+    // A Rust slice cannot contain more than isize::MAX bytes. Check the
+    // caller's untrusted length before from_raw_parts, which would otherwise
+    // have undefined behavior for an impossible argument count.
+    if arg_count > isize::MAX as usize / std::mem::size_of::<u64>() {
+        rt.last_error = Some("owned call argument count exceeds Rust slice limits".to_string());
+        return 0;
+    }
     let name = match unsafe { CStr::from_ptr(name).to_str() } {
         Ok(name) => name,
         Err(_) => {
