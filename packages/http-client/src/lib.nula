@@ -142,10 +142,8 @@ pub fn send_response(req) {
 /// than POST are not silently converted to GET.
 pub fn send_request(req) {
     let response = send_response(req);
-    if response == nil then { nil }
-    else {
-        let parsed = parse(response);
-        if get_bool(parsed, "ok", false) then { get_string(parsed, "body", "") }
-        else { nil }
-    }
+    if response == nil then { return nil } else {};
+    let parsed = parse(response);
+    if !get_bool(parsed, "ok", false) then { return nil } else {};
+    get_string(parsed, "body", "")
 }
