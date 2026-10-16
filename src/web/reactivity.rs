@@ -945,6 +945,7 @@ fn wrap_signal_read(name: &str, span: Span) -> Expr {
 mod tests {
     use super::*;
     use crate::lexer::Lexer;
+    use crate::parser::Parser;
 
     #[test]
     fn generated_runtime_exposes_disposable_signal_subscriptions() {
@@ -954,8 +955,6 @@ mod tests {
         assert!(javascript.contains("subscribers.forEach(function (listener)"));
         assert!(javascript.contains("Object.is(signals[name], value)"));
     }
-
-    use crate::parser::Parser;
 
     fn parse(source: &str) -> AstModule {
         let tokens = Lexer::new(source).lex().unwrap();
