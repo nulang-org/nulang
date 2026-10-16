@@ -110,3 +110,98 @@ fn fired_timers_and_saga_compensations_commit_atomically() {
         )
     ));
 }
+
+#[test]
+fn signals_during_an_open_activation_do_not_checkpoint_speculative_state() {
+    let mut runtime = Runtime::new();
+    let actor_id =
+        runtime.spawn_workflow_actor("SuspendedSignal", Box::new(Vec::new), HashMap::new());
+    let safe_snapshot = runtime.persistence.load_snapshot(actor_id).unwrap();
+
+    runtime
+        .actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .current_workflow_activation = Some(WorkflowActivationId::new(actor_id, 97));
+
+    runtime.append_signal_received(actor_id, "resume", None).unwrap();
+
+    let tail = runtime
+        .persistence
+        .load_durable_tail_position(actor_id)
+        .unwrap()
+        .expect("signal must be committed before wake-up");
+    assert!(tail.sequence > safe_snapshot.sequence);
+    assert_eq!(
+        runtime.persistence.load_snapshot(actor_id).unwrap().sequence,
+        safe_snapshot.sequence,
+        "the unfinished activation must replay from its last completed state"
+    );
+}
+
+#[test]
+fn unsupported_atomic_store_refuses_signal_without_publishing_history() {
+    use nulang::runtime::JsonFileStore;
+    use std::io::ErrorKind;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let mut runtime = Runtime::new();
+    let actor_id =
+        runtime.spawn_workflow_actor("NoPartialSignal", Box::new(Vec::new), HashMap::new());
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "nulang-no-partial-workflow-signal-{}-{nonce}",
+        std::process::id()
+    ));
+    runtime.persistence = Box::new(JsonFileStore::new(&path).unwrap());
+
+    let error = runtime
+        .append_signal_received(actor_id, "resume", None)
+        .expect_err("unsupported storage must fail closed before recording the signal");
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert!(runtime.persistence.read_workflow_events(actor_id).is_empty());
+
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn custom_event_in_an_open_activation_is_committed_without_checkpointing() {
+    use nulang::vm::Value;
+
+    let mut runtime = Runtime::new();
+    let actor_id =
+        runtime.spawn_workflow_actor("AtomicCustom", Box::new(Vec::new), HashMap::new());
+    let safe_snapshot = runtime.persistence.load_snapshot(actor_id).unwrap();
+    runtime
+        .actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .current_workflow_activation = Some(WorkflowActivationId::new(actor_id, 123));
+
+    runtime.emit_event(actor_id, "Created", &[Value::int(5)]);
+
+    let tail = runtime
+        .persistence
+        .load_durable_tail_position(actor_id)
+        .unwrap()
+        .expect("custom event must advance the atomic tail");
+    assert!(tail.sequence > safe_snapshot.sequence);
+    assert_eq!(
+        runtime.persistence.load_snapshot(actor_id).unwrap().sequence,
+        safe_snapshot.sequence
+    );
+    assert!(runtime.persistence.read_workflow_events(actor_id).iter().any(
+        |event| matches!(
+            event,
+            WorkflowEvent::Custom {
+                sequence,
+                replay_id: Some(_),
+                name,
+                ..
+            } if *sequence == tail.sequence && name == "Created"
+        )
+    ));
+}
