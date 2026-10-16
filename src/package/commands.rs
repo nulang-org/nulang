@@ -1061,9 +1061,9 @@ fn build_module_path() -> Option<String> {
     }
 }
 
-/// `nula build`: resolve dependencies, write the lockfile, type-check entry.
-/// `nula build`: resolve dependencies, write the lockfile, type-check and
-/// compile to a .nbc artifact in .nula/dist/.
+/// Build one validated bytecode artifact and behavior manifest. The compiler's
+/// --emit-nbc path already runs type/effect/capability checks; a separate
+/// --check invocation would repeat the frontend and double process startup.
 fn cmd_build(json: bool) -> NuResult<()> {
     let root = package_root()?;
     let manifest_path = root.join(MANIFEST_FILE);
@@ -1076,11 +1076,6 @@ fn cmd_build(json: bool) -> NuResult<()> {
 
     let entry = prepare_package()?;
     let entry_str = entry.to_string_lossy().into_owned();
-
-    if json {
-        return cmd_build_json(&root, &name, &version, &entry_str);
-    }
-
     let dist_dir = root.join(".nula").join("dist");
     std::fs::create_dir_all(&dist_dir).map_err(|e| NuError::PackageError {
         msg: format!("cannot create {}: {}", dist_dir.display(), e),
@@ -1092,118 +1087,67 @@ fn cmd_build(json: bool) -> NuResult<()> {
     let behavior_path = dist_dir.join(format!("{}.behavior.json", name));
     let behavior_path_str = behavior_path.to_string_lossy().into_owned();
 
-    eprintln!("Building {}...", name);
-    eprintln!("  Type-checking {}...", entry.display());
+    eprintln!("Building {} (checking and compiling once)...", name);
     let caps = capability_args();
-    let cap_refs: Vec<&str> = caps.iter().map(|s| s.as_str()).collect();
-    nulang_exe(&[&["--check", &entry_str], &cap_refs[..]].concat())?;
-    eprintln!("  Compiling {} to .nbc...", name);
-    nulang_exe(
-        &[
-            &[
-                "--emit-nbc",
-                "--out",
-                &nbc_path_str,
-                "--emit-behavior-manifest",
-                &behavior_path_str,
-                "--behavior-package-name",
-                &name,
-                "--behavior-package-version",
-                &version,
-                &entry_str,
-            ],
-            &cap_refs[..],
-        ]
-        .concat(),
-    )?;
-    println!("Build succeeded.");
-    Ok(())
-}
-
-/// `nula build --json`: machine-readable build report. The JSON report is
-/// the only output on stdout; progress stays on stderr. Type-check
-/// diagnostics are produced by the child `nulang --check --json` invocation
-/// and forwarded (re-wrapped as `command: "build"`) so consumers see one
-/// schema.
-fn cmd_build_json(root: &Path, name: &str, version: &str, entry_str: &str) -> NuResult<()> {
-    use crate::json_diagnostics::{diagnostic_from_message, JsonReport, SCHEMA_VERSION};
-
-    // Step 1: type-check with JSON diagnostics, capturing the child's stdout.
-    eprintln!("Building {}...", name);
-    eprintln!("  Type-checking {}...", entry_str);
-    let check = nulang_exe_output(&["--json", "--check", entry_str])?;
-    if !check.status.success() {
-        let stdout = String::from_utf8_lossy(&check.stdout);
-        // Forward the child's structured diagnostics when parseable; fall
-        // back to a single opaque error otherwise.
-        let report = match serde_json::from_str::<serde_json::Value>(stdout.trim()) {
-            Ok(v) if v["diagnostics"].is_array() => serde_json::json!({
-                "schema_version": SCHEMA_VERSION,
-                "command": "build",
-                "file": entry_str,
-                "ok": false,
-                "diagnostics": v["diagnostics"],
-            })
-            .to_string(),
-            _ => JsonReport::new(
-                "build",
-                Some(entry_str.to_string()),
-                vec![diagnostic_from_message(format!(
-                    "nulang --check exited with {}",
-                    check.status
-                ))],
-            )
-            .to_json_string(),
-        };
-        println!("{}", report.trim_end());
-        return Err(NuError::PackageError {
-            msg: format!("type check failed for {}", entry_str),
-            span: Span::default(),
-        });
+    let mut args: Vec<&str> = Vec::new();
+    if json {
+        args.push("--json");
     }
-
-    // Step 2: compile to .nbc (stdout captured so only JSON reaches stdout).
-    let dist_dir = root.join(".nula").join("dist");
-    std::fs::create_dir_all(&dist_dir).map_err(|e| NuError::PackageError {
-        msg: format!("cannot create {}: {}", dist_dir.display(), e),
-        span: Span::default(),
-    })?;
-    let nbc_path = dist_dir.join(format!("{}.nbc", name));
-    let nbc_path_str = nbc_path.to_string_lossy().into_owned();
-    let behavior_path = dist_dir.join(format!("{}.behavior.json", name));
-    let behavior_path_str = behavior_path.to_string_lossy().into_owned();
-    eprintln!("  Compiling {} to .nbc...", name);
-    let compile = nulang_exe_output(&[
+    args.extend_from_slice(&[
         "--emit-nbc",
         "--out",
         &nbc_path_str,
         "--emit-behavior-manifest",
         &behavior_path_str,
         "--behavior-package-name",
-        name,
+        &name,
         "--behavior-package-version",
-        version,
-        entry_str,
-    ])?;
-    if !compile.status.success() {
-        let stderr = String::from_utf8_lossy(&compile.stderr).trim().to_string();
-        let report = JsonReport::new(
-            "build",
-            Some(entry_str.to_string()),
-            vec![diagnostic_from_message(format!(
-                "nulang --emit-nbc exited with {}: {}",
-                compile.status, stderr
-            ))],
-        );
-        print!("{}", report.to_json_string());
-        return Err(NuError::PackageError {
-            msg: format!("compilation failed for {}", entry_str),
-            span: Span::default(),
-        });
-    }
+        &version,
+        &entry_str,
+    ]);
+    args.extend(caps.iter().map(String::as_str));
 
-    let report = JsonReport::new("build", Some(entry_str.to_string()), Vec::new());
-    print!("{}", report.to_json_string());
+    if json {
+        let compile = nulang_exe_output(&args)?;
+        // Fail closed if the compiler did not return the documented schema.
+        let parsed = serde_json::from_slice::<serde_json::Value>(&compile.stdout)
+            .ok()
+            .filter(|report| {
+                report["schema_version"].as_u64()
+                    == Some(crate::json_diagnostics::SCHEMA_VERSION as u64)
+                    && report["command"] == "build"
+                    && report["diagnostics"].is_array()
+                    && report["ok"].as_bool() == Some(compile.status.success())
+            });
+        if let Some(report) = parsed {
+            println!("{report}");
+        } else {
+            let stderr = String::from_utf8_lossy(&compile.stderr);
+            let report = crate::json_diagnostics::JsonReport::new(
+                "build",
+                Some(entry_str.clone()),
+                vec![crate::json_diagnostics::diagnostic_from_message(format!(
+                    "compiler returned an invalid JSON report (status {}): {}",
+                    compile.status,
+                    stderr.trim()
+                ))],
+            );
+            print!("{}", report.to_json_string());
+            return Err(NuError::PackageError {
+                msg: format!("invalid compiler JSON report for {entry_str}"),
+                span: Span::default(),
+            });
+        }
+        if !compile.status.success() {
+            return Err(NuError::PackageError {
+                msg: format!("compilation failed for {entry_str}"),
+                span: Span::default(),
+            });
+        }
+    } else {
+        nulang_exe(&args)?;
+        println!("Build succeeded.");
+    }
     Ok(())
 }
 
@@ -1229,6 +1173,18 @@ fn nulang_exe_output(args: &[&str]) -> NuResult<std::process::Output> {
                 }
             }
         }
+    }
+    // Match the ordinary compiler invocation's locked dependency search path.
+    // Without this, JSON builds can resolve different imports from normal builds.
+    let mut module_path = std::env::var("NULANG_MODULE_PATH").unwrap_or_default();
+    if let Some(computed) = build_module_path() {
+        if !module_path.is_empty() {
+            module_path.push(';');
+        }
+        module_path.push_str(&computed);
+    }
+    if !module_path.is_empty() {
+        cmd.env("NULANG_MODULE_PATH", &module_path);
     }
     cmd.output().map_err(|e| NuError::PackageError {
         msg: format!("failed to run nulang ({}): {}", exe.display(), e),

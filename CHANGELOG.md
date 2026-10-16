@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Single-pass package builds — 2026-10-16
+- **`nula build` now validates and emits bytecode in one compiler frontend pass instead of starting a redundant check-only compiler subprocess.** Normal and JSON builds retain source-aware diagnostics, type/effect/capability validation, relative imports, and behavior manifest emission.
+- **A matched-binary CLI benchmark compares full package build subprocess latency and output artifacts.** Performance gains are not asserted before exact-head Rust tests and same-host paired benchmarks finish; artifact writes remain non-transactional.
+
 ### Web static-root containment — 2026-10-15
 - **Experimental Web static file serving refuses parent traversal and symlinks escaping configured roots.** Canonical candidate paths must remain inside their canonicalized static or output root, and normal in-root files remain serveable.
 - **A filesystem regression verifies parent and symlink escape rejection.** This is a clean current-main successor to draft #1676; it does not change SSE or claim protection from malicious concurrent mutation of a trusted static root.
