@@ -1014,6 +1014,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn differential_fuzz_direct_call_runtime_error_has_one_prefix() {
+        // October 15 nightly repro: warmed JIT must not wrap a callee's
+        // formatted RuntimeError in another RuntimeError prefix.
+        let source =
+            "fn cond(c, a, b) { if- c then a else b }; cond(true, 1, 2) + cond(false, 10, 20)";
+        let outcome = differential_fuzz_one(source)
+            .expect("JIT direct-call runtime error must match interpreter formatting");
+        assert!(
+            matches!(outcome, DiffOutcome::Agreed { .. }),
+            "must compare the actual compiler backends: {:?}",
+            outcome
+        );
+    }
+
     /// Differential regression cases: known kernels that must agree across
     /// all backends. Added from nightly fuzz captures (2026-10-10).
     #[test]
