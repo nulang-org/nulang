@@ -5585,7 +5585,7 @@ impl Runtime {
                     operation_id,
                     ..
                 } if name == step_name
-                    && (operation_id.is_none() || *operation_id == expected_id) =>
+                    && (operation_id.is_none() || operation_id.as_deref() == expected_id.as_deref()) =>
                 {
                     status = SagaCompensationRecoveryStatus::OutcomeUnknown;
                 }
