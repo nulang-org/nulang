@@ -155,3 +155,31 @@ test('failed layer addition does not poison a later valid command', () => {
   assert.doesNotThrow(() => host.dispatch({ type: 'layer.add', layer: { id: 'pins', type: 'circle', source: 'sites' } }));
   host.destroy();
 });
+
+test('cannot remove or mutate basemap-owned sources and layers', () => {
+  const fake = fixture();
+  const host = createMapHost({ maplibregl: fake.maplibregl, container: {}, style: 'sample-style' });
+  const map = fake.maps[0];
+  map.sources.set('basemap', { type: 'vector' });
+  map.layers.set('basemap-layer', { id: 'basemap-layer' });
+  host.dispatch({ type: 'source.remove', id: 'basemap' });
+  host.dispatch({ type: 'layer.remove', id: 'basemap-layer' });
+  host.dispatch({ type: 'layer.visibility', id: 'basemap-layer', visible: false });
+  assert.ok(map.sources.has('basemap'));
+  assert.ok(map.layers.has('basemap-layer'));
+  assert.ok(!map.actions.some(action => action[0] === 'removeSource' || action[0] === 'removeLayer' || action[0] === 'layout'));
+  host.destroy();
+});
+
+test('failed in-place GeoJSON update preserves retained data', () => {
+  const fake = fixture();
+  const host = createMapHost({ maplibregl: fake.maplibregl, container: {}, style: 'sample-style' });
+  host.dispatch({ type: 'source.upsert', id: 'sites', source: { type: 'geojson', data: point } });
+  const map = fake.maps[0];
+  map.getSource('sites').setData = () => { throw new Error('update failed'); };
+  assert.throws(() => host.dispatch({ type: 'source.upsert', id: 'sites', source: { type: 'geojson', data: { type: 'FeatureCollection', features: [1] } } }), /update failed/);
+  map.sources.clear();
+  map.emit('style.load');
+  assert.deepEqual(map.getSource('sites').data, point);
+  host.destroy();
+});
