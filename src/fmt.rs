@@ -1232,7 +1232,7 @@ fn op_sym_unary(op: crate::ast::UnOp) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::format_source;
+    use super::{format_directory, format_source};
 
     /// Formatting must be idempotent: formatting the formatted output is a
     /// no-op (returns the same text), so repeated `fmt` runs converge.
@@ -1429,6 +1429,42 @@ fn main() {
                 "formatter must refuse a lossy rewrite: {source}"
             );
         }
+    }
+
+    #[test]
+    fn test_fmt_directory_preflights_every_file_before_rewriting_any() {
+        let root = std::env::temp_dir().join(format!(
+            "nulang_fmt_preflight_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).expect("create test directory");
+        let safe = root.join("a.nula");
+        let unsafe_file = root.join("z.nula");
+        let original = "import Foo::Bar";
+        std::fs::write(&safe, original).expect("write safe file");
+        std::fs::write(
+            &unsafe_file,
+            "fn main() { // must keep this comment\n  1\n}\n",
+        )
+        .expect("write unsafe file");
+
+        let result = format_directory(&root, false);
+        assert!(result.is_err(), "unsafe file should abort the directory operation");
+        assert_eq!(
+            std::fs::read_to_string(&safe).expect("read source"),
+            original,
+            "preflight failure must not change previously visited files"
+        );
+        assert!(
+            std::fs::read_to_string(&unsafe_file)
+                .expect("read unsafe source")
+                .contains("// must keep this comment")
+        );
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
