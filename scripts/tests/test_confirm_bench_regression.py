@@ -27,6 +27,11 @@ class CriterionFilterTests(unittest.TestCase):
         self.assertRegex("persist/checkpoint_json_encode/1kb", pattern)
         self.assertRegex("persist_checkpoint_json_encode/1kb", pattern)
 
+    def test_filter_does_not_split_benchmark_id_underscores(self):
+        pattern = confirm.criterion_filter(["persist_checkpoint_json_encode/1_kb"])
+        self.assertRegex("persist/checkpoint_json_encode/1_kb", pattern)
+        self.assertNotRegex("persist/checkpoint_json_encode/1/kb", pattern)
+
 class ManifestValidationTests(unittest.TestCase):
     def test_rejects_non_object_regression_rows(self):
         with tempfile.TemporaryDirectory() as tmp:
