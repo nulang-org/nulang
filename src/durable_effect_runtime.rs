@@ -212,7 +212,8 @@ impl<'a> DurableEffectCoordinator<'a> {
             DurableEffectDispatchDecision::ReplayRecordedResult(receipt) => Ok(receipt),
             DurableEffectDispatchDecision::DispatchWithDeduplication { operation_id } => {
                 let key = operation_id.idempotency_key();
-                let receipt = dispatch(&key, request).map_err(DurableAsyncDispatchError::Provider)?;
+                let receipt =
+                    dispatch(&key, request).map_err(DurableAsyncDispatchError::Provider)?;
                 Ok(self.complete(operation_id, request, receipt)?)
             }
             _ => Err(DurableAsyncDispatchError::UnexpectedDecision),
