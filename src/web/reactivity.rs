@@ -104,18 +104,12 @@ impl SignalGraph {
                     let id = NodeId::new(format!("attribute:{attribute_read_index}:{signal}"));
                     attribute_read_index += 1;
                     let mut node = UiNode::new(id.clone(), "attribute_read");
-                    node.properties.insert(
-                        "signal".to_string(),
-                        WireValue::from(signal.clone()),
-                    );
-                    node.properties.insert(
-                        "path".to_string(),
-                        WireValue::from(path.clone()),
-                    );
-                    node.properties.insert(
-                        "attribute".to_string(),
-                        WireValue::from(attribute.clone()),
-                    );
+                    node.properties
+                        .insert("signal".to_string(), WireValue::from(signal.clone()));
+                    node.properties
+                        .insert("path".to_string(), WireValue::from(path.clone()));
+                    node.properties
+                        .insert("attribute".to_string(), WireValue::from(attribute.clone()));
                     node.properties.insert("value".to_string(), WireValue::Null);
                     root.children.push(id);
                     node
@@ -1430,8 +1424,7 @@ fn view() -> Html {
             .collect();
         assert_eq!(attributes.len(), 2);
         assert!(attributes.iter().all(|node| {
-            node.properties.get("value")
-                == Some(&nulang_ui_protocol::WireValue::from("Updated"))
+            node.properties.get("value") == Some(&nulang_ui_protocol::WireValue::from("Updated"))
         }));
 
         rewrite_module(&mut module, None);
