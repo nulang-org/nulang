@@ -3076,6 +3076,7 @@ mod tests {
 import stdlib::web::types
 
 signal count: Html = text("0")
+signal visible: Bool = true
 
 fn add() {}
 
@@ -3083,6 +3084,7 @@ fn home() -> Html {
     <div class="card">
         <button action={add}>Add</button>
         <span class={count} title={count} data-state={count}>{count}</span>
+        <div>{if visible then <section>Shown</section> else <aside>Hidden</aside>}</div>
     </div>
 }
 
@@ -3119,6 +3121,19 @@ app "counter" {
         assert!(
             html.contains(r#"data-nulang-bind-data-state="count""#),
             "compiled hyphenated attribute binding missing from SSR: {html}"
+        );
+
+        assert!(
+            html.contains(r#"data-nulang-if="visible""#),
+            "conditional marker missing from SSR: {html}"
+        );
+        assert!(
+            html.contains(r#"data-nulang-branch="then""#),
+            "active conditional branch missing from SSR: {html}"
+        );
+        assert!(
+            !html.contains(r#"data-nulang-branch="else""#),
+            "inactive conditional branch must never execute or render on the server: {html}"
         );
 
         let js = std::fs::read_to_string(dir.join("dist/app.client.js"))
