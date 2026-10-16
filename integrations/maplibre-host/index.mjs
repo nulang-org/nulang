@@ -55,10 +55,17 @@ export function createMapHost({ maplibregl, container, style, ...options }) {
             throw new Error('Cannot replace a non-GeoJSON or structurally changed source; remove it first');
           }
           sources.set(id, source);
-          if (ready()) {
-            const live = map.getSource(id);
-            if (live) live.setData(source.data);
-            else reconcile();
+          try {
+            if (ready()) {
+              const live = map.getSource(id);
+              if (live) {
+                if (typeof live.setData !== 'function') throw new Error('GeoJSON source does not support setData');
+                live.setData(source.data);
+              } else reconcile();
+            }
+          } catch (error) {
+            sources.set(id, old);
+            throw error;
           }
         } else {
           if (ready() && map.getSource(id)) throw new Error(`Source ID already exists in basemap: ${id}`);
@@ -69,6 +76,7 @@ export function createMapHost({ maplibregl, container, style, ...options }) {
       }
       case 'source.remove': {
         const id = command.id;
+        if (!sources.has(id)) break; // Never remove a basemap-owned source.
         for (const [layerId, layer] of layers) {
           if (layer.source === id) {
             if (ready() && map.getLayer(layerId)) map.removeLayer(layerId);
@@ -92,14 +100,14 @@ export function createMapHost({ maplibregl, container, style, ...options }) {
         break;
       }
       case 'layer.remove':
-        if (ready() && map.getLayer(command.id)) map.removeLayer(command.id);
+        if (layers.has(command.id) && ready() && map.getLayer(command.id)) map.removeLayer(command.id);
         layers.delete(command.id);
         visibility.delete(command.id);
         break;
       case 'layer.visibility':
         if (typeof command.visible !== 'boolean') throw new TypeError('visible must be a boolean');
         visibility.set(command.id, command.visible);
-        if (ready() && map.getLayer(command.id)) {
+        if (layers.has(command.id) && ready() && map.getLayer(command.id)) {
           map.setLayoutProperty(command.id, 'visibility', command.visible ? 'visible' : 'none');
         }
         break;
