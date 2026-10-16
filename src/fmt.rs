@@ -47,7 +47,7 @@ pub fn format_source(source: &str) -> Result<String, String> {
         fmt_decl(&mut out, decl, 0, &mut had_unhandled);
     }
     if had_unhandled {
-        return Err("file contains constructs not yet supported by the formatter (e.g. workflow, agent, let-binding, class, impl). The file was not modified.".to_string());
+        return Err("formatting refused: at least one construct or modifier cannot be preserved safely; the file was not modified".to_string());
     }
     if !out.ends_with('\n') {
         out.push('\n');
@@ -141,8 +141,36 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             ret_type,
             body,
             effect,
+            type_params,
+            type_param_constraints,
+            default_values,
+            using_params,
+            error_type,
+            cap,
+            requires,
+            ensures,
+            annotations,
+            public,
             ..
         } => {
+            // The AST printer currently omits several source-level modifiers.
+            // Refuse the entire file rather than silently changing its API,
+            // effect/ownership contracts, or runtime pre/postconditions.
+            if *public
+                || !type_params.is_empty()
+                || !type_param_constraints.is_empty()
+                || default_values.iter().any(Option::is_some)
+                || !using_params.is_empty()
+                || error_type.is_some()
+                || cap.is_some()
+                || !requires.is_empty()
+                || !ensures.is_empty()
+                || !annotations.is_empty()
+                || params.iter().any(|param| param.cap.is_some())
+            {
+                *had_unhandled = true;
+                return;
+            }
             out.push_str(&format!("{}fn {}(", sp, name));
             for (i, p) in params.iter().enumerate() {
                 let pn = &p.name;
@@ -204,8 +232,39 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             name,
             behaviors,
             state_fields,
+            type_params,
+            persistent,
+            init,
+            backend,
+            initializer,
+            version,
+            events,
+            apply_handlers,
+            migrations,
+            is_organization,
+            virtual_,
+            key_params,
+            implements,
             ..
         } => {
+            // Actor/entity provenance and durability are not yet printed.
+            if *persistent
+                || !type_params.is_empty()
+                || !init.is_empty()
+                || backend.is_some()
+                || initializer.is_some()
+                || *version != 1
+                || !events.is_empty()
+                || !apply_handlers.is_empty()
+                || !migrations.is_empty()
+                || *is_organization
+                || *virtual_
+                || !key_params.is_empty()
+                || implements.is_some()
+            {
+                *had_unhandled = true;
+                return;
+            }
             out.push_str(&format!("{}actor {} {{\n", sp, name));
             for (fnm, _, fty, fdef) in state_fields {
                 out.push_str(&format!("{}    state {}: {}", sp, fnm, fmt_type(fty)));
