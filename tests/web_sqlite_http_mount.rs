@@ -190,3 +190,32 @@ fn mounted_http_rejects_credentials_before_invoking_native_handler() {
     drop(server);
     cleanup(&path);
 }
+
+
+#[test]
+fn standard_listener_does_not_enable_sqlite_mount_implicitly() {
+    let server = WebDevServer::bind_runtime(0, None, None, vec![]).unwrap();
+    let response = send(
+        server.port,
+        "GET",
+        "/__nulang/sqlite/item",
+        &auth("Bearer a"),
+        "",
+    );
+    assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+}
+
+#[test]
+fn mounted_http_marks_successful_tenant_data_uncacheable() {
+    let path = db_path();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let server = WebDevServer::bind_runtime_with_sqlite(
+        0, None, None, vec![], mount(&path, &calls),
+    )
+    .unwrap();
+    let response = send(server.port, "GET", "/__nulang/sqlite/item", &auth("Bearer a"), "");
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.contains("Cache-Control: no-store\r\n"), "{response}");
+    drop(server);
+    cleanup(&path);
+}
