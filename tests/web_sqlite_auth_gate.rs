@@ -48,11 +48,13 @@ fn gate_scopes_all_crud_operations_to_verified_tenant_not_spoofed_headers() {
     let store = database();
     let verifier = TestVerifier;
     let gate = WebSqliteAuthGate::new(&store, &verifier);
+    let headers_a = headers("Bearer allow-a", "tenant-b");
+    let headers_b = headers("Bearer allow-b", "tenant-a");
     let a: AuthorizedWebSqlite<'_> = gate
-        .authorize_headers(&headers("Bearer allow-a", "tenant-b"))
+        .authorize_headers(&headers_a)
         .expect("valid tenant A credentials");
     let b = gate
-        .authorize_headers(&headers("Bearer allow-b", "tenant-a"))
+        .authorize_headers(&headers_b)
         .expect("valid tenant B credentials");
 
     a.put("shared", "alpha").unwrap();
@@ -121,7 +123,8 @@ fn tenant_handle_is_request_scoped_and_has_no_tenant_selector() {
     let store = database();
     let verifier = TestVerifier;
     let gate = WebSqliteAuthGate::new(&store, &verifier);
-    let authorized = gate.authorize_headers(&headers("Bearer allow-a", "tenant-b")).unwrap();
+    let request_headers = headers("Bearer allow-a", "tenant-b");
+    let authorized = gate.authorize_headers(&request_headers).unwrap();
     authorized.put("item", "value").unwrap();
 
     // The handle contains no caller-settable tenant ID. Each operation uses
