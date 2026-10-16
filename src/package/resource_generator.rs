@@ -323,4 +323,46 @@ mod tests {
         assert!(result.is_err());
         assert!(!dir.join("src").exists());
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn generator_rejects_symlinked_resource_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_package("resource_symlink");
+        let outside = test_package("resource_symlink_outside");
+        fs::create_dir_all(root.join("src")).unwrap();
+        symlink(&outside, root.join("src").join("resources")).unwrap();
+
+        let result = run(
+            &argv(&["resource", "Billboard", "--field", "name:String"]),
+            &root,
+        );
+        assert!(result.is_err(), "generator must reject a symlinked output directory");
+        assert!(!outside.join("billboard.nula").exists());
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generator_rejects_symlinked_source_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_package("src_symlink");
+        let outside = test_package("src_symlink_outside");
+        symlink(&outside, root.join("src")).unwrap();
+
+        let result = run(
+            &argv(&["resource", "Billboard", "--field", "name:String"]),
+            &root,
+        );
+        assert!(result.is_err(), "generator must reject a symlinked source directory");
+        assert!(!outside.join("resources").exists());
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
 }
