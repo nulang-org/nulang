@@ -10,6 +10,30 @@ const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 
+// Limit the response metadata exposed to Nulang, not just the outbound
+// request headers. Check before cloning any potentially large header value.
+// The underlying HTTP parser must independently enforce wire-level limits.
+fn insert_bounded_response_header(
+    headers: &mut BTreeMap<String, String>,
+    used_bytes: &mut usize,
+    name: &str,
+    value: &str,
+) -> Result<(), String> {
+    let total = used_bytes
+        .checked_add(name.len())
+        .and_then(|n| n.checked_add(value.len()))
+        .ok_or_else(|| "Http.request: response headers exceed 64 KiB limit".to_string())?;
+    if total > MAX_HEADER_BYTES {
+        return Err("Http.request: response headers exceed 64 KiB limit".to_string());
+    }
+    if headers.len() >= 100 && !headers.contains_key(&name.to_ascii_lowercase()) {
+        return Err("Http.request: too many response headers".to_string());
+    }
+    headers.insert(name.to_ascii_lowercase(), value.to_string());
+    *used_bytes = total;
+    Ok(())
+}
+
 /// Execute a single outbound request and return a UTF-8 JSON response:
 /// {"status": integer, "ok": boolean, "headers": object, "body": string}.
 ///
@@ -103,9 +127,10 @@ pub fn request_text(
 
     let status = response.status();
     let mut headers = BTreeMap::new();
+    let mut response_header_bytes = 0usize;
     for name in response.headers_names() {
         if let Some(value) = response.header(&name) {
-            headers.insert(name.to_ascii_lowercase(), value.to_string());
+            insert_bounded_response_header(&mut headers, &mut response_header_bytes, &name, value)?;
         }
     }
     let mut bytes = Vec::new();
@@ -126,4 +151,57 @@ pub fn request_text(
         "body": body,
     }))
     .map_err(|e| format!("Http.request: failed to serialize response: {e}"))
+}
+
+#[cfg(test)]
+mod response_header_limit_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_aggregate_response_headers_above_limit() {
+        let mut headers = BTreeMap::new();
+        let mut used = 0usize;
+        for i in 0..8 {
+            insert_bounded_response_header(
+                &mut headers,
+                &mut used,
+                &format!("x-long-{i}"),
+                &"a".repeat(8192 - 8),
+            )
+            .expect("within response-header budget");
+        }
+        let error =
+            insert_bounded_response_header(&mut headers, &mut used, "x-over", "one more header")
+                .expect_err("aggregate response-header bytes must be bounded");
+        assert!(error.contains("response headers exceed"));
+    }
+
+    #[test]
+    fn rejects_a_single_oversized_response_header() {
+        let mut headers = BTreeMap::new();
+        let mut used = 0usize;
+        let error = insert_bounded_response_header(
+            &mut headers,
+            &mut used,
+            "x-large",
+            &"a".repeat(MAX_HEADER_BYTES + 1),
+        )
+        .expect_err("over-limit response header must be rejected");
+        assert!(error.contains("response headers exceed"));
+        assert_eq!(used, 0);
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn preserves_small_response_headers_and_normalizes_names() {
+        let mut headers = BTreeMap::new();
+        let mut used = 0usize;
+        insert_bounded_response_header(&mut headers, &mut used, "X-Request-Id", "req-123")
+            .expect("normal response header");
+        assert_eq!(
+            headers.get("x-request-id").map(String::as_str),
+            Some("req-123")
+        );
+        assert_eq!(used, "X-Request-Id".len() + "req-123".len());
+    }
 }
