@@ -1372,6 +1372,44 @@ mod tests {
     }
 
     #[test]
+    fn test_owned_call_rejects_impossible_argument_length_before_slice_creation() {
+        let rt = nulang_runtime_new();
+        let source = CString::new("fn id(x: Int) -> Int { x } id(0)").unwrap();
+        let module = unsafe { nulang_compile(rt, source.as_ptr()) };
+        assert!(module >= 0);
+        let function = CString::new("id").unwrap();
+        let argument = unsafe { nulang_owned_value_int_new(rt, 7) };
+        assert_ne!(argument, 0);
+
+        // The pointer is valid for one handle, but this count cannot describe
+        // a Rust slice. It must be rejected before from_raw_parts is called.
+        let impossible_count = isize::MAX as usize / std::mem::size_of::<u64>() + 1;
+        let result = unsafe {
+            nulang_call_function_owned(rt, module, function.as_ptr(), &argument, impossible_count)
+        };
+        assert_eq!(result, 0);
+        let error = unsafe { nulang_last_error(rt) };
+        assert!(!error.is_null());
+        assert!(
+            unsafe { CStr::from_ptr(error) }
+                .to_string_lossy()
+                .contains("argument count"),
+            "oversized argument count should report an explicit C ABI error"
+        );
+
+        let valid = unsafe {
+            nulang_call_function_owned(rt, module, function.as_ptr(), &argument, 1)
+        };
+        assert_ne!(valid, 0);
+        let mut value = 0;
+        assert!(unsafe { nulang_owned_value_int(rt, valid, &mut value) });
+        assert_eq!(value, 7);
+        assert!(unsafe { nulang_owned_value_release(rt, argument) });
+        assert!(unsafe { nulang_owned_value_release(rt, valid) });
+        unsafe { nulang_runtime_free(rt) };
+    }
+
+    #[test]
     fn test_owned_handle_rejects_pointer_forgery_and_invalid_module() {
         let rt = nulang_runtime_new();
         let source = CString::new("1").unwrap();
