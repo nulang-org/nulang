@@ -8144,6 +8144,12 @@ mod vm_tests {
 
         // Hot run: the loop body tiers up past HOT_THRESHOLD=1000 and must
         // still produce the string constant, not nil.
+        // Interpreter-only run gives the exact dynamic-bytecode work
+        // reference for this same hot-loop input.
+        let mut reference_vm = VM::new_without_jit();
+        reference_vm.load_module(build_string_loop_module(3000));
+        reference_vm.run().expect("reference string loop should run");
+
         let mut hot_vm = VM::new();
         hot_vm.load_module(build_string_loop_module(3000));
         let hot = hot_vm.run().expect("hot string loop should run");
@@ -8755,6 +8761,13 @@ mod vm_tests {
         module.emit(Instruction::new2(OpCode::Move, 4, 0)); // 8
         module.emit(Instruction::new0(OpCode::Halt)); // 9
         module.entry_point = Some(0);
+
+        // A native hot loop can execute internal back-edges without
+        // re-entering VM dispatch. Record the exact interpreted work
+        // for the same module as a reference upper bound.
+        let mut reference_vm = VM::new_without_jit();
+        reference_vm.load_module(module.clone());
+        reference_vm.run().expect("reference IMul loop must complete");
 
         let mut vm = VM::new();
         vm.load_module(module);
