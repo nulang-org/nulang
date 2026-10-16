@@ -5580,12 +5580,11 @@ impl Runtime {
         let mut status = SagaCompensationRecoveryStatus::NotStarted;
         for event in &events[failure_at + 1..] {
             match event {
-                WorkflowEvent::SagaCompensationStarted {
-                    step_name: name,
-                    operation_id,
-                    ..
-                } if name == step_name
-                    && (operation_id.is_none() || operation_id.as_deref() == expected_id.as_deref()) =>
+                // Any recorded start is in doubt until proven complete.
+                // Even a malformed/mismatched legacy key must not make an
+                // already-dispatched compensation eligible for redrive.
+                WorkflowEvent::SagaCompensationStarted { step_name: name, .. }
+                    if name == step_name =>
                 {
                     status = SagaCompensationRecoveryStatus::OutcomeUnknown;
                 }
