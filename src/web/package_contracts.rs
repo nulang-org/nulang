@@ -71,6 +71,24 @@ pub fn compile_modules_contracts(modules: &[AstModule]) -> ContractCompilation {
     compiled
         .routes
         .sort_by(|a, b| (&a.method, &a.path).cmp(&(&b.method, &b.path)));
+    // Do not silently discard a second registration for the same method and
+    // path. Runtime route selection and generated API metadata can otherwise
+    // disagree about which handler wins. Retain a single route in the
+    // best-effort result, but make the validated build/serve boundary fail.
+    for adjacent in compiled.routes.windows(2) {
+        let [first, second] = adjacent else {
+            continue;
+        };
+        if first.method == second.method && first.path == second.path {
+            compiled.diagnostics.push(format!(
+                "duplicate web route {} {}: handlers '{}' and '{}' register the same route",
+                first.method,
+                first.path,
+                first.handler.as_deref().unwrap_or("<dynamic>"),
+                second.handler.as_deref().unwrap_or("<dynamic>"),
+            ));
+        }
+    }
     compiled
         .routes
         .dedup_by(|a, b| a.method == b.method && a.path == b.path);
@@ -420,6 +438,65 @@ import @nulang/postgres
             compiled.module_imports,
             vec!["@nulang/auth".to_string(), "@nulang/postgres".to_string()]
         );
+    }
+
+    #[test]
+    fn rejects_duplicate_method_and_path_across_modules() {
+        let first = parse(
+            r#"
+fn first() { "first" }
+fn register_first() {
+    perform Web.route("GET", "/health", first)
+}
+"#,
+        );
+        let second = parse(
+            r#"
+fn second() { "second" }
+fn register_second() {
+    perform Web.route("GET", "/health", second)
+}
+"#,
+        );
+
+        let compiled = compile_modules_contracts(&[first, second]);
+        assert_eq!(compiled.routes.len(), 1);
+        assert!(
+            compiled.diagnostics.iter().any(|diagnostic| {
+                diagnostic.contains("duplicate web route GET /health")
+                    && diagnostic.contains("first")
+                    && diagnostic.contains("second")
+            }),
+            "{:?}",
+            compiled.diagnostics
+        );
+        assert!(crate::web::validation::validate_compilation(compiled).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_public_helper_and_direct_registration() {
+        let module = parse(
+            r#"
+import stdlib::web::host
+fn health() { "ok" }
+fn web_main() {
+    route("/health", health)
+    perform Web.route("GET", "/health", health)
+}
+"#,
+        );
+
+        let compiled = compile_modules_contracts(&[module]);
+        assert_eq!(compiled.routes.len(), 1);
+        assert!(
+            compiled.diagnostics.iter().any(|diagnostic| {
+                diagnostic.contains("duplicate web route GET /health")
+                    && diagnostic.contains("health")
+            }),
+            "{:?}",
+            compiled.diagnostics
+        );
+        assert!(crate::web::validation::validate_compilation(compiled).is_err());
     }
 
     #[test]

@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Duplicate Web route registration diagnostics — 2026-10-16
+- **Package Web contract extraction now reports repeated method/path registrations instead of silently discarding their conflict.** The existing validated build/serve boundary rejects duplicates, including cross-module and helper/direct registrations, while best-effort extraction still returns a deduplicated route list.
+- **Focused regression tests cover both duplicate sources.** This change does not alter route-matching precedence or introduce new web syntax.
+
 ### Parsed Web module import metadata — 2026-10-16
 - **Web deployment metadata now uses package AST import declarations for `@nulang/*` module capabilities, middleware, and required Cloud config names**, rather than rescanning raw source lines. Repeated imports are normalized deterministically; text inside comments and string literals cannot become a deployment module requirement.
 - **Regression tests cover source-free deployment IR generation and package import extraction.** Legacy effect-capability source scanning is unchanged and requires a separate compiler-semantic migration before removal.
