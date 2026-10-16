@@ -464,6 +464,24 @@ mod tests {
     }
 
     #[test]
+    fn plaintext_preparation_requires_loopback_host_and_hostaddr() {
+        let local: postgres::Config =
+            "postgresql://nulang:nulang@127.0.0.1:5432/nulang".parse().unwrap();
+        assert!(require_local_plaintext(&local).is_ok());
+
+        let remote: postgres::Config =
+            "postgresql://nulang:nulang@db.example.com:5432/nulang".parse().unwrap();
+        assert!(require_local_plaintext(&remote).is_err());
+
+        let overridden: postgres::Config =
+            "host=127.0.0.1 hostaddr=10.0.0.1 user=nulang".parse().unwrap();
+        assert!(require_local_plaintext(&overridden).is_err());
+
+        let implicit: postgres::Config = "user=nulang".parse().unwrap();
+        assert!(require_local_plaintext(&implicit).is_err());
+    }
+
+    #[test]
     fn rejects_trailing_empty_bind_argument() {
         assert!(extract_queries(r#"fn f() { perform DB.query("SELECT 1",) }"#).is_err());
     }
