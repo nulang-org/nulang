@@ -1008,7 +1008,10 @@ impl WebDevServer {
                 }
             }
         } else {
-            Self::serve_static(static_dir.as_deref(), output_dir.as_deref(), &request.path)
+            Self::revalidate_static_response(
+                Self::serve_static(static_dir.as_deref(), output_dir.as_deref(), &request.path),
+                &request,
+            )
         };
         for cookie in take_response_cookies() {
             response.headers.push(("Set-Cookie".into(), cookie));
@@ -1060,6 +1063,32 @@ impl WebDevServer {
         stream.flush()
     }
 
+    /// Conditional GET applies only to successfully located static files.
+    /// It does not change mutation or dynamic-route response handling.
+    fn revalidate_static_response(
+        mut response: HttpResponse,
+        request: &HttpRequest,
+    ) -> HttpResponse {
+        if request.method != HttpMethod::Get || response.status != 200 {
+            return response;
+        }
+        let not_modified = response
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("etag"))
+            .is_some_and(|(_, etag)| {
+                request.headers.iter().any(|(name, value)| {
+                    name.eq_ignore_ascii_case("if-none-match")
+                        && if_none_match_matches(value, etag)
+                })
+            });
+        if not_modified {
+            response.status = 304;
+            response.body.clear();
+        }
+        response
+    }
+
     fn serve_static(
         static_dir: Option<&Path>,
         output_dir: Option<&Path>,
@@ -1075,7 +1104,11 @@ impl WebDevServer {
                 let content_type = guess_content_type(&requested);
                 return HttpResponse {
                     status: 200,
-                    headers: vec![("Content-Type".into(), content_type.into())],
+                    headers: vec![
+                        ("Content-Type".into(), content_type.into()),
+                        ("ETag".into(), format!("\"{}\"", blake3::hash(&data).to_hex())),
+                        ("Cache-Control".into(), "no-cache".into()),
+                    ],
                     body: data,
                 };
             }
@@ -1114,6 +1147,35 @@ fn contained_static_file(root: &Path, relative: &str) -> Option<(PathBuf, PathBu
     }
 }
 
+/// HTTP entity tags are comma-separated, except that commas inside quoted
+/// opaque values belong to that tag. For GET, weak comparison is sufficient.
+fn if_none_match_matches(value: &str, etag: &str) -> bool {
+    if value.trim() == "*" {
+        return true;
+    }
+
+    let member_matches = |member: &str| {
+        let member = member.trim();
+        member.strip_prefix("W/").unwrap_or(member) == etag
+    };
+
+    let mut inside_quotes = false;
+    let mut start = 0;
+    let mut matched = false;
+    for (index, byte) in value.bytes().enumerate() {
+        match byte {
+            b'"' => inside_quotes = !inside_quotes,
+            b',' if !inside_quotes => {
+                matched |= member_matches(&value[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    // An unterminated quoted tag invalidates the conditional request.
+    !inside_quotes && (matched || member_matches(&value[start..]))
+}
+
 fn guess_content_type(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()) {
         Some("html") => "text/html; charset=utf-8",
@@ -1128,6 +1190,16 @@ fn guess_content_type(path: &Path) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn if_none_match_comparison_respects_quoted_commas_and_weak_tags() {
+        let etag = "\"abc\"";
+        assert!(if_none_match_matches("\"wrong\", W/\"abc\"", etag));
+        assert!(if_none_match_matches("*", etag));
+        assert!(!if_none_match_matches("\"abc,other\"", etag));
+        assert!(!if_none_match_matches("\"abc,other", etag));
+        assert!(!if_none_match_matches("W/\"wrong\"", etag));
+    }
 
     // A deterministic reader forces TCP-like fragmentation without sleeps.
     struct FixedChunkReader<'a> {

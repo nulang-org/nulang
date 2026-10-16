@@ -165,3 +165,114 @@ fn legacy_route_still_falls_back_over_real_http() {
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
     assert!(response_body(&response).starts_with("legacy"), "{response}");
 }
+
+#[test]
+fn static_asset_etags_support_revalidation_over_real_http() {
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct StaticRoot(PathBuf);
+    impl Drop for StaticRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = StaticRoot(std::env::temp_dir().join(format!(
+        "nulang-web-etag-{}-{nonce}",
+        std::process::id()
+    )));
+    std::fs::create_dir_all(&root.0).unwrap();
+    let asset = root.0.join("app.js");
+    std::fs::write(&asset, "first").unwrap();
+
+    let server = WebDevServer::bind_runtime(0, Some(root.0.clone()), None, vec![])
+        .expect("bind static WebDevServer");
+    let get = "GET /app.js HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let initial = send_raw_request(server.port, get);
+    assert!(initial.starts_with("HTTP/1.1 200 OK\r\n"), "{initial}");
+    assert_eq!(response_body(&initial), "first");
+    let etag = response_header(&initial, "etag").expect("strong ETag on static asset");
+    assert!(etag.starts_with('"') && etag.ends_with('"'), "{etag}");
+    assert_eq!(
+        response_header(&initial, "cache-control"),
+        Some("no-cache")
+    );
+
+    let revalidated = send_raw_request(
+        server.port,
+        &format!("GET /app.js HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: {etag}\r\n\r\n"),
+    );
+    assert!(
+        revalidated.starts_with("HTTP/1.1 304 Not Modified\r\n"),
+        "{revalidated}"
+    );
+    assert_eq!(response_body(&revalidated), "");
+    assert_eq!(response_header(&revalidated, "etag"), Some(etag));
+    assert_eq!(response_header(&revalidated, "content-length"), Some("0"));
+
+    let weak_and_list = send_raw_request(
+        server.port,
+        &format!(
+            "GET /app.js HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: \"not-this\", W/{etag}\r\n\r\n"
+        ),
+    );
+    assert!(
+        weak_and_list.starts_with("HTTP/1.1 304 Not Modified\r\n"),
+        "{weak_and_list}"
+    );
+
+    let any_existing = send_raw_request(
+        server.port,
+        "GET /app.js HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: *\r\n\r\n",
+    );
+    assert!(
+        any_existing.starts_with("HTTP/1.1 304 Not Modified\r\n"),
+        "{any_existing}"
+    );
+
+    let missing = send_raw_request(
+        server.port,
+        "GET /missing.js HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: *\r\n\r\n",
+    );
+    assert!(missing.starts_with("HTTP/1.1 404 Not Found\r\n"), "{missing}");
+
+    let non_matching = send_raw_request(
+        server.port,
+        "GET /app.js HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: \"wrong\"\r\n\r\n",
+    );
+    assert!(non_matching.starts_with("HTTP/1.1 200 OK\r\n"), "{non_matching}");
+    assert_eq!(response_body(&non_matching), "first");
+
+    // Same length, new bytes: a size-only validator would incorrectly return 304.
+    std::fs::write(&asset, "other").unwrap();
+    let updated = send_raw_request(
+        server.port,
+        &format!("GET /app.js HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: {etag}\r\n\r\n"),
+    );
+    assert!(updated.starts_with("HTTP/1.1 200 OK\r\n"), "{updated}");
+    assert_eq!(response_body(&updated), "other");
+    assert_ne!(response_header(&updated, "etag"), Some(etag));
+
+    // Conditional GET is a static-asset optimization, not a mutation bypass.
+    let post = send_raw_request(
+        server.port,
+        "POST /app.js HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: *\r\nContent-Length: 0\r\n\r\n",
+    );
+    assert!(!post.starts_with("HTTP/1.1 304"), "{post}");
+}
+
+fn response_header<'a>(response: &'a str, key: &str) -> Option<&'a str> {
+    response
+        .split_once("\r\n\r\n")?
+        .0
+        .split("\r\n")
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case(key))
+        .map(|(_, value)| value.trim())
+}
