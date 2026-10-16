@@ -91,7 +91,13 @@ def measurement_affinity(cpu_mode: str) -> set[int] | None:
 def criterion_filter(benchmarks: list[str]) -> str:
     if not benchmarks:
         raise ValueError("at least one benchmark is required")
-    escaped = "|".join(re.escape(name) for name in benchmarks)
+    # Criterion's report directory replaces group-path `/` characters with
+    # `_`, while its CLI filter sees the original display name. A manifest is
+    # built from report paths, so each `_` must accept either spelling.
+    escaped = "|".join(
+        r"[_/]".join(re.escape(segment) for segment in name.split("_"))
+        for name in benchmarks
+    )
     return rf"^(?:{escaped})$"
 
 

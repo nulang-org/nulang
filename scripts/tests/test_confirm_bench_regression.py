@@ -22,6 +22,11 @@ class CriterionFilterTests(unittest.TestCase):
         self.assertEqual(r"^(?:group/a\+b|scheduler/foo/1000)$", value)
 
 
+    def test_filter_matches_group_slashes_sanitized_in_criterion_report_paths(self):
+        pattern = confirm.criterion_filter(["persist_checkpoint_json_encode/1kb"])
+        self.assertRegex("persist/checkpoint_json_encode/1kb", pattern)
+        self.assertRegex("persist_checkpoint_json_encode/1kb", pattern)
+
 class ManifestValidationTests(unittest.TestCase):
     def test_rejects_non_object_regression_rows(self):
         with tempfile.TemporaryDirectory() as tmp:
