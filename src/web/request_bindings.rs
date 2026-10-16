@@ -21,6 +21,7 @@ pub struct RequestBindingValues<'a> {
 pub enum RequestDecodeErrorKind {
     Missing,
     InvalidType,
+    AmbiguousInput,
     DuplicateHandlerSlot,
     InvalidHandlerSlot,
     IncompleteBindingPlan,
@@ -43,7 +44,9 @@ impl RequestDecodeError {
     pub fn is_client_error(&self) -> bool {
         matches!(
             self.kind,
-            RequestDecodeErrorKind::Missing | RequestDecodeErrorKind::InvalidType
+            RequestDecodeErrorKind::Missing
+                | RequestDecodeErrorKind::InvalidType
+                | RequestDecodeErrorKind::AmbiguousInput
         )
     }
 
@@ -66,6 +69,7 @@ impl RequestDecodeError {
         match self.kind {
             RequestDecodeErrorKind::Missing => "missing_request_input",
             RequestDecodeErrorKind::InvalidType => "invalid_request_input",
+            RequestDecodeErrorKind::AmbiguousInput => "ambiguous_request_input",
             RequestDecodeErrorKind::DuplicateHandlerSlot => "duplicate_handler_slot",
             RequestDecodeErrorKind::InvalidHandlerSlot => "invalid_handler_slot",
             RequestDecodeErrorKind::IncompleteBindingPlan => "incomplete_binding_plan",
@@ -179,7 +183,7 @@ pub fn bind_request_arguments(
             ));
         }
 
-        let raw = lookup(binding, values).ok_or_else(|| {
+        let raw = lookup(binding, values)?.ok_or_else(|| {
             error(
                 binding,
                 RequestDecodeErrorKind::Missing,
@@ -245,19 +249,35 @@ fn error(
 fn lookup<'a>(
     binding: &RouteBindingContract,
     values: &'a RequestBindingValues<'a>,
-) -> Option<&'a str> {
-    match binding.source {
+) -> Result<Option<&'a str>, RequestDecodeError> {
+    let value = match binding.source {
         RouteBindingSource::Path => values.path.get(&binding.source_name).map(String::as_str),
         RouteBindingSource::Query => values.query.get(&binding.source_name).map(String::as_str),
-        RouteBindingSource::Header => values
-            .headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(&binding.source_name))
-            .map(|(_, value)| value.as_str()),
+        RouteBindingSource::Header => {
+            // A scalar binding cannot safely pick an arbitrary value from
+            // repeated HTTP fields, including differently cased field names.
+            let mut matches = values
+                .headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case(&binding.source_name));
+            let first = matches.next().map(|(_, value)| value.as_str());
+            if matches.next().is_some() {
+                return Err(error(
+                    binding,
+                    RequestDecodeErrorKind::AmbiguousInput,
+                    format!(
+                        "multiple header values for scalar input '{}'",
+                        binding.source_name
+                    ),
+                ));
+            }
+            first
+        }
         RouteBindingSource::Cookie => values.cookies.get(&binding.source_name).map(String::as_str),
         RouteBindingSource::Body => values.body,
         RouteBindingSource::Form => values.form.get(&binding.source_name).map(String::as_str),
-    }
+    };
+    Ok(value)
 }
 
 fn source_name(source: RouteBindingSource) -> &'static str {
