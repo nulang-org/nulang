@@ -1,0 +1,59 @@
+name: Timer deadline exact-base A/B
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/timer-deadline-ab.yml'
+      - 'scripts/timer_deadline_ab_bench.py'
+      - 'scripts/tests/test_timer_deadline_ab_bench.py'
+      - 'benches/bench_main.rs'
+      - 'benches/timer_bench.rs'
+      - 'src/runtime/timer.rs'
+
+concurrency:
+  group: timer-deadline-ab-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  matched:
+    name: Matched-fixture timer deadline A/B
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Test benchmark harness contracts
+        run: python3 -m unittest scripts/tests/test_timer_deadline_ab_bench.py -v
+
+      - name: Compare matched-fixture Criterion samples
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          python3 scripts/timer_deadline_ab_bench.py \
+            --base-ref "$BASE_SHA" --runs 8 --warmup 1 \
+            --output timer-deadline-ab.json
+
+      - name: Publish measurements and provenance
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          report = json.loads(Path('timer-deadline-ab.json').read_text())
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write('## Exact-base timer deadline A/B\n\n')
+              f.write(f"Base: {report['base_sha']} · Candidate: {report['candidate_sha']}\n\n")
+              f.write('| Heap head | Pending timers | Base ns | Candidate ns | Paired speedup |\n')
+              f.write('| --- | ---: | ---: | ---: | ---: | ---: |\n')
+              for label, row in report['comparison'].items():
+                  head, count = label.split('/')
+                  f.write(f"| {head} | {count} | {row['median_base_ns']:.1f} | "
+                          f"{row['median_candidate_ns']:.1f} | {row['median_speedup_x']:.3f}× |\n")
+              f.write('\nCriterion microbenchmarks; not end-to-end actor throughput.\n')
+          PY
