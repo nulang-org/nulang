@@ -33,6 +33,9 @@ jobs:
       - name: Regression — Web action payload field names
         run: node --test tests/web_action_payload.test.cjs
 
+      - name: Browser smoke — Web action events
+        run: node tests/web_action_browser_smoke.cjs
+
       - name: Enable corepack
         run: corepack enable
 
