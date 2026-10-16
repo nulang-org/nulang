@@ -1199,7 +1199,7 @@ mod tests {
         // A cross-origin script can DNS-rebind attacker.example to localhost.
         // Read-only routes must reject that Host before any page or SSE dispatch.
         let rebound_read = format!(
-            "GET / HTTP/1.1\\r\\nHost: attacker.example:{}\\r\\n\\r\\n",
+            "GET / HTTP/1.1\r\nHost: attacker.example:{}\r\n\r\n",
             server.port
         );
         assert!(
@@ -1207,14 +1207,14 @@ mod tests {
             "read routes must reject DNS-rebound hosts"
         );
 
-        let trusted_read = format!("GET / HTTP/1.1\\r\\nHost: {host}\\r\\n\\r\\n");
+        let trusted_read = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
         assert!(
             send(server.port, &trusted_read).starts_with("HTTP/1.1 404 Not Found"),
             "valid read requests must reach normal routing"
         );
 
         let rebound_sse = format!(
-            "GET /__nulang/sse/room HTTP/1.1\\r\\nHost: attacker.example:{}\\r\\n\\r\\n",
+            "GET /__nulang/sse/room HTTP/1.1\r\nHost: attacker.example:{}\r\n\r\n",
             server.port
         );
         assert!(
@@ -1222,7 +1222,7 @@ mod tests {
             "SSE must reject an untrusted Host before subscribing"
         );
 
-        let missing_host = "GET / HTTP/1.1\\r\\nConnection: close\\r\\n\\r\\n";
+        let missing_host = "GET / HTTP/1.1\r\nConnection: close\r\n\r\n";
         assert!(
             send(server.port, missing_host).starts_with("HTTP/1.1 403 Forbidden"),
             "HTTP reads without Host must fail closed"
