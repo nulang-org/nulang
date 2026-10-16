@@ -792,11 +792,18 @@ pub trait PersistenceStore: Send + Sync {
             .collect()
     }
 
-    /// Read `SagaCompensated` workflow events.
+    /// Read completed saga compensation events, including provider-verified
+    /// receipts. Start intents remain separate from completion records.
     fn read_saga_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
         self.read_workflow_events(actor_id)
             .into_iter()
-            .filter(|e| matches!(e, WorkflowEvent::SagaCompensated { .. }))
+            .filter(|e| {
+                matches!(
+                    e,
+                    WorkflowEvent::SagaCompensated { .. }
+                        | WorkflowEvent::SagaCompensationVerified { .. }
+                )
+            })
             .collect()
     }
 
