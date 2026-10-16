@@ -1483,6 +1483,28 @@ fn main() {
     }
 
     #[test]
+    fn test_fmt_refuses_public_generic_and_defaulted_functions() {
+        for source in [
+            "pub fn identity[T](value: T) -> T { value }",
+            "fn greet(name: String = \"world\") -> String { name }",
+        ] {
+            assert!(
+                format_source(source).is_err(),
+                "formatter must not discard function signature semantics: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fmt_refuses_persistent_actor_semantics() {
+        let source = "persistent actor Counter { state count: Int = 0 behavior ping() { 1 } }";
+        assert!(
+            format_source(source).is_err(),
+            "formatter must not turn a persistent actor into a transient actor"
+        );
+    }
+
+    #[test]
     fn test_fmt_does_not_confuse_url_string_with_comment() {
         let source = "fn main() { perform IO.print(\"https://example.com/test\") }";
         assert!(
