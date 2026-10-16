@@ -128,7 +128,7 @@ fn two_same_operation_sites_map_to_two_distinct_effect_opcodes() {
 
 #[test]
 fn compiled_source_effect_drives_recovery_using_one_stable_operation_id() {
-    use nulang::durable_effect::{CompiledEffectSpecError, DurableEffectSpec};
+    use nulang::durable_effect::DurableEffectSpec;
     use nulang::durable_effect_runtime::{
         DurableEffectCoordinator, DurableEffectDispatchDecision, DurableEffectRuntimeError,
     };
@@ -183,8 +183,12 @@ fn compiled_source_effect_drives_recovery_using_one_stable_operation_id() {
     // Simulate the provider accepting a mutation immediately before the
     // process dies without recording a terminal receipt.
     let provider_key = spec.id.idempotency_key();
-    let provider_mutations = 1;
-    let provider_calls = 1;
+    let mut provider_results = std::collections::HashMap::new();
+    let mut provider_calls = 1;
+    let first_result = provider_results
+        .entry(provider_key.clone())
+        .or_insert_with(|| b"provider-receipt".to_vec())
+        .clone();
     {
         let mut recovered_coordinator = DurableEffectCoordinator::new(&mut store, 42, 1);
         assert_eq!(
@@ -193,14 +197,20 @@ fn compiled_source_effect_drives_recovery_using_one_stable_operation_id() {
                 operation_id: spec.id
             }
         );
-        // A cooperative provider deduplicates a retry with the same key.
+        // The provider receives a second call but deduplicates the mutation.
         assert_eq!(spec.id.idempotency_key(), provider_key);
+        provider_calls += 1;
+        let second_result = provider_results
+            .entry(provider_key)
+            .or_insert_with(|| b"duplicate-mutation".to_vec())
+            .clone();
+        assert_eq!(second_result, first_result);
         recovered_coordinator
-            .complete(spec.id, request, b"provider-receipt".to_vec())
+            .complete(spec.id, request, second_result)
             .unwrap();
     }
-    assert_eq!(provider_mutations, 1);
-    assert_eq!(provider_calls, 1); // Counter models only first actual dispatch.
+    assert_eq!(provider_results.len(), 1);
+    assert_eq!(provider_calls, 2);
     assert_eq!(store.latest_sequence(42), 2);
 
     let mut restarted = DurableEffectCoordinator::new(&mut store, 42, 1);
@@ -213,7 +223,6 @@ fn compiled_source_effect_drives_recovery_using_one_stable_operation_id() {
         Err(DurableEffectRuntimeError::RequestMismatch(_))
     ));
     assert_eq!(store.latest_sequence(42), 2);
-    let _ = std::mem::size_of::<CompiledEffectSpecError>();
 }
 
 #[test]
@@ -283,7 +292,7 @@ fn compiled_async_effect_rejects_missing_turn_identity_and_distinguishes_occurre
     use nulang::primitives::{DeliverySemantics, EffectBoundary};
 
     let module = compile_module(
-        "actor Assistant { behavior ask(prompt: String) { perform Inference.ask(prompt) perform Inference.ask(prompt) } }",
+        "actor Assistant { behavior ask(prompt: String) { perform Inference.ask(prompt)\n perform Inference.ask(prompt) } }",
     );
     let build = |pc, key, occurrence| {
         DurableEffectSpec::from_compiled_async_site(
