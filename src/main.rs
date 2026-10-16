@@ -1075,7 +1075,9 @@ struct Options {
     /// durable entities; other programs keep the in-memory store.
     ///
     /// Supported forms: `<dir>` or `json:<dir>` (JSON file store),
-    /// `rocksdb:<path>`, and `postgres:<conn_str>`.
+    /// `sqlite:<path>`, `rocksdb:<path>`, and `postgres:<conn_str>`.
+    /// Workflows require explicit `sqlite:<path>` until other backends
+    /// implement the atomic transition contract.
     store_path: Option<String>,
     /// Escalate warnings (e.g. RFC 0015 deprecations) to a hard error.
     deny_warnings: bool,
@@ -1191,7 +1193,8 @@ fn print_help() {
     println!("  --rewrite-signals <file> Rewrite HTML for signals and emit client JS");
     println!("  --store <uri>    Durable store URI for programs declaring durable");
     println!("                   entities (default: $NULANG_STORE_PATH or .nulang/store/).");
-    println!("                   Forms: <dir>|json:<dir>|rocksdb:<path>|postgres:<conn_str>");
+    println!("                   Forms: <dir>|json:<dir>|sqlite:<path>|rocksdb:<path>|postgres:<conn_str>");
+    println!("                   Workflows require explicit --store sqlite:<path>.");
     println!("  --color auto|always|never  Colorize error output (default: auto)");
     println!("  -h, --help       Show this help message");
 }
@@ -1974,7 +1977,11 @@ fn run_source(
             let has_actors = !mir.behaviors.is_empty();
             let result_raw = if has_actors {
                 let mut rt = nulang::runtime::Runtime::new();
-                let has_durable = ast.decls.iter().any(|d| {
+                let has_workflow = ast
+                    .decls
+                    .iter()
+                    .any(|d| matches!(d, nulang::ast::Decl::Workflow { .. }));
+                let has_durable = has_workflow || ast.decls.iter().any(|d| {
                     matches!(
                         d,
                         nulang::ast::Decl::Actor {
@@ -1990,13 +1997,14 @@ fn run_source(
                             nulang::ast::StateModel::Durable | nulang::ast::StateModel::EventSourced
                         ))
                 );
+                let configured_store = store_path
+                    .map(str::to_owned)
+                    .or_else(|| std::env::var("NULANG_STORE_PATH").ok());
+                if has_workflow {
+                    validate_workflow_store_uri(configured_store.as_deref())?;
+                }
                 let store_dir = if has_durable {
-                    Some(
-                        store_path
-                            .map(|s| s.to_string())
-                            .or_else(|| std::env::var("NULANG_STORE_PATH").ok())
-                            .unwrap_or_else(|| ".nulang/store".to_string()),
-                    )
+                    Some(configured_store.unwrap_or_else(|| ".nulang/store".to_string()))
                 } else {
                     None
                 };
@@ -2069,7 +2077,11 @@ fn run_source(
             // `NULANG_STORE_PATH` env var, default `.nulang/store/`.
             // Programs without durable declarations keep the in-memory
             // store (as do `nula test` and the standalone VM paths).
-            let has_durable = ast.decls.iter().any(|d| {
+            let has_workflow = ast
+                .decls
+                .iter()
+                .any(|d| matches!(d, nulang::ast::Decl::Workflow { .. }));
+            let has_durable = has_workflow || ast.decls.iter().any(|d| {
                 matches!(
                     d,
                     nulang::ast::Decl::Actor {
@@ -2085,13 +2097,14 @@ fn run_source(
                     ))
                 )
             });
+            let configured_store = store_path
+                .map(str::to_owned)
+                .or_else(|| std::env::var("NULANG_STORE_PATH").ok());
+            if has_workflow {
+                validate_workflow_store_uri(configured_store.as_deref())?;
+            }
             let store_dir = if has_actors && has_durable {
-                Some(
-                    store_path
-                        .map(|s| s.to_string())
-                        .or_else(|| std::env::var("NULANG_STORE_PATH").ok())
-                        .unwrap_or_else(|| ".nulang/store".to_string()),
-                )
+                Some(configured_store.unwrap_or_else(|| ".nulang/store".to_string()))
             } else {
                 None
             };
@@ -2180,11 +2193,24 @@ fn run_source(
     }
 }
 
+/// Fail closed for workflows when the selected store cannot atomically commit
+/// the start marker, actor snapshot, and subsequent durable transitions.
+fn validate_workflow_store_uri(uri: Option<&str>) -> NuResult<()> {
+    if matches!(uri, Some(value) if value.starts_with("sqlite:") && value.len() > "sqlite:".len()) {
+        return Ok(());
+    }
+    Err(NuError::RuntimeError {
+        msg: "durable workflows require an explicit atomic store; use --store sqlite:<path> (or NULANG_STORE_PATH=sqlite:<path>). JSON, RocksDB and PostgreSQL do not yet support atomic workflow transitions".to_string(),
+        span: Span::default(),
+    })
+}
+
 /// Swap a runtime's in-memory persistence store for the backend described by
 /// `uri`.
 ///
 /// Supported URI forms:
 /// - `<dir>` or `json:<dir>` — JSON file store (`JsonFileStore`).
+/// - `sqlite:<path>` — libSQL/SQLite atomic store (feature `sqlite`).
 /// - `rocksdb:<path>` — RocksDB backend (requires the `rocksdb` feature).
 /// - `postgres:<conn_str>` — PostgreSQL backend (requires the `postgres`
 ///   feature).
@@ -2192,7 +2218,35 @@ fn run_source(
 /// Used by `nulang run` when the program declares durable/event-sourced
 /// entities so their state survives process restarts.
 fn install_persistence_store(runtime: &mut nulang::runtime::Runtime, uri: &str) -> NuResult<()> {
-    if uri.starts_with("rocksdb:") {
+    if let Some(path) = uri.strip_prefix("sqlite:") {
+        #[cfg(feature = "sqlite")]
+        {
+            if path.is_empty() {
+                return Err(NuError::RuntimeError {
+                    msg: "SQLite store path is required after sqlite:".to_string(),
+                    span: Span::default(),
+                });
+            }
+            let store = nulang::runtime::LibsqlStore::new(path).map_err(|e| {
+                NuError::RuntimeError {
+                    msg: format!("failed to open SQLite store at '{}': {}", path, e),
+                    span: Span::default(),
+                }
+            })?;
+            runtime.persistence = Box::new(store);
+            eprintln!("[durable] atomic SQLite persistent store: {}", path);
+            Ok(())
+        }
+        #[cfg(not(feature = "sqlite"))]
+        {
+            let _ = path;
+            Err(NuError::RuntimeError {
+                msg: "SQLite persistence backend is not enabled (rebuild with --features sqlite)"
+                    .to_string(),
+                span: Span::default(),
+            })
+        }
+    } else if uri.starts_with("rocksdb:") {
         #[cfg(feature = "rocksdb")]
         {
             let path = &uri["rocksdb:".len()..];
@@ -2807,6 +2861,43 @@ fn levenshtein_distance(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workflow_cli_requires_explicit_supported_atomic_store() {
+        assert!(validate_workflow_store_uri(None).is_err());
+        assert!(validate_workflow_store_uri(Some("json:.nulang/store")).is_err());
+        assert!(validate_workflow_store_uri(Some("rocksdb:/tmp/store")).is_err());
+        assert!(validate_workflow_store_uri(Some("sqlite:")).is_err());
+        assert!(validate_workflow_store_uri(Some("sqlite:/tmp/nulang-workflow.db")).is_ok());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn cli_sqlite_uri_can_commit_an_atomic_workflow_start() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let db_path = std::env::temp_dir().join(format!(
+            "nulang-atomic-cli-store-{}-{unique}.db",
+            std::process::id()
+        ));
+        let mut runtime = nulang::runtime::Runtime::new();
+        let uri = format!("sqlite:{}", db_path.display());
+        install_persistence_store(&mut runtime, &uri).unwrap();
+
+        let id = runtime
+            .try_spawn_workflow_actor("SqliteCliWorkflow", Box::new(Vec::new), std::collections::HashMap::new())
+            .unwrap();
+        let tail = runtime
+            .persistence
+            .load_durable_tail_position(id)
+            .unwrap()
+            .expect("CLI SQLite URI must use an atomic-capable store");
+        assert_eq!(runtime.persistence.load_snapshot(id).unwrap().sequence, tail.sequence);
+        drop(runtime);
+        let _ = std::fs::remove_file(db_path);
+    }
 
     /// An actor program run through the CLI path must create real actors
     /// and deliver sent messages: with the bare standalone VM the stub

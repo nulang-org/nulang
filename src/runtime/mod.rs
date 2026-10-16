@@ -907,8 +907,9 @@ impl Runtime {
     }
 
     /// Spawn a durable workflow and report failure if its initial
-    /// `WorkflowStarted` journal entry or first snapshot cannot be committed.
-    /// The actor is not published or scheduled until both writes succeed.
+    /// `WorkflowStarted` event and snapshot cannot commit atomically.
+    /// The actor is not published or scheduled until that transition succeeds.
+    /// Stores without atomic transition support fail closed.
     pub fn try_spawn_workflow_actor(
         &mut self,
         name: &str,
