@@ -5305,10 +5305,16 @@ impl Runtime {
 
             #[cfg(feature = "native-codegen")]
             {
-                // Reset native-codegen safepoint counter for this behavior.
-                if let Some(actor) = self.actors.get_mut(&actor_id) {
-                    actor.jit_safepoint_counter = crate::backends::JIT_SAFEPOINT_BUDGET;
-                    crate::jit::runtime::set_jit_safepoint_ptr(&mut actor.jit_safepoint_counter);
+                // Safepoint yields are scheduler handoffs. A direct synchronous
+                // ask (or mailbox flush) must run to completion even if its
+                // hot loop tiers up into native code and crosses the budget.
+                if (*self_ptr).suspend_enabled {
+                    if let Some(actor) = self.actors.get_mut(&actor_id) {
+                        actor.jit_safepoint_counter = crate::backends::JIT_SAFEPOINT_BUDGET;
+                        crate::jit::runtime::set_jit_safepoint_ptr(&mut actor.jit_safepoint_counter);
+                    }
+                } else {
+                    crate::jit::runtime::clear_jit_safepoint_ptr();
                 }
             }
 
