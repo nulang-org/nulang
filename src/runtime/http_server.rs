@@ -978,11 +978,9 @@ impl WebDevServer {
         // ambient-context handlers. Reverse proxies must explicitly supply
         // the externally trusted scheme and authority.
         let public_origin = std::env::var("NULANG_WEB_PUBLIC_ORIGIN").ok();
-        let mut response = if let Some(forbidden) = unsafe_origin_response(
-            &request,
-            stream.local_addr().ok(),
-            public_origin.as_deref(),
-        ) {
+        let mut response = if let Some(forbidden) =
+            unsafe_origin_response(&request, stream.local_addr().ok(), public_origin.as_deref())
+        {
             forbidden
         } else if path.starts_with(Self::SSE_PATH_PREFIX) {
             let room = &path[Self::SSE_PATH_PREFIX.len()..];
@@ -1185,7 +1183,9 @@ mod tests {
     fn web_dev_server_fences_cross_origin_mutations_before_dispatch() {
         fn send(port: u16, raw: &str) -> String {
             let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
             stream.write_all(raw.as_bytes()).unwrap();
             stream.shutdown(std::net::Shutdown::Write).unwrap();
             let mut response = String::new();
@@ -1200,9 +1200,8 @@ mod tests {
         );
         assert!(send(server.port, &foreign).starts_with("HTTP/1.1 403 Forbidden"));
 
-        let missing = format!(
-            "POST /mutation HTTP/1.1\r\nHost: {host}\r\nContent-Length: 0\r\n\r\n"
-        );
+        let missing =
+            format!("POST /mutation HTTP/1.1\r\nHost: {host}\r\nContent-Length: 0\r\n\r\n");
         assert!(send(server.port, &missing).starts_with("HTTP/1.1 403 Forbidden"));
 
         let trusted = format!(
