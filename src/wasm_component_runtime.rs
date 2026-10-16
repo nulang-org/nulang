@@ -461,10 +461,11 @@ mod tests {
         let err = spin
             .call(&mut store, ())
             .expect_err("runaway guest must exhaust fuel");
-        assert!(
-            err.to_string().contains("fuel"),
-            "trap should identify fuel exhaustion: {err}"
-        );
+        // Wasmtime does not guarantee a stable fuel-specific trap message:
+        // some supported releases report only the wasm backtrace. The trap
+        // itself plus zero remaining fuel is the portable security contract.
+        assert!(!err.to_string().is_empty(), "runaway guest must trap");
+        assert_eq!(store.get_fuel().expect("remaining fuel"), 0);
     }
 
     #[test]
