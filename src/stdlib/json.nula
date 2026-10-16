@@ -138,7 +138,7 @@ pub fn parse(json: String) -> JsonValue {
                 cp = cp + 1;
                 if cp < len then {
                     let sc = perform String.charAt(json, cp);
-                    if sc == 43 || sc == 45 then { cp = cp + 1 } else {}
+                    if sc == 43 || sc == 45 then { cp = cp + 1 } else { cp = cp }
                 } else {};
                 while cp < len {
                     let dc = perform String.charAt(json, cp);
