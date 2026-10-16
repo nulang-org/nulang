@@ -44,12 +44,20 @@ def digest_artifacts(project: Path) -> dict[str, str]:
     return {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
 
 
-def run_build(binary: Path, project: Path, mode: str, env: dict[str, str]) -> int:
+def run_build(binary: Path, project: Path, mode: str, env: dict[str, str], timeout_seconds: float) -> int:
     args = [str(binary), "nula", "build"]
     if mode == "json":
         args.append("--json")
     start_ns = time.perf_counter_ns()
-    proc = subprocess.run(args, cwd=project, env=env, capture_output=True, text=True)
+    try:
+        proc = subprocess.run(
+            args, cwd=project, env=env, capture_output=True, text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise BenchmarkError(
+            f"compiler timed out after {timeout_seconds:g} seconds: {' '.join(args)}"
+        ) from exc
     duration_ns = time.perf_counter_ns() - start_ns
     if proc.returncode != 0:
         raise BenchmarkError(
@@ -79,9 +87,12 @@ def benchmark_packages(
     rounds: int = 7,
     modes: tuple[str, ...] = ("normal", "json"),
     stdlib: Path | None = None,
+    timeout_seconds: float = 120.0,
 ) -> dict:
     if rounds < 1:
         raise BenchmarkError("rounds must be >= 1")
+    if not (0 < timeout_seconds <= 86_400):
+        raise BenchmarkError("timeout_seconds must be within (0, 86400]")
     if not (package / "Nulang.toml").is_file():
         raise BenchmarkError("fixture must have Nulang.toml")
     if not (package / "src").is_dir():
@@ -119,11 +130,11 @@ def benchmark_packages(
                         ignore=shutil.ignore_patterns(".nula", "dist", ".git", "target"),
                     )
                     samples[mode]["fresh"][variant].append(
-                        run_build(binaries[variant], project, mode, env)
+                        run_build(binaries[variant], project, mode, env, timeout_seconds)
                     )
                     first = digest_artifacts(project)
                     samples[mode]["repeat"][variant].append(
-                        run_build(binaries[variant], project, mode, env)
+                        run_build(binaries[variant], project, mode, env, timeout_seconds)
                     )
                     second = digest_artifacts(project)
                     if first != second:
@@ -163,6 +174,7 @@ def main() -> int:
     parser.add_argument("--package", required=True, type=Path)
     parser.add_argument("--stdlib", type=Path)
     parser.add_argument("--rounds", type=int, default=7)
+    parser.add_argument("--timeout-seconds", type=float, default=120.0)
     parser.add_argument("--mode", choices=("normal", "json", "both"), default="both")
     parser.add_argument("--out", type=Path, help="write JSON output to this file instead of stdout")
     args = parser.parse_args()
@@ -171,6 +183,7 @@ def main() -> int:
         result = benchmark_packages(
             args.base_binary, args.candidate_binary, args.package,
             rounds=args.rounds, modes=modes, stdlib=args.stdlib,
+            timeout_seconds=args.timeout_seconds,
         )
     except BenchmarkError as exc:
         parser.exit(1, f"benchmark invalid: {exc}\n")
