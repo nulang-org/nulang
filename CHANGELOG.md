@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Actor interpreter fairness and scheduler-scoped continuations — 2026-10-16
+- **Transient actors can cooperatively yield interpreted bytecode and resume without new messages.** Per-dispatch instruction quanta preserve standalone VM run-to-completion and leave durable/workflow turns unchanged pending safe checkpoint semantics.
+- **Scheduler-only preemption preserves synchronous actor contracts.** Direct asks and mailbox flushes cannot expose a partial bytecode result; resumed actor dispatches retain non-blocking timed receive and async effect semantics.
+- **Deterministic scheduling runs yielded continuations to completion.** The seeded ready set includes runnable continuations even when mail is empty, but excludes actors waiting on external completion. Regression tests exercise these boundaries.
+
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
