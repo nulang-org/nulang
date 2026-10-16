@@ -30,6 +30,9 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Test emitted web reactivity micro-runtime
+        run: node --test tests/web_reactivity_runtime.test.cjs
+
       - name: Enable corepack
         run: corepack enable
 
