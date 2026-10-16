@@ -233,6 +233,15 @@ impl ExpirationWheel {
         self.buckets[bucket].push(item);
     }
 
+    // An already-overdue entry denied by the purge budget must be retried on
+    // the next tick. Re-inserting it by its old deadline can strand it in a
+    // bucket we have already drained until the wheel wraps around.
+    fn defer_due(&mut self, item: ExpirationRef, now_ms: u64) {
+        let next_tick = (now_ms / self.tick_ms).saturating_add(1);
+        let bucket = (next_tick % self.buckets.len() as u64) as usize;
+        self.buckets[bucket].push(item);
+    }
+
     fn drain_candidates(&mut self, now_ms: u64, out: &mut Vec<ExpirationRef>) {
         let current = now_ms / self.tick_ms;
         let Some(last) = self.last_tick else {
@@ -655,7 +664,11 @@ impl CacheStore {
 
         for item in candidates.iter().copied() {
             if expired >= max_items {
-                self.expiry.schedule(item, now_ms);
+                if item.expires_at_ms <= now_ms {
+                    self.expiry.defer_due(item, now_ms);
+                } else {
+                    self.expiry.schedule(item, now_ms);
+                }
                 continue;
             }
             let Some(slot) = self.slots.get(item.slot as usize) else {
