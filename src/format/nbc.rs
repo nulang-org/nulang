@@ -465,6 +465,25 @@ mod tests {
     }
 
     #[test]
+    fn core_vm_rejects_over_budget_artifact_without_publishing_a_module() {
+        let bytes = sample_module().to_nbc(None).expect("encode fixture");
+        let limits = NbcDecodeLimits {
+            max_artifact_bytes: bytes.len() - 1,
+            max_instructions: usize::MAX,
+            max_metadata_bytes: usize::MAX,
+        };
+        let mut vm = crate::core_vm::CoreVM::new();
+        assert!(vm.load_nbc_with_limits(&bytes, limits).is_err());
+        assert!(vm.modules.is_empty(), "rejected artifact must not be published");
+
+        let loaded = vm
+            .load_nbc_with_limits(&bytes, NbcDecodeLimits::UNLIMITED)
+            .expect("valid artifact");
+        assert_eq!(loaded, 0);
+        assert_eq!(vm.modules.len(), 1);
+    }
+
+    #[test]
     fn test_nbc_rejects_bad_magic() {
         let mut bytes = sample_module().to_nbc(None).unwrap();
         bytes[0] = b'X';
