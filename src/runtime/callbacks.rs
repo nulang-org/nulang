@@ -1139,7 +1139,7 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
                 return Some(crate::vm::Value::nil());
             }
         }
-                if matches!(effect_name, "Env" | "System" | "FS") {
+        if matches!(effect_name, "Env" | "System" | "FS") {
             return perform_host_stdlib_builtin(
                 self,
                 effect_name,
@@ -1967,7 +1967,7 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
                 );
                 return Some(crate::vm::Value::nil());
             }
-                        if matches!(effect_name, "Env" | "System" | "FS") {
+            if matches!(effect_name, "Env" | "System" | "FS") {
                 return perform_host_stdlib_builtin(
                     self,
                     effect_name,
