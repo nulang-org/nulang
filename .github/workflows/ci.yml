@@ -51,6 +51,9 @@ jobs:
       - name: Regression — Web form action dispatch
         run: node --test tests/web_form_action_events.test.cjs
 
+      - name: Browser smoke — Web action events
+        run: node tests/web_action_browser_smoke.cjs
+
       - name: Install docs dependencies
         run: |
           cd docs
