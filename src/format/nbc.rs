@@ -439,10 +439,14 @@ mod tests {
                 "metadata bytes",
             ),
         ] {
-            assert!(matches!(
-                CodeModule::from_nbc_with_limits(&bytes, limits),
-                Err(FormatError::ResourceLimitExceeded { resource, .. }) if resource == expected_resource
-            ), "{expected_resource} limit must fail closed");
+            assert!(
+                matches!(
+                    CodeModule::from_nbc_with_limits(&bytes, limits),
+                    Err(FormatError::ResourceLimitExceeded { resource, .. })
+                        if resource == expected_resource
+                ),
+                "{expected_resource} limit must fail closed"
+            );
         }
     }
 
