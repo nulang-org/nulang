@@ -130,12 +130,7 @@ pub fn request_text(
     let mut response_header_bytes = 0usize;
     for name in response.headers_names() {
         if let Some(value) = response.header(&name) {
-            insert_bounded_response_header(
-                &mut headers,
-                &mut response_header_bytes,
-                &name,
-                value,
-            )?;
+            insert_bounded_response_header(&mut headers, &mut response_header_bytes, &name, value)?;
         }
     }
     let mut bytes = Vec::new();
@@ -161,7 +156,7 @@ pub fn request_text(
 #[cfg(test)]
 mod response_header_limit_tests {
     use super::*;
-    
+
     #[test]
     fn rejects_aggregate_response_headers_above_limit() {
         let mut headers = BTreeMap::new();
@@ -175,13 +170,9 @@ mod response_header_limit_tests {
             )
             .expect("within response-header budget");
         }
-        let error = insert_bounded_response_header(
-            &mut headers,
-            &mut used,
-            "x-over",
-            "one more header",
-        )
-        .expect_err("aggregate response-header bytes must be bounded");
+        let error =
+            insert_bounded_response_header(&mut headers, &mut used, "x-over", "one more header")
+                .expect_err("aggregate response-header bytes must be bounded");
         assert!(error.contains("response headers exceed"));
     }
 
@@ -207,7 +198,10 @@ mod response_header_limit_tests {
         let mut used = 0usize;
         insert_bounded_response_header(&mut headers, &mut used, "X-Request-Id", "req-123")
             .expect("normal response header");
-        assert_eq!(headers.get("x-request-id").map(String::as_str), Some("req-123"));
+        assert_eq!(
+            headers.get("x-request-id").map(String::as_str),
+            Some("req-123")
+        );
         assert_eq!(used, "X-Request-Id".len() + "req-123".len());
     }
 }
