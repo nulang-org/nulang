@@ -343,6 +343,59 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_token_is_shared_with_children_and_starts_unset() {
+        let mut scope = TaskScope::<(), ()>::new(1, 2).unwrap();
+        let token = scope.cancellation_token();
+        let child_token = token.clone();
+        assert!(!token.is_cancelled());
+        assert!(!child_token.is_cancelled());
+        scope.cancel(CancellationCause::Parent);
+        assert!(token.is_cancelled());
+        assert!(child_token.is_cancelled());
+    }
+
+    #[test]
+    fn first_child_failure_signals_running_siblings() {
+        let mut scope = TaskScope::<(), &'static str>::new(2, 2).unwrap();
+        let failing = scope.try_submit().unwrap();
+        let running = scope.try_submit().unwrap();
+        scope.admit_next();
+        scope.admit_next();
+        let sibling_token = scope.cancellation_token();
+        scope.complete(failing, Err("failed")).unwrap();
+        assert!(sibling_token.is_cancelled());
+        assert_eq!(scope.in_flight(), 1);
+        assert!(!scope.is_quiescent());
+        scope.acknowledge_cancelled(running).unwrap();
+        assert!(scope.is_quiescent());
+    }
+
+    #[test]
+    fn cancellation_token_is_visible_across_threads_after_notification() {
+        let mut scope = TaskScope::<(), ()>::new(1, 1).unwrap();
+        let token = scope.cancellation_token();
+        let (signal, notified) = std::sync::mpsc::sync_channel::<()>(0);
+        let join = std::thread::spawn(move || {
+            notified.recv().unwrap();
+            token.is_cancelled()
+        });
+        scope.cancel(CancellationCause::DeadlineExceeded);
+        signal.send(()).unwrap();
+        assert!(join.join().unwrap());
+    }
+
+    #[test]
+    fn cancellation_of_one_scope_does_not_cancel_another() {
+        let mut first = TaskScope::<(), ()>::new(1, 1).unwrap();
+        let second = TaskScope::<(), ()>::new(1, 1).unwrap();
+        let first_token = first.cancellation_token();
+        let second_token = second.cancellation_token();
+        first.cancel(CancellationCause::Parent);
+        assert!(first_token.is_cancelled());
+        assert!(!second_token.is_cancelled());
+    }
+
+    #[test]
     fn completion_does_not_mean_parent_scope_can_close_with_queued_children() {
         let mut scope = TaskScope::<usize, ()>::new(1, 2).unwrap();
         let a = scope.try_submit().unwrap();
