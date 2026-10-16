@@ -80,8 +80,14 @@ function browserChecks() {
   const special = document.getElementById('special');
   const ssrIsland = document.getElementById('ssr-island');
   const ssrIslandText = document.getElementById('ssr-island-state');
-  const islandScope = api.mount(ssrIsland, { localSignals: true });
-  assert(islandScope.signal('status').get() === 'Local', 'SSR island initialization');
+  // This fixture is also reused by the compiler-generated SSR test, which
+  // intentionally has no local island yet.
+  const islandScope = ssrIsland
+    ? api.mount(ssrIsland, { localSignals: true })
+    : null;
+  if (islandScope) {
+    assert(islandScope.signal('status').get() === 'Local', 'SSR island initialization');
+  }
   assert(api.signal('status').get() === 'Initial', 'SSR text state');
   assert(api.signal('__proto__').get() === 'Safe', 'special key');
   const writes = [];
@@ -108,10 +114,12 @@ function browserChecks() {
   catch (error) { thrown = true; assert(error.message === 'expected', 'exception propagation'); }
   assert(thrown, 'callback exception was swallowed');
   assert(span.textContent === 'Recovered', 'exception flush');
-  assert(ssrIslandText.textContent === 'Local', 'global update leaked into SSR island');
-  islandScope.signal('status').set('Island changed');
-  assert(ssrIslandText.textContent === 'Island changed', 'island update missing');
-  assert(span.textContent === 'Recovered', 'island update leaked into global content');
+  if (islandScope) {
+    assert(ssrIslandText.textContent === 'Local', 'global update leaked into SSR island');
+    islandScope.signal('status').set('Island changed');
+    assert(ssrIslandText.textContent === 'Island changed', 'island update missing');
+    assert(span.textContent === 'Recovered', 'island update leaked into global content');
+  }
   api.signal('__proto__').set('Updated');
   assert(special.title === 'Updated', 'prototype-safe key');
   assert(link.href === 'https://example.test/unchanged', 'unsafe URL mutated');
