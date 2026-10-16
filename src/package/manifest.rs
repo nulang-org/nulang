@@ -118,8 +118,8 @@ pub struct BudgetsSection {
     /// Maximum initial JavaScript transfer size, e.g. "20KB" or "1.5MB".
     #[serde(default)]
     pub initial_js: Option<String>,
-    /// Maximum sum of all emitted, uncompressed .js and .mjs assets.
-    /// Unlike initial_js, this includes lazy chunks as well as the client runtime.
+    /// Maximum sum of all published, uncompressed .js and .mjs files.
+    /// Unlike initial_js, includes root scripts and lazily loaded chunks.
     #[serde(default)]
     pub total_js: Option<String>,
     /// Largest Contentful Paint target, e.g. "1.5s".
