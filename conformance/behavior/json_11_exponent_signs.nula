@@ -1,0 +1,8 @@
+// Regression: JSON exponent lexing must preserve optional '+'/'-' and no-sign forms.
+import stdlib::json
+
+fn main() {
+    perform IO.print("positive=" + stringify(parse("1e+2")))
+    perform IO.print("negative=" + stringify(parse("1e-0")))
+    perform IO.print("unsigned=" + stringify(parse("1e2")))
+}
