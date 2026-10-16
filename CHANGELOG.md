@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Duplicate Web route registration diagnostics — 2026-10-16
+- **Package Web contract extraction now reports repeated method/path registrations instead of silently discarding their conflict.** The existing validated build/serve boundary rejects duplicates, including cross-module and helper/direct registrations, while best-effort extraction still returns a deduplicated route list.
+- **Focused regression tests cover both duplicate sources.** This change does not alter route-matching precedence or introduce new web syntax.
+
 ### Web static-root containment — 2026-10-15
 - **Experimental Web static file serving refuses parent traversal and symlinks escaping configured roots.** Canonical candidate paths must remain inside their canonicalized static or output root, and normal in-root files remain serveable.
 - **A filesystem regression verifies parent and symlink escape rejection.** This is a clean current-main successor to draft #1676; it does not change SSE or claim protection from malicious concurrent mutation of a trusted static root.
