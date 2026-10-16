@@ -730,8 +730,8 @@ pub(crate) fn signal_workflow(
     name: &str,
     payload: Option<String>,
 ) -> std::io::Result<()> {
-    // A signal must not become visible in memory or resume execution unless
-    // its durable journal write and checkpoint both succeeded.
+    // A signal must not resume execution before its event has committed. For
+    // open activations the existing safe snapshot remains untouched for replay.
     append_signal_received(rt, actor_id, name, payload.clone())?;
 
     let should_resume = {
