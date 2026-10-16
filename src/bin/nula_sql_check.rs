@@ -128,16 +128,16 @@ fn extract_queries(source: &str) -> Result<Vec<QueryCall>, String> {
         .map_err(|e| format!("Nulang lexer failed: {e}"))?;
     let tokens: Vec<_> = tokens
         .into_iter()
-        .filter(|t| !matches!(t.kind, TokenKind::Newline | TokenKind::DocComment(_)))
+        .filter(|t| !matches!(&t.kind, TokenKind::Newline | TokenKind::DocComment(_)))
         .collect();
     let mut queries = Vec::new();
 
     for i in 0..tokens.len().saturating_sub(4) {
-        if !matches!(tokens[i].kind, TokenKind::Perform)
+        if !matches!(&tokens[i].kind, TokenKind::Perform)
             || !matches!(&tokens[i + 1].kind, TokenKind::UpperIdent(name) if name == "DB")
-            || !matches!(tokens[i + 2].kind, TokenKind::Dot)
+            || !matches!(&tokens[i + 2].kind, TokenKind::Dot)
             || !is_db_query_operation(&tokens[i + 3].kind)
-            || !matches!(tokens[i + 4].kind, TokenKind::LParen)
+            || !matches!(&tokens[i + 4].kind, TokenKind::LParen)
         {
             continue;
         }
@@ -169,9 +169,9 @@ fn literal_compatible(argument: ArgumentType, oid: u32) -> bool {
     match argument {
         // Conservative checks: the actual runtime binder must still accept
         // the values. Do not claim all PostgreSQL implicit casts are safe.
-        ArgumentType::Int => oid == 20,               // int8
-        ArgumentType::Float => oid == 701,             // float8
-        ArgumentType::Bool => oid == 16,               // bool
+        ArgumentType::Int => oid == 20, // int8
+        ArgumentType::Float => oid == 701, // float8
+        ArgumentType::Bool => oid == 16, // bool
         ArgumentType::Text => matches!(oid, 25 | 1043), // text, varchar
         ArgumentType::Null | ArgumentType::Dynamic => true,
     }
@@ -234,9 +234,9 @@ fn prepare_queries(calls: &[QueryCall], client: &mut Client) -> Result<QueryCach
         // PostgreSQL's prepare/describe protocol parses and analyzes SQL but
         // does not execute the statement, including writes. No user arguments
         // are sent to the database during contract preparation.
-        let statement = client
-            .prepare(&call.sql)
-            .map_err(|e| format!("byte {}: PostgreSQL rejected SQL ({:?})", call.offset, e.code()))?;
+        let statement = client.prepare(&call.sql).map_err(|e| {
+            format!("byte {}: PostgreSQL rejected SQL ({:?})", call.offset, e.code())
+        })?;
         queries.insert(
             hash.clone(),
             PreparedQuery {
@@ -301,7 +301,10 @@ fn main_impl() -> Result<(), String> {
         // NoTls adapter. Requiring an explicit opt-in prevents silent use over
         // a remote unencrypted connection. Use a local dev DB or SSH tunnel.
         if !allow_plaintext {
-            return Err("prepare uses NoTls; pass --allow-plaintext only for a local database or secure tunnel".into());
+            return Err(
+                "prepare uses NoTls; pass --allow-plaintext only for a local database or secure tunnel"
+                    .into(),
+            );
         }
         let url = env::var("NULANG_SQL_DATABASE_URL")
             .map_err(|_| "set NULANG_SQL_DATABASE_URL for prepare".to_owned())?;
