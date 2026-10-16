@@ -1175,7 +1175,7 @@ impl EffectChecker {
                     if !grants.contains(category) {
                         return Err(NuError::EffectError {
                             msg: format!(
-                                "function '{name}' performs effect '{eff}' which requires resource capability '{category}' (not granted; grant it with --with={category})"
+                                "function '{name}' performs effect '{eff}' which requires resource capability '{category}' (not granted; grant it with --with {category})"
                             ),
                             span: Span::default(),
                             missing_effects: None,
