@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url';
 
 const identifier = /^[A-Za-z_$][\w$]*$/;
 const types = { String: 'string', Int: 'number', Float: 'number', Bool: 'boolean' };
+const reservedOperations = new Set(['constructor', 'baseUrl', 'transport', 'then', '__proto__', 'prototype']);
 
 function tsType(type, label) {
   if (type == null) return 'string'; // Current runtime decodes untyped values as strings.
@@ -26,11 +27,16 @@ function renderRoute(route) {
   const context = `${method} ${route.path}`;
   if (!['GET', 'POST'].includes(method)) throw new Error(`unsupported method at ${context}`);
   const name = route.handler;
-  if (!identifier.test(name ?? '') || name === 'constructor') {
+  if (!identifier.test(name ?? '') || reservedOperations.has(name)) {
     throw new Error(`unsupported handler name '${name}' at ${context}`);
   }
   if (typeof route.path !== 'string' || !route.path.startsWith('/')) {
     throw new Error(`invalid absolute path at ${context}`);
+  }
+  // WHATWG URL resolution treats //host and backslashes as authority changes;
+  // query/fragment syntax is not part of a route path contract.
+  if (route.path.startsWith('//') || /[\\?#]/.test(route.path) || /\s/.test(route.path.replace(/\{[^}]*\}/g, ''))) {
+    throw new Error(`unsafe URL path at ${context}`);
   }
   const bindings = route.bindings ?? [];
   if (!Array.isArray(bindings)) throw new Error(`invalid bindings at ${context}`);
