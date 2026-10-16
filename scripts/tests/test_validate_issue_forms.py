@@ -137,5 +137,42 @@ body:
         self.assertTrue(validate.validate_templates(self.directory))
 
 
+    def test_unknown_control_type_list_yields_diagnostic_not_traceback(self):
+        self.write('bad.yml', """name: Bug
+description: Broken
+body:
+  - type: []
+    attributes: {label: Invalid}
+""")
+        errors = validate.validate_templates(self.directory)
+        self.assertTrue(any('unsupported control type' in error for error in errors))
+
+    def test_invalid_ipv6_contact_url_returns_actionable_error(self):
+        self.write('config.yml', """contact_links:
+  - name: Contact
+    about: Contact maintainers
+    url: https://[broken
+""")
+        errors = validate.validate_templates(self.directory)
+        self.assertTrue(any('absolute https://' in error for error in errors))
+
+    def test_yaml_11_implicit_boolean_aliases_are_rejected(self):
+        self.write('bug_report.yml', """name: Bug
+description: Broken
+body:
+  - type: input
+    id: version
+    attributes: {label: Version}
+    validations: {required: yes}
+""")
+        errors = validate.validate_templates(self.directory)
+        self.assertTrue(any('must be boolean' in error for error in errors))
+
+    def test_config_implicit_boolean_alias_is_rejected(self):
+        self.write('config.yml', 'blank_issues_enabled: on\n')
+        errors = validate.validate_templates(self.directory)
+        self.assertTrue(any('must be boolean' in error for error in errors))
+
+
 if __name__ == '__main__':
     unittest.main()
