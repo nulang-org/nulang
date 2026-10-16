@@ -7,13 +7,13 @@ WebGPU polyfill, external dependencies, or server round trips are introduced.
 
 ## Run
 
-From this directory:
+From this directory, using a built Nulang CLI (or an installed `nula` launcher):
 
 ```sh
-nula dev
+../../target/release/nulang nula dev
 ```
 
-Then open `http://127.0.0.1:3000/`. For a static build use `nula build --web`
+Then open `http://127.0.0.1:3000/`. For a static build use `../../target/release/nulang nula build --web`
 and serve the resulting `dist/` directory. The Nulang web builder copies
 `static/` into `dist/` and automatically injects `app.client.js` because the
 page contains a `data-signal` binding. The module script runs after parsing,
@@ -24,6 +24,8 @@ so the `window.nulang.signal('pointCount')` bridge is available.
 ```sh
 npm test
 ```
+
+CI also runs the Node suite and builds this example with the Nulang release CLI, checking that the generated HTML and static assets exist.
 
 Requires Node 20+. These tests exercise WebGL 2 mock lifecycle, context
 loss/restoration, Canvas 2D fallback, frame coalescing, GPU resource cleanup,
@@ -40,6 +42,7 @@ in `src/web/reactivity.rs`.
   array and must not mutate it until the next update. One GPU vertex buffer is
   reused; frames are coalesced via `requestAnimationFrame`.
 - Reactive updates stay in the browser and do **not** send actor messages.
+- The example inserts the *constant* `<script type="module" src="/demo.js"></script>` via `Web.raw`: Nulang correctly blocks script tags constructed through `Web.html` for security. Do not interpolate user-controlled strings into this trusted-only escape hatch.
 - `dispose()` cancels scheduled frames, disconnects its resize observer, and
   deletes GPU resources. WebGL context loss pauses rendering; restoration
   recreates the program and buffer from the retained points.
