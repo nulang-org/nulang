@@ -4723,6 +4723,20 @@ mod tests {
     }
 
     #[test]
+    fn test_network_grant_error_suggests_supported_cli_syntax() {
+        let ast = parse_module("fn fetch_url() -> Unit ! {Net} { unit }");
+        let mut checker = EffectChecker::new();
+        checker.set_resource_grants(&[]);
+        let err = checker
+            .check_module(&ast.decls)
+            .expect_err("missing net grant must be rejected");
+        assert!(
+            format!("{err}").contains("grant it with --with net"),
+            "suggest space-separated --with net, as the CLI parses it: {err}"
+        );
+    }
+
+    #[test]
     fn test_shadowed_function_name_not_charged_callee_row() {
         // A local binding shadows the same-named module function: calling the
         // local (pure) closure must not be charged the module function's row.
