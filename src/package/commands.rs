@@ -2006,18 +2006,18 @@ fn strip_main_function(source: &str) -> String {
         .iter()
         .filter(|token| {
             !matches!(
-                token.kind,
+                &token.kind,
                 TokenKind::Newline | TokenKind::DocComment(_) | TokenKind::Eof
             )
         })
         .collect();
     for window in significant.windows(5) {
         if window[0].span.start != eligible_starts[0]
-            || !matches!(window[0].kind, TokenKind::Fn)
+            || !matches!(&window[0].kind, TokenKind::Fn)
             || !matches!(&window[1].kind, TokenKind::Ident(name) if name == "main")
-            || !matches!(window[2].kind, TokenKind::LParen)
-            || !matches!(window[3].kind, TokenKind::RParen)
-            || !matches!(window[4].kind, TokenKind::LBrace)
+            || !matches!(&window[2].kind, TokenKind::LParen)
+            || !matches!(&window[3].kind, TokenKind::RParen)
+            || !matches!(&window[4].kind, TokenKind::LBrace)
         {
             continue;
         }
@@ -2029,7 +2029,7 @@ fn strip_main_function(source: &str) -> String {
             .position(|token| token.span.start == window[4].span.start);
         if let Some(open_pos) = open_pos {
             for token in &significant[open_pos..] {
-                match token.kind {
+                match &token.kind {
                     TokenKind::LBrace => depth += 1,
                     TokenKind::RBrace => {
                         if depth == 0 {
