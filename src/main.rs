@@ -2955,6 +2955,29 @@ mod tests {
         assert!(validate_node_security_mode(true, true, true, true, loopback).is_err());
     }
 
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn test_node_plaintext_cannot_join_off_host_seed() {
+        let loopback = "127.0.0.1:9000".parse().unwrap();
+        let local_seed = "127.0.0.1:9001".parse().unwrap();
+        let remote_seed = "203.0.113.10:9001".parse().unwrap();
+        assert!(
+            validate_node_security_mode(true, false, false, false, loopback, Some(local_seed))
+                .is_ok(),
+            "explicit plaintext may join a loopback seed"
+        );
+        assert!(
+            validate_node_security_mode(true, false, false, false, loopback, Some(remote_seed))
+                .is_err(),
+            "loopback bind must not allow plaintext egress to a remote seed"
+        );
+        assert!(
+            validate_node_security_mode(false, true, true, true, loopback, Some(remote_seed))
+                .is_ok(),
+            "mTLS may join a remote seed"
+        );
+    }
+
     #[test]
     fn test_run_source_actor_program_schedules_and_delivers() {
         let source = r#"
