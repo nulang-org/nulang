@@ -73,3 +73,46 @@ fn build_web_emits_contract_for_server_routes_without_static_rendering() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn build_web_still_renders_pure_static_routes() {
+    let root = temp_dir();
+    std::fs::write(
+        root.join("Nulang.toml"),
+        include_str!("../examples/hello-web/Nulang.toml"),
+    )
+    .expect("write manifest");
+    std::fs::write(
+        root.join("src/main.nula"),
+        include_str!("../examples/hello-web/src/main.nula"),
+    )
+    .expect("write source");
+
+    let result = Command::new(env!("CARGO_BIN_EXE_nulang"))
+        .args(["nula", "build", "--web"])
+        .current_dir(&root)
+        .env(
+            "NULANG_STDLIB",
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/stdlib"),
+        )
+        .output()
+        .expect("run nula web build");
+
+    assert!(
+        result.status.success(),
+        "static web build must succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr),
+    );
+
+    let page = std::fs::read_to_string(root.join("dist/index.html"))
+        .expect("static home is rendered");
+    assert!(page.contains("Hello, Nulang Web!"), "{page}");
+
+    let ir: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("dist/nulang-app.ir.json"))
+            .expect("IR is emitted"))
+            .expect("IR is valid JSON");
+    assert_eq!(ir["routes"][0]["placement"], "static");
+    let _ = std::fs::remove_dir_all(&root);
+}
