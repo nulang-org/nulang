@@ -65,6 +65,24 @@ pub fn compile_modules_contracts(modules: &[AstModule]) -> ContractCompilation {
     compiled
         .routes
         .sort_by(|a, b| (&a.method, &a.path).cmp(&(&b.method, &b.path)));
+    // Do not silently discard a second registration for the same method and
+    // path. Runtime route selection and generated API metadata can otherwise
+    // disagree about which handler wins. Retain a single route in the
+    // best-effort result, but make the validated build/serve boundary fail.
+    for adjacent in compiled.routes.windows(2) {
+        let [first, second] = adjacent else {
+            continue;
+        };
+        if first.method == second.method && first.path == second.path {
+            compiled.diagnostics.push(format!(
+                "duplicate web route {} {}: handlers '{}' and '{}' register the same route",
+                first.method,
+                first.path,
+                first.handler.as_deref().unwrap_or("<dynamic>"),
+                second.handler.as_deref().unwrap_or("<dynamic>"),
+            ));
+        }
+    }
     compiled
         .routes
         .dedup_by(|a, b| a.method == b.method && a.path == b.path);
@@ -409,6 +427,7 @@ fn register_second() {
             "{:?}",
             compiled.diagnostics
         );
+        assert!(crate::web::validation::validate_compilation(compiled).is_err());
     }
 
     #[test]
@@ -434,6 +453,7 @@ fn web_main() {
             "{:?}",
             compiled.diagnostics
         );
+        assert!(crate::web::validation::validate_compilation(compiled).is_err());
     }
 
     #[test]
