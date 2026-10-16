@@ -99,8 +99,10 @@ function browserChecks() {
   api.signal('status').set(payload);
   assert(span.textContent === payload && span.querySelector('img') === null, 'HTML injection');
   assert(button.title === payload && button.textContent === 'Static', 'attribute safety');
+  let thrown = false;
   try { api.batch(() => { api.signal('status').set('Recovered'); throw Error('expected'); }); }
-  catch (error) { assert(error.message === 'expected', 'exception propagation'); }
+  catch (error) { thrown = true; assert(error.message === 'expected', 'exception propagation'); }
+  assert(thrown, 'callback exception was swallowed');
   assert(span.textContent === 'Recovered', 'exception flush');
   api.signal('__proto__').set('Updated');
   assert(special.title === 'Updated', 'prototype-safe key');
