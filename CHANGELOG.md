@@ -1,4 +1,10 @@
 # Nulang Changelog
+### Conservative Web placement and stale-route cleanup — 2026-10-17
+- **Unannotated routes now default to server execution**, even for literal GET/HEAD paths. Static generation is opt-in through an explicit `@placement(static)` route handler.
+- **Known unsafe explicit static contracts are rejected**, including dynamic paths, request-bound inputs, and declared effects other than `Render`. This is not yet a full transitive-purity proof for unannotated helper calls.
+- **Rebuilds remove stale route HTML using the prior deployment IR** while retaining unchanged pages and unrelated files. Cleanup validates path containment and rejects symlinked artifacts; failures abort the build rather than deleting files outside the output directory.
+- **Migration:** annotate intentionally static page handlers, review hybrid build output and run exact-head CI before promotion.
+
 ### Web static-build route placement enforcement — 2026-10-17
 - **`nula build --web` now executes and writes HTML only for routes classified `static` by its compiler-contract-backed deployment IR.** Server/edge/client routes remain in the manifest but are not prerendered during the build.
 - **Signal analysis and deployment IR generation precede prerendering**, so build output uses the same placement decision exported to Nulang Cloud. This does not yet strengthen the existing placement inference heuristic or purge output left by earlier builds; exact-head integration tests and CI are required before promotion.
