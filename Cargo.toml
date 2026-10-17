@@ -239,6 +239,16 @@ split-debuginfo = "unpacked"
 [profile.dev.package."*"]
 opt-level = 1
 
+# Opt-in low-overhead profile for compiler/frontend iteration. Keep the
+# default dev profile unchanged for debug-capable runtime development.
+[profile.dev-fast]
+inherits = "dev"
+debug = "line-tables-only"
+
+[profile.dev-fast.package."*"]
+opt-level = 0
+debug = false
+
 [profile.test]
 lto = false
 codegen-units = 16

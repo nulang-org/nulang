@@ -242,6 +242,11 @@ jobs:
       - name: Check zero warnings
         run: cargo check --locked --tests --no-default-features
 
+      # This opt-in profile must be validated on the pinned stable toolchain,
+      # not only documented in the Justfile.
+      - name: Fast-profile compiler smoke
+        run: cargo check --locked --no-default-features --lib --profile dev-fast
+
       - name: Smoke test standalone Savina runner
         run: |
           output="$(cargo run --locked --no-default-features --features savina-bench --bin nulang-savina -- --benchmark ping_pong --format jsonl)"

@@ -21,6 +21,38 @@ test: check-nextest
 test-doc:
     cargo test --locked --doc
 
+# Faster, opt-in compiler/backend edit loops. Default/release builds retain
+# their existing feature and debug contracts.
+check-core:
+    cargo check --locked --no-default-features --lib --profile dev-fast
+
+check-jit:
+    cargo check --locked --no-default-features --features native-codegen --lib --profile dev-fast
+
+check-wasm:
+    cargo check --locked --no-default-features --features wasm-backend --lib --profile dev-fast
+
+build-core:
+    cargo build --locked --no-default-features --bin nulang --profile dev-fast
+
+# Cargo writes HTML timing reports into the chosen target profile directory.
+build-timings:
+    cargo build --locked --timings --profile dev-fast
+
+build-timings-core:
+    cargo build --locked --timings --no-default-features --bin nulang --profile dev-fast
+
+# Optional Linux linker experiment. RUSTFLAGS replaces target rustflags, so
+# repeat export-dynamic to preserve the native FFI linker contract.
+build-mold:
+    @command -v mold >/dev/null || { echo "mold not found; install mold first" >&2; exit 2; }
+    RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-C link-arg=-fuse-ld=mold -C link-arg=-Wl,--export-dynamic" cargo build --locked --profile dev-fast
+
+# Opt-in, same-host comparison of cold and no-op builds. Creates separate
+# disposable target directories; never clears the developer's Cargo cache.
+benchmark-dev-profiles:
+    python3 scripts/compare_build_profiles.py --output target/dev-profile-benchmarks.json
+
 # Fast inner-loop gate: formatting, compilation, and the default test suite.
 fast-check: check-nextest
     cargo fmt --check

@@ -1,4 +1,7 @@
 [target.x86_64-unknown-linux-gnu]
+# Preserve the established Linux linker and exported-symbol ABI for all
+# ordinary dev/release builds. The opt-in build-mold Justfile recipe supplies
+# RUSTFLAGS to select mold without changing the default release toolchain.
 linker = "gcc"
 rustflags = ["-C", "link-arg=-fuse-ld=bfd", "-C", "link-arg=-Wl,--export-dynamic"]
 
