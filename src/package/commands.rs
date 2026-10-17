@@ -1350,11 +1350,12 @@ fn cmd_build_web() -> NuResult<()> {
         span: Span::default(),
     })?;
     let output_dir = root.join(&manifest.web.output_dir);
-    let stage = crate::package::web_output::StagedWebOutput::prepare(&output_dir)
-        .map_err(|e| NuError::PackageError {
+    let stage = crate::package::web_output::StagedWebOutput::prepare(&output_dir).map_err(|e| {
+        NuError::PackageError {
             msg: format!("cannot stage {}: {}", output_dir.display(), e),
             span: Span::default(),
-        })?;
+        }
+    })?;
     cmd_build_web_into(&root, &manifest, stage.path())?;
     stage.publish().map_err(|e| NuError::PackageError {
         msg: format!("cannot publish {}: {}", output_dir.display(), e),
@@ -3261,10 +3262,8 @@ app "counter" {
 
     #[test]
     fn web_compile_failure_preserves_last_good_dist() {
-        let dir = std::env::temp_dir().join(format!(
-            "nulang_web_failed_publish_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("nulang_web_failed_publish_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         scaffold_package(&dir, "rollback-app", "web").unwrap();
@@ -3291,7 +3290,10 @@ app "rollback" {
         assert!(String::from_utf8_lossy(&prior).contains("last good"));
 
         std::fs::write(&main, "fn main() { unknown syntax ???").unwrap();
-        assert!(cmd_build_web().is_err(), "invalid code must fail the next build");
+        assert!(
+            cmd_build_web().is_err(),
+            "invalid code must fail the next build"
+        );
         assert_eq!(
             std::fs::read(dir.join("dist/index.html")).unwrap(),
             prior,
