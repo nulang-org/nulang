@@ -421,6 +421,24 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Mechanical cost inspection — 2026-09-20
+- **Static bytecode mechanical-cost reports** (Experimental, `src/cost_model.rs`,
+  `nulang costs`). Compiled modules can now report explicit VM heap-allocation
+  sites, string materialization, copies, calls, branches, effect/suspension
+  boundaries, FFI, actor/distributed operations, and I/O per function. Heap
+  sites proven non-escaping by the existing iso-arena analysis are reported
+  separately as arena-eligible, without treating them as allocation-free. The
+  `--json` form is machine-readable, and `--deny-allocations` provides a CI
+  gate for explicit heap/string allocation sites without claiming to model
+  dynamic execution frequency or hidden host allocations.
+- **Transitive `@noalloc` function contract** (Experimental). `@noalloc`
+  is preserved through AST → HIR → MIR and checked against optimized emitted
+  bytecode. Direct calls are proven transitively; indirect calls fail closed.
+  Heap/string materialization, capturing closure environments, deep-copy
+  operations, spills, effect/suspension boundaries, FFI/Python, actor and
+  distributed operations, I/O, and missing proof metadata reject the contract.
+  Native, WASM, and WasmFX reuse the same bytecode proof before backend-specific
+  code generation so changing backends cannot silently weaken the guarantee.
 ### Actor-capable `.nbc` execution — 2026-09-22
 - **Precompiled actor/workflow artifacts execute through the real Runtime**
   instead of standalone VM actor callbacks. Serialized modules carrying actor
