@@ -94,7 +94,13 @@ local root. `clone_top` creates independent roots with a retain barrier,
 observe the same ownership protocol. Checked arithmetic computes first and
 commits only if the operation and allocation succeed. Focused tests exercise
 clone, unwind, cross-frame transfer, self-copy, empty-stack and bounds
-errors, and overflow atomicity.
+errors, and overflow atomicity. The actor-scoped stack also supports
+`RootedIntFrameStack::suspend` and `::resume`: suspension consumes and
+drops the ORCA-owning stack, retaining only pointer-free signed numeric
+values and frame module indices; resume builds new counted roots in an
+independent actor heap. One checkpoint may be resumed more than once
+without sharing ORCA object addresses. This is **not** the production
+VM's `SuspendedVmState` or the versioned durable format.
 
 **Promotion boundary:** This is a controlled ownership model, **not** a
 replacement for the production VM's raw `Vec<Frame>` or captured
