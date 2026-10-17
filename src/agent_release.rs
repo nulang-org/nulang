@@ -54,18 +54,33 @@ pub struct AgentReleaseEnvelope {
     pub release_id: String,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum AgentReleaseError {
-    #[error("invalid agent release: {0}")]
     Invalid(String),
-    #[error("invalid agent release JSON: {0}")]
-    Json(#[from] serde_json::Error),
-    #[error("release manifest exceeds {MAX_RELEASE_BYTES} bytes")]
+    Json(serde_json::Error),
     TooLarge,
-    #[error("release ID does not match its definition")]
     IdentityMismatch,
-    #[error("asset content does not match its declared digest")]
     AssetMismatch,
+}
+
+impl std::fmt::Display for AgentReleaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(message) => write!(f, "invalid agent release: {message}"),
+            Self::Json(error) => write!(f, "invalid agent release JSON: {error}"),
+            Self::TooLarge => write!(f, "release manifest exceeds {MAX_RELEASE_BYTES} bytes"),
+            Self::IdentityMismatch => write!(f, "release ID does not match its definition"),
+            Self::AssetMismatch => write!(f, "asset content does not match its declared digest"),
+        }
+    }
+}
+
+impl std::error::Error for AgentReleaseError {}
+
+impl From<serde_json::Error> for AgentReleaseError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error)
+    }
 }
 
 /// Hash the *exact* bytes that an asset registry stores. Caller is responsible
