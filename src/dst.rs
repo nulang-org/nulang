@@ -403,6 +403,46 @@ mod tests {
     }
 
     #[test]
+    fn test_dst_records_messages_to_unregistered_actors() {
+        let mut sim = Simulator::new(7);
+        sim.register_actor(1, "registered");
+        sim.send(1, 99, "missing", vec![SimValue::Int(42)]);
+        sim.run_until_quiescence();
+
+        let undeliverable = sim.undeliverable_messages();
+        assert_eq!(undeliverable.len(), 1);
+        assert_eq!(undeliverable[0].sender, 1);
+        assert_eq!(undeliverable[0].target, 99);
+        assert_eq!(undeliverable[0].behavior, "missing");
+        assert_eq!(undeliverable[0].payload, vec![SimValue::Int(42)]);
+        assert!(!sim.has_deadlock());
+    }
+
+    #[test]
+    fn test_dst_timer_to_unregistered_actor_is_diagnosed() {
+        let mut sim = Simulator::new(1);
+        sim.timers.push((25, 7, SimMessage {
+            sender: 0,
+            target: 7,
+            behavior: "wake".into(),
+            payload: vec![],
+        }));
+        sim.run_until_quiescence();
+        assert_eq!(sim.clock_ms(), 25);
+        assert_eq!(sim.undeliverable_messages().len(), 1);
+        assert_eq!(sim.undeliverable_messages()[0].behavior, "wake");
+    }
+
+    #[test]
+    fn test_dst_registered_actor_keeps_clean_delivery_diagnostics() {
+        let mut sim = Simulator::new(1);
+        sim.send(0, 5, "work", vec![]);
+        sim.register_actor(5, "worker");
+        sim.run_until_quiescence();
+        assert!(sim.undeliverable_messages().is_empty());
+    }
+
+    #[test]
     fn test_quiescence_detection() {
         let mut sim = Simulator::new(0).with_max_steps(100);
         sim.register_actor(1, "worker");
