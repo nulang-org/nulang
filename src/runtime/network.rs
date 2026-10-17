@@ -2871,6 +2871,35 @@ mod tests {
         assert_ne!(id1.0, 0, "NodeId must not be zero");
     }
 
+    // Nulang distributed-peer NUL0 v1 has a frozen 16-byte versioned
+    // handshake. Nulang Cloud's host/guest transport happens to share the
+    // NUL0 name, but its length/type/flags/stream/CRC framing is different.
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn test_peer_handshake_accepts_frozen_v1_layout() {
+        let mut wire = Vec::from(crate::format::constants::WIRE_MAGIC);
+        wire.extend_from_slice(&crate::format::constants::WIRE_VERSION.to_be_bytes());
+        wire.extend_from_slice(&17u64.to_be_bytes());
+
+        let node = read_handshake(&mut wire.as_slice()).expect("valid peer handshake");
+        assert_eq!(node, NodeId(17));
+        assert_eq!(wire.len(), crate::format::constants::WIRE_HANDSHAKE_LEN);
+    }
+
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn test_peer_handshake_rejects_cloud_host_guest_header() {
+        // The Cloud host/guest protocol begins with a big-endian frame
+        // length, not the NUL0 distributed-peer magic + version handshake.
+        // Its frame must not be accidentally interpreted as a peer identity.
+        let mut cloud_frame = Vec::from(16u32.to_be_bytes());
+        cloud_frame.extend_from_slice(&[0x07, 0, 0, 0]); // Cloud Ping, flags, stream ID
+        cloud_frame.extend_from_slice(&[0; 8]); // payload and CRC (not inspected)
+        let err = read_handshake(&mut cloud_frame.as_slice())
+            .expect_err("host/guest framing is not a peer handshake");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
     // ------------------------------------------------------------------
     // 2. ActorMessage roundtrip
     // ------------------------------------------------------------------
