@@ -303,7 +303,25 @@ def comparisons(samples: dict[str, dict[str, list[dict[str, float | int | None |
                 [float(value) for value in base_rss if value is not None],
                 [float(value) for value in candidate_rss if value is not None],
             )
-        out[mode] = {"time": time, "rss": rss}
+
+        scheduler_settle = None
+        if mode == "idle":
+            base_settle = [row["scheduler_settle_seconds"] for row in base_rows]
+            candidate_settle = [row["scheduler_settle_seconds"] for row in candidate_rows]
+            if all(
+                value is not None and float(value) > 0
+                for value in base_settle + candidate_settle
+            ):
+                scheduler_settle = paired_lower_is_better(
+                    [float(value) for value in base_settle if value is not None],
+                    [float(value) for value in candidate_settle if value is not None],
+                )
+
+        out[mode] = {
+            "time": time,
+            "rss": rss,
+            "scheduler_settle": scheduler_settle,
+        }
 
     base_layout = int(samples["base"]["idle"][0]["actor_struct_bytes"])
     candidate_layout = int(samples["candidate"]["idle"][0]["actor_struct_bytes"])
