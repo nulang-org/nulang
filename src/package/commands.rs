@@ -3243,7 +3243,9 @@ app "counter" {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("old")).unwrap();
         std::fs::create_dir_all(dir.join("keep")).unwrap();
+        std::fs::create_dir_all(dir.join("removed")).unwrap();
         std::fs::write(dir.join("old/index.html"), b"removed page").unwrap();
+        std::fs::write(dir.join("removed/index.html"), b"retired route").unwrap();
         std::fs::write(dir.join("keep/index.html"), b"retained page").unwrap();
         std::fs::write(dir.join("private.txt"), b"unmanaged").unwrap();
 
@@ -3251,7 +3253,8 @@ app "counter" {
             "version": 1,
             "routes": [
                 {"method": "GET", "path": "/old", "placement": "static", "artifact": "old/index.html"},
-                {"method": "GET", "path": "/keep", "placement": "static", "artifact": "keep/index.html"}
+                {"method": "GET", "path": "/keep", "placement": "static", "artifact": "keep/index.html"},
+                {"method": "GET", "path": "/removed", "placement": "static", "artifact": "removed/index.html"}
             ],
             "signals": {}, "capabilities": [], "budgets": {},
             "middleware": [], "cloud_config": []
@@ -3270,6 +3273,7 @@ app "counter" {
 
         prune_stale_web_html(&dir, &old_ir, &new_ir).unwrap();
         assert!(!dir.join("old/index.html").exists());
+        assert!(!dir.join("removed/index.html").exists());
         assert_eq!(std::fs::read(dir.join("keep/index.html")).unwrap(), b"retained page");
         assert_eq!(std::fs::read(dir.join("private.txt")).unwrap(), b"unmanaged");
         let _ = std::fs::remove_dir_all(&dir);
