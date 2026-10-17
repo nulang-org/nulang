@@ -1989,8 +1989,7 @@ impl Value {
     /// Create an actor reference, rejecting IDs that do not fit the inline
     /// value representation. Use `try_actor_ref` at fallible boundaries.
     pub fn actor_ref(id: u64) -> Self {
-        Self::try_actor_ref(id)
-            .expect("actor ID exceeds the 48-bit inline handle range")
+        Self::try_actor_ref(id).expect("actor ID exceeds the 48-bit inline handle range")
     }
 
     /// Create a closure reference.
