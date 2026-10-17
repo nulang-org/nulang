@@ -58,7 +58,21 @@ An explicit annotation creates a **closed** record that requires an exact field 
 fn origin() -> { x: Int, y: Int } = { x: 0, y: 0 }
 ```
 
-Closed record annotations reject records with extra or missing fields. Use inferred parameters when you want row polymorphism.
+Closed record annotations reject records with extra or missing fields.
+
+### Explicit open record annotations (experimental)
+
+An inline record *type annotation* with a trailing `..` preserves required field types while accepting additional fields:
+
+```nulang
+fn x_coordinate(point: { x: Int, .. }) -> Int {
+    point.x
+}
+
+x_coordinate({ x: 10, y: 20 })  // valid: y is an extra field
+```
+
+The `x` field is still required and must have type `Int`. The row tail must come last; without `..`, an annotation is closed. This extension uses an inferred row variable. Named record declarations remain closed. This feature is currently **experimental** and is not part of the Frozen Core or Stable grammar.
 
 ## Reference Capabilities
 

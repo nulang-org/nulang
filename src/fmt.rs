@@ -1228,6 +1228,14 @@ mod tests {
     }
 
     #[test]
+    fn test_fmt_explicit_open_record_annotation() {
+        let src = "fn get_x(p: { x: Int, .. }) -> Int { p.x }";
+        let formatted = format_source(src).expect("open record annotation formats");
+        assert!(formatted.contains("{ x: Int, .. }"), "got: {formatted}");
+        assert_idempotent(src);
+    }
+
+    #[test]
     fn test_fmt_effect_decl() {
         let src = r#"effect MyEffect {
     op: Int -> Bool

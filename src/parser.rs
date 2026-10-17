@@ -5547,8 +5547,22 @@ impl Parser {
             TokenKind::LBrace => {
                 self.advance(); // consume '{'
                 let mut fields = Vec::new();
+                let mut open_row = false;
                 self.skip_newlines();
                 while self.peek_kind() != &TokenKind::RBrace && !self.is_at_end() {
+                    // Experimental inline open-row annotation: { x: Int, .. }.
+                    if self.consume_if(&TokenKind::DotDot) {
+                        open_row = true;
+                        self.skip_newlines();
+                        if self.peek_kind() != &TokenKind::RBrace {
+                            return Err(NuError::parse_error(
+                                "open row tail must appear at the end of the record type"
+                                    .to_string(),
+                                self.current_span(),
+                            ));
+                        }
+                        break;
+                    }
                     let fname = self.expect_ident("field name")?;
                     self.expect(TokenKind::Colon)?;
                     let fty = self.parse_type()?;
@@ -5560,7 +5574,11 @@ impl Parser {
                     self.skip_newlines();
                 }
                 self.expect(TokenKind::RBrace)?;
-                Ok(Type::Record(fields))
+                if open_row {
+                    Ok(Type::record_open(fields, TypeVar::fresh()))
+                } else {
+                    Ok(Type::Record(fields))
+                }
             }
             TokenKind::Ampersand => {
                 self.advance(); // consume '&'
@@ -6965,6 +6983,43 @@ mod tests {
             }
             _ => panic!("Expected record type declaration"),
         }
+    }
+
+    #[test]
+    fn test_parse_explicit_open_record_annotation() {
+        let module = parse("fn get_x(p: { x: Int, .. }) -> Int { p.x }").unwrap();
+        let Decl::Function { params, .. } = &module.decls[0] else {
+            panic!("expected function");
+        };
+        let Type::Record(fields) = params[0].ty.as_ref().expect("type annotation") else {
+            panic!("expected record type");
+        };
+        assert!(fields
+            .iter()
+            .any(|(name, ty)| name == "x" && ty == &Type::int()));
+        assert!(fields.iter().any(|(name, ty)| {
+            name == crate::types::RECORD_ROW_TAIL_FIELD && matches!(ty, Type::Var(_))
+        }));
+    }
+
+    #[test]
+    fn test_experimental_open_record_grammar_fixtures() {
+        let positive = include_str!("../conformance/grammar/positive_open_record_annotations.nula");
+        parse(positive).expect("open-record positive grammar fixture should parse");
+
+        for negative in [
+            include_str!("../conformance/grammar/negative_open_record_tail_not_last.nula"),
+            include_str!("../conformance/grammar/negative_open_record_duplicate_tail.nula"),
+        ] {
+            assert!(parse(negative).is_err(), "malformed row tail should not parse");
+        }
+    }
+
+    #[test]
+    fn test_parse_open_record_tail_must_be_last() {
+        let err = parse("fn get_x(p: { .., x: Int }) -> Int { p.x }")
+            .expect_err("row tail before fields must be rejected");
+        assert!(format!("{:?}", err).contains("end of the record type"));
     }
 
     #[test]
