@@ -204,6 +204,37 @@ fn test_spawn_send_step_sequence() {
 }
 
 #[test]
+fn actor_trace_jsonl_tracks_admission_backpressure_and_dequeue() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![]));
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.register_behavior("ping", noop_test_behavior);
+        actor.mailbox = Mailbox::new(1);
+    }
+
+    rt.send_message(actor_id, "ping", &[Value::int(424242)]);
+    rt.send_message(actor_id, "ping", &[Value::int(999999)]);
+    rt.step_actor(actor_id);
+
+    let jsonl = rt.actor_trace_jsonl(actor_id).expect("existing actor trace");
+    assert!(!jsonl.contains("424242"));
+    assert!(!jsonl.contains("999999"));
+    let records: Vec<serde_json::Value> = jsonl
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("valid JSON"))
+        .collect();
+    let outcomes: Vec<&str> = records
+        .iter()
+        .map(|record| record["event"].as_str().unwrap())
+        .collect();
+    assert_eq!(outcomes, vec!["admitted", "backpressured", "dequeued"]);
+    assert_eq!(records[1]["payload_len"], 1);
+    assert_eq!(records[2]["actor_id"], actor_id);
+    assert!(rt.actor_trace_jsonl(u64::MAX).is_none());
+}
+
+#[test]
 fn burst_send_has_single_ready_queue_entry() {
     let mut rt = Runtime::new();
     let actor_id = rt.spawn_actor(Box::new(|| vec![]));
