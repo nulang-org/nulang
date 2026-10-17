@@ -135,6 +135,7 @@ fn required_host_authority(
             name: string_arg(0)?,
         },
         ("Http", Some("get" | "post")) => http_outbound_authority(&string_arg(0)?)?,
+        ("Http", Some("request")) => http_outbound_authority(&string_arg(1)?)?,
         ("Http", Some("serve")) => {
             let port = regs
                 .first()
@@ -2908,6 +2909,53 @@ mod host_authority_tests {
             Some("get"),
             &constants,
             &regs,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn actor_http_request_authorizes_url_not_method_and_rejects_other_ports() {
+        let mut rt = Runtime::new();
+        let actor_id = 800_033;
+        let mut actor = Actor::new(actor_id, "http-request-authority", 8);
+        let manifest =
+            AuthorityManifest::from_tokens(["Net::TcpOut(api.example.com:443)"]).unwrap();
+        actor.install_authority_manifest(&manifest);
+        rt.actors.insert(actor_id, actor);
+
+        let (constants, regs) =
+            string_args(&["PATCH", "https://api.example.com/v1/users", "[]", "body"]);
+        assert!(authorize_actor_host_effect(
+            &rt,
+            Some(actor_id),
+            "Http",
+            Some("request"),
+            &constants,
+            &regs
+        )
+        .is_ok());
+
+        let (constants, regs) =
+            string_args(&["GET", "https://api.example.com:8443/private", "[]", ""]);
+        assert!(authorize_actor_host_effect(
+            &rt,
+            Some(actor_id),
+            "Http",
+            Some("request"),
+            &constants,
+            &regs
+        )
+        .is_err());
+
+        // Malformed/truncated new-effect invocations cannot bypass authority.
+        let (constants, regs) = string_args(&["GET"]);
+        assert!(authorize_actor_host_effect(
+            &rt,
+            Some(actor_id),
+            "Http",
+            Some("request"),
+            &constants,
+            &regs
         )
         .is_err());
     }

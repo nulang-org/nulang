@@ -1,5 +1,8 @@
 // http-client — request builder, percent-encoding, and query-string helpers
 // over the built-in `Http` effect.
+// The new Http.request operation is experimental, text-only, and bounded.
+
+import stdlib::json
 // Consume with: `import lib` from any file in the package.
 // Requests are plain records: {method, base, path, headers, params, body}.
 // Only `send` performs the Http effect; everything else is pure.
@@ -116,12 +119,33 @@ pub fn header_value(name, req) {
 
 // ── Sending ───────────────────────────────────────────────────────────────
 
-/// Send the request via the built-in Http effect and return the response
-/// body. Requires a runtime host (not available in the standalone VM).
-pub fn send_request(req) -> String ! {Http, String, Array} {
-    if req.method == "POST" then {
-        perform Http.post(request_url(req), req.body)
-    } else {
-        perform Http.get(request_url(req))
+/// Serialize caller-supplied request headers without hand-rolled escaping.
+/// The standard JSON encoder preserves quotes, backslashes and control characters.
+pub fn encode_headers(headers) {
+    var pairs = [];
+    for h in headers {
+        pairs = perform Array.push(pairs, JsonArray([JsonString(h.0), JsonString(h.1)]))
+    };
+    stringify(JsonArray(pairs))
+}
+
+/// Send the entire request and return the structured Http.request response
+/// as a JSON string: {status, ok, headers, body}. Errors return nil.
+/// Requests are text-only (4 MiB body/response limit), time out after 15 seconds,
+/// and never follow redirects or automatically retry.
+pub fn send_response(req) {
+    perform Http.request(req.method, request_url(req), encode_headers(req.headers), req.body)
+}
+
+/// Backwards-compatible body-only shortcut.
+/// Unlike the old implementation, headers are transmitted and methods other
+/// than POST are not silently converted to GET.
+pub fn send_request(req) {
+    let response = send_response(req);
+    if response == nil then { nil }
+    else {
+        let parsed = parse(response);
+        if get_bool(parsed, "ok", false) then { get_string(parsed, "body", "") }
+        else { nil }
     }
 }
