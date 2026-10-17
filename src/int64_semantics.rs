@@ -35,7 +35,10 @@ impl std::error::Error for Int64Error {}
 /// Staging representation that never loses any bit of a signed 64-bit Int.
 /// This is *not* the eventual heap layout or cross-backend Value ABI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Int64Storage {
+pub struct Int64Storage(Int64Repr);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Int64Repr {
     Inline(u64),
     Wide(i64),
 }
@@ -43,24 +46,24 @@ pub enum Int64Storage {
 impl Int64Storage {
     pub fn from_i64(value: i64) -> Self {
         match value_layout::try_tag_int(value) {
-            Some(raw) => Self::Inline(raw),
-            None => Self::Wide(value),
+            Some(raw) => Self(Int64Repr::Inline(raw)),
+            None => Self(Int64Repr::Wide(value)),
         }
     }
 
     pub fn to_i64(self) -> i64 {
-        match self {
-            Self::Inline(raw) => value_layout::as_int_raw(raw),
-            Self::Wide(value) => value,
+        match self.0 {
+            Int64Repr::Inline(raw) => value_layout::as_int_raw(raw),
+            Int64Repr::Wide(value) => value,
         }
     }
 
     /// The single-word representation if this integer fits the inline range.
     /// Never mask high bits to coerce a wide value into an inline one.
     pub fn inline_bits(self) -> Option<u64> {
-        match self {
-            Self::Inline(raw) => Some(raw),
-            Self::Wide(_) => None,
+        match self.0 {
+            Int64Repr::Inline(raw) => Some(raw),
+            Int64Repr::Wide(_) => None,
         }
     }
 }
