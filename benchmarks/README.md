@@ -16,10 +16,10 @@ mean_ns_upper}` per line).
 ## Status: regression-gated against a rolling window
 
 The CI `bench` job (`.github/workflows/ci.yml`) runs `cargo bench` on every
-push to `main`, collects results here and as a build artifact, then runs
-`scripts/check_bench_regression.py` against them. The job fails (after
-still committing the new result, so history stays complete) if any
-benchmark regresses beyond a threshold set from *that benchmark's own*
+push to `main`, collects results as a workflow artifact, then runs
+`scripts/check_bench_regression.py` against them. The job fails if a
+benchmark regression is **confirmed by paired parent/candidate measurements**
+using the noise-adjusted threshold set from *that benchmark's own*
 historical spread — not a flat percentage. GitHub Actions' shared runners
 have enough run-to-run noise (commonly 20-50%+ on wall-clock-sensitive
 benchmarks, from neighbor CPU/cache contention) that a naive fixed
@@ -62,6 +62,33 @@ optimization.** They are regression signals, not controlled A/B measurements.
 Performance PRs should use the same-runner Nulang A/B workflow below as the
 primary before/after evidence; a fixed self-hosted runner is preferred when
 longitudinal absolute numbers matter.
+
+## Protected benchmark-history branch (October 2026)
+
+Repository rules require a reviewed pull request to change every branch,
+including `automation/benchmark-history`, and prohibit force pushes. CI
+must not bypass those rules. Each benchmark job uploads the current Criterion
+JSON and Savina JSONL (plus any regression diagnostics) in a
+`bench-results-<commit-sha>` workflow artifact, configured with 90-day
+retention. The archival step emits a visible warning rather than failing
+otherwise valid runtime tests when history cannot be updated.
+
+The rolling regression baseline continues to use **the last approved
+snapshots** on `automation/benchmark-history`. **New benchmark results do
+not automatically enter that baseline** until a reviewed history-import PR
+merges. Review/import relevant artifacts before they expire; if history
+becomes stale, treat historical alerts as diagnostic only and rely on
+same-host exact-base paired tests for promotion.
+
+To import, retrieve the artifact for the completed `main` workflow via
+`gh run download <run-id> -n bench-results-<commit-sha>`. In a clean
+checkout, create a new topic branch **from**
+`origin/automation/benchmark-history`, copy the artifact's canonical
+`benchmarks/<commit-sha>.json` file into that branch, then open a pull
+request targeting `automation/benchmark-history`. Batch multiple SHA
+snapshots when appropriate, preserve the existing tracked history, and
+obtain all ruleset-required reviews. Never force-push or rewrite the
+protected history branch.
 
 ## Cross-runtime Savina baselines
 
