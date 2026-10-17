@@ -31,6 +31,21 @@ records exact nanosecond timings from each runtime and reports the median for
 every workload. The JSON also records OS/CPU counts, git SHA, toolchain
 versions, and the CPU topology used for measurement.
 
+**Measurement integrity:** the runner requires exactly one complete record for
+each of the four workloads per runtime and sample. A sample with a missing,
+malformed, duplicate, incorrectly labelled, zero-duration, or wrong-message-count
+record aborts the entire report; results are not silently overwritten or divided
+by invalid counts. To validate the parser without compiler toolchains:
+
+```bash
+python3 -m unittest discover -s scripts/tests -p 'test_cross_runtime_bench.py'
+```
+
+The current matrix does **not** include Pony, peak RSS, or process-crash
+recovery. Do not describe the output as benchmarking those capabilities.
+See [typed durable actor proof plan](../../docs/TYPED_DURABLE_ACTOR_PROOF_PLAN.md)
+for the separate follow-on correctness and performance gates.
+
 ## CPU-topology rule
 
 `--cpu-mode single` is the default and is the mode intended for cross-runtime
