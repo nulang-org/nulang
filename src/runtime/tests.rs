@@ -8898,3 +8898,67 @@ fn failed_workflow_step_survives_sqlite_restart_without_readmitting_command() {
     drop(restarted);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn rejected_resumed_success_commit_defers_actor_destruction_until_vm_scope_ends() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("count".to_string(), StateModel::Durable);
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "RejectedResumedSuccess",
+            Box::new(|| vec![("count".into(), Value::int(0))]),
+            models,
+        )
+        .unwrap();
+    let activation = workflow::commit_workflow_command(&mut rt, actor_id, 0, vec![]).unwrap();
+    rt.actors.get_mut(&actor_id).unwrap().activation_epoch = 0;
+
+    // This helper is invoked while resume call sites can still have a live VM
+    // borrow; the caller, not the helper, must quarantine after that borrow ends.
+    rt.commit_resumed_workflow_success(actor_id, Some(activation), "resume".into());
+
+    assert!(
+        rt.actors.contains_key(&actor_id),
+        "terminal failure must be reported without destroying an actor in the VM window"
+    );
+    assert!(!rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .iter()
+        .any(|event| matches!(event, WorkflowEvent::StepCompleted { .. })));
+}
+
+#[test]
+fn rejected_resumed_failure_commit_defers_actor_destruction_until_vm_scope_ends() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("count".to_string(), StateModel::Durable);
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "RejectedResumedFailure",
+            Box::new(|| vec![("count".into(), Value::int(0))]),
+            models,
+        )
+        .unwrap();
+    let activation = workflow::commit_workflow_command(&mut rt, actor_id, 0, vec![]).unwrap();
+    rt.actors.get_mut(&actor_id).unwrap().activation_epoch = 0;
+
+    rt.commit_resumed_workflow_failure(
+        actor_id,
+        Some(activation),
+        "resume".into(),
+        "injected terminal rejection".into(),
+        0,
+    );
+
+    assert!(
+        rt.actors.contains_key(&actor_id),
+        "failed-step commit helper must report failure without destroying a live VM actor"
+    );
+    assert!(!rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .iter()
+        .any(|event| matches!(event, WorkflowEvent::StepFailed { .. })));
+}
