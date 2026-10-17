@@ -100,6 +100,64 @@ impl GoalGraph {
             .collect())
     }
 
+    /// Return at most 'capacity' ready tasks, preferring the longest remaining
+    /// dependency chain. Every unfinished downstream task counts as one unit;
+    /// this is a deterministic critical-path *heuristic*, not a latency estimate.
+    ///
+    /// Input order breaks equal-depth ties. Even a zero-capacity call validates
+    /// the graph so corrupt dependencies cannot be silently ignored.
+    pub fn critical_path_ready_task_ids(&self, capacity: usize) -> Result<Vec<Uuid>, String> {
+        let mut ready = self.ready_task_ids()?;
+        if capacity == 0 || ready.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let tasks: HashMap<Uuid, &crate::Task> =
+            self.tasks.iter().map(|task| (task.id, task)).collect();
+        let mut successors: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+        for task in &self.tasks {
+            for dependency in &task.dependencies {
+                successors.entry(*dependency).or_default().push(task.id);
+            }
+        }
+
+        fn remaining_depth(
+            id: Uuid,
+            tasks: &HashMap<Uuid, &crate::Task>,
+            successors: &HashMap<Uuid, Vec<Uuid>>,
+            memo: &mut HashMap<Uuid, usize>,
+        ) -> usize {
+            if let Some(&depth) = memo.get(&id) {
+                return depth;
+            }
+            let longest_child = successors
+                .get(&id)
+                .into_iter()
+                .flatten()
+                .filter(|child| {
+                    tasks.get(child).is_some_and(|task| {
+                        !matches!(
+                            task.status,
+                            TaskStatus::Completed | TaskStatus::Cancelled | TaskStatus::Failed
+                        )
+                    })
+                })
+                .map(|child| remaining_depth(*child, tasks, successors, memo))
+                .max()
+                .unwrap_or(0);
+            let depth = 1 + longest_child;
+            memo.insert(id, depth);
+            depth
+        }
+
+        let mut memo = HashMap::new();
+        ready.sort_by_cached_key(|id| {
+            std::cmp::Reverse(remaining_depth(*id, &tasks, &successors, &mut memo))
+        });
+        ready.truncate(capacity);
+        Ok(ready)
+    }
+
     pub fn completed_task_count(&self) -> usize {
         self.tasks
             .iter()
