@@ -170,7 +170,9 @@ fn resuming_same_checkpoint_creates_independently_owned_roots() {
 #[test]
 fn an_empty_stack_can_suspend_and_resume_without_leaving_roots() {
     let mut original_actor = Actor::new(81, "empty-owner", 0);
-    let checkpoint = RootedIntFrameStack::new(&mut original_actor).suspend().unwrap();
+    let checkpoint = RootedIntFrameStack::new(&mut original_actor)
+        .suspend()
+        .unwrap();
     assert_eq!(original_actor.heap.live_count(), 0);
     let mut restored_actor = Actor::new(82, "empty-restored-owner", 0);
     {
