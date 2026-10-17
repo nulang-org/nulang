@@ -140,13 +140,37 @@ impl AgentReleaseEnvelope {
     }
 }
 
+/// Domain-separated, length-prefixed binary encoding. Independent of JSON
+/// whitespace, object-key order, and serializer implementations.
 fn definition_id(definition: &AgentReleaseDefinition) -> Result<String, AgentReleaseError> {
-    let canonical = serde_json::to_vec(definition)?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(DOMAIN);
-    hasher.update(&(canonical.len() as u32).to_le_bytes());
-    hasher.update(&canonical);
+    for field in [
+        &definition.schema,
+        &definition.agent,
+        &definition.version,
+        &definition.artifact_id,
+        &definition.prompt,
+        &definition.policy,
+        &definition.model.provider,
+        &definition.model.model,
+        &definition.model.revision,
+    ] {
+        hash_text(&mut hasher, field);
+    }
+    for assets in [&definition.skills, &definition.tools] {
+        hasher.update(&(assets.len() as u32).to_le_bytes());
+        for asset in assets {
+            hash_text(&mut hasher, &asset.name);
+            hash_text(&mut hasher, &asset.digest);
+        }
+    }
     Ok(format!("blake3:{}", hasher.finalize().to_hex()))
+}
+
+fn hash_text(hasher: &mut blake3::Hasher, text: &str) {
+    hasher.update(&(text.len() as u32).to_le_bytes());
+    hasher.update(text.as_bytes());
 }
 
 fn validate_definition(d: &AgentReleaseDefinition) -> Result<(), AgentReleaseError> {
