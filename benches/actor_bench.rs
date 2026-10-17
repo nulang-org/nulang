@@ -141,6 +141,45 @@ fn bench_message_enqueue(c: &mut Criterion) {
         )
     });
 
+    // Separate the ordinary untraced send from the tracing-active send.
+    // runtime_with_consumer() executes a setup message and can leave
+    // current_trace populated, so explicitly fix trace state in each fixture.
+    group.bench_function("by_id_no_trace_100", |b| {
+        b.iter_batched_ref(
+            || {
+                let (mut rt, actor_id) = runtime_with_consumer();
+                rt.current_trace = None;
+                (rt, actor_id)
+            },
+            |(rt, actor_id)| {
+                let msg = Value::int(1);
+                for _ in 0..MESSAGE_BATCH {
+                    rt.send_message_by_id(*actor_id, 0, &[msg]);
+                }
+                black_box(rt);
+            },
+            BatchSize::SmallInput,
+        )
+    });
+
+    group.bench_function("by_id_traced_100", |b| {
+        b.iter_batched_ref(
+            || {
+                let (mut rt, actor_id) = runtime_with_consumer();
+                rt.current_trace = Some(nulang::runtime::TraceContext::root());
+                (rt, actor_id)
+            },
+            |(rt, actor_id)| {
+                let msg = Value::int(1);
+                for _ in 0..MESSAGE_BATCH {
+                    rt.send_message_by_id(*actor_id, 0, &[msg]);
+                }
+                black_box(rt);
+            },
+            BatchSize::SmallInput,
+        )
+    });
+
     group.finish();
 }
 

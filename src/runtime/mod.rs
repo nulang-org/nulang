@@ -2771,44 +2771,32 @@ impl Runtime {
             payload: MessagePayload::from_slice(args),
             sender: self.current_actor.unwrap_or(0),
             priority: MessagePriority::Normal,
-            trace_id: out_trace.clone(),
+            trace_id: out_trace,
         };
         let admission = if let Some(actor) = self.actors.get_mut(&target_id) {
-            if actor.mailbox.push_local(msg).is_ok() {
-                // Record only messages that were actually admitted. The
-                // runtime-default recorder is disabled unless explicitly
-                // enabled, making this branch effectively free in production.
-                actor
-                    .flight_recorder
-                    .record(self.current_actor.unwrap_or(0), behavior_id, args);
-                // Activity resets the dehydration idle timer.
-                actor.idle_ms = 0;
-                MessageAdmission::Accepted
-            } else {
-                // Mailbox is full (capacity > 0). Route to DLQ with a simple notification.
-                self.route_to_dlq(
-                    &Message {
-                        behavior_id,
-                        payload: MessagePayload::from_slice(args),
-                        sender: self.current_actor.unwrap_or(0),
-                        priority: MessagePriority::System,
-                        trace_id: out_trace.clone(),
-                    },
-                    "mailbox full",
-                );
-                MessageAdmission::Backpressured
+            match actor.mailbox.push_local(msg) {
+                Ok(()) => {
+                    // Record only messages that were actually admitted. The
+                    // runtime-default recorder is disabled unless explicitly
+                    // enabled, making this branch effectively free in production.
+                    actor
+                        .flight_recorder
+                        .record(self.current_actor.unwrap_or(0), behavior_id, args);
+                    // Activity resets the dehydration idle timer.
+                    actor.idle_ms = 0;
+                    MessageAdmission::Accepted
+                }
+                Err(rejected) => {
+                    // Reuse the original message on backpressure; no duplicate
+                    // payload or W3C traceparent allocation is necessary.
+                    self.route_to_dlq(&rejected, "mailbox full");
+                    MessageAdmission::Backpressured
+                }
             }
         } else {
-            self.route_to_dlq(
-                &Message {
-                    behavior_id,
-                    payload: MessagePayload::from_slice(args),
-                    sender: self.current_actor.unwrap_or(0),
-                    priority: MessagePriority::System,
-                    trace_id: out_trace.clone(),
-                },
-                "target actor not found",
-            );
+            // The mailbox never took ownership, so this same message is
+            // available for the missing-actor dead-letter path.
+            self.route_to_dlq(&msg, "target actor not found");
             MessageAdmission::Rejected
         };
 

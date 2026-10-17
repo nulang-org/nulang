@@ -158,6 +158,13 @@ operation end to end.
 
 Examples:
 - `actor/message_enqueue/*` measures local mailbox admission/enqueue only.
+  The `by_id_no_trace_100` and `by_id_traced_100` variants explicitly
+  control `Runtime::current_trace` after fixture setup and isolate the
+  allocation cost of W3C trace propagation. The pre-existing `by_id_100`
+  name is retained unchanged for history continuity; its setup can leave
+  trace context populated, so do not label it an untraced baseline.
+  For an optimization result, run exact-base paired measurements on the
+  same host and verify that no other workload regresses.
 - `actor/message_drain/*` measures scheduler + registered native-handler
   execution for messages already queued in setup.
 - `actor/lifecycle_spawn_send_receive_gc` is an end-to-end lifecycle cost and
