@@ -417,7 +417,67 @@ pub struct BehaviorEntry {
     pub handler_fn: fn(&mut Actor, &[Value]),
 }
 
+/// Borrowed, ORCA-owned allocation containing a full-width integer.
+///
+/// This staging lease is intentionally `!Copy` and does **not** expose a VM
+/// `Value` or process-local pointer. It is tied to an exclusive borrow of
+/// the owning actor's heap and GC and releases exactly one local reference
+/// when dropped, preventing accidental migration into v1 message/snapshot
+/// formats before the wide-int value ABI is defined.
+pub struct WideIntLease<'a> {
+    heap: &'a mut ActorHeap,
+    gc: &'a mut OrcaGc,
+    ptr: std::ptr::NonNull<u8>,
+}
+
+impl WideIntLease<'_> {
+    /// Read the signed 64-bit scalar. No truncation to the inline payload.
+    pub fn value(&self) -> i64 {
+        // SAFETY: `ptr` was returned by `OrcaGc::alloc_object` with
+        // `size_of::<i64>()` bytes and 8-byte heap alignment, then
+        // initialized before this lease was returned. The exclusive heap
+        // borrow keeps the allocation live for the lifetime of the lease.
+        unsafe { self.ptr.as_ptr().cast::<i64>().read() }
+    }
+}
+
+impl Drop for WideIntLease<'_> {
+    fn drop(&mut self) {
+        // SAFETY: this lease owns the only newly-created local reference;
+        // the borrowed heap and GC are those used at allocation time. It
+        // cannot be copied or outlive the actor's heap.
+        unsafe {
+            self.gc.drop_local_ref(self.heap, self.ptr.as_ptr());
+        }
+    }
+}
+
 impl Actor {
+    /// Allocate an ORCA-managed full-width scalar for pre-adoption Int64
+    /// representation testing. The lease is local and cannot be inserted
+    /// into a VM register, cross-actor message or v1 persisted format.
+    ///
+    /// Both inline-range and wide-range integers can be tested here; the
+    /// production fast path should remain inline when it fits.
+    pub fn lease_wide_int(&mut self, value: i64) -> Option<WideIntLease<'_>> {
+        let ptr = self.orca_gc.alloc_object(
+            &mut self.heap,
+            std::mem::size_of::<i64>(),
+            TypeTag::WideInt,
+        )?;
+        // SAFETY: fresh ORCA payload allocation is at least 8-byte aligned
+        // and exactly the size of an i64. It is exclusively owned by this
+        // actor while its initial reference count is one.
+        unsafe {
+            ptr.cast::<i64>().write(value);
+        }
+        Some(WideIntLease {
+            heap: &mut self.heap,
+            gc: &mut self.orca_gc,
+            ptr: std::ptr::NonNull::new(ptr).expect("ORCA returned a non-null allocation"),
+        })
+    }
+
     pub fn new(id: u64, name: impl Into<String>, mailbox_cap: usize) -> Self {
         Actor {
             id,
