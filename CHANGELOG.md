@@ -1,4 +1,10 @@
 # Nulang Changelog
+### Incubating Core and tagged-value safety — 2026-10-17 (draft PR)
+- **Governance:** Pre-adoption Nulang Core is now Incubating rather than Stable, pending independent adoption evidence. Language semantics can be revised with spec, changelog, and conformance evidence without a two-major-version deprecation cycle. The existing v1 bytecode, wire, and value-format archival contracts remain separately versioned.
+- **Runtime:** `Value::try_actor_ref` rejects 64-bit IDs that cannot fit in its 48-bit inline handle. `Value::actor_ref` now fails loudly instead of wrapping to an unrelated actor. This is not yet a full-width logical identity implementation.
+- **Virtual actors:** Known local grain hash collisions are rejected before mapping overwrite or hydration. Cluster-global collision freedom still requires identity-separated addressing.
+- **VM floats:** `Value::float` now applies canonical NaN encoding before tag discrimination. Regression tests cover hardware-NaN and tag-shaped NaN inputs.
+
 ### Web static-root containment — 2026-10-15
 - **Experimental Web static file serving refuses parent traversal and symlinks escaping configured roots.** Canonical candidate paths must remain inside their canonicalized static or output root, and normal in-root files remain serveable.
 - **A filesystem regression verifies parent and symlink escape rejection.** This is a clean current-main successor to draft #1676; it does not change SSE or claim protection from malicious concurrent mutation of a trusted static root.
