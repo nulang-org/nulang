@@ -421,6 +421,8 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### MIR scalar replacement — 2026-09-20
+- **Projection-only compiler-generated tuples and records can now be eliminated before bytecode emission** (`src/mir_escape.rs`, `src/mir_scalar_replace.rs`, `src/mir_codegen.rs`). A conservative MIR escape proof identifies local immutable aggregates, and the first scalar-replacement pass rewrites same-basic-block field projections to their constituent locals so eligible values never emit `TupleMk`/`RecMk`. Aliases, mutation, cross-block uses, captured-value reassignment, and ordinary named source locals fail closed; the latter remain materialized to preserve debugger visibility. Criterion coverage includes a 1,000-iteration record hot loop, and bytecode regression tests pin allocation elimination.
 ### Actor-capable `.nbc` execution — 2026-09-22
 - **Precompiled actor/workflow artifacts execute through the real Runtime**
   instead of standalone VM actor callbacks. Serialized modules carrying actor
