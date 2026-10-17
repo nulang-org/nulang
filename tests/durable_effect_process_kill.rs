@@ -212,8 +212,8 @@ fn verify_crash_recovery(stage: &str) {
         let mut coordinator = DurableEffectCoordinator::new(&mut store, ACTOR_ID, 1);
         coordinator
             .execute_compiled_async_with_deduplication(
-            &actor,
-            &grant,
+                &actor,
+                &grant,
                 &module,
                 pc,
                 EXECUTION_KEY,
@@ -240,8 +240,8 @@ fn verify_crash_recovery(stage: &str) {
     assert_eq!(
         coordinator
             .execute_compiled_async_with_deduplication(
-            &actor,
-            &grant,
+                &actor,
+                &grant,
                 &module,
                 pc,
                 EXECUTION_KEY,
