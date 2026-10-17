@@ -797,7 +797,10 @@ fn web_main() {
         let compiled = compile_module_contracts(&module);
         assert_eq!(compiled.routes.len(), 1);
         assert!(
-            compiled.routes[0].effects.iter().any(|effect| effect == "Time"),
+            compiled.routes[0]
+                .effects
+                .iter()
+                .any(|effect| effect == "Time"),
             "static handler must retain effects of local transitive callees"
         );
         let errors = crate::web::validation::validate_compilation(compiled).unwrap_err();
@@ -826,7 +829,10 @@ fn web_main() {
         let compiled = compile_module_contracts(&module);
         assert_eq!(compiled.routes.len(), 1);
         assert!(
-            compiled.routes[0].effects.iter().any(|effect| effect == "Time"),
+            compiled.routes[0]
+                .effects
+                .iter()
+                .any(|effect| effect == "Time"),
             "explicitly declared Render must not erase inferred effects"
         );
     }
