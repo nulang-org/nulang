@@ -522,18 +522,33 @@ thread_local! {
     static RESPONSE_COOKIES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Set the request context for the current thread, run `f`, then clear it.
+/// Reset thread-local request state even if a handler unwinds. Cookies
+/// intentionally remain available after successful dispatch until
+/// the response writer calls `take_response_cookies`.
+struct RequestContextReset;
+
+impl Drop for RequestContextReset {
+    fn drop(&mut self) {
+        CURRENT_REQUEST.with(|current| *current.borrow_mut() = None);
+        if std::thread::panicking() {
+            // Prevent partial state from a failed handler escaping into
+            // an error handler or a subsequent request on this thread.
+            RESPONSE_COOKIES.with(|cookies| cookies.borrow_mut().clear());
+        }
+    }
+}
+
+/// Set request state for the handler's dynamic extent. On unwind the guard
+/// also discards pending cookies, while successful responses retain them.
 pub fn with_request_context<F, R>(ctx: RequestContext, f: F) -> R
 where
     F: FnOnce() -> R,
 {
-    CURRENT_REQUEST.with(|c| *c.borrow_mut() = Some(ctx));
-    RESPONSE_COOKIES.with(|c| c.borrow_mut().clear());
-    let result = f();
-    CURRENT_REQUEST.with(|c| *c.borrow_mut() = None);
-    result
+    CURRENT_REQUEST.with(|current| *current.borrow_mut() = Some(ctx));
+    RESPONSE_COOKIES.with(|cookies| cookies.borrow_mut().clear());
+    let _reset = RequestContextReset;
+    f()
 }
-
 /// Add a `Set-Cookie` header for the current response.
 pub fn set_cookie(name: &str, value: &str) {
     let cookie = format!("{}={}; Path=/; HttpOnly; SameSite=Lax", name, value);
@@ -1483,6 +1498,56 @@ mod tests {
         assert!(String::from_utf8(response.body)
             .unwrap()
             .contains("Invalid UI action envelope"));
+    }
+
+    #[test]
+    fn request_context_and_cookies_are_cleared_when_handler_panics() {
+        let _ = take_response_cookies();
+        let request = RequestContext {
+            request: HttpRequest {
+                method: HttpMethod::Post,
+                path: "/isolation".into(),
+                headers: vec![],
+                body: vec![],
+            },
+            params: HashMap::new(),
+        };
+
+        let failed = std::panic::catch_unwind(|| {
+            with_request_context(request, || {
+                assert_eq!(current_request_method().as_deref(), Some("POST"));
+                set_cookie("transient", "secret");
+                panic!("simulate a failed request handler");
+            });
+        });
+
+        assert!(failed.is_err());
+        assert_eq!(current_request_method(), None, "request state leaked");
+        assert!(
+            take_response_cookies().is_empty(),
+            "pending cookies leaked after handler panic"
+        );
+    }
+
+    #[test]
+    fn request_cookies_survive_success_until_response_commit() {
+        let _ = take_response_cookies();
+        let request = RequestContext {
+            request: HttpRequest {
+                method: HttpMethod::Get,
+                path: "/success".into(),
+                headers: vec![],
+                body: vec![],
+            },
+            params: HashMap::new(),
+        };
+        with_request_context(request, || set_cookie("ok", "1"));
+
+        assert_eq!(current_request_method(), None);
+        let cookies = take_response_cookies();
+        assert_eq!(cookies.len(), 1);
+        assert!(cookies[0].starts_with("ok=1;"));
+        assert!(take_response_cookies().is_empty());
     }
 
     #[test]
