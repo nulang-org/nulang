@@ -516,13 +516,10 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
                 }
             }
         }
-        // End the VM-execution window only after any suspend-state
-        // re-capture above: draining deferred wakes runs other actors
-        // on the shared VM, which would clobber the frames an
-        // un-captured suspend still needs. Runs on every path, so
-        // wakes of other actors are not lost when THIS one suspends.
     }
-    // A failed durable transition cannot publish speculative state. Drop
+    // Suspension state has been re-captured while the VM borrow was live.
+    // The borrow is now released; a failed durable transition must not
+    // publish speculative state. Drop
     // the actor only after the shared VM borrow ends, and before deferred
     // receive wakes can run it.
     if terminal_commit_failed {
