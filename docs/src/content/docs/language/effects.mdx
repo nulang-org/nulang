@@ -8,7 +8,7 @@ import CopyMarkdown from '../../../components/CopyMarkdown.astro';
 
 <CopyMarkdown />
 
-Algebraic effects let you separate _what_ a program does from _how_ it does it. An effect declares operations; handlers provide implementations. Effects compose freely without monad transformers.
+Algebraic effects separate _what_ a computation requests from _how_ a handler implements it. An effect declares operations; handlers can intercept those operations. Inferred effect rows constrain the operations a function may request, but handler lookup is a runtime operation.
 
 ## Defining Effects
 
@@ -27,7 +27,7 @@ effect Logger {
 
 ## Performing Effects
 
-`perform` invokes an operation. The compiler statically tracks which effects each function may perform via row-polymorphic effect types:
+`perform` requests an operation. The compiler tracks which effects a function may perform through row-polymorphic effect types and checks declared effect bounds:
 
 ```nulang
 fn counter() -> Int ! {State} {
@@ -60,6 +60,8 @@ handle perform Logger.log("hello") {
 
 The `resume` keyword marks that execution should continue at the `perform` site with the arm body's value. Without `resume`, the handler arm's value is the handle expression's result (the handler does not resume the continuation).
 
+**Handler availability is not exhaustively checked at every call site.** Even when a `perform` is admitted by the inferred effect row, the runtime can report `Unhandled effect` when no suitable handler or built-in runtime implementation is available. This is covered by `conformance/behavior/resume_12_unhandled_effect_runtime_error.json`. An effect signature is therefore not proof that execution will succeed.
+
 ## Effect Rows
 
 Effect types use row polymorphism, like records. The effect row appears in a function's type signature after the return type, introduced by `!` or `throws`:
@@ -76,13 +78,15 @@ fn program() -> Unit ! {IO, State, Int} {
 }
 ```
 
-`throws` is an alias for `!`:
+`throws` is also accepted as a spelling of the signature marker in the following effect-row example; see the language specification and error-model RFC for the distinct `Result`-error annotation forms:
 
 ```nulang
 fn log(msg: String) -> Unit throws {IO} {
     perform IO.print(msg)
 }
 ```
+
+Effect rows and external resource **authority grants** are distinct: requiring `FS` or `Http` does not automatically authorize a particular filesystem path or network address. Actor and host execution must enforce the relevant grants. The currently shipped enforcement boundaries are tracked in [the semantic stabilization contract](https://github.com/nulang-org/nulang/blob/main/docs/SEMANTIC_STABILIZATION_CONTRACT.md).
 
 ## Built-in Effects
 
@@ -103,8 +107,6 @@ are:
 | `Env` | `get` | Environment variables |
 | `Process` | `run` | Trusted/standalone shell command execution |
 | `Debug` | `inspect` | Labeled value inspection |
-
-> `Process.run` is intentionally not dispatched by actor-backed production runtimes. The standalone VM implementation uses `/bin/sh -c`, which inherits host OS authority and is therefore unsuitable for untrusted actor execution until a separate isolated process sandbox with explicit resource and filesystem/network policy exists.
 | `Test` | `assert`, `assert_eq`, `assert_true` | Test assertions |
 | `Random` | `int` | Random numbers |
 | `Time` | `now` | Wall-clock time |
@@ -119,6 +121,10 @@ are:
 | `Python` | `import`, `call`, `get_attr` | Python interop (PyO3) |
 | `System` | `arg` | Command-line arguments |
 | `Realtime` | `broadcast` | Realtime channel broadcast |
+
+> **Process boundary:** `Process.run` is intentionally not dispatched by actor-backed production runtimes. The standalone VM implementation uses `/bin/sh -c` and inherits host OS authority. It is unsuitable for untrusted actor execution without explicit sandbox and resource policy.
+
+These are operation families, not a guarantee that every backend, runtime profile, or host grants them. See [implementation status](https://github.com/nulang-org/nulang/blob/main/docs/IMPLEMENTATION_STATUS.md) for backend coverage.
 
 `perform LLM.ask(prompt)` remains accepted as a legacy alias for
 `perform Inference.ask(prompt)` — both dispatch identically at runtime.

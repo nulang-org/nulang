@@ -1,6 +1,6 @@
 ---
 title: Safety
-description: How Nulang guarantees memory safety, type safety, and fault tolerance at compile time.
+description: Current compiler checks, runtime safeguards, and limits of Nulang's safety guarantees.
 ---
 import CapabilityDemo from '../../../components/animations/CapabilityDemo.astro';
 
@@ -8,7 +8,7 @@ import CapabilityDemo from '../../../components/animations/CapabilityDemo.astro'
 
 <CapabilityDemo />
 
-Nulang's capability system (inspired by Pony) prevents data races and use-after-free at compile time. There are seven capabilities:
+Nulang's Pony-inspired reference capabilities statically restrict aliasing, mutation, and actor-message transfer. They work alongside the ORCA runtime memory manager; a capability check is not, by itself, a proof that every VM, FFI, or unsafe runtime path is memory-safe. There are seven capability qualifiers:
 
 | Capability | Deny Read | Deny Write | Sendable | Description |
 |------------|-----------|------------|----------|-------------|
@@ -20,18 +20,18 @@ Nulang's capability system (inspired by Pony) prevents data races and use-after-
 | `tag` | Yes | Yes | Yes | Opaque, identity-only |
 | `lineariso` | Yes | Yes | Yes | Linear isolated (at-most-once use) |
 
-**Key guarantees**:
+**Current enforcement and boundaries**:
 
-- **No data races**: only `iso` and `val` are sendable between actors. Mutable `ref` and `trn` cannot cross actor boundaries.
-- **Compile-time only**: capabilities are erased at runtime. There is zero overhead for capability checks — they are proved by the type checker and then discarded.
-- **LinearIso enforcement**: `lineariso` is tracked per binding along every control-flow path. Sending or capturing a `lineariso` value consumes it; branch-merge analysis ensures at-most-once use conservatively.
+- **Actor sends**: the analyzer permits locally sendable `iso`, `lineariso`, `val`, and `tag` values, subject to transfer/aliasing rules. `ref` and `trn` cannot be sent as mutable aliases. Remote sends also require a network-serializable representation; a locally transferable value is not necessarily remotely sendable.
+- **Compile-time qualifiers versus runtime ownership**: capability qualifiers are checked statically and need no runtime *capability-tag* checks. ORCA collection, message transfer, and runtime/host validation still have costs and correctness obligations.
+- **Linear use**: `lineariso` analysis conservatively tracks consumption across branches. This establishes a checked source-level rule, not an assertion that all unsafe runtime and external integrations have been formally verified.
 
 ## Type System
 
-- **Hindley-Milner inference** (Algorithm W): full type inference with polymorphism. The compiler infers types globally — you write annotations only for public APIs.
-- **No `any` / `dynamic`**: every expression has a known type. There are no implicit coercions or runtime type checks.
+- **Hindley-Milner inference** (Algorithm W): polymorphic local expressions often need no annotations. Actor behavior and other externally checked boundaries still require explicit contracts.
+- **Typed core**: Nulang does not expose a general `any`/`dynamic` escape hatch in its core type system. Boundary checks and dynamic runtime dispatch still exist; they should not be confused with compile-time proofs.
 - **Pattern matching**: variants, tuples, records, nested patterns, and guards are type-checked, but compile-time exhaustiveness analysis is not complete yet. A non-exhaustive `match` can still reach the runtime `non-exhaustive match` error path. Compile-time exhaustiveness is tracked as P0 correctness work in issue #332.
-- **No null**: `nil` is an explicit tagged value with its own type (`Nil`). You cannot dereference nil — the type system tracks where `nil` may flow.
+- **Explicit `nil`**: `nil` is a tagged value with a distinct type (`Nil`), not an implicit nullable form of every reference type. Host, FFI, and experimental backend behavior requires separate validation.
 - **Row polymorphism**: records are structurally typed. A function accepting `{ x: Int, y: Int }` works with any record containing those fields (and any others) — no type-level casting needed.
 
 ## Effect System
@@ -49,16 +49,18 @@ fn greet() -> Unit ! {IO} {
 ```
 
 - **Row polymorphism**: `!{IO | e}` means "IO plus whatever other effects the caller has." Effects compose without monad transformers.
-- **Handler exhaustiveness**: unhandled effects are compile-time errors. If a function performs `State.get`, the caller must either handle `State` or propagate it in its own effect row.
-- **Side-effect documentation**: the effect row IS the documentation. You can see every side effect a function may have by reading its type signature.
+- **Static effect-row checking**: the checker rejects a function whose inferred effects exceed an explicitly permitted row. This constrains what it *may request*; it does not prove that every dynamically performed effect has a handler installed.
+- **Dynamic handler resolution**: handlers are selected at runtime. An unhandled operation can produce `Unhandled effect` at runtime; see `conformance/behavior/resume_12_unhandled_effect_runtime_error.json` and `SPEC2.md`.
+- **External authority is separate**: an effect row does not grant access to a particular file, secret, or network endpoint. The runtime must enforce those grants at host boundaries. See `docs/SEMANTIC_STABILIZATION_CONTRACT.md`.
+- **Effect rows as interfaces**: effect rows document checked effect requirements, not a complete account of ambient runtime, persistence, or backend behavior.
 
 ## Actor Isolation
 
-Actors share no memory. All communication is via message passing — there is no shared mutable state between actors.
+Actors communicate through messages and are intended to prevent cross-actor mutable aliases. Some immutable or transferable values use runtime-managed representations; actor isolation therefore relies on both static sendability checks and runtime ownership handling.
 
-- **Mailbox isolation**: each actor has a private mailbox. Delivery can fail—for example, a bounded mailbox can overflow or a target can disappear—and those failures are routed through the runtime's failure/DLQ paths rather than silently executing another handler.
-- **Per-actor GC**: ORCA garbage collection operates per-actor. One actor's GC cycle never pauses another actor — no global stop-the-world.
-- **Supervision isolation**: supervision trees restart failed actors in isolation. A crashing actor's memory is released; other actors continue running.
+- **Mailbox isolation**: actors have private mailboxes. Spawned actors currently default to unbounded mailboxes; configured capacity provides backpressure. Failed delivery and remote transport behavior must be handled explicitly.
+- **ORCA memory management**: actor-local ownership and runtime-managed cross-actor references reduce broad heap coupling. Do not infer that every collector operation is independent or that there are no global coordination points.
+- **Supervision**: links, monitors, restart policies, and actor isolation support containment. Actual recovery guarantees depend on the execution and persistence path.
 
 ## Fault Tolerance
 
@@ -67,7 +69,7 @@ Nulang inherits BEAM/OTP fault-tolerance patterns:
 - **Supervision trees**: four restart strategies — `one_for_one`, `one_for_all`, `rest_for_one`, `simple_one_for_one`. Configurable restart intensity (max restarts per time window).
 - **Exit trapping**: actors can trap exits from linked or monitored actors, handling failures as messages rather than crashing.
 - **Process groups**: named groups of actors for coordinated shutdown or broadcast.
-- **Durable workflows**: checkpointed state with saga compensation — if a workflow step fails, previously completed steps are compensated (rolled back) automatically.
+- **Durable workflows (experimental)**: history, checkpoints, and saga compensation exist, but compensation is not a transactional rollback of arbitrary external effects. Suspended resume and failed persistence boundaries are still being hardened (see [issue #1389](https://github.com/nulang-org/nulang/issues/1389)).
 - **Cascading shutdown**: when a supervisor terminates, all children are shut down in dependency order. Abnormal kills propagate to linked actors unless trapped.
 
 ## Comparisons
@@ -76,17 +78,17 @@ Nulang inherits BEAM/OTP fault-tolerance patterns:
 
 | | Nulang | Rust |
 |---|---|---|
-| **Memory safety** | Capabilities + ORCA GC | Ownership + borrowing + lifetimes |
+| **Memory management model** | Reference capabilities + ORCA GC; unsafe runtime boundaries still need validation | Ownership + borrowing + lifetimes |
 | **Lifetime annotations** | None needed | Explicit `'a` annotations |
 | **Sendable by default** | `val` (immutable) is sendable; `iso` transfers ownership | `Send + Sync` traits |
-| **Concurrency bugs** | Prevented by actor isolation + capabilities | Prevented by `Send`/`Sync` + borrow checker |
+| **Concurrency model** | Isolated actors with checked sendability; distributed/runtime invariants under stabilization | `Send`/`Sync` plus ownership rules |
 
 ### vs Go
 
 | | Nulang | Go |
 |---|---|---|
-| **Data race detection** | Compile-time (capabilities) | Runtime (`go run -race`) |
-| **Nil safety** | Nil is typed and checked | Nil dereference panics at runtime |
+| **Data-race strategy** | Static sendability and actor isolation; runtime enforcement still matters | Race detector plus Go memory model |
+| **Nil model** | Distinct `Nil` type, with backend/boundary validation still required | Nil values on supported types; invalid dereferences panic |
 | **Error handling** | Pattern matching on `Result` | `if err != nil` |
 | **Effect tracking** | Compile-time effect rows | No effect system |
 
@@ -97,14 +99,14 @@ Nulang inherits BEAM/OTP fault-tolerance patterns:
 | **Type safety** | Static types catch bugs at compile time | Dynamic types — errors surface at runtime |
 | **Effect documentation** | Effect rows in type signatures | No effect tracking — any function can do I/O |
 | **Pattern matching** | Typed; compile-time exhaustiveness analysis is still incomplete | Non-exhaustive by default |
-| **Fault tolerance** | Same OTP supervision primitives | Same OTP supervision primitives |
+| **Fault tolerance** | OTP-inspired supervision and monitors; semantics still stabilizing | Mature OTP runtime and libraries |
 
 ### vs C/C++
 
 | | Nulang | C/C++ |
 |---|---|---|
 | **Manual memory management** | None — ORCA GC per actor | `malloc`/`free`, `new`/`delete` |
-| **Use-after-free** | Impossible (GC + capabilities) | Common source of CVEs |
+| **Use-after-free defense** | Managed memory and checked capabilities; raw `Value`/FFI soundness work remains | Manual ownership and unsafe pointers require discipline |
 | **Buffer overflows** | Bounds-checked arrays | Raw pointer arithmetic |
-| **Data races** | Prevented by capabilities | Undefined behavior |
-| **Null dereference** | Typed `nil`, checked by type system | Segmentation fault |
+| **Data-race defense** | Static actor-send restrictions plus runtime isolation | Unsynchronized C/C++ data races are undefined behavior |
+| **Null handling** | Distinct `Nil` type; boundary correctness is separately validated | Invalid dereference is undefined behavior |
