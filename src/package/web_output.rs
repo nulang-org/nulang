@@ -241,6 +241,40 @@ mod tests {
     }
 
     #[test]
+    fn aliases_of_the_same_output_share_one_build_lock() {
+        let fixture = Fixture::new("aliases");
+        let child = fixture.0.join("subdir");
+        fs::create_dir_all(&child).unwrap();
+        let first = StagedWebOutput::prepare(&fixture.output()).unwrap();
+        let alias = child.join("../dist");
+        let err = match StagedWebOutput::prepare(&alias) {
+            Ok(_) => panic!("path aliases must not bypass the build lock"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        drop(first);
+        assert!(StagedWebOutput::prepare(&alias).is_ok());
+    }
+
+    #[test]
+    fn orphaned_lock_is_not_silently_stolen() {
+        let fixture = Fixture::new("orphan");
+        let lock = fixture.0.join(".dist.nulang-build.lock");
+        fs::write(&lock, b"pid=999999\n").unwrap();
+
+        let err = match StagedWebOutput::prepare(&fixture.output()) {
+            Ok(_) => panic!("orphaned lock must fail closed"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&lock).unwrap(), b"pid=999999\n");
+
+        // An operator has verified there is no active owner.
+        fs::remove_file(lock).unwrap();
+        assert!(StagedWebOutput::prepare(&fixture.output()).is_ok());
+    }
+
+    #[test]
     fn successful_build_releases_lock_for_next_build() {
         let fixture = Fixture::new("unlock");
         let first = StagedWebOutput::prepare(&fixture.output()).unwrap();
