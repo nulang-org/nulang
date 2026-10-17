@@ -1,7 +1,7 @@
 //! `nula` CLI subcommands: `new`, `init`, `build`, `build-wasm`, `test`, `run`,
 //! `list`, `clean`, `add`, `remove`, `watch`, `publish`, `deploy`.
 
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -76,6 +76,7 @@ pub fn run(args: &[String]) -> NuResult<()> {
             cmd_new(path_arg, template)
         }
         Some("init") => cmd_init(),
+        Some("release") => cmd_release(&args[1..]),
         Some("build") => {
             let web = args.get(1).map(String::as_str) == Some("--web");
             if web {
@@ -266,7 +267,7 @@ pub fn run(args: &[String]) -> NuResult<()> {
 
         Some(other) => Err(NuError::PackageError {
             msg: format!(
-                "unknown nula subcommand '{}' (expected new, init, build, build-wasm, test, run, add, remove, publish, deploy, watch, doc, list, or clean)",
+                "unknown nula subcommand '{}' (expected new, init, release, build, build-wasm, test, run, add, remove, publish, deploy, watch, doc, list, or clean)",
                 other
             ),
             span: Span::default(),
@@ -275,6 +276,67 @@ pub fn run(args: &[String]) -> NuResult<()> {
             print_usage();
             Ok(())
         }
+    }
+}
+
+/// Offline release manifest operations. Never sign, authorize or dispatch
+/// based solely on a self-declared release ID.
+fn cmd_release(args: &[String]) -> NuResult<()> {
+    use crate::agent_release::{
+        AgentReleaseDefinition, AgentReleaseEnvelope, MAX_RELEASE_BYTES,
+    };
+
+    let [action, path] = args else {
+        return Err(release_cli_error(
+            "usage: nulang nula release <seal|verify> <file.json>",
+        ));
+    };
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .map_err(release_cli_error)?
+        .take((MAX_RELEASE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(release_cli_error)?;
+    if bytes.len() > MAX_RELEASE_BYTES {
+        return Err(release_cli_error("release file exceeds 65536 bytes"));
+    }
+
+    match action.as_str() {
+        "seal" => {
+            let definition: AgentReleaseDefinition =
+                serde_json::from_slice(&bytes).map_err(release_cli_error)?;
+            let envelope =
+                AgentReleaseEnvelope::seal(definition).map_err(release_cli_error)?;
+            println!(
+                "{}",
+                serde_json::to_string(&envelope).map_err(release_cli_error)?
+            );
+        }
+        "verify" => {
+            let envelope =
+                AgentReleaseEnvelope::parse_and_verify(&bytes).map_err(release_cli_error)?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "schema_version": 1,
+                    "command": "release.verify",
+                    "release_id": envelope.release_id
+                })
+            );
+        }
+        _ => {
+            return Err(release_cli_error(
+                "usage: nulang nula release <seal|verify> <file.json>",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn release_cli_error(error: impl std::fmt::Display) -> NuError {
+    NuError::PackageError {
+        msg: format!("agent release: {error}"),
+        span: Span::default(),
     }
 }
 
@@ -288,6 +350,8 @@ fn print_usage() {
     println!("                Scaffold a new package directory");
     println!("                Templates: default, cli, lib, full");
     println!("  init          Scaffold a new package in the current directory");
+    println!("  release seal <definition.json>    Seal immutable agent release");
+    println!("  release verify <release.json>     Verify release identity");
     println!("  build         Build .nbc + RFC 0020 behavior sidecar in .nula/dist/");
     println!("  build-wasm    Build package to .wasm + .cwasm in .nula/dist/");
     println!("  test [--filter <substr>] [--verbose|-v] [--watch|-w]  Run .nula test files");
