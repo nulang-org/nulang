@@ -373,12 +373,15 @@ impl Mailbox {
         true
     }
 
-    fn release_slot(&self, system: bool) {
-        let previous = self.queued_count.fetch_sub(1, Ordering::Relaxed);
-        debug_assert!(previous > 0, "mailbox logical count underflow");
+    /// Only called from exclusive scheduler-owned dequeue/receive paths.
+    fn release_slot(&mut self, system: bool) {
+        let queued = self.queued_count.get_mut();
+        debug_assert!(*queued > 0, "mailbox logical count underflow");
+        *queued = (*queued).wrapping_sub(1);
         if !system && self.capacity != 0 {
-            let previous_normal = self.normal_count.fetch_sub(1, Ordering::Relaxed);
-            debug_assert!(previous_normal > 0, "mailbox normal credit underflow");
+            let normal = self.normal_count.get_mut();
+            debug_assert!(*normal > 0, "mailbox normal credit underflow");
+            *normal = (*normal).wrapping_sub(1);
         }
     }
 
@@ -397,11 +400,21 @@ impl Mailbox {
     }
 
     /// Push a message from the scheduler thread.
+    ///
+    /// Exclusive `&mut self` access rules out concurrent shared producers
+    /// during this call, so both counters can use non-atomic updates. Shared
+    /// `push(&self)` still reserves normal credits using atomic CAS.
     pub fn push_local(&mut self, msg: Message) -> Result<(), Message> {
         let system = msg.priority == MessagePriority::System;
-        if !self.reserve_slot(system) {
-            return Err(msg);
+        if !system && self.capacity != 0 {
+            let normal = self.normal_count.get_mut();
+            if *normal >= self.capacity {
+                return Err(msg);
+            }
+            *normal = (*normal).wrapping_add(1);
         }
+        let queued = self.queued_count.get_mut();
+        *queued = (*queued).wrapping_add(1);
         self.local_queue.push_back(msg);
         Ok(())
     }
