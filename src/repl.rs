@@ -580,6 +580,7 @@ impl Repl {
 
         let combined_module = AstModule {
             name: "repl".to_string(),
+            exports: vec![],
             decls: combined_decls,
         };
 
@@ -659,6 +660,7 @@ impl Repl {
                     Decl::Function { name, .. } => {
                         let decl_ty = self.type_checker.check_module(&AstModule {
                             name: "repl".to_string(),
+                            exports: vec![],
                             decls: context_decls.clone(),
                         })?;
                         println!("{} : {}", name, type_to_string(&decl_ty));
@@ -666,6 +668,7 @@ impl Repl {
                     Decl::LetBinding { name, .. } | Decl::Signal { name, .. } => {
                         let decl_ty = self.type_checker.check_module(&AstModule {
                             name: "repl".to_string(),
+                            exports: vec![],
                             decls: context_decls.clone(),
                         })?;
                         println!("{} : {}", name, type_to_string(&decl_ty));
@@ -742,6 +745,7 @@ impl Repl {
 
         let module = AstModule {
             name: "typecheck".to_string(),
+            exports: vec![],
             decls: combined_decls,
         };
 
@@ -978,6 +982,7 @@ impl Repl {
         });
         let module = AstModule {
             name: "effectcheck".to_string(),
+            exports: vec![],
             decls: combined_decls,
         };
         let _ty = self.type_checker.check_module(&module)?;

@@ -49,6 +49,7 @@ pub fn compile_modules_contracts(modules: &[AstModule]) -> ContractCompilation {
 
     let mut combined = AstModule {
         name: "__web_contract_package".to_string(),
+        exports: vec![],
         decls: modules
             .iter()
             .flat_map(|module| module.decls.iter().cloned())
