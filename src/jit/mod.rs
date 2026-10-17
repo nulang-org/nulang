@@ -474,12 +474,7 @@ impl JitSession {
     /// Cache a native leaf in its module's dispatch slice. Replacement is
     /// idempotent: recompiling a leaf may update its pointer, not duplicate
     /// its function index.
-    fn cache_native_leaf_call(
-        &mut self,
-        module_idx: usize,
-        func_idx: usize,
-        call: NativeLeafCall,
-    ) {
+    fn cache_native_leaf_call(&mut self, module_idx: usize, func_idx: usize, call: NativeLeafCall) {
         self.native_leaf_calls.insert((module_idx, func_idx), call);
         if self.native_leaf_dispatch.len() <= module_idx {
             self.native_leaf_dispatch
