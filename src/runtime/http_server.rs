@@ -552,9 +552,9 @@ where
 /// RFC HTTP field names and RFC 6265 cookie names use the token grammar.
 fn http_token(input: &str) -> bool {
     !input.is_empty()
-        && input.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
-        })
+        && input
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
 }
 
 /// Disallow response header injection and caller-controlled framing fields.
@@ -1339,7 +1339,9 @@ mod tests {
         });
         let mut connection = TcpStream::connect(address).expect("connect test client");
         let mut output = Vec::new();
-        connection.read_to_end(&mut output).expect("read HTTP response");
+        connection
+            .read_to_end(&mut output)
+            .expect("read HTTP response");
         server.join().expect("response writer did not panic");
         String::from_utf8(output).expect("HTTP output is UTF-8")
     }
