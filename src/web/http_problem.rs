@@ -87,6 +87,47 @@ mod tests {
         assert_eq!(problem["source"], "query");
     }
 
+
+    #[test]
+    fn server_http_problem_never_exposes_internal_binding_diagnostics() {
+        let error = RequestDecodeError {
+            kind: RequestDecodeErrorKind::InvalidHandlerSlot,
+            source: Some(RouteBindingSource::Header),
+            source_name: Some("X-Internal-Tenant-Secret".to_string()),
+            handler_param: Some("secret_tenant_validator".to_string()),
+            handler_index: Some(987),
+            expected_type: Some("InternalCapability".to_string()),
+            message: "secret_tenant_validator points to impossible slot 987".to_string(),
+        };
+
+        // The transport-neutral error remains useful to server-side diagnostics.
+        assert!(error.problem_details()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("secret_tenant_validator"));
+
+        // The externally serialized problem must not disclose internal details.
+        let response = request_decode_problem_response(&error);
+        assert_eq!(response.status, 500);
+        let problem: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(problem["status"], 500);
+        assert_eq!(problem["code"], "internal_server_error");
+        let exposed = String::from_utf8(response.body).unwrap();
+        for forbidden in [
+            "secret_tenant_validator",
+            "X-Internal-Tenant-Secret",
+            "InternalCapability",
+            "987",
+            "invalid_handler_slot",
+            "handler_param",
+            "handler_index",
+            "expected_type",
+            "source_name",
+        ] {
+            assert!(!exposed.contains(forbidden), "exposed {forbidden}: {exposed}");
+        }
+    }
+
     #[test]
     fn binding_plan_failure_stays_server_problem_response() {
         let error = RequestDecodeError {
@@ -102,7 +143,10 @@ mod tests {
         let response = request_decode_problem_response(&error);
         assert_eq!(response.status, 500);
         let problem: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
-        assert_eq!(problem["code"], "incomplete_binding_plan");
-        assert_eq!(problem["handler_index"], 1);
+        assert_eq!(problem["code"], "internal_server_error");
+        assert_eq!(problem["title"], "Internal Server Error");
+        assert_eq!(problem["type"], "about:blank");
+        assert!(problem.get("handler_index").is_none());
+        assert!(problem.get("detail").is_none());
     }
 }
