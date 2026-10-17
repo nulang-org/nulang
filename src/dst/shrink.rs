@@ -160,7 +160,7 @@ mod tests {
         let events = [Event::Noise, Event::Send];
         let minimized = minimize_failing_trace(&events, 100, ordered_failure);
         assert_eq!(minimized.status, MinimizationStatus::NotFailing);
-        assert_eq!(minimized.trace, events);
+        assert_eq!(minimized.trace, events.to_vec());
         assert_eq!(minimized.replays, 1);
     }
 
@@ -170,7 +170,7 @@ mod tests {
         let minimized = minimize_failing_trace(&events, 0, |_| panic!("must not replay"));
         assert_eq!(minimized.status, MinimizationStatus::BudgetExhausted);
         assert_eq!(minimized.replays, 0);
-        assert_eq!(minimized.trace, events);
+        assert_eq!(minimized.trace, events.to_vec());
     }
 
     #[test]
@@ -179,7 +179,7 @@ mod tests {
         let minimized = minimize_failing_trace(&events, 1, ordered_failure);
         assert_eq!(minimized.status, MinimizationStatus::BudgetExhausted);
         assert_eq!(minimized.replays, 1);
-        assert_eq!(minimized.trace, events);
+        assert_eq!(minimized.trace, events.to_vec());
     }
 
     #[test]
