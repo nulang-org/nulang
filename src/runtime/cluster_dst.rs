@@ -191,11 +191,27 @@ impl DeterministicCluster {
         let bus = self.bus.clone();
         let mut rt = Runtime::new();
         rt.install_virtual_clock();
+        // A process restart does not rewind wall time. Bring the fresh
+        // virtual clock to this harness's current round BEFORE joining the
+        // cluster, so heartbeat/probe/deadline timestamps use the same
+        // simulated time horizon as the surviving nodes.
+        rt.advance_time(Duration::from_millis(
+            self.round.saturating_mul(ROUND_STEP.as_millis() as u64),
+        ));
         let transport =
             DeterministicNetworkTransport::bind_with_bus(addr, bus).expect("dst transport binds");
         transport.register_on_bus();
         rt.enable_distribution_with_transport(Box::new(transport))
             .expect("dst distribution enables");
+        // Recreating the transport must not silently disable fault injection
+        // for just this node after a crash/restart cycle.
+        if self.reorder {
+            rt.distributed
+                .transport
+                .as_mut()
+                .expect("dst transport")
+                .set_reorder(true);
+        }
         if let Some(cluster) = rt.distributed.cluster.as_mut() {
             cluster.set_rng(Box::new(DeterministicRng::new(self.rng.next())));
         }
