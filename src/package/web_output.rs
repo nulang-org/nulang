@@ -334,6 +334,38 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_atomic_exchange_preserves_both_nonempty_directories() {
+        let fixture = Fixture::new("exchange");
+        let previous = fixture.0.join("previous");
+        let candidate = fixture.0.join("candidate");
+        fs::create_dir(&previous).unwrap();
+        fs::create_dir(&candidate).unwrap();
+        fs::write(previous.join("index.html"), b"old").unwrap();
+        fs::write(candidate.join("index.html"), b"new").unwrap();
+
+        linux_atomic_exchange(&candidate, &previous).unwrap();
+        assert_eq!(fs::read(previous.join("index.html")).unwrap(), b"new");
+        assert_eq!(fs::read(candidate.join("index.html")).unwrap(), b"old");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_atomic_exchange_failure_does_not_remove_previous_output() {
+        let fixture = Fixture::new("exchange-missing");
+        let previous = fixture.0.join("previous");
+        let missing = fixture.0.join("missing");
+        fs::create_dir(&previous).unwrap();
+        fs::write(previous.join("index.html"), b"preserved").unwrap();
+
+        assert!(linux_atomic_exchange(&missing, &previous).is_err());
+        assert_eq!(
+            fs::read(previous.join("index.html")).unwrap(),
+            b"preserved"
+        );
+    }
+
     #[test]
     fn publication_rename_failure_restores_previous_directory() {
         let fixture = Fixture::new("rollback");
