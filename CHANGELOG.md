@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Experimental actor lifecycle diagnostics — 2026-10-17
+- **Opt-in per-actor flight recording now distinguishes local mailbox admission, capacity backpressure, and scheduler dequeue.** The bounded, per-actor event sequence does not guarantee handler completion or cover every remote/system delivery path.
+- **A metadata-only JSONL export omits payload values and legacy in-memory payload summaries.** Three targeted regressions cover bounded chronological events, redaction, and local admission/backpressure/dequeue. Local rust/CI validation is required before merging.
+
 ### Bounded Nulang Web development-server connections — 2026-10-16
 - **The experimental Web development listener caps active connections at 64**, including SSE, and returns `503` with `Retry-After: 1` when full.
 - **Worker capacity is returned by a scoped RAII lease** after normal completion, panic, or thread-spawn failure. One shared `Arc` route table replaces per-connection clones of compiled route modules.
