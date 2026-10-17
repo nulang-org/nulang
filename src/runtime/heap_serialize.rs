@@ -953,6 +953,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn v1_continuation_rejects_wide_int_without_silent_reinterpretation() {
+        // The heap tag is in-memory only. Existing NLCS v1 readers may not
+        // reinterpret the formerly unknown discriminant 9 as a new object.
+        assert_eq!(TypeTag::WideInt as u8, 9);
+        assert!(TypeTag::from_u8(9).is_none());
+        assert!(ensure_v1_type_supported(TypeTag::WideInt).is_err());
+        assert!(ensure_v1_type_supported(TypeTag::Array).is_ok());
+        assert!(ensure_v1_type_supported(TypeTag::Raw).is_ok());
+    }
+
+    #[test]
     fn test_format_constants() {
         assert_eq!(MAGIC, *b"NLCS");
         assert_eq!(VERSION, 1);
