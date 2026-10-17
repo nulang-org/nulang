@@ -4025,6 +4025,75 @@ mod optimize_tests {
     }
 
     #[test]
+    fn test_fold_function_does_not_report_change_when_unfoldable() {
+        let mut b = mir::FunctionBuilder::new("unfoldable", Some(Type::bool()));
+        let param = b.add_param("param", Type::bool());
+        let result = b.add_temp(Type::bool());
+        b.assign(result, mir::RValue::Load(param));
+        b.terminate(mir::Terminator::Return(Some(result)));
+        let mut func = b.build();
+        let before = func.blocks.clone();
+        let constants = collect_const_locals(&func);
+        let floats = float_locals(&func);
+
+        assert!(
+            !fold_function(&mut func, &constants, &floats),
+            "an unchanged MIR assignment must not force another optimization iteration"
+        );
+        assert_eq!(func.blocks, before);
+    }
+
+    #[test]
+    fn test_receive_match_payload_invalidates_constant_local() {
+        let mut b = mir::FunctionBuilder::new("receive_payload", Some(Type::bool()));
+        let match_index = b.add_temp(Type::int());
+        let payload = b.add_temp(Type::bool()); // ReceiveMatch writes match_index + 1.
+        let result = b.add_temp(Type::bool());
+        b.assign(payload, mir::RValue::Const(Constant::Bool(true)));
+        b.assign(
+            match_index,
+            mir::RValue::ReceiveMatch {
+                behavior_ids: vec![1],
+                max_params: 1,
+            },
+        );
+        b.assign(result, mir::RValue::Load(payload));
+        b.terminate(mir::Terminator::Return(Some(result)));
+        let func = b.build();
+
+        assert!(
+            !collect_const_locals(&func).contains_key(&payload),
+            "the payload local is overwritten implicitly by selective receive"
+        );
+    }
+
+    #[test]
+    fn test_receive_wait_payload_invalidates_constant_local() {
+        let mut b = mir::FunctionBuilder::new("receive_wait_payload", Some(Type::bool()));
+        let match_index = b.add_temp(Type::int());
+        let payload = b.add_temp(Type::bool());
+        let timeout = b.add_temp(Type::int());
+        let result = b.add_temp(Type::bool());
+        b.assign(payload, mir::RValue::Const(Constant::Bool(true)));
+        b.assign(
+            match_index,
+            mir::RValue::ReceiveWait {
+                behavior_ids: vec![1],
+                max_params: 1,
+                timeout,
+            },
+        );
+        b.assign(result, mir::RValue::Load(payload));
+        b.terminate(mir::Terminator::Return(Some(result)));
+        let func = b.build();
+
+        assert!(
+            !collect_const_locals(&func).contains_key(&payload),
+            "the payload local is overwritten implicitly by timed selective receive"
+        );
+    }
+
+    #[test]
     fn test_jump_thread() {
         // Manually build block0: Jump(1), block1: Jump(2), block2:
         // Const(42); Return. After threading, block0 jumps straight to
