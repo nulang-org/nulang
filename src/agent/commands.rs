@@ -62,7 +62,7 @@ fn print_help() {
            nulang agent run  [--project <dir>] [--message <text>]\n\
            nulang agent chat [--project <dir>]\n\
            nulang agent goals [--project <dir>]\n\
-           nulang agent graph --goal <uuid> [--project <dir>]\n           nulang agent mcp serve [--port <n>]\n"
+           nulang agent graph --goal <uuid> [--project <dir>]\n           nulang agent mcp serve [--workspace <dir>] [--compiler <nulang-bin>]\n"
     );
 }
 
@@ -177,18 +177,36 @@ fn cmd_graph(args: &[String]) -> NuResult<()> {
 fn cmd_mcp(args: &[String]) -> NuResult<()> {
     match args.first().map(String::as_str) {
         Some("serve") => {
-            let port = args
-                .iter()
-                .position(|a| a == "--port")
-                .and_then(|i| args.get(i + 1))
-                .and_then(|p| p.parse::<u16>().ok())
-                .unwrap_or(8765);
-            eprintln!(
-                "MCP stub listening on 127.0.0.1:{} (stdio/json-rpc wiring in P2.1)",
-                port
-            );
-            Ok(())
+            // The protocol host is a separate, lightweight workspace binary;
+            // do not link MCP transport/credentials into the language runtime.
+            // Stdio is inherited: stdout must stay pure JSON-RPC.
+            let executable = std::env::var_os("NULANG_MCP_BIN")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    let sibling = std::env::current_exe()
+                        .ok()
+                        .map(|exe| exe.with_file_name(if cfg!(windows) {
+                            "nulang-ai-mcp.exe"
+                        } else {
+                            "nulang-ai-mcp"
+                        }));
+                    sibling.filter(|candidate| candidate.is_file())
+                        .unwrap_or_else(|| PathBuf::from("nulang-ai-mcp"))
+                });
+            let status = std::process::Command::new(&executable)
+                .args(&args[1..])
+                .status()
+                .map_err(|e| agent_err(format!(
+                    "cannot start Nulang MCP host ({e}); install it with: cargo install --path crates/nulang-ai-mcp"
+                )))?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(agent_err(format!("Nulang MCP host exited with {status}")))
+            }
         }
-        _ => Err(agent_err("usage: nulang agent mcp serve [--port <n>]")),
+        _ => Err(agent_err(
+            "usage: nulang agent mcp serve [--workspace <dir>] [--compiler <nulang-bin>]",
+        )),
     }
 }
