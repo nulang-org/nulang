@@ -1,0 +1,1 @@
+{"exit_code":0,"stdout":"ascii=bcd\nunicode=é\nlead_cut=<nil>\ntrail_cut=<nil>\nemoji_cut=<nil>\nclamped=é\noverflow_clamped=bc\nempty=\nnegative=<nil>","stderr":""}

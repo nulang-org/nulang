@@ -332,6 +332,13 @@ String operations built on the `String` builtin effect primitives
 (`String.length`, `String.charAt`, `String.substring`, `String.concat`).
 Functions use `perform` internally to access these effectful operations.
 
+`String.substring(s, start, length)` uses **UTF-8 byte offsets**, not Unicode
+character positions. Slices on valid character boundaries return a string;
+negative, out-of-range, or mid-codepoint bounds return `nil` rather than
+panicking. The `char_at` wrapper may return `nil` for such offsets as well,
+despite its historical out-of-range `""` convention. Use Unicode-aware
+iteration rather than per-byte substring calls for non-ASCII text.
+
 | Function | Signature | Description |
 |---|---|---|
 | `length` | `fn length(s)` | Length of the string in bytes. |
