@@ -170,6 +170,18 @@ pub fn tag_int(payload: i64) -> u64 {
     TAG_INT | ((payload as u64) & PAYLOAD_MASK)
 }
 
+/// Try to encode an integer without silently truncating values that require
+/// the future wide-Int runtime representation. The legacy `tag_int` encoder
+/// still applies 48-bit wrapping for v1 bytecode compatibility.
+#[inline]
+pub fn try_tag_int(payload: i64) -> Option<u64> {
+    if int48_in_range(payload) {
+        Some(tag_int(payload))
+    } else {
+        None
+    }
+}
+
 /// Pack a boolean into a tagged value.
 #[inline]
 pub fn tag_bool(b: bool) -> u64 {
