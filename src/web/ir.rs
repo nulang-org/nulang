@@ -364,6 +364,32 @@ mod tests {
         );
 
         assert_eq!(ir.routes.len(), 1);
+
+        // This serialized v1 shape is the producer-side compatibility contract
+        // for Cloud's read-only Web IR preflight. Runtime bindings and the
+        // emitted artifact must agree; Cloud must not reparse Nulang source.
+        let serialized: serde_json::Value =
+            serde_json::from_str(&ir.to_json()).expect("compiler Web IR is JSON");
+        assert_eq!(serialized["version"], 1);
+        assert_eq!(serialized["routes"][0]["method"], "GET");
+        assert_eq!(serialized["routes"][0]["path"], "/users/{id: Int}");
+        assert_eq!(serialized["routes"][0]["placement"], "server");
+        assert!(serialized["routes"][0]["artifact"].is_null());
+        assert_eq!(serialized["routes"][0]["handler"], "show_user");
+        assert_eq!(serialized["routes"][0]["bindings"][0]["source"], "path");
+        assert_eq!(serialized["routes"][0]["bindings"][0]["source_name"], "id");
+        assert_eq!(serialized["routes"][0]["bindings"][0]["handler_index"], 0);
+        assert!(serialized["signals"].is_object());
+        assert!(serialized["capabilities"].is_array());
+        // This exact v1 envelope is also parsed by Nulang Cloud's read-only
+        // preflight. If the compiler changes its output, update both fixture
+        // consumers deliberately rather than silently drifting the protocol.
+        let expected: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/web_ir_v1_compiler_contract.json"
+        ))
+        .expect("shared compiler Web IR contract fixture must be JSON");
+        assert_eq!(serialized, expected, "compiler Web IR v1 contract drift");
+
         assert_eq!(ir.routes[0].handler.as_deref(), Some("show_user"));
         assert_eq!(ir.routes[0].response_type.as_deref(), Some("Html"));
         assert_eq!(ir.routes[0].placement, "server");
