@@ -65,13 +65,38 @@ pub fn validation_diagnostics(compilation: &ContractCompilation) -> Vec<String> 
         // Static artifacts are only meaningful for safe retrieval methods.
         // A declared static mutation must fail before build tooling can
         // execute its handler to generate an HTML artifact.
-        if route.placement.as_deref() == Some("static")
-            && !matches!(route.method.as_str(), "GET" | "HEAD")
-        {
-            diagnostics.push(format!(
-                "route {} {}: static placement only supports GET or HEAD",
-                route.method, route.path
-            ));
+        if route.placement.as_deref() == Some("static") {
+            if !matches!(route.method.as_str(), "GET" | "HEAD") {
+                diagnostics.push(format!(
+                    "route {} {}: static placement only supports GET or HEAD",
+                    route.method, route.path
+                ));
+            }
+            if route.path.split('/').any(|segment| {
+                segment.starts_with(':')
+                    || segment.contains('{')
+                    || segment.contains('}')
+                    || segment == "."
+                    || segment == ".."
+                    || segment.contains('\\')
+            }) {
+                diagnostics.push(format!(
+                    "route {} {}: static placement requires a literal safe path",
+                    route.method, route.path
+                ));
+            }
+            if route.effects.iter().any(|effect| effect != "Render") {
+                diagnostics.push(format!(
+                    "route {} {}: static placement has unsupported declared effects",
+                    route.method, route.path
+                ));
+            }
+            if route.handler_params.iter().any(|param| param.request.is_some()) {
+                diagnostics.push(format!(
+                    "route {} {}: static placement cannot bind request inputs",
+                    route.method, route.path
+                ));
+            }
         }
     }
 
