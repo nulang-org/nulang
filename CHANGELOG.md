@@ -251,6 +251,9 @@ version + migration.*
 
 ## Stable tier
 
+### WASM guest execution budget — 2026-09-21
+- **Deterministic fuel enforcement across every Wasmtime host path** (Experimental backend hardening, `src/wasm_runtime.rs`, `src/wasm_component_runtime.rs`, `src/wasmfx_runtime.rs`). Wasmtime fuel consumption is enabled for module, Component Model, and WasmFX execution. Each invocation or pooled-component checkout receives a fresh 100,000,000-fuel budget, so non-terminating guest code traps instead of monopolizing a host thread. Caller-supplied module configs cannot accidentally disable this termination boundary. Infinite-loop regressions cover the module and WasmFX runtimes; the threat model now records both fuel enforcement and the already-implemented component import capability gate.
+
 ### Preserve observable MIR panic through DCE — 2026-09-24
 - **MIR dead-store elimination now treats `RValue::Panic` as observable/divergent** (`src/mir_codegen.rs`), so an unused panic result cannot cause a reachable contract/precondition failure to be optimized away. A focused optimizer regression pins the behavior.
 ### Zero-copy non-reentrant JIT register entry — 2026-09-24

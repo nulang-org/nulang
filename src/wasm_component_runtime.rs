@@ -1,6 +1,8 @@
 use crate::types::{NuError, NuResult, Span};
 
 #[cfg(feature = "wasm-backend")]
+use crate::wasm_runtime::DEFAULT_WASM_FUEL;
+#[cfg(feature = "wasm-backend")]
 use wasmtime::component::*;
 #[cfg(feature = "wasm-backend")]
 use wasmtime::*;
@@ -26,6 +28,7 @@ pub fn component_config() -> Config {
     config.memory_guard_size(128 << 20);
     config.cranelift_opt_level(OptLevel::Speed);
     config.wasm_simd(true);
+    config.consume_fuel(true);
     config
 }
 
@@ -188,6 +191,13 @@ impl ComponentRuntime {
     fn checkout(&self) -> NuResult<PooledInstance> {
         if let Some(mut pooled) = self.pool.lock().unwrap().pop() {
             pooled.store.data_mut().log_messages.clear();
+            pooled
+                .store
+                .set_fuel(DEFAULT_WASM_FUEL)
+                .map_err(|e| NuError::VMError {
+                    msg: format!("wasmtime fuel: {}", e),
+                    span: Span::default(),
+                })?;
             return Ok(pooled);
         }
         let mut store = Store::new(
@@ -197,6 +207,12 @@ impl ComponentRuntime {
                 log_messages: Vec::new(),
             },
         );
+        store
+            .set_fuel(DEFAULT_WASM_FUEL)
+            .map_err(|e| NuError::VMError {
+                msg: format!("wasmtime fuel: {}", e),
+                span: Span::default(),
+            })?;
         let instance = self
             .linker
             .instantiate(&mut store, &self.component)
@@ -294,6 +310,7 @@ mod tests {
                 log_messages: Vec::new(),
             },
         );
+        store.set_fuel(DEFAULT_WASM_FUEL).expect("set fuel");
         let linker = ComponentRuntime::build_linker(&engine, rt.caps).expect("linker");
         let component = wasmtime::component::Component::new(&engine, &wasm).expect("component");
         let err = linker
@@ -329,6 +346,7 @@ mod tests {
                 log_messages: Vec::new(),
             },
         );
+        store.set_fuel(DEFAULT_WASM_FUEL).expect("set fuel");
         let linker = ComponentRuntime::build_linker(&engine, rt.caps).expect("linker");
         let component = wasmtime::component::Component::new(&engine, &wasm).expect("component");
         let _instance = linker
