@@ -1,5 +1,5 @@
 //! `nula` CLI subcommands: `new`, `init`, `build`, `build-wasm`, `test`, `run`,
-//! `list`, `clean`, `add`, `remove`, `watch`, `publish`, `deploy`.
+//! `list`, `clean`, `add`, `remove`, `watch`, `publish`, `deploy`, `inspect`.
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -76,6 +76,14 @@ pub fn run(args: &[String]) -> NuResult<()> {
             cmd_new(path_arg, template)
         }
         Some("init") => cmd_init(),
+        Some("inspect") => match &args[1..] {
+            [] => cmd_inspect(false),
+            [flag] if flag.as_str() == "--json" => cmd_inspect(true),
+            _ => Err(NuError::PackageError {
+                msg: "usage: nulang nula inspect [--json]".to_string(),
+                span: Span::default(),
+            }),
+        },
         Some("build") => {
             let web = args.get(1).map(String::as_str) == Some("--web");
             if web {
@@ -266,7 +274,7 @@ pub fn run(args: &[String]) -> NuResult<()> {
 
         Some(other) => Err(NuError::PackageError {
             msg: format!(
-                "unknown nula subcommand '{}' (expected new, init, build, build-wasm, test, run, add, remove, publish, deploy, watch, doc, list, or clean)",
+                "unknown nula subcommand '{}' (expected new, init, inspect, build, build-wasm, test, run, add, remove, publish, deploy, watch, doc, list, or clean)",
                 other
             ),
             span: Span::default(),
@@ -276,6 +284,64 @@ pub fn run(args: &[String]) -> NuResult<()> {
             Ok(())
         }
     }
+}
+
+/// Read only allowlisted project metadata. Serializing the manifest
+/// wholesale would leak registry credentials and dependency URL tokens.
+fn inspect_package(root: &Path) -> NuResult<serde_json::Value> {
+    let manifest = Manifest::load(root)?;
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "command": "inspect",
+        "project": {
+            "name": manifest.package.name,
+            "version": manifest.package.version,
+            "entry": manifest.package.entry,
+            "capabilities": manifest.package.capabilities,
+            "dependencies": manifest.dependencies.keys().cloned().collect::<Vec<_>>(),
+            "lockfile_present": root.join(LOCKFILE_FILE).is_file()
+        }
+    }))
+}
+
+fn cmd_inspect(json: bool) -> NuResult<()> {
+    let report = inspect_package(&package_root()?)?;
+    if json {
+        println!("{}", report);
+    } else {
+        let project = &report["project"];
+        println!(
+            "{} v{}",
+            project["name"].as_str().unwrap_or("unknown"),
+            project["version"].as_str().unwrap_or("unknown")
+        );
+        println!("Entry: {}", project["entry"].as_str().unwrap_or(""));
+        let capabilities: Vec<&str> = project["capabilities"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        println!(
+            "Capabilities: {}",
+            if capabilities.is_empty() {
+                "none".to_string()
+            } else {
+                capabilities.join(", ")
+            }
+        );
+        println!(
+            "Dependencies: {}",
+            project["dependencies"].as_array().map_or(0, Vec::len)
+        );
+        let lockfile = if project["lockfile_present"].as_bool().unwrap_or(false) {
+            "present"
+        } else {
+            "missing"
+        };
+        println!("Lockfile: {lockfile}");
+    }
+    Ok(())
 }
 
 fn print_usage() {
@@ -288,6 +354,7 @@ fn print_usage() {
     println!("                Scaffold a new package directory");
     println!("                Templates: default, cli, lib, full");
     println!("  init          Scaffold a new package in the current directory");
+    println!("  inspect [--json]  Inspect safe project metadata for coding agents");
     println!("  build         Build .nbc + RFC 0020 behavior sidecar in .nula/dist/");
     println!("  build-wasm    Build package to .wasm + .cwasm in .nula/dist/");
     println!("  test [--filter <substr>] [--verbose|-v] [--watch|-w]  Run .nula test files");
