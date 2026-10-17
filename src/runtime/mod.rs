@@ -80,6 +80,7 @@ mod spawn;
 pub(crate) use spawn::spawn_from_module_with_authority;
 mod timer;
 mod trace;
+mod wide_int_registers;
 mod workflow;
 pub use trace::TraceContext;
 
@@ -126,6 +127,7 @@ pub use resp_cache::*;
 pub use scheduler::*;
 pub use supervisor::*;
 pub use timer::*;
+pub use wide_int_registers::*;
 
 use crate::crdt_peer_sync::PeerCrdtFrontiers;
 use crate::types::{ExitReason, NuError, Span, VmSuspension};
