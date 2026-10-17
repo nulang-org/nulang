@@ -64,6 +64,27 @@ Stacked follow-up PR after the pure Int64 kernel:
   must integrate stack-slot barriers, GC root scans, containers, actor sends,
   snapshots, and backend helper ABI before source-level `Int` is widened.
 
+## Phase 1c — generic tagged values with rooted register barriers
+
+The follow-up branch uses `RootedIntRegisters` to model VM register ownership
+while preserving the existing single-word `Value` layout. The bank
+exclusively borrows an actor's ORCA heap and GC. Small signed integers are
+`TAG_INT` values; full-width values are `TAG_PTR` values pointing to
+ORCA-managed `TypeTag::WideInt` payloads. A pointer range check prevents
+the legacy 48-bit pointer codec from silently truncating high addresses.
+
+Each register roots its own object. `copy_into` increments the local
+reference count before replacing the destination; `move_into` transfers
+ownership; overwrite, clear and bank drop decrement exactly once. Checked
+arithmetic validates a new `i64` before mutating the destination.
+Overflow, bounds errors and allocation failure retain the previous root.
+
+**Still gated:** The public bytecode VM does not use this register bank.
+Raw tagged bits remain private. Cross-actor messages, async suspension,
+containers, FFI and NLCS v1 snapshots cannot carry these wide roots. The
+source language's `Int` remains 48-bit until backend and durability
+parity are proven.
+
 ## Current code in this PR
 
 `src/int64_semantics.rs` implements the target **pure checked arithmetic
