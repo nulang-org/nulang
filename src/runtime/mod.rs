@@ -1477,6 +1477,31 @@ impl Runtime {
         grain_id: Option<GrainId>,
         object_holds: ObjectRefLease,
     ) {
+        if let Some(requested_grain) = grain_id.as_ref() {
+            // Even when the numeric handle names a live actor, it must never
+            // substitute for a different logical grain identity.
+            if grain_actor_id(requested_grain) != target_id
+                || self.grain_id_conflicts(target_id, requested_grain)
+            {
+                warn!(
+                    "nulang-grain: rejecting cross-shard identity collision for {} at handle {}",
+                    requested_grain.actor_name(),
+                    target_id
+                );
+                self.route_to_dlq(
+                    &Message {
+                        behavior_id,
+                        payload: MessagePayload::from_slice(&[]),
+                        sender,
+                        priority: MessagePriority::System,
+                        trace_id: trace_id.clone(),
+                    },
+                    "grain identity mismatch (cross-shard)",
+                );
+                return;
+            }
+        }
+
         // If the target is a known grain identity but not currently resident,
         // hydrate it before delivering the message. The `grain_id` carried on
         // grain cross-shard messages handles first-time hydration; the local
@@ -2522,6 +2547,14 @@ impl Runtime {
         sender: u64,
     ) {
         let stable_id = grain_actor_id(&grain_id);
+        if self.grain_id_conflicts(stable_id, &grain_id) {
+            warn!(
+                "nulang-grain: rejecting conflicting grain send for {} at handle {}",
+                grain_id.actor_name(),
+                stable_id
+            );
+            return;
+        }
 
         // Cross-shard routing: if the grain's stable id belongs to another
         // shard, resolve the behavior id from the grain type metadata and
@@ -2598,6 +2631,14 @@ impl Runtime {
         sender: u64,
     ) {
         let stable_id = grain_actor_id(&grain_id);
+        if self.grain_id_conflicts(stable_id, &grain_id) {
+            warn!(
+                "nulang-grain: rejecting conflicting remote grain send for {} at handle {}",
+                grain_id.actor_name(),
+                stable_id
+            );
+            return;
+        }
         let prev = self.current_actor;
         if sender != 0 {
             self.current_actor = Some(sender);
