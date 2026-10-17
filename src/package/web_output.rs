@@ -204,6 +204,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn publication_rename_failure_restores_previous_directory() {
+        let fixture = Fixture::new("rollback");
+        fs::create_dir_all(&fixture.output()).unwrap();
+        fs::write(fixture.output().join("index.html"), b"previous").unwrap();
+
+        let stage = StagedWebOutput::prepare(&fixture.output()).unwrap();
+        // Simulate a failure between the previous-output rename and promotion.
+        fs::remove_dir_all(stage.path()).unwrap();
+        assert!(stage.publish().is_err());
+        assert_eq!(
+            fs::read(fixture.output().join("index.html")).unwrap(),
+            b"previous"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_build_rejects_nested_prior_output_symlinks() {
+        use std::os::unix::fs::symlink;
+        let fixture = Fixture::new("nested-link");
+        fs::create_dir_all(fixture.output().join("nested")).unwrap();
+        fs::write(fixture.0.join("secret.txt"), b"outside").unwrap();
+        symlink(
+            fixture.0.join("secret.txt"),
+            fixture.output().join("nested/secret.txt"),
+        )
+        .unwrap();
+        assert!(StagedWebOutput::prepare(&fixture.output()).is_err());
+        assert_eq!(
+            fs::read(fixture.0.join("secret.txt")).unwrap(),
+            b"outside"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn staged_build_refuses_symlinked_prior_output() {
