@@ -1,0 +1,47 @@
+name: Distributed runtime stage benchmark
+
+on:
+  pull_request:
+    paths:
+      - 'tests/distributed_stage_bench.rs'
+      - 'tests/distributed_stage_bench_contract.rs'
+      - 'src/runtime/**'
+      - '.github/workflows/distributed-stage-bench-pr.yml'
+
+concurrency:
+  group: distributed-stage-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  distributed-stage:
+    name: Distributed send vs ingress vs scheduler
+    if: github.head_ref == 'perf/distributed-stage-decomposition-20261004'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify stage-boundary contract
+        run: cargo test --locked --no-default-features --features tcp --test distributed_stage_bench_contract
+
+      - name: Measure runtime stage decomposition
+        run: |
+          set -o pipefail
+          cargo test --locked --release --no-default-features --features tcp --test distributed_stage_bench -- --ignored --nocapture | tee benchmark-output.txt
+
+      - name: Upload benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: distributed-stage-${{ github.sha }}
+          path: benchmark-output.txt
+          if-no-files-found: error
+          retention-days: 14
