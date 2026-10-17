@@ -24,6 +24,42 @@ fn make_jit() -> JitSession {
     JitSession::new().expect("JIT must be available on test host")
 }
 
+/// Native callees are compiled once and must be cached in the correct
+/// module's dispatch table instead of rebuilding a filtered HashMap scan
+/// every time the caller's compiled region executes.
+#[test]
+fn native_leaf_dispatch_cache_is_module_scoped_and_deduplicated() {
+    let mut jit = make_jit();
+    let leaf = NativeLeafCall {
+        ptr: noop_jit_region as *const u8,
+        return_reg: 3,
+        required_args: 2,
+    };
+
+    jit.cache_native_leaf_call(1, 7, leaf);
+    jit.cache_native_leaf_call(1, 9, leaf);
+    jit.cache_native_leaf_call(3, 7, leaf);
+    jit.cache_native_leaf_call(1, 7, leaf);
+
+    let module_one = jit.native_leaf_dispatch.get(1).expect("module 1 cache");
+    assert_eq!(module_one.len(), 2, "repeated registration must not duplicate callees");
+    assert_eq!(module_one[0].0, 7);
+    assert_eq!(module_one[1].0, 9);
+    assert_eq!(module_one[0].2, 3);
+    assert_eq!(module_one[0].3, 2);
+    assert!(jit.native_leaf_dispatch[0].is_empty());
+    assert!(jit.native_leaf_dispatch[2].is_empty());
+    assert_eq!(jit.native_leaf_dispatch[3].len(), 1);
+    assert_eq!(jit.native_leaf_dispatch[3][0].0, 7);
+
+    // Reusing the module's native-call slice needs no new temporary Vec.
+    let cached_ptr = jit.native_leaf_dispatch[1].as_ptr();
+    assert_eq!(jit.native_leaf_calls_for_module(1).as_ptr(), cached_ptr);
+    assert_eq!(jit.native_leaf_calls_for_module(1).as_ptr(), cached_ptr);
+    assert!(jit.native_leaf_calls_for_module(99).is_empty());
+}
+
+
 #[test]
 fn test_jit_session_creation() {
     let jit = JitSession::new().expect("JIT must be available");
