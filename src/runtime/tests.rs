@@ -8916,7 +8916,8 @@ fn rejected_resumed_success_commit_defers_actor_destruction_until_vm_scope_ends(
 
     // This helper is invoked while resume call sites can still have a live VM
     // borrow; the caller, not the helper, must quarantine after that borrow ends.
-    rt.commit_resumed_workflow_success(actor_id, Some(activation), "resume".into());
+    let committed = rt.commit_resumed_workflow_success(actor_id, Some(activation), "resume".into());
+    assert!(!committed, "stale activation must reject completed-step commit");
 
     assert!(
         rt.actors.contains_key(&actor_id),
@@ -8944,13 +8945,14 @@ fn rejected_resumed_failure_commit_defers_actor_destruction_until_vm_scope_ends(
     let activation = workflow::commit_workflow_command(&mut rt, actor_id, 0, vec![]).unwrap();
     rt.actors.get_mut(&actor_id).unwrap().activation_epoch = 0;
 
-    rt.commit_resumed_workflow_failure(
+    let committed = rt.commit_resumed_workflow_failure(
         actor_id,
         Some(activation),
         "resume".into(),
         "injected terminal rejection".into(),
         0,
     );
+    assert!(!committed, "stale activation must reject failed-step commit");
 
     assert!(
         rt.actors.contains_key(&actor_id),
