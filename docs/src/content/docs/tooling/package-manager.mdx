@@ -9,7 +9,7 @@ registry, type-checks and compiles packages, runs tests, and publishes
 tarballs to a registry server. Every `nula` command operates on the package
 in the current working directory (the one containing `Nulang.toml`).
 
-Run `nulang nula` with no arguments to list all subcommands.
+The shorter top-level forms (`nulang new`, `nulang run`, `nulang test`, `nulang build`, `nulang dev`, and other package subcommands) dispatch to the same handlers. The existing `nulang nula <command>` syntax remains supported for compatibility. Run `nulang nula` with no arguments to list all subcommands. Use `nulang check <file.nula>` to type-check a source file and `nulang doctor` for a read-only environment report.
 
 ## Creating a package
 
