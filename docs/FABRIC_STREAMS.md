@@ -65,6 +65,26 @@ Cursor commits are monotonic and cannot advance beyond the current stream tail.
 This establishes the persistence primitive needed for later ACK/NACK semantics
 without pretending that ACK redelivery already exists.
 
+### Read-only retention planning
+
+`FileFabricStreamStore::preview_retention(stream, keep_from_sequence)`
+and `Runtime::fabric_stream_preview_retention` calculate a **non-destructive**
+whole-segment retention estimate. Results include the requested floor,
+first retained segment sequence, count and byte size of fully eligible
+segments, and lowest named consumer cursor.
+
+This API **does not delete segments, change replay visibility, or configure a
+retention policy**. It refuses invalid floors, any installed replication policy,
+a floor ahead of a named consumer cursor, and streams containing a
+`producer_state.json` file from experimental producer-idempotency work.
+The current final segment is always retained; no partial-segment trim exists.
+
+No byte/age policy, distributed deletion coordination, compaction, or
+dead-letter replay is implemented. Plans are estimates, **not durable
+authorization to delete files later**: the stream may change between preview
+and any future trim. Cluster retention first requires a quorum-proven
+committed frontier, follower catch-up, and consumer-progress coordination.
+
 ## Runtime APIs
 
 After opening storage:

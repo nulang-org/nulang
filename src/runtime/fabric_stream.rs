@@ -75,6 +75,18 @@ pub struct FabricStreamInfo {
     pub committed_sequence: u64,
 }
 
+/// A read-only estimate of whole log segments that *could* be trimmed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FabricStreamRetentionPreview {
+    pub stream: String,
+    pub requested_keep_from_sequence: u64,
+    pub first_retained_sequence: Option<u64>,
+    pub eligible_segment_count: usize,
+    pub eligible_bytes: u64,
+    /// Lowest named consumer cursor, if any.
+    pub minimum_consumer_cursor: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StreamMetadata {
     version: u16,
@@ -315,6 +327,99 @@ impl FileFabricStreamStore {
             next_sequence: state.next_sequence,
             last_sequence: state.next_sequence.checked_sub(1).filter(|&seq| seq > 0),
             committed_sequence,
+        })
+    }
+
+    /// Preview whole-segment retention eligibility without deleting anything.
+    ///
+    /// Deliberately standalone-only: replicated retention needs quorum and
+    /// follower catch-up proofs. Existing consumer cursors and producer state
+    /// must not be silently invalidated by physical segment removal.
+    pub fn preview_retention(
+        &mut self,
+        name: &str,
+        keep_from_sequence: u64,
+    ) -> io::Result<FabricStreamRetentionPreview> {
+        self.ensure_state(name)?;
+        let next_sequence = self
+            .states
+            .get(name)
+            .expect("state recovered")
+            .next_sequence;
+        if keep_from_sequence == 0 || keep_from_sequence > next_sequence {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Fabric keep-from sequence must be in 1..={next_sequence}"),
+            ));
+        }
+        if self.replication_policy(name)?.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "replicated Fabric retention needs a quorum-safe trim frontier",
+            ));
+        }
+        let dir = self.stream_dir(name);
+        // Local idempotent producer checkpoints refer to exact log records.
+        // Do not claim an eligibility proof until their migration/expiry
+        // semantics have been implemented alongside retention.
+        if dir.join("producer_state.json").exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Fabric retention cannot discard local producer checkpoint history",
+            ));
+        }
+
+        let cursors = read_cursors(&dir.join("cursors.json"))?;
+        let tail = next_sequence.saturating_sub(1);
+        if cursors.cursors.values().any(|&cursor| cursor > tail) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fabric retention preview found a consumer cursor beyond the local tail",
+            ));
+        }
+        let minimum_consumer_cursor = cursors.cursors.values().copied().min();
+        if let Some(minimum) = minimum_consumer_cursor {
+            if keep_from_sequence.saturating_sub(1) > minimum {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("Fabric retention would pass consumer cursor {minimum}"),
+                ));
+            }
+        }
+
+        let segments = list_segments(&dir)?;
+        let mut eligible_segment_count = 0;
+        let mut eligible_bytes = 0u64;
+        // Always retain the last segment. The current append state may still
+        // reference it even if all of its records precede the requested floor.
+        for index in 0..segments.len().saturating_sub(1) {
+            let (base, path) = &segments[index];
+            let next_base = segments[index + 1].0;
+            if next_base > keep_from_sequence {
+                break;
+            }
+            let records = decode_segment(path, *base, false)?;
+            if records.last().map(|record| record.sequence) != next_base.checked_sub(1) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Fabric retention preview found an invalid segment boundary",
+                ));
+            }
+            let bytes = fs::metadata(path)?.len();
+            eligible_bytes = eligible_bytes.checked_add(bytes).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "Fabric retention byte count overflow")
+            })?;
+            eligible_segment_count += 1;
+        }
+        Ok(FabricStreamRetentionPreview {
+            stream: name.to_string(),
+            requested_keep_from_sequence: keep_from_sequence,
+            first_retained_sequence: segments
+                .get(eligible_segment_count)
+                .map(|(base, _)| *base),
+            eligible_segment_count,
+            eligible_bytes,
+            minimum_consumer_cursor,
         })
     }
 
@@ -1171,6 +1276,16 @@ impl Runtime {
         self.fabric_stream_store_mut()?.stream_info(name)
     }
 
+    /// Read-only standalone stream retention estimate; never deletes records.
+    pub fn fabric_stream_preview_retention(
+        &mut self,
+        name: &str,
+        keep_from_sequence: u64,
+    ) -> io::Result<FabricStreamRetentionPreview> {
+        self.fabric_stream_store_mut()?
+            .preview_retention(name, keep_from_sequence)
+    }
+
     pub fn fabric_stream_names(&mut self) -> io::Result<Vec<String>> {
         self.fabric_stream_store_mut()?.stream_names()
     }
@@ -1979,6 +2094,148 @@ mod tests {
         store.commit_cursor("events", "worker", 2).unwrap();
         assert!(store.commit_cursor("events", "worker", 1).is_err());
         assert!(store.commit_cursor("events", "worker", 3).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retention_preview_only_plans_complete_segments_with_consumers_caught_up() {
+        let root = test_dir("retention-preview");
+        let mut store = FileFabricStreamStore::open(&root).unwrap();
+        store
+            .create_stream(
+                "events",
+                FabricStreamConfig {
+                    segment_max_bytes: 96,
+                },
+            )
+            .unwrap();
+        for payload in [b'a', b'b', b'c', b'd'] {
+            store.append("events", &[payload; 48]).unwrap();
+        }
+        store.commit_cursor("events", "worker", 3).unwrap();
+        let before = store.read_from("events", 1, 10).unwrap();
+        let plan = store.preview_retention("events", 4).unwrap();
+        assert_eq!(plan.stream, "events");
+        assert_eq!(plan.requested_keep_from_sequence, 4);
+        assert_eq!(plan.first_retained_sequence, Some(4));
+        assert_eq!(plan.eligible_segment_count, 3);
+        assert!(plan.eligible_bytes > 0);
+        assert_eq!(plan.minimum_consumer_cursor, Some(3));
+        assert_eq!(store.read_from("events", 1, 10).unwrap(), before);
+        assert_eq!(store.preview_retention("events", 1).unwrap().eligible_segment_count, 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retention_preview_fails_closed_when_consumer_or_replication_is_unsafe() {
+        let root = test_dir("retention-unsafe");
+        let mut store = FileFabricStreamStore::open(&root).unwrap();
+        store
+            .create_stream(
+                "events",
+                FabricStreamConfig {
+                    segment_max_bytes: 96,
+                },
+            )
+            .unwrap();
+        for _ in 0..3 {
+            store.append("events", &[1; 48]).unwrap();
+        }
+        store.commit_cursor("events", "worker", 1).unwrap();
+        assert_eq!(
+            store.preview_retention("events", 3).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            store.preview_retention("events", 0).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            store.preview_retention("events", 5).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        // A corrupted cursor beyond the local tail must not be treated as
+        // proof that discarded records were fully processed.
+        write_json_atomic(
+            &root.join("events").join("cursors.json"),
+            &CursorFile {
+                version: STREAM_FORMAT_VERSION,
+                cursors: BTreeMap::from([("worker".to_string(), 99)]),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            store.preview_retention("events", 2).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        store
+            .establish_replication_policy(
+                "events",
+                FabricStreamReplicationPolicy {
+                    partition: 0,
+                    epoch: FABRIC_STREAM_INITIAL_EPOCH,
+                    leader: 10,
+                    membership_fingerprint: 44,
+                    replication_factor: 2,
+                    replicas: vec![10, 11],
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.preview_retention("events", 1).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_retention_preview_does_not_mutate_replay_or_cursors() {
+        let root = test_dir("runtime-retention-preview");
+        let mut runtime = Runtime::new();
+        runtime.fabric_stream_open(&root).unwrap();
+        runtime
+            .fabric_stream_create(
+                "audit",
+                FabricStreamConfig {
+                    segment_max_bytes: 96,
+                },
+            )
+            .unwrap();
+        runtime.fabric_stream_append("audit", &[1; 48]).unwrap();
+        runtime.fabric_stream_append("audit", &[2; 48]).unwrap();
+        runtime.fabric_stream_commit_cursor("audit", "consumer", 1).unwrap();
+
+        let before = runtime.fabric_stream_read("audit", 1, 10).unwrap();
+        let preview = runtime.fabric_stream_preview_retention("audit", 2).unwrap();
+        assert_eq!(preview.eligible_segment_count, 1);
+        assert_eq!(runtime.fabric_stream_read("audit", 1, 10).unwrap(), before);
+        assert_eq!(runtime.fabric_stream_cursor("audit", "consumer").unwrap(), 1);
+        drop(runtime);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retention_preview_never_approves_partial_last_segment_or_producer_state() {
+        let root = test_dir("retention-partial");
+        let mut store = FileFabricStreamStore::open(&root).unwrap();
+        store
+            .create_stream("events", FabricStreamConfig::default())
+            .unwrap();
+        for _ in 0..3 {
+            store.append("events", b"x").unwrap();
+        }
+        store.commit_cursor("events", "worker", 3).unwrap();
+        let plan = store.preview_retention("events", 4).unwrap();
+        assert_eq!(plan.eligible_segment_count, 0);
+        assert_eq!(plan.first_retained_sequence, Some(1));
+
+        // Retention must not destroy records protected by producer checkpoints
+        // introduced on a separate draft branch.
+        fs::write(root.join("events").join("producer_state.json"), b"{}").unwrap();
+        assert_eq!(
+            store.preview_retention("events", 3).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
         let _ = fs::remove_dir_all(root);
     }
 
