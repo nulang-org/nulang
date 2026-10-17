@@ -1472,6 +1472,7 @@ match Some(Some(2)) with {
   | Some(Some(x)) => x
   | Some(None) => 0
   | None => 0
+  | _ => 0
 }
 "#;
         assert_int(source, 2);
@@ -1549,6 +1550,7 @@ match Some(None) with {
   | Some(Some(x)) => 1
   | Some(None) => 2
   | None => 3
+  | _ => 0
 }
 "#;
         assert_int(source, 2);
@@ -1562,6 +1564,7 @@ type Option[T] = Some(T) | None
 match None with {
   | Some(Some(x)) => 1
   | None => 0
+  | _ => 0
 }
 "#;
         assert_int(source, 0);

@@ -176,8 +176,9 @@ Core surface forms (`src/ast.rs`, `src/parser.rs`):
   §6.3).
 
 There is no `switch` and no `case` keyword — `match` arms are introduced by
-`|`. Pattern matching is typed but **not** exhaustiveness-checked today: a
-non-exhaustive `match` compiles and may fail at runtime.
+`|`. Pattern matching is typed; incomplete matches over `Bool` and statically
+known closed variants are rejected conservatively. More complex or open-ended
+domains are not yet exhaustiveness-checked and can fail at runtime.
 
 ### 2.2 HM Type Inference
 
@@ -212,7 +213,8 @@ consumption tracking. Capabilities are compile-time only — see §2.4.
 
 **What does not exist:** no type classes or constrained types
 (`fn f[T: Serializable]` is not valid Nulang), no `protocol` construct, and
-no exhaustiveness checking for `match`. Type inference deliberately does not
+no general exhaustiveness/usefulness analysis for `match` beyond finite-type
+coverage checks. Type inference deliberately does not
 cross actor boundaries — behavior signatures are explicit annotations — so
 actors remain separately checkable units.
 

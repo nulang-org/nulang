@@ -1690,6 +1690,8 @@ match tree {
 }
 ```
 
+Conservative compile-time coverage checking rejects matches missing cases for `Bool` and statically known closed variants. Guarded arms are not treated as unconditionally covering a case. For other scrutinee types and complex payload patterns, runtime non-exhaustive failures are still possible.
+
 Pattern guards (`| pat if cond => ...`) are implemented — the guard is a boolean expression evaluated with the pattern's bindings in scope after the pattern matches, and an arm whose guard fails falls through to the next arm (a guarded last arm whose guard fails raises the non-exhaustive-match error) — while list-cons patterns are planned for a future version. Nested variant, tuple, and record patterns all match structurally: sub-patterns are tested recursively against the payload, element, or field value, so `Some(Some(x))` rejects both `Some(None)` and `None`, and the `Node((l, v, r))` form above binds `l`, `v`, and `r`. One caveat remains: tuple patterns do not check arity — a pattern tests only the positions it names, so `(a, b)` also matches a longer tuple (extra elements are ignored) and a position beyond the scrutinee's length binds nil.
 
 ## 6.8 Lambda Expressions

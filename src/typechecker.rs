@@ -3400,7 +3400,137 @@ impl TypeChecker {
             final_subst = compose_subst(&s, &final_subst);
         }
 
+        // Only reject uncovered matches when the scrutinee has a known,
+        // finite set of cases. This is a conservative safety check: it never
+        // treats a guarded pattern as total, and leaves open-ended scalar
+        // domains alone until general usefulness analysis is available.
+        let resolved_scrutinee = apply_subst(&scrut_ty, &final_subst);
+        Self::check_finite_match_coverage(&resolved_scrutinee, arms, span)?;
+
         Ok((final_subst.clone(), apply_subst(&first_arm, &final_subst)))
+    }
+
+    /// A wildcard or variable always matches; an alias matches exactly the
+    /// values matched by its underlying pattern.
+    fn pattern_is_catchall(pattern: &Pattern) -> bool {
+        match pattern {
+            Pattern::Wild | Pattern::Var(_) => true,
+            Pattern::Alias(_, inner) => Self::pattern_is_catchall(inner),
+            _ => false,
+        }
+    }
+
+    /// Prove a pattern cannot fail for a value of the given type.
+    /// Recurse only through tuples and records with known shapes. A literal
+    /// or a nested constructor remains refutable unless the type checker
+    /// gains general usefulness analysis.
+    fn pattern_is_irrefutable_for_type(pattern: &Pattern, ty: &Type) -> bool {
+        match pattern {
+            Pattern::Wild | Pattern::Var(_) => true,
+            Pattern::Alias(_, inner) => Self::pattern_is_irrefutable_for_type(inner, ty),
+            Pattern::Tuple(patterns) => match ty {
+                Type::Tuple(types) if patterns.len() == types.len() => patterns
+                    .iter()
+                    .zip(types)
+                    .all(|(pattern, ty)| Self::pattern_is_irrefutable_for_type(pattern, ty)),
+                _ => false,
+            },
+            Pattern::Record(patterns) => match ty {
+                Type::Record(fields) => patterns.iter().all(|(field_name, pattern)| {
+                    fields
+                        .iter()
+                        .find(|(name, _)| name == field_name)
+                        .is_some_and(|(_, ty)| {
+                            Self::pattern_is_irrefutable_for_type(pattern, ty)
+                        })
+                }),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// Prove that a pattern covers every value of this variant constructor.
+    /// Nested patterns with literals or variants cannot establish coverage
+    /// without recursively checking the payload's actual type.
+    fn pattern_covers_constructor(
+        pattern: &Pattern,
+        constructor: &str,
+        payload: &Option<Type>,
+    ) -> bool {
+        match pattern {
+            Pattern::Alias(_, inner) => {
+                Self::pattern_covers_constructor(inner, constructor, payload)
+            }
+            Pattern::Variant(name, nested) if name == constructor => {
+                match (nested.as_deref(), payload) {
+                    (None, None) => true,
+                    (Some(inner), Some(ty)) => Self::pattern_is_irrefutable_for_type(inner, ty),
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Reject provably incomplete matches of Bool and closed variants.
+    ///
+    /// We do not claim exhaustiveness for Int, String, tuples, records, open
+    /// or unresolved types: accepting them here is not a proof of coverage.
+    fn check_finite_match_coverage(
+        scrutinee_type: &Type,
+        arms: &[(Pattern, Option<Expr>, Expr)],
+        span: Span,
+    ) -> NuResult<()> {
+        let unguarded: Vec<&Pattern> = arms
+            .iter()
+            .filter_map(|(pattern, guard, _)| guard.is_none().then_some(pattern))
+            .collect();
+
+        if unguarded.iter().any(|pattern| Self::pattern_is_catchall(pattern)) {
+            return Ok(());
+        }
+
+        let missing: Vec<String> = match scrutinee_type {
+            Type::Primitive(PrimitiveType::Bool) => [false, true]
+                .into_iter()
+                .filter(|value| {
+                    !unguarded.iter().any(|pattern| {
+                        fn matches_boolean(pattern: &Pattern, value: bool) -> bool {
+                            match pattern {
+                                Pattern::Lit(Literal::Bool(found)) => *found == value,
+                                Pattern::Alias(_, inner) => matches_boolean(inner, value),
+                                _ => false,
+                            }
+                        }
+                        matches_boolean(pattern, *value)
+                    })
+                })
+                .map(|value| value.to_string())
+                .collect(),
+            Type::Variant(constructors) => constructors
+                .iter()
+                .filter(|(name, payload)| {
+                    !unguarded.iter().any(|pattern| {
+                        Self::pattern_covers_constructor(pattern, name, payload)
+                    })
+                })
+                .map(|(name, _)| name.clone())
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        Err(NuError::TypeError {
+            msg: format!("non-exhaustive match: missing {}", missing.join(", ")),
+            span,
+            expected_type: Some("all cases or an unguarded catch-all".to_string()),
+            found_type: Some(scrutinee_type.to_string()),
+            similar_names: None,
+        })
     }
 
     /// Bind pattern variables into a new context.
@@ -4878,6 +5008,178 @@ mod tests {
         };
         let (s, ty) = tc.infer_expr(&ctx, &expr).unwrap();
         assert_eq!(apply_subst(&ty, &s), Type::int());
+    }
+
+    #[test]
+    fn test_match_bool_rejects_missing_branch() {
+        let mut tc = TypeChecker::new();
+        let ctx = TypeContext::new();
+        let expr = Expr::Match {
+            scrutinee: Box::new(bool_lit(true)),
+            arms: vec![(Pattern::Lit(Literal::Bool(true)), None, int_lit(1))],
+            span: sp(),
+        };
+
+        let error = tc.infer_expr(&ctx, &expr).unwrap_err();
+        assert!(
+            format!("{error}").contains("non-exhaustive match"),
+            "expected a non-exhaustive match diagnostic, got: {error}"
+        );
+        assert!(format!("{error}").contains("false"));
+    }
+
+    #[test]
+    fn test_match_bool_accepts_both_unguarded_branches() {
+        let mut tc = TypeChecker::new();
+        let ctx = TypeContext::new();
+        let expr = Expr::Match {
+            scrutinee: Box::new(bool_lit(true)),
+            arms: vec![
+                (Pattern::Lit(Literal::Bool(true)), None, int_lit(1)),
+                (Pattern::Lit(Literal::Bool(false)), None, int_lit(0)),
+            ],
+            span: sp(),
+        };
+
+        let (subst, ty) = tc.infer_expr(&ctx, &expr).unwrap();
+        assert_eq!(apply_subst(&ty, &subst), Type::int());
+    }
+
+    #[test]
+    fn test_match_bool_guarded_catchall_is_not_exhaustive() {
+        let mut tc = TypeChecker::new();
+        let ctx = TypeContext::new();
+        let expr = Expr::Match {
+            scrutinee: Box::new(bool_lit(true)),
+            arms: vec![(Pattern::Wild, Some(bool_lit(true)), int_lit(1))],
+            span: sp(),
+        };
+
+        let error = tc.infer_expr(&ctx, &expr).unwrap_err();
+        assert!(format!("{error}").contains("non-exhaustive match"));
+    }
+
+    #[test]
+    fn test_match_closed_variant_requires_all_constructors() {
+        let choice_type = Type::Variant(vec![
+            ("Some".to_string(), Some(Type::int())),
+            ("None".to_string(), None),
+        ]);
+        let ctx = ctx_with("choice", choice_type);
+        let mut tc = TypeChecker::new();
+        let expr = Expr::Match {
+            scrutinee: Box::new(var("choice")),
+            arms: vec![(
+                Pattern::Variant("Some".to_string(), Some(Box::new(Pattern::Var("x".to_string())))),
+                None,
+                int_lit(1),
+            )],
+            span: sp(),
+        };
+        let error = tc.infer_expr(&ctx, &expr).unwrap_err();
+        assert!(
+            format!("{error}").contains("non-exhaustive match"),
+            "expected a non-exhaustive match diagnostic, got: {error}"
+        );
+        assert!(format!("{error}").contains("None"));
+    }
+
+    #[test]
+    fn test_match_closed_variant_accepts_irrefutable_tuple_payload() {
+        let ctx = ctx_with(
+            "tree",
+            Type::Variant(vec![
+                ("Leaf".to_string(), None),
+                (
+                    "Node".to_string(),
+                    Some(Type::Tuple(vec![Type::int(), Type::int()])),
+                ),
+            ]),
+        );
+        let mut tc = TypeChecker::new();
+        let expr = Expr::Match {
+            scrutinee: Box::new(var("tree")),
+            arms: vec![
+                (Pattern::Variant("Leaf".to_string(), None), None, int_lit(0)),
+                (
+                    Pattern::Variant(
+                        "Node".to_string(),
+                        Some(Box::new(Pattern::Tuple(vec![
+                            Pattern::Var("a".to_string()),
+                            Pattern::Var("b".to_string()),
+                        ]))),
+                    ),
+                    None,
+                    var("a"),
+                ),
+            ],
+            span: sp(),
+        };
+
+        let (subst, ty) = tc.infer_expr(&ctx, &expr).unwrap();
+        assert_eq!(apply_subst(&ty, &subst), Type::int());
+    }
+
+    #[test]
+    fn test_match_closed_variant_rejects_refutable_tuple_payload() {
+        let ctx = ctx_with(
+            "tree",
+            Type::Variant(vec![
+                ("Leaf".to_string(), None),
+                (
+                    "Node".to_string(),
+                    Some(Type::Tuple(vec![Type::int(), Type::int()])),
+                ),
+            ]),
+        );
+        let mut tc = TypeChecker::new();
+        let expr = Expr::Match {
+            scrutinee: Box::new(var("tree")),
+            arms: vec![
+                (Pattern::Variant("Leaf".to_string(), None), None, int_lit(0)),
+                (
+                    Pattern::Variant(
+                        "Node".to_string(),
+                        Some(Box::new(Pattern::Tuple(vec![
+                            Pattern::Lit(Literal::Int(1)),
+                            Pattern::Wild,
+                        ]))),
+                    ),
+                    None,
+                    int_lit(1),
+                ),
+            ],
+            span: sp(),
+        };
+
+        let err = tc.infer_expr(&ctx, &expr).unwrap_err();
+        assert!(format!("{err}").contains("non-exhaustive match"));
+        assert!(format!("{err}").contains("Node"));
+    }
+
+    #[test]
+    fn test_match_closed_variant_accepts_unguarded_constructors() {
+        let choice_type = Type::Variant(vec![
+            ("Some".to_string(), Some(Type::int())),
+            ("None".to_string(), None),
+        ]);
+        let ctx = ctx_with("choice", choice_type);
+        let mut tc = TypeChecker::new();
+        let expr = Expr::Match {
+            scrutinee: Box::new(var("choice")),
+            arms: vec![
+                (
+                    Pattern::Variant("Some".to_string(), Some(Box::new(Pattern::Wild))),
+                    None,
+                    int_lit(1),
+                ),
+                (Pattern::Variant("None".to_string(), None), None, int_lit(0)),
+            ],
+            span: sp(),
+        };
+
+        let (subst, ty) = tc.infer_expr(&ctx, &expr).unwrap();
+        assert_eq!(apply_subst(&ty, &subst), Type::int());
     }
 
     // -----------------------------------------------------------------------
