@@ -10,6 +10,8 @@
 //!   nulang agent <init|run|chat|goals|graph>
 //!   nulang nula <new|build|build-wasm|test|run|add|remove|publish|deploy|watch|doc>
 //!   nulang fmt [--check] [<file>]
+//!   nulang web routes [--ir FILE]
+//!   nulang web inspect METHOD PATH [--ir FILE]
 //!
 //! Options:
 //!   -r, --repl               Start interactive REPL
@@ -99,6 +101,18 @@ fn main() {
     }
 
     let args: Vec<String> = std::env::args().collect();
+
+    // Inspect the already-validated deployment manifest without starting handlers.
+    if args.get(1).is_some_and(|arg| arg == "web") {
+        match nulang::web::inspect::run_cli(&args[2..]) {
+            Ok(output) => println!("{output}"),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
 
     if args.len() <= 1 {
         // If stdin is piped, execute as a script; otherwise start REPL.
@@ -1126,6 +1140,8 @@ fn print_help() {
     println!("       nulang --lsp");
     println!("       nulang --dap");
     println!("       nulang fmt [--check] [<file>]");
+    println!("       nulang web routes [--ir FILE]");
+    println!("       nulang web inspect METHOD PATH [--ir FILE]");
     println!("       nulang node --listen <ADDR> [--seed <ADDR>] [--expected-nodes <N>]");
     println!("       nulang --doc");
     println!();
