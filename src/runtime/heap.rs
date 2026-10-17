@@ -131,6 +131,11 @@ pub enum TypeTag {
     Raw = 7,
     /// Remote actor reference (node_id + actor_id).
     RemoteActor = 8,
+    /// Pre-adoption wide signed integer, stored as one native i64.
+    ///
+    /// Heap-only staging type. The v1 continuation decoder MUST NOT accept
+    /// this tag until its format is versioned and all value consumers agree.
+    WideInt = 9,
 }
 
 // ---------------------------------------------------------------------------
