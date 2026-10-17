@@ -73,8 +73,10 @@ Requires Rust 1.93+, Linux or macOS.
 
 ## Stability
 
-Nulang is alpha software. The language version is `1.0.0-frozen`: the bytecode
-format, wire protocol, and Nulang Core are frozen and will never break. The HM
+Nulang is alpha software. Existing artifacts may carry the historical
+`1.0.0-frozen` metadata; published bytecode and protocol versions retain
+archival compatibility obligations. The source-language Core is Incubating
+and may change before independently validated adoption (RFC 0032). The HM
 type system, effect system, capability lattice, and actor surface are Stable
 (breaking changes require an RFC and a deprecation cycle). Everything else is
 Experimental. See `GOVERNANCE.md` for the full stability contract.
