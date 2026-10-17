@@ -255,10 +255,12 @@ let smile = "\u{1F600}"          // 😀
 
 ---
 
-### 14. `catch` (postfix or prefix) and `fail`
+### 14. Deprecated `catch` / `fail` compatibility
 
-Both forms of `catch` desugar to a `match` on `Ok`/`Error` variants.
-`fail` produces an early-exit `Error` value.
+Older programs may use `catch` (which desugars to `match`) and `fail`.
+Both forms are **deprecated** under RFC 0015. Prefer explicit `Result`
+values, `match`, and `?` for compatible propagation in new programs.
+The syntax below is retained as a legacy reference, not a recommended style.
 
 ```nula
 type Result[Ok, Err] = Ok(Ok) | Error(Err)

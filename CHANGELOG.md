@@ -16,6 +16,12 @@
 - **Pinned supported TLS and WASM runtime dependencies to patched versions.** Updated rustls 0.23.45 to 0.23.46 and Wasmtime 48.0.5 to 48.0.6 (including compatible Cranelift and runtime lockfile packages) to address October 2026 RustSec advisories.
 - **Documented the remaining legacy rustls 0.22 advisories in the Cargo audit policy.** The affected version is transitive through libsql's hyper-rustls 0.25 path; explicit advisory exceptions are restricted to the documented IDs until the upstream dependency chain is upgraded.
 
+### Progressive beginner ergonomics — 2026-10-13
+- **Consolidated `nulang doctor`:** a read-only report of the installed CLI, compiled features and local package, with integration tests for correct output, invalid arguments and non-mutation. Supersedes the competing CLI implementation in draft #1557 after validation.
+- **Additive CLI aliases:** `nulang new|build|test|run|add|remove|list|clean|watch|dev|doc|publish|deploy` dispatch to existing `nulang nula` handlers; `nulang check <file>` is an alias for `--check <file>`. The older spellings remain valid and `nulang init <name>` keeps its experiment-scaffolding meaning.
+- **Optional prelude:** `import stdlib::prelude` provides `println`, `string_length`, and `int_to_string` as ordinary typed wrappers over existing effect operations; there is no change to effect tracking or external-authority policy.
+- **Education:** Getting-started examples and pitfalls identify deprecated `catch`/`fail` constructs and recommend `Result` and `match` instead. Integration tests pin alias compatibility and the explicit prelude behavior.
+
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
