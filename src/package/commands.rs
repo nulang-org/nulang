@@ -1349,6 +1349,22 @@ fn cmd_build_web() -> NuResult<()> {
         msg: format!("failed to load {}: {}", MANIFEST_FILE, e),
         span: Span::default(),
     })?;
+    let output_dir = root.join(&manifest.web.output_dir);
+    let stage = crate::package::web_output::StagedWebOutput::prepare(&output_dir)
+        .map_err(|e| NuError::PackageError {
+            msg: format!("cannot stage {}: {}", output_dir.display(), e),
+            span: Span::default(),
+        })?;
+    cmd_build_web_into(&root, &manifest, stage.path())?;
+    stage.publish().map_err(|e| NuError::PackageError {
+        msg: format!("cannot publish {}: {}", output_dir.display(), e),
+        span: Span::default(),
+    })?;
+    println!("Web build succeeded: {}", output_dir.display());
+    Ok(())
+}
+
+fn cmd_build_web_into(root: &Path, manifest: &Manifest, output_dir: &Path) -> NuResult<()> {
     let entry = prepare_package()?;
     let entry_str = entry.to_string_lossy().into_owned();
 
@@ -1360,8 +1376,7 @@ fn cmd_build_web() -> NuResult<()> {
     let nbc_path = build_dir.join("build.nbc");
     let nbc_path_str = nbc_path.to_string_lossy().into_owned();
 
-    let output_dir = root.join(&manifest.web.output_dir);
-    std::fs::create_dir_all(&output_dir).map_err(|e| NuError::PackageError {
+    std::fs::create_dir_all(output_dir).map_err(|e| NuError::PackageError {
         msg: format!("cannot create {}: {}", output_dir.display(), e),
         span: Span::default(),
     })?;
@@ -1515,7 +1530,6 @@ fn cmd_build_web() -> NuResult<()> {
         });
     }
 
-    println!("Web build succeeded: {}", output_dir.display());
     Ok(())
 }
 
