@@ -1566,11 +1566,18 @@ mod tests {
         );
 
         let response = WebDevServer::html_route_response(&request, "<p>never render</p>");
-        assert_eq!(response.status, 303, "POST redirects must use PRG semantics");
-        assert!(response.body.is_empty(), "redirect must not inject client HTML");
-        assert!(response.headers.iter().any(|(name, value)| {
-            name == "Location" && value == "/projects/42"
-        }));
+        assert_eq!(
+            response.status, 303,
+            "POST redirects must use PRG semantics"
+        );
+        assert!(
+            response.body.is_empty(),
+            "redirect must not inject client HTML"
+        );
+        assert!(response
+            .headers
+            .iter()
+            .any(|(name, value)| { name == "Location" && value == "/projects/42" }));
     }
 
     #[test]
@@ -1603,7 +1610,10 @@ mod tests {
             || {},
         );
         let page = WebDevServer::html_route_response(&request, "<h1>normal</h1>");
-        assert_eq!(page.status, 200, "redirect state must not leak to later requests");
+        assert_eq!(
+            page.status, 200,
+            "redirect state must not leak to later requests"
+        );
         assert!(String::from_utf8_lossy(&page.body).contains("<h1>normal</h1>"));
     }
 
@@ -1631,10 +1641,7 @@ mod tests {
             );
             let response = WebDevServer::html_route_response(&request, "unused");
             assert_eq!(response.status, 400, "unsafe redirect: {location:?}");
-            assert!(!response
-                .headers
-                .iter()
-                .any(|(name, _)| name == "Location"));
+            assert!(!response.headers.iter().any(|(name, _)| name == "Location"));
         }
     }
 
