@@ -941,8 +941,10 @@ fn cont_resume_dst(frames: &[Frame]) -> u8 {
 /// defines their durable encoding and ownership, no snapshot may contain one.
 fn ensure_v1_type_supported(tag: TypeTag) -> Result<(), String> {
     if tag == TypeTag::WideInt {
-        return Err("NLCS v1 cannot serialize wide Int64 objects; a versioned format is required"
-            .to_string());
+        return Err(
+            "NLCS v1 cannot serialize wide Int64 objects; a versioned format is required"
+                .to_string(),
+        );
     }
     Ok(())
 }
