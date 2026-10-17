@@ -3260,6 +3260,48 @@ app "counter" {
     }
 
     #[test]
+    fn web_compile_failure_preserves_last_good_dist() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_web_failed_publish_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        scaffold_package(&dir, "rollback-app", "web").unwrap();
+        let main = dir.join("src/main.nula");
+        std::fs::write(
+            &main,
+            r#"import stdlib::web::html
+import stdlib::web::types
+
+@placement(static)
+fn home() -> Html {
+    text("last good")
+}
+app "rollback" {
+    route "GET" "/" -> home
+}
+"#,
+        )
+        .unwrap();
+
+        let _guard = ChangeDir::new(&dir);
+        cmd_build_web().expect("first build should pass");
+        let prior = std::fs::read(dir.join("dist/index.html")).unwrap();
+        assert!(String::from_utf8_lossy(&prior).contains("last good"));
+
+        std::fs::write(&main, "fn main() { unknown syntax ???").unwrap();
+        assert!(cmd_build_web().is_err(), "invalid code must fail the next build");
+        assert_eq!(
+            std::fs::read(dir.join("dist/index.html")).unwrap(),
+            prior,
+            "a failed build must not publish partially rendered HTML"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn stale_route_html_is_pruned_without_removing_unrelated_assets() {
         use serde_json::json;
         let dir =
