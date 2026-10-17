@@ -1228,10 +1228,19 @@ fn view() -> Html {
     #[test]
     fn test_client_runtime_updates_dynamic_attributes() {
         let js = generate_client_runtime();
-        assert!(js.contains("attributeBindings"), "attribute bindings index missing");
-        assert!(js.contains("data-nulang-bind-"), "attribute metadata missing");
+        assert!(
+            js.contains("attributeBindings"),
+            "attribute bindings index missing"
+        );
+        assert!(
+            js.contains("data-nulang-bind-"),
+            "attribute metadata missing"
+        );
         assert!(js.contains("setAttribute("), "attribute updates missing");
-        assert!(js.contains("removeAttribute("), "attribute clearing missing");
+        assert!(
+            js.contains("removeAttribute("),
+            "attribute clearing missing"
+        );
     }
 
     #[test]
