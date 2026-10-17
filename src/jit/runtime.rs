@@ -827,7 +827,11 @@ fn save_jit_thread_state() -> JitThreadState {
         JIT_BRANCH_EXIT_PC.with(|c| c.get()),
     );
     let pending_error = AOT_PENDING_ERROR.with(|e| e.borrow().clone());
-    let leaf_calls = JIT_LEAF_CALLS.with(|slot| slot.borrow().clone());
+    // Transfer ownership of the outer dispatch allocation into the saved
+    // thread state. Nested interpreter/native execution installs its own
+    // dispatch entries and must not inherit the outer native call table.
+    // Restoring the snapshot returns the original allocation unchanged.
+    let leaf_calls = JIT_LEAF_CALLS.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
     let leaf_constants = JIT_LEAF_CONSTANTS.with(|slot| slot.get());
     JitThreadState {
         vm,
@@ -2123,12 +2127,14 @@ mod tests {
         // Vec buffer and its module-local contents across nested execution.
         std::thread::spawn(|| {
             super::set_jit_leaf_calls(&[(7, std::ptr::null(), 2, 1)], std::ptr::null());
-            let outer_ptr =
-                super::JIT_LEAF_CALLS.with(|slot| slot.borrow().as_ptr());
+            let outer_ptr = super::JIT_LEAF_CALLS.with(|slot| slot.borrow().as_ptr());
             let saved = super::save_jit_thread_state();
 
             super::JIT_LEAF_CALLS.with(|slot| {
-                assert!(slot.borrow().is_empty(), "nested execution must not see stale outer dispatch");
+                assert!(
+                    slot.borrow().is_empty(),
+                    "nested execution must not see stale outer dispatch"
+                );
             });
             super::set_jit_leaf_calls(&[(9, std::ptr::null(), 3, 2)], std::ptr::null());
             super::restore_jit_thread_state(saved);
@@ -2139,7 +2145,11 @@ mod tests {
                 assert_eq!(entries[0].func_idx, 7);
                 assert_eq!(entries[0].return_reg, 2);
                 assert_eq!(entries[0].required_args, 1);
-                assert_eq!(entries.as_ptr(), outer_ptr, "restoration must reuse the original allocation");
+                assert_eq!(
+                    entries.as_ptr(),
+                    outer_ptr,
+                    "restoration must reuse the original allocation"
+                );
             });
             super::clear_jit_leaf_calls();
         })
