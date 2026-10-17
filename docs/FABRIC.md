@@ -199,6 +199,7 @@ semantics that later cluster and stream layers can reuse.
 - [x] Automatic pending-quorum retry scheduling with exponential backoff.
 - [x] Durable replication policy and epoch-1 fencing.
 - [x] Stable installed stream placement across unrelated cluster growth/rejoin.
+- [x] Carried ordered-policy bootstrap removes first-contact membership race.
 - [x] Quorum-backed sequential epoch transition among old replicas.
 - [x] Durable one-proposal-per-epoch promises that fence the old epoch.
 - [x] Proposal-scoped push repair for a lagging new-policy voter.
