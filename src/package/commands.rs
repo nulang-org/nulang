@@ -3149,9 +3149,14 @@ fn dashboard() -> Html {
     text("Server-only dashboard")
 }
 
+fn submit() -> Html {
+    text("Mutation result")
+}
+
 app "placement" {
     route "GET" "/" -> home
     route "GET" "/dashboard" -> dashboard
+    route "POST" "/submit" -> submit
 }
 "#,
         )
@@ -3167,6 +3172,10 @@ app "placement" {
             !dir.join("dist/dashboard/index.html").exists(),
             "server routes must never be emitted as static HTML"
         );
+        assert!(
+            !dir.join("dist/submit/index.html").exists(),
+            "POST mutations must never be emitted as static HTML"
+        );
 
         let manifest = std::fs::read_to_string(dir.join("dist/nulang-app.ir.json"))
             .expect("web deployment IR should be emitted");
@@ -3179,6 +3188,12 @@ app "placement" {
         }));
         assert!(ir.routes.iter().any(|route| {
             route.path == "/dashboard" && route.placement == "server" && route.artifact.is_none()
+        }));
+        assert!(ir.routes.iter().any(|route| {
+            route.method == "POST"
+                && route.path == "/submit"
+                && route.placement == "server"
+                && route.artifact.is_none()
         }));
         let _ = std::fs::remove_dir_all(&dir);
     }
