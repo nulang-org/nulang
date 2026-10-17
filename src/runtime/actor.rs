@@ -99,7 +99,7 @@ impl TraceEventKind {
 pub struct TraceEntry {
     /// Admission, backpressure, or dequeue outcome.
     pub event: TraceEventKind,
-    /// Per-actor monotonic sequence number (arrival order).
+    /// Per-actor monotonic diagnostic-event sequence number.
     pub seq: u64,
     /// Actor ID of the sender (0 = system/runtime message).
     pub sender: u64,
