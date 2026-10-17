@@ -1323,7 +1323,7 @@ fn validate_libsql_remote_url(raw: &str) -> io::Result<()> {
         )
     };
 
-    if raw.is_empty() || raw.trim() != raw || raw.chars().any(|ch| ch.is_ascii_control()) {
+    if raw.is_empty() || raw.trim() != raw || raw.chars().any(|ch| ch.is_ascii_control() || ch == '\\') {
         return Err(invalid());
     }
 
