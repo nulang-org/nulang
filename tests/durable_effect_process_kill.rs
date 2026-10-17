@@ -5,6 +5,7 @@
 
 #![cfg(all(feature = "sqlite", unix))]
 
+use nulang::authority::{AuthorityGrant, AuthorityManifest};
 use nulang::bytecode::CodeModule;
 use nulang::durable_effect_runtime::DurableEffectCoordinator;
 use nulang::hir_lower;
@@ -12,7 +13,7 @@ use nulang::lexer::Lexer;
 use nulang::mir_codegen;
 use nulang::mir_lower;
 use nulang::parser::Parser;
-use nulang::runtime::{LibsqlStore, PersistenceStore};
+use nulang::runtime::{Actor, LibsqlStore, PersistenceStore};
 use nulang::typechecker::TypeChecker;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -24,6 +25,19 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const ACTOR_ID: u64 = 42;
 const REQUEST: &[u8] = b"order=42&cents=100";
 const EXECUTION_KEY: &str = "order:42:payment";
+
+fn authorized_actor() -> (Actor, AuthorityGrant) {
+    let grant = AuthorityGrant::Other {
+        namespace: "Inference".into(),
+        operation: "ask".into(),
+        argument: None,
+    };
+    let mut actor = Actor::new(ACTOR_ID, "Payments", 16);
+    actor.persistent = true;
+    actor.activation_epoch = 1;
+    actor.install_authority_manifest(&AuthorityManifest::from_grants([grant.clone()]));
+    (actor, grant)
+}
 
 fn compiled_source() -> CodeModule {
     let source =
@@ -94,10 +108,13 @@ fn durable_effect_crash_fixture_child() {
     let module = compiled_source();
     let pc = module.effect_sites[0].pc;
     let mut store = LibsqlStore::new(Path::new(&db_path)).expect("open file-backed libSQL");
+    let (actor, grant) = authorized_actor();
     let mut coordinator = DurableEffectCoordinator::new(&mut store, ACTOR_ID, 1);
 
     let receipt = coordinator
         .execute_compiled_async_with_deduplication(
+            &actor,
+            &grant,
             &module,
             pc,
             EXECUTION_KEY,
@@ -189,11 +206,14 @@ fn verify_crash_recovery(stage: &str) {
 
     let module = compiled_source();
     let pc = module.effect_sites[0].pc;
+    let (actor, grant) = authorized_actor();
     let mut calls = 0;
     let receipt = {
         let mut coordinator = DurableEffectCoordinator::new(&mut store, ACTOR_ID, 1);
         coordinator
             .execute_compiled_async_with_deduplication(
+            &actor,
+            &grant,
                 &module,
                 pc,
                 EXECUTION_KEY,
@@ -220,6 +240,8 @@ fn verify_crash_recovery(stage: &str) {
     assert_eq!(
         coordinator
             .execute_compiled_async_with_deduplication(
+            &actor,
+            &grant,
                 &module,
                 pc,
                 EXECUTION_KEY,
