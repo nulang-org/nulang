@@ -53,7 +53,7 @@ impl WebBuildLock {
 impl Drop for WebBuildLock {
     fn drop(&mut self) {
         // Close the handle before unlinking for Windows compatibility.
-        self.handle.take();
+        drop(self.handle.take());
         let _ = fs::remove_file(&self.path);
     }
 }
