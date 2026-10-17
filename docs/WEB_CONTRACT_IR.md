@@ -238,6 +238,8 @@ the binding plan is equivalent to:
 ```
 
 ## Static-build execution boundary
+Static route contracts reuse the effect checker's fixed-point direct-call inference for local functions. A static handler calling a helper that performs a non-render effect now carries that effect in deployment IR and fails the existing static validation gate, even when the handler declares a narrower row. This covers transitive same-module direct calls; imported, dynamically dispatched or indirect callee effects still require package-wide compiler-linkage proof and must not be represented as fully verified purity.
+
 
 Static prerendering now requires an explicit `@placement(static)` on the handler. A plain GET route is classified `server` unless the compiler contract supplies a placement. Static contracts reject dynamic paths, request-source bindings, mutation methods, and known disallowed declared effects. This is a conservative structural gate rather than a proof of transitive effect purity: effect inference and helper-call analysis remain a compiler follow-up.
 
