@@ -13,12 +13,10 @@ fn linux_atomic_exchange(stage: &Path, target: &Path) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    let stage = CString::new(stage.as_os_str().as_bytes()).map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidInput, "NUL in staging path")
-    })?;
-    let target = CString::new(target.as_os_str().as_bytes()).map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidInput, "NUL in output path")
-    })?;
+    let stage = CString::new(stage.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in staging path"))?;
+    let target = CString::new(target.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in output path"))?;
 
     // On Linux, RENAME_EXCHANGE swaps both existing directories as a single
     // namespace operation. Unsupported kernels/filesystems fail closed.
@@ -421,10 +419,7 @@ mod tests {
         fs::write(previous.join("index.html"), b"preserved").unwrap();
 
         assert!(linux_atomic_exchange(&missing, &previous).is_err());
-        assert_eq!(
-            fs::read(previous.join("index.html")).unwrap(),
-            b"preserved"
-        );
+        assert_eq!(fs::read(previous.join("index.html")).unwrap(), b"preserved");
     }
 
     #[test]
