@@ -16,6 +16,10 @@
 - **Pinned supported TLS and WASM runtime dependencies to patched versions.** Updated rustls 0.23.45 to 0.23.46 and Wasmtime 48.0.5 to 48.0.6 (including compatible Cranelift and runtime lockfile packages) to address October 2026 RustSec advisories.
 - **Documented the remaining legacy rustls 0.22 advisories in the Cargo audit policy.** The affected version is transitive through libsql's hyper-rustls 0.25 path; explicit advisory exceptions are restricted to the documented IDs until the upstream dependency chain is upgraded.
 
+### Experimental typed Web content collection discovery — 2026-10-15
+- **Added a read-only Markdown content metadata boundary for future Hugo-inspired Web pages.** Typed TOML front matter (title, draft, tags) preserves Markdown source and derives canonical slugs from both leaf pages and page-bundle indexes.
+- **Collection discovery now sorts output deterministically, rejects duplicate slugs and malformed pages, and refuses symlinked content entries.** No Markdown renderer, route registration, asset publishing or deployment-IR integration is introduced by this change.
+
 ### WASM dynamic string-add parity — 2026-09-25
 - **WASM `Binary(Add)` now preserves the VM's runtime string fallback.** When either operand is a tagged string, `host_add` delegates to the existing string-concatenation helper instead of coercing both operands through integer arithmetic.
 - **A differential-fuzz regression is pinned.** Array-loaded strings such as `let a = ["x", "y"]; a[0] + 2` now produce `"x2"` on WASM just as they do on the bytecode reference.
