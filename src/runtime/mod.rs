@@ -7056,24 +7056,38 @@ impl Runtime {
         // Snapshot everything a restart needs to rebuild the child, so a
         // supervised restart restores behaviors/bytecode/state instead of
         // producing a bare actor that silently drops every message.
-        let restart = self.actors.get(&child_id).map(|actor| RestartTemplate {
-            state_data: actor
-                .state_data
-                .iter()
-                .map(|(name, value)| (name.clone(), *value))
-                .collect(),
-            state_models: actor.state_models.clone(),
-            behaviors: actor
-                .behavior_table
-                .iter()
-                .map(|entry| (entry.name.clone(), entry.handler_fn))
-                .collect(),
-            bytecode_module: actor.bytecode_module.as_deref().cloned(),
-            bytecode_offsets: actor.bytecode_offsets.clone(),
-            compensation_offsets: actor.compensation_offsets.clone(),
-            persistent: actor.persistent,
-            is_workflow: actor.is_workflow,
-            is_agent: actor.is_agent,
+        let restart = self.actors.get(&child_id).and_then(|actor| {
+            // Raw Values can contain heap pointers or module-local string IDs.
+            // An unresolvable value must disable restarting this child rather
+            // than resurrect a pointer into an old actor's retired heap.
+            let mut state_data = Vec::with_capacity(actor.state_data.len());
+            for (name, value) in &actor.state_data {
+                let persisted = actor.persist_value(value);
+                if matches!(&persisted, PersistedValue::Nil) && !value.is_nil() {
+                    warn!(
+                        child_id,
+                        field = %name,
+                        "supervised actor state cannot be safely captured for restart"
+                    );
+                    return None;
+                }
+                state_data.push((name.clone(), persisted));
+            }
+            Some(RestartTemplate {
+                state_data,
+                state_models: actor.state_models.clone(),
+                behaviors: actor
+                    .behavior_table
+                    .iter()
+                    .map(|entry| (entry.name.clone(), entry.handler_fn))
+                    .collect(),
+                bytecode_module: actor.bytecode_module.as_deref().cloned(),
+                bytecode_offsets: actor.bytecode_offsets.clone(),
+                compensation_offsets: actor.compensation_offsets.clone(),
+                persistent: actor.persistent,
+                is_workflow: actor.is_workflow,
+                is_agent: actor.is_agent,
+            })
         });
         let spec = ChildSpec { restart, ..spec };
         if let Some(child) = self.actors.get_mut(&child_id) {
