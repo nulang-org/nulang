@@ -1436,6 +1436,27 @@ fn cmd_build_web() -> NuResult<()> {
         .iter()
         .filter(|route| route.placement == "static")
         .count();
+    // The previous deployment manifest lists previously generated routes. Remove
+    // only obsolete route HTML, without clearing unrelated files in dist/.
+    let previous_ir_path = output_dir.join("nulang-app.ir.json");
+    if previous_ir_path.is_file() {
+        let previous_json =
+            std::fs::read_to_string(&previous_ir_path).map_err(|e| NuError::PackageError {
+                msg: format!("cannot read {}: {}", previous_ir_path.display(), e),
+                span: Span::default(),
+            })?;
+        let previous_ir: crate::web::ir::DeploymentIr = serde_json::from_str(&previous_json)
+            .map_err(|e| NuError::PackageError {
+                msg: format!(
+                    "cannot validate previous web deployment IR {}: {}",
+                    previous_ir_path.display(),
+                    e
+                ),
+                span: Span::default(),
+            })?;
+        prune_stale_web_html(&output_dir, &previous_ir, &ir)?;
+    }
+
     eprintln!("  Rendering {} static route(s)...", static_count);
     // DeploymentIr is generated in registration order from this exact list.
     for (route, ir_route) in routes.iter().zip(&ir.routes) {
@@ -1495,6 +1516,91 @@ fn cmd_build_web() -> NuResult<()> {
     }
 
     println!("Web build succeeded: {}", output_dir.display());
+    Ok(())
+}
+
+/// Rebuilds must not serve pages from routes removed or moved to server
+/// placement. The old IR, not an arbitrary directory scan, is the deletion
+/// authority. Never follow symlinks or path traversal from that JSON.
+fn prune_stale_web_html(
+    output_dir: &Path,
+    previous: &crate::web::ir::DeploymentIr,
+    current: &crate::web::ir::DeploymentIr,
+) -> NuResult<()> {
+    use std::collections::HashSet;
+    let error = |message: String| NuError::PackageError {
+        msg: message,
+        span: Span::default(),
+    };
+    if previous.version != 1 || current.version != 1 {
+        return Err(error("cannot clean route HTML from unsupported deployment IR version".into()));
+    }
+    let output_metadata = std::fs::symlink_metadata(output_dir).map_err(|e| {
+        error(format!("cannot inspect {}: {}", output_dir.display(), e))
+    })?;
+    if !output_metadata.is_dir() || output_metadata.file_type().is_symlink() {
+        return Err(error("web output directory must be a real directory".into()));
+    }
+    let output_root = output_dir.canonicalize().map_err(|e| {
+        error(format!("cannot resolve {}: {}", output_dir.display(), e))
+    })?;
+    let checked_path = |route_path: &str| -> NuResult<PathBuf> {
+        if !route_path.starts_with('/') || route_path.starts_with("//") {
+            return Err(error(format!("unsafe prior route path: {route_path:?}")));
+        }
+        let trimmed = route_path.trim_matches('/');
+        if trimmed.split('/').any(|segment| {
+            segment == "." || segment == ".." || segment.contains('\\')
+                || segment.bytes().any(|byte| byte == 0)
+        }) {
+            return Err(error(format!("unsafe prior route path: {route_path:?}")));
+        }
+        Ok(route_path_to_output_file(route_path))
+    };
+    let mut retained = HashSet::new();
+    for route in current.routes.iter().filter(|route| route.placement == "static") {
+        retained.insert(checked_path(&route.path)?);
+    }
+
+    // Validate every old path before deleting anything, including legacy
+    // server routes that older builds erroneously prerendered.
+    let mut stale = Vec::new();
+    for route in &previous.routes {
+        let relative = checked_path(&route.path)?;
+        if retained.contains(&relative) || stale.contains(&relative) {
+            continue;
+        }
+        let target = output_dir.join(&relative);
+        let metadata = match std::fs::symlink_metadata(&target) {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(error(format!("cannot inspect {}: {}", target.display(), e))),
+        };
+        if !metadata.is_file() {
+            return Err(error(format!(
+                "refusing to remove non-regular route artifact {}",
+                target.display()
+            )));
+        }
+        let parent = target.parent().ok_or_else(|| {
+            error(format!("route artifact has no parent: {}", target.display()))
+        })?;
+        let actual_parent = parent.canonicalize().map_err(|e| {
+            error(format!("cannot resolve {}: {}", parent.display(), e))
+        })?;
+        if !actual_parent.starts_with(&output_root) {
+            return Err(error(format!(
+                "route artifact escapes output directory: {}",
+                target.display()
+            )));
+        }
+        stale.push(target);
+    }
+    for file in stale {
+        std::fs::remove_file(&file).map_err(|e| {
+            error(format!("cannot remove stale {}: {}", file.display(), e))
+        })?;
+    }
     Ok(())
 }
 
