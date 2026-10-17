@@ -3,9 +3,7 @@
 
 use nulang::authority::{AuthorityGrant, AuthorityManifest};
 use nulang::bytecode::CodeModule;
-use nulang::durable_effect_runtime::{
-    DurableAsyncDispatchError, DurableEffectCoordinator,
-};
+use nulang::durable_effect_runtime::{DurableAsyncDispatchError, DurableEffectCoordinator};
 use nulang::hir_lower;
 use nulang::lexer::Lexer;
 use nulang::mir_codegen;
@@ -121,7 +119,10 @@ fn lost_provider_response_keeps_prepared_intent_and_retries_same_key() {
             |key, _| {
                 calls += 1;
                 provider.insert(key.to_string(), b"receipt".to_vec());
-                Err(io::Error::new(io::ErrorKind::TimedOut, "lost provider response"))
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "lost provider response",
+                ))
             },
         );
         assert!(matches!(
@@ -182,7 +183,10 @@ fn metadata_or_request_drift_never_reaches_provider() {
             b"charge=100",
             |_, _| panic!("invalid compiler metadata must not dispatch"),
         );
-        assert!(matches!(failure, Err(DurableAsyncDispatchError::InvalidSite(_))));
+        assert!(matches!(
+            failure,
+            Err(DurableAsyncDispatchError::InvalidSite(_))
+        ));
     }
     assert_eq!(store.latest_sequence(42), 0);
 
@@ -237,7 +241,10 @@ fn stale_activation_does_not_call_provider_for_prepared_effect() {
             b"charge=100",
             |_, _| Err(io::Error::new(io::ErrorKind::TimedOut, "no receipt")),
         );
-        assert!(matches!(failed, Err(DurableAsyncDispatchError::Provider(_))));
+        assert!(matches!(
+            failed,
+            Err(DurableAsyncDispatchError::Provider(_))
+        ));
     }
     {
         // Claim newer epoch by committing a distinct durable effect.
@@ -246,7 +253,7 @@ fn stale_activation_does_not_call_provider_for_prepared_effect() {
         let other = DurableEffectSpec::new(
             DurableEffectId::derive(42, "epoch-2-claim", 0, "Test.claim"),
             "Test.claim",
-            EffectBoundary::Local,
+            EffectBoundary::External,
             DeliverySemantics::AtLeastOnce,
         );
         let mut claimed = DurableEffectCoordinator::new(&mut store, 42, 2);
@@ -263,6 +270,9 @@ fn stale_activation_does_not_call_provider_for_prepared_effect() {
         b"charge=100",
         |_, _| panic!("stale owner must not redispatch"),
     );
-    assert!(matches!(result, Err(DurableAsyncDispatchError::Recovery(_))));
+    assert!(matches!(
+        result,
+        Err(DurableAsyncDispatchError::Recovery(_))
+    ));
     assert_eq!(store.latest_sequence(42), 2);
 }
