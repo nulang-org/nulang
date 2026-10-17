@@ -327,6 +327,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn durable_history_and_replication_are_independent_state_properties() {
+        let state = PersistenceSemantics {
+            durability: Durability::Durable,
+            history: HistorySemantics::EventSourced,
+            replication: ReplicationSemantics::Replicated,
+        };
+        let execution =
+            ExecutionSemantics::new(ExecutionDomain::Actor, state, IdentitySemantics::Stable);
+
+        assert_eq!(execution.persistence.durability, Durability::Durable);
+        assert_eq!(execution.persistence.history, HistorySemantics::EventSourced);
+        assert_eq!(execution.persistence.replication, ReplicationSemantics::Replicated);
+        assert_eq!(execution.domain, ExecutionDomain::Actor);
+        assert_eq!(execution.identity, IdentitySemantics::Stable);
+    }
+
+    #[test]
+    fn default_state_is_local_current_state_and_ephemeral() {
+        assert_eq!(PersistenceSemantics::EPHEMERAL.durability, Durability::Ephemeral);
+        assert_eq!(PersistenceSemantics::EPHEMERAL.history, HistorySemantics::CurrentState);
+        assert_eq!(
+            PersistenceSemantics::EPHEMERAL.replication,
+            ReplicationSemantics::Local
+        );
+    }
+
+    #[test]
     fn execution_domain_is_independent_from_persistence_and_identity() {
         let ephemeral_actor = ExecutionSemantics::ACTOR;
         let durable_entity = ExecutionSemantics::new(
