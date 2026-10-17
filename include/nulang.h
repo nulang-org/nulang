@@ -117,10 +117,31 @@ bool nulang_value_is_nil(NulangValue value);
 bool nulang_value_is_unit(NulangValue value);
 
 /**
- * Return a C string representation of a Nulang value.
+ * Convert a Nulang value to a C string using the module that owns its string
+ * constant pool. Prefer this function whenever converting a String value.
  *
- * The returned pointer is owned by the runtime and normally valid until the
- * runtime is freed. Call `nulang_free_string` to release it earlier.
+ * The returned pointer is owned by the runtime until released via
+ * `nulang_free_string` or until the runtime is destroyed. Returns NULL and
+ * sets `nulang_last_error` when the module handle or string id is invalid.
+ *
+ * The caller must supply the module handle that produced the value. Since
+ * NulangValue currently contains raw tagged bits, the ABI cannot verify
+ * provenance if two different modules use the same string id.
+ */
+const char *nulang_value_to_string_in_module(NulangRuntime *runtime,
+                                              int64_t module_handle,
+                                              NulangValue value);
+
+/**
+ * Legacy conversion for primitive values and unambiguous string values.
+ *
+ * If more than one compiled module maps the string id to different text (or
+ * does not contain that id), returns NULL with an ambiguity error instead of
+ * silently interpreting it using the most recently compiled module.
+ * Prefer `nulang_value_to_string_in_module` for strings.
+ *
+ * The returned pointer is runtime-owned and can be released early using
+ * `nulang_free_string`.
  */
 const char *nulang_value_to_string(NulangRuntime *runtime, NulangValue value);
 

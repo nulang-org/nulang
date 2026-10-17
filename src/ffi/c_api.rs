@@ -204,24 +204,73 @@ impl NulangRuntime {
         }
     }
 
-    fn value_to_cached_cstr(&mut self, value: Value) -> *const c_char {
-        let text = if let Some(id) = value.as_string_id() {
-            let module_idx = self.modules.len().saturating_sub(1);
-            self.modules
-                .get(module_idx)
-                .and_then(|m| m.constants.get(id as usize))
-                .and_then(|c| match c {
-                    crate::bytecode::Constant::String(s) => Some(s.clone()),
+    /// Resolve a string using its owning module. Legacy unqualified lookup is
+    /// permitted only when every compiled module maps the id to identical text.
+    /// A raw NaN-boxed string id is not sufficient to identify its provenance.
+    fn resolve_module_string(
+        &self,
+        string_id: usize,
+        module_index: Option<usize>,
+    ) -> Result<String, String> {
+        fn lookup(module: &crate::bytecode::CodeModule, string_id: usize) -> Option<&str> {
+            module
+                .constants
+                .get(string_id)
+                .and_then(|constant| match constant {
+                    crate::bytecode::Constant::String(text) => Some(text.as_str()),
                     _ => None,
                 })
-                .unwrap_or_else(|| value.to_string_repr())
+        }
+
+        if let Some(module_index) = module_index {
+            return self
+                .modules
+                .get(module_index)
+                .and_then(|module| lookup(module, string_id))
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    format!("string id {string_id} is not present in the selected module")
+                });
+        }
+
+        let mut resolved: Option<&str> = None;
+        for module in &self.modules {
+            let current = lookup(module, string_id).ok_or_else(|| {
+                "ambiguous string value across modules; use nulang_value_to_string_in_module"
+                    .to_string()
+            })?;
+            if let Some(previous) = resolved {
+                if previous != current {
+                    return Err(
+                        "ambiguous string value across modules; use nulang_value_to_string_in_module"
+                            .to_string(),
+                    );
+                }
+            } else {
+                resolved = Some(current);
+            }
+        }
+        resolved.map(str::to_owned).ok_or_else(|| {
+            "string value has no compiled module; use nulang_value_to_string_in_module".to_string()
+        })
+    }
+
+    fn value_to_cached_cstr(
+        &mut self,
+        value: Value,
+        module_index: Option<usize>,
+    ) -> Result<*const c_char, String> {
+        let text = if let Some(id) = value.as_string_id() {
+            self.resolve_module_string(id as usize, module_index)?
         } else {
             value.to_string_repr()
         };
-        let cstr = CString::new(text).unwrap_or_else(|_| CString::new("").unwrap());
+        let cstr = CString::new(text).map_err(|_| {
+            "Nulang string cannot be represented as a C string (interior NUL)".to_string()
+        })?;
         let ptr = cstr.as_ptr();
         self.string_cache.push(cstr);
-        ptr
+        Ok(ptr)
     }
 }
 
@@ -601,8 +650,60 @@ pub unsafe extern "C" fn nulang_value_to_string(
     }
     // SAFETY: runtime is non-null and valid.
     let rt = unsafe { &mut *runtime };
+    rt.clear_error();
     match value_from_c(value) {
-        Ok(value) => rt.value_to_cached_cstr(value),
+        Ok(value) => match rt.value_to_cached_cstr(value, None) {
+            Ok(ptr) => ptr,
+            Err(message) => {
+                rt.last_error = Some(message);
+                std::ptr::null()
+            }
+        },
+        Err(message) => {
+            rt.last_error = Some(message.to_string());
+            std::ptr::null()
+        }
+    }
+}
+
+/// Convert a string value using the compiled module that owns its string pool.
+///
+/// Unlike the legacy converter, this function never guesses a string's module
+/// from raw tagged bits. The caller must pass the handle of the module from
+/// which the value originated. Non-string primitive values do not use a pool.
+///
+/// # Safety
+/// `runtime` must be a live runtime pointer. `module_handle` must refer
+/// to a module compiled by that runtime.
+#[no_mangle]
+pub unsafe extern "C" fn nulang_value_to_string_in_module(
+    runtime: *mut NulangRuntime,
+    module_handle: i64,
+    value: NulangValue,
+) -> *const c_char {
+    if runtime.is_null() {
+        return std::ptr::null();
+    }
+    // SAFETY: caller guarantees a live, exclusively accessed runtime.
+    let rt = unsafe { &mut *runtime };
+    rt.clear_error();
+    let module_index = if module_handle >= 0 {
+        rt.module_index_for_handle(module_handle as usize)
+    } else {
+        None
+    };
+    let Some(module_index) = module_index else {
+        rt.last_error = Some("invalid compiled module handle".to_string());
+        return std::ptr::null();
+    };
+    match value_from_c(value) {
+        Ok(value) => match rt.value_to_cached_cstr(value, Some(module_index)) {
+            Ok(ptr) => ptr,
+            Err(message) => {
+                rt.last_error = Some(message);
+                std::ptr::null()
+            }
+        },
         Err(message) => {
             rt.last_error = Some(message.to_string());
             std::ptr::null()
@@ -784,6 +885,79 @@ mod tests {
         assert!(!err.is_null());
 
         // SAFETY: rt is valid.
+        unsafe { nulang_runtime_free(rt) };
+    }
+
+    #[test]
+    fn test_c_api_rejects_ambiguous_legacy_string_lookup_across_modules() {
+        let rt = nulang_runtime_new();
+        let a = CString::new("1 + 2").unwrap();
+        let b = CString::new("3 + 4").unwrap();
+        let module_a = unsafe { nulang_compile(rt, a.as_ptr()) };
+        let module_b = unsafe { nulang_compile(rt, b.as_ptr()) };
+        assert!(module_a >= 0 && module_b >= 0);
+
+        // Both modules allocate their first string at the same string index.
+        // Raw NulangValue bits alone cannot identify the owning module.
+        let text_a = CString::new("from module a").unwrap();
+        let text_b = CString::new("from module b").unwrap();
+        let value_a = unsafe { nulang_module_string(rt, module_a, text_a.as_ptr()) };
+        let value_b = unsafe { nulang_module_string(rt, module_b, text_b.as_ptr()) };
+        assert_eq!(value_a.raw, value_b.raw);
+
+        let legacy = unsafe { nulang_value_to_string(rt, value_a) };
+        assert!(
+            legacy.is_null(),
+            "legacy lookup must not silently select the last module"
+        );
+        let error = unsafe { CStr::from_ptr(nulang_last_error(rt)) }
+            .to_string_lossy()
+            .into_owned();
+        assert!(error.contains("ambiguous"), "{error}");
+
+        let ptr_a = unsafe { nulang_value_to_string_in_module(rt, module_a, value_a) };
+        assert!(!ptr_a.is_null());
+        assert_eq!(
+            unsafe { CStr::from_ptr(ptr_a) }.to_str().unwrap(),
+            "from module a"
+        );
+        assert!(unsafe { nulang_free_string(rt, ptr_a) });
+
+        let ptr_b = unsafe { nulang_value_to_string_in_module(rt, module_b, value_b) };
+        assert!(!ptr_b.is_null());
+        assert_eq!(
+            unsafe { CStr::from_ptr(ptr_b) }.to_str().unwrap(),
+            "from module b"
+        );
+        assert!(unsafe { nulang_free_string(rt, ptr_b) });
+
+        let invalid = unsafe { nulang_value_to_string_in_module(rt, -1, value_a) };
+        assert!(invalid.is_null());
+        assert!(!unsafe { nulang_last_error(rt) }.is_null());
+        unsafe { nulang_runtime_free(rt) };
+    }
+
+    #[test]
+    fn test_c_api_legacy_string_lookup_remains_valid_when_unambiguous() {
+        let rt = nulang_runtime_new();
+        let first = CString::new("7").unwrap();
+        let second = CString::new("8").unwrap();
+        let module_a = unsafe { nulang_compile(rt, first.as_ptr()) };
+        let module_b = unsafe { nulang_compile(rt, second.as_ptr()) };
+        assert!(module_a >= 0 && module_b >= 0);
+
+        let shared = CString::new("identical").unwrap();
+        let a = unsafe { nulang_module_string(rt, module_a, shared.as_ptr()) };
+        let b = unsafe { nulang_module_string(rt, module_b, shared.as_ptr()) };
+        assert_eq!(a.raw, b.raw);
+
+        let ptr = unsafe { nulang_value_to_string(rt, a) };
+        assert!(!ptr.is_null());
+        assert_eq!(
+            unsafe { CStr::from_ptr(ptr) }.to_str().unwrap(),
+            "identical"
+        );
+        assert!(unsafe { nulang_free_string(rt, ptr) });
         unsafe { nulang_runtime_free(rt) };
     }
 
