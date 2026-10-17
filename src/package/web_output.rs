@@ -233,10 +233,7 @@ mod tests {
         )
         .unwrap();
         assert!(StagedWebOutput::prepare(&fixture.output()).is_err());
-        assert_eq!(
-            fs::read(fixture.0.join("secret.txt")).unwrap(),
-            b"outside"
-        );
+        assert_eq!(fs::read(fixture.0.join("secret.txt")).unwrap(), b"outside");
     }
 
     #[cfg(unix)]
