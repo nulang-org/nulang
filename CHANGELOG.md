@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Linux atomic Web release exchange — 2026-10-17
+- **On Linux, updating an existing `dist/` exchanges the complete staged and published directories using `renameat2(RENAME_EXCHANGE)`.** The output path stays present and points to one complete version during the exchange. The former build is removed from its previous staging path after publication.
+- **Unsupported Linux filesystems fail closed** rather than silently falling back to a two-rename gap; initial deployment still uses a single rename. Other operating systems retain the earlier rollbackable two-rename behavior.
+- **This is atomic namespace visibility, not guaranteed power-loss durability.** Directory and file fsync, immutable release retention, and crash recovery remain separate work. Linux exchange tests cover nonempty directories and preservation on failed exchange.
+
 ### Serialize concurrent Web builds — 2026-10-17
 - **`nula build --web` acquires an exclusive, per-output lockfile** before copying prior output or starting the compilation phase, and holds it until promotion and backup cleanup complete. Concurrent builds of the same canonical output directory fail closed instead of publishing over one another.
 - **Lockfiles record the build PID and are released on normal exit or build failure.** A lock left by a crashed process is intentionally not stolen automatically; confirm the process is inactive before deleting the documented `.<output>.nulang-build.lock` file next to the output directory.
