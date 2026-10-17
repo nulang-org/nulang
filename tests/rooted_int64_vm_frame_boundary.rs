@@ -3,7 +3,7 @@
 //! contain arbitrary pointers; wide heap pointers must never be exported.
 
 use nulang::runtime::{Actor, FrameInt64BoundaryError, RootedIntFrame};
-use nulang::vm::{Frame, Value};
+use nulang::vm::{Frame, Value, VM};
 
 #[test]
 fn numeric_legacy_frame_roundtrips_with_control_metadata_and_empty_slots() {
@@ -111,5 +111,44 @@ fn arithmetic_overflow_leaves_destination_unchanged_across_frame_boundary() {
         assert!(frame.checked_add_into(2, 0, 1).is_err());
         assert_eq!(frame.read(2).unwrap(), Some(-9));
     }
+    assert_eq!(actor.heap.live_count(), 0);
+}
+
+#[test]
+fn production_vm_installs_only_verified_inline_frames() {
+    let mut actor = Actor::new(67, "frame-owner", 0);
+    let mut vm = VM::new_without_jit();
+    {
+        let mut rooted = RootedIntFrame::new(&mut actor, 3);
+        rooted.store(0, -77).unwrap();
+        vm.install_numeric_rooted_frame(&rooted).unwrap();
+    }
+    assert_eq!(vm.frames().len(), 1);
+    assert_eq!(vm.frames()[0].module_idx, 3);
+    assert_eq!(vm.frames()[0].regs[0].as_int(), Some(-77));
+    assert_eq!(actor.heap.live_count(), 0);
+}
+
+#[test]
+fn production_vm_does_not_discard_active_frame_when_wide_install_is_denied() {
+    let mut actor = Actor::new(68, "frame-owner", 0);
+    let mut vm = VM::new_without_jit();
+    let mut previous = Frame::new(None, 1);
+    previous.pc = 123;
+    previous.regs[0] = Value::int(19);
+    vm.set_current_frame(previous);
+    {
+        let mut rooted = RootedIntFrame::new(&mut actor, 2);
+        rooted.store(0, i64::MAX).unwrap();
+        assert_eq!(
+            vm.install_numeric_rooted_frame(&rooted),
+            Err(FrameInt64BoundaryError::WideIntegerRequiresNewAbi { register: 0 })
+        );
+        assert_eq!(rooted.read(0).unwrap(), Some(i64::MAX));
+    }
+    assert_eq!(vm.frames().len(), 1);
+    assert_eq!(vm.frames()[0].module_idx, 1);
+    assert_eq!(vm.frames()[0].pc, 123);
+    assert_eq!(vm.frames()[0].regs[0].as_int(), Some(19));
     assert_eq!(actor.heap.live_count(), 0);
 }
