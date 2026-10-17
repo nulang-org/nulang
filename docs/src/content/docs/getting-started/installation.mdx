@@ -21,6 +21,15 @@ Tagged releases publish checksummed archives on [GitHub Releases](https://github
 
 Download the archive **and matching `.sha256` file** from the same tagged release. Choose the archive for your operating system and CPU architecture.
 
+**Python integration:** Archives built with the Python-free `release-cli`
+profile do not include `Python.*` runtime dispatch. The compiler may still
+recognize Python effects, but they cannot execute in that binary. For Python
+interop, clone the source and build with
+`cargo build --locked --release --no-default-features --features full`,
+with matching Python development/runtime libraries installed. Older archives
+built with the original default features may instead have a version-specific
+`libpython` dependency (see the compatibility note below).
+
 ### Linux example (x86_64)
 
 From the directory containing the downloaded files:
