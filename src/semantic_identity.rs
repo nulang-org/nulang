@@ -206,6 +206,71 @@ where
     ))
 }
 
+/// Erase the private representation of nominal/opaque types at a public API
+/// boundary. This is deliberately NOT used for MIR or artifact ABI identity.
+fn public_type_view(ty: &Type) -> Type {
+    match ty {
+        Type::Nominal { name, .. } => Type::Nominal {
+            name: name.clone(),
+            underlying: Box::new(Type::unit()),
+        },
+        Type::Tuple(items) => Type::Tuple(items.iter().map(public_type_view).collect()),
+        Type::Record(fields) => Type::Record(
+            fields
+                .iter()
+                .map(|(name, ty)| (name.clone(), public_type_view(ty)))
+                .collect(),
+        ),
+        Type::Variant(cases) => Type::Variant(
+            cases
+                .iter()
+                .map(|(name, ty)| (name.clone(), ty.as_ref().map(public_type_view)))
+                .collect(),
+        ),
+        Type::Array(inner) => Type::Array(Box::new(public_type_view(inner))),
+        Type::Function {
+            param,
+            ret,
+            effect,
+            cap,
+        } => Type::Function {
+            param: Box::new(public_type_view(param)),
+            ret: Box::new(public_type_view(ret)),
+            effect: effect.clone(),
+            cap: *cap,
+        },
+        Type::Actor { state, behavior } => Type::Actor {
+            state: Box::new(public_type_view(state)),
+            behavior: Box::new(public_type_view(behavior)),
+        },
+        Type::App { constructor, args } => Type::App {
+            constructor: Box::new(public_type_view(constructor)),
+            args: args.iter().map(public_type_view).collect(),
+        },
+        Type::Reference { cap, inner } => Type::Reference {
+            cap: *cap,
+            inner: Box::new(public_type_view(inner)),
+        },
+        Type::Scheme { vars, body } => Type::Scheme {
+            vars: vars.clone(),
+            body: Box::new(public_type_view(body)),
+        },
+        other => other.clone(),
+    }
+}
+
+/// Alpha-normalized, backend-independent encoding of one public API type.
+///
+/// Unlike `canonical_type_bytes`, this removes process-global TypeVar,
+/// Region, and Skolem IDs and hides opaque-type representations. It is an
+/// additive source interface encoding, not a native ABI or frozen wire format.
+pub fn canonical_public_type_bytes(ty: &Type) -> Vec<u8> {
+    let mut encoder = Encoder::default();
+    encoder.bytes(b"nulang.public-type.v1\0");
+    encoder.ty(&public_type_view(ty));
+    encoder.out
+}
+
 /// Produce the canonical MIR byte stream used by [`semantic_id_for_mir`].
 ///
 /// Declaration-vector order and compiler-assigned function/behavior indices are
