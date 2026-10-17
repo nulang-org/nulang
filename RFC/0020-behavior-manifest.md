@@ -17,6 +17,18 @@ to the emitted bytecode bytes, durable actor persistence classification,
 state-schema semantic identity, schema versions, migration topology,
 deterministic manifest hashing, and structural upgrade preflight.
 
+Optional compiler-owned WASM sidecar emission is now implemented for
+`nulang --backend wasm --emit-behavior-manifest <path>`. The same typed HIR
+used for code generation produces the durability metadata, and the sidecar's
+`artifact.digest` binds the exact emitted `.wasm` bytes. The artifact
+kind/backend pair is `wasm-module` / `wasm`, distinct from
+`nulang-bytecode-v1` / `bytecode`. Compiler-owned identity fields and
+structural validation remain versioned under the existing v0alpha1 schema.
+
+The sidecar is not an authorization grant or executable attestation; Cloud
+continues to enforce independently and must treat it as untrusted until
+authenticated provenance and policy admission are implemented.
+
 This does **not** resolve the RFC or complete its full proposed surface:
 effects, authority inventories, interfaces, resources, provenance attestations,
 and canonical migration-body identity remain follow-up work. Migration identity

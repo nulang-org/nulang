@@ -21,6 +21,7 @@ use std::str::FromStr;
 
 pub const BEHAVIOR_MANIFEST_SCHEMA: &str = "nulang.behavior/v0alpha1";
 pub const BEHAVIOR_ARTIFACT_KIND_NBC_V1: &str = "nulang-bytecode-v1";
+pub const BEHAVIOR_ARTIFACT_KIND_WASM_MODULE: &str = "wasm-module";
 const BEHAVIOR_MANIFEST_DIGEST_DOMAIN: &[u8] = b"nulang.behavior-manifest.v0alpha1\0";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +117,43 @@ impl BehaviorManifest {
         artifact_bytes: &[u8],
         hir: &hir::Module,
     ) -> Result<Self, BehaviorManifestError> {
+        Self::from_typed_hir_with_kind(
+            package_name,
+            package_version,
+            artifact,
+            artifact_bytes,
+            hir,
+            BEHAVIOR_ARTIFACT_KIND_NBC_V1,
+        )
+    }
+
+    /// Produce a WASM sidecar from the identical typed HIR used by the WASM
+    /// backend and bind it to the exact emitted WASM bytes.
+    pub fn from_typed_hir_for_wasm(
+        package_name: impl Into<String>,
+        package_version: impl Into<String>,
+        artifact: &ArtifactIdentityManifest,
+        artifact_bytes: &[u8],
+        hir: &hir::Module,
+    ) -> Result<Self, BehaviorManifestError> {
+        Self::from_typed_hir_with_kind(
+            package_name,
+            package_version,
+            artifact,
+            artifact_bytes,
+            hir,
+            BEHAVIOR_ARTIFACT_KIND_WASM_MODULE,
+        )
+    }
+
+    fn from_typed_hir_with_kind(
+        package_name: impl Into<String>,
+        package_version: impl Into<String>,
+        artifact: &ArtifactIdentityManifest,
+        artifact_bytes: &[u8],
+        hir: &hir::Module,
+        artifact_kind: &str,
+    ) -> Result<Self, BehaviorManifestError> {
         let package_name = package_name.into();
         let package_version = package_version.into();
         let actor_defs = actor_defs_by_name(hir);
@@ -147,7 +185,7 @@ impl BehaviorManifest {
                 language_version: LANGUAGE_VERSION_STR.to_string(),
             },
             artifact: BehaviorArtifact {
-                kind: BEHAVIOR_ARTIFACT_KIND_NBC_V1.to_string(),
+                kind: artifact_kind.to_string(),
                 digest: artifact_digest(artifact_bytes),
                 source_id: artifact.source_id().map(|id| id.to_string()),
                 semantic_id: artifact.semantic_id().to_string(),
@@ -345,10 +383,19 @@ impl BehaviorManifest {
                 "package version must not be empty".to_string(),
             ));
         }
-        if self.artifact.kind != BEHAVIOR_ARTIFACT_KIND_NBC_V1 {
-            return Err(BehaviorManifestError::UnsupportedArtifactKind(
-                self.artifact.kind.clone(),
-            ));
+        match (self.artifact.kind.as_str(), self.artifact.backend.as_str()) {
+            (BEHAVIOR_ARTIFACT_KIND_NBC_V1, "bytecode")
+            | (BEHAVIOR_ARTIFACT_KIND_WASM_MODULE, "wasm") => {}
+            (BEHAVIOR_ARTIFACT_KIND_NBC_V1, _) | (BEHAVIOR_ARTIFACT_KIND_WASM_MODULE, _) => {
+                return Err(BehaviorManifestError::InvalidPackage(
+                    "artifact kind and backend must describe the same executable format".into(),
+                ));
+            }
+            _ => {
+                return Err(BehaviorManifestError::UnsupportedArtifactKind(
+                    self.artifact.kind.clone(),
+                ));
+            }
         }
         validate_blake3_digest("artifact.digest", &self.artifact.digest)?;
 
@@ -870,6 +917,38 @@ mod tests {
                     .collect()
             },
         }
+    }
+
+    #[test]
+    fn wasm_manifest_requires_exact_wasm_bytes_and_matching_backend() {
+        let wasm = b"\0asm\x01\0\0\0";
+        let wasm_identity = ArtifactIdentityManifest::new(
+            Some(SourceId::from_bytes(b"fn main() = 42")),
+            SemanticId::from_canonical_bytes(b"wasm-program", []),
+            "nulang-rust-0.1.0",
+            "wasm32",
+            "nulang-wasm-v1",
+            "wasm",
+            std::iter::empty::<&str>(),
+        );
+        let manifest = BehaviorManifest::from_typed_hir_for_wasm(
+            "wasm-check",
+            "0.2.0",
+            &wasm_identity,
+            wasm,
+            &typed_hir(1),
+        )
+        .expect("WASM manifest");
+        assert_eq!(manifest.artifact.kind, BEHAVIOR_ARTIFACT_KIND_WASM_MODULE);
+        assert_eq!(manifest.artifact.backend, "wasm");
+        manifest.verify_artifact_bytes(wasm).expect("exact WASM");
+        assert!(manifest.verify_artifact_bytes(b"mutated").is_err());
+        let parsed = BehaviorManifest::from_json(&manifest.to_json().unwrap()).unwrap();
+        assert_eq!(parsed, manifest);
+
+        let mut mismatched = manifest;
+        mismatched.artifact.backend = "bytecode".into();
+        assert!(BehaviorManifest::from_json(&serde_json::to_vec(&mismatched).unwrap()).is_err());
     }
 
     #[test]
