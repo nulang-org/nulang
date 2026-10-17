@@ -228,16 +228,25 @@ impl fmt::Display for CompiledEffectSpecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingExecutionKey => {
-                write!(f, "durable compiled effect requires a replay-stable execution key")
+                write!(
+                    f,
+                    "durable compiled effect requires a replay-stable execution key"
+                )
             }
             Self::MissingSite { pc } => {
                 write!(f, "missing compiler-owned effect-site metadata at pc {pc}")
             }
             Self::InvalidOpcode { pc } => {
-                write!(f, "effect-site metadata at pc {pc} does not point to PerformAsync")
+                write!(
+                    f,
+                    "effect-site metadata at pc {pc} does not point to PerformAsync"
+                )
             }
             Self::OperationMismatch { pc } => {
-                write!(f, "effect-site operation does not match opcode constant at pc {pc}")
+                write!(
+                    f,
+                    "effect-site operation does not match opcode constant at pc {pc}"
+                )
             }
         }
     }
