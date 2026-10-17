@@ -1565,9 +1565,10 @@ fn prune_stale_web_html(
     // Validate every old path before deleting anything, including legacy
     // server routes that older builds erroneously prerendered.
     let mut stale = Vec::new();
+    let mut seen = HashSet::new();
     for route in &previous.routes {
         let relative = checked_path(&route.path)?;
-        if retained.contains(&relative) || stale.contains(&relative) {
+        if retained.contains(&relative) || !seen.insert(relative.clone()) {
             continue;
         }
         let target = output_dir.join(&relative);
