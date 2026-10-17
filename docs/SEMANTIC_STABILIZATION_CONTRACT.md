@@ -2,6 +2,12 @@
 
 Status: active stabilization policy for the pre-production language/runtime.
 
+**Incubating policy (2026-10-17):** The source-language Core is no longer
+Stable-tier or permanently Frozen: see RFC 0032. This **does not relax**
+correctness, authority, deterministic replay, or exact-head CI gates below.
+Semantics can change before independent adoption, but backend parity, durable
+data safety, and versioned compatibility boundaries still must be proven.
+
 This document narrows Nulang development around one goal: make the semantics already claimed by the language deterministic, fail-closed, backend-consistent, and recoverable before expanding the public language surface.
 
 It complements the stability tiers in `GOVERNANCE.md`, the consolidated architecture roadmap in issue #331, and the P0 stabilization gate in issue #231.
