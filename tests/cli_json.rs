@@ -324,3 +324,67 @@ fn nula_test_json_all_passing_is_ok() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+
+#[cfg(feature = "wasm-backend")]
+#[test]
+fn wasm_cli_emits_compiler_owned_behavior_manifest_bound_to_exact_bytes() {
+    let dir = temp_dir("wasm_behavior");
+    let input = write_temp(&dir, "main.nula", "fn main() = 42\n");
+    let wasm_path = dir.join("main.wasm");
+    let manifest_path = dir.join("main.behavior.json");
+
+    let output = Command::new(nulang_exe())
+        .arg("--backend")
+        .arg("wasm")
+        .arg("--out")
+        .arg(&wasm_path)
+        .arg("--emit-behavior-manifest")
+        .arg(&manifest_path)
+        .args(["--behavior-package-name", "wasm-check", "--behavior-package-version", "0.2.0"])
+        .arg(&input)
+        .env("NULANG_STDLIB", stdlib_dir())
+        .output()
+        .expect("run Nulang WASM compiler");
+    assert!(
+        output.status.success(),
+        "WASM compile failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let wasm = std::fs::read(&wasm_path).expect("WASM bytes");
+    assert!(wasm.starts_with(b"\\0asm"), "compiled artifact must be WebAssembly");
+    let manifest_bytes = std::fs::read(&manifest_path).expect("compiler-owned WASM sidecar");
+    let manifest = nulang::behavior_manifest::BehaviorManifest::from_json(&manifest_bytes)
+        .expect("parse exact emitted manifest");
+    assert_eq!(manifest.package.name, "wasm-check");
+    assert_eq!(manifest.package.version, "0.2.0");
+    assert_eq!(manifest.artifact.kind, "wasm-module");
+    assert_eq!(manifest.artifact.backend, "wasm");
+    manifest.verify_artifact_bytes(&wasm).expect("manifest digest matches emitted WASM");
+
+    let mut modified = wasm;
+    modified.push(0);
+    assert!(
+        manifest.verify_artifact_bytes(&modified).is_err(),
+        "changing executable bytes must invalidate provenance"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn behavior_manifest_cli_rejects_unsupported_backend_combination() {
+    let dir = temp_dir("invalid_behavior_backend");
+    let input = write_temp(&dir, "main.nula", "fn main() = 1\n");
+    let manifest_path = dir.join("out.behavior.json");
+
+    let output = Command::new(nulang_exe())
+        .args(["--backend", "bytecode", "--emit-behavior-manifest"])
+        .arg(&manifest_path)
+        .arg(&input)
+        .output()
+        .expect("run CLI with unsupported manifest backend");
+    assert!(!output.status.success(), "unsupported emission must fail closed");
+    assert!(!manifest_path.exists(), "no invalid sidecar must be written");
+    let _ = std::fs::remove_dir_all(&dir);
+}
