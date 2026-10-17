@@ -1,17 +1,13 @@
 #!/usr/bin/env sh
-# ---------------------------------------------------------------------------
-# Pre-push — thorough checks before pushing to remote
-# ---------------------------------------------------------------------------
-
+# Pre-push: use the same blocking Clippy policy as CI.
 set -e
 
-# Ensure rustup-managed toolchain used consistently.
 export PATH="$HOME/.cargo/bin:$PATH"
 
-echo "→ cargo clippy --all-targets -- -D warnings --cap-lints warn"
-cargo clippy --all-targets -- -D warnings --cap-lints warn
+echo "→ cargo clippy --locked --all-targets -- -D clippy::correctness"
+cargo clippy --locked --all-targets -- -D clippy::correctness
 
-echo "→ cargo test"
-cargo test
+echo "→ cargo test --locked"
+cargo test --locked
 
 echo "✓ pre-push checks passed"
