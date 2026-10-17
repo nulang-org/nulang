@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Bounded mailbox supervisor-credit isolation — 2026-10-16
+- **System and supervisor messages bypass ordinary mailbox capacity without consuming normal/bulk credits.** Total queued depth remains separate from application capacity, including staged selective-receive messages.
+- **Conformance tests cover concurrent bounded admission, supervisor-message floods, credit release on consumption and committed receive, and pooled mailbox reset.** System signals remain unbounded and require separate observability and abuse controls.
+
 ### Web static-root containment — 2026-10-15
 - **Experimental Web static file serving refuses parent traversal and symlinks escaping configured roots.** Canonical candidate paths must remain inside their canonicalized static or output root, and normal in-root files remain serveable.
 - **A filesystem regression verifies parent and symlink escape rejection.** This is a clean current-main successor to draft #1676; it does not change SSE or claim protection from malicious concurrent mutation of a trusted static root.
