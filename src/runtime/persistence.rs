@@ -530,6 +530,25 @@ impl DurableTransition {
                     }
                 }
             }
+            if let Some(replay_id) = event.replay_id() {
+                if replay_id.activation.actor_id != self.actor_id {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "durable transition workflow replay actor does not match transition actor",
+                    ));
+                }
+                // An intermediate event can follow a previously committed
+                // command. Only require a sequence match when this transition
+                // actually stages a new command alongside the event.
+                if let Some(command) = &self.command {
+                    if replay_id.activation.command_sequence != command.sequence {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "durable transition workflow replay command sequence does not match accepted command",
+                        ));
+                    }
+                }
+            }
         }
         if self
             .domain_events
