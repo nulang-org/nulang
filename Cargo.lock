@@ -2473,6 +2473,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "ureq",
+ "url",
  "uuid",
  "wasm-encoder 0.220.1",
  "wasmtime",
