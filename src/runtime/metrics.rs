@@ -72,8 +72,12 @@ mod scheduler_queue_metric_tests {
     #[test]
     fn exports_scheduler_ready_queue_depth_gauges() {
         let runtime = Runtime::new();
-        runtime.scheduler.enqueue_with_priority(7, ActorPriority::High);
-        runtime.scheduler.enqueue_with_priority(8, ActorPriority::Low);
+        runtime
+            .scheduler
+            .enqueue_with_priority(7, ActorPriority::High);
+        runtime
+            .scheduler
+            .enqueue_with_priority(8, ActorPriority::Low);
         let exposition = runtime.metrics_snapshot().to_prometheus_text();
 
         assert!(exposition.contains("# TYPE nulang_scheduler_ready_high gauge\n"));
@@ -163,7 +167,10 @@ impl MetricsSnapshot {
         out.push_str(&format!("nulang_scheduler_ready_high {}\n", s.ready_high));
         out.push_str("# HELP nulang_scheduler_ready_normal Runnable Normal-priority queue depth\n");
         out.push_str("# TYPE nulang_scheduler_ready_normal gauge\n");
-        out.push_str(&format!("nulang_scheduler_ready_normal {}\n", s.ready_normal));
+        out.push_str(&format!(
+            "nulang_scheduler_ready_normal {}\n",
+            s.ready_normal
+        ));
         out.push_str("# HELP nulang_scheduler_ready_low Runnable Low-priority queue depth\n");
         out.push_str("# TYPE nulang_scheduler_ready_low gauge\n");
         out.push_str(&format!("nulang_scheduler_ready_low {}\n", s.ready_low));
