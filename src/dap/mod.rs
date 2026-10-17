@@ -1252,9 +1252,85 @@ pub(crate) mod tests {
         path
     }
 
+    // Unlike a finite Cursor, the scripted client stays connected until it
+    // receives the actual terminal DAP event. This affects only tests: real
+    // clients still disconnect on EOF and use the existing bounded shutdown.
+    struct AwaitTerminatedReader {
+        bytes: std::io::Cursor<Vec<u8>>,
+        terminal_rx: std::sync::mpsc::Receiver<()>,
+        waiting_tx: Option<std::sync::mpsc::Sender<()>>,
+        finished: bool,
+    }
+
+    impl std::io::Read for AwaitTerminatedReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if buf.is_empty() || self.finished {
+                return Ok(0);
+            }
+            let read = std::io::Read::read(&mut self.bytes, buf)?;
+            if read != 0 {
+                return Ok(read);
+            }
+            self.finished = true;
+            if let Some(tx) = self.waiting_tx.take() {
+                let _ = tx.send(());
+            }
+            // A generous test failure bound, not a quiescence heuristic for
+            // successful execution. No client EOF is delivered before the
+            // terminal event has actually been written.
+            self.terminal_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "scripted DAP client did not receive terminated event",
+                    )
+                })?;
+            Ok(0)
+        }
+    }
+
+    struct TerminalEventWriter {
+        output: Vec<u8>,
+        terminal_tx: Option<std::sync::mpsc::Sender<()>>,
+    }
+
+    impl std::io::Write for TerminalEventWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.output.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            // write_message flushes after each complete DAP frame. Signal
+            // only for an actual terminal event, never text within output
+            // or a response with a similar name.
+            if self.terminal_tx.is_some()
+                && parse_output(&self.output)
+                    .iter()
+                    .any(|m| m["type"] == "event" && m["event"] == "terminated")
+            {
+                if let Some(tx) = self.terminal_tx.take() {
+                    let _ = tx.send(());
+                }
+            }
+            Ok(())
+        }
+    }
+
     /// Drive a scripted DAP session against `source` and return the framed
     /// output (responses + events) as parsed JSON messages.
     fn run_session(source: &str, script: &[Json]) -> Vec<Json> {
+        run_session_with_mode(source, script, false)
+    }
+
+    /// Test a program's natural termination without simulating client EOF
+    /// before the background debuggee has emitted its terminal events.
+    fn run_session_until_terminated(source: &str, script: &[Json]) -> Vec<Json> {
+        run_session_with_mode(source, script, true)
+    }
+
+    fn run_session_with_mode(source: &str, script: &[Json], await_terminal: bool) -> Vec<Json> {
         let path = write_prog(source);
         let prog = path.to_string_lossy().to_string();
         // Substitute the real temp path for the "<prog>" placeholder in any
@@ -1284,9 +1360,26 @@ pub(crate) mod tests {
         for m in &script {
             send(&mut input, m);
         }
-        let mut output = Vec::new();
-        let reader = std::io::Cursor::new(input);
-        run_dap_server_io(std::io::BufReader::new(reader), &mut output);
+        let output = if await_terminal {
+            let (terminal_tx, terminal_rx) = std::sync::mpsc::channel();
+            let reader = AwaitTerminatedReader {
+                bytes: std::io::Cursor::new(input),
+                terminal_rx,
+                waiting_tx: None,
+                finished: false,
+            };
+            let mut writer = TerminalEventWriter {
+                output: Vec::new(),
+                terminal_tx: Some(terminal_tx),
+            };
+            run_dap_server_io(std::io::BufReader::new(reader), &mut writer);
+            writer.output
+        } else {
+            let mut output = Vec::new();
+            let reader = std::io::Cursor::new(input);
+            run_dap_server_io(std::io::BufReader::new(reader), &mut output);
+            output
+        };
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
         parse_output(&output)
     }
@@ -1328,6 +1421,71 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_scripted_reader_holds_eof_until_terminal_signal() {
+        let (terminal_tx, terminal_rx) = std::sync::mpsc::channel();
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        let reader_thread = std::thread::spawn(move || {
+            let mut reader = AwaitTerminatedReader {
+                bytes: std::io::Cursor::new(Vec::new()),
+                terminal_rx,
+                waiting_tx: Some(waiting_tx),
+                finished: false,
+            };
+            let mut buf = [0u8; 1];
+            read_tx
+                .send(std::io::Read::read(&mut reader, &mut buf))
+                .unwrap();
+        });
+
+        // An explicit handshake proves the reader reached the EOF boundary;
+        // the assertion does not depend on a particular scheduling delay.
+        waiting_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("scripted reader did not reach the EOF gate");
+        assert!(matches!(
+            read_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        terminal_tx.send(()).unwrap();
+        assert_eq!(
+            read_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("reader did not resume on termination")
+                .unwrap(),
+            0
+        );
+        reader_thread.join().unwrap();
+    }
+
+    #[test]
+    fn test_terminal_event_writer_releases_eof_only_on_terminated_frame() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut writer = TerminalEventWriter {
+            output: Vec::new(),
+            terminal_tx: Some(tx),
+        };
+        write_message(
+            &mut writer,
+            &json!({ "type": "response", "command": "terminated" }),
+        );
+        write_message(
+            &mut writer,
+            &json!({ "type": "event", "event": "exited", "body": { "exitCode": 0 } }),
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        write_message(
+            &mut writer,
+            &json!({ "type": "event", "event": "terminated" }),
+        );
+        assert!(rx.try_recv().is_ok());
+        assert!(writer.terminal_tx.is_none());
+    }
+
+    #[test]
     fn test_continue_reaches_exit() {
         let source = "let a = 1 in a + 1";
         let script = vec![
@@ -1340,12 +1498,18 @@ pub(crate) mod tests {
             ),
             req(4, "configurationDone", json!({})),
         ];
-        let msgs = run_session(source, &script);
+        // A scripted test client must remain connected while the debuggee
+        // finishes; a finite Cursor EOF models a real client disconnect.
+        let msgs = run_session_until_terminated(source, &script);
 
-        // No breakpoints set -> the program runs to completion.
+        // No breakpoints set -> the program runs to successful completion.
+        // An erroring debuggee also emits Exited + Terminated; event presence
+        // alone would mask an execution failure in this regression test.
         assert!(
-            msgs.iter().any(|m| m["event"] == "exited"),
-            "expected exited, got {:#?}",
+            msgs.iter().any(|m| {
+                m["type"] == "event" && m["event"] == "exited" && m["body"]["exitCode"] == 0
+            }),
+            "expected successful exit code 0, got {:#?}",
             msgs
         );
         assert!(
