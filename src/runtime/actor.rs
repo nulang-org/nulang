@@ -839,6 +839,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wide_int_lease_preserves_full_i64_range_and_releases_orca_object() {
+        let mut actor = Actor::new(17, "int-owner", 0);
+        for value in [i64::MIN, -(1_i64 << 47) - 1, 1_i64 << 47, i64::MAX] {
+            assert_eq!(actor.heap.live_count(), 0);
+            {
+                let lease = actor.lease_wide_int(value).expect("8-byte ORCA allocation");
+                assert_eq!(lease.value(), value);
+            }
+            assert_eq!(
+                actor.heap.live_count(),
+                0,
+                "owned wide integer must free its ORCA allocation on lease drop"
+            );
+        }
+    }
+
+    #[test]
+    fn wide_int_lease_does_not_make_raw_vm_values_or_leak_across_actor_lifetimes() {
+        let mut actor = Actor::new(23, "int-owner", 0);
+        {
+            let lease = actor.lease_wide_int(i64::MAX).unwrap();
+            assert_eq!(lease.value(), i64::MAX);
+            // No public conversion to the v1 Value layout: the future
+            // wide-int message/snapshot ABI needs an explicit version.
+        }
+        assert_eq!(actor.heap.live_count(), 0);
+        let inline = crate::vm::Value::try_int(i64::MAX);
+        assert!(inline.is_none(), "must not alias an existing 48-bit integer");
+    }
+
+    #[test]
     fn test_actor_new() {
         let actor = Actor::new(1, "test", 0);
         assert_eq!(actor.id, 1);
