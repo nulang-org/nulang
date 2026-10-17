@@ -88,13 +88,35 @@ pub trait DistributedVmCallbacks: std::any::Any + std::fmt::Debug {
         Value::unit()
     }
 
+    /// Fail closed when no distributed callback implements remote spawning.
+    /// Only an admitted spawn may produce a valid actor reference.
     fn remote_spawn(
         &mut self,
         _target_node: u64,
         _behavior: &str,
         _init: &[(String, Value)],
     ) -> Value {
-        Value::actor_ref(0)
+        Value::nil()
+    }
+}
+
+#[cfg(test)]
+mod remote_spawn_failure_contract_tests {
+    use super::{DistributedVmCallbacks, Value};
+
+    #[derive(Debug)]
+    struct UnconfiguredDistributedCallbacks;
+
+    impl DistributedVmCallbacks for UnconfiguredDistributedCallbacks {}
+
+    #[test]
+    fn default_remote_spawn_does_not_fabricate_actor_reference() {
+        let mut callbacks = UnconfiguredDistributedCallbacks;
+        let result = callbacks.remote_spawn(42, "Worker", &[]);
+        assert!(
+            result.is_nil(),
+            "unwired remote spawn must fail with nil, not ActorRef(0)"
+        );
     }
 }
 
@@ -994,7 +1016,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
         _behavior_idx: usize,
         _init: Vec<(String, Value)>,
     ) -> Value {
-        Value::actor_ref(0)
+        Value::nil()
     }
 
     fn send_message(&mut self, _target: Value, _behavior_id: u16, _args: &[Value]) {}
@@ -4683,7 +4705,7 @@ impl VM {
             self.actor_callbacks
                 .spawn_actor(module, spawn_pc, behavior_idx, init)
         } else {
-            Value::actor_ref(0)
+            Value::nil()
         };
         self.frames[frame_idx].regs[instr.op3 as usize] = result;
         Ok(())
@@ -4758,7 +4780,7 @@ impl VM {
             if let Some(cb) = &mut self.distributed_callbacks {
                 cb.remote_spawn(node_id, &behavior_name, &init)
             } else {
-                Value::actor_ref(0)
+                Value::nil()
             }
         } else {
             match self.modules.get(module_idx) {
@@ -4766,7 +4788,7 @@ impl VM {
                     self.actor_callbacks
                         .spawn_actor(module, spawn_pc, behavior_idx, init)
                 }
-                None => Value::actor_ref(0),
+                None => Value::nil(),
             }
         };
         self.frames[frame_idx].regs[node_reg] = result;

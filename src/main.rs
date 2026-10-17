@@ -2615,7 +2615,7 @@ fn run_nbc_file(path: &str, verify_source: Option<&str>, store_path: Option<&str
 /// source execution.
 ///
 /// A bare `VM` installs `StandaloneVmCallbacks`, whose actor operations are
-/// deliberately inert (`spawn` returns actor-ref 0 and `send` is a no-op).
+/// deliberately inert (`spawn` returns nil and `send` is a no-op).
 /// Serialized actor/workflow modules therefore must use the real Runtime bridge
 /// and scheduler, exactly like the bytecode source path in `run_source`.
 fn run_nbc_module(
