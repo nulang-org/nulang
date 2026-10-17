@@ -104,7 +104,7 @@ fn main() {
 ```
 
 :::note
-Current state of this surface, verified with the compiler binary: `perform Python.import(...)` does not parse today — `import` is a reserved keyword and the parser does not exempt it as an effect operation name (error `E0102`). Until that is fixed there is no way to import a module from pure Nulang source, so `Python.call`/`Python.get_attr` compile and dispatch but return `nil` with a `module '<name>' not imported` diagnostic for never-imported modules, and performing `Python.*` from inside a behavior traps the behavior silently. The bridge itself (import, call, attribute access, marshalling) is implemented and unit-tested at the Rust level; driving it end-to-end from source is blocked on the import syntax gap.
+Current source-level parser behavior (pending compiler and CI validation): The parser now accepts `perform Python.import(...)` even though `import` is a reserved keyword. This resolves the source-level parse blocker only; Python marshalling and actor-host dispatch are still experimental and require end-to-end verification. Do not assume Python calls are production-ready merely because the source parses. The bridge itself (import, call, attribute access, marshalling) has Rust unit coverage, but source-level integration still needs verification.
 :::
 
 ## The C FFI
