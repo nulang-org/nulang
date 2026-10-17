@@ -437,12 +437,16 @@ mod tests {
     #[test]
     fn test_dst_timer_to_unregistered_actor_is_diagnosed() {
         let mut sim = Simulator::new(1);
-        sim.timers.push((25, 7, SimMessage {
-            sender: 0,
-            target: 7,
-            behavior: "wake".into(),
-            payload: vec![],
-        }));
+        sim.timers.push((
+            25,
+            7,
+            SimMessage {
+                sender: 0,
+                target: 7,
+                behavior: "wake".into(),
+                payload: vec![],
+            },
+        ));
         sim.run_until_quiescence();
         assert_eq!(sim.clock_ms(), 25);
         assert_eq!(sim.undeliverable_messages().len(), 1);
