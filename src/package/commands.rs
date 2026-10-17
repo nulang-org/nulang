@@ -3088,6 +3088,7 @@ signal count: Html = text("0")
 
 fn add() {}
 
+@placement(static)
 fn home() -> Html {
     <div class="card">
         <button action={add}>Add</button>
@@ -3123,6 +3124,73 @@ app "counter" {
         assert!(js.contains("window.nulang"), "nulang global missing");
         assert!(js.contains("hydrate"), "hydrate missing");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_route_html_is_pruned_without_removing_unrelated_assets() {
+        use serde_json::json;
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_web_stale_html_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("old")).unwrap();
+        std::fs::create_dir_all(dir.join("keep")).unwrap();
+        std::fs::write(dir.join("old/index.html"), b"removed page").unwrap();
+        std::fs::write(dir.join("keep/index.html"), b"retained page").unwrap();
+        std::fs::write(dir.join("private.txt"), b"unmanaged").unwrap();
+
+        let old_ir: crate::web::ir::DeploymentIr = serde_json::from_value(json!({
+            "version": 1,
+            "routes": [
+                {"method": "GET", "path": "/old", "placement": "static", "artifact": "old/index.html"},
+                {"method": "GET", "path": "/keep", "placement": "static", "artifact": "keep/index.html"}
+            ],
+            "signals": {}, "capabilities": [], "budgets": {},
+            "middleware": [], "cloud_config": []
+        }))
+        .unwrap();
+        let new_ir: crate::web::ir::DeploymentIr = serde_json::from_value(json!({
+            "version": 1,
+            "routes": [
+                {"method": "GET", "path": "/old", "placement": "server", "artifact": null},
+                {"method": "GET", "path": "/keep", "placement": "static", "artifact": "keep/index.html"}
+            ],
+            "signals": {}, "capabilities": [], "budgets": {},
+            "middleware": [], "cloud_config": []
+        }))
+        .unwrap();
+
+        prune_stale_web_html(&dir, &old_ir, &new_ir).unwrap();
+        assert!(!dir.join("old/index.html").exists());
+        assert_eq!(std::fs::read(dir.join("keep/index.html")).unwrap(), b"retained page");
+        assert_eq!(std::fs::read(dir.join("private.txt")).unwrap(), b"unmanaged");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_route_cleanup_never_follows_untrusted_parent_paths() {
+        use serde_json::json;
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_web_stale_path_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old_ir: crate::web::ir::DeploymentIr = serde_json::from_value(json!({
+            "version": 1,
+            "routes": [{"method": "GET", "path": "/../private", "placement": "static", "artifact": "../private/index.html"}],
+            "signals": {}, "capabilities": [], "budgets": {},
+            "middleware": [], "cloud_config": []
+        }))
+        .unwrap();
+        let new_ir: crate::web::ir::DeploymentIr = serde_json::from_value(json!({
+            "version": 1, "routes": [], "signals": {},
+            "capabilities": [], "budgets": {}, "middleware": [], "cloud_config": []
+        }))
+        .unwrap();
+        assert!(prune_stale_web_html(&dir, &old_ir, &new_ir).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
