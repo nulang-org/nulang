@@ -4043,6 +4043,68 @@ mod durable_transition_tests {
     }
 
     #[test]
+    fn durable_transition_rejects_cross_actor_timer_replay_identity_without_writing() {
+        let mut store = MemoryStore::new();
+        let mut candidate = transition(10, 1, 1);
+        candidate.workflow_events = vec![WorkflowEvent::TimerSet {
+            sequence: 1,
+            replay_id: Some(WorkflowReplayEventId::new(
+                WorkflowActivationId::new(11, 1),
+                0,
+            )),
+            name: "wake".to_string(),
+            duration_ms: 100,
+        }];
+
+        let error = store.commit_transition(candidate).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(store.latest_sequence(10), 0);
+        assert!(store.committed_transitions(10).is_empty());
+        assert!(store.read_workflow_events(10).is_empty());
+    }
+
+    #[test]
+    fn durable_transition_rejects_intermediate_replay_identity_for_wrong_command() {
+        let mut candidate = transition(10, 1, 1);
+        candidate.workflow_events = vec![WorkflowEvent::Custom {
+            sequence: 1,
+            replay_id: Some(WorkflowReplayEventId::new(
+                WorkflowActivationId::new(10, 99),
+                0,
+            )),
+            name: "audit".to_string(),
+            args: vec![],
+        }];
+
+        let error = candidate.digest().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn durable_transition_accepts_intermediate_replay_of_prior_command() {
+        let mut store = MemoryStore::new();
+        store.commit_transition(transition(10, 1, 1)).unwrap();
+
+        let mut candidate = transition(10, 1, 2);
+        // Intermediate events may be committed after their command was admitted,
+        // without creating a second command journal entry.
+        candidate.command = None;
+        candidate.workflow_events = vec![WorkflowEvent::TimerSet {
+            sequence: 2,
+            replay_id: Some(WorkflowReplayEventId::new(
+                WorkflowActivationId::new(10, 1),
+                0,
+            )),
+            name: "wake".to_string(),
+            duration_ms: 100,
+        }];
+
+        store.commit_transition(candidate).unwrap();
+        assert_eq!(store.latest_sequence(10), 2);
+        assert_eq!(store.read_workflow_events(10).len(), 2);
+    }
+
+    #[test]
     fn memory_store_commits_transition_as_one_logical_unit() {
         let mut store = MemoryStore::new();
         let committed = store.commit_transition(transition(10, 1, 1)).unwrap();
