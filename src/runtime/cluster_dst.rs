@@ -227,6 +227,18 @@ impl DeterministicCluster {
         {
             rt.join_cluster(seed);
         }
+        // Preserve the logical durable backend while discarding the old
+        // process runtime. The simulation models persistent storage as an
+        // independently surviving resource: actor heaps, mailboxes, timers
+        // and transport are rebuilt, but committed snapshots/journals stay
+        // available to the new Runtime's real recovery path.
+        //
+        // This does not simulate closing/reopening a disk connection or
+        // power loss during a write; those require backend-specific tests.
+        rt.persistence = std::mem::replace(
+            &mut self.nodes[index].persistence,
+            Box::new(super::persistence::MemoryStore::new()),
+        );
         self.nodes[index] = rt;
         self.crashed[index] = false;
         self.partitions[index].clear();
@@ -439,6 +451,113 @@ mod tests {
                 );
             }
             assert_eq!(cluster.limit_hits, 0, "seed {seed}: scheduler budget exhausted");
+        }
+    }
+
+    /// The real atomic MemoryStore and Runtime::recover_actor must survive
+    /// hard-node restarts in the DST harness. A new epoch can supersede the
+    /// old owner, but stale actors cannot append or replace its state.
+    #[test]
+    fn test_dst_cluster_durable_recovery_rejects_stale_epoch_after_seeded_crashes() {
+        use crate::runtime::{
+            ActorSnapshot, DurableTransition, PersistedValue, DURABLE_TRANSITION_VERSION,
+        };
+
+        const ACTOR_ID: u64 = 98_001;
+        let make_transition = |epoch: u64, sequence: u64, count: i64| {
+            let mut snapshot = ActorSnapshot {
+                actor_id: ACTOR_ID,
+                sequence,
+                activation_epoch: epoch,
+                ..ActorSnapshot::default()
+            };
+            snapshot
+                .state
+                .insert("count".to_string(), PersistedValue::Int(count));
+            DurableTransition {
+                version: DURABLE_TRANSITION_VERSION,
+                actor_id: ACTOR_ID,
+                activation_epoch: epoch,
+                sequence,
+                expected_previous_sequence: sequence - 1,
+                command: None,
+                snapshot: Some(snapshot),
+                workflow_events: vec![],
+                domain_events: vec![],
+                durable_effects: vec![],
+                outbox: vec![],
+            }
+        };
+
+        for seed in 0..8 {
+            let mut rng = DeterministicRng::new(seed);
+            let mut cluster = DeterministicCluster::new(&[addr(9171), addr(9172)], seed);
+            let first = make_transition(1, 1, 10);
+            cluster
+                .node_mut(1)
+                .persistence
+                .commit_transition(first)
+                .expect("initial atomic commit");
+            cluster.run_rounds(20);
+
+            // Explicit, seed-controlled fault cutpoint: after commit, before
+            // restart; the surviving node continues advancing virtual time.
+            cluster.crash_node(1);
+            let outage_rounds = 1 + rng.next() % 8;
+            cluster.run_rounds(outage_rounds);
+            cluster.restart_node(1);
+
+            let node = cluster.node_mut(1);
+            assert_eq!(
+                node.recover_actor(ACTOR_ID),
+                Some(ACTOR_ID),
+                "seed {seed}, outage {outage_rounds}: committed actor must recover"
+            );
+            let actor = node.actors.get(&ACTOR_ID).unwrap();
+            assert_eq!(actor.activation_epoch, 1, "seed {seed}");
+            assert_eq!(actor.sequence, 1, "seed {seed}");
+            assert_eq!(
+                actor.get_state_field("count").and_then(|value| value.as_int()),
+                Some(10),
+                "seed {seed}: recovered state must match committed snapshot"
+            );
+
+            // A successor activation publishes a new state and fencing epoch.
+            let second = make_transition(2, 2, 20);
+            node.persistence
+                .commit_transition(second.clone())
+                .expect("successor atomic commit");
+            let stale = make_transition(1, 3, 999);
+            let failure = node.persistence.commit_transition(stale).unwrap_err();
+            assert_eq!(
+                failure.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "seed {seed}: stale activation must not commit"
+            );
+            assert_eq!(node.persistence.latest_sequence(ACTOR_ID), 2);
+
+            // Another crash drops the recovered actor's in-memory state.
+            cluster.crash_node(1);
+            cluster.run_rounds(1 + rng.next() % 8);
+            cluster.restart_node(1);
+
+            let node = cluster.node_mut(1);
+            assert_eq!(node.recover_actor(ACTOR_ID), Some(ACTOR_ID), "seed {seed}");
+            let actor = node.actors.get(&ACTOR_ID).unwrap();
+            assert_eq!(actor.activation_epoch, 2, "seed {seed}");
+            assert_eq!(actor.sequence, 2, "seed {seed}");
+            assert_eq!(
+                actor.get_state_field("count").and_then(|value| value.as_int()),
+                Some(20),
+                "seed {seed}: stale write must not change recovered state"
+            );
+            // Retrying the same committed transition after a process restart
+            // is idempotent and does not consume another journal sequence.
+            node.persistence
+                .commit_transition(second)
+                .expect("idempotent replay after restart");
+            assert_eq!(node.persistence.latest_sequence(ACTOR_ID), 2);
+            assert_eq!(cluster.limit_hits, 0, "seed {seed}: scheduler budget");
         }
     }
 

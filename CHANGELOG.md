@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### Cluster DST durable-state recovery and fencing — 2026-10-17
+- **The test-only real-runtime cluster harness retains its persisted backend when replacing a crashed node.** Actor heaps, mailboxes, and transport are rebuilt while committed snapshots and journal history remain available to `Runtime::recover_actor`.
+- **An eight-seed fault-cutpoint regression exercises actual atomic `DurableTransition` commits, two successive simulated crashes, actor-state recovery, idempotent commit retry, and rejection of a stale activation epoch.** This models logically surviving storage, not power-loss/fsync or backend reconnection semantics. Full exact-head Rust validation is required before promotion.
+
 ### Deterministic cluster restart fidelity — 2026-10-17
 - **Test-only real-runtime cluster simulation now preserves elapsed virtual time across node restarts.** The replacement runtime advances to the current simulation round before joining its peers; seeded regressions catch clock rewind after multi-round crashes.
 - **Restarted simulation transports retain bounded adjacent-packet reordering** when the test harness has enabled it. Production networking, runtime clocks and durability semantics are unchanged; exact-head Rust CI is required before promotion.
