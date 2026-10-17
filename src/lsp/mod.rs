@@ -2366,7 +2366,14 @@ fn nu_error_to_diagnostic(err: NuError) -> Vec<Diagnostic> {
 
 /// Build a single LSP Diagnostic from a non-Multiple NuError.
 fn single_diagnostic(err: NuError) -> Diagnostic {
-    let (message, start_line, start_col, end_line, end_col) = match err {
+    // Preserve the same structured compiler facts exposed by the CLI and
+    // --json output. Compute them before destructuring the owned error.
+    let code = err
+        .stable_code()
+        .map(|code| NumberOrString::String(code.to_string()));
+    let notes = crate::diagnostic::diagnostic_notes(&err);
+    let help = err.suggestion().map(|suggestion| suggestion.to_string());
+    let (mut message, start_line, start_col, end_line, end_col) = match err {
         NuError::LexError { msg, span }
         | NuError::ParseError { msg, span, .. }
         | NuError::TypeError { msg, span, .. }
@@ -2394,6 +2401,17 @@ fn single_diagnostic(err: NuError) -> Diagnostic {
         NuError::Multiple(_) => unreachable!("Multiple handled by caller"),
     };
 
+    // Keep the headline intact and append detailed notes and actionable
+    // help. These details otherwise disappear in standard LSP diagnostics.
+    for note in notes {
+        message.push('\n');
+        message.push_str(&note);
+    }
+    if let Some(help) = help {
+        message.push_str("\nhelp: ");
+        message.push_str(&help);
+    }
+
     let start = Position::new(
         start_line.saturating_sub(1) as u32,
         start_col.saturating_sub(1) as u32,
@@ -2406,7 +2424,7 @@ fn single_diagnostic(err: NuError) -> Diagnostic {
     Diagnostic {
         range: Range::new(start, end),
         severity: Some(DiagnosticSeverity::ERROR),
-        code: None,
+        code,
         code_description: None,
         source: Some("nulang".to_string()),
         message,
@@ -3925,6 +3943,44 @@ mod lsp_tests {
         let engine = InlayHintEngine::new("fun foo) bar(");
         let hints = engine.generate_inlay_hints(None, None, None);
         assert!(hints.is_empty());
+    }
+
+    /// CLI and JSON diagnostics already publish stable codes and structured
+    /// explanations.  The LSP must preserve them for editor users too.
+    #[test]
+    fn test_lsp_type_mismatch_diagnostic_preserves_code_notes_and_help() {
+        let err = NuError::type_mismatch("Int", "String", crate::types::Span::default());
+        let diagnostic = single_diagnostic(err);
+
+        assert_eq!(
+            diagnostic.code,
+            Some(NumberOrString::String("E0201".to_string()))
+        );
+        assert!(diagnostic.message.contains("expected type: Int"));
+        assert!(diagnostic.message.contains("found type: String"));
+        assert!(diagnostic.message.contains("help: "));
+    }
+
+    #[test]
+    fn test_lsp_multiple_diagnostics_preserve_individual_codes_and_effect_notes() {
+        let span = crate::types::Span::default();
+        let errors = NuError::Multiple(vec![
+            NuError::unbound_variable("missing", span, None),
+            NuError::missing_effects(vec!["IO".to_string()], "{}", span),
+        ]);
+        let diagnostics = nu_error_to_diagnostic(errors);
+
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(
+            diagnostics[0].code,
+            Some(NumberOrString::String("E0202".to_string()))
+        );
+        assert_eq!(
+            diagnostics[1].code,
+            Some(NumberOrString::String("E0301".to_string()))
+        );
+        assert!(diagnostics[1].message.contains("missing effects: IO"));
+        assert!(diagnostics[1].message.contains("allowed effects: {}"));
     }
 
     #[test]
