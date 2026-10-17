@@ -119,6 +119,28 @@ impl From<&str> for LlmError {
         LlmError::from_string(s)
     }
 }
+
+/// Parse provider-produced tool arguments without manufacturing an empty
+/// object from malformed or non-object model output. An empty object is valid
+/// only when the provider actually supplies `{}`.
+pub(crate) fn parse_tool_arguments(
+    value: serde_json::Value,
+) -> Result<serde_json::Map<String, serde_json::Value>, LlmError> {
+    match value {
+        serde_json::Value::Object(map) => Ok(map),
+        serde_json::Value::String(raw) => serde_json::from_str(&raw).map_err(|err| {
+            LlmError::new(
+                LlmErrorKind::FormatError,
+                format!("Tool arguments must be a valid JSON object: {err}"),
+            )
+        }),
+        _ => Err(LlmError::new(
+            LlmErrorKind::FormatError,
+            "Tool arguments must be a JSON object",
+        )),
+    }
+}
+
 /// A single tool invocation produced by an LLM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -133,6 +155,37 @@ pub struct ToolCall {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_arguments_accept_valid_json_objects() {
+        let object = serde_json::json!({"query": "Nulang"});
+        let from_object = parse_tool_arguments(object.clone()).unwrap();
+        let from_string =
+            parse_tool_arguments(serde_json::Value::String(object.to_string())).unwrap();
+        assert_eq!(from_object, from_string);
+        assert_eq!(from_object["query"], "Nulang");
+        assert!(parse_tool_arguments(serde_json::json!("{}")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn tool_arguments_reject_malformed_json() {
+        let err = parse_tool_arguments(serde_json::json!("{broken")).unwrap_err();
+        assert_eq!(err.kind, LlmErrorKind::FormatError);
+    }
+
+    #[test]
+    fn tool_arguments_reject_non_object_payloads() {
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!(42),
+            serde_json::json!([]),
+            serde_json::json!("[1, 2]"),
+            serde_json::json!("null"),
+        ] {
+            let err = parse_tool_arguments(value).unwrap_err();
+            assert_eq!(err.kind, LlmErrorKind::FormatError);
+        }
+    }
 
     #[test]
     fn test_llm_response_construction() {
