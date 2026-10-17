@@ -6148,6 +6148,21 @@ impl Runtime {
         Ok(actor)
     }
 
+    /// Reject local collisions between a truncated virtual-actor hash and a
+    /// previously registered actor/virtual-actor identity. This is a safety
+    /// check, not a replacement for full logical IDs across distributed nodes.
+    fn grain_id_conflicts(&self, stable_id: u64, grain_id: &GrainId) -> bool {
+        self.grain_actor_ids
+            .get(&stable_id)
+            .is_some_and(|registered| registered != grain_id)
+            || self
+                .actor_grain_id
+                .get(&stable_id)
+                .is_some_and(|registered| registered != grain_id)
+            || (self.actors.contains_key(&stable_id)
+                && self.actor_grain_id.get(&stable_id) != Some(grain_id))
+    }
+
     /// Resolve a virtual actor (grain) identity to a resident actor id,
     /// hydrating it from persistence if necessary.
     ///
@@ -6168,6 +6183,18 @@ impl Runtime {
             .clone();
 
         let stable_actor_id = grain_actor_id(&grain_id);
+        if self.grain_id_conflicts(stable_actor_id, &grain_id)
+            || self.actors.contains_key(&stable_actor_id)
+        {
+            return Err(NuError::RuntimeError {
+                msg: format!(
+                    "virtual actor identity collision or inconsistent resident mapping for {} (handle {})",
+                    grain_id.actor_name(),
+                    stable_actor_id
+                ),
+                span: Span::new(0, 0),
+            });
+        }
 
         // Register the recovery module so checkpoint/replay know the bytecode.
         self.register_recovery_module(
@@ -6714,6 +6741,14 @@ impl Runtime {
         match op_name {
             Some("ref") => {
                 let stable_id = grain_actor_id(&grain_id);
+                if self.grain_id_conflicts(stable_id, &grain_id) {
+                    warn!(
+                        "nulang-grain: refusing conflicting virtual actor identity {} at handle {}",
+                        grain_id.actor_name(),
+                        stable_id
+                    );
+                    return Some(Value::nil());
+                }
                 // Register the stable id -> GrainId mapping so sends to this
                 // reference can hydrate the grain on first use, even though the
                 // actor itself is not materialised yet.
