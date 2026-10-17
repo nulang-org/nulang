@@ -155,6 +155,14 @@ NUL0/type/sequence envelope and a type-specific payload.
 Implemented distributed/runtime pieces include remote actor routing, gossip
 membership, remote spawn negotiation, and CRDT state synchronization.
 
+**Wire-protocol boundary:** This frozen NUL0 v1 peer protocol is **not** the
+Nulang Cloud host–guest protocol of the same name. Nulang peers exchange a
+16-byte `"NUL0"`/version/node-ID handshake and frame magic/type/u64-sequence
+packets. Cloud's `nats-transport/src/nul0.rs` instead uses a length/type/flags/
+u16-stream header followed by a CRC32 trailer, without this peer handshake.
+The formats must not be interchanged; any future bridge needs an explicit,
+versioned adapter and its own conformance tests.
+
 This is not yet a claim of production-grade transparent clustering. In
 particular, automatic virtual-actor activation/placement and the broader target
 cluster architecture remain separate work.
