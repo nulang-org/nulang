@@ -2448,6 +2448,44 @@ pub struct SuspendedVmState {
     pub step_count: usize,
 }
 
+/// Why a production VM continuation cannot be safely represented as a
+/// detached, pointer-free **numeric-only** checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumericContinuationError {
+    NoCurrentFrame,
+    InvalidCurrentFrame,
+    EffectHandlersUnsupported,
+    SpillsUnsupported { frame: usize },
+    ClosureEnvironmentUnsupported { frame: usize },
+    InvalidCaller { frame: usize },
+    UnsupportedValue { frame: usize, register: usize },
+    DestinationNotEmpty,
+}
+
+/// One numeric-only frame, detached from any VM heap or closure environment.
+/// These fields are private so only checked capture can construct values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InlineNumericFrame {
+    regs: [Option<i64>; 256],
+    pc: usize,
+    module_idx: usize,
+    return_dst: u8,
+    caller_idx: Option<usize>,
+}
+
+/// Pointer-free, cloneable capture of the production VM's **inline-only**
+/// numeric activation frames and step counter.
+///
+/// This checkpoint cannot contain ORCA WideInt pointers, effect-handler
+/// state, spills, closures, or other tagged value kinds. It is neither a
+/// replacement for SuspendedVmState nor a versioned durable format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NumericVmContinuation {
+    frames: Vec<InlineNumericFrame>,
+    current_frame_idx: usize,
+    step_count: usize,
+}
+
 #[cfg(feature = "native-codegen")]
 fn compute_jit_candidate_pcs(module: &CodeModule) -> Vec<bool> {
     let len = module.instructions.len();
@@ -3007,6 +3045,113 @@ impl VM {
         self.current_frame_idx = state.current_frame_idx;
         self.handler_stack = state.handler_stack;
         self.step_count = state.step_count;
+    }
+
+    /// Capture the **actual** production activation frames as detached
+    /// numbers, not cloneable ORCA pointer-tagged Values. Effect handlers,
+    /// closure captures, spills, and all non-inline values fail closed.
+    ///
+    /// Read-only and non-destructive on both success and failure. This is
+    /// intentionally not the VM's general take_suspended_state() behavior.
+    pub fn try_checkpoint_inline_numeric_continuation(
+        &self,
+    ) -> Result<NumericVmContinuation, NumericContinuationError> {
+        let active = self
+            .current_frame_idx
+            .ok_or(NumericContinuationError::NoCurrentFrame)?;
+        if active >= self.frames.len() {
+            return Err(NumericContinuationError::InvalidCurrentFrame);
+        }
+        if !self.handler_stack.is_empty() {
+            return Err(NumericContinuationError::EffectHandlersUnsupported);
+        }
+
+        let mut frames = Vec::with_capacity(self.frames.len());
+        for (index, frame) in self.frames.iter().enumerate() {
+            if !frame.spilled.is_empty() {
+                return Err(NumericContinuationError::SpillsUnsupported { frame: index });
+            }
+            if frame.closure_env.is_some() {
+                return Err(NumericContinuationError::ClosureEnvironmentUnsupported {
+                    frame: index,
+                });
+            }
+            if frame.caller_idx.is_some_and(|caller| caller >= index) {
+                return Err(NumericContinuationError::InvalidCaller { frame: index });
+            }
+            let mut regs = [None; 256];
+            for (reg, value) in frame.regs.iter().enumerate() {
+                if value.is_nil() {
+                    continue;
+                }
+                regs[reg] = Some(
+                    value
+                        .as_int()
+                        .ok_or(NumericContinuationError::UnsupportedValue {
+                            frame: index,
+                            register: reg,
+                        })?,
+                );
+            }
+            frames.push(InlineNumericFrame {
+                regs,
+                pc: frame.pc,
+                module_idx: frame.module_idx,
+                return_dst: frame.return_dst,
+                caller_idx: frame.caller_idx,
+            });
+        }
+        Ok(NumericVmContinuation {
+            frames,
+            current_frame_idx: active,
+            step_count: self.step_count,
+        })
+    }
+
+    /// Restore independently copied, pointer-free inline registers into an
+    /// empty production VM. Refuses to destroy an existing active frame or
+    /// effect-handler stack. The complete replacement is prepared before
+    /// altering any VM state.
+    ///
+    /// Wide Int64 values must remain rooted in the ORCA staging bank until
+    /// all production frame/continuation/back-end barriers are implemented.
+    pub fn restore_inline_numeric_continuation(
+        &mut self,
+        checkpoint: &NumericVmContinuation,
+    ) -> Result<(), NumericContinuationError> {
+        if !self.frames.is_empty()
+            || self.current_frame_idx.is_some()
+            || !self.handler_stack.is_empty()
+        {
+            return Err(NumericContinuationError::DestinationNotEmpty);
+        }
+        if checkpoint.current_frame_idx >= checkpoint.frames.len() {
+            return Err(NumericContinuationError::InvalidCurrentFrame);
+        }
+        let mut frames = Vec::with_capacity(checkpoint.frames.len());
+        for (index, captured) in checkpoint.frames.iter().enumerate() {
+            if captured.caller_idx.is_some_and(|caller| caller >= index) {
+                return Err(NumericContinuationError::InvalidCaller { frame: index });
+            }
+            let mut frame = Frame::new(captured.caller_idx, captured.module_idx);
+            frame.pc = captured.pc;
+            frame.return_dst = captured.return_dst;
+            for (reg, number) in captured.regs.iter().enumerate() {
+                if let Some(number) = number {
+                    frame.regs[reg] = Value::try_int(*number).ok_or(
+                        NumericContinuationError::UnsupportedValue {
+                            frame: index,
+                            register: reg,
+                        },
+                    )?;
+                }
+            }
+            frames.push(frame);
+        }
+        self.frames = frames;
+        self.current_frame_idx = Some(checkpoint.current_frame_idx);
+        self.step_count = checkpoint.step_count;
+        Ok(())
     }
 
     /// Install a numeric, ORCA-rooted Int64 staging frame into the actual
