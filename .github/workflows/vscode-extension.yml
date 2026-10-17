@@ -8,6 +8,7 @@ on:
       - 'editors/vscode/**'
       - '.github/workflows/vscode-extension.yml'
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - 'editors/vscode/**'
       - '.github/workflows/vscode-extension.yml'
@@ -27,6 +28,7 @@ jobs:
   # Build & package the .vsix (grammar + LSP client)
   # -----------------------------------------------------------------------
   build:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     name: Build & Package
     runs-on: ubuntu-latest
     steps:
@@ -60,6 +62,7 @@ jobs:
   # Integration test: real VS Code + real `nulang --lsp`
   # -----------------------------------------------------------------------
   test:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     name: Integration Test (VS Code + LSP)
     runs-on: ubuntu-latest
     steps:

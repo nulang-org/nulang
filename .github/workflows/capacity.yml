@@ -2,6 +2,7 @@ name: Capacity Core
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - "crates/nulang-capacity/**"
       - "Cargo.toml"
@@ -26,6 +27,7 @@ env:
 
 jobs:
   capacity:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     name: Format, Check, Test & Clippy
     runs-on: ubuntu-latest
     steps:

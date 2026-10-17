@@ -8,6 +8,7 @@ on:
         required: false
         default: '5'
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - '.github/workflows/jit-codegen-bench.yml'
       - 'src/backends/mod.rs'
@@ -23,6 +24,7 @@ concurrency:
 
 jobs:
   validate:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     name: Validate JIT compile telemetry
     runs-on: ubuntu-latest
     timeout-minutes: 45

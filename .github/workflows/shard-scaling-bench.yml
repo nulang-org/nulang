@@ -12,6 +12,7 @@ on:
         required: false
         default: '5'
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - '.github/workflows/shard-scaling-bench.yml'
       - 'src/bin/nulang_shard_bench.rs'
@@ -24,6 +25,7 @@ concurrency:
 
 jobs:
   validate:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     name: Validate shard scaling harness
     runs-on: ubuntu-latest
     timeout-minutes: 30
