@@ -136,6 +136,8 @@ HTTP request
 
 `Int`, `Float`, and `Bool` request values are decoded explicitly. `String`, untyped values, and custom/opaque identifier types remain string-backed until Web Contract IR carries a richer runtime representation.
 
+Bound scalar headers reject repeated case-insensitive field names instead of using the first occurrence; unbound repeated headers remain unchanged. Query and form captures still use a single-value map (last occurrence wins) pending explicit repeated-value/collection semantics. Do not rely on these legacy maps for security-sensitive duplicate-field policy.
+
 The source-agnostic VM call seam validates that handler slots are complete, unique, and in range before execution. A complete compiler binding plan can therefore invoke a handler regardless of whether its arguments came from path, query, header, cookie, body, or form.
 
 The transport-facing dispatch seam includes:
@@ -160,6 +162,7 @@ Request decoding distinguishes client input failures from compiler/runtime invar
 
 - missing required request input -> HTTP `400`
 - invalid scalar request input -> HTTP `400`
+- multiple case-insensitive HTTP header occurrences for a bound scalar header -> HTTP `400` (`ambiguous_request_input`)
 - duplicate handler slots -> HTTP `500`
 - invalid handler slots -> HTTP `500`
 - incomplete binding plans -> HTTP `500`
