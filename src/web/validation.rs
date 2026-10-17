@@ -91,7 +91,11 @@ pub fn validation_diagnostics(compilation: &ContractCompilation) -> Vec<String> 
                     route.method, route.path
                 ));
             }
-            if route.handler_params.iter().any(|param| param.request.is_some()) {
+            if route
+                .handler_params
+                .iter()
+                .any(|param| param.request.is_some())
+            {
                 diagnostics.push(format!(
                     "route {} {}: static placement cannot bind request inputs",
                     route.method, route.path
@@ -241,9 +245,12 @@ mod tests {
                 diagnostics: Vec::new(),
             };
             let errors = validate_compilation(compilation).unwrap_err();
-            assert!(errors.iter().any(|message| {
-                message.contains("GET /account") && message.contains("static placement")
-            }), "effect {effect} must not be statically prerendered");
+            assert!(
+                errors.iter().any(|message| {
+                    message.contains("GET /account") && message.contains("static placement")
+                }),
+                "effect {effect} must not be statically prerendered"
+            );
         }
     }
 
@@ -260,7 +267,9 @@ mod tests {
             diagnostics: Vec::new(),
         };
         let errors = validate_compilation(compilation).unwrap_err();
-        assert!(errors.iter().any(|message| message.contains("static placement")));
+        assert!(errors
+            .iter()
+            .any(|message| message.contains("static placement")));
     }
 
     #[test]
@@ -286,9 +295,9 @@ mod tests {
             diagnostics: Vec::new(),
         };
         let errors = validate_compilation(compilation).unwrap_err();
-        assert!(errors.iter().any(|message| {
-            message.contains("static placement cannot bind request inputs")
-        }));
+        assert!(errors
+            .iter()
+            .any(|message| { message.contains("static placement cannot bind request inputs") }));
     }
 
     #[test]
