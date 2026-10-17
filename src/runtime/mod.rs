@@ -39,7 +39,6 @@ mod grain;
 mod network;
 mod object_store;
 mod orca_cycle;
-mod wide_int_registers;
 mod supervision;
 mod supervisor;
 pub use distributed_context::{
@@ -81,6 +80,7 @@ mod spawn;
 pub(crate) use spawn::spawn_from_module_with_authority;
 mod timer;
 mod trace;
+mod wide_int_registers;
 mod workflow;
 pub use trace::TraceContext;
 
@@ -120,7 +120,6 @@ pub use network::NetworkTransport;
 pub use network::*;
 pub use object_store::*;
 pub use orca_cycle::*;
-pub use wide_int_registers::*;
 pub use persistence::*;
 pub use process_groups::*;
 pub use registry::*;
@@ -128,6 +127,7 @@ pub use resp_cache::*;
 pub use scheduler::*;
 pub use supervisor::*;
 pub use timer::*;
+pub use wide_int_registers::*;
 
 use crate::crdt_peer_sync::PeerCrdtFrontiers;
 use crate::types::{ExitReason, NuError, Span, VmSuspension};
