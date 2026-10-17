@@ -1,0 +1,5 @@
+// CI integration smoke: forces changed-fixture gate to execute an actual
+// Nulang program rather than pass with an empty diff.
+fn main() {
+    perform IO.print("changed-conformance-gate=ok")
+}
