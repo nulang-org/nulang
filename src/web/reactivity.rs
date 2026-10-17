@@ -887,10 +887,9 @@ pub fn generate_client_runtime() -> String {
           runClientAction(handler);
         }
       };
-      el.addEventListener('click', listener);
-      if (el.tagName === 'FORM') {
-        el.addEventListener('submit', listener);
-      }
+      // Clicks bubble from every control in a form. Only an actual submit
+      // should invoke its action; non-form actions remain click-driven.
+      el.addEventListener(el.tagName === 'FORM' ? 'submit' : 'click', listener);
     });
   }
 

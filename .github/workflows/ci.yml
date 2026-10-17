@@ -48,8 +48,8 @@ jobs:
       - name: Smoke test browser playground
         run: node playground/web/test/smoke.mjs
 
-      - name: Test generated Web client signal hydration
-        run: node scripts/tests/web_signal_name_safety.mjs
+      - name: Smoke test Nulang Web action events
+        run: node scripts/tests/web_action_events.mjs
 
       - name: Install docs dependencies
         run: |
