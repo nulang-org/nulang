@@ -1,6 +1,6 @@
 # Nulang Implementation Status
 
-**Updated:** 2026-09-23  
+**Updated:** 2026-10-16  
 **Scope:** current `main` implementation, not roadmap promises
 
 This document is the compact status map for contributors who need to know what
@@ -81,13 +81,29 @@ The live runtime is sharded and cooperatively scheduled.
   larger payloads use shared `Arc<Vec<Value>>` storage.
 - Ready-queue ownership is deduplicated so bursts of sends do not create
   duplicate ready tokens.
-- Actor turns adapt their batch size to runnable-peer pressure while retaining
-  a hard reduction/preemption boundary.
+- Actor turns adapt their mailbox batch size to runnable-peer pressure (up to
+  16 messages with peers ready, or up to 256 without them) while retaining a
+  default 1,000-message-reduction ceiling. This does **not** imply universal
+  instruction-level preemption inside long-running behaviors.
 - Each actor's first 16 KiB bump-heap block is allocated lazily on first
   small-object allocation rather than at actor spawn.
 
 Actors support links, monitors, supervision, process groups, priorities,
 selective receive, timed receive, and actor-local ORCA memory management.
+
+### Delivery and mailbox guarantees
+
+A source-level `send` is fire-and-forget, not proof of receiver admission or
+processing. Bounded local mailboxes can reject normal/bulk messages with
+backpressure; system messages bypass that capacity. Unknown actors/behaviors
+and unsupported cross-shard payloads may also be rejected. The local runtime
+can place a notification in its dead-letter mailbox, but that notification does
+**not** retain the rejected message payload or supply a durable retry queue.
+Do not promise lossless, exactly-once, or durable remote delivery without an
+application-level acknowledgment, retry, and idempotency protocol.
+
+Strict High > Normal > Low scheduler priority is implemented, but sustained
+higher-priority traffic can starve lower-priority actors.
 
 ## Durability and persistence
 
@@ -151,6 +167,18 @@ Borsh-based component boundary for serializable Nulang values.
 
 Treat Component Model support as an evolving integration boundary, not as proof
 that every bytecode/runtime feature is component-portable today.
+
+## Experimental Web deployment boundary
+
+The HTTP/Web effect host, compiler-first web framework, browser runtime, and
+in-process SSE transport are experimental. Do not treat a successful demo,
+static build, or an open hardening pull request as evidence of an audited
+Internet-facing server. Before public deployment, validate **the exact code
+revision being shipped**, including request framing, Host/origin admission,
+response header/cookie sanitization, static-file root containment, bounded SSE
+resources, and form/server-action dispatch. A proposed fix is not part of
+`main` until merged and validated there. The development server is not a
+production-security certification.
 
 ## Performance validation
 
