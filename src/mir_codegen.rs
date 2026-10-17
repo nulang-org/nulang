@@ -1670,8 +1670,21 @@ fn collect_const_locals(func: &mir::Function) -> std::collections::HashMap<mir::
         std::collections::HashMap::new();
     for block in &func.blocks {
         for stmt in &block.stmts {
-            if let mir::Stmt::Assign { dst, .. } = stmt {
+            if let mir::Stmt::Assign { dst, op } = stmt {
                 *assign_count.entry(*dst).or_insert(0) += 1;
+                // Selective receive writes its match index to dst and
+                // message payloads to dst+1..dst+max_params. These implicit
+                // definitions must invalidate any apparent single-assignment
+                // constant in a payload local.
+                if let mir::RValue::ReceiveMatch { max_params, .. }
+                | mir::RValue::ReceiveWait { max_params, .. } = op
+                {
+                    for offset in 1..=(*max_params).min(func.locals.len()) {
+                        if let Some(id) = dst.0.checked_add(offset as u32) {
+                            *assign_count.entry(mir::LocalId(id)).or_insert(0) += 1;
+                        }
+                    }
+                }
             }
         }
     }
@@ -1679,9 +1692,34 @@ fn collect_const_locals(func: &mir::Function) -> std::collections::HashMap<mir::
     disallowed.extend(func.params.iter().copied());
     disallowed.extend(func.captures.iter().copied());
 
+    // The returned map is function-wide: it can only contain constants
+    // guaranteed available at *every* use. A literal defined in a branch
+    // does not dominate its join, even when it is the sole assignment.
+    // Restrict candidates to the entry block until the optimizer has an
+    // explicit CFG/dominator-aware per-program-point constant lattice.
+    let Some(entry) = func.blocks.iter().find(|block| block.id == func.entry) else {
+        return std::collections::HashMap::new();
+    };
+    let mut initialized = HashSet::new();
+    for stmt in &entry.stmts {
+        let mut reads = HashSet::new();
+        stmt_reads(stmt, &mut reads);
+        for read in reads {
+            if !initialized.contains(&read) {
+                disallowed.insert(read);
+            }
+        }
+        if let mir::Stmt::Assign { dst, .. } = stmt {
+            initialized.insert(*dst);
+        }
+    }
+
     let mut const_locals: std::collections::HashMap<mir::LocalId, Constant> =
         std::collections::HashMap::new();
     for block in &func.blocks {
+        if block.id != func.entry {
+            continue;
+        }
         for stmt in &block.stmts {
             if let mir::Stmt::Assign {
                 dst,
@@ -1708,13 +1746,12 @@ fn fold_function(
     for block in &mut func.blocks {
         for stmt in &mut block.stmts {
             if let mir::Stmt::Assign { op, .. } = stmt {
-                let mut original = mir::RValue::Const(Constant::Nil);
-                std::mem::swap(op, &mut original);
-                let folded = fold_rvalue(original, const_locals, is_float);
-                if folded != *op {
-                    *op = folded;
+                let original = std::mem::replace(op, mir::RValue::Const(Constant::Nil));
+                let folded = fold_rvalue(original.clone(), const_locals, is_float);
+                if folded != original {
                     changed = true;
                 }
+                *op = folded;
             }
         }
     }
@@ -1737,7 +1774,13 @@ fn fold_rvalue(
         },
         RValue::Unary(uop, local) => match const_locals.get(&local) {
             Some(c) => match (uop, c) {
-                (UnOp::Neg, Int(n)) => RValue::Const(Int(n.wrapping_neg())),
+                // Value::int sign-extends a 48-bit payload. Negating
+                // INT48_MIN is an error in the VM, not wrapping arithmetic.
+                (UnOp::Neg, Int(n))
+                    if canonical_int48(*n) != crate::value_layout::INT48_MIN =>
+                {
+                    RValue::Const(Int(-canonical_int48(*n)))
+                }
                 (UnOp::Neg, Float(f)) => RValue::Const(Float(-f)),
                 (UnOp::Not, Bool(b)) => RValue::Const(Bool(!b)),
                 // The remaining Not rules never fire on well-typed MIR
@@ -1793,6 +1836,12 @@ fn fold_rvalue(
     }
 }
 
+/// Interpret an integer constant exactly as Value::int/as_int do at runtime.
+/// Values outside the signed 48-bit payload range are truncated on load.
+fn canonical_int48(n: i64) -> i64 {
+    crate::value_layout::sext48((n as u64) & crate::value_layout::PAYLOAD_MASK)
+}
+
 /// Constant-fold `Const op Const` per the VM's integer/float handler
 /// semantics. Returns None when no rule applies (mixed int/float, float
 /// Eq/Ne — the VM uses epsilon equality there — nil comparisons, ...).
@@ -1800,6 +1849,19 @@ fn fold_binary_consts(bop: crate::ast::BinOp, a: &Constant, b: &Constant) -> Opt
     use crate::ast::BinOp;
     use mir::RValue;
     use Constant::{Bool, Float, Int, Nil, String as CString};
+
+    // Constants are stored as i64 in MIR but encoded as signed Int48 by
+    // Value::int. Compare, divide and shift their *runtime* values.
+    let normalized_a = match a {
+        Int(n) => Some(Int(canonical_int48(*n))),
+        _ => None,
+    };
+    let normalized_b = match b {
+        Int(n) => Some(Int(canonical_int48(*n))),
+        _ => None,
+    };
+    let a = normalized_a.as_ref().unwrap_or(a);
+    let b = normalized_b.as_ref().unwrap_or(b);
 
     Some(match (bop, a, b) {
         // -- Int arithmetic (i64 wrapping; the constant pool truncates to
@@ -1869,6 +1931,12 @@ fn fold_one_const(
     use crate::ast::BinOp;
     use mir::RValue;
     use Constant::{Bool, Int, Nil};
+
+    let normalized = match c {
+        Int(n) => Some(Int(canonical_int48(*n))),
+        _ => None,
+    };
+    let c = normalized.as_ref().unwrap_or(c);
 
     // Skip when the live operand may hold a float: the VM's F* handlers
     // coerce the int constant, and IEEE semantics differ at ±0.0/NaN.
@@ -2082,6 +2150,9 @@ fn rvalue_side_effecting(rv: &mir::RValue) -> bool {
     matches!(
         rv,
         mir::RValue::Panic(_)
+            // Integer negation raises an overflow error for INT48_MIN and
+            // may raise a type error; unused results cannot be discarded.
+            | mir::RValue::Unary(crate::ast::UnOp::Neg, _)
             | mir::RValue::Call { .. }
             | mir::RValue::Perform { .. }
             | mir::RValue::PerformAsync { .. }
@@ -3647,6 +3718,154 @@ mod optimize_tests {
     }
 
     #[test]
+    fn test_collect_const_locals_rejects_conditional_definition() {
+        // An entry branch can bypass the only literal assignment. The
+        // uninitialized register is nil along that path, not the literal.
+        let mut b = mir::FunctionBuilder::new("conditional", Some(Type::int()));
+        let condition = b.add_param("condition", Type::bool());
+        let value = b.add_temp(Type::int());
+        let result = b.add_temp(Type::int());
+        let then_block = b.create_block();
+        let join_block = b.create_block();
+        b.terminate(mir::Terminator::Branch {
+            cond: condition,
+            then_: then_block,
+            else_: join_block,
+        });
+        b.switch_to(then_block);
+        b.assign(value, mir::RValue::Const(Constant::Int(7)));
+        b.terminate(mir::Terminator::Jump(join_block));
+        b.switch_to(join_block);
+        b.assign(result, mir::RValue::Load(value));
+        b.terminate(mir::Terminator::Return(Some(result)));
+
+        let func = b.build();
+        assert!(
+            !collect_const_locals(&func).contains_key(&value),
+            "a branch-local definition cannot be propagated to the join"
+        );
+    }
+
+    #[test]
+    fn test_collect_const_locals_rejects_read_before_entry_definition() {
+        // A single assignment in the entry block need not precede all reads.
+        let mut b = mir::FunctionBuilder::new("forward_read", Some(Type::int()));
+        let value = b.add_temp(Type::int());
+        let result = b.add_temp(Type::int());
+        b.assign(result, mir::RValue::Load(value));
+        b.assign(value, mir::RValue::Const(Constant::Int(7)));
+        b.terminate(mir::Terminator::Return(Some(result)));
+
+        let func = b.build();
+        assert!(
+            !collect_const_locals(&func).contains_key(&value),
+            "the constant is not available to reads before its definition"
+        );
+    }
+
+    #[test]
+    fn test_fold_int48_comparisons_use_runtime_normalized_operands() {
+        use crate::ast::BinOp;
+        use crate::value_layout::{INT48_MAX, INT48_MIN};
+
+        // An out-of-payload constant is truncated by Value::int before
+        // comparisons execute. The optimizer must compare the same values.
+        assert_eq!(
+            fold_binary_consts(
+                BinOp::Lt,
+                &Constant::Int(INT48_MAX + 1),
+                &Constant::Int(0)
+            ),
+            Some(mir::RValue::Const(Constant::Bool(true)))
+        );
+        assert_eq!(
+            fold_binary_consts(
+                BinOp::Eq,
+                &Constant::Int(INT48_MAX + 1),
+                &Constant::Int(INT48_MIN)
+            ),
+            Some(mir::RValue::Const(Constant::Bool(true)))
+        );
+    }
+
+    #[test]
+    fn test_fold_int48_divisor_that_truncates_to_zero_returns_nil() {
+        use crate::ast::BinOp;
+
+        assert_eq!(
+            fold_binary_consts(
+                BinOp::Div,
+                &Constant::Int(42),
+                &Constant::Int(1_i64 << 48)
+            ),
+            Some(mir::RValue::Const(Constant::Nil))
+        );
+    }
+
+    #[test]
+    fn test_fold_int48_min_negation_preserves_runtime_overflow() {
+        let src = mir::LocalId(0);
+        let mut consts = std::collections::HashMap::new();
+        consts.insert(src, Constant::Int(crate::value_layout::INT48_MIN));
+        assert_eq!(
+            fold_rvalue(
+                mir::RValue::Unary(crate::ast::UnOp::Neg, src),
+                &consts,
+                &[false]
+            ),
+            mir::RValue::Unary(crate::ast::UnOp::Neg, src),
+            "the VM must remain responsible for reporting Int48 minimum negation overflow"
+        );
+    }
+
+    #[test]
+    fn test_dce_preserves_unused_negation_that_can_trap() {
+        let mut b = mir::FunctionBuilder::new("unused_trap", Some(Type::int()));
+        let source = b.add_temp(Type::int());
+        let unused = b.add_temp(Type::int());
+        let returned = b.add_temp(Type::int());
+        b.assign(
+            source,
+            mir::RValue::Const(Constant::Int(crate::value_layout::INT48_MIN)),
+        );
+        b.assign(unused, mir::RValue::Unary(crate::ast::UnOp::Neg, source));
+        b.assign(returned, mir::RValue::Const(Constant::Int(1)));
+        b.terminate(mir::Terminator::Return(Some(returned)));
+
+        let mut func = b.build();
+        optimize_function(&mut func, &mut Vec::new());
+
+        assert!(
+            func.blocks[0].stmts.iter().any(|stmt| {
+                matches!(
+                    stmt,
+                    mir::Stmt::Assign {
+                        op: mir::RValue::Unary(crate::ast::UnOp::Neg, _),
+                        ..
+                    }
+                )
+            }),
+            "unused negation must still execute when it can raise an overflow error"
+        );
+    }
+
+    #[test]
+    fn test_fold_int48_out_of_payload_negation_preserves_overflow() {
+        let src = mir::LocalId(0);
+        let mut consts = std::collections::HashMap::new();
+        consts.insert(src, Constant::Int(crate::value_layout::INT48_MAX + 1));
+        assert_eq!(
+            fold_rvalue(
+                mir::RValue::Unary(crate::ast::UnOp::Neg, src),
+                &consts,
+                &[false]
+            ),
+            mir::RValue::Unary(crate::ast::UnOp::Neg, src),
+            "signed normalization must precede deciding whether negation may fold"
+        );
+    }
+
+    #[test]
     fn test_fold_const_add() {
         // `1 + 2` folds to a single constant; no IAdd survives.
         let value = run_source("1 + 2").unwrap();
@@ -4022,6 +4241,99 @@ mod optimize_tests {
         );
         b.terminate(mir::Terminator::Return(None));
         assert!(plan_consuming_send_args(&b.build()).args_by_stmt.is_empty());
+    }
+
+    #[test]
+    fn test_fold_function_reports_only_the_first_real_change() {
+        let mut b = mir::FunctionBuilder::new("fold_once", Some(Type::bool()));
+        let source = b.add_temp(Type::bool());
+        let result = b.add_temp(Type::bool());
+        b.assign(source, mir::RValue::Const(Constant::Bool(true)));
+        b.assign(result, mir::RValue::Unary(crate::ast::UnOp::Not, source));
+        b.terminate(mir::Terminator::Return(Some(result)));
+        let mut func = b.build();
+
+        let constants = collect_const_locals(&func);
+        let floats = float_locals(&func);
+        assert!(fold_function(&mut func, &constants, &floats));
+        assert_eq!(
+            func.blocks[0].stmts[1],
+            mir::Stmt::Assign {
+                dst: result,
+                op: mir::RValue::Const(Constant::Bool(false)),
+            }
+        );
+        let constants = collect_const_locals(&func);
+        assert!(!fold_function(&mut func, &constants, &floats));
+    }
+
+    #[test]
+    fn test_fold_function_does_not_report_change_when_unfoldable() {
+        let mut b = mir::FunctionBuilder::new("unfoldable", Some(Type::bool()));
+        let param = b.add_param("param", Type::bool());
+        let result = b.add_temp(Type::bool());
+        b.assign(result, mir::RValue::Load(param));
+        b.terminate(mir::Terminator::Return(Some(result)));
+        let mut func = b.build();
+        let before = func.blocks.clone();
+        let constants = collect_const_locals(&func);
+        let floats = float_locals(&func);
+
+        assert!(
+            !fold_function(&mut func, &constants, &floats),
+            "an unchanged MIR assignment must not force another optimization iteration"
+        );
+        assert_eq!(func.blocks, before);
+    }
+
+    #[test]
+    fn test_receive_match_payload_invalidates_constant_local() {
+        let mut b = mir::FunctionBuilder::new("receive_payload", Some(Type::bool()));
+        let match_index = b.add_temp(Type::int());
+        let payload = b.add_temp(Type::bool()); // ReceiveMatch writes match_index + 1.
+        let result = b.add_temp(Type::bool());
+        b.assign(payload, mir::RValue::Const(Constant::Bool(true)));
+        b.assign(
+            match_index,
+            mir::RValue::ReceiveMatch {
+                behavior_ids: vec![1],
+                max_params: 1,
+            },
+        );
+        b.assign(result, mir::RValue::Load(payload));
+        b.terminate(mir::Terminator::Return(Some(result)));
+        let func = b.build();
+
+        assert!(
+            !collect_const_locals(&func).contains_key(&payload),
+            "the payload local is overwritten implicitly by selective receive"
+        );
+    }
+
+    #[test]
+    fn test_receive_wait_payload_invalidates_constant_local() {
+        let mut b = mir::FunctionBuilder::new("receive_wait_payload", Some(Type::bool()));
+        let match_index = b.add_temp(Type::int());
+        let payload = b.add_temp(Type::bool());
+        let timeout = b.add_temp(Type::int());
+        let result = b.add_temp(Type::bool());
+        b.assign(payload, mir::RValue::Const(Constant::Bool(true)));
+        b.assign(
+            match_index,
+            mir::RValue::ReceiveWait {
+                behavior_ids: vec![1],
+                max_params: 1,
+                timeout,
+            },
+        );
+        b.assign(result, mir::RValue::Load(payload));
+        b.terminate(mir::Terminator::Return(Some(result)));
+        let func = b.build();
+
+        assert!(
+            !collect_const_locals(&func).contains_key(&payload),
+            "the payload local is overwritten implicitly by timed selective receive"
+        );
     }
 
     #[test]
