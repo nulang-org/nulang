@@ -238,6 +238,8 @@ the binding plan is equivalent to:
 ```
 
 ## Static-build execution boundary
+Web builds coordinate through an exclusive lockfile next to the output directory (e.g. `.dist.nulang-build.lock`). Contending Nulang builders fail with an `AlreadyExists` error instead of racing over `dist/`. The lock is held across compilation, staging, publication and old-backup cleanup. It contains the build PID for diagnosis; after an abrupt crash, verify that the process has exited before manually removing an orphaned lockfile. Locking is cooperative and assumes a filesystem with reliable exclusive-create semantics. It does not turn the two-rename promotion into a crash-atomic directory swap.
+
 The web CLI now performs the build in a sibling staging directory and publishes it only after compilation, prerendering, manifest generation and budget checks succeed. Prior build output is retained on ordinary build failures, and unmanaged files from a safe previous output snapshot are carried forward. Promotion of an existing nonempty `dist/` uses a rollbackable two-rename sequence, **not a crash-atomic directory swap**. Concurrent writers to one output directory are not yet serialized; do not deploy an interrupted or unverified build.
 
 
