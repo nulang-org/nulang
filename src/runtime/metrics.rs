@@ -67,7 +67,6 @@ impl MetricsServer {
 
 #[cfg(test)]
 mod scheduler_queue_metric_tests {
-    use super::*;
     use crate::runtime::{ActorPriority, Runtime};
 
     #[test]
