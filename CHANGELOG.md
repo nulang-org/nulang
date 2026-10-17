@@ -1,3 +1,4 @@
+# Nulang Changelog
 ### ORCA-owned wide-Int storage staging — 2026-10-17
 - **Scoped heap representation:** Added `TypeTag::WideInt` and `Actor::lease_wide_int`. Each lease allocates a full signed `i64` in the existing ORCA-owned actor heap and releases its local reference on Drop. No tagged `Value` or pointer escapes into messages or persistence.
 - **Continuation safety:** NLCS v1 explicitly rejects the new in-memory heap tag during serialization; its decoder continues to reject tag 9 as unknown. No existing v1 artifact is reinterpreted.
