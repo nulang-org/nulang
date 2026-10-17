@@ -83,6 +83,12 @@ fn checked_arithmetic_agrees_with_i128_oracle_at_sign_and_width_boundaries() {
             if b == 0 {
                 assert_eq!(int64::div(a, b), Err(Int64Error::DivisionByZero));
                 assert_eq!(int64::rem(a, b), Err(Int64Error::DivisionByZero));
+            } else if a == i64::MIN && b == -1 {
+                // Signed MIN / -1 is an overflow for *both* div and rem.
+                // Rust's checked_rem intentionally returns None here even
+                // though the mathematical remainder would be zero.
+                assert_eq!(int64::div(a, b), Err(Int64Error::Overflow));
+                assert_eq!(int64::rem(a, b), Err(Int64Error::Overflow));
             } else {
                 assert_eq!(int64::div(a, b), oracle(i128::from(a) / i128::from(b)));
                 assert_eq!(int64::rem(a, b), oracle(i128::from(a) % i128::from(b)));
