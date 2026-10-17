@@ -5,7 +5,8 @@
 //! accordingly so their timings are not misread as message throughput.
 
 use criterion::{black_box, criterion_group, BatchSize, BenchmarkId, Criterion, Throughput};
-use nulang::runtime::{Mailbox, Message, MessagePayload, MessagePriority, Runtime};
+use nulang::iso_arena::IsoArena;
+use nulang::runtime::{Mailbox, Message, MessagePayload, MessagePriority, Runtime, TypeTag};
 use nulang::vm::Value;
 
 const MESSAGE_BATCH: usize = 100;
@@ -174,6 +175,45 @@ fn bench_message_drain(c: &mut Criterion) {
     group.finish();
 }
 
+/// Separate the common no-allocation reset path from the opt-in arena
+/// allocation path. A denser idle actor layout is only useful if active
+/// message processing remains within its acceptable performance budget.
+fn bench_iso_arena(c: &mut Criterion) {
+    const EPOCHS: usize = 128;
+    let mut group = c.benchmark_group("actor/iso_arena");
+    group.throughput(Throughput::Elements(EPOCHS as u64));
+
+    group.bench_function("idle_reset_128", |b| {
+        b.iter(|| {
+            let mut arena = IsoArena::new();
+            for _ in 0..EPOCHS {
+                arena.reset();
+            }
+            black_box(arena);
+        })
+    });
+
+    group.bench_function("active_alloc_reset_128", |b| {
+        b.iter_batched_ref(
+            || {
+                let mut arena = IsoArena::new();
+                arena.alloc(8, TypeTag::Raw).expect("arena allocation");
+                arena.reset();
+                arena
+            },
+            |arena| {
+                for _ in 0..EPOCHS {
+                    black_box(arena.alloc(8, TypeTag::Raw).expect("arena allocation"));
+                    arena.reset();
+                }
+            },
+            BatchSize::SmallInput,
+        )
+    });
+
+    group.finish();
+}
+
 fn selective_receive_mailbox(depth: usize, hit_behavior: u16) -> Mailbox {
     let mut mailbox = Mailbox::new(0);
     for _ in 0..depth.saturating_sub(1) {
@@ -267,5 +307,6 @@ criterion_group!(
     bench_spawn_send_receive,
     bench_message_enqueue,
     bench_message_drain,
+    bench_iso_arena,
     bench_selective_receive
 );

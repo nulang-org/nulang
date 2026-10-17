@@ -1,0 +1,66 @@
+name: Iso arena exact-base A/B
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Git ref or SHA to compare against
+        required: false
+        default: main
+  pull_request:
+    paths:
+      - '.github/workflows/iso-arena-ab.yml'
+      - 'scripts/iso_arena_ab_bench.py'
+      - 'scripts/tests/test_iso_arena_ab_bench.py'
+      - 'benches/actor_bench.rs'
+      - 'src/iso_arena.rs'
+
+concurrency:
+  group: iso-arena-ab-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    name: Exact-base active/idle iso arena Criterion A/B
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Test comparator contracts
+        run: python3 -m unittest scripts/tests/test_iso_arena_ab_bench.py
+
+      # Keep this an opt-in diagnostic, not an unreviewed performance gate.
+      # No cache, artifact uploads, or modification of the comparison base.
+      - name: Paired Criterion comparison
+        env:
+          BASE_REF: "${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || inputs.base_ref }}"
+        run: |
+          python3 scripts/iso_arena_ab_bench.py \
+            --base-ref "$BASE_REF" \
+            --pairs 5 \
+            --warmup 1 \
+            --output iso-arena-ab.json
+
+      - name: Publish same-host comparison
+        if: always() && hashFiles('iso-arena-ab.json') != ''
+        run: |
+          {
+            echo '## IsoArena Criterion exact-base A/B'
+            echo
+            echo 'The exact same benchmark module is built against the parent and candidate libraries.'
+            echo
+            echo 'Live allocation/reset throughput is a **separate gate** from idle RSS.'
+            echo
+            echo '### Active allocation and idle reset'
+            echo
+            echo '```json'
+            jq '.cases' iso-arena-ab.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

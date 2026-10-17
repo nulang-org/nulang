@@ -98,19 +98,38 @@ const BLOCK_SIZE: usize = 64 * 1024;
 /// live list.  [`IsoArena::reset`] reclaims the whole epoch in O(1).
 #[derive(Debug)]
 pub struct IsoArena {
-    /// Backing blocks.  `Box<[u64]>` guarantees 8-byte alignment for the
-    /// embedded headers and keeps block addresses stable as the Vec grows.
-    blocks: Vec<Box<[u64]>>,
-    /// Index of the block currently being bumped from.
-    block_idx: usize,
-    /// Byte offset into the current block.
-    offset: usize,
-    /// Allocations served in the current epoch (since last reset).
-    epoch_allocs: usize,
-    /// Total allocations served over the arena's lifetime.
-    total_allocs: usize,
-    /// Number of epoch resets.
+    /// Cold allocation state is absent until the first successful allocation.
+    /// Most runtime actors never use the optional iso-arena optimization.
+    state: Option<Box<IsoArenaState>>,
+    /// A reset without any allocation still counts as a completed epoch.
     resets: usize,
+}
+
+/// Allocator bookkeeping kept off the common idle-actor layout.
+#[derive(Debug)]
+struct IsoArenaState {
+    /// Stable backing blocks; retained and reused across epochs.
+    blocks: Vec<Box<[u64]>>,
+    block_idx: usize,
+    offset: usize,
+    epoch_allocs: usize,
+    total_allocs: usize,
+}
+
+impl IsoArenaState {
+    fn new() -> Self {
+        Self {
+            blocks: Vec::new(),
+            block_idx: 0,
+            offset: 0,
+            epoch_allocs: 0,
+            total_allocs: 0,
+        }
+    }
+
+    fn block_cap(&self, idx: usize) -> usize {
+        self.blocks[idx].len() * std::mem::size_of::<u64>()
+    }
 }
 
 impl Default for IsoArena {
@@ -121,101 +140,98 @@ impl Default for IsoArena {
 
 impl IsoArena {
     pub fn new() -> Self {
-        IsoArena {
-            blocks: Vec::new(),
-            block_idx: 0,
-            offset: 0,
-            epoch_allocs: 0,
-            total_allocs: 0,
+        Self {
+            state: None,
             resets: 0,
         }
     }
 
-    fn block_cap(&self, idx: usize) -> usize {
-        self.blocks[idx].len() * std::mem::size_of::<u64>()
+    #[cfg(test)]
+    fn has_allocated_blocks(&self) -> bool {
+        self.state.is_some()
     }
 
-    /// Allocate `payload_size` bytes in the arena, returning a pointer to
-    /// the payload (just past a freshly written [`OrcaHeader`]).
-    ///
-    /// Returns `None` only on usize overflow of the size computation; block
-    /// growth is unbounded (a fresh block is chained when needed).
+    /// Allocate a message-scoped value. The first successful allocation
+    /// initializes the arena's cold bookkeeping, while later allocations
+    /// reuse the same blocks and cursors as before.
     pub fn alloc(&mut self, payload_size: usize, type_tag: TypeTag) -> Option<*mut u8> {
         let aligned = payload_size.checked_add(7)? & !7;
         let total = ActorHeap::HEADER_SIZE.checked_add(aligned)?;
 
-        // Find a block with room, chaining a fresh one when necessary.
+        // Do not allocate bookkeeping for a request that cannot fit in usize.
+        let state = self
+            .state
+            .get_or_insert_with(|| Box::new(IsoArenaState::new()));
         loop {
-            if self.block_idx == self.blocks.len() {
+            if state.block_idx == state.blocks.len() {
                 let cap = BLOCK_SIZE.max(total);
-                self.blocks
+                state
+                    .blocks
                     .push(vec![0u64; cap / std::mem::size_of::<u64>()].into_boxed_slice());
-                self.offset = 0;
+                state.offset = 0;
             }
-            if self.offset + total <= self.block_cap(self.block_idx) {
+            if state.offset + total <= state.block_cap(state.block_idx) {
                 break;
             }
-            // Current block is full (or a retained undersized block); move
-            // to the next one.  Stranded space is reclaimed at the next
-            // reset, when allocation restarts from block 0.
-            self.block_idx += 1;
-            self.offset = 0;
+            state.block_idx += 1;
+            state.offset = 0;
         }
 
-        let base = self.blocks[self.block_idx].as_mut_ptr() as *mut u8;
+        let base = state.blocks[state.block_idx].as_mut_ptr() as *mut u8;
         debug_assert!(base as usize % 8 == 0);
-        let header_ptr = unsafe { base.add(self.offset) } as *mut OrcaHeader;
-        let payload = unsafe { base.add(self.offset + ActorHeap::HEADER_SIZE) };
+        let header_ptr = unsafe { base.add(state.offset) } as *mut OrcaHeader;
+        let payload = unsafe { base.add(state.offset + ActorHeap::HEADER_SIZE) };
         unsafe {
-            // SAFETY: header_ptr points into our live block with `total`
-            // bytes of room; OrcaHeader fits in the first HEADER_SIZE bytes.
+            // SAFETY: header_ptr points into the active block with `total`
+            // bytes available; the OrcaHeader prefix is fully initialized.
             std::ptr::write(
                 header_ptr,
                 OrcaHeader::new(0, type_tag, total, payload_size),
             );
         }
-        self.offset += total;
-        self.epoch_allocs += 1;
-        self.total_allocs += 1;
+        state.offset += total;
+        state.epoch_allocs += 1;
+        state.total_allocs += 1;
         debug_assert!(self.contains(payload));
         debug_assert!(payload as usize % 8 == 0);
         Some(payload)
     }
 
-    /// True when `ptr` lies inside any arena block (including space from
-    /// previous, already-reset epochs — such pointers are dead anyway, and
-    /// treating them as arena-owned keeps stale rc traffic harmless).
+    /// True for any pointer within a retained arena block, including from
+    /// a prior reset epoch. An uninitialized arena owns no pointers.
     pub fn contains(&self, ptr: *const u8) -> bool {
         if ptr.is_null() {
             return false;
         }
+        let Some(state) = self.state.as_ref() else {
+            return false;
+        };
         let p = ptr as usize;
-        self.blocks.iter().any(|b| {
+        state.blocks.iter().any(|b| {
             let start = b.as_ptr() as usize;
             p >= start && p < start + b.len() * std::mem::size_of::<u64>()
         })
     }
 
-    /// Reclaim the whole epoch in O(1): restart bumping from block 0.
-    /// Block memory is retained for reuse by the next epoch.
+    /// Reclaim the epoch in O(1), retaining blocks for reuse. A no-op epoch
+    /// remains allocation-free but increments the observable reset counter.
     pub fn reset(&mut self) {
-        self.block_idx = 0;
-        self.offset = 0;
-        self.epoch_allocs = 0;
+        if let Some(state) = self.state.as_mut() {
+            state.block_idx = 0;
+            state.offset = 0;
+            state.epoch_allocs = 0;
+        }
         self.resets += 1;
     }
 
-    /// Allocations served in the current epoch.
     pub fn epoch_allocs(&self) -> usize {
-        self.epoch_allocs
+        self.state.as_ref().map_or(0, |state| state.epoch_allocs)
     }
 
-    /// Total allocations served (lifetime).
     pub fn total_allocs(&self) -> usize {
-        self.total_allocs
+        self.state.as_ref().map_or(0, |state| state.total_allocs)
     }
 
-    /// Number of epoch resets performed.
     pub fn resets(&self) -> usize {
         self.resets
     }
@@ -652,6 +668,41 @@ mod tests {
     }
 
     // -- Arena mechanics ----------------------------------------------------
+
+    #[test]
+    fn idle_arena_keeps_cold_allocation_metadata_out_of_actor() {
+        assert!(
+            std::mem::size_of::<IsoArena>() <= 2 * std::mem::size_of::<usize>(),
+            "idle arena should hold no inline block vector or epoch cursors"
+        );
+        let a = IsoArena::new();
+        assert!(!a.has_allocated_blocks());
+        assert_eq!(a.epoch_allocs(), 0);
+        assert_eq!(a.total_allocs(), 0);
+        assert!(!a.contains(std::ptr::null()));
+    }
+
+    #[test]
+    fn resetting_unused_arena_does_not_allocate_and_keeps_reset_count() {
+        let mut a = IsoArena::new();
+        a.reset();
+        a.reset();
+        assert_eq!(a.resets(), 2);
+        assert!(!a.has_allocated_blocks());
+        assert_eq!(a.total_allocs(), 0);
+
+        let ptr = a.alloc(16, TypeTag::Array).unwrap();
+        assert!(a.has_allocated_blocks());
+        assert!(a.contains(ptr));
+        assert_eq!(a.epoch_allocs(), 1);
+        assert_eq!(a.total_allocs(), 1);
+        assert_eq!(a.resets(), 2);
+        a.reset();
+        assert_eq!(a.resets(), 3);
+        assert_eq!(a.epoch_allocs(), 0);
+        assert_eq!(a.total_allocs(), 1);
+        assert_eq!(ptr, a.alloc(16, TypeTag::Array).unwrap());
+    }
 
     #[test]
     fn arena_alloc_write_header_and_len() {
