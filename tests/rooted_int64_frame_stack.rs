@@ -115,3 +115,67 @@ fn signed_64_bit_arithmetic_updates_only_the_target_frame() {
     }
     assert_eq!(actor.heap.live_count(), 0);
 }
+
+#[test]
+fn suspend_into_semantic_checkpoint_releases_original_roots_and_restores_new_actor() {
+    let mut original_actor = Actor::new(76, "original-owner", 0);
+    let checkpoint = {
+        let mut stack = RootedIntFrameStack::new(&mut original_actor);
+        let caller = stack.push_empty(4);
+        stack.store(caller, 0, i64::MAX).unwrap();
+        let callee = stack.push_empty(9);
+        stack.store(callee, 0, i64::MIN).unwrap();
+        stack.store(callee, 17, 7).unwrap();
+        stack.suspend().unwrap()
+    };
+    assert_eq!(original_actor.heap.live_count(), 0);
+
+    let mut resumed_actor = Actor::new(77, "resumed-owner", 0);
+    {
+        let mut resumed = RootedIntFrameStack::resume(&mut resumed_actor, &checkpoint).unwrap();
+        assert_eq!(resumed.frame_count(), 2);
+        assert_eq!(resumed.read(0, 0).unwrap(), Some(i64::MAX));
+        assert_eq!(resumed.read(1, 0).unwrap(), Some(i64::MIN));
+        assert_eq!(resumed.read(1, 17).unwrap(), Some(7));
+        resumed.pop().unwrap();
+        assert_eq!(resumed.read(0, 0).unwrap(), Some(i64::MAX));
+    }
+    assert_eq!(resumed_actor.heap.live_count(), 0);
+}
+
+#[test]
+fn resuming_same_checkpoint_creates_independently_owned_roots() {
+    let mut source_actor = Actor::new(78, "source-owner", 0);
+    let checkpoint = {
+        let mut stack = RootedIntFrameStack::new(&mut source_actor);
+        stack.push_empty(0);
+        stack.store(0, 0, i64::MAX).unwrap();
+        stack.suspend().unwrap()
+    };
+    assert_eq!(source_actor.heap.live_count(), 0);
+
+    let mut actor_a = Actor::new(79, "first-resume-owner", 0);
+    let mut actor_b = Actor::new(80, "second-resume-owner", 0);
+    {
+        let mut first = RootedIntFrameStack::resume(&mut actor_a, &checkpoint).unwrap();
+        let second = RootedIntFrameStack::resume(&mut actor_b, &checkpoint).unwrap();
+        first.clear(0, 0).unwrap();
+        assert_eq!(first.read(0, 0).unwrap(), None);
+        assert_eq!(second.read(0, 0).unwrap(), Some(i64::MAX));
+    }
+    assert_eq!(actor_a.heap.live_count(), 0);
+    assert_eq!(actor_b.heap.live_count(), 0);
+}
+
+#[test]
+fn an_empty_stack_can_suspend_and_resume_without_leaving_roots() {
+    let mut original_actor = Actor::new(81, "empty-owner", 0);
+    let checkpoint = RootedIntFrameStack::new(&mut original_actor).suspend().unwrap();
+    assert_eq!(original_actor.heap.live_count(), 0);
+    let mut restored_actor = Actor::new(82, "empty-restored-owner", 0);
+    {
+        let restored = RootedIntFrameStack::resume(&mut restored_actor, &checkpoint).unwrap();
+        assert_eq!(restored.frame_count(), 0);
+    }
+    assert_eq!(restored_actor.heap.live_count(), 0);
+}
