@@ -3584,6 +3584,157 @@ fn test_exiting_sender_heap_retired_until_refs_drain() {
     );
 }
 
+/// A receiver needs one actor-lifetime hold per foreign object, not one per
+/// delivery or payload slot. In-flight sends are counted independently and
+/// must all drain before the single retained hold is released.
+#[test]
+fn repeated_foreign_pointer_deliveries_take_one_receiver_hold() {
+    let mut rt = Runtime::new();
+    let owner = rt.spawn_actor(Box::new(|| vec![]));
+    let receiver = rt.spawn_actor(Box::new(|| vec![]));
+    declare_test_behavior(&mut rt, receiver, "handle");
+    rt.run_scheduler();
+
+    let ptr = rt
+        .actors
+        .get_mut(&owner)
+        .unwrap()
+        .heap
+        .alloc(16, TypeTag::Raw)
+        .unwrap();
+    // SAFETY: ptr refers to a live allocation on owner's actor heap.
+    let value = unsafe { Value::ptr(ptr) };
+
+    rt.current_actor = Some(owner);
+    for _ in 0..64 {
+        rt.send_message_by_id(receiver, 0, &[value, value]);
+    }
+    rt.current_actor = None;
+    rt.run_scheduler();
+
+    // All 128 in-flight send credits must have drained; a long-lived actor
+    // must retain only one hold on this object after consuming the messages.
+    let header = unsafe { &*ActorHeap::header_of(ptr) };
+    assert_eq!(
+        header.foreign_count, 1,
+        "repeated deliveries must share one receiver hold"
+    );
+
+    // The receiver's hold protects the object after the sender's last drop.
+    let owner_actor = rt.actors.get_mut(&owner).unwrap();
+    unsafe {
+        owner_actor
+            .orca_gc
+            .drop_local_ref(&mut owner_actor.heap, ptr);
+    }
+    assert_eq!(owner_actor.heap.live_count(), 1);
+
+    rt.exit_actor(receiver, ExitReason::Normal);
+    rt.run_scheduler();
+    assert_eq!(
+        rt.actors.get(&owner).unwrap().heap.live_count(),
+        0,
+        "the sole foreign hold must be released exactly once at receiver exit"
+    );
+}
+
+/// Foreign holds are scoped to each receiving actor. A sender can exit
+/// before the receivers without invalidating their distinct holds.
+#[test]
+fn foreign_hold_dedup_preserves_distinct_receivers_and_retired_heap() {
+    let mut rt = Runtime::new();
+    let owner = rt.spawn_actor(Box::new(|| vec![]));
+    let first = rt.spawn_actor(Box::new(|| vec![]));
+    let second = rt.spawn_actor(Box::new(|| vec![]));
+    for id in [first, second] {
+        declare_test_behavior(&mut rt, id, "handle");
+    }
+    rt.run_scheduler();
+
+    let ptr = rt
+        .actors
+        .get_mut(&owner)
+        .unwrap()
+        .heap
+        .alloc(16, TypeTag::Raw)
+        .unwrap();
+    // SAFETY: ptr refers to a live allocation on owner's actor heap.
+    let value = unsafe { Value::ptr(ptr) };
+    rt.current_actor = Some(owner);
+    rt.send_message_by_id(first, 0, &[value]);
+    rt.send_message_by_id(first, 0, &[value]);
+    rt.send_message_by_id(second, 0, &[value]);
+    rt.current_actor = None;
+    rt.run_scheduler();
+
+    assert_eq!(
+        unsafe { (*ActorHeap::header_of(ptr)).foreign_count },
+        2,
+        "two receivers must each own one hold"
+    );
+
+    rt.exit_actor(owner, ExitReason::Normal);
+    assert_eq!(rt.retired_heaps.len(), 1);
+    rt.exit_actor(first, ExitReason::Normal);
+    assert_eq!(
+        unsafe { (*ActorHeap::header_of(ptr)).foreign_count },
+        1,
+        "exiting one receiver must leave the other hold intact"
+    );
+    rt.exit_actor(second, ExitReason::Normal);
+    assert!(
+        rt.retired_heaps.is_empty(),
+        "retired sender heap must be reclaimed after final receiver exits"
+    );
+}
+
+/// An exited owner's retired heap must remain alive for queued repeated
+/// deliveries, but the receiver should establish only one persistent hold
+/// when it eventually consumes them.
+#[test]
+fn repeated_foreign_deliveries_preserve_retired_owner_heap() {
+    let mut rt = Runtime::new();
+    let owner = rt.spawn_actor(Box::new(|| vec![]));
+    let receiver = rt.spawn_actor(Box::new(|| vec![]));
+    declare_test_behavior(&mut rt, receiver, "handle");
+    rt.run_scheduler();
+
+    let ptr = rt
+        .actors
+        .get_mut(&owner)
+        .unwrap()
+        .heap
+        .alloc(16, TypeTag::Raw)
+        .unwrap();
+    // SAFETY: live allocation remains pinned by in-flight message refs.
+    let value = unsafe { Value::ptr(ptr) };
+    rt.current_actor = Some(owner);
+    for _ in 0..32 {
+        rt.send_message_by_id(receiver, 0, &[value]);
+    }
+    rt.current_actor = None;
+
+    rt.exit_actor(owner, ExitReason::Normal);
+    assert_eq!(
+        rt.retired_heaps.len(),
+        1,
+        "queued references must pin the exited owner's heap"
+    );
+
+    rt.run_scheduler();
+    assert_eq!(
+        unsafe { (*ActorHeap::header_of(ptr)).foreign_count },
+        1,
+        "only the receiver's single hold should remain after all sends drain"
+    );
+
+    rt.exit_actor(receiver, ExitReason::Normal);
+    assert!(
+        rt.retired_heaps.is_empty(),
+        "retired heap must be reclaimed after final receiver hold is released"
+    );
+}
+
 /// Regression test: forwarding a received heap reference must use the
 /// true owner recorded in the object header, not the forwarding actor —
 /// the old code tripped the `send_ref_to` ownership debug_assert and, in
