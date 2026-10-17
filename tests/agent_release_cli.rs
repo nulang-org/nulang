@@ -1,4 +1,6 @@
-use nulang::agent_release::{asset_digest, AgentReleaseDefinition, AgentReleaseEnvelope, ModelBinding};
+use nulang::agent_release::{
+    asset_digest, AgentReleaseDefinition, AgentReleaseEnvelope, ModelBinding,
+};
 use std::path::Path;
 use std::process::Command;
 
@@ -15,7 +17,10 @@ fn release_cli_seals_and_verifies_a_pinned_release() {
     let temp = std::env::temp_dir().join(format!(
         "nulang_release_cli_{}_{}",
         std::process::id(),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
     ));
     std::fs::create_dir_all(&temp).unwrap();
     let definition = AgentReleaseDefinition {
@@ -35,16 +40,28 @@ fn release_cli_seals_and_verifies_a_pinned_release() {
     };
     let definition_path = temp.join("definition.json");
     let envelope_path = temp.join("sealed.json");
-    std::fs::write(&definition_path, serde_json::to_vec(&definition).unwrap()).unwrap();
+    std::fs::write(
+        &definition_path,
+        serde_json::to_vec(&definition).unwrap(),
+    )
+    .unwrap();
 
     let sealed = cli(&definition_path, &["nula", "release", "seal"]);
-    assert!(sealed.status.success(), "{}", String::from_utf8_lossy(&sealed.stderr));
+    assert!(
+        sealed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sealed.stderr)
+    );
     let envelope = AgentReleaseEnvelope::parse_and_verify(&sealed.stdout).unwrap();
     assert_eq!(envelope.definition.agent, "research-agent");
     std::fs::write(&envelope_path, &sealed.stdout).unwrap();
 
     let verified = cli(&envelope_path, &["nula", "release", "verify"]);
-    assert!(verified.status.success(), "{}", String::from_utf8_lossy(&verified.stderr));
+    assert!(
+        verified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
     let output: serde_json::Value = serde_json::from_slice(&verified.stdout).unwrap();
     assert_eq!(output["command"], "release.verify");
     assert_eq!(output["release_id"], envelope.release_id);
