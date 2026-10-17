@@ -58,12 +58,25 @@ record larger than the target is allowed to occupy its own segment.
 ### Consumer cursors and replay
 
 A cursor is the last fully processed stream sequence for a named consumer.
-Cursor commits are monotonic and cannot advance beyond the current stream tail.
+Cursor commits are monotonic. For standalone streams without a replication
+policy, they retain the original local-tail bound.
 
-`read_consumer(stream, consumer, limit)` replays from `cursor + 1`.
+For streams with an installed replication policy, `read_consumer` returns
+**only quorum-committed records** after `cursor + 1`, and `commit_cursor`
+rejects progress beyond the durable quorum-committed sequence. Raw
+`fabric_stream_read` / `FileFabricStreamStore::read_from` intentionally
+remain available to replication and diagnostic tools, and may expose a
+locally durable but uncommitted tail. Reopening a stream after a crash does
+not promote that tail into committed consumer visibility.
+
+A replicated consumer cursor already beyond the committed boundary (for
+example, from an older version) now fails closed on read rather than
+silently advancing or discarding records. Operators must investigate any
+such legacy cursor before resuming effects; the code does not rewrite it.
 
 This establishes the persistence primitive needed for later ACK/NACK semantics
-without pretending that ACK redelivery already exists.
+without pretending that ACK redelivery already exists. Future leased-consumer
+APIs must enforce the same committed-only visibility and cursor bound.
 
 ## Runtime APIs
 
