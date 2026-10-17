@@ -4,17 +4,67 @@
 //! rollbackable on ordinary errors but is not an atomic swap under a crash.
 
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_STAGE: AtomicU64 = AtomicU64::new(1);
+
+/// A cooperative, per-output build lock. The create_new operation is atomic
+/// across processes on ordinary local filesystems. We never steal a lock:
+/// after a crash, a human must confirm the PID is no longer running and
+/// remove the orphaned lockfile explicitly.
+struct WebBuildLock {
+    path: PathBuf,
+    handle: Option<fs::File>,
+}
+
+impl WebBuildLock {
+    fn acquire(parent: &Path, name: &str) -> io::Result<Self> {
+        let path = parent.join(format!(".{name}.nulang-build.lock"));
+        let handle = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| {
+                if e.kind() == io::ErrorKind::AlreadyExists {
+                    io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!(
+                            "another Nulang web build owns {}; verify the process before removing a stale lock",
+                            path.display()
+                        ),
+                    )
+                } else {
+                    e
+                }
+            })?;
+        let mut lock = Self {
+            path,
+            handle: Some(handle),
+        };
+        if let Some(handle) = lock.handle.as_mut() {
+            writeln!(handle, "pid={}", std::process::id())?;
+        }
+        Ok(lock)
+    }
+}
+
+impl Drop for WebBuildLock {
+    fn drop(&mut self) {
+        // Close the handle before unlinking for Windows compatibility.
+        drop(self.handle.take());
+        let _ = fs::remove_file(&self.path);
+    }
+}
 
 pub(super) struct StagedWebOutput {
     target: PathBuf,
     stage: PathBuf,
     backup: PathBuf,
     published: bool,
+    // Held throughout copying, building, promotion and backup cleanup.
+    _lock: WebBuildLock,
 }
 
 impl StagedWebOutput {
@@ -35,25 +85,29 @@ impl StagedWebOutput {
                 )
             })?;
         fs::create_dir_all(parent)?;
+        let parent = fs::canonicalize(parent)?;
+        let target = parent.join(name);
+        let lock = WebBuildLock::acquire(&parent, name)?;
         let serial = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
         let label = format!("{}-{}-{}", name, std::process::id(), serial);
         let stage = parent.join(format!(".{label}.staging"));
         let backup = parent.join(format!(".{label}.previous"));
         fs::create_dir(&stage)?;
         let output = Self {
-            target: target.to_path_buf(),
+            target: target.clone(),
             stage,
             backup,
             published: false,
+            _lock: lock,
         };
-        match fs::symlink_metadata(target) {
+        match fs::symlink_metadata(&target) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "existing web output must be a real directory",
                 ));
             }
-            Ok(_) => copy_regular_tree(target, &output.stage)?,
+            Ok(_) => copy_regular_tree(&target, &output.stage)?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         };
@@ -167,6 +221,82 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn concurrent_build_cannot_stage_same_output() {
+        let fixture = Fixture::new("concurrent");
+        let first = StagedWebOutput::prepare(&fixture.output()).unwrap();
+        let err = match StagedWebOutput::prepare(&fixture.output()) {
+            Err(err) => err,
+            Ok(_) => panic!("a second build must not stage while the first holds the lock"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert!(first.path().exists());
+        drop(first);
+
+        // Failed/interrupted ordinary builds release their cooperative lock.
+        let next = StagedWebOutput::prepare(&fixture.output()).unwrap();
+        assert!(next.path().exists());
+    }
+
+    #[test]
+    fn aliases_of_the_same_output_share_one_build_lock() {
+        let fixture = Fixture::new("aliases");
+        let child = fixture.0.join("subdir");
+        fs::create_dir_all(&child).unwrap();
+        let first = StagedWebOutput::prepare(&fixture.output()).unwrap();
+        let alias = child.join("../dist");
+        let err = match StagedWebOutput::prepare(&alias) {
+            Ok(_) => panic!("path aliases must not bypass the build lock"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        drop(first);
+        assert!(StagedWebOutput::prepare(&alias).is_ok());
+    }
+
+    #[test]
+    fn orphaned_lock_is_not_silently_stolen() {
+        let fixture = Fixture::new("orphan");
+        let lock = fixture.0.join(".dist.nulang-build.lock");
+        fs::write(&lock, b"pid=999999\n").unwrap();
+
+        let err = match StagedWebOutput::prepare(&fixture.output()) {
+            Ok(_) => panic!("orphaned lock must fail closed"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&lock).unwrap(), b"pid=999999\n");
+
+        // An operator has verified there is no active owner.
+        fs::remove_file(lock).unwrap();
+        assert!(StagedWebOutput::prepare(&fixture.output()).is_ok());
+    }
+
+    #[test]
+    fn successful_build_releases_lock_for_next_build() {
+        let fixture = Fixture::new("unlock");
+        let first = StagedWebOutput::prepare(&fixture.output()).unwrap();
+        fs::write(first.path().join("index.html"), b"first").unwrap();
+        first.publish().unwrap();
+        let next = StagedWebOutput::prepare(&fixture.output()).unwrap();
+        assert_eq!(fs::read(next.path().join("index.html")).unwrap(), b"first");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_stage_preparation_releases_lock_without_leaking_files() {
+        use std::os::unix::fs::symlink;
+        let fixture = Fixture::new("invalid-before-lock");
+        let external = fixture.0.join("private");
+        fs::create_dir_all(&external).unwrap();
+        symlink(&external, fixture.output()).unwrap();
+
+        assert!(StagedWebOutput::prepare(&fixture.output()).is_err());
+        fs::remove_file(fixture.output()).unwrap();
+        let stage = StagedWebOutput::prepare(&fixture.output()).unwrap();
+        assert!(stage.path().exists());
     }
 
     #[test]

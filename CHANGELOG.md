@@ -1,7 +1,12 @@
 # Nulang Changelog
+### Serialize concurrent Web builds — 2026-10-17
+- **`nula build --web` acquires an exclusive, per-output lockfile** before copying prior output or starting the compilation phase, and holds it until promotion and backup cleanup complete. Concurrent builds of the same canonical output directory fail closed instead of publishing over one another.
+- **Lockfiles record the build PID and are released on normal exit or build failure.** A lock left by a crashed process is intentionally not stolen automatically; confirm the process is inactive before deleting the documented `.<output>.nulang-build.lock` file next to the output directory.
+- **Publication remains rollbackable, not crash-atomic**: the existing-directory promotion still uses two renames. Lockfiles coordinate Nulang builds on local filesystems but do not protect against unrelated tools directly modifying `dist/`.
+
 ### Staged Web build output and rollback — 2026-10-17
 - **`nula build --web` now prepares output in a sibling staging directory**, starting from a symlink-safe copy of the previous output so unrelated assets can survive. Compilation, prerendering, cleanup, IR generation and budgets run against staging, leaving the last published `dist/` intact on normal build failures.
-- **Successful builds promote the completed staging directory with rollback on rename errors.** Existing-directory replacement uses two portable renames and is not crash-atomic or safe from simultaneous builds; atomic exchange and build locking remain future work. Stale backups may require cleanup after interruption.
+- **Successful builds promote the completed staging directory with rollback on rename errors.** Existing-directory replacement uses two portable renames and is not crash-atomic or safe from simultaneous builds; atomic exchange and build locking remain future work. Stale backups may require cleanup after interruption. Later commits serialize cooperating CLI builders with an exclusive lockfile.
 - **Tests exercise successful publication, failed-build preservation and output-root symlink refusal.** Full exact-head CI is required before promotion.
 
 ### Conservative Web placement and stale-route cleanup — 2026-10-17
