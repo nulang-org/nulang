@@ -4418,9 +4418,6 @@ impl VM {
         let effect_op_idx = instr.imm16() as usize;
         let dst_reg = instr.op3 as usize;
         let effect_op = self.module_const_string(module_idx, effect_op_idx);
-        // Pass the full frame register slice and the module's constant pool
-        // so the callback can resolve string-id arguments from registers.
-        let args = &self.frames[frame_idx].regs;
         // The execution loop has already advanced the frame PC past this
         // instruction. On Pending it rewinds, so a resumed execution obtains
         // the same exact bytecode PC and compiler-owned semantic site.
@@ -4431,7 +4428,21 @@ impl VM {
                 msg: "PerformAsync requires an already-fetched bytecode PC".into(),
                 span: Span::default(),
             })?;
-        let module = &self.modules[module_idx];
+        let module = self.modules.get(module_idx).ok_or_else(|| NuError::VMError {
+            msg: "PerformAsync references a missing bytecode module".into(),
+            span: Span::default(),
+        })?;
+        // Do not hand a forged/stale instruction identity to any host callback:
+        // the PC must refer to the exact instruction the VM is executing.
+        if instr.opcode != OpCode::PerformAsync || module.instructions.get(pc) != Some(&instr) {
+            return Err(NuError::VMError {
+                msg: "PerformAsync site does not match executing bytecode".into(),
+                span: Span::default(),
+            });
+        }
+        // Pass the full frame register slice so legacy callbacks can still
+        // resolve string-id arguments from the executing module's constants.
+        let args = &self.frames[frame_idx].regs;
         match self
             .actor_callbacks
             .perform_async_in_module(module, pc, &effect_op, args)
@@ -6385,6 +6396,13 @@ mod vm_tests {
         let mut vm = VM::new_without_jit();
         let mut module = CodeModule::new("perform_async_ready_value");
         let effect_idx = module.add_string_constant("Test.value");
+        let instr = Instruction::new3(
+            OpCode::PerformAsync,
+            ((effect_idx >> 8) & 0xff) as u8,
+            (effect_idx & 0xff) as u8,
+            7,
+        );
+        module.emit(instr);
         vm.load_module(module);
         vm.set_actor_callbacks(Box::new(ReadyValueCallbacks::new()));
 
@@ -6393,12 +6411,6 @@ mod vm_tests {
         vm.frames.push(frame);
         vm.current_frame_idx = Some(0);
 
-        let instr = Instruction::new3(
-            OpCode::PerformAsync,
-            ((effect_idx >> 8) & 0xff) as u8,
-            (effect_idx & 0xff) as u8,
-            7,
-        );
         vm.step_perform_async(0, 0, instr)
             .expect("ReadyValue should complete without suspension");
 
