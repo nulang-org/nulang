@@ -5,11 +5,18 @@
 //! run for a given seed. This enables reproducible debugging of concurrency
 //! bugs, deadlock detection, and invariant checking.
 //!
-//! Usage:
-//!   let mut sim = Simulator::new(42); // seed = 42
-//!   sim.load_program("examples/pingpong.nula");
-//!   sim.run_until_quiescence();
-//!   assert!(!sim.has_deadlock());
+//! The lightweight `Simulator` records message deliveries rather than
+//! executing Nulang actor behaviors. For semantic/GC/durability testing, use
+//! the real `Runtime::run_scheduler_deterministic` and its virtual clock.
+//!
+//! Lightweight example:
+//!   let mut sim = Simulator::new(42).with_max_steps(100);
+//!   sim.register_actor(1, "worker");
+//!   sim.send(0, 1, "work", vec![]);
+//!   assert_eq!(
+//!       sim.run_until_quiescence_checked(),
+//!       SimulationRunResult::Quiescent { steps: 2 },
+//!   );
 
 use std::collections::{HashMap, VecDeque};
 
@@ -122,8 +129,24 @@ pub enum StepResult {
     Quiescent,
 }
 
+/// Terminal result of a bounded simulation. A step limit is never success:
+/// retain the seed and budget so a failed interleaving can be reproduced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "check whether the simulation reached quiescence"]
+pub enum SimulationRunResult {
+    Quiescent {
+        steps: u64,
+    },
+    StepLimitExceeded {
+        seed: u64,
+        steps: u64,
+        max_steps: u64,
+    },
+}
+
 /// The deterministic simulator.
 pub struct Simulator {
+    seed: u64,
     pub rng: DeterministicRng,
     pub actors: HashMap<u64, SimActor>,
     pub pending_messages: VecDeque<SimMessage>,
@@ -137,6 +160,7 @@ impl Simulator {
     /// Create a new simulator with the given random seed.
     pub fn new(seed: u64) -> Self {
         Self {
+            seed,
             rng: DeterministicRng::new(seed),
             actors: HashMap::new(),
             pending_messages: VecDeque::new(),
@@ -179,7 +203,14 @@ impl Simulator {
     /// Advance the simulation by one step.
     pub fn step(&mut self) -> StepResult {
         if self.step_count >= self.max_steps {
-            return StepResult::NoProgress;
+            // The last permitted step may have processed the final message.
+            // That is successful quiescence, not budget exhaustion. Do not
+            // consume another step or advance virtual time to find out.
+            return if self.has_pending_work() {
+                StepResult::NoProgress
+            } else {
+                StepResult::Quiescent
+            };
         }
         self.step_count += 1;
 
@@ -247,13 +278,51 @@ impl Simulator {
         }
     }
 
-    /// Run the simulation until quiescence or step limit.
-    pub fn run_until_quiescence(&mut self) {
+    /// Return whether any work remains in the lightweight simulation:
+    /// undelivered messages, actor mailboxes, or scheduled timers.
+    ///
+    /// This is not a detector for suspended real-runtime actors or external
+    /// asynchronous operations. Use the real Runtime DST for those scenarios.
+    pub fn has_pending_work(&self) -> bool {
+        !self.pending_messages.is_empty()
+            || !self.timers.is_empty()
+            || self.actors.values().any(|actor| !actor.mailbox.is_empty())
+    }
+
+    /// Run without hiding a step-budget exhaustion. On failure, the seed and
+    /// budget can be used to reproduce the same scheduling interleaving.
+    pub fn run_until_quiescence_checked(&mut self) -> SimulationRunResult {
         loop {
             match self.step() {
-                StepResult::Quiescent | StepResult::NoProgress => break,
-                _ => {}
+                StepResult::MessageProcessed { .. } => {}
+                StepResult::Quiescent => {
+                    return SimulationRunResult::Quiescent {
+                        steps: self.step_count,
+                    };
+                }
+                StepResult::NoProgress => {
+                    return SimulationRunResult::StepLimitExceeded {
+                        seed: self.seed,
+                        steps: self.step_count,
+                        max_steps: self.max_steps,
+                    };
+                }
             }
+        }
+    }
+
+    /// Run to quiescence or panic with a reproducible failure message.
+    ///
+    /// Preserves the original void API for callers using the harness in
+    /// tests, but a depleted budget no longer masquerades as success.
+    pub fn run_until_quiescence(&mut self) {
+        if let SimulationRunResult::StepLimitExceeded {
+            seed,
+            steps,
+            max_steps,
+        } = self.run_until_quiescence_checked()
+        {
+            panic!("DST step limit exceeded: seed={seed}, steps={steps}, max_steps={max_steps}");
         }
     }
 
@@ -400,6 +469,103 @@ mod tests {
         sim.run_until_quiescence();
         assert!(sim.timers.is_empty());
         assert_eq!(sim.clock_ms(), 100);
+    }
+
+    #[test]
+    fn test_dst_checked_run_is_quiescent_with_zero_budget_and_no_work() {
+        let mut sim = Simulator::new(7).with_max_steps(0);
+
+        assert_eq!(
+            sim.run_until_quiescence_checked(),
+            SimulationRunResult::Quiescent { steps: 0 }
+        );
+        assert!(!sim.has_pending_work());
+    }
+
+    #[test]
+    fn test_dst_pending_work_includes_undelivered_messages() {
+        let mut sim = Simulator::new(7).with_max_steps(0);
+        sim.register_actor(1, "worker");
+        sim.send(0, 1, "pending", vec![]);
+
+        assert!(sim.has_pending_work());
+        assert_eq!(sim.step_count(), 0);
+        assert_eq!(
+            sim.run_until_quiescence_checked(),
+            SimulationRunResult::StepLimitExceeded {
+                seed: 7,
+                steps: 0,
+                max_steps: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn test_dst_checked_run_quiesces_at_exact_message_budget() {
+        let mut sim = Simulator::new(42).with_max_steps(1);
+        sim.register_actor(1, "worker");
+        sim.send(0, 1, "work", vec![]);
+
+        assert_eq!(
+            sim.run_until_quiescence_checked(),
+            SimulationRunResult::Quiescent { steps: 1 },
+            "finishing the last allowed message is not a step-limit failure"
+        );
+        assert_eq!(sim.step_count(), 1);
+    }
+
+    #[test]
+    fn test_dst_checked_run_reports_seed_when_work_remains() {
+        let mut sim = Simulator::new(123).with_max_steps(1);
+        sim.register_actor(1, "worker");
+        sim.send(0, 1, "first", vec![]);
+        sim.send(0, 1, "second", vec![]);
+
+        assert_eq!(
+            sim.run_until_quiescence_checked(),
+            SimulationRunResult::StepLimitExceeded {
+                seed: 123,
+                steps: 1,
+                max_steps: 1,
+            }
+        );
+        assert!(sim.has_pending_work());
+    }
+
+    #[test]
+    fn test_dst_zero_budget_rejects_pending_timer_without_advancing_time() {
+        let mut sim = Simulator::new(9).with_max_steps(0);
+        sim.register_actor(1, "timer-worker");
+        sim.timers.push((
+            100,
+            1,
+            SimMessage {
+                sender: 0,
+                target: 1,
+                behavior: "wake".to_string(),
+                payload: vec![],
+            },
+        ));
+
+        assert_eq!(
+            sim.run_until_quiescence_checked(),
+            SimulationRunResult::StepLimitExceeded {
+                seed: 9,
+                steps: 0,
+                max_steps: 0,
+            }
+        );
+        assert_eq!(sim.clock_ms(), 0);
+        assert_eq!(sim.timers.len(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "seed=77")]
+    fn test_dst_legacy_runner_fails_closed_at_budget_limit() {
+        let mut sim = Simulator::new(77).with_max_steps(0);
+        sim.register_actor(1, "worker");
+        sim.send(0, 1, "queued", vec![]);
+        sim.run_until_quiescence();
     }
 
     #[test]
