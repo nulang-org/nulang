@@ -39,7 +39,7 @@ class WoodpeckerRustReproducibilityTests(unittest.TestCase):
         for command in commands:
             self.assertRegex(
                 command,
-                r"^- cargo (?:check|clippy|test) --locked(?:\\s|$)",
+                r"^- cargo (?:check|clippy|test) --locked(?:\s|$)",
                 f"CI must fail rather than mutate Cargo.lock: {command}",
             )
 
