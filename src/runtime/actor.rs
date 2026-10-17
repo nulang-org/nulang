@@ -471,10 +471,11 @@ impl Actor {
         unsafe {
             ptr.cast::<i64>().write(value);
         }
+        let ptr = std::ptr::NonNull::new(ptr).expect("ORCA returned a non-null allocation");
         Some(WideIntLease {
             heap: &mut self.heap,
             gc: &mut self.orca_gc,
-            ptr: std::ptr::NonNull::new(ptr).expect("ORCA returned a non-null allocation"),
+            ptr,
         })
     }
 
