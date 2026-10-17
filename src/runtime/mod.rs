@@ -2785,6 +2785,14 @@ impl Runtime {
                 actor.idle_ms = 0;
                 MessageAdmission::Accepted
             } else {
+                // Preserve local backpressure as an explicit diagnostic
+                // outcome; the rejected message was never admitted.
+                actor.flight_recorder.record_metadata(
+                    TraceEventKind::Backpressured,
+                    self.current_actor.unwrap_or(0),
+                    behavior_id,
+                    args.len(),
+                );
                 // Mailbox is full (capacity > 0). Route to DLQ with a simple notification.
                 self.route_to_dlq(
                     &Message {
@@ -3900,9 +3908,16 @@ impl Runtime {
             }
         };
         if let Some(msg) = msg_opt {
-            // Message delivery counts as activity for dehydration.
+            // A dequeue is not proof of successful handler completion. Record
+            // this distinction before dispatch, with no payload inspection.
             if let Some(actor) = self.actors.get_mut(&actor_id) {
                 actor.idle_ms = 0;
+                actor.flight_recorder.record_metadata(
+                    TraceEventKind::Dequeued,
+                    msg.sender,
+                    msg.behavior_id,
+                    msg.payload.len(),
+                );
             }
             let behavior_idx = msg.behavior_id as usize;
             let journal_source_actor = (msg.sender != 0).then_some(msg.sender);
@@ -7194,6 +7209,18 @@ impl Runtime {
         }
         self.cluster_config = config;
         true
+    }
+
+    /// Export recent diagnostic events for a live actor as redacted JSONL.
+    ///
+    /// `None` indicates an unknown actor. A disabled or empty recorder
+    /// returns `Some("")`. Each line contains only identifiers, counts and
+    /// local admission/dequeue outcomes. No payload values are exported;
+    /// neither successful execution nor remote delivery is implied.
+    pub fn actor_trace_jsonl(&self, actor_id: u64) -> Option<String> {
+        self.actors
+            .get(&actor_id)
+            .map(|actor| actor.flight_recorder.to_metadata_jsonl(actor_id))
     }
 
     /// Snapshot all runtime metrics into a single serializable struct.
