@@ -3,6 +3,8 @@
 Thanks for your interest in contributing! Nulang is pre-1.0 alpha software —
 expect rough edges, and expect breaking changes before v1.0.
 
+Agent-assisted changes should follow the [work-order and PR evidence contract](docs/AGENT_WORK_ORDERS.md). Human contributions can use the same acceptance and verification checklist; this does not change required CI checks.
+
 ## Build from source
 
 ```bash
