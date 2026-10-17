@@ -5,7 +5,7 @@
 //! accordingly so their timings are not misread as message throughput.
 
 use criterion::{black_box, criterion_group, BatchSize, BenchmarkId, Criterion, Throughput};
-use nulang::runtime::{Mailbox, Message, MessagePayload, MessagePriority, Runtime};
+use nulang::runtime::{Actor, Mailbox, Message, MessagePayload, MessagePriority, Runtime};
 use nulang::vm::Value;
 
 const MESSAGE_BATCH: usize = 100;
@@ -53,6 +53,27 @@ fn bench_spawn_idle_batch(c: &mut Criterion) {
     });
 
     group.finish();
+}
+
+/// Pooled actor spawn throughput. Runtime setup and the pre-existing actor
+/// are outside the timed section, so this measures the real Runtime::spawn_actor
+/// recycle path (including name regeneration, reset, insertion, and scheduling)
+/// rather than just formatting a synthetic String in isolation.
+fn bench_spawn_from_pool(c: &mut Criterion) {
+    c.bench_function("actor/spawn_from_pool/1", |b| {
+        b.iter_batched_ref(
+            || {
+                let mut rt = Runtime::new();
+                rt.actor_pool
+                    .push(Actor::new(1, "actor_00000000000000000000", 0));
+                rt
+            },
+            |rt| {
+                black_box(rt.spawn_actor(Box::new(Vec::new)));
+            },
+            BatchSize::SmallInput,
+        )
+    });
 }
 
 /// End-to-end runtime lifecycle cost: construct runtime, spawn actor, register a
@@ -264,6 +285,7 @@ fn bench_selective_receive(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_spawn_idle_batch,
+    bench_spawn_from_pool,
     bench_spawn_send_receive,
     bench_message_enqueue,
     bench_message_drain,
