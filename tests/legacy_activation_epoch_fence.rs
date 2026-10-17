@@ -1,0 +1,84 @@
+//! Migration boundary: an existing legacy snapshot is an ownership-fencing
+//! authority until the first atomic transition establishes a durable tail.
+//! Both persistence backends must reject stale activations without mutation.
+
+use nulang::runtime::{
+    ActorSnapshot, DurableTransition, DurableTailPosition, MemoryStore, PersistenceStore,
+    DURABLE_TRANSITION_VERSION,
+};
+use std::io;
+
+#[cfg(feature = "sqlite")]
+use nulang::runtime::LibsqlStore;
+
+fn transition(actor_id: u64, activation_epoch: u64, sequence: u64) -> DurableTransition {
+    DurableTransition {
+        version: DURABLE_TRANSITION_VERSION,
+        actor_id,
+        activation_epoch,
+        sequence,
+        expected_previous_sequence: sequence - 1,
+        command: None,
+        snapshot: Some(ActorSnapshot {
+            actor_id,
+            sequence,
+            activation_epoch,
+            ..ActorSnapshot::default()
+        }),
+        workflow_events: vec![],
+        domain_events: vec![],
+        durable_effects: vec![],
+        outbox: vec![],
+    }
+}
+
+fn assert_legacy_epoch_fences_first_atomic_commit(store: &mut dyn PersistenceStore, actor_id: u64) {
+    store
+        .save_snapshot(ActorSnapshot {
+            actor_id,
+            sequence: 5,
+            activation_epoch: 9,
+            ..ActorSnapshot::default()
+        })
+        .expect("legacy snapshot should persist");
+
+    let stale = store
+        .commit_transition(transition(actor_id, 8, 6))
+        .expect_err("an older owner must not promote a legacy history");
+    assert_eq!(stale.kind(), io::ErrorKind::PermissionDenied);
+
+    let untouched = store.load_snapshot(actor_id).expect("legacy snapshot remains");
+    assert_eq!(untouched.sequence, 5, "rejection must not advance state");
+    assert_eq!(untouched.activation_epoch, 9, "rejection must not replace the owner");
+    assert_eq!(
+        store.load_durable_tail_position(actor_id).unwrap(),
+        None,
+        "rejection must not establish an atomic tail"
+    );
+
+    let committed = store
+        .commit_transition(transition(actor_id, 9, 6))
+        .expect("current owner may extend the legacy tail");
+    assert_eq!(committed.activation_epoch, 9);
+    assert_eq!(committed.sequence, 6);
+    assert_eq!(
+        store.load_durable_tail_position(actor_id).unwrap(),
+        Some(DurableTailPosition {
+            activation_epoch: 9,
+            sequence: 6,
+        })
+    );
+}
+
+#[test]
+fn memory_store_legacy_snapshot_epoch_fences_first_atomic_commit() {
+    let mut store = MemoryStore::new();
+    assert_legacy_epoch_fences_first_atomic_commit(&mut store, 742_001);
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn libsql_legacy_snapshot_epoch_fences_first_atomic_commit() {
+    let mut store = LibsqlStore::in_memory().expect("in-memory libsql");
+    assert_legacy_epoch_fences_first_atomic_commit(&mut store, 742_002);
+}
