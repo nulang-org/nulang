@@ -4131,7 +4131,17 @@ impl Parser {
                 let grant_span = self.current_span();
                 let namespace = self.expect_ident("authority namespace")?;
                 self.expect(TokenKind::DoubleColon)?;
-                let operation = self.expect_ident("authority operation")?;
+                // Python's built-in `import` effect is a reserved language
+                // keyword, but an explicitly granted `Python::import` must
+                // still be expressible. Do not permit it in other namespaces.
+                let operation = if namespace == "Python"
+                    && self.match_token(&TokenKind::Import)
+                {
+                    self.advance();
+                    "import".to_string()
+                } else {
+                    self.expect_ident("authority operation")?
+                };
                 let argument = if self.consume_if(&TokenKind::LParen) {
                     let argument = self.expect_string("authority argument")?;
                     self.expect(TokenKind::RParen)?;
@@ -4281,9 +4291,9 @@ impl Parser {
         self.advance(); // consume 'perform'
         let effect = self.expect_ident("effect name")?;
         self.expect(TokenKind::Dot)?;
-        // `ask`, `link`, `monitor`, `exit` and `ref` are reserved keywords,
-        // so they lex as keyword tokens rather than identifiers; accept them
-        // as operation names (`perform Actor.link(t)`, `perform Grain.ref(...)`).
+        // Some built-in effect operation names are also reserved keywords.
+        // Accept them after the effect qualifier without relaxing keyword
+        // handling elsewhere (e.g. Python.import and Actor.link).
         let op = match self.peek_kind() {
             TokenKind::Ask => {
                 self.advance();
@@ -4304,6 +4314,11 @@ impl Parser {
             TokenKind::Ref => {
                 self.advance();
                 "ref".to_string()
+            }
+            // Python.import is a built-in effect operation, not a module import.
+            TokenKind::Import => {
+                self.advance();
+                "import".to_string()
             }
             _ => self.expect_ident("operation name")?,
         };
@@ -6930,6 +6945,49 @@ mod tests {
         let tokens = lexer.lex()?;
         let mut parser = Parser::new(tokens);
         parser.parse_expr()
+    }
+
+    #[test]
+    fn test_perform_accepts_keyword_named_python_import() {
+        let expr = parse_expr("perform Python.import(\"math\")")
+            .expect("effect operation named import must parse");
+        match expr {
+            Expr::Perform { effect, op, args, .. } => {
+                assert_eq!(effect, "Python");
+                assert_eq!(op, "import");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected Python import effect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_spawn_accepts_keyword_named_python_import_authority() {
+        let expr = parse_expr(
+            "spawn Worker {} with [Python::import, Python::call, Python::get_attr]",
+        )
+        .expect("Python::import must be legal in a literal authority grant");
+        match expr {
+            Expr::Spawn { capabilities, .. } => {
+                assert_eq!(
+                    capabilities,
+                    vec![
+                        "Python::call".to_string(),
+                        "Python::get_attr".to_string(),
+                        "Python::import".to_string(),
+                    ]
+                );
+            }
+            other => panic!("expected spawn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_keyword_authority_exception_does_not_apply_to_other_namespaces() {
+        assert!(
+            parse_expr("spawn Worker {} with [Other::import]").is_err(),
+            "reserved keywords remain invalid authority operations outside Python"
+        );
     }
 
     #[test]

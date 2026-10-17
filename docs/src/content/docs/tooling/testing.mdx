@@ -137,8 +137,8 @@ is testable from the start.
 
 - **Per-function style** — if a file defines functions whose names start
   with `test_`, each one is discovered and run as a separate test case.
-  The runner strips the file's `fn main` and wraps each test function in
-  its own temporary `main`, so the functions must take no arguments:
+  The runner removes a parsed top-level block-bodied `main` and wraps each
+  test function in its own temporary `main`, so tests must take no arguments:
 
   ```nulang
   // tests/test_strings.nula — two test cases: test_greet_world, test_greet_empty.
@@ -158,10 +158,12 @@ is testable from the start.
   ```
 
 :::caution
-Discovery is a simple textual scan for `fn test_`. A comment containing
-that literal (e.g. `` `fn test_*` ``) is picked up as a test name too, and
-the resulting wrapper fails to compile. Avoid writing `fn test_` in test
-file comments.
+Test discovery parses top-level function declarations rather than scanning
+comments or string literals. Only zero-argument `fn test_*` functions are
+selected as individual test cases. Block-bodied `main` removal uses parsed
+source locations, so braces inside strings and comments are not counted.
+Files with no matching declarations run as whole-file tests; invalid source
+is diagnosed by normal compilation.
 :::
 
 ### Flags

@@ -553,6 +553,14 @@ pub trait ForeignInterop: Send {
     /// Import a foreign module, making its exports available via `call`.
     /// Returns an error string if the module cannot be loaded.
     fn import(&mut self, name: &str) -> Result<(), String>;
+
+    /// Read a module attribute without invoking it. Existing foreign backends
+    /// default to unsupported rather than accidentally calling a value.
+    fn get_attr(&mut self, module: &str, attr: &str) -> Result<Value, String> {
+        Err(format!(
+            "foreign backend does not support attribute lookup: {module}.{attr}"
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -566,6 +574,37 @@ pub struct DefaultForeignInterop {
     bridge: crate::python::PyBridge,
     /// Cached module names → Python object ids, for `call` lookups.
     modules: std::collections::HashMap<String, crate::python::PythonObjectId>,
+}
+
+#[cfg(feature = "python")]
+#[derive(Default)]
+struct TemporaryPythonHandles {
+    ids: Vec<crate::python::PythonObjectId>,
+}
+
+#[cfg(feature = "python")]
+impl TemporaryPythonHandles {
+    fn track(&mut self, id: crate::python::PythonObjectId) {
+        self.ids.push(id);
+    }
+
+    /// Returned opaque handles must outlive the Python call that produced them.
+    fn keep(&mut self, id: crate::python::PythonObjectId) {
+        self.ids.retain(|candidate| *candidate != id);
+    }
+}
+
+#[cfg(feature = "python")]
+impl Drop for TemporaryPythonHandles {
+    fn drop(&mut self) {
+        // Acquire the GIL before the registry mutex, matching get_object's
+        // lock order. This cleanup runs even when a Python call raises.
+        pyo3::Python::attach(|_py| {
+            for id in self.ids.drain(..) {
+                crate::python::unregister_object(id);
+            }
+        });
+    }
 }
 
 #[cfg(feature = "python")]
@@ -588,17 +627,36 @@ impl ForeignInterop for DefaultForeignInterop {
         Ok(())
     }
 
+    fn get_attr(&mut self, module: &str, attr: &str) -> Result<Value, String> {
+        let module_id = *self
+            .modules
+            .get(module)
+            .ok_or_else(|| format!("module '{}' not imported", module))?;
+        let attr_id = self.bridge.get_attr(module_id, attr)?;
+        let mut temporary = TemporaryPythonHandles::default();
+        temporary.track(attr_id);
+        crate::python::python_object_id_to_value(attr_id)
+    }
+
     fn call(&mut self, module: &str, function: &str, args: &[Value]) -> Result<Value, String> {
         let module_id = *self
             .modules
             .get(module)
             .ok_or_else(|| format!("module '{}' not imported", module))?;
+        let mut temporary = TemporaryPythonHandles::default();
         let func_id = self.bridge.get_attr(module_id, function)?;
-        let py_args: Result<Vec<_>, String> = args
-            .iter()
-            .map(|v| crate::python::value_to_python_object_id(*v))
-            .collect();
-        let result_id = self.bridge.call(func_id, py_args?)?;
+        temporary.track(func_id);
+        let mut py_args = Vec::with_capacity(args.len());
+        for value in args {
+            // The compatibility converter always registers a fresh wrapper,
+            // even for an existing TAG_PYTHON object. Retain the source VM
+            // handle, but release each new wrapper when this call completes.
+            let id = crate::python::value_to_python_object_id(*value)?;
+            temporary.track(id);
+            py_args.push(id);
+        }
+        let result_id = self.bridge.call(func_id, py_args)?;
+        temporary.track(result_id);
         crate::python::python_object_id_to_value(result_id)
     }
 
@@ -610,14 +668,24 @@ impl ForeignInterop for DefaultForeignInterop {
             .modules
             .get(&request.module)
             .ok_or_else(|| format!("module '{}' not imported", request.module))?;
+        let mut temporary = TemporaryPythonHandles::default();
         let func_id = self.bridge.get_attr(module_id, &request.function)?;
-        let py_args: Result<Vec<_>, String> = request
-            .args
-            .iter()
-            .map(crate::python::owned_foreign_to_python_object_id)
-            .collect();
-        let result_id = self.bridge.call(func_id, py_args?)?;
-        crate::python::python_object_id_to_owned_foreign(result_id)
+        temporary.track(func_id);
+        let mut py_args = Vec::with_capacity(request.args.len());
+        for value in &request.args {
+            let id = crate::python::owned_foreign_to_python_object_id(value)?;
+            if !matches!(value, crate::runtime::OwnedForeignValue::OpaqueHandle { .. }) {
+                temporary.track(id);
+            }
+            py_args.push(id);
+        }
+        let result_id = self.bridge.call(func_id, py_args)?;
+        temporary.track(result_id);
+        let result = crate::python::python_object_id_to_owned_foreign(result_id)?;
+        if matches!(result, crate::runtime::OwnedForeignValue::OpaqueHandle { .. }) {
+            temporary.keep(result_id);
+        }
+        Ok(result)
     }
 }
 
@@ -789,6 +857,155 @@ mod tests {
         );
         let result = fi.call_owned(&request).expect("owned Python call failed");
         assert_eq!(result, crate::runtime::OwnedForeignValue::Float(9.0));
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
+    fn test_python_temporary_handles_release_registered_objects() {
+        let id = pyo3::Python::attach(|py| crate::python::register_object(py.None()));
+        {
+            let mut temporary = TemporaryPythonHandles::default();
+            temporary.track(id);
+            assert!(crate::python::get_object(id).is_some());
+        }
+        assert!(crate::python::get_object(id).is_none());
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
+    fn test_python_temporary_handles_can_keep_returned_objects() {
+        let id = pyo3::Python::attach(|py| crate::python::register_object(py.None()));
+        {
+            let mut temporary = TemporaryPythonHandles::default();
+            temporary.track(id);
+            temporary.keep(id);
+        }
+        assert!(crate::python::get_object(id).is_some());
+        crate::python::unregister_object(id);
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
+    fn test_foreign_interop_owned_python_handle_is_reusable_after_call() {
+        let mut fi = DefaultForeignInterop::new().expect("Python backend init failed");
+        fi.import("builtins").expect("builtins import failed");
+        let result = fi
+            .call_owned(&crate::runtime::ForeignCallRequest::new(
+                "builtins",
+                "list",
+                vec![],
+            ))
+            .expect("Python list call failed");
+        let crate::runtime::OwnedForeignValue::OpaqueHandle { backend: "python", id } = result else {
+            panic!("list() must return an opaque Python object");
+        };
+        let reused = fi
+            .call_owned(&crate::runtime::ForeignCallRequest::new(
+                "builtins",
+                "len",
+                vec![crate::runtime::OwnedForeignValue::OpaqueHandle {
+                    backend: "python",
+                    id,
+                }],
+            ))
+            .expect("Python handle should survive temporary cleanup");
+        assert_eq!(reused, crate::runtime::OwnedForeignValue::Int(0));
+        crate::python::unregister_object(crate::python::PythonObjectId(id));
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
+    fn test_python_attribute_string_survives_temporary_registry_cleanup() {
+        let mut fi = DefaultForeignInterop::new().expect("Python backend init failed");
+        fi.import("builtins").expect("builtins import failed");
+        let value = fi.get_attr("builtins", "__name__").expect("attribute lookup failed");
+        let id = value.as_raw() & crate::value_layout::PAYLOAD_MASK;
+        assert_eq!(
+            value.as_raw() & crate::value_layout::TAG_MASK,
+            crate::python::TAG_PYTHON
+        );
+        let result = fi
+            .call_owned(&crate::runtime::ForeignCallRequest::new(
+                "builtins",
+                "len",
+                vec![crate::runtime::OwnedForeignValue::OpaqueHandle {
+                    backend: "python",
+                    id,
+                }],
+            ))
+            .expect("returned attribute must survive cleanup");
+        assert_eq!(result, crate::runtime::OwnedForeignValue::Int(8));
+        crate::python::unregister_object(crate::python::PythonObjectId(id));
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
+    fn test_direct_value_wrapper_registers_a_distinct_temporary_handle() {
+        // The legacy conversion always registers a new object ID, including
+        // when its input is an already registered Python-tagged VM value.
+        let original = pyo3::Python::attach(|py| {
+            crate::python::register_object(py.None())
+        });
+        let vm_value = unsafe {
+            Value::from_raw(crate::python::TAG_PYTHON | original.0)
+        };
+        let wrapper = crate::python::value_to_python_object_id(vm_value)
+            .expect("wrap an already registered object");
+        assert_ne!(wrapper, original, "conversion should create a temporary registry slot");
+        {
+            let mut temporary = TemporaryPythonHandles::default();
+            temporary.track(wrapper);
+        }
+        assert!(crate::python::get_object(wrapper).is_none());
+        assert!(crate::python::get_object(original).is_some());
+        crate::python::unregister_object(original);
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
+    fn test_foreign_interop_owned_unicode_string_roundtrip() {
+        let mut fi = DefaultForeignInterop::new().expect("failed to create Python bridge");
+        fi.import("builtins").expect("failed to import builtins");
+
+        let text = "Olá, Nulang 🐍".to_string();
+        let request = crate::runtime::ForeignCallRequest::new(
+            "builtins",
+            "str",
+            vec![crate::runtime::OwnedForeignValue::String(text.clone())],
+        );
+        let result = fi.call_owned(&request).expect("owned Python string call failed");
+        assert_eq!(result, crate::runtime::OwnedForeignValue::String(text));
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
+    fn test_foreign_interop_direct_unresolved_string_fails_closed() {
+        let mut fi = DefaultForeignInterop::new().expect("failed to create Python bridge");
+        fi.import("builtins").expect("failed to import builtins");
+
+        let err = fi
+            .call("builtins", "str", &[Value::string(17)])
+            .err()
+            .expect("direct call cannot resolve string pool IDs");
+        assert!(err.contains("string pool"), "unexpected diagnostic: {err}");
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
+    fn test_foreign_interop_get_attr_reads_non_callable_constant() {
+        let mut fi = DefaultForeignInterop::new().expect("Python backend initialization failed");
+        fi.import("math").expect("math module import failed");
+        let result = fi.get_attr("math", "pi").expect("math.pi is a non-callable attribute");
+        let value = result.as_float().expect("expected Python float");
+        assert!((value - std::f64::consts::PI).abs() < f64::EPSILON);
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
+    fn test_foreign_interop_get_attr_rejects_unimported_module() {
+        let mut fi = DefaultForeignInterop::new().expect("Python backend initialization failed");
+        let err = fi.get_attr("not_imported", "anything").unwrap_err();
+        assert!(err.contains("not imported"), "unexpected error: {err}");
     }
 
     #[cfg(feature = "python")]
