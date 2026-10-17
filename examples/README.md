@@ -1,16 +1,64 @@
 # Nulang Example Programs
 
 A curated suite of self-contained Nulang programs demonstrating the language
-from basic to advanced. Each example is runnable and verified against the
-current compiler.
-
-**Verified against commit:** `fd516ef`
+from basic to advanced. Example source is the authority; CI validates selected
+smoke cases, but **the full catalog is not certified at every commit**. The
+older example-suite verification snapshot referenced commit `fd516ef`.
 
 ## Running an example
 
+Use a tagged release binary on your `PATH`:
+
 ```bash
-nulang examples/NN_name.nula
+nulang examples/08_actors.nula
 ```
+
+Or build and run from this source checkout without assuming where Cargo places
+the binary (the repository configures `CARGO_TARGET_DIR`):
+
+```bash
+cargo run --locked -- examples/08_actors.nula
+cargo run --locked -- examples/18_inventory_reservations.nula
+```
+
+## A small real-world actor: inventory reservations
+
+[`18_inventory_reservations.nula`](18_inventory_reservations.nula) models a
+single stock-keeping unit. The `Inventory` actor owns `available` and
+`reserved` counters. A `reserve` message checks the available balance before
+mutating both values; an over-reservation is rejected. A `release` message
+restores inventory.
+
+Unlike a counter demo, this shows **why actor ownership matters**: business
+invariants are enforced at the state owner, rather than relying on callers to
+coordinate changes to shared mutable state.
+
+The smoke test checks this message sequence:
+
+```text
+reservation accepted: 3
+reservation rejected: 4 (insufficient stock)
+available=2 reserved=3
+release accepted: 1
+available=3 reserved=2
+```
+
+After building the compiler, run
+`NULANG_BIN=./target/debug/nulang bash scripts/verify_inventory_example.sh`
+if the binary is at that path, or simply run
+`bash scripts/verify_inventory_example.sh` to build into a known local target
+directory and execute the test.
+
+**Scope:** this is in-memory, single-process actor behavior. It does not
+demonstrate persistence, durable reservation semantics, cross-node delivery,
+exactly-once effects, authorization, or production readiness. For current
+runtime boundaries see [implementation status](../docs/IMPLEMENTATION_STATUS.md).
+
+**Note on example 17:** despite its historical filename,
+[`17_actor_fetcher.nula`](17_actor_fetcher.nula) is a **sequential**
+HTTP/JSON/FS program. Its source documents a current native-runtime
+limitation combining actors and HTTP effects. Do not use it as evidence of
+concurrent HTTP fetching.
 
 ## Examples
 
@@ -32,7 +80,8 @@ nulang examples/NN_name.nula
 | 14 | `14_option_result.nula` | Option/Result types, map, unwrap, catch, pattern matching | `nulang examples/14_option_result.nula` |
 | 15 | `15_ranges.nula` | Range expressions, for-in-range loops, range with pipe/arithmetic | `nulang examples/15_ranges.nula` |
 | 16 | `16_realworld.nula` | Real-world CLI: HTTP fetch, JSON parse, datetime, FS write, env, args | `nulang examples/16_realworld.nula <url>` |
-| 17 | `17_actor_fetcher.nula` | URL fetcher & reporter: Http.get, JSON pattern matching, datetime, FS | `nulang examples/17_actor_fetcher.nula` |
+| 17 | `17_actor_fetcher.nula` | **Sequential** URL reporter (legacy filename; no actor use), HTTP/JSON/FS | `nulang examples/17_actor_fetcher.nula` |
+| 18 | `18_inventory_reservations.nula` | Actor-owned inventory invariants; successful reservation, rejection, release | `nulang examples/18_inventory_reservations.nula` |
 
 ## Notes
 
