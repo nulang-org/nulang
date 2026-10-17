@@ -21,6 +21,7 @@ pub mod backends;
 pub mod behavior_manifest;
 #[cfg(test)]
 pub mod benchmarks;
+pub mod branching;
 pub mod bytecode;
 #[cfg(feature = "wasmfx-backend")]
 pub mod cir;
