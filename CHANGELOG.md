@@ -1,4 +1,10 @@
 # Nulang Changelog
+### Checked production VM numeric continuation boundary — 2026-10-17
+- **Actual VM integration:** Added `VM::try_checkpoint_inline_numeric_continuation()` and `VM::restore_inline_numeric_continuation()`, capturing real multi-frame activation state as independent signed numbers with PC, caller, return destination, module and step-count metadata.
+- **Fail-closed capture:** Rejects active effect handlers, spills, closure captures, invalid caller topology, and nonnumeric tagged values without dereferencing any heap pointer. A failed capture leaves the active VM untouched.
+- **Atomic restoration:** Restores only into an empty VM; reconstructs legacy inline `Value` registers before publishing the replacement frames, refusing to overwrite existing active execution state.
+- **Scope:** Inline numeric values only; full-width Int64 remains in ORCA-rooted staging. Neither production continuation ownership for arbitrary Values nor a versioned durable snapshot is implemented. Regression tests cover all rejection paths.
+
 ### Rooted Int64 multi-frame lifecycle staging — 2026-10-17
 - **Scoped frame ownership:** Added `RootedIntFrameStack`, partitioning actor-borrowed ORCA-backed numeric registers into 256-slot frames; cloning the top frame retains each wide scalar before the clone takes ownership.
 - **Unwind barriers:** Returning or popping a frame releases all roots in that frame in reverse slot order; copy and move work across frames without leaking or aliasing references.

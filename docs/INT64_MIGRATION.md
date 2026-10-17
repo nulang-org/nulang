@@ -85,7 +85,28 @@ containers, FFI and NLCS v1 snapshots cannot carry these wide roots. The
 source language's `Int` remains 48-bit until backend and durability
 parity are proven.
 
-## Current code in this PR## Phase 1e — actor-scoped frame duplication and unwind
+## Current code in this PR## Phase 1f — fail-closed snapshotting of real production VM continuations
+
+`VM::try_checkpoint_inline_numeric_continuation()` inspects the actual
+production `Vec<Frame>`, producing a cloneable pointer-free
+`NumericVmContinuation` only if every register is nil or an inline Int.
+The resulting state includes frame program counters, modules, return
+registers, caller links, active-frame index and step count. This operation
+is nondestructive. Pending effect handlers, spills, closure captures,
+invalid caller indices and any other tagged value cause explicit errors
+without dereferencing pointers.
+
+`VM::restore_inline_numeric_continuation` converts the validated
+checkpoint to independent inline registers **before** atomically
+installing it into an empty VM. It refuses to overwrite active frames or
+handlers. This is a bounded production VM interface, not a replacement
+for `Continuation::capture`, `take_suspended_state`, runtime durable
+recovery, or actor message passing. It is intentionally incapable of
+transporting an ORCA WideInt allocation to the legacy cloneable Frame.
+The main Int64 migration remains gated on coherent heap root barriers
+for every production register/frame/continuation/JIT/AOT/WASM edge.
+
+## Phase 1e — actor-scoped frame duplication and unwind
 
 `RootedIntFrameStack` models 256-register VM call frames over a single
 actor-borrowed, ORCA-rooted `Value` bank. Every wide register owns a counted
