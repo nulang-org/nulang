@@ -117,14 +117,15 @@ Linux and macOS (x86_64 and aarch64 release artifacts per
 docs/RELEASING.md). Windows is not supported yet — WSL works. Rust 1.95.0 is
 pinned via `rust-toolchain.toml`.
 
-## What's the deal with "1.0.0-frozen" and "200-year horizon"?
+## What's the deal with the historical "1.0.0-frozen" label?
 
-`1.0.0-frozen` is the *language* version: the bytecode format, wire
-protocol, and Nulang Core are designated Frozen (never break), per RFCs
-0001/0002 and GOVERNANCE.md. It is not a claim that the implementation is
-finished — see the alpha disclaimer. The long-horizon framing is a design
-discipline (freeze what must never change, iterate on the rest), not a
-prediction.
+`1.0.0-frozen` is a historical language metadata label, not a promise that
+the current source-language Core can never change. Development now reports
+`1.0.0-incubating` while retaining the v1 numeric format/language generation
+for existing artifacts. Published bytecode and protocol formats remain
+versioned compatibility obligations, but the Core is Incubating under
+RFC 0032. The 200-year horizon is a design goal, not a guarantee that the
+alpha implementation or present-day syntax will remain unchanged.
 
 ## Is there a hosted platform? Is this open source?
 
