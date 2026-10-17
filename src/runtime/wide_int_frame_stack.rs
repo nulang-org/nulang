@@ -14,6 +14,7 @@ const FRAME_REGISTERS: usize = 256;
 pub enum IntFrameStackError {
     EmptyStack,
     InvalidFrame,
+    InvalidCheckpoint,
     Register(IntRegisterError),
 }
 
@@ -27,6 +28,17 @@ impl From<IntRegisterError> for IntFrameStackError {
 struct FrameMetadata {
     #[allow(dead_code)]
     module_idx: usize,
+}
+
+/// Detached semantic representation of a rooted numeric frame stack.
+///
+/// Contains signed numbers and module indices, never NaN-boxed pointer bits.
+/// This is an **in-process checkpoint**, not a versioned durability ABI.
+/// The snapshot can outlive its source actor safely because it holds no
+/// references to that actor's heap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootedIntStackCheckpoint {
+    frames: Vec<(usize, Vec<Option<i64>>)>,
 }
 
 /// A single actor-owned contiguous register bank partitioned into stack
@@ -79,6 +91,49 @@ impl<'a> RootedIntFrameStack<'a> {
                 .copy_into(new_base + reg, previous_base + reg)?;
         }
         Ok(index)
+    }
+
+    /// Suspend this staging stack to detached numeric values. Ownership of
+    /// the frame stack is consumed; its ORCA roots are all dropped as the
+    /// method returns. No raw pointer or legacy VM Frame may escape.
+    pub fn suspend(self) -> Result<RootedIntStackCheckpoint, IntFrameStackError> {
+        let mut frames = Vec::with_capacity(self.frames.len());
+        for (index, meta) in self.frames.iter().enumerate() {
+            let base = index * FRAME_REGISTERS;
+            let mut values = Vec::with_capacity(FRAME_REGISTERS);
+            for slot in 0..FRAME_REGISTERS {
+                values.push(self.registers.read(base + slot)?);
+            }
+            frames.push((meta.module_idx, values));
+        }
+        Ok(RootedIntStackCheckpoint { frames })
+    }
+
+    /// Rebuild independent ORCA roots on the *destination* actor. A failed
+    /// allocation unwinds the partially constructed stack automatically.
+    /// The checkpoint can be reused without sharing heap pointers.
+    pub fn resume(
+        actor: &'a mut Actor,
+        checkpoint: &RootedIntStackCheckpoint,
+    ) -> Result<Self, IntFrameStackError> {
+        // Validate the complete checkpoint before allocating any roots.
+        if checkpoint
+            .frames
+            .iter()
+            .any(|(_, values)| values.len() != FRAME_REGISTERS)
+        {
+            return Err(IntFrameStackError::InvalidCheckpoint);
+        }
+        let mut stack = Self::new(actor);
+        for (module_idx, values) in &checkpoint.frames {
+            let frame = stack.push_empty(*module_idx);
+            for (reg, value) in values.iter().enumerate() {
+                if let Some(number) = value {
+                    stack.store(frame, reg, *number)?;
+                }
+            }
+        }
+        Ok(stack)
     }
 
     /// Return/unwind the top frame, releasing every root it owns.
