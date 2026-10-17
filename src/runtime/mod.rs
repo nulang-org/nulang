@@ -3582,15 +3582,17 @@ impl Runtime {
                         // Idle grain with no in-flight behavior: record a
                         // state-only hibernation marker so the next send wakes
                         // it and starts a fresh behavior.
-                        actor.hibernation_state = Some(crate::runtime::actor::HibernationState {
-                            continuation_bytes: Vec::new(),
-                            module_hash,
-                            hibernated_at_ms: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_millis() as u64,
-                            state_fields: actor.state_data.clone(),
-                        });
+                        actor.hibernation_state =
+                            Some(Box::new(crate::runtime::actor::HibernationState {
+                                continuation_bytes: Vec::new(),
+                                module_hash,
+                                hibernated_at_ms: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_millis()
+                                    as u64,
+                                state_fields: actor.state_data.clone(),
+                            }));
                         true
                     }
                     Err(e) => {
