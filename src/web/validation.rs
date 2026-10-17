@@ -65,13 +65,42 @@ pub fn validation_diagnostics(compilation: &ContractCompilation) -> Vec<String> 
         // Static artifacts are only meaningful for safe retrieval methods.
         // A declared static mutation must fail before build tooling can
         // execute its handler to generate an HTML artifact.
-        if route.placement.as_deref() == Some("static")
-            && !matches!(route.method.as_str(), "GET" | "HEAD")
-        {
-            diagnostics.push(format!(
-                "route {} {}: static placement only supports GET or HEAD",
-                route.method, route.path
-            ));
+        if route.placement.as_deref() == Some("static") {
+            if !matches!(route.method.as_str(), "GET" | "HEAD") {
+                diagnostics.push(format!(
+                    "route {} {}: static placement only supports GET or HEAD",
+                    route.method, route.path
+                ));
+            }
+            if route.path.split('/').any(|segment| {
+                segment.starts_with(':')
+                    || segment.contains('{')
+                    || segment.contains('}')
+                    || segment == "."
+                    || segment == ".."
+                    || segment.contains('\\')
+            }) {
+                diagnostics.push(format!(
+                    "route {} {}: static placement requires a literal safe path",
+                    route.method, route.path
+                ));
+            }
+            if route.effects.iter().any(|effect| effect != "Render") {
+                diagnostics.push(format!(
+                    "route {} {}: static placement has unsupported declared effects",
+                    route.method, route.path
+                ));
+            }
+            if route
+                .handler_params
+                .iter()
+                .any(|param| param.request.is_some())
+            {
+                diagnostics.push(format!(
+                    "route {} {}: static placement cannot bind request inputs",
+                    route.method, route.path
+                ));
+            }
         }
     }
 
@@ -199,6 +228,92 @@ mod tests {
         assert!(errors.iter().any(|message| {
             message.contains("POST /submit") && message.contains("static placement")
         }));
+    }
+
+    #[test]
+    fn static_placement_fails_closed_for_request_or_external_effects() {
+        for effect in ["Request", "Respond", "DB", "Net", "IO", "Actor", "Realtime"] {
+            let compilation = ContractCompilation {
+                routes: vec![RouteContract {
+                    method: "GET".into(),
+                    path: "/account".into(),
+                    handler: Some("account".into()),
+                    effects: vec![effect.into()],
+                    placement: Some("static".into()),
+                    ..RouteContract::default()
+                }],
+                diagnostics: Vec::new(),
+            };
+            let errors = validate_compilation(compilation).unwrap_err();
+            assert!(
+                errors.iter().any(|message| {
+                    message.contains("GET /account") && message.contains("static placement")
+                }),
+                "effect {effect} must not be statically prerendered"
+            );
+        }
+    }
+
+    #[test]
+    fn static_placement_rejects_dynamic_paths_and_request_bindings() {
+        let compilation = ContractCompilation {
+            routes: vec![RouteContract {
+                method: "GET".into(),
+                path: "/users/:id".into(),
+                handler: Some("show_user".into()),
+                placement: Some("static".into()),
+                ..RouteContract::default()
+            }],
+            diagnostics: Vec::new(),
+        };
+        let errors = validate_compilation(compilation).unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|message| message.contains("static placement")));
+    }
+
+    #[test]
+    fn static_placement_rejects_request_bound_query_parameters() {
+        use crate::web::contracts::{RequestParamBindingContract, RequestParamSource};
+        let compilation = ContractCompilation {
+            routes: vec![RouteContract {
+                method: "GET".into(),
+                path: "/search".into(),
+                handler: Some("search".into()),
+                handler_params: vec![HandlerParamContract {
+                    name: "term".into(),
+                    ty: Some("String".into()),
+                    capability: None,
+                    request: Some(RequestParamBindingContract {
+                        source: RequestParamSource::Query,
+                        source_name: "term".into(),
+                    }),
+                }],
+                placement: Some("static".into()),
+                ..RouteContract::default()
+            }],
+            diagnostics: Vec::new(),
+        };
+        let errors = validate_compilation(compilation).unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|message| { message.contains("static placement cannot bind request inputs") }));
+    }
+
+    #[test]
+    fn static_placement_preserves_explicit_pure_get_routes() {
+        let compilation = ContractCompilation {
+            routes: vec![RouteContract {
+                method: "GET".into(),
+                path: "/about".into(),
+                handler: Some("about".into()),
+                effects: vec!["Render".into()],
+                placement: Some("static".into()),
+                ..RouteContract::default()
+            }],
+            diagnostics: Vec::new(),
+        };
+        assert!(validate_compilation(compilation).is_ok());
     }
 
     #[test]

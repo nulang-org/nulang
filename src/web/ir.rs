@@ -178,13 +178,10 @@ pub fn generate_deployment_ir(
     }
 }
 
-fn default_route_placement(method: &str, path: &str) -> String {
-    let dynamic_path = path.contains(':') || (path.contains('{') && path.contains('}'));
-    if dynamic_path || !matches!(method, "GET" | "HEAD") {
-        "server".to_string()
-    } else {
-        "static".to_string()
-    }
+fn default_route_placement(_method: &str, _path: &str) -> String {
+    // A simple GET path is not evidence of purity. Only an explicitly
+    // authorized static route may run at build time; unknown stays on server.
+    "server".to_string()
 }
 
 fn route_path_to_artifact(path: &str) -> String {
@@ -387,8 +384,10 @@ mod tests {
     }
 
     #[test]
-    fn test_default_route_placement_understands_typed_params() {
-        assert_eq!(default_route_placement("GET", "/about"), "static");
+    fn implicit_routes_are_server_only_without_compiler_proof() {
+        // Path/method alone cannot prove absence of request, DB or other effects.
+        assert_eq!(default_route_placement("GET", "/about"), "server");
+        assert_eq!(default_route_placement("HEAD", "/robots.txt"), "server");
         assert_eq!(default_route_placement("GET", "/users/:id"), "server");
         assert_eq!(
             default_route_placement("GET", "/users/{id: UserId}"),

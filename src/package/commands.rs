@@ -1436,6 +1436,27 @@ fn cmd_build_web() -> NuResult<()> {
         .iter()
         .filter(|route| route.placement == "static")
         .count();
+    // The previous deployment manifest lists previously generated routes. Remove
+    // only obsolete route HTML, without clearing unrelated files in dist/.
+    let previous_ir_path = output_dir.join("nulang-app.ir.json");
+    if previous_ir_path.is_file() {
+        let previous_json =
+            std::fs::read_to_string(&previous_ir_path).map_err(|e| NuError::PackageError {
+                msg: format!("cannot read {}: {}", previous_ir_path.display(), e),
+                span: Span::default(),
+            })?;
+        let previous_ir: crate::web::ir::DeploymentIr = serde_json::from_str(&previous_json)
+            .map_err(|e| NuError::PackageError {
+                msg: format!(
+                    "cannot validate previous web deployment IR {}: {}",
+                    previous_ir_path.display(),
+                    e
+                ),
+                span: Span::default(),
+            })?;
+        prune_stale_web_html(&output_dir, &previous_ir, &ir)?;
+    }
+
     eprintln!("  Rendering {} static route(s)...", static_count);
     // DeploymentIr is generated in registration order from this exact list.
     for (route, ir_route) in routes.iter().zip(&ir.routes) {
@@ -1495,6 +1516,103 @@ fn cmd_build_web() -> NuResult<()> {
     }
 
     println!("Web build succeeded: {}", output_dir.display());
+    Ok(())
+}
+
+/// Rebuilds must not serve pages from routes removed or moved to server
+/// placement. The old IR, not an arbitrary directory scan, is the deletion
+/// authority. Never follow symlinks or path traversal from that JSON.
+fn prune_stale_web_html(
+    output_dir: &Path,
+    previous: &crate::web::ir::DeploymentIr,
+    current: &crate::web::ir::DeploymentIr,
+) -> NuResult<()> {
+    use std::collections::HashSet;
+    let error = |message: String| NuError::PackageError {
+        msg: message,
+        span: Span::default(),
+    };
+    if previous.version != 1 || current.version != 1 {
+        return Err(error(
+            "cannot clean route HTML from unsupported deployment IR version".into(),
+        ));
+    }
+    let output_metadata = std::fs::symlink_metadata(output_dir)
+        .map_err(|e| error(format!("cannot inspect {}: {}", output_dir.display(), e)))?;
+    if !output_metadata.is_dir() || output_metadata.file_type().is_symlink() {
+        return Err(error(
+            "web output directory must be a real directory".into(),
+        ));
+    }
+    let output_root = output_dir
+        .canonicalize()
+        .map_err(|e| error(format!("cannot resolve {}: {}", output_dir.display(), e)))?;
+    let checked_path = |route_path: &str| -> NuResult<PathBuf> {
+        if !route_path.starts_with('/') || route_path.starts_with("//") {
+            return Err(error(format!("unsafe prior route path: {route_path:?}")));
+        }
+        let trimmed = route_path.trim_matches('/');
+        if trimmed.split('/').any(|segment| {
+            segment == "."
+                || segment == ".."
+                || segment.contains('\\')
+                || segment.bytes().any(|byte| byte == 0)
+        }) {
+            return Err(error(format!("unsafe prior route path: {route_path:?}")));
+        }
+        Ok(route_path_to_output_file(route_path))
+    };
+    let mut retained = HashSet::new();
+    for route in current
+        .routes
+        .iter()
+        .filter(|route| route.placement == "static")
+    {
+        retained.insert(checked_path(&route.path)?);
+    }
+
+    // Validate every old path before deleting anything, including legacy
+    // server routes that older builds erroneously prerendered.
+    let mut stale = Vec::new();
+    let mut seen = HashSet::new();
+    for route in &previous.routes {
+        let relative = checked_path(&route.path)?;
+        if retained.contains(&relative) || !seen.insert(relative.clone()) {
+            continue;
+        }
+        let target = output_dir.join(&relative);
+        let metadata = match std::fs::symlink_metadata(&target) {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(error(format!("cannot inspect {}: {}", target.display(), e))),
+        };
+        if !metadata.is_file() {
+            return Err(error(format!(
+                "refusing to remove non-regular route artifact {}",
+                target.display()
+            )));
+        }
+        let parent = target.parent().ok_or_else(|| {
+            error(format!(
+                "route artifact has no parent: {}",
+                target.display()
+            ))
+        })?;
+        let actual_parent = parent
+            .canonicalize()
+            .map_err(|e| error(format!("cannot resolve {}: {}", parent.display(), e)))?;
+        if !actual_parent.starts_with(&output_root) {
+            return Err(error(format!(
+                "route artifact escapes output directory: {}",
+                target.display()
+            )));
+        }
+        stale.push(target);
+    }
+    for file in stale {
+        std::fs::remove_file(&file)
+            .map_err(|e| error(format!("cannot remove stale {}: {}", file.display(), e)))?;
+    }
     Ok(())
 }
 
@@ -3088,6 +3206,7 @@ signal count: Html = text("0")
 
 fn add() {}
 
+@placement(static)
 fn home() -> Html {
     <div class="card">
         <button action={add}>Add</button>
@@ -3123,6 +3242,80 @@ app "counter" {
         assert!(js.contains("window.nulang"), "nulang global missing");
         assert!(js.contains("hydrate"), "hydrate missing");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_route_html_is_pruned_without_removing_unrelated_assets() {
+        use serde_json::json;
+        let dir =
+            std::env::temp_dir().join(format!("nulang_web_stale_html_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("old")).unwrap();
+        std::fs::create_dir_all(dir.join("keep")).unwrap();
+        std::fs::create_dir_all(dir.join("removed")).unwrap();
+        std::fs::write(dir.join("old/index.html"), b"removed page").unwrap();
+        std::fs::write(dir.join("removed/index.html"), b"retired route").unwrap();
+        std::fs::write(dir.join("keep/index.html"), b"retained page").unwrap();
+        std::fs::write(dir.join("private.txt"), b"unmanaged").unwrap();
+
+        let old_ir: crate::web::ir::DeploymentIr = serde_json::from_value(json!({
+            "version": 1,
+            "routes": [
+                {"method": "GET", "path": "/old", "placement": "static", "artifact": "old/index.html"},
+                {"method": "POST", "path": "/old", "placement": "server", "artifact": null},
+                {"method": "GET", "path": "/keep", "placement": "static", "artifact": "keep/index.html"},
+                {"method": "GET", "path": "/removed", "placement": "static", "artifact": "removed/index.html"}
+            ],
+            "signals": {}, "capabilities": [], "budgets": {},
+            "middleware": [], "cloud_config": []
+        }))
+        .unwrap();
+        let new_ir: crate::web::ir::DeploymentIr = serde_json::from_value(json!({
+            "version": 1,
+            "routes": [
+                {"method": "GET", "path": "/old", "placement": "server", "artifact": null},
+                {"method": "GET", "path": "/keep", "placement": "static", "artifact": "keep/index.html"}
+            ],
+            "signals": {}, "capabilities": [], "budgets": {},
+            "middleware": [], "cloud_config": []
+        }))
+        .unwrap();
+
+        prune_stale_web_html(&dir, &old_ir, &new_ir).unwrap();
+        assert!(!dir.join("old/index.html").exists());
+        assert!(!dir.join("removed/index.html").exists());
+        assert_eq!(
+            std::fs::read(dir.join("keep/index.html")).unwrap(),
+            b"retained page"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("private.txt")).unwrap(),
+            b"unmanaged"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_route_cleanup_never_follows_untrusted_parent_paths() {
+        use serde_json::json;
+        let dir =
+            std::env::temp_dir().join(format!("nulang_web_stale_path_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old_ir: crate::web::ir::DeploymentIr = serde_json::from_value(json!({
+            "version": 1,
+            "routes": [{"method": "GET", "path": "/../private", "placement": "static", "artifact": "../private/index.html"}],
+            "signals": {}, "capabilities": [], "budgets": {},
+            "middleware": [], "cloud_config": []
+        }))
+        .unwrap();
+        let new_ir: crate::web::ir::DeploymentIr = serde_json::from_value(json!({
+            "version": 1, "routes": [], "signals": {},
+            "capabilities": [], "budgets": {}, "middleware": [], "cloud_config": []
+        }))
+        .unwrap();
+        assert!(prune_stale_web_html(&dir, &old_ir, &new_ir).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3195,6 +3388,22 @@ app "placement" {
                 && route.placement == "server"
                 && route.artifact.is_none()
         }));
+
+        // Rebuild the same output directory with the former static page now
+        // explicitly server-hosted. It must not retain a stale index.html.
+        let source_path = dir.join("src/main.nula");
+        let source = std::fs::read_to_string(&source_path).unwrap();
+        std::fs::write(
+            &source_path,
+            source.replace("@placement(static)", "@placement(server)"),
+        )
+        .unwrap();
+        cmd_build_web().expect("incremental hybrid build should succeed");
+        assert!(
+            !dir.join("dist/index.html").exists(),
+            "a route switched to server placement must lose its old HTML"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
