@@ -1,4 +1,10 @@
 # Nulang Changelog
+### ORCA-owned wide-Int storage staging — 2026-10-17
+- **Scoped heap representation:** Added `TypeTag::WideInt` and `Actor::lease_wide_int`. Each lease allocates a full signed `i64` in the existing ORCA-owned actor heap and releases its local reference on Drop. No tagged `Value` or pointer escapes into messages or persistence.
+- **Continuation safety:** NLCS v1 explicitly rejects the new in-memory heap tag during serialization; its decoder continues to reject tag 9 as unknown. No existing v1 artifact is reinterpreted.
+- **Regression tests:** Full-width signed extrema survive the actor heap round trip and the allocation is reclaimed after the scoped lease; the v1 format boundary rejects wide-integer heap objects.
+- **Scope:** Staging only, not full-width source-level `Int`; VM/JIT/AOT/WASM, v2 serialization, cross-actor references, replay, and FFI are separate promotion gates.
+
 ### Checked Int64 semantic kernel (staging only) — 2026-10-17
 - **Incubating numeric foundation:** Added a pure full-width signed `i64` checked arithmetic kernel with explicit overflow, division-by-zero and negative-exponent errors; negative exponent and `0**0` semantics are documented.
 - **Tagged representation boundary:** Added `value_layout::try_tag_int` and `Value::try_int` to reject integers outside the immediate 48-bit signed payload. The opaque `Int64Storage` staging type preserves wider `i64` values losslessly.

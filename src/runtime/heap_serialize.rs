@@ -161,6 +161,12 @@ pub fn serialize_continuation(
     // Pass 1: collect all reachable objects from frames and closure envs.
     collect_reachable(&mut ctx, cont, handler_stack, vm)?;
 
+    // NLCS v1 has no wide-Int semantics. Reject rather than emitting an
+    // unversioned TypeTag 9 that an older reader would misinterpret.
+    for obj in &ctx.objects {
+        ensure_v1_type_supported(obj.type_tag)?;
+    }
+
     // Pass 2: serialize to bytes.
     let mut buf = Vec::new();
     write_header(&mut buf, module_hash, &ctx);
@@ -344,7 +350,11 @@ fn walk_value(
                     walk_value(ctx, *slot, vm, module_idx)?;
                 }
             }
-            TypeTag::String | TypeTag::ActorRef | TypeTag::RemoteActor | TypeTag::Raw => {}
+            TypeTag::String
+            | TypeTag::ActorRef
+            | TypeTag::RemoteActor
+            | TypeTag::Raw
+            | TypeTag::WideInt => {}
         }
     }
 
@@ -927,6 +937,18 @@ fn cont_resume_dst(frames: &[Frame]) -> u8 {
 // TypeTag helpers
 // ---------------------------------------------------------------------------
 
+/// NLCS v1 deliberately excludes staged ORCA wide integers. Until v2
+/// defines their durable encoding and ownership, no snapshot may contain one.
+fn ensure_v1_type_supported(tag: TypeTag) -> Result<(), String> {
+    if tag == TypeTag::WideInt {
+        return Err(
+            "NLCS v1 cannot serialize wide Int64 objects; a versioned format is required"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 impl TypeTag {
     fn from_u8(v: u8) -> Option<Self> {
         match v {
@@ -951,6 +973,17 @@ impl TypeTag {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v1_continuation_rejects_wide_int_without_silent_reinterpretation() {
+        // The heap tag is in-memory only. Existing NLCS v1 readers may not
+        // reinterpret the formerly unknown discriminant 9 as a new object.
+        assert_eq!(TypeTag::WideInt as u8, 9);
+        assert!(TypeTag::from_u8(9).is_none());
+        assert!(ensure_v1_type_supported(TypeTag::WideInt).is_err());
+        assert!(ensure_v1_type_supported(TypeTag::Array).is_ok());
+        assert!(ensure_v1_type_supported(TypeTag::Raw).is_ok());
+    }
 
     #[test]
     fn test_format_constants() {
