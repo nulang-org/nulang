@@ -28,6 +28,14 @@ class WoodpeckerRustConcurrencyTests(unittest.TestCase):
 
 
 class WoodpeckerRustReproducibilityTests(unittest.TestCase):
+    def test_rust_workflow_runs_its_dependency_free_contracts(self):
+        source = RUST_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn(
+            "python3 -m unittest discover -s scripts/tests -p test_woodpecker_rust_concurrency.py",
+            source,
+            "self-hosted Rust CI must execute this lockfile/concurrency contract even when Actions is unavailable",
+        )
+
     def test_rust_validation_uses_the_committed_cargo_lockfile(self):
         source = RUST_WORKFLOW.read_text(encoding="utf-8")
         commands = [
