@@ -15,7 +15,8 @@ use crate::durable_effect::{
 use crate::durable_effect_persistence::DurableEffectPersistenceRecord;
 use crate::primitives::{DeliverySemantics, EffectBoundary};
 use crate::runtime::{
-    Actor, ActorState, DurableCommit, DurableTransition, PersistenceStore, DURABLE_TRANSITION_VERSION,
+    Actor, ActorState, DurableCommit, DurableTransition, PersistenceStore,
+    DURABLE_TRANSITION_VERSION,
 };
 use std::fmt;
 use std::io;
@@ -93,10 +94,19 @@ impl From<DurableEffectRequestMismatch> for DurableEffectRuntimeError {
 pub enum DurableAsyncDispatchError {
     InvalidSite(CompiledEffectSpecError),
     Authorization(RuntimeAuthorityError),
-    ActorMismatch { expected: u64, actual: u64 },
+    ActorMismatch {
+        expected: u64,
+        actual: u64,
+    },
     ActorNotLive,
-    ActorEpochMismatch { expected: u64, actual: u64 },
-    GrantOperationMismatch { operation: String, grant: AuthorityGrant },
+    ActorEpochMismatch {
+        expected: u64,
+        actual: u64,
+    },
+    GrantOperationMismatch {
+        operation: String,
+        grant: AuthorityGrant,
+    },
     Recovery(DurableEffectRuntimeError),
     Provider(io::Error),
     UnexpectedDecision,
