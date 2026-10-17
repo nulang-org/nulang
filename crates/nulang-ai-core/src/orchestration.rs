@@ -135,7 +135,7 @@ impl GoalGraph {
                 .into_iter()
                 .flatten()
                 .filter(|child| {
-                    tasks.get(child).is_some_and(|task| {
+                    tasks.get(*child).is_some_and(|task| {
                         !matches!(
                             task.status,
                             TaskStatus::Completed | TaskStatus::Cancelled | TaskStatus::Failed
