@@ -387,8 +387,10 @@ mod tests {
     }
 
     #[test]
-    fn test_default_route_placement_understands_typed_params() {
-        assert_eq!(default_route_placement("GET", "/about"), "static");
+    fn implicit_routes_are_server_only_without_compiler_proof() {
+        // Path/method alone cannot prove absence of request, DB or other effects.
+        assert_eq!(default_route_placement("GET", "/about"), "server");
+        assert_eq!(default_route_placement("HEAD", "/robots.txt"), "server");
         assert_eq!(default_route_placement("GET", "/users/:id"), "server");
         assert_eq!(
             default_route_placement("GET", "/users/{id: UserId}"),
