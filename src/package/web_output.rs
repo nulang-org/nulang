@@ -170,6 +170,51 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_build_cannot_stage_same_output() {
+        let fixture = Fixture::new("concurrent");
+        let first = StagedWebOutput::prepare(&fixture.output()).unwrap();
+        let err = match StagedWebOutput::prepare(&fixture.output()) {
+            Err(err) => err,
+            Ok(_) => panic!("a second build must not stage while the first holds the lock"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert!(first.path().exists());
+        drop(first);
+
+        // Failed/interrupted ordinary builds release their cooperative lock.
+        let next = StagedWebOutput::prepare(&fixture.output()).unwrap();
+        assert!(next.path().exists());
+    }
+
+    #[test]
+    fn successful_build_releases_lock_for_next_build() {
+        let fixture = Fixture::new("unlock");
+        let first = StagedWebOutput::prepare(&fixture.output()).unwrap();
+        fs::write(first.path().join("index.html"), b"first").unwrap();
+        first.publish().unwrap();
+        let next = StagedWebOutput::prepare(&fixture.output()).unwrap();
+        assert_eq!(
+            fs::read(next.path().join("index.html")).unwrap(),
+            b"first"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_stage_preparation_releases_lock_without_leaking_files() {
+        use std::os::unix::fs::symlink;
+        let fixture = Fixture::new("invalid-before-lock");
+        let external = fixture.0.join("private");
+        fs::create_dir_all(&external).unwrap();
+        symlink(&external, fixture.output()).unwrap();
+
+        assert!(StagedWebOutput::prepare(&fixture.output()).is_err());
+        fs::remove_file(fixture.output()).unwrap();
+        let stage = StagedWebOutput::prepare(&fixture.output()).unwrap();
+        assert!(stage.path().exists());
+    }
+
+    #[test]
     fn failed_staged_build_does_not_mutate_previous_output() {
         let fixture = Fixture::new("failed");
         fs::create_dir_all(&fixture.output()).unwrap();
