@@ -3690,6 +3690,52 @@ mod optimize_tests {
     }
 
     #[test]
+    fn test_collect_const_locals_rejects_conditional_definition() {
+        // An entry branch can bypass the only literal assignment. The
+        // uninitialized register is nil along that path, not the literal.
+        let mut b = mir::FunctionBuilder::new("conditional", Some(Type::int()));
+        let condition = b.add_param("condition", Type::bool());
+        let value = b.add_temp(Type::int());
+        let result = b.add_temp(Type::int());
+        let then_block = b.create_block();
+        let join_block = b.create_block();
+        b.terminate(mir::Terminator::Branch {
+            cond: condition,
+            then_: then_block,
+            else_: join_block,
+        });
+        b.switch_to(then_block);
+        b.assign(value, mir::RValue::Const(Constant::Int(7)));
+        b.terminate(mir::Terminator::Jump(join_block));
+        b.switch_to(join_block);
+        b.assign(result, mir::RValue::Load(value));
+        b.terminate(mir::Terminator::Return(Some(result)));
+
+        let func = b.build();
+        assert!(
+            !collect_const_locals(&func).contains_key(&value),
+            "a branch-local definition cannot be propagated to the join"
+        );
+    }
+
+    #[test]
+    fn test_collect_const_locals_rejects_read_before_entry_definition() {
+        // A single assignment in the entry block need not precede all reads.
+        let mut b = mir::FunctionBuilder::new("forward_read", Some(Type::int()));
+        let value = b.add_temp(Type::int());
+        let result = b.add_temp(Type::int());
+        b.assign(result, mir::RValue::Load(value));
+        b.assign(value, mir::RValue::Const(Constant::Int(7)));
+        b.terminate(mir::Terminator::Return(Some(result)));
+
+        let func = b.build();
+        assert!(
+            !collect_const_locals(&func).contains_key(&value),
+            "the constant is not available to reads before its definition"
+        );
+    }
+
+    #[test]
     fn test_fold_int48_comparisons_use_runtime_normalized_operands() {
         use crate::ast::BinOp;
         use crate::value_layout::{INT48_MAX, INT48_MIN};
