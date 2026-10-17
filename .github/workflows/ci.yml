@@ -30,6 +30,9 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Test retained MapLibre web host
+        run: node --test integrations/maplibre-host/test/*.test.mjs
+
       - name: Enable corepack
         run: corepack enable
 

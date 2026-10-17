@@ -1,0 +1,24 @@
+name: MapLibre Browser Smoke
+
+on:
+  pull_request:
+    paths:
+      - 'integrations/maplibre-host/**'
+      - '.github/workflows/maplibre-browser-smoke.yml'
+  workflow_dispatch:
+
+jobs:
+  maplibre-chromium:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install pinned map and browser test packages
+        run: npm install --no-save --no-package-lock --prefix integrations/maplibre-host maplibre-gl@6.13.0 playwright@1.58.2
+      - name: Install Chromium and dependencies
+        run: npm exec --prefix integrations/maplibre-host -- playwright install --with-deps chromium
+      - name: Exercise real MapLibre style and source lifecycle in Chromium
+        run: node integrations/maplibre-host/test/browser-smoke.mjs
