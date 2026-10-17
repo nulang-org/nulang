@@ -6979,7 +6979,10 @@ mod tests {
         let parsed = parse_expr("<span title={left - right}>ok</span>")
             .expect("minus inside braces must remain a binary operator");
         let ast = format!("{parsed:?}");
-        assert!(ast.contains("Binary"), "missing subtraction expression: {ast}");
+        assert!(
+            ast.contains("Binary"),
+            "missing subtraction expression: {ast}"
+        );
     }
 
     #[test]
