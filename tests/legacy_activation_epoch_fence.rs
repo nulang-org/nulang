@@ -166,7 +166,9 @@ fn libsql_reopen_preserves_legacy_owner_fence_before_atomic_promotion() {
     // Reopening after the failed transaction must reveal no partial writes.
     {
         let mut store = LibsqlStore::new(&db_path).expect("reopen rejected history");
-        let snapshot = store.load_snapshot(actor_id).expect("legacy snapshot survives");
+        let snapshot = store
+            .load_snapshot(actor_id)
+            .expect("legacy snapshot survives");
         assert_eq!(snapshot.sequence, 5);
         assert_eq!(snapshot.activation_epoch, 9);
         assert_eq!(store.load_durable_tail_position(actor_id).unwrap(), None);
@@ -188,7 +190,9 @@ fn libsql_reopen_preserves_legacy_owner_fence_before_atomic_promotion() {
                 sequence: 6,
             })
         );
-        let snapshot = store.load_snapshot(actor_id).expect("promoted snapshot survives");
+        let snapshot = store
+            .load_snapshot(actor_id)
+            .expect("promoted snapshot survives");
         assert_eq!(snapshot.sequence, 6);
         assert_eq!(snapshot.activation_epoch, 10);
     }
