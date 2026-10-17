@@ -14,16 +14,26 @@ cargo build --release
 Requires Rust 1.95.0 (pinned by `rust-toolchain.toml`), Linux or macOS.
 Windows is unsupported; use WSL.
 
-## Run the tests
+## Validate a change
+
+All local pre-merge checks use the same implementation, `scripts/ci-local.sh`:
 
 ```bash
-cargo test                                          # full test suite
-cargo test --features wasm-backend                  # WASM backend suite
-./conformance/run.py                                # behavioral conformance suite
-NULANG_BIN=./target/release/nulang bash scripts/verify_doc_examples.sh  # doc snippets
+bash scripts/ci-local.sh            # compiler/runtime feature matrix
+just check                          # equivalent, if just is installed
+mise run check                      # equivalent, if mise is installed
+bash scripts/ci-local.sh --full     # add release, rustdoc, audit, docs examples, Lean
+just check-full                     # equivalent extended gate, if just is installed
 ```
 
-Please make sure these pass before opening a PR. CI runs them all.
+For a quicker inner loop, `just fast-check` runs formatting, `cargo check`,
+and default-feature Nextest tests; it requires `just` and `cargo-nextest`.
+A passing fast check is **not** equivalent to the feature-matrix gate.
+The full-script option additionally requires `cargo-audit` and Lean/`lake`.
+
+Neither local mode substitutes for hosted cross-platform packaging, benchmark
+regression confirmation, nightly fuzzing, or docs-site/playground CI. Verify
+the exact PR head's required GitHub checks before requesting a merge.
 
 ## Commit style
 
