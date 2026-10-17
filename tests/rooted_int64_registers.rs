@@ -83,7 +83,10 @@ fn missing_registers_fail_closed_without_mutating_other_slots() {
         assert_eq!(regs.store(1, 3), Err(IntRegisterError::InvalidRegister));
         assert_eq!(regs.copy_into(0, 1), Err(IntRegisterError::InvalidRegister));
         assert_eq!(regs.move_into(1, 0), Err(IntRegisterError::InvalidRegister));
-        assert_eq!(regs.checked_add_into(0, 0, 1), Err(IntRegisterError::InvalidRegister));
+        assert_eq!(
+            regs.checked_add_into(0, 0, 1),
+            Err(IntRegisterError::InvalidRegister)
+        );
         assert_eq!(regs.read(0).unwrap(), Some(i64::MAX));
     }
     assert_eq!(actor.heap.live_count(), 0);
