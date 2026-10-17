@@ -26,6 +26,28 @@ use crate::mir;
 use crate::runtime::heap::TypeTag as HeapTypeTag;
 use crate::types::{NuResult, Span};
 
+/// Optimization policy for native machine code emitted by Cranelift.
+///
+/// This controls generated code, not the Rust compiler executable size or
+/// the future standalone-linker artifact.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AotOptimization {
+    /// Preserve the historical native-backend optimization behavior.
+    #[default]
+    Speed,
+    /// Prefer code-size reductions where Cranelift supports them.
+    Small,
+}
+
+impl AotOptimization {
+    fn cranelift_level(self) -> &'static str {
+        match self {
+            Self::Speed => "speed",
+            Self::Small => "speed_and_size",
+        }
+    }
+}
+
 /// Compiled AOT module ready for execution.
 pub struct AotModule {
     /// The Cranelift JIT module that owns compiled code memory.
@@ -65,10 +87,27 @@ impl AotModule {
 
     /// Compile a MIR module to native code for a specific target ISA.
     pub fn compile_for_target(mir_module: &mir::Module, target: &str) -> NuResult<Self> {
+        Self::compile_for_target_with_optimization(mir_module, target, AotOptimization::Speed)
+    }
+
+    /// Compile using an explicit native machine-code optimization policy.
+    ///
+    /// The returned module still runs from in-memory JIT code; this API
+    /// does not emit a linkable object file or a standalone executable.
+    pub fn compile_for_target_with_optimization(
+        mir_module: &mir::Module,
+        target: &str,
+        optimization: AotOptimization,
+    ) -> NuResult<Self> {
         // Set up Cranelift with the target ISA.
         let mut flag_builder = settings::builder();
         let _ = flag_builder.set("enable_simd", "true");
-        let _ = flag_builder.set("opt_level", "speed");
+        flag_builder
+            .set("opt_level", optimization.cranelift_level())
+            .map_err(|e| crate::types::NuError::VMError {
+                msg: format!("invalid Cranelift optimization setting: {e}"),
+                span: Span::default(),
+            })?;
         let isa_builder = create_isa_builder(target)?;
         let isa = isa_builder
             .finish(settings::Flags::new(flag_builder))
@@ -2056,6 +2095,35 @@ mod tests {
         assert_eq!(
             unsafe { crate::vm::Value::from_raw(result) }.as_bool(),
             Some(true)
+        );
+    }
+}
+
+#[cfg(test)]
+mod optimization_profile_tests {
+    use super::*;
+
+    #[test]
+    fn small_native_profile_maps_to_cranelift_size_optimization() {
+        let mut builder = settings::builder();
+        builder
+            .set("opt_level", AotOptimization::Small.cranelift_level())
+            .expect("Cranelift size optimization level is supported");
+        assert_eq!(
+            settings::Flags::new(builder).opt_level(),
+            settings::OptLevel::SpeedAndSize
+        );
+    }
+
+    #[test]
+    fn native_default_remains_speed_optimized() {
+        let mut builder = settings::builder();
+        builder
+            .set("opt_level", AotOptimization::default().cranelift_level())
+            .expect("Cranelift speed optimization level is supported");
+        assert_eq!(
+            settings::Flags::new(builder).opt_level(),
+            settings::OptLevel::Speed
         );
     }
 }
