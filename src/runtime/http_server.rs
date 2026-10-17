@@ -1485,6 +1485,96 @@ mod tests {
             .contains("Invalid UI action envelope"));
     }
 
+    // Web.redirect must affect the HTTP status, not just render a meta-refresh.
+    #[test]
+    fn web_post_redirect_uses_303_location_without_rendering_html() {
+        let request = HttpRequest {
+            method: HttpMethod::Post,
+            path: "/projects/42/deploy".into(),
+            headers: vec![],
+            body: vec![],
+        };
+        with_request_context(
+            RequestContext {
+                request: request.clone(),
+                params: HashMap::new(),
+            },
+            || set_response_redirect("/projects/42"),
+        );
+
+        let response = WebDevServer::html_route_response(&request, "<p>never render</p>");
+        assert_eq!(response.status, 303, "POST redirects must use PRG semantics");
+        assert!(response.body.is_empty(), "redirect must not inject client HTML");
+        assert!(response.headers.iter().any(|(name, value)| {
+            name == "Location" && value == "/projects/42"
+        }));
+    }
+
+    #[test]
+    fn web_get_redirect_uses_302_and_unmodified_pages_still_render() {
+        let request = HttpRequest {
+            method: HttpMethod::Get,
+            path: "/projects/42".into(),
+            headers: vec![],
+            body: vec![],
+        };
+        with_request_context(
+            RequestContext {
+                request: request.clone(),
+                params: HashMap::new(),
+            },
+            || set_response_redirect("/login"),
+        );
+        let redirect = WebDevServer::html_route_response(&request, "unused");
+        assert_eq!(redirect.status, 302);
+        assert!(redirect
+            .headers
+            .iter()
+            .any(|(name, value)| name == "Location" && value == "/login"));
+
+        with_request_context(
+            RequestContext {
+                request: request.clone(),
+                params: HashMap::new(),
+            },
+            || {},
+        );
+        let page = WebDevServer::html_route_response(&request, "<h1>normal</h1>");
+        assert_eq!(page.status, 200, "redirect state must not leak to later requests");
+        assert!(String::from_utf8_lossy(&page.body).contains("<h1>normal</h1>"));
+    }
+
+    #[test]
+    fn web_redirect_rejects_external_or_header_injection_targets() {
+        let request = HttpRequest {
+            method: HttpMethod::Post,
+            path: "/submit".into(),
+            headers: vec![],
+            body: vec![],
+        };
+        for location in [
+            "//evil.example",
+            "/\\evil.example",
+            "/ok\r\nX-Injected: yes",
+            "javascript:alert(1)",
+            "",
+        ] {
+            with_request_context(
+                RequestContext {
+                    request: request.clone(),
+                    params: HashMap::new(),
+                },
+                || set_response_redirect(location),
+            );
+            let response = WebDevServer::html_route_response(&request, "unused");
+            assert_eq!(response.status, 400, "unsafe redirect: {location:?}");
+            assert!(!response
+                .headers
+                .iter()
+                .any(|(name, _)| name == "Location"));
+        }
+    }
+
     #[test]
     fn test_current_request_method() {
         let _ctx = with_request_context(
