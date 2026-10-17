@@ -76,10 +76,22 @@ pub(crate) struct ScheduledFault {
 /// order and every injected fault.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum ClusterTraceEvent {
-    FaultScheduled { round: u64, fault: ClusterFault },
-    FaultApplied { round: u64, fault: ClusterFault },
-    RoundOrder { round: u64, order: Vec<usize> },
-    NodeSkippedCrashed { round: u64, node: usize },
+    FaultScheduled {
+        round: u64,
+        fault: ClusterFault,
+    },
+    FaultApplied {
+        round: u64,
+        fault: ClusterFault,
+    },
+    RoundOrder {
+        round: u64,
+        order: Vec<usize>,
+    },
+    NodeSkippedCrashed {
+        round: u64,
+        node: usize,
+    },
     SchedulerStep {
         round: u64,
         node: usize,
@@ -1342,7 +1354,6 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod foundationdb_trace_tests {
     use super::*;
@@ -1374,10 +1385,10 @@ mod foundationdb_trace_tests {
                 fault: ClusterFault::Partition { from: 0, to: 1 }
             }
         )));
-        assert!(first.trace().iter().any(|event| matches!(
-            event,
-            ClusterTraceEvent::RoundOrder { round: 0, .. }
-        )));
+        assert!(first
+            .trace()
+            .iter()
+            .any(|event| matches!(event, ClusterTraceEvent::RoundOrder { round: 0, .. })));
         let encoded = serde_json::to_vec(second.trace()).unwrap();
         let decoded: Vec<ClusterTraceEvent> = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded, second.trace());
