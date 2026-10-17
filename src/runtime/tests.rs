@@ -8176,15 +8176,7 @@ fn test_cross_shard_grain_delivery_does_not_hijack_unrelated_actor() {
         .insert(handle, Actor::new(handle, "unrelated-actor".to_string(), 0));
     let holds = ObjectRefLease::acquire(&rt.object_store, &[]).unwrap();
 
-    rt.deliver_cross_shard_message(
-        handle,
-        0,
-        Vec::new(),
-        0,
-        None,
-        Some(grain_id),
-        holds,
-    );
+    rt.deliver_cross_shard_message(handle, 0, Vec::new(), 0, None, Some(grain_id), holds);
 
     assert!(
         rt.actors.get(&handle).unwrap().mailbox.is_empty(),
