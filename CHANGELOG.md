@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Experimental Web staged build publication — 2026-10-15
+- **`nula build --web` stages generated HTML, assets, client runtime, signal metadata, and deployment IR before publication.** Failed compile, validation, prerender, copy or budget checks preserve the previous output, while successful builds replace obsolete artifacts.
+- **Output publication checks paths, symlinks, managed destinations and concurrent-build locks.** Synchronous install failures attempt to restore the previous directory.
+- **This is not a crash-atomic filesystem transaction.** Interrupted two-rename publication may require manual recovery of a backup and lock. This change is stacked on the single-validated-contract and static-route-only build implementation (#1734 and #1778).
+
 ### Static-only Web artifact generation — 2026-10-15
 - **`nula build --web` prerenders only routes that validated Deployment IR classifies as static.** Server-placed routes (including POST mutations) remain in deployment metadata but are not executed or emitted as public HTML during static generation.
 - **A mixed-route build regression validates placement and emitted artifacts**, preserving the compiler-owned validated contract as the shared authority for runtime and deployment.
