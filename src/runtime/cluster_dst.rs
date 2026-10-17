@@ -389,6 +389,43 @@ mod tests {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
     }
 
+    /// A restarted node must join at the current simulated time, not at the
+    /// virtual clock's zero point. Otherwise crash duration is effectively
+    /// erased for that node's failure detector, timers and deadlines.
+    #[test]
+    fn test_dst_cluster_restart_preserves_global_virtual_round() {
+        const BEFORE_CRASH: u64 = 7;
+        const WHILE_CRASHED: u64 = 13;
+
+        for seed in 0..8 {
+            let mut cluster = DeterministicCluster::new(&[addr(9161), addr(9162)], seed);
+            cluster.run_rounds(BEFORE_CRASH);
+            cluster.crash_node(1);
+            cluster.run_rounds(WHILE_CRASHED);
+            cluster.restart_node(1);
+
+            let expected = ROUND_STEP * (BEFORE_CRASH + WHILE_CRASHED) as u32;
+            for node in 0..2 {
+                assert_eq!(
+                    cluster.node(node).virtual_clock.as_ref().unwrap().elapsed(),
+                    expected,
+                    "seed {seed}: node {node} clock must equal global round {} after restart",
+                    cluster.round
+                );
+            }
+
+            cluster.step_round();
+            for node in 0..2 {
+                assert_eq!(
+                    cluster.node(node).virtual_clock.as_ref().unwrap().elapsed(),
+                    expected + ROUND_STEP,
+                    "seed {seed}: node {node} must advance without a clock discontinuity"
+                );
+            }
+            assert_eq!(cluster.limit_hits, 0, "seed {seed}: scheduler budget exhausted");
+        }
+    }
+
     /// Spawn a counter actor with an `inc` behavior that adds its arg to a
     /// `count` state field, and return its id.
     fn spawn_counter(rt: &mut Runtime) -> u64 {
