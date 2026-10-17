@@ -3,6 +3,7 @@
 - **Scoped frame ownership:** Added `RootedIntFrameStack`, partitioning actor-borrowed ORCA-backed numeric registers into 256-slot frames; cloning the top frame retains each wide scalar before the clone takes ownership.
 - **Unwind barriers:** Returning or popping a frame releases all roots in that frame in reverse slot order; copy and move work across frames without leaking or aliasing references.
 - **Checked cross-frame arithmetic:** Signed 64-bit arithmetic detects overflow before replacing the destination root, preserving prior content on failure.
+- **Detached suspension:** The staging stack can be consumed into a pointer-free numeric checkpoint, releasing the original roots; resuming recreates independent roots owned by the destination actor, even after the source actor terminates. Checkpoints are not the durable ABI.
 - **Scope:** Staging only. This is not the actual VM `Vec<Frame>` / continuation persistence ABI, and legacy production execution remains unchanged.
 
 ### Numeric VM Frame boundary for Int64 — 2026-10-17
