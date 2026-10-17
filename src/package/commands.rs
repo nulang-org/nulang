@@ -1533,24 +1533,29 @@ fn prune_stale_web_html(
         span: Span::default(),
     };
     if previous.version != 1 || current.version != 1 {
-        return Err(error("cannot clean route HTML from unsupported deployment IR version".into()));
+        return Err(error(
+            "cannot clean route HTML from unsupported deployment IR version".into(),
+        ));
     }
-    let output_metadata = std::fs::symlink_metadata(output_dir).map_err(|e| {
-        error(format!("cannot inspect {}: {}", output_dir.display(), e))
-    })?;
+    let output_metadata = std::fs::symlink_metadata(output_dir)
+        .map_err(|e| error(format!("cannot inspect {}: {}", output_dir.display(), e)))?;
     if !output_metadata.is_dir() || output_metadata.file_type().is_symlink() {
-        return Err(error("web output directory must be a real directory".into()));
+        return Err(error(
+            "web output directory must be a real directory".into(),
+        ));
     }
-    let output_root = output_dir.canonicalize().map_err(|e| {
-        error(format!("cannot resolve {}: {}", output_dir.display(), e))
-    })?;
+    let output_root = output_dir
+        .canonicalize()
+        .map_err(|e| error(format!("cannot resolve {}: {}", output_dir.display(), e)))?;
     let checked_path = |route_path: &str| -> NuResult<PathBuf> {
         if !route_path.starts_with('/') || route_path.starts_with("//") {
             return Err(error(format!("unsafe prior route path: {route_path:?}")));
         }
         let trimmed = route_path.trim_matches('/');
         if trimmed.split('/').any(|segment| {
-            segment == "." || segment == ".." || segment.contains('\\')
+            segment == "."
+                || segment == ".."
+                || segment.contains('\\')
                 || segment.bytes().any(|byte| byte == 0)
         }) {
             return Err(error(format!("unsafe prior route path: {route_path:?}")));
@@ -1558,7 +1563,11 @@ fn prune_stale_web_html(
         Ok(route_path_to_output_file(route_path))
     };
     let mut retained = HashSet::new();
-    for route in current.routes.iter().filter(|route| route.placement == "static") {
+    for route in current
+        .routes
+        .iter()
+        .filter(|route| route.placement == "static")
+    {
         retained.insert(checked_path(&route.path)?);
     }
 
@@ -1584,11 +1593,14 @@ fn prune_stale_web_html(
             )));
         }
         let parent = target.parent().ok_or_else(|| {
-            error(format!("route artifact has no parent: {}", target.display()))
+            error(format!(
+                "route artifact has no parent: {}",
+                target.display()
+            ))
         })?;
-        let actual_parent = parent.canonicalize().map_err(|e| {
-            error(format!("cannot resolve {}: {}", parent.display(), e))
-        })?;
+        let actual_parent = parent
+            .canonicalize()
+            .map_err(|e| error(format!("cannot resolve {}: {}", parent.display(), e)))?;
         if !actual_parent.starts_with(&output_root) {
             return Err(error(format!(
                 "route artifact escapes output directory: {}",
@@ -1598,9 +1610,8 @@ fn prune_stale_web_html(
         stale.push(target);
     }
     for file in stale {
-        std::fs::remove_file(&file).map_err(|e| {
-            error(format!("cannot remove stale {}: {}", file.display(), e))
-        })?;
+        std::fs::remove_file(&file)
+            .map_err(|e| error(format!("cannot remove stale {}: {}", file.display(), e)))?;
     }
     Ok(())
 }
@@ -3237,10 +3248,8 @@ app "counter" {
     #[test]
     fn stale_route_html_is_pruned_without_removing_unrelated_assets() {
         use serde_json::json;
-        let dir = std::env::temp_dir().join(format!(
-            "nulang_web_stale_html_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("nulang_web_stale_html_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("old")).unwrap();
         std::fs::create_dir_all(dir.join("keep")).unwrap();
@@ -3276,18 +3285,22 @@ app "counter" {
         prune_stale_web_html(&dir, &old_ir, &new_ir).unwrap();
         assert!(!dir.join("old/index.html").exists());
         assert!(!dir.join("removed/index.html").exists());
-        assert_eq!(std::fs::read(dir.join("keep/index.html")).unwrap(), b"retained page");
-        assert_eq!(std::fs::read(dir.join("private.txt")).unwrap(), b"unmanaged");
+        assert_eq!(
+            std::fs::read(dir.join("keep/index.html")).unwrap(),
+            b"retained page"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("private.txt")).unwrap(),
+            b"unmanaged"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn stale_route_cleanup_never_follows_untrusted_parent_paths() {
         use serde_json::json;
-        let dir = std::env::temp_dir().join(format!(
-            "nulang_web_stale_path_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("nulang_web_stale_path_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let old_ir: crate::web::ir::DeploymentIr = serde_json::from_value(json!({
