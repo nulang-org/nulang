@@ -1,0 +1,56 @@
+name: Durable Effect Safety Gate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Every PR runs this gate, including changes outside the durability paths:
+# compiler semantics, host dispatch, and storage layers can affect replay.
+concurrency:
+  group: durability-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  durable-effect-crash-recovery:
+    name: Durable effect crash/recovery (Rust 1.95)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Pull requests normally check out a synthetic merge ref; this safety
+          # gate must execute the immutable code revision under review.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Prove immutable test head
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          actual="$(git rev-parse HEAD)"
+          echo "Exact code head: $actual"
+          test "$actual" = "$EXPECTED_HEAD"
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt, clippy
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check storage and test targets with minimal SQLite feature set
+        run: cargo check --locked --all-targets --no-default-features --features sqlite
+
+      - name: Run deterministic and hard-kill durable effect safety matrix
+        run: bash scripts/test-durability-guarantees.sh

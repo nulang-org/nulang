@@ -27,7 +27,10 @@ For one logical durable external effect, the runtime contract is:
 7. replay a completed result without redispatching the provider;
 8. reject request or specification drift before dispatch;
 9. reject stale activation epochs at the persistence boundary;
-10. model compensation as another explicit durable effect rather than pretending
+10. before replaying an existing Prepared/Completed record, require the exact
+    current activation epoch to be committed durably; a higher in-memory epoch
+    is not itself authority to redispatch;
+11. model compensation as another explicit durable effect rather than pretending
     the original external mutation can be rolled back.
 
 A Nulang-local journal or transaction cannot prove that an arbitrary remote
@@ -96,9 +99,23 @@ Run:
 bash scripts/test-durability-guarantees.sh
 ```
 
-The gate is deterministic and performs no public network calls, sleeps, or
-wall-clock assertions. It covers semantic-site artifact propagation, storage
-recovery, crash-window behavior, and the lower-level durable-effect contracts.
+The gate performs no public network calls. Its small in-memory matrix has no
+sleep or wall-clock assertions; the SQLite/libSQL subprocess lane necessarily
+has a bounded child-readiness timeout. The lane uses a real hard process kill
+after explicit fsynced readiness, then reopens the same database to prove that
+actor snapshot state, durable effect intent, terminal receipt, and installed
+activation epoch survive. A simulated external provider uses a separate
+fsynced idempotency ledger to prove the provider-commit/receipt-loss window
+does not result in a second logical mutation *when the provider cooperates*.
+
+The coordinator requires a committed activation epoch before a recovered
+effect may dispatch or return its receipt. This closes the obvious stale
+replay path, but the read is not a distributed lease or a provider-side
+fence: another activation could supersede the epoch after the read but
+before the provider call. Callers need stable provider deduplication keys,
+a suitably fenced provider protocol, or both. The current test is a store
+and coordinator process-recovery fixture, **not** yet a fully compiled Nulang
+actor program executed across all backends.
 
 ## Competitive benchmark contract
 
