@@ -1,5 +1,5 @@
 //! Agent-safe project inspection contract. Run with:
- //! cargo test --test nula_inspect
+//! cargo test --test nula_inspect
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -39,11 +39,16 @@ registry = "https://user:private-token@example.org"
 [dependencies]
 helper = { git = "https://user:another-secret@example.org/helper.git" }
 "#,
-    ).unwrap();
+    )
+    .unwrap();
     std::fs::write(dir.join("Nulang.lock"), "").unwrap();
 
     let out = run(&dir, &["nula", "inspect", "--json"]);
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8(out.stdout).unwrap();
     let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(value["schema_version"], 1);
@@ -51,8 +56,14 @@ helper = { git = "https://user:another-secret@example.org/helper.git" }
     assert_eq!(value["project"]["name"], "demo-agent");
     assert_eq!(value["project"]["version"], "0.1.0");
     assert_eq!(value["project"]["entry"], "src/main.nula");
-    assert_eq!(value["project"]["capabilities"], serde_json::json!(["net"]));
-    assert_eq!(value["project"]["dependencies"], serde_json::json!(["helper"]));
+    assert_eq!(
+        value["project"]["capabilities"],
+        serde_json::json!(["net"])
+    );
+    assert_eq!(
+        value["project"]["dependencies"],
+        serde_json::json!(["helper"])
+    );
     assert_eq!(value["project"]["lockfile_present"], true);
     assert!(!stdout.contains("private-token"));
     assert!(!stdout.contains("another-secret"));
@@ -68,7 +79,8 @@ fn inspect_fails_without_manifest_and_rejects_unknown_flags() {
     std::fs::write(
         dir.join("Nulang.toml"),
         "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
-    ).unwrap();
+    )
+    .unwrap();
     let unknown = run(&dir, &["nula", "inspect", "--typo"]);
     assert!(!unknown.status.success());
     std::fs::remove_dir_all(&dir).unwrap();
