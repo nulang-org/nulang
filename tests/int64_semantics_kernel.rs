@@ -56,3 +56,37 @@ fn power_boundary_cases_are_deterministic_even_for_huge_exponents() {
     assert_eq!(int64::pow(-1, i64::MAX), Ok(-1));
     assert_eq!(int64::pow(-1, i64::MAX - 1), Ok(1));
 }
+
+#[test]
+fn checked_arithmetic_agrees_with_i128_oracle_at_sign_and_width_boundaries() {
+    let values = [
+        i64::MIN,
+        i64::MIN + 1,
+        -(1_i64 << 47) - 1,
+        -(1_i64 << 47),
+        -1,
+        0,
+        1,
+        (1_i64 << 47) - 1,
+        1_i64 << 47,
+        i64::MAX - 1,
+        i64::MAX,
+    ];
+    for a in values {
+        for b in values {
+            let oracle = |candidate: i128| {
+                i64::try_from(candidate).map_err(|_| Int64Error::Overflow)
+            };
+            assert_eq!(int64::add(a, b), oracle(i128::from(a) + i128::from(b)));
+            assert_eq!(int64::sub(a, b), oracle(i128::from(a) - i128::from(b)));
+            assert_eq!(int64::mul(a, b), oracle(i128::from(a) * i128::from(b)));
+            if b == 0 {
+                assert_eq!(int64::div(a, b), Err(Int64Error::DivisionByZero));
+                assert_eq!(int64::rem(a, b), Err(Int64Error::DivisionByZero));
+            } else {
+                assert_eq!(int64::div(a, b), oracle(i128::from(a) / i128::from(b)));
+                assert_eq!(int64::rem(a, b), oracle(i128::from(a) % i128::from(b)));
+            }
+        }
+    }
+}
