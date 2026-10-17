@@ -225,8 +225,8 @@ fn verify_crash_recovery(stage: &str) {
             .expect("replay terminal receipt"),
         receipt
     );
-    assert_eq!(reopened.latest_sequence(ACTOR_ID), 2);
     drop(coordinator);
+    assert_eq!(reopened.latest_sequence(ACTOR_ID), 2);
     drop(reopened);
     fs::remove_dir_all(dir).expect("remove isolated test directory");
 }
