@@ -444,6 +444,7 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
     }
 
     rt.restore_suspended_workflow_activation(actor_id, suspended.activation);
+    let mut terminal_commit_failed = false;
     let self_ptr: *mut Runtime = rt;
     unsafe {
         let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -473,7 +474,7 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
                             actor.set_state_field("step_index", Value::int(n + 1));
                         }
                     }
-                    (*self_ptr).commit_resumed_workflow_success(
+                    terminal_commit_failed = !(*self_ptr).commit_resumed_workflow_success(
                         actor_id,
                         suspended.activation,
                         suspended.step_name,
@@ -505,7 +506,7 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
             }
             Err(error) => {
                 if (*self_ptr).actor_is_workflow(actor_id) {
-                    (*self_ptr).commit_resumed_workflow_failure(
+                    terminal_commit_failed = !(*self_ptr).commit_resumed_workflow_failure(
                         actor_id,
                         suspended.activation,
                         suspended.step_name,
@@ -520,7 +521,16 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
         // on the shared VM, which would clobber the frames an
         // un-captured suspend still needs. Runs on every path, so
         // wakes of other actors are not lost when THIS one suspends.
-        (*self_ptr).vm_exec_end();
+    }
+    // A failed durable transition cannot publish speculative state. Drop
+    // the actor only after the shared VM borrow ends, and before deferred
+    // receive wakes can run it.
+    if terminal_commit_failed {
+        rt.actors.remove(&actor_id);
+    }
+    rt.vm_exec_end();
+    if terminal_commit_failed {
+        return;
     }
     // The suspension resolved (completed or failed): if messages queued
     // up while the behavior was suspended, schedule the actor to drain
