@@ -8168,6 +8168,31 @@ fn test_grain_hydration_rejects_conflicting_stable_id_before_mutation() {
 }
 
 #[test]
+fn test_cross_shard_grain_delivery_does_not_hijack_unrelated_actor() {
+    let mut rt = Runtime::new();
+    let grain_id = GrainId::new("Counter", "alpha");
+    let handle = grain_actor_id(&grain_id);
+    rt.actors
+        .insert(handle, Actor::new(handle, "unrelated-actor".to_string(), 0));
+    let holds = ObjectRefLease::acquire(&rt.object_store, &[]).unwrap();
+
+    rt.deliver_cross_shard_message(
+        handle,
+        0,
+        Vec::new(),
+        0,
+        None,
+        Some(grain_id),
+        holds,
+    );
+
+    assert!(
+        rt.actors.get(&handle).unwrap().mailbox.is_empty(),
+        "cross-shard virtual actor traffic must not be delivered to a non-grain actor with a colliding handle"
+    );
+}
+
+#[test]
 fn test_grain_ref_builtin_int_key() {
     let mut rt = Runtime::new();
     let constants = vec![Constant::String("User".to_string())];
