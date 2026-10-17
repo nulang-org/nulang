@@ -16,6 +16,29 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # A fast, independent gate for the embedding FFI and Rust SDK. Test the
+  # exact PR head, not the synthesized GitHub merge ref.
+  embedding-smoke:
+    name: Rust SDK + C ABI smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact PR head
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.95.0'
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Compile and run embedded Rust and C smoke
+        run: bash scripts/check-embedding.sh
+
   # -----------------------------------------------------------------------
   # Documentation site + zero-install browser playground
   # -----------------------------------------------------------------------

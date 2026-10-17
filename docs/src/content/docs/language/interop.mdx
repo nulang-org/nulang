@@ -160,6 +160,27 @@ Ownership and limits: each handle is unique across runtime instances, and lookup
 
 **Embedding limitations:** The C interface still creates a fresh bytecode VM for each run/call; it does not expose a persistent actor scheduler or durability lifecycle. Scoped callback registries do not turn unsafe native code into a sandbox: loaded libraries and pointers execute inside the host process, and AOT/WASM native helpers are not covered by this bytecode VM-scoped registry. Do not treat distinct `NulangRuntime` handles as complete tenant security boundaries; use process isolation for untrusted native code.
 
+## Embedding Nulang in Rust (experimental)
+
+Rust applications can embed the typed core VM without manipulating C pointers or NaN-boxed values. The `nulang::ffi::embed` module provides `RustEmbedder`, runtime-bound `RustModule` handles, typed `RustValue` variants, and ordinary `Result<_, EmbedError>` returns.
+
+```rust
+use nulang::ffi::embed::{RustEmbedder, RustValue};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut engine = RustEmbedder::new()?;
+    let module = engine.compile("fn add(a: Int, b: Int) -> Int { a + b } add(1, 2)")?;
+    assert_eq!(engine.run(&module)?, RustValue::Int(3));
+    assert_eq!(
+        engine.call(&module, "add", &[RustValue::Int(20), RustValue::Int(22)])?,
+        RustValue::Int(42)
+    );
+    Ok(())
+}
+```
+
+The Rust API copies primitive and string values out of the VM, rejects unsupported heap and actor values, prevents module handles from crossing runtime instances, and remains deliberately single-threaded. It does **not** yet embed the durable actor scheduler, expose async polling, or sandbox native extensions. Use external process isolation for untrusted execution.
+
 ## See also
 
 - [Algebraic Effects](/language/effects/) — how `perform` and effect rows work.

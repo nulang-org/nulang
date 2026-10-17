@@ -29,7 +29,7 @@ use crate::vm::{Value, VM};
 static NEXT_OWNED_HANDLE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
-enum OwnedHostValue {
+pub(crate) enum OwnedHostValue {
     Int(i64),
     Float(f64),
     Bool(bool),
@@ -60,7 +60,7 @@ pub struct NulangRuntime {
 }
 
 impl NulangRuntime {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         NulangRuntime {
             modules: Vec::new(),
             module_handles: Vec::new(),
@@ -75,7 +75,7 @@ impl NulangRuntime {
         }
     }
 
-    fn store_owned(&mut self, value: OwnedHostValue) -> u64 {
+    pub(crate) fn store_owned(&mut self, value: OwnedHostValue) -> u64 {
         match NEXT_OWNED_HANDLE
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         {
@@ -118,6 +118,16 @@ impl NulangRuntime {
             return 0;
         };
         self.store_owned(owned)
+    }
+
+    pub(crate) fn take_owned(&mut self, handle: u64) -> Option<OwnedHostValue> {
+        self.owned_values.remove(&handle)
+    }
+
+    pub(crate) fn last_error_message(&self) -> String {
+        self.last_error
+            .clone()
+            .unwrap_or_else(|| "embedded Nulang operation failed without a diagnostic".to_string())
     }
 
     fn set_error(&mut self, err: NuError) {

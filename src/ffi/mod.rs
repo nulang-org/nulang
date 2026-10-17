@@ -7,6 +7,7 @@
 //! VM execution engine. The registry is global and thread-safe.
 
 pub mod c_api;
+pub mod embed;
 pub mod marshal;
 pub mod native;
 
