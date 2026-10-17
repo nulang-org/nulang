@@ -349,3 +349,48 @@ pub(crate) fn send_down_message(
     }
     rt.enqueue_actor(watcher_id);
 }
+
+#[cfg(test)]
+mod exit_signal_conformance_tests {
+    use super::*;
+
+    #[test]
+    fn normal_exit_notifies_trapping_link_without_killing_it() {
+        let mut rt = Runtime::new();
+        let source = rt.spawn_actor(Box::new(|| vec![]));
+        let peer = rt.spawn_actor(Box::new(|| vec![]));
+        rt.actors.get_mut(&peer).unwrap().trap_exits = true;
+        rt.link_actors(source, peer);
+
+        rt.exit_actor(source, ExitReason::Normal);
+
+        assert!(!rt.actors.contains_key(&source));
+        let peer_actor = rt.actors.get_mut(&peer).expect("trapping peer survives");
+        let exit_signal = peer_actor
+            .mailbox
+            .pop()
+            .expect("normal exit must notify a trapping linked actor");
+        assert_eq!(exit_signal.priority, MessagePriority::System);
+        assert_eq!(exit_signal.sender, source);
+        assert_eq!(exit_signal.behavior_id, 0);
+        assert_eq!(
+            exit_signal.payload.as_slice(),
+            &[Value::int(source as i64), Value::int(peer as i64)]
+        );
+        assert!(peer_actor.mailbox.is_empty());
+    }
+
+    #[test]
+    fn normal_exit_does_not_notify_or_kill_nontrapping_link() {
+        let mut rt = Runtime::new();
+        let source = rt.spawn_actor(Box::new(|| vec![]));
+        let peer = rt.spawn_actor(Box::new(|| vec![]));
+        rt.link_actors(source, peer);
+
+        rt.exit_actor(source, ExitReason::Normal);
+
+        assert!(!rt.actors.contains_key(&source));
+        let peer_actor = rt.actors.get(&peer).expect("normal exit must not kill peer");
+        assert!(peer_actor.mailbox.is_empty());
+    }
+}
