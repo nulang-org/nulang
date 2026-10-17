@@ -55,10 +55,11 @@ steps:
       - apt-get update
       - DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-dev pkg-config
       - rustup component add rustfmt clippy
+      - python3 -m unittest discover -s scripts/tests -p test_woodpecker_rust_concurrency.py
       - cargo fmt --all -- --check
-      - cargo check --all-targets --no-default-features
-      - cargo check --all-targets
-      - cargo clippy --all-targets --no-default-features -- -D clippy::correctness
-      - cargo test --no-default-features
-      - cargo test
+      - cargo check --locked --all-targets --no-default-features
+      - cargo check --locked --all-targets
+      - cargo clippy --locked --all-targets --no-default-features -- -D clippy::correctness
+      - cargo test --locked --no-default-features
+      - cargo test --locked
       - git diff --check
