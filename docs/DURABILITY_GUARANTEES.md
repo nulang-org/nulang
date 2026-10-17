@@ -65,6 +65,34 @@ blanket exactly-once guarantee for an uncooperative provider.
 The configured backend owns retry, deduplication, and commit semantics. Nulang
 delegates rather than inferring a stronger guarantee.
 
+## Compiled async-effect identity bridge (experimental)
+
+`DurableEffectSpec::from_compiled_async_site` accepts a `CodeModule`, exact
+`PerformAsync` program counter, stable actor/turn identity, and dynamic site
+occurrence. It rejects missing site metadata, a non-`PerformAsync` opcode, a
+constant-pool operation mismatch, and a missing execution key. It derives the
+same logical `DurableEffectId` as compiler-owned semantic-site identity rather
+than inventing another effect identifier in every provider integration. Callers
+must first admit a verified/pinned compiled artifact: checking an opcode and
+constant does not establish semantic-ID provenance from untrusted metadata.
+
+`tests/effect_site_artifact_metadata.rs` now checks this bridge against a
+compiled `.nula` actor behavior, an NBC encode/decode round trip, formatting
+changes, a simulated provider commit before local receipt, repeat dispatch with
+the same idempotency key, and replay/mismatch behavior in `MemoryStore`.
+
+**This is not a .nula end-to-end durability guarantee.** The test invokes the
+coordinator directly from Rust; the production bytecode effect callback is
+not yet forced through this coordinator. `from_compiled_async_site` only
+constructs a validated specification: it does not persist a `Prepared` intent,
+dispatch the provider, or enforce provider cooperation. Full acceptance still
+requires a VM/host dispatch adapter that journals *before* the external call,
+tracks replay-stable turn keys and invocation occurrence across process restarts,
+integrates terminal receipts atomically with the owning turn, and injects real
+restart/failover faults. This work must preserve source-level effect authority
+checks and never reinterpret `DeliverySemantics` as a stronger guarantee than
+the external provider supplies.
+
 ## What is not yet a production-wide guarantee
 
 Passing this gate does **not** prove that every `perform`, workflow activity,
