@@ -228,7 +228,10 @@ fn verify_crash_recovery(stage: &str) {
             REQUEST,
             |_, _| panic!("revoked grant must not redispatch provider"),
         );
-        assert!(matches!(error, Err(DurableAsyncDispatchError::Authorization(_))));
+        assert!(matches!(
+            error,
+            Err(DurableAsyncDispatchError::Authorization(_))
+        ));
         assert_eq!(store.latest_sequence(ACTOR_ID), 1);
         assert!(provider_path.exists(), "provider receipt remains recoverable");
     }
