@@ -50,10 +50,12 @@ fn empty_snapshot() -> ActorSnapshot {
 /// performed in Criterion setup and excluded from the timed body.
 fn bench_memory_store(c: &mut Criterion) {
     c.bench_function("persist/memory_store_empty", |b| {
-        b.iter_batched(
-            || (MemoryStore::new(), empty_snapshot()),
-            |(mut store, snapshot)| {
-                store.save_snapshot(snapshot).expect("save snapshot");
+        b.iter_batched_ref(
+            || (MemoryStore::new(), Some(empty_snapshot())),
+            |(store, snapshot)| {
+                store
+                    .save_snapshot(snapshot.take().expect("fresh benchmark snapshot"))
+                    .expect("save snapshot");
                 black_box(store.load_snapshot(1));
             },
             BatchSize::SmallInput,
@@ -64,10 +66,12 @@ fn bench_memory_store(c: &mut Criterion) {
     for (label, bytes) in [("1kb", 1024usize), ("1mb", 1024 * 1024)] {
         group.throughput(Throughput::Bytes(bytes as u64));
         group.bench_with_input(BenchmarkId::from_parameter(label), &bytes, |b, &bytes| {
-            b.iter_batched(
-                || (MemoryStore::new(), snapshot_with_payload(bytes)),
-                |(mut store, snapshot)| {
-                    store.save_snapshot(snapshot).expect("save snapshot");
+            b.iter_batched_ref(
+                || (MemoryStore::new(), Some(snapshot_with_payload(bytes))),
+                |(store, snapshot)| {
+                    store
+                        .save_snapshot(snapshot.take().expect("fresh benchmark snapshot"))
+                        .expect("save snapshot");
                     black_box(store.load_snapshot(1));
                 },
                 BatchSize::SmallInput,

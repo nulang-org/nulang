@@ -39,7 +39,7 @@ fn peer_populated_scheduler(count: usize) -> Scheduler {
     scheduler
 }
 
-fn drain_owner(scheduler: Scheduler) -> usize {
+fn drain_owner(scheduler: &Scheduler) -> usize {
     let mut drained = 0usize;
     while let Some(actor_id) = scheduler.dequeue() {
         black_box(actor_id);
@@ -48,7 +48,7 @@ fn drain_owner(scheduler: Scheduler) -> usize {
     black_box(drained)
 }
 
-fn drain_worker_zero(scheduler: Scheduler) -> usize {
+fn drain_worker_zero(scheduler: &Scheduler) -> usize {
     let mut drained = 0usize;
     while let Some(actor_id) = scheduler.next_task(0) {
         black_box(actor_id);
@@ -63,7 +63,7 @@ fn bench_global_owner_dispatch(c: &mut Criterion) {
     for count in [1_000usize, 10_000] {
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
-            b.iter_batched(
+            b.iter_batched_ref(
                 || populated_global_scheduler(count),
                 |scheduler| {
                     let drained = drain_owner(scheduler);
@@ -83,7 +83,7 @@ fn bench_mixed_priority_owner_dispatch(c: &mut Criterion) {
     for count in [1_000usize, 10_000] {
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
-            b.iter_batched(
+            b.iter_batched_ref(
                 || populated_mixed_scheduler(count),
                 |scheduler| {
                     let drained = drain_owner(scheduler);
@@ -103,7 +103,7 @@ fn bench_peer_steal_dispatch(c: &mut Criterion) {
     for count in [1_000usize, 10_000] {
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
-            b.iter_batched(
+            b.iter_batched_ref(
                 || peer_populated_scheduler(count),
                 |scheduler| {
                     let drained = drain_worker_zero(scheduler);
