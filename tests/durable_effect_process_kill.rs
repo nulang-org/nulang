@@ -233,7 +233,10 @@ fn verify_crash_recovery(stage: &str) {
             Err(DurableAsyncDispatchError::Authorization(_))
         ));
         assert_eq!(store.latest_sequence(ACTOR_ID), 1);
-        assert!(provider_path.exists(), "provider receipt remains recoverable");
+        assert!(
+            provider_path.exists(),
+            "provider receipt remains recoverable"
+        );
     }
 
     let mut calls = 0;
