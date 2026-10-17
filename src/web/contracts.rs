@@ -12,6 +12,7 @@
 use crate::ast::{
     AstModule, Decl, Expr, FunctionAnnotation, Literal, Param, WebRequestParamSource, WorkflowItem,
 };
+use crate::effect_checker::{flatten_decls, EffectChecker, EffectContext};
 use crate::lexer::Lexer;
 use crate::parser::Parser;
 use crate::types::EffectRow;
@@ -231,6 +232,23 @@ fn collect_contracts_recursive(path: &Path, out: &mut ContractCompilation) {
 
 /// Compile and validate static route contracts from a parsed module.
 pub fn compile_module_contracts(module: &AstModule) -> ContractCompilation {
+    // The Web manifest must not trust the handler's declared row alone:
+    // a static route can invoke unannotated local helpers which perform
+    // Request, Time, DB, and other ambient effects. Reuse the compiler's
+    // direct-call fixed-point inference rather than writing a second walker.
+    let declarations = flatten_decls(&module.decls);
+    let mut checker = EffectChecker::new();
+    let inference_error = checker
+        .register_function_rows(&declarations)
+        .err()
+        .map(|error| error.to_string());
+    let mut function_bodies = HashMap::new();
+    for declaration in &declarations {
+        if let Decl::Function { name, body, .. } = *declaration {
+            function_bodies.insert(name.as_str(), body.as_ref());
+        }
+    }
+
     let functions: HashMap<String, FunctionMeta> = module
         .decls
         .iter()
@@ -307,6 +325,31 @@ pub fn compile_module_contracts(module: &AstModule) -> ContractCompilation {
             );
         }
 
+        let mut route_effects = meta.map(|m| m.effects.clone()).unwrap_or_default();
+        if meta.and_then(|m| m.placement.as_deref()) == Some("static") {
+            match (&inference_error, handler_name.as_deref()) {
+                (Some(error), _) => out.diagnostics.push(format!(
+                    "{method} {path}: cannot verify static handler effects: {error}"
+                )),
+                (None, Some(name)) => match function_bodies.get(name) {
+                    Some(body) => match checker.infer_effects(&EffectContext::empty(), body) {
+                        Ok(row) => route_effects.extend(effect_names(Some(&row))),
+                        Err(error) => out.diagnostics.push(format!(
+                            "{method} {path}: cannot infer static handler effects: {error}"
+                        )),
+                    },
+                    None => out.diagnostics.push(format!(
+                        "{method} {path}: static route handler '{name}' has no local body for effect validation"
+                    )),
+                },
+                (None, None) => out.diagnostics.push(format!(
+                    "{method} {path}: static route requires a directly resolvable handler"
+                )),
+            }
+        }
+        route_effects.sort();
+        route_effects.dedup();
+
         out.routes.push(RouteContract {
             method,
             path,
@@ -324,7 +367,7 @@ pub fn compile_module_contracts(module: &AstModule) -> ContractCompilation {
                 .unwrap_or_default(),
             response_type: meta.and_then(|m| m.response_type.clone()),
             error_type: meta.and_then(|m| m.error_type.clone()),
-            effects: meta.map(|m| m.effects.clone()).unwrap_or_default(),
+            effects: route_effects,
             reference_capability: meta.and_then(|m| m.reference_capability.clone()),
             placement: meta.and_then(|m| m.placement.clone()),
         });
