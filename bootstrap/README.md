@@ -34,22 +34,20 @@ nulang out.nbc                          # VM runs the compiled program → 7
 The Rust host (`nulang`) runs `compile_hex.nula`; the hex output is converted
 to `.nbc` binary (RFC 0001) by `fixup_hex.py` + `hex2nbc.py`.
 
-### Stage 2 (In Progress — Self-compiling)
-A full Nulang Core parser + type-checker + code generator, written in Nulang
-Core, that compiles itself. `verify.sh` checks 1–6 are passing: single
-expressions, recursion (fib), and multi-fn programs compile and run through
-`compile_hex.nula`.
+### Stage 2 (Restricted-subset self-compilation verified historically)
+The Nulang-written `compile_hex.nula` emitter can compile its own
+`prep_core.py`-transformed source into executable `.nbc`. Check 7 in
+`bootstrap/verify.sh` is enabled and compares its outputs with the host-run
+emitter over six Core expressions. Commit
+[`0c19d60`](https://github.com/nulang-org/nulang/commit/0c19d60a01ad5679ebfc3bb64947fcb98141738b)
+records this oracle passing on 2026-09-11. The earlier disabled-check-7
+investigation in `CHECK7_STATUS.md` is historical, not the current gate.
 
-**Known blocker:** the self-compile oracle (check 7) is disabled. The host
-compiler can build `bootstrap/self_compile.nbc` from `prep_core.py` output,
-but running the self-hosted compiler on any input returns a closure value
-(e.g. `#Value(7ff7000000000068)`) instead of hex bytecode. The closure is
-created while the program builds its top-level function table; the final
-`main()` call does not execute or does not return unit. The root cause is
-still under investigation — it is **not** the previously suspected host
-register-spill bug (simple deep let-chains and effect calls inside functions
-compile correctly in isolation). See `bootstrap/diagnose_self_host.py` for
-an automated dump of each pipeline stage.
+This is **not a fully self-hosted Nulang compiler**: the bootstrap accepts a
+restricted expression subset rather than full modules, types and effects;
+Python still performs source preprocessing and bytecode fixups, and the
+Rust-implemented Nulang VM executes the resulting compiler. The independent
+CI gate and its evidence limitations are described in [STATUS.md](STATUS.md).
 
 ### Stage 3 (Planned — Independence)
 The Stage 2 `.nbc` is run on a minimal Core VM (pure interpreter, no JIT, no
@@ -73,15 +71,21 @@ bootstrap/
 ├── hex2nbc.py              # Hex text → .nbc binary
 ├── diagnose_self_host.py   # Diagnostic dump of the Stage 2 self-compile pipeline
 ├── spill_bug_repro.nula    # Register-spill regression repro
-└── verify.sh               # End-to-end bootstrap verification (run: bash verify.sh)
+├── verify.sh               # Existing seven-check bootstrap verification
+├── verify_differential.py  # Stage 1 vs Stage 2 emitted code + executed output
+├── fixtures/differential.json # Curated expected-outcome corpus
+└── STATUS.md               # Evidence, limitations, and next gates
 ```
 
 ## Build & Test
 
 ```bash
-# Run the self-hosted pipeline end-to-end. Checks 1–6 pass; check 7 (the
-# Stage 2 self-compile oracle) is currently disabled.
-bash bootstrap/verify.sh
+# Run existing checks 1–7 (includes the enabled Stage 2 self-compile oracle).
+NULANG_BIN=/tmp/cargo-target/debug/nulang bash bootstrap/verify.sh
+
+# Run the independent bootstrap-generation differential corpus.
+python3 -m unittest discover -s scripts/tests -p test_bootstrap_differential.py
+python3 bootstrap/verify_differential.py --nulang /tmp/cargo-target/debug/nulang
 
 # Single expression through the self-hosting pipeline:
 echo '1 + 2 * 3' | nulang bootstrap/compile_hex.nula |
@@ -94,8 +98,13 @@ python3 bootstrap/diagnose_self_host.py [smoke_expr]
 ```
 
 `verify.sh` and `diagnose_self_host.py` accept
-`NULANG_BIN=/path/to/nulang bash bootstrap/verify.sh` to skip the `cargo run`
-rebuild.
+`NULANG_BIN=/path/to/nulang` to skip the `cargo run` rebuild. Build the CLI
+first with `cargo build --locked --bin nulang`. Cargo's checked-in
+`.cargo/config.toml` currently places the executable at
+`/tmp/cargo-target/debug/nulang`, not `target/debug/nulang`. The differential runner
+requires `--nulang` and uses temporary output files rather than modifying the
+checkout. The checked-in fixture set is intentionally small and does not
+establish Rust-frontend equivalence.
 
 ## Core Constraints
 

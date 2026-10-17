@@ -1,0 +1,41 @@
+name: Bootstrap contract
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'bootstrap/**'
+      - 'scripts/tests/test_bootstrap_differential.py'
+      - '.github/workflows/bootstrap-contract.yml'
+  pull_request:
+    paths:
+      - 'bootstrap/**'
+      - 'scripts/tests/test_bootstrap_differential.py'
+      - '.github/workflows/bootstrap-contract.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bootstrap-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate harness contract
+        run: python3 -m unittest discover -s scripts/tests -p test_bootstrap_differential.py
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build reference host once
+        run: cargo build --locked --bin nulang
+      - name: Verify existing seven-stage bootstrap checks
+        run: |
+          test -x /tmp/cargo-target/debug/nulang
+          NULANG_BIN=/tmp/cargo-target/debug/nulang bash bootstrap/verify.sh
+      - name: Differential bootstrap corpus (host vs self-compiled)
+        run: python3 bootstrap/verify_differential.py --nulang /tmp/cargo-target/debug/nulang

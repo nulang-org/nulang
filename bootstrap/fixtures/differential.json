@@ -1,0 +1,8 @@
+[
+  {"id": "arithmetic_precedence", "source": "1 + 2 * 3", "expected": "7"},
+  {"id": "let_binding", "source": "let x = 42 in x + 1", "expected": "43"},
+  {"id": "true_branch", "source": "if 1 < 2 then 100 else 200", "expected": "100"},
+  {"id": "boolean_negation", "source": "not false", "expected": "true"},
+  {"id": "closure_application", "source": "(fn(x) => x + 1)(41)", "expected": "42"},
+  {"id": "recursion", "source": "let fib = fn(n) => if n < 2 then n else fib(n - 1) + fib(n - 2) in fib(10)", "expected": "55"}
+]
