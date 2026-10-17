@@ -39,6 +39,7 @@ mod grain;
 mod network;
 mod object_store;
 mod orca_cycle;
+mod wide_int_registers;
 mod supervision;
 mod supervisor;
 pub use distributed_context::{
@@ -119,6 +120,7 @@ pub use network::NetworkTransport;
 pub use network::*;
 pub use object_store::*;
 pub use orca_cycle::*;
+pub use wide_int_registers::*;
 pub use persistence::*;
 pub use process_groups::*;
 pub use registry::*;
