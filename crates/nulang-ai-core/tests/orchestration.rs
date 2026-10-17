@@ -120,7 +120,6 @@ fn progress_ledger_round_trips_and_is_goal_bound() {
     assert!(err.contains("bound to goal"));
 }
 
-
 #[test]
 fn bounded_ready_batch_prioritizes_longest_unfinished_dependency_chain() {
     let goal = Goal::new("demo", "parallel research", 20.0);
@@ -137,21 +136,43 @@ fn bounded_ready_batch_prioritizes_longest_unfinished_dependency_chain() {
     // The input order puts the shortest branch first deliberately.
     let mut graph = GoalGraph {
         goal,
-        tasks: vec![shallow.clone(), middle.clone(), long.clone(), middle_child, long_child, long_grandchild],
+        tasks: vec![
+            shallow.clone(),
+            middle.clone(),
+            long.clone(),
+            middle_child,
+            long_child,
+            long_grandchild,
+        ],
         agents: vec![],
     };
-    assert_eq!(graph.ready_task_ids().unwrap(), vec![shallow.id, middle.id, long.id]);
-    assert_eq!(graph.critical_path_ready_task_ids(2).unwrap(), vec![long.id, middle.id]);
-    assert_eq!(graph.critical_path_ready_task_ids(0).unwrap(), Vec::<Uuid>::new());
+    assert_eq!(
+        graph.ready_task_ids().unwrap(),
+        vec![shallow.id, middle.id, long.id]
+    );
+    assert_eq!(
+        graph.critical_path_ready_task_ids(2).unwrap(),
+        vec![long.id, middle.id]
+    );
+    assert_eq!(
+        graph.critical_path_ready_task_ids(0).unwrap(),
+        Vec::<Uuid>::new()
+    );
 
     // A cancelled branch must not artificially inflate its parent's priority.
     graph.tasks[4].status = TaskStatus::Cancelled;
-    assert_eq!(graph.critical_path_ready_task_ids(3).unwrap(), vec![middle.id, shallow.id, long.id]);
+    assert_eq!(
+        graph.critical_path_ready_task_ids(3).unwrap(),
+        vec![middle.id, shallow.id, long.id]
+    );
 }
 
 #[test]
 fn bounded_ready_batch_rejects_invalid_graph_even_when_capacity_is_zero() {
     let mut graph = graph_with_dependency();
     graph.tasks[1].dependencies = vec![Uuid::new_v4()];
-    assert!(graph.critical_path_ready_task_ids(0).unwrap_err().contains("unknown dependency"));
+    assert!(graph
+        .critical_path_ready_task_ids(0)
+        .unwrap_err()
+        .contains("unknown dependency"));
 }
