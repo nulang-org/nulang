@@ -99,6 +99,8 @@ or a signed inline integer, and rejects closure environments or spilled
 slots. It explicitly refuses exports containing full-width integers that
 do not fit the old 48-bit payload. No raw tagged pointer escapes.
 
+The VM now exposes `VM::install_numeric_rooted_frame`, which checks the entire rooted frame and installs it using the existing `set_current_frame` only if every value is representable by the legacy inline ABI. Failed wide-value exports leave the VM's previous frame unchanged. This is a real production VM entrypoint, but intentionally not a wide-integer execution path.
+
 A semantic, pointer-free `FrameInt64Snapshot` can capture signed 64-bit
 values and restore them as *new* actor-owned ORCA roots. This is only an
 in-process staging snapshot, **not** a versioned persistence, wire or
