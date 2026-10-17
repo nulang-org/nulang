@@ -391,7 +391,10 @@ mod exit_signal_conformance_tests {
         rt.exit_actor(source, ExitReason::Normal);
 
         assert!(!rt.actors.contains_key(&source));
-        let peer_actor = rt.actors.get(&peer).expect("normal exit must not kill peer");
+        let peer_actor = rt
+            .actors
+            .get(&peer)
+            .expect("normal exit must not kill peer");
         assert!(peer_actor.mailbox.is_empty());
     }
 }
