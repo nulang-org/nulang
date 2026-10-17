@@ -264,6 +264,34 @@ mod tests {
     }
 
     #[test]
+    fn static_placement_rejects_request_bound_query_parameters() {
+        use crate::web::contracts::{RequestParamBindingContract, RequestParamSource};
+        let compilation = ContractCompilation {
+            routes: vec![RouteContract {
+                method: "GET".into(),
+                path: "/search".into(),
+                handler: Some("search".into()),
+                handler_params: vec![HandlerParamContract {
+                    name: "term".into(),
+                    ty: Some("String".into()),
+                    capability: None,
+                    request: Some(RequestParamBindingContract {
+                        source: RequestParamSource::Query,
+                        source_name: "term".into(),
+                    }),
+                }],
+                placement: Some("static".into()),
+                ..RouteContract::default()
+            }],
+            diagnostics: Vec::new(),
+        };
+        let errors = validate_compilation(compilation).unwrap_err();
+        assert!(errors.iter().any(|message| {
+            message.contains("static placement cannot bind request inputs")
+        }));
+    }
+
+    #[test]
     fn static_placement_preserves_explicit_pure_get_routes() {
         let compilation = ContractCompilation {
             routes: vec![RouteContract {
