@@ -20,11 +20,20 @@ pub(super) struct StagedWebOutput {
 impl StagedWebOutput {
     pub(super) fn prepare(target: &Path) -> io::Result<Self> {
         let parent = target.parent().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "web output has no parent directory")
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "web output has no parent directory",
+            )
         })?;
-        let name = target.file_name().and_then(|name| name.to_str()).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "web output has no valid directory name")
-        })?;
+        let name = target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "web output has no valid directory name",
+                )
+            })?;
         fs::create_dir_all(parent)?;
         let serial = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
         let label = format!("{}-{}-{}", name, std::process::id(), serial);
@@ -117,7 +126,10 @@ fn copy_regular_tree(source: &Path, destination: &Path) -> io::Result<()> {
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("unsafe entry in prior web output: {}", entry.path().display()),
+                format!(
+                    "unsafe entry in prior web output: {}",
+                    entry.path().display()
+                ),
             ));
         }
     }
@@ -167,7 +179,10 @@ mod tests {
             fs::write(stage.path().join("index.html"), b"partial").unwrap();
             // Simulate build failure by dropping the stage without publication.
         }
-        assert_eq!(fs::read(fixture.output().join("index.html")).unwrap(), b"old");
+        assert_eq!(
+            fs::read(fixture.output().join("index.html")).unwrap(),
+            b"old"
+        );
     }
 
     #[test]
@@ -179,7 +194,10 @@ mod tests {
         let stage = StagedWebOutput::prepare(&fixture.output()).unwrap();
         fs::write(stage.path().join("index.html"), b"new").unwrap();
         stage.publish().unwrap();
-        assert_eq!(fs::read(fixture.output().join("index.html")).unwrap(), b"new");
+        assert_eq!(
+            fs::read(fixture.output().join("index.html")).unwrap(),
+            b"new"
+        );
         assert_eq!(
             fs::read(fixture.output().join("unmanaged.txt")).unwrap(),
             b"retain"
