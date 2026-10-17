@@ -359,9 +359,13 @@ impl Mailbox {
         }
     }
 
-    fn release_slot(&self) {
-        let previous = self.queued_count.fetch_sub(1, Ordering::Relaxed);
-        debug_assert!(previous > 0, "mailbox logical count underflow");
+    /// Called only while holding exclusive mailbox access (pop/commit).
+    /// Concurrent producers use atomic reservation through `push(&self)`,
+    /// but Rust's exclusive borrow permits a plain counter update here.
+    fn release_slot(&mut self) {
+        let count = self.queued_count.get_mut();
+        debug_assert!(*count > 0, "mailbox logical count underflow");
+        *count = (*count).wrapping_sub(1);
     }
 
     /// Push a message from a concurrent producer.
@@ -379,11 +383,18 @@ impl Mailbox {
     }
 
     /// Push a message from the scheduler thread.
+    ///
+    /// Exclusive `&mut self` access proves that no concurrent producer can
+    /// reserve a slot during this operation in safe Rust. Update the logical
+    /// count directly instead of paying atomic RMW/CAS costs per local send.
+    /// Shared `push(&self)` retains its atomic reservation protocol.
     pub fn push_local(&mut self, msg: Message) -> Result<(), Message> {
         let system = msg.priority == MessagePriority::System;
-        if !self.reserve_slot(system) {
+        let count = self.queued_count.get_mut();
+        if !system && self.capacity != 0 && *count >= self.capacity {
             return Err(msg);
         }
+        *count = (*count).wrapping_add(1);
         self.local_queue.push_back(msg);
         Ok(())
     }
