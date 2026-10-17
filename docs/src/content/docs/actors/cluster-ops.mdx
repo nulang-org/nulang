@@ -13,7 +13,7 @@ The [Distribution & Clustering](/actors/distribution/) page describes the wire p
 The `nulang node` command starts a network-enabled node (shard 0, TCP transport) that runs until SIGINT/SIGTERM:
 
 ```bash
-nulang node --listen 127.0.0.1:9000
+nulang node --listen 127.0.0.1:9000 --plaintext
 ```
 
 On startup the node prints its bind address and its **node id** — an 8-byte random identifier assigned when distribution is enabled. You will need this id to target the node from `spawn@` expressions:
@@ -32,10 +32,10 @@ Full flag list (from `nulang node --help`):
 | `--tls-cert <PATH>` | — | Server certificate (PEM) for mutual TLS |
 | `--tls-key <PATH>` | — | Server private key (PEM) |
 | `--tls-ca <PATH>` | — | CA certificate for mutual TLS |
-| `--plaintext` | — | Disable TLS (insecure, dev only) |
+| `--plaintext` | — | Explicit plaintext opt-out (loopback listener and loopback seed only) |
 
 :::caution
-If no TLS material is provided, the node logs a warning and uses the **plaintext** transport. Without `--plaintext`, supplying `--tls-cert`/`--tls-key`/`--tls-ca` enables mutual TLS (see [RFC 0013](https://github.com/nulang/nulang/blob/main/RFC/0013-authenticated-transport.md)). Treat plaintext as development-only.
+`nulang node` fails startup unless **all three** `--tls-cert`, `--tls-key`, and `--tls-ca` files are supplied and nonempty, or `--plaintext` is specified explicitly. Missing, partial, or unreadable TLS material never causes a plaintext fallback. Plaintext is limited to a loopback **bind address and seed address**; do not use it for exposed deployments. For production clusters, configure mutual TLS with verified peer identities (see [RFC 0013](https://github.com/nulang-org/nulang/blob/main/RFC/0013-authenticated-transport.md)). The lower-level Rust `TlsConfig::PlaintextInsecure` API does **not** inherit this CLI startup policy.
 :::
 
 ## Joining a Cluster with `--seed`
@@ -44,13 +44,17 @@ A **seed** is simply a node you already trust to be reachable: a joiner dials th
 
 ```bash
 # Terminal 1 — the seed (first node)
-nulang node --listen 127.0.0.1:9000
+nulang node --listen 127.0.0.1:9000 --plaintext
 
 # Terminal 2 — join through the seed
-nulang node --listen 127.0.0.1:9001 --seed 127.0.0.1:9000
+nulang node --listen 127.0.0.1:9001 --seed 127.0.0.1:9000 --plaintext
 ```
 
 TCP links are fully duplex — a joiner that only dials out still receives gossip and messages inbound, so NAT-style outbound-only setups work.
+:::caution
+The CLI blocks a non-loopback *initial seed* in plaintext mode. This is not a general outbound network sandbox: embedders using `TlsConfig::PlaintextInsecure` or nodes receiving other peers through membership discovery must enforce network isolation separately. Never expose plaintext distribution to untrusted networks.
+:::
+
 
 ## Cluster Formation and Split-Brain Protection
 
@@ -69,8 +73,8 @@ By default there is **no quorum logic**: a partition leaves both sides running i
 
 ```bash
 # Both nodes agree on the expected cluster size
-nulang node --listen 127.0.0.1:9000 --expected-nodes 2
-nulang node --listen 127.0.0.1:9001 --seed 127.0.0.1:9000 --expected-nodes 2
+nulang node --listen 127.0.0.1:9000 --expected-nodes 2 --plaintext
+nulang node --listen 127.0.0.1:9001 --seed 127.0.0.1:9000 --expected-nodes 2 --plaintext
 ```
 
 :::note
@@ -93,7 +97,8 @@ fn store_handler(actor: &mut Actor, args: &[Value]) {
 }
 
 let mut rt = Runtime::new();
-rt.enable_distribution("0.0.0.0:9000".parse().unwrap(), TlsConfig::PlaintextInsecure)?;
+// Local-only demonstration; use MutualTls with a CA for networked deployments.
+rt.enable_distribution("127.0.0.1:9000".parse().unwrap(), TlsConfig::PlaintextInsecure)?;
 rt.register_spawnable_behavior("store", store_handler);
 rt.run_distributed_node();
 ```

@@ -31,8 +31,8 @@
 
 | ID | Threat | Mitigation | Status |
 |---|---|---|---|
-| D1 | **Node impersonation** — attacker spoofs another node's ID in the NUL0 handshake | `TlsConfig::MutualTls` enforces client certs. Node IDs are validated against the TLS identity. | Partial: TLS config exists but is not CLI-wired yet. |
-| D2 | **Wire-protocol tampering** — attacker modifies length-prefixed frames in transit | TLS encrypts the TCP stream. Big-endian frame encoding is deterministic, so truncation is detectable. | Partial: TLS available but not default. |
+| D1 | **Node impersonation** — attacker spoofs another node's ID in the NUL0 handshake | `TlsConfig::MutualTls` enforces client certs. Node IDs are validated against the TLS identity. | CLI requires a complete mTLS configuration unless explicitly opting into loopback-only plaintext; the embedder can still select insecure transport. |
+| D2 | **Wire-protocol tampering** — attacker modifies length-prefixed frames in transit | TLS encrypts the TCP stream. Big-endian frame encoding is deterministic, so truncation is detectable. | CLI has no implicit plaintext fallback; explicit local plaintext and Rust embedder plaintext remain unauthenticated. |
 | D3 | **Split-brain** — network partition causes two clusters to diverge | `StaticQuorumResolver` (configurable via `set_cluster_config`) requires a quorum to accept membership changes. | Available: operator must configure expected node count. |
 | D4 | **CRDT delta flooding** — malicious node sends oversized delta-sync packets | `sync_crdts_delta` limits delta batches to changed entries only. Full sync is rate-limited by `CRDT_FULL_SYNC_INTERVAL` (16 rounds). | Implemented. |
 | D5 | **Remote spawn abuse** — attacker spawns arbitrary behaviors on remote nodes | `register_spawnable_behavior` is required; unknown names return `SpawnResponse{success:false}`. | Implemented. |
@@ -106,7 +106,7 @@ An attacker uploads a `.wasm` module to a Nulang service that runs user code.
 
 ## 4. Security Checklist for Operators
 
-- [ ] Enable `TlsConfig::MutualTls` for all production clusters (not default yet).
+- [ ] Configure `--tls-cert`, `--tls-key`, and `--tls-ca` for production `nulang node` clusters. Use `TlsConfig::MutualTls` for production Rust embedders; CLI `--plaintext` is restricted to loopback bind/seed only.
 - [ ] Configure `StaticQuorumResolver` with `expected_nodes > 1` to prevent split-brain.
 - [ ] Use `--ffi-sandbox --ffi-allow /path/to/lib.so` in production. Never use `--ffi-sandbox` with an empty allowlist (it will deny all FFI).
 - [ ] Monitor `Mailbox` depths and actor reduction counts for DoS.
