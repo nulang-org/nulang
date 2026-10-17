@@ -1,6 +1,7 @@
 //! Source-compiled metadata through durable intent, provider dedup, and receipt.
 //! This does not exercise the VM's live PerformAsync callback or process restarts.
 
+use nulang::authority::{AuthorityGrant, AuthorityManifest};
 use nulang::bytecode::CodeModule;
 use nulang::durable_effect_runtime::{
     DurableAsyncDispatchError, DurableEffectCoordinator,
@@ -10,10 +11,26 @@ use nulang::lexer::Lexer;
 use nulang::mir_codegen;
 use nulang::mir_lower;
 use nulang::parser::Parser;
-use nulang::runtime::{MemoryStore, PersistenceStore};
+use nulang::runtime::{Actor, MemoryStore, PersistenceStore};
 use nulang::typechecker::TypeChecker;
 use std::collections::BTreeMap;
 use std::io;
+
+fn inference_grant() -> AuthorityGrant {
+    AuthorityGrant::Other {
+        namespace: "Inference".into(),
+        operation: "ask".into(),
+        argument: None,
+    }
+}
+
+fn authorized_actor() -> Actor {
+    let mut actor = Actor::new(42, "Payments", 16);
+    actor.persistent = true;
+    actor.activation_epoch = 1;
+    actor.install_authority_manifest(&AuthorityManifest::from_grants([inference_grant()]));
+    actor
+}
 
 fn compiled_source() -> CodeModule {
     let source =
@@ -33,6 +50,8 @@ fn compiled_source() -> CodeModule {
 fn compiled_effect_dispatch_records_receipt_and_never_reinvokes_completed_provider() {
     let module = compiled_source();
     let pc = module.effect_sites[0].pc;
+    let actor = authorized_actor();
+    let grant = inference_grant();
     let request = b"order=42&cents=100";
     let mut store = MemoryStore::new();
     let mut calls = 0;
@@ -41,6 +60,7 @@ fn compiled_effect_dispatch_records_receipt_and_never_reinvokes_completed_provid
         let mut coordinator = DurableEffectCoordinator::new(&mut store, 42, 1);
         coordinator
             .execute_compiled_async_with_deduplication(
+                &actor, &grant,
                 &module,
                 pc,
                 "order:42:payment",
@@ -63,6 +83,7 @@ fn compiled_effect_dispatch_records_receipt_and_never_reinvokes_completed_provid
     let mut recovered = DurableEffectCoordinator::new(&mut store, 42, 1);
     let replay = recovered
         .execute_compiled_async_with_deduplication(
+                &actor, &grant,
             &module,
             pc,
             "order:42:payment",
@@ -79,6 +100,8 @@ fn compiled_effect_dispatch_records_receipt_and_never_reinvokes_completed_provid
 fn lost_provider_response_keeps_prepared_intent_and_retries_same_key() {
     let module = compiled_source();
     let pc = module.effect_sites[0].pc;
+    let actor = authorized_actor();
+    let grant = inference_grant();
     let mut store = MemoryStore::new();
     let mut provider = BTreeMap::<String, Vec<u8>>::new();
     let mut calls = 0;
@@ -86,6 +109,7 @@ fn lost_provider_response_keeps_prepared_intent_and_retries_same_key() {
     {
         let mut coordinator = DurableEffectCoordinator::new(&mut store, 42, 1);
         let failed = coordinator.execute_compiled_async_with_deduplication(
+                &actor, &grant,
             &module,
             pc,
             "order:42:payment",
@@ -111,6 +135,7 @@ fn lost_provider_response_keeps_prepared_intent_and_retries_same_key() {
         let mut recovered = DurableEffectCoordinator::new(&mut store, 42, 1);
         let receipt = recovered
             .execute_compiled_async_with_deduplication(
+                &actor, &grant,
                 &module,
                 pc,
                 "order:42:payment",
@@ -136,12 +161,15 @@ fn lost_provider_response_keeps_prepared_intent_and_retries_same_key() {
 fn metadata_or_request_drift_never_reaches_provider() {
     let module = compiled_source();
     let pc = module.effect_sites[0].pc;
+    let actor = authorized_actor();
+    let grant = inference_grant();
     let mut store = MemoryStore::new();
     let mut mismatched = module.clone();
     mismatched.effect_sites[0].effect_operation = "Other.charge".into();
     {
         let mut coordinator = DurableEffectCoordinator::new(&mut store, 42, 1);
         let failure = coordinator.execute_compiled_async_with_deduplication(
+                &actor, &grant,
             &mismatched,
             pc,
             "order:42:payment",
@@ -157,6 +185,7 @@ fn metadata_or_request_drift_never_reaches_provider() {
         let mut coordinator = DurableEffectCoordinator::new(&mut store, 42, 1);
         coordinator
             .execute_compiled_async_with_deduplication(
+                &actor, &grant,
                 &module,
                 pc,
                 "order:42:payment",
@@ -169,6 +198,7 @@ fn metadata_or_request_drift_never_reaches_provider() {
     let mut replay = DurableEffectCoordinator::new(&mut store, 42, 1);
     assert!(matches!(
         replay.execute_compiled_async_with_deduplication(
+                &actor, &grant,
             &module, pc, "order:42:payment", 0, b"charge=200",
             |_, _| panic!("request drift must not dispatch")
         ),
@@ -181,10 +211,13 @@ fn metadata_or_request_drift_never_reaches_provider() {
 fn stale_activation_does_not_call_provider_for_prepared_effect() {
     let module = compiled_source();
     let pc = module.effect_sites[0].pc;
+    let actor = authorized_actor();
+    let grant = inference_grant();
     let mut store = MemoryStore::new();
     {
         let mut first = DurableEffectCoordinator::new(&mut store, 42, 1);
         let failed = first.execute_compiled_async_with_deduplication(
+                &actor, &grant,
             &module, pc, "order:42:payment", 0, b"charge=100",
             |_, _| Err(io::Error::new(io::ErrorKind::TimedOut, "no receipt")),
         );
@@ -205,6 +238,7 @@ fn stale_activation_does_not_call_provider_for_prepared_effect() {
     }
     let mut stale = DurableEffectCoordinator::new(&mut store, 42, 1);
     let result = stale.execute_compiled_async_with_deduplication(
+                &actor, &grant,
         &module, pc, "order:42:payment", 0, b"charge=100",
         |_, _| panic!("stale owner must not redispatch"),
     );
