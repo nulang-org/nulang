@@ -10,8 +10,8 @@ use crate::durable_effect::{
     CompiledEffectSpecError, DurableEffectId, DurableEffectRecord, DurableEffectRecoveryAction,
     DurableEffectRequestMismatch, DurableEffectSpec,
 };
-use crate::primitives::{DeliverySemantics, EffectBoundary};
 use crate::durable_effect_persistence::DurableEffectPersistenceRecord;
+use crate::primitives::{DeliverySemantics, EffectBoundary};
 use crate::runtime::{
     DurableCommit, DurableTransition, PersistenceStore, DURABLE_TRANSITION_VERSION,
 };
@@ -159,7 +159,10 @@ impl<'a> DurableEffectCoordinator<'a> {
             // A completed receipt can be read without provider dispatch.
             // Prepared effects, however, must never authorize a stale or
             // unclaimed future activation to retry the external operation.
-            if !matches!(recovered, DurableEffectDispatchDecision::ReplayRecordedResult(_)) {
+            if !matches!(
+                recovered,
+                DurableEffectDispatchDecision::ReplayRecordedResult(_)
+            ) {
                 self.require_claimed_activation()?;
             }
             return Ok(recovered);
@@ -533,8 +536,11 @@ mod tests {
         }
         {
             let mut next = DurableEffectCoordinator::new(&mut store, 42, 2);
-            next.begin(spec(42, "turn:advance", DeliverySemantics::AtLeastOnce), b"other")
-                .unwrap();
+            next.begin(
+                spec(42, "turn:advance", DeliverySemantics::AtLeastOnce),
+                b"other",
+            )
+            .unwrap();
         }
         let mut stale = DurableEffectCoordinator::new(&mut store, 42, 1);
         assert!(matches!(
@@ -572,12 +578,17 @@ mod tests {
         {
             let mut first = DurableEffectCoordinator::new(&mut store, 42, 1);
             first.begin(prepared.clone(), b"request").unwrap();
-            first.complete(prepared.id, b"request", b"receipt".to_vec()).unwrap();
+            first
+                .complete(prepared.id, b"request", b"receipt".to_vec())
+                .unwrap();
         }
         {
             let mut next = DurableEffectCoordinator::new(&mut store, 42, 2);
-            next.begin(spec(42, "turn:advance", DeliverySemantics::AtLeastOnce), b"other")
-                .unwrap();
+            next.begin(
+                spec(42, "turn:advance", DeliverySemantics::AtLeastOnce),
+                b"other",
+            )
+            .unwrap();
         }
         let mut old = DurableEffectCoordinator::new(&mut store, 42, 1);
         assert_eq!(
