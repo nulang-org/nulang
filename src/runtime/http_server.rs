@@ -1529,4 +1529,26 @@ mod tests {
         let (history, _rx) = realtime_subscribe(room);
         assert_eq!(history, vec!["hello"]);
     }
+
+    #[test]
+    fn test_realtime_history_is_capped_even_without_subscribers() {
+        let room = "test:history-bounds-red-spec";
+        for n in 0..96 {
+            realtime_broadcast(room, &format!("event-{n}"));
+        }
+        let (history, _rx) = realtime_subscribe(room);
+        assert!(
+            history.len() <= 64,
+            "unattended rooms must not grow replay history without bound"
+        );
+        assert_eq!(history.last().map(String::as_str), Some("event-95"));
+    }
+
+    #[test]
+    fn test_realtime_rejects_oversized_broadcasts() {
+        let room = "test:oversized-realtime-red-spec";
+        realtime_broadcast(room, &"x".repeat(8 * 1024 + 1));
+        let (history, _rx) = realtime_subscribe(room);
+        assert!(history.is_empty(), "oversized events must not enter replay");
+    }
 }
