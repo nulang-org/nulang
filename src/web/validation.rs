@@ -202,6 +202,59 @@ mod tests {
     }
 
     #[test]
+    fn static_placement_fails_closed_for_request_or_external_effects() {
+        for effect in ["Request", "Respond", "DB", "Net", "IO", "Actor", "Realtime"] {
+            let compilation = ContractCompilation {
+                routes: vec![RouteContract {
+                    method: "GET".into(),
+                    path: "/account".into(),
+                    handler: Some("account".into()),
+                    effects: vec![effect.into()],
+                    placement: Some("static".into()),
+                    ..RouteContract::default()
+                }],
+                diagnostics: Vec::new(),
+            };
+            let errors = validate_compilation(compilation).unwrap_err();
+            assert!(errors.iter().any(|message| {
+                message.contains("GET /account") && message.contains("static placement")
+            }), "effect {effect} must not be statically prerendered");
+        }
+    }
+
+    #[test]
+    fn static_placement_rejects_dynamic_paths_and_request_bindings() {
+        let compilation = ContractCompilation {
+            routes: vec![RouteContract {
+                method: "GET".into(),
+                path: "/users/:id".into(),
+                handler: Some("show_user".into()),
+                placement: Some("static".into()),
+                ..RouteContract::default()
+            }],
+            diagnostics: Vec::new(),
+        };
+        let errors = validate_compilation(compilation).unwrap_err();
+        assert!(errors.iter().any(|message| message.contains("static placement")));
+    }
+
+    #[test]
+    fn static_placement_preserves_explicit_pure_get_routes() {
+        let compilation = ContractCompilation {
+            routes: vec![RouteContract {
+                method: "GET".into(),
+                path: "/about".into(),
+                handler: Some("about".into()),
+                effects: vec!["Render".into()],
+                placement: Some("static".into()),
+                ..RouteContract::default()
+            }],
+            diagnostics: Vec::new(),
+        };
+        assert!(validate_compilation(compilation).is_ok());
+    }
+
+    #[test]
     fn validate_compilation_rejects_invalid_contracts() {
         let compilation = ContractCompilation {
             routes: vec![contract("/users/{id: UserId}", Vec::new())],
