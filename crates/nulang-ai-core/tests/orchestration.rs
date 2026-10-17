@@ -119,3 +119,60 @@ fn progress_ledger_round_trips_and_is_goal_bound() {
     let err = progress.record_round(&other).unwrap_err();
     assert!(err.contains("bound to goal"));
 }
+
+#[test]
+fn bounded_ready_batch_prioritizes_longest_unfinished_dependency_chain() {
+    let goal = Goal::new("demo", "parallel research", 20.0);
+    let shallow = Task::new(goal.id, "shallow", ManagerKind::Research);
+    let middle = Task::new(goal.id, "middle", ManagerKind::Research);
+    let long = Task::new(goal.id, "long", ManagerKind::Research);
+    let mut middle_child = Task::new(goal.id, "middle child", ManagerKind::Research);
+    middle_child.dependencies.push(middle.id);
+    let mut long_child = Task::new(goal.id, "long child", ManagerKind::Research);
+    long_child.dependencies.push(long.id);
+    let mut long_grandchild = Task::new(goal.id, "long grandchild", ManagerKind::Research);
+    long_grandchild.dependencies.push(long_child.id);
+
+    // The input order puts the shortest branch first deliberately.
+    let mut graph = GoalGraph {
+        goal,
+        tasks: vec![
+            shallow.clone(),
+            middle.clone(),
+            long.clone(),
+            middle_child,
+            long_child,
+            long_grandchild,
+        ],
+        agents: vec![],
+    };
+    assert_eq!(
+        graph.ready_task_ids().unwrap(),
+        vec![shallow.id, middle.id, long.id]
+    );
+    assert_eq!(
+        graph.critical_path_ready_task_ids(2).unwrap(),
+        vec![long.id, middle.id]
+    );
+    assert_eq!(
+        graph.critical_path_ready_task_ids(0).unwrap(),
+        Vec::<Uuid>::new()
+    );
+
+    // A cancelled branch must not artificially inflate its parent's priority.
+    graph.tasks[4].status = TaskStatus::Cancelled;
+    assert_eq!(
+        graph.critical_path_ready_task_ids(3).unwrap(),
+        vec![middle.id, shallow.id, long.id]
+    );
+}
+
+#[test]
+fn bounded_ready_batch_rejects_invalid_graph_even_when_capacity_is_zero() {
+    let mut graph = graph_with_dependency();
+    graph.tasks[1].dependencies = vec![Uuid::new_v4()];
+    assert!(graph
+        .critical_path_ready_task_ids(0)
+        .unwrap_err()
+        .contains("unknown dependency"));
+}
