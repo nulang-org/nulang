@@ -923,6 +923,12 @@ impl PersistenceStore for MemoryStore {
             // sequence boundary. A stale activation must not establish the
             // first atomic tail over a newer snapshot's fencing epoch.
             if let Some(snapshot) = self.snapshots.get(&transition.actor_id) {
+                if snapshot.activation_epoch == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid zero legacy snapshot activation epoch",
+                    ));
+                }
                 if transition.activation_epoch < snapshot.activation_epoch {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
@@ -1955,11 +1961,11 @@ impl PersistenceStore for LibsqlStore {
                     }
                 };
                 if let Some(snapshot_epoch) = snapshot_epoch {
-                    if snapshot_epoch < 0 {
+                    if snapshot_epoch <= 0 {
                         let _ = tx.rollback().await;
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            "invalid negative legacy snapshot activation epoch",
+                            "invalid nonpositive legacy snapshot activation epoch",
                         ));
                     }
                     if transition.activation_epoch < snapshot_epoch as u64 {
