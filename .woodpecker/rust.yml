@@ -55,6 +55,7 @@ steps:
       - apt-get update
       - DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-dev pkg-config
       - rustup component add rustfmt clippy
+      - python3 -m unittest discover -s scripts/tests -p test_woodpecker_rust_concurrency.py
       - cargo fmt --all -- --check
       - cargo check --locked --all-targets --no-default-features
       - cargo check --locked --all-targets
