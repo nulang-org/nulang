@@ -1374,6 +1374,10 @@ impl LibsqlStore {
             tokio::runtime::Runtime::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let db = rt.block_on(async {
             libsql::Builder::new_remote(url.to_string(), auth_token.to_string())
+                // libSQL's built-in TLS uses unmaintained rustls 0.22 through
+                // hyper-rustls 0.25. Supply a Hyper 0.14-compatible native
+                // TLS connector with system certificate verification instead.
+                .connector(hyper_tls::HttpsConnector::new())
                 .build()
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
