@@ -1,0 +1,29 @@
+// Go-inspired byte encoding foundation: UTF-8 bytes + strict hexadecimal codec.
+// The arrays contain octets [0, 255]; malformed input must never be normalized.
+import stdlib::bytes
+
+fn show_hex(r: Result[String, ByteError]) -> String {
+    match r {
+        Ok(value) => value,
+        Error(_) => "error",
+    }
+}
+
+fn show_decoded(r: Result[[Int], ByteError]) -> String {
+    match r {
+        Ok(bytes) => show_hex(encode_hex(bytes)),
+        Error(_) => "error",
+    }
+}
+
+fn main() {
+    perform IO.print("empty=" + show_hex(encode_hex([])))
+    perform IO.print("boundaries=" + show_hex(encode_hex([0, 15, 16, 127, 128, 255])))
+    perform IO.print("roundtrip=" + show_decoded(decode_hex("00ff10aB")))
+    perform IO.print("utf8=" + show_hex(encode_hex(from_utf8("hé💡"))))
+    perform IO.print("odd=" + show_decoded(decode_hex("abc")))
+    perform IO.print("bad_digit=" + show_decoded(decode_hex("0g")))
+    perform IO.print("bad_byte_low=" + show_hex(encode_hex([-1])))
+    perform IO.print("bad_byte_high=" + show_hex(encode_hex([256])))
+    perform IO.print("empty_decoded=" + show_decoded(decode_hex("")))
+}
