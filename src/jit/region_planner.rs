@@ -127,7 +127,7 @@ pub(crate) fn direct_call_target(
                 };
                 return Some(idx);
             }
-            OpCode::ConstM1 if instr.op1 == FUNC_VALUE_REG => return None, // -1 is not a function
+            OpCode::ConstM1 if instr.op1 == FUNC_VALUE_REG => return None,
             OpCode::ConstU if instr.op3 == FUNC_VALUE_REG => {
                 let pool = instr.imm16() as usize;
                 return match module.constants.get(pool) {
@@ -135,7 +135,7 @@ pub(crate) fn direct_call_target(
                     _ => None,
                 };
             }
-            OpCode::Move if instr.op2 == FUNC_VALUE_REG => return None, // indirect
+            OpCode::Move if instr.op2 == FUNC_VALUE_REG => return None,
             _ => {}
         }
     }
@@ -222,9 +222,6 @@ pub(crate) fn compute_may_suspend(module: &crate::bytecode::CodeModule) -> Vec<b
     use crate::bytecode::OpCode;
     let n = module.function_table.len();
     let mut result = vec![false; n];
-    // Directly unsafe: contains a non-whitelisted opcode (effect/actor/
-    // foreign/suspending) or an indirect call (Call/ClosureCall whose target
-    // is not a statically-recovered direct callee).
     for i in 0..n {
         let start = module.function_table[i];
         let end = if i + 1 < n {
@@ -236,16 +233,14 @@ pub(crate) fn compute_may_suspend(module: &crate::bytecode::CodeModule) -> Vec<b
             let op = module.instructions[pc].opcode;
             if matches!(op, OpCode::Call | OpCode::ClosureCall) {
                 if direct_call_target(module, pc, start).is_none() {
-                    result[i] = true; // indirect call: unknown target
+                    result[i] = true;
                 }
-                // direct call: leave for the fixed-point propagation
             } else if !is_non_suspending_op(op) {
                 result[i] = true;
                 break;
             }
         }
     }
-    // Propagate through the direct-call graph until stable.
     loop {
         let mut changed = false;
         for i in 0..n {
@@ -312,7 +307,6 @@ pub(crate) fn compute_recursive(module: &crate::bytecode::CodeModule) -> Vec<boo
             }
         }
     }
-    // Floyd-Warshall transitive closure.
     for k in 0..n {
         for i in 0..n {
             if reach[i][k] {
@@ -374,11 +368,6 @@ pub(crate) fn find_compilable_region(
         }
         let op = instructions[i].opcode;
 
-        // Halt is always a hard boundary. Returns are normally boundaries too,
-        // except when an earlier in-region branch targets bytecode beyond the
-        // return. MIR can lay an early-exit block (Ret/RetVal) lexically before
-        // sibling loop blocks; in that shape the return is an internal CFG exit
-        // and the scanner must cross it to discover the loop back-edge.
         if op == crate::bytecode::OpCode::Halt {
             break;
         }
@@ -412,42 +401,21 @@ pub(crate) fn find_compilable_region(
             if target > i {
                 max_forward_target = max_forward_target.max(target);
             }
-            // A genuine loop back-edge lands WITHIN the region (target >= offset):
-            // the loop head is the region start or an earlier in-region pc, and
-            // re-entering it continues the loop. A backward jump to BEFORE the
-            // region start (target < offset) is an EXIT (e.g. a return path's
-            // jump back to a RetVal), not a loop — don't treat it as a back-edge.
             if target >= offset && target < i {
                 has_back_edge = true;
             }
         }
         len += 1;
 
-        // Once a back-edge closes the CFG frontier there is no reason to pull
-        // unrelated lexical bytecode (for example the top-level wrapper Call)
-        // into the native region. A fallthrough exit resumes at offset + len.
         if has_back_edge && i >= max_forward_target {
             break;
         }
     }
 
     if has_back_edge {
-        // A genuine loop loops INTERNALLY in the compiled code, so the JIT
-        // enter/exit + probe cost is amortized across all its iterations —
-        // always worth compiling.
         len
     } else {
         let straight = first_branch.unwrap_or(len);
-        // A small straight-line region — whether a function body or a loop
-        // fragment — is re-entered by the interpreter once per call (a body)
-        // or per enclosing-loop iteration (a fragment), so the JIT
-        // enter/exit + probe cost is paid EVERY time. That exceeds the cost of
-        // just interpreting `straight` instructions below ~STRAIGHT_LINE_MIN,
-        // so compiling a small non-looping region is a regression (a
-        // call-heavy loop benchmarked ~4.6x SLOWER when its 2-instruction
-        // callee was compiled). Genuine loops (internal back-edge) loop
-        // natively and amortize the cost, so they are always compiled; only
-        // small non-looping regions are rejected.
         if straight < STRAIGHT_LINE_MIN {
             0
         } else {
@@ -486,15 +454,9 @@ pub(crate) fn native_direct_call(
         return None;
     }
     let idx = direct_call_target(module, pc, func_start_for(module, pc))?;
-    // A suspending callee must not be run re-entrantly from a compiled
-    // region: it could suspend mid-run and be re-entered from its call start,
-    // double-executing pre-suspend side effects. Stay on the interpreter.
     if may_suspend.is_some_and(|v| v.get(idx) == Some(&true)) {
         return None;
     }
-    // A recursive callee must not go through the re-entrant helper either:
-    // each helper call consumes native stack, so unbounded recursion would
-    // overflow it. The interpreter uses heap-allocated frames instead.
     if recursive.is_some_and(|v| v.get(idx) == Some(&true)) {
         return None;
     }
@@ -503,18 +465,29 @@ pub(crate) fn native_direct_call(
 
 /// A direct-call callee that can execute as an isolated native leaf.
 ///
-/// The first native-call slice is intentionally conservative: the body must
-/// be straight-line scalar register code ending in one `Ret`/`RetVal`, with
-/// no nested calls, branches, effects, heap mutation, actor operations, or
-/// other VM state. `required_args` is the highest read-before-write register
-/// plus one; the runtime fast path uses it to reject a call site whose staged
-/// argument count would leave a callee input uninitialized.
+/// The leaf may contain pure forward-only control flow, but no nested calls,
+/// effects, heap/container mutation, actor operations, backedges, escaping
+/// branches, or other VM state. `required_args` is the highest register that
+/// may be read before a dominating write, plus one; the runtime fast path uses
+/// it to reject a call site whose staged argument count would leave a callee
+/// input uninitialized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NativeLeafPlan {
     pub(crate) start: usize,
     pub(crate) len: usize,
     pub(crate) return_reg: u8,
     pub(crate) required_args: usize,
+}
+
+fn merge_leaf_defs(slot: &mut Option<[bool; 256]>, incoming: &[bool; 256]) {
+    match slot {
+        Some(existing) => {
+            for (defined, incoming_defined) in existing.iter_mut().zip(incoming.iter()) {
+                *defined &= *incoming_defined;
+            }
+        }
+        None => *slot = Some(*incoming),
+    }
 }
 
 pub(crate) fn native_leaf_plan(
@@ -544,18 +517,90 @@ pub(crate) fn native_leaf_plan(
         return None;
     }
 
-    let mut written = [false; 256];
+    let body_len = body_end - start;
+    let mut defs_in: Vec<Option<[bool; 256]>> = vec![None; body_len + 1];
+    defs_in[0] = Some([false; 256]);
     let mut required_args = 0usize;
 
-    for instr in &module.instructions[start..body_end] {
+    for rel in 0..body_len {
+        let pc = start + rel;
+        let instr = module.instructions[pc];
+
+        let branch_target = match instr.opcode {
+            OpCode::Jmp => {
+                let target = pc as i64 + instr.simm16() as i64;
+                if target <= pc as i64 || target >= body_end as i64 {
+                    return None;
+                }
+                Some(target as usize)
+            }
+            OpCode::JmpT | OpCode::JmpF => {
+                let target = pc as i64 + instr.offset16() as i64;
+                if target <= pc as i64 || target >= body_end as i64 {
+                    return None;
+                }
+                Some(target as usize)
+            }
+            OpCode::Nop
+            | OpCode::Const0
+            | OpCode::Const1
+            | OpCode::Const2
+            | OpCode::ConstM1
+            | OpCode::ConstU
+            | OpCode::Load
+            | OpCode::Store
+            | OpCode::Move
+            | OpCode::Swap
+            | OpCode::Dup
+            | OpCode::IAdd
+            | OpCode::ISub
+            | OpCode::IMul
+            | OpCode::IDiv
+            | OpCode::IMod
+            | OpCode::IPow
+            | OpCode::FPow
+            | OpCode::Xor
+            | OpCode::Shl
+            | OpCode::Shr
+            | OpCode::BitAnd
+            | OpCode::BitOr
+            | OpCode::FAdd
+            | OpCode::FSub
+            | OpCode::FMul
+            | OpCode::FDiv
+            | OpCode::ICmpEq
+            | OpCode::ICmpLt
+            | OpCode::ICmpGt
+            | OpCode::ICmpLe
+            | OpCode::ICmpGe
+            | OpCode::FCmpEq
+            | OpCode::FCmpLt
+            | OpCode::FCmpGt
+            | OpCode::INeg
+            | OpCode::Not
+            | OpCode::IToF
+            | OpCode::FToI
+            | OpCode::FNeg
+            | OpCode::IInc
+            | OpCode::IDec
+            | OpCode::And
+            | OpCode::Or => None,
+            _ => return None,
+        };
+
+        let Some(mut written) = defs_in[rel] else {
+            continue;
+        };
         let mut note_read = |reg: u8| {
             let idx = reg as usize;
             if !written[idx] {
                 required_args = required_args.max(idx + 1);
             }
         };
+
         match instr.opcode {
-            OpCode::Nop => {}
+            OpCode::Nop | OpCode::Jmp => {}
+            OpCode::JmpT | OpCode::JmpF => note_read(instr.op1),
             OpCode::Const0 | OpCode::Const1 | OpCode::Const2 | OpCode::ConstM1 => {
                 written[instr.op1 as usize] = true;
             }
@@ -600,25 +645,47 @@ pub(crate) fn native_leaf_plan(
                 note_read(instr.op2);
                 written[instr.op3 as usize] = true;
             }
-            OpCode::INeg | OpCode::Not | OpCode::IToF | OpCode::FToI | OpCode::FNeg => {
+            OpCode::INeg | OpCode::Not | OpCode::IToF | OpCode::FToI => {
                 note_read(instr.op1);
                 written[instr.op2 as usize] = true;
+            }
+            OpCode::FNeg => {
+                note_read(instr.op1);
+                written[instr.op3 as usize] = true;
             }
             OpCode::IInc | OpCode::IDec => {
                 note_read(instr.op1);
                 written[instr.op1 as usize] = true;
             }
-            _ => return None,
+            _ => unreachable!("native-leaf opcode validation must stay exhaustive"),
+        }
+
+        match instr.opcode {
+            OpCode::Jmp => {
+                merge_leaf_defs(
+                    &mut defs_in[branch_target.expect("validated jump target") - start],
+                    &written,
+                );
+            }
+            OpCode::JmpT | OpCode::JmpF => {
+                merge_leaf_defs(&mut defs_in[rel + 1], &written);
+                merge_leaf_defs(
+                    &mut defs_in[branch_target.expect("validated branch target") - start],
+                    &written,
+                );
+            }
+            _ => merge_leaf_defs(&mut defs_in[rel + 1], &written),
         }
     }
 
-    if !written[return_reg as usize] {
+    let exit_defs = defs_in[body_len]?;
+    if !exit_defs[return_reg as usize] {
         required_args = required_args.max(return_reg as usize + 1);
     }
 
     Some(NativeLeafPlan {
         start,
-        len: body_end - start,
+        len: body_len,
         return_reg,
         required_args,
     })
@@ -649,7 +716,7 @@ pub(crate) fn find_compilable_region_with_calls(
                 Some(idx) => {
                     native_calls.insert(i, idx);
                 }
-                None => break, // indirect / suspending / recursive call — stop
+                None => break,
             }
         } else if !compiler::is_opcode_compilable(op) {
             break;
