@@ -1953,9 +1953,11 @@ impl Value {
         }
     }
 
-    /// Create a float value.
+    /// Create a float value, canonicalizing NaNs so they cannot alias tags.
     pub fn float(f: f64) -> Self {
-        Value { raw: f.to_bits() }
+        Value {
+            raw: crate::value_layout::float_bits(f),
+        }
     }
 
     /// Create a boolean value.
