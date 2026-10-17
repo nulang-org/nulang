@@ -3659,6 +3659,77 @@ mod optimize_tests {
     }
 
     #[test]
+    fn test_fold_int48_comparisons_use_runtime_normalized_operands() {
+        use crate::ast::BinOp;
+        use crate::value_layout::{INT48_MAX, INT48_MIN};
+
+        // An out-of-payload constant is truncated by Value::int before
+        // comparisons execute. The optimizer must compare the same values.
+        assert_eq!(
+            fold_binary_consts(
+                BinOp::Lt,
+                &Constant::Int(INT48_MAX + 1),
+                &Constant::Int(0)
+            ),
+            Some(mir::RValue::Const(Constant::Bool(true)))
+        );
+        assert_eq!(
+            fold_binary_consts(
+                BinOp::Eq,
+                &Constant::Int(INT48_MAX + 1),
+                &Constant::Int(INT48_MIN)
+            ),
+            Some(mir::RValue::Const(Constant::Bool(true)))
+        );
+    }
+
+    #[test]
+    fn test_fold_int48_divisor_that_truncates_to_zero_returns_nil() {
+        use crate::ast::BinOp;
+
+        assert_eq!(
+            fold_binary_consts(
+                BinOp::Div,
+                &Constant::Int(42),
+                &Constant::Int(1_i64 << 48)
+            ),
+            Some(mir::RValue::Const(Constant::Nil))
+        );
+    }
+
+    #[test]
+    fn test_fold_int48_min_negation_preserves_runtime_overflow() {
+        let src = mir::LocalId(0);
+        let mut consts = std::collections::HashMap::new();
+        consts.insert(src, Constant::Int(crate::value_layout::INT48_MIN));
+        assert_eq!(
+            fold_rvalue(
+                mir::RValue::Unary(crate::ast::UnOp::Neg, src),
+                &consts,
+                &[false]
+            ),
+            mir::RValue::Unary(crate::ast::UnOp::Neg, src),
+            "the VM must remain responsible for reporting Int48 minimum negation overflow"
+        );
+    }
+
+    #[test]
+    fn test_fold_int48_out_of_payload_negation_preserves_overflow() {
+        let src = mir::LocalId(0);
+        let mut consts = std::collections::HashMap::new();
+        consts.insert(src, Constant::Int(crate::value_layout::INT48_MAX + 1));
+        assert_eq!(
+            fold_rvalue(
+                mir::RValue::Unary(crate::ast::UnOp::Neg, src),
+                &consts,
+                &[false]
+            ),
+            mir::RValue::Unary(crate::ast::UnOp::Neg, src),
+            "signed normalization must precede deciding whether negation may fold"
+        );
+    }
+
+    #[test]
     fn test_fold_const_add() {
         // `1 + 2` folds to a single constant; no IAdd survives.
         let value = run_source("1 + 2").unwrap();
