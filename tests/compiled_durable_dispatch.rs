@@ -60,7 +60,8 @@ fn compiled_effect_dispatch_records_receipt_and_never_reinvokes_completed_provid
         let mut coordinator = DurableEffectCoordinator::new(&mut store, 42, 1);
         coordinator
             .execute_compiled_async_with_deduplication(
-                &actor, &grant,
+                &actor,
+                &grant,
                 &module,
                 pc,
                 "order:42:payment",
@@ -83,7 +84,8 @@ fn compiled_effect_dispatch_records_receipt_and_never_reinvokes_completed_provid
     let mut recovered = DurableEffectCoordinator::new(&mut store, 42, 1);
     let replay = recovered
         .execute_compiled_async_with_deduplication(
-                &actor, &grant,
+            &actor,
+            &grant,
             &module,
             pc,
             "order:42:payment",
@@ -109,7 +111,8 @@ fn lost_provider_response_keeps_prepared_intent_and_retries_same_key() {
     {
         let mut coordinator = DurableEffectCoordinator::new(&mut store, 42, 1);
         let failed = coordinator.execute_compiled_async_with_deduplication(
-                &actor, &grant,
+            &actor,
+            &grant,
             &module,
             pc,
             "order:42:payment",
@@ -135,7 +138,8 @@ fn lost_provider_response_keeps_prepared_intent_and_retries_same_key() {
         let mut recovered = DurableEffectCoordinator::new(&mut store, 42, 1);
         let receipt = recovered
             .execute_compiled_async_with_deduplication(
-                &actor, &grant,
+                &actor,
+                &grant,
                 &module,
                 pc,
                 "order:42:payment",
@@ -169,7 +173,8 @@ fn metadata_or_request_drift_never_reaches_provider() {
     {
         let mut coordinator = DurableEffectCoordinator::new(&mut store, 42, 1);
         let failure = coordinator.execute_compiled_async_with_deduplication(
-                &actor, &grant,
+            &actor,
+            &grant,
             &mismatched,
             pc,
             "order:42:payment",
@@ -185,7 +190,8 @@ fn metadata_or_request_drift_never_reaches_provider() {
         let mut coordinator = DurableEffectCoordinator::new(&mut store, 42, 1);
         coordinator
             .execute_compiled_async_with_deduplication(
-                &actor, &grant,
+                &actor,
+                &grant,
                 &module,
                 pc,
                 "order:42:payment",
@@ -198,8 +204,13 @@ fn metadata_or_request_drift_never_reaches_provider() {
     let mut replay = DurableEffectCoordinator::new(&mut store, 42, 1);
     assert!(matches!(
         replay.execute_compiled_async_with_deduplication(
-                &actor, &grant,
-            &module, pc, "order:42:payment", 0, b"charge=200",
+            &actor,
+            &grant,
+            &module,
+            pc,
+            "order:42:payment",
+            0,
+            b"charge=200",
             |_, _| panic!("request drift must not dispatch")
         ),
         Err(DurableAsyncDispatchError::Recovery(_))
@@ -217,8 +228,13 @@ fn stale_activation_does_not_call_provider_for_prepared_effect() {
     {
         let mut first = DurableEffectCoordinator::new(&mut store, 42, 1);
         let failed = first.execute_compiled_async_with_deduplication(
-                &actor, &grant,
-            &module, pc, "order:42:payment", 0, b"charge=100",
+            &actor,
+            &grant,
+            &module,
+            pc,
+            "order:42:payment",
+            0,
+            b"charge=100",
             |_, _| Err(io::Error::new(io::ErrorKind::TimedOut, "no receipt")),
         );
         assert!(matches!(failed, Err(DurableAsyncDispatchError::Provider(_))));
@@ -238,8 +254,13 @@ fn stale_activation_does_not_call_provider_for_prepared_effect() {
     }
     let mut stale = DurableEffectCoordinator::new(&mut store, 42, 1);
     let result = stale.execute_compiled_async_with_deduplication(
-                &actor, &grant,
-        &module, pc, "order:42:payment", 0, b"charge=100",
+        &actor,
+        &grant,
+        &module,
+        pc,
+        "order:42:payment",
+        0,
+        b"charge=100",
         |_, _| panic!("stale owner must not redispatch"),
     );
     assert!(matches!(result, Err(DurableAsyncDispatchError::Recovery(_))));
