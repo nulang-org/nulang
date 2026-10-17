@@ -5,7 +5,7 @@
 //! accordingly so their timings are not misread as message throughput.
 
 use criterion::{black_box, criterion_group, BatchSize, BenchmarkId, Criterion, Throughput};
-use nulang::runtime::{Mailbox, Message, MessagePayload, MessagePriority, Runtime};
+use nulang::runtime::{FlightRecorder, Mailbox, Message, MessagePayload, MessagePriority, Runtime};
 use nulang::vm::Value;
 
 const MESSAGE_BATCH: usize = 100;
@@ -174,6 +174,44 @@ fn bench_message_drain(c: &mut Criterion) {
     group.finish();
 }
 
+/// Debug-only recorder cost under enabled/disabled policies. The enabled
+/// fixture is already populated before timing so the hot path excludes the
+/// first allocation and measures ring overwrite behavior.
+fn bench_flight_recorder(c: &mut Criterion) {
+    const BATCH: usize = 128;
+    let payload = [Value::int(42)];
+    let mut group = c.benchmark_group("actor/flight_recorder");
+    group.throughput(Throughput::Elements(BATCH as u64));
+
+    group.bench_function("disabled_128", |b| {
+        b.iter(|| {
+            let mut recorder = FlightRecorder::new(0);
+            for _ in 0..BATCH {
+                recorder.record(black_box(1), 1, black_box(&payload));
+            }
+            black_box(recorder);
+        })
+    });
+
+    group.bench_function("enabled_hot_128", |b| {
+        b.iter_batched_ref(
+            || {
+                let mut recorder = FlightRecorder::new(32);
+                recorder.record(1, 1, &payload);
+                recorder
+            },
+            |recorder| {
+                for _ in 0..BATCH {
+                    recorder.record(black_box(1), 1, black_box(&payload));
+                }
+                black_box(recorder);
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.finish();
+}
+
 fn selective_receive_mailbox(depth: usize, hit_behavior: u16) -> Mailbox {
     let mut mailbox = Mailbox::new(0);
     for _ in 0..depth.saturating_sub(1) {
@@ -267,5 +305,6 @@ criterion_group!(
     bench_spawn_send_receive,
     bench_message_enqueue,
     bench_message_drain,
+    bench_flight_recorder,
     bench_selective_receive
 );

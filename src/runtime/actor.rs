@@ -91,18 +91,24 @@ pub struct TraceEntry {
     pub payload_summary: String,
 }
 
-/// A fixed-size ring buffer that records the most recent N messages
-/// delivered to an actor.  When the buffer is full, oldest entries are
-/// overwritten.
+/// A fixed-size ring buffer that records the most recent N messages.
+///
+/// Keep only the capacity and an optional pointer inline. Almost all ordinary
+/// runtime actors have recording disabled; enabled but never-used recorders
+/// also avoid allocating until the first message is captured.
 #[derive(Debug, Clone)]
 pub struct FlightRecorder {
-    entries: Vec<TraceEntry>,
-    /// Write cursor (next slot to fill).
-    cursor: usize,
-    /// Monotonic sequence counter for this actor.
-    next_seq: u64,
-    /// Maximum number of entries to retain.
     max_entries: usize,
+    storage: Option<Box<FlightRecorderStorage>>,
+}
+
+/// Cold debug-only state that must not inflate each idle Actor.
+#[derive(Debug, Clone)]
+struct FlightRecorderStorage {
+    entries: Vec<TraceEntry>,
+    /// Write cursor (next slot to fill after the ring fills).
+    cursor: usize,
+    next_seq: u64,
 }
 
 fn runtime_flight_recorder_enabled() -> bool {
@@ -122,27 +128,17 @@ fn runtime_flight_recorder_enabled() -> bool {
 }
 
 impl FlightRecorder {
-    /// Create an enabled flight recorder retaining up to `max_entries` messages.
-    ///
-    /// Storage is allocated lazily on the first recorded message rather than
-    /// reserving the whole ring for every actor at spawn time.
+    /// Create a flight recorder retaining up to `max_entries` messages.
+    /// Neither the ring nor the debug bookkeeping is allocated before the
+    /// first message is recorded.
     pub fn new(max_entries: usize) -> Self {
-        FlightRecorder {
-            entries: Vec::new(),
-            cursor: 0,
-            next_seq: 0,
+        Self {
             max_entries,
+            storage: None,
         }
     }
 
-    /// Create the runtime-default flight recorder.
-    ///
-    /// Per-actor flight recording is intentionally opt-in in production
-    /// because payload summarization formats values and the ring can grow to a
-    /// meaningful amount of memory across large actor populations. Set
-    /// `NULANG_FLIGHT_RECORDER=1` (or `true`) to enable it for actors
-    /// created by the runtime. Direct callers of `FlightRecorder::new` retain
-    /// the historical always-enabled behavior.
+    /// Runtime recording remains opt-in in production.
     pub fn runtime_default(max_entries: usize) -> Self {
         if cfg!(test) || runtime_flight_recorder_enabled() {
             Self::new(max_entries)
@@ -151,16 +147,22 @@ impl FlightRecorder {
         }
     }
 
-    /// Record a message delivery.
+    /// Record a delivered message. The disabled path does not allocate.
     pub fn record(&mut self, sender: u64, behavior_id: u16, payload: &[Value]) {
         if self.max_entries == 0 {
             return;
         }
 
-        let seq = self.next_seq;
-        self.next_seq += 1;
+        let storage = self.storage.get_or_insert_with(|| {
+            Box::new(FlightRecorderStorage {
+                entries: Vec::new(),
+                cursor: 0,
+                next_seq: 0,
+            })
+        });
+        let seq = storage.next_seq;
+        storage.next_seq += 1;
 
-        let payload_len = payload.len();
         let mut payload_summary = String::new();
         for (idx, value) in payload.iter().take(3).enumerate() {
             if idx != 0 {
@@ -173,59 +175,60 @@ impl FlightRecorder {
             seq,
             sender,
             behavior_id,
-            payload_len,
+            payload_len: payload.len(),
             payload_summary,
         };
 
-        if self.entries.len() < self.max_entries {
-            self.entries.push(entry);
+        if storage.entries.len() < self.max_entries {
+            storage.entries.push(entry);
         } else {
-            self.entries[self.cursor] = entry;
-            self.cursor = (self.cursor + 1) % self.max_entries;
+            storage.entries[storage.cursor] = entry;
+            storage.cursor = (storage.cursor + 1) % self.max_entries;
         }
     }
 
-    /// Return all recorded entries (raw ring buffer — use ordered_entries()
-    /// for chronological order).
+    /// Raw ring-buffer entries (use `ordered_entries` for chronological order).
     pub fn entries(&self) -> &[TraceEntry] {
-        &self.entries
+        self.storage
+            .as_ref()
+            .map_or(&[], |storage| storage.entries.as_slice())
     }
 
-    /// Return entries in chronological order (oldest first), even when the
-    /// ring buffer has wrapped.
+    /// Return entries oldest-first, including after the ring wraps.
     pub fn ordered_entries(&self) -> Vec<&TraceEntry> {
-        if self.entries.is_empty() {
-            return vec![];
+        let Some(storage) = self.storage.as_ref() else {
+            return Vec::new();
+        };
+        if storage.entries.len() < self.max_entries {
+            return storage.entries.iter().collect();
         }
-        if self.entries.len() < self.max_entries {
-            return self.entries.iter().collect();
-        }
-        // Full ring: oldest is at cursor, newest at cursor-1 (wrapping)
-        let mut result = Vec::with_capacity(self.entries.len());
-        for i in 0..self.entries.len() {
-            let idx = (self.cursor + i) % self.entries.len();
-            result.push(&self.entries[idx]);
+        let mut result = Vec::with_capacity(storage.entries.len());
+        for i in 0..storage.entries.len() {
+            let idx = (storage.cursor + i) % storage.entries.len();
+            result.push(&storage.entries[idx]);
         }
         result
     }
 
-    /// Number of entries recorded.
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.entries().len()
     }
 
-    /// True when no messages have been recorded.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries().is_empty()
     }
 
-    /// Clear all recorded entries.
+    /// Clear entries and reset sequence/cursor without discarding a previously
+    /// allocated ring: a new recording epoch should reuse its storage.
     pub fn clear(&mut self) {
-        self.entries.clear();
-        self.cursor = 0;
-        self.next_seq = 0;
+        if let Some(storage) = self.storage.as_mut() {
+            storage.entries.clear();
+            storage.cursor = 0;
+            storage.next_seq = 0;
+        }
     }
 }
+
 /// Serialized hibernation state for an actor.
 #[derive(Debug, Clone)]
 pub struct HibernationState {
@@ -933,16 +936,67 @@ mod tests {
     #[test]
     fn flight_recorder_storage_is_lazy() {
         let mut recorder = FlightRecorder::new(4);
-        assert_eq!(recorder.entries.capacity(), 0);
+        assert!(recorder.storage.is_none());
         assert!(recorder.is_empty());
 
         recorder.record(7, 3, &[Value::int(42)]);
 
         assert_eq!(recorder.len(), 1);
-        assert!(recorder.entries.capacity() > 0);
+        assert!(recorder
+            .storage
+            .as_ref()
+            .is_some_and(|storage| storage.entries.capacity() > 0));
         assert_eq!(recorder.entries()[0].sender, 7);
         assert_eq!(recorder.entries()[0].behavior_id, 3);
         assert_eq!(recorder.entries()[0].payload_summary, "42");
+    }
+
+    #[test]
+    fn disabled_flight_recorder_occupies_at_most_two_machine_words() {
+        // Millions of idle actors must not each carry an inline Vec,
+        // cursor and sequence counter for an unused debug facility.
+        assert!(
+            std::mem::size_of::<FlightRecorder>() <= 2 * std::mem::size_of::<usize>(),
+            "disabled flight-recorder metadata is too large for actor density"
+        );
+
+        let mut recorder = FlightRecorder::new(0);
+        recorder.record(7, 3, &[Value::int(42)]);
+        assert!(recorder.is_empty());
+    }
+
+    #[test]
+    fn lazy_flight_recorder_preserves_ring_order_and_clear() {
+        let mut recorder = FlightRecorder::new(2);
+        assert!(recorder.is_empty());
+        recorder.record(11, 1, &[Value::int(1)]);
+        recorder.record(12, 2, &[Value::int(2)]);
+        recorder.record(13, 3, &[Value::int(3)]);
+        let ordered = recorder.ordered_entries();
+        assert_eq!(
+            ordered.iter().map(|entry| entry.seq).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert_eq!(
+            ordered.iter().map(|entry| entry.sender).collect::<Vec<_>>(),
+            [12, 13]
+        );
+
+        let cloned = recorder.clone();
+        assert_eq!(
+            cloned
+                .ordered_entries()
+                .iter()
+                .map(|entry| entry.seq)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+
+        recorder.clear();
+        assert!(recorder.is_empty());
+        recorder.record(14, 4, &[Value::int(4)]);
+        assert_eq!(recorder.entries()[0].seq, 0);
+        assert_eq!(recorder.entries()[0].sender, 14);
     }
 
     #[test]
@@ -951,8 +1005,8 @@ mod tests {
         recorder.record(7, 3, &[Value::int(42)]);
 
         assert!(recorder.is_empty());
-        assert_eq!(recorder.entries.capacity(), 0);
-        assert_eq!(recorder.next_seq, 0);
+        assert!(recorder.storage.is_none());
+        assert!(recorder.storage.is_none());
     }
 }
 
