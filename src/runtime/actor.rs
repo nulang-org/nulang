@@ -946,6 +946,44 @@ mod tests {
     }
 
     #[test]
+    fn flight_recorder_metadata_events_are_bounded_and_ordered() {
+        let mut recorder = FlightRecorder::new(2);
+        recorder.record(7, 3, &[Value::int(42)]);
+        recorder.record_metadata(TraceEventKind::Backpressured, 8, 4, 1);
+        recorder.record_metadata(TraceEventKind::Dequeued, 7, 3, 1);
+
+        let ordered = recorder.ordered_entries();
+        assert_eq!(ordered.len(), 2);
+        assert_eq!(ordered[0].seq, 1);
+        assert_eq!(ordered[0].event, TraceEventKind::Backpressured);
+        assert_eq!(ordered[0].payload_summary, "");
+        assert_eq!(ordered[1].seq, 2);
+        assert_eq!(ordered[1].event, TraceEventKind::Dequeued);
+        assert_eq!(ordered[1].payload_len, 1);
+    }
+
+    #[test]
+    fn flight_recorder_jsonl_omits_message_values() {
+        let mut recorder = FlightRecorder::new(2);
+        recorder.record(7, 3, &[Value::int(424242)]);
+        recorder.record_metadata(TraceEventKind::Dequeued, 7, 3, 1);
+
+        let jsonl = recorder.to_metadata_jsonl(99);
+        assert!(!jsonl.contains("424242"), "trace exports must never expose payload values");
+        assert!(!jsonl.contains("payload_summary"));
+        let events: Vec<serde_json::Value> = jsonl
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid JSONL record"))
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["actor_id"], 99);
+        assert_eq!(events[0]["event"], "admitted");
+        assert_eq!(events[0]["seq"], 0);
+        assert_eq!(events[1]["event"], "dequeued");
+        assert_eq!(events[1]["seq"], 1);
+    }
+
+    #[test]
     fn zero_capacity_flight_recorder_is_noop() {
         let mut recorder = FlightRecorder::new(0);
         recorder.record(7, 3, &[Value::int(42)]);
