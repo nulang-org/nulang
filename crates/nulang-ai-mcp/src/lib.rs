@@ -132,10 +132,15 @@ impl McpServer {
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| serde_json::json!({}));
-        let tools = self.registry.tools.read().await;
-        let (_, handler) = tools
-            .get(name)
-            .ok_or_else(|| format!("Unknown tool: {name}"))?;
+        // Clone the handler under the lock, then release the guard before
+        // awaiting external code. Handlers may register/unregister other tools.
+        let handler = {
+            let tools = self.registry.tools.read().await;
+            let (_, handler) = tools
+                .get(name)
+                .ok_or_else(|| format!("Unknown tool: {name}"))?;
+            Arc::clone(handler)
+        };
         let result = handler.call(args).await?;
         Ok(serde_json::json!({"content": [{"type": "text", "text": result.to_string()}]}))
     }
