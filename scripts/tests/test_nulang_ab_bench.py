@@ -14,6 +14,90 @@ nulang_ab_bench = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(nulang_ab_bench)
 
 
+class RecordParserTests(unittest.TestCase):
+    EXPECTED = {
+        "counting": 200_000,
+        "ping_pong": 40_001,
+        "thread_ring": 20_000,
+        "fork_join": 100_000,
+    }
+
+    def valid_output(self):
+        return "\n".join(
+            [
+                f"[cross-bench] runtime=nulang benchmark={name} "
+                f"messages={count} elapsed_ns=1000"
+                for name, count in self.EXPECTED.items()
+            ]
+            + [
+                "[cross-bench] runtime=nulang benchmark=skynet "
+                "messages=1110 elapsed_ns=1200",
+                "[ab-bench] benchmark=enqueue_payload_1 "
+                "operations=100000 elapsed_ns=2200",
+            ]
+        )
+
+    def test_valid_cross_and_extra_ab_records_are_preserved(self):
+        rows = nulang_ab_bench.parse_records(self.valid_output())
+        self.assertEqual(set(self.EXPECTED) | {"skynet", "ab/enqueue_payload_1"}, set(rows))
+        self.assertEqual(100_000, rows["ab/enqueue_payload_1"]["messages"])
+
+    def test_duplicate_cross_record_is_rejected(self):
+        output = self.valid_output() + "\n" + (
+            "[cross-bench] runtime=nulang benchmark=counting "
+            "messages=200000 elapsed_ns=800"
+        )
+        with self.assertRaisesRegex(RuntimeError, "duplicate.*counting"):
+            nulang_ab_bench.parse_records(output)
+
+    def test_duplicate_ab_record_is_rejected(self):
+        output = self.valid_output() + "\n" + (
+            "[ab-bench] benchmark=enqueue_payload_1 "
+            "operations=100000 elapsed_ns=900"
+        )
+        with self.assertRaisesRegex(RuntimeError, "duplicate.*enqueue_payload_1"):
+            nulang_ab_bench.parse_records(output)
+
+    def test_changed_known_cross_workload_count_is_rejected(self):
+        output = self.valid_output().replace(
+            "benchmark=counting messages=200000",
+            "benchmark=counting messages=199999",
+        )
+        with self.assertRaisesRegex(RuntimeError, "counting.*expected 200000"):
+            nulang_ab_bench.parse_records(output)
+
+    def test_zero_elapsed_time_is_rejected_at_parse_time(self):
+        output = self.valid_output().replace(
+            "operations=100000 elapsed_ns=2200",
+            "operations=100000 elapsed_ns=0",
+        )
+        with self.assertRaisesRegex(RuntimeError, "elapsed_ns must be positive"):
+            nulang_ab_bench.parse_records(output)
+
+    def test_wrong_runtime_record_is_rejected(self):
+        output = self.valid_output() + "\n" + (
+            "[cross-bench] runtime=go benchmark=counting "
+            "messages=200000 elapsed_ns=2000"
+        )
+        with self.assertRaisesRegex(RuntimeError, "unexpected runtime"):
+            nulang_ab_bench.parse_records(output)
+
+    def test_malformed_ab_record_is_rejected_instead_of_ignored(self):
+        output = self.valid_output() + "\n" + (
+            "[ab-bench] benchmark=broken operations=100 elapsed_ns=NaN"
+        )
+        with self.assertRaisesRegex(RuntimeError, "malformed.*ab-bench"):
+            nulang_ab_bench.parse_records(output)
+
+    def test_missing_mandatory_cross_workload_is_rejected(self):
+        output = "\n".join(
+            line for line in self.valid_output().splitlines()
+            if "benchmark=thread_ring" not in line
+        )
+        with self.assertRaisesRegex(RuntimeError, "thread_ring"):
+            nulang_ab_bench.parse_records(output)
+
+
 class PairedComparisonTests(unittest.TestCase):
     def test_paired_comparisons_use_same_round_ratios(self):
         samples = {
