@@ -180,7 +180,9 @@ fn validate_definition(d: &AgentReleaseDefinition) -> Result<(), AgentReleaseErr
     valid_name("agent", &d.agent)?;
     valid_name("version", &d.version)?;
     if !valid_hex64(&d.artifact_id) {
-        return Err(invalid("artifact_id must be a lowercase 64-character hex identity"));
+        return Err(invalid(
+            "artifact_id must be a lowercase 64-character hex identity",
+        ));
     }
     validate_digest(&d.prompt)?;
     validate_digest(&d.policy)?;
@@ -217,14 +219,18 @@ fn valid_name(field: &str, value: &str) -> Result<(), AgentReleaseError> {
         || value.len() > 128
         || !value.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
     {
-        return Err(invalid(format!("{field} must be 1-128 ASCII letters, digits, ., _ or -")));
+        return Err(invalid(format!(
+            "{field} must be 1-128 ASCII letters, digits, ., _ or -"
+        )));
     }
     Ok(())
 }
 
 fn validate_digest(value: &str) -> Result<(), AgentReleaseError> {
     if !value.starts_with("blake3:") || !valid_hex64(&value[7..]) {
-        return Err(invalid("digest must be blake3:<64 lowercase hex characters>"));
+        return Err(invalid(
+            "digest must be blake3:<64 lowercase hex characters>",
+        ));
     }
     Ok(())
 }
