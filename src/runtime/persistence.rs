@@ -530,6 +530,25 @@ impl DurableTransition {
                     }
                 }
             }
+            if let Some(replay_id) = event.replay_id() {
+                if replay_id.activation.actor_id != self.actor_id {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "durable transition workflow replay actor does not match transition actor",
+                    ));
+                }
+                // An intermediate event can follow a previously committed
+                // command. Only require a sequence match when this transition
+                // actually stages a new command alongside the event.
+                if let Some(command) = &self.command {
+                    if replay_id.activation.command_sequence != command.sequence {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "durable transition workflow replay command sequence does not match accepted command",
+                        ));
+                    }
+                }
+            }
         }
         if self
             .domain_events
@@ -4040,6 +4059,62 @@ mod durable_transition_tests {
 
         let error = candidate.digest().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn durable_transition_rejects_cross_actor_timer_replay_identity_without_writing() {
+        let mut store = MemoryStore::new();
+        let mut candidate = transition(10, 1, 1);
+        let replay_id = WorkflowReplayEventId::new(WorkflowActivationId::new(11, 1), 0);
+        candidate.workflow_events = vec![WorkflowEvent::TimerSet {
+            sequence: 1,
+            replay_id: Some(replay_id),
+            name: "wake".to_string(),
+            duration_ms: 100,
+        }];
+
+        let error = store.commit_transition(candidate).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(store.latest_sequence(10), 0);
+        assert!(store.committed_transitions(10).is_empty());
+        assert!(store.read_workflow_events(10).is_empty());
+    }
+
+    #[test]
+    fn durable_transition_rejects_intermediate_replay_identity_for_wrong_command() {
+        let mut candidate = transition(10, 1, 1);
+        let replay_id = WorkflowReplayEventId::new(WorkflowActivationId::new(10, 99), 0);
+        candidate.workflow_events = vec![WorkflowEvent::Custom {
+            sequence: 1,
+            replay_id: Some(replay_id),
+            name: "audit".to_string(),
+            args: vec![],
+        }];
+
+        let error = candidate.digest().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn durable_transition_accepts_intermediate_replay_of_prior_command() {
+        let mut store = MemoryStore::new();
+        store.commit_transition(transition(10, 1, 1)).unwrap();
+
+        let mut candidate = transition(10, 1, 2);
+        // Intermediate events may be committed after their command was admitted,
+        // without creating a second command journal entry.
+        candidate.command = None;
+        let replay_id = WorkflowReplayEventId::new(WorkflowActivationId::new(10, 1), 0);
+        candidate.workflow_events = vec![WorkflowEvent::TimerSet {
+            sequence: 2,
+            replay_id: Some(replay_id),
+            name: "wake".to_string(),
+            duration_ms: 100,
+        }];
+
+        store.commit_transition(candidate).unwrap();
+        assert_eq!(store.latest_sequence(10), 2);
+        assert_eq!(store.read_workflow_events(10).len(), 2);
     }
 
     #[test]
