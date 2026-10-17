@@ -233,6 +233,15 @@ impl ExpirationWheel {
         self.buckets[bucket].push(item);
     }
 
+    // An already-overdue entry denied by the purge budget must be retried on
+    // the next tick. Re-inserting it by its old deadline can strand it in a
+    // bucket we have already drained until the wheel wraps around.
+    fn defer_due(&mut self, item: ExpirationRef, now_ms: u64) {
+        let next_tick = (now_ms / self.tick_ms).saturating_add(1);
+        let bucket = (next_tick % self.buckets.len() as u64) as usize;
+        self.buckets[bucket].push(item);
+    }
+
     fn drain_candidates(&mut self, now_ms: u64, out: &mut Vec<ExpirationRef>) {
         let current = now_ms / self.tick_ms;
         let Some(last) = self.last_tick else {
@@ -655,7 +664,11 @@ impl CacheStore {
 
         for item in candidates.iter().copied() {
             if expired >= max_items {
-                self.expiry.schedule(item, now_ms);
+                if item.expires_at_ms <= now_ms {
+                    self.expiry.defer_due(item, now_ms);
+                } else {
+                    self.expiry.schedule(item, now_ms);
+                }
                 continue;
             }
             let Some(slot) = self.slots.get(item.slot as usize) else {
@@ -785,6 +798,32 @@ mod tests {
         store.set_integer(b"b", 9, Some(10), 200);
         assert_eq!(store.purge_expired(210, 100), 1);
         assert_eq!(store.get(b"b", 210), None);
+    }
+
+    #[test]
+    fn overdue_expirations_deferred_by_sweep_budget_are_reaped_next_tick() {
+        let mut store = CacheStore::new();
+        store.set_integer(b"first", 1, Some(5), 100);
+        store.set_integer(b"second", 2, Some(5), 100);
+
+        // Both deadlines land in tick 10, but only one can be reclaimed.
+        assert_eq!(store.purge_expired(110, 1), 1);
+        assert_eq!(store.len(), 1);
+
+        // A deferred item must not be lost until the wheel wraps back to tick 10.
+        assert_eq!(store.purge_expired(120, 1), 1);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn zero_budget_does_not_strand_overdue_expirations() {
+        let mut store = CacheStore::new();
+        store.set_integer(b"key", 1, Some(5), 100);
+
+        assert_eq!(store.purge_expired(110, 0), 0);
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.purge_expired(120, 1), 1);
+        assert!(store.is_empty());
     }
 
     #[test]
