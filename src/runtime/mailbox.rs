@@ -373,12 +373,15 @@ impl Mailbox {
         true
     }
 
-    fn release_slot(&self, system: bool) {
-        let previous = self.queued_count.fetch_sub(1, Ordering::Relaxed);
-        debug_assert!(previous > 0, "mailbox logical count underflow");
+    /// Only called from exclusive scheduler-owned dequeue/receive paths.
+    fn release_slot(&mut self, system: bool) {
+        let queued = self.queued_count.get_mut();
+        debug_assert!(*queued > 0, "mailbox logical count underflow");
+        *queued = (*queued).wrapping_sub(1);
         if !system && self.capacity != 0 {
-            let previous_normal = self.normal_count.fetch_sub(1, Ordering::Relaxed);
-            debug_assert!(previous_normal > 0, "mailbox normal credit underflow");
+            let normal = self.normal_count.get_mut();
+            debug_assert!(*normal > 0, "mailbox normal credit underflow");
+            *normal = (*normal).wrapping_sub(1);
         }
     }
 
@@ -397,11 +400,21 @@ impl Mailbox {
     }
 
     /// Push a message from the scheduler thread.
+    ///
+    /// Exclusive `&mut self` access rules out concurrent shared producers
+    /// during this call, so both counters can use non-atomic updates. Shared
+    /// `push(&self)` still reserves normal credits using atomic CAS.
     pub fn push_local(&mut self, msg: Message) -> Result<(), Message> {
         let system = msg.priority == MessagePriority::System;
-        if !self.reserve_slot(system) {
-            return Err(msg);
+        if !system && self.capacity != 0 {
+            let normal = self.normal_count.get_mut();
+            if *normal >= self.capacity {
+                return Err(msg);
+            }
+            *normal = (*normal).wrapping_add(1);
         }
+        let queued = self.queued_count.get_mut();
+        *queued = (*queued).wrapping_add(1);
         self.local_queue.push_back(msg);
         Ok(())
     }
@@ -710,6 +723,68 @@ mod tests {
         let accepted: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
         assert_eq!(accepted, 100);
         assert_eq!(mb.len(), 100);
+    }
+
+    #[test]
+    fn exclusive_local_admission_preserves_shared_capacity_and_receive_accounting() {
+        let mut mb = Mailbox::new(2);
+
+        // Both shared and scheduler-local producers contribute to one logical
+        // count, even though only the shared admission needs atomic CAS.
+        mb.push(make_msg(11, 100)).unwrap();
+        mb.push_local(make_msg(22, 200)).unwrap();
+        assert_eq!(mb.len(), 2);
+        assert!(mb.push(make_msg(33, 300)).is_err());
+        assert!(mb.push_local(make_msg(33, 300)).is_err());
+
+        // A selective-receive candidate still occupies capacity until commit.
+        let (arm, _) = mb.receive_match(&[22]).expect("local candidate");
+        assert_eq!(arm, 0);
+        assert_eq!(mb.len(), 2);
+        assert!(mb.push_local(make_msg(33, 300)).is_err());
+        mb.commit_receive_match().expect("commit local candidate");
+        assert_eq!(mb.len(), 1);
+        mb.push_local(make_msg(33, 300)).unwrap();
+
+        // System traffic bypasses capacity, then releases exactly one slot.
+        let mut system = make_msg(99, 0);
+        system.priority = MessagePriority::System;
+        mb.push(system).unwrap();
+        assert_eq!(mb.len(), 3);
+        assert_eq!(mb.pop().unwrap().behavior_id, 99);
+        assert_eq!(mb.len(), 2);
+
+        // Local traffic precedes already-staged normal shared traffic.
+        assert_eq!(mb.pop().unwrap().behavior_id, 33);
+        assert_eq!(mb.pop().unwrap().behavior_id, 11);
+        assert!(mb.is_empty());
+    }
+
+    #[test]
+    fn exclusive_local_bounded_admission_isolates_supervisor_traffic() {
+        let mut mb = Mailbox::new(1);
+        let mut system = make_msg(90, 0);
+        system.priority = MessagePriority::System;
+        mb.push_local(system).unwrap();
+        mb.push_local(make_msg(10, 100)).unwrap();
+        assert_eq!(mb.len(), 2, "supervisor signal does not consume normal credit");
+        assert!(mb.push(make_msg(11, 101)).is_err());
+        assert!(mb.push_local(make_msg(11, 101)).is_err());
+
+        // Consuming the system signal must not free the application's credit.
+        assert_eq!(mb.pop().unwrap().behavior_id, 90);
+        assert!(mb.push(make_msg(12, 102)).is_err());
+        assert_eq!(mb.len(), 1);
+
+        // Local normal traffic releases exactly one credit when committed
+        // by selective receive; shared traffic may then occupy it.
+        assert!(mb.receive_match(&[10]).is_some());
+        assert!(mb.push(make_msg(13, 103)).is_err());
+        mb.commit_receive_match().expect("commit local normal");
+        mb.push(make_msg(13, 103)).unwrap();
+        assert!(mb.push_local(make_msg(14, 104)).is_err());
+        assert_eq!(mb.pop().unwrap().behavior_id, 13);
+        assert!(mb.is_empty());
     }
 
     #[test]
