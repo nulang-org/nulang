@@ -15,7 +15,7 @@ use crate::durable_effect::{
 use crate::primitives::{DeliverySemantics, EffectBoundary};
 use crate::durable_effect_persistence::DurableEffectPersistenceRecord;
 use crate::runtime::{
-    Actor, DurableCommit, DurableTransition, PersistenceStore, DURABLE_TRANSITION_VERSION,
+    Actor, ActorState, DurableCommit, DurableTransition, PersistenceStore, DURABLE_TRANSITION_VERSION,
 };
 use std::fmt;
 use std::io;
@@ -94,6 +94,7 @@ pub enum DurableAsyncDispatchError {
     InvalidSite(CompiledEffectSpecError),
     Authorization(RuntimeAuthorityError),
     ActorMismatch { expected: u64, actual: u64 },
+    ActorNotLive,
     ActorEpochMismatch { expected: u64, actual: u64 },
     GrantOperationMismatch { operation: String, grant: AuthorityGrant },
     Recovery(DurableEffectRuntimeError),
@@ -110,6 +111,7 @@ impl fmt::Display for DurableAsyncDispatchError {
                 f,
                 "durable effect actor mismatch: expected {expected}, got {actual}"
             ),
+            Self::ActorNotLive => write!(f, "terminated actor cannot dispatch durable effect"),
             Self::ActorEpochMismatch { expected, actual } => write!(
                 f,
                 "durable effect activation epoch mismatch: expected {expected}, got {actual}"
@@ -230,6 +232,9 @@ impl<'a> DurableEffectCoordinator<'a> {
                 expected: self.actor_id,
                 actual: actor.id,
             });
+        }
+        if actor.state == ActorState::Terminated {
+            return Err(DurableAsyncDispatchError::ActorNotLive);
         }
         if actor.activation_epoch != self.activation_epoch {
             return Err(DurableAsyncDispatchError::ActorEpochMismatch {
