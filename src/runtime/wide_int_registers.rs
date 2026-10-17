@@ -32,6 +32,7 @@ pub enum IntRegisterError {
 pub struct RootedIntRegisters<'a> {
     heap: &'a mut ActorHeap,
     gc: &'a mut OrcaGc,
+    owner_id: u64,
     slots: Vec<Value>,
 }
 
@@ -40,6 +41,7 @@ impl<'a> RootedIntRegisters<'a> {
         Self {
             heap: &mut actor.heap,
             gc: &mut actor.orca_gc,
+            owner_id: actor.id,
             slots: vec![Value::nil(); count],
         }
     }
@@ -68,7 +70,7 @@ impl<'a> RootedIntRegisters<'a> {
             // the bank lives.
             let header = unsafe { &*ActorHeap::header_of(ptr) };
             debug_assert_eq!(header.type_tag, TypeTag::WideInt);
-            debug_assert_eq!(header.actor_id, self.gc.actor_id());
+            debug_assert_eq!(header.actor_id, self.owner_id);
             debug_assert_eq!(header.payload_size, std::mem::size_of::<i64>());
             // SAFETY: same live and initialized eight-byte payload proof.
             return Ok(Some(unsafe { ptr.cast::<i64>().read() }));
