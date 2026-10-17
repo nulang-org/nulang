@@ -692,6 +692,41 @@ mod tests {
     }
 
     #[test]
+    fn exclusive_local_admission_preserves_shared_capacity_and_receive_accounting() {
+        let mut mb = Mailbox::new(2);
+
+        // Both shared and scheduler-local producers contribute to one logical
+        // count, even though only the shared admission needs atomic CAS.
+        mb.push(make_msg(11, 100)).unwrap();
+        mb.push_local(make_msg(22, 200)).unwrap();
+        assert_eq!(mb.len(), 2);
+        assert!(mb.push(make_msg(33, 300)).is_err());
+        assert!(mb.push_local(make_msg(33, 300)).is_err());
+
+        // A selective-receive candidate still occupies capacity until commit.
+        let (arm, _) = mb.receive_match(&[22]).expect("local candidate");
+        assert_eq!(arm, 0);
+        assert_eq!(mb.len(), 2);
+        assert!(mb.push_local(make_msg(33, 300)).is_err());
+        mb.commit_receive_match().expect("commit local candidate");
+        assert_eq!(mb.len(), 1);
+        mb.push_local(make_msg(33, 300)).unwrap();
+
+        // System traffic bypasses capacity, then releases exactly one slot.
+        let mut system = make_msg(99, 0);
+        system.priority = MessagePriority::System;
+        mb.push(system).unwrap();
+        assert_eq!(mb.len(), 3);
+        assert_eq!(mb.pop().unwrap().behavior_id, 99);
+        assert_eq!(mb.len(), 2);
+
+        // Local traffic precedes already-staged normal shared traffic.
+        assert_eq!(mb.pop().unwrap().behavior_id, 33);
+        assert_eq!(mb.pop().unwrap().behavior_id, 11);
+        assert!(mb.is_empty());
+    }
+
+    #[test]
     fn test_supervisor_signals_never_dropped() {
         let mut mb = Mailbox::new(4);
         for i in 0..1000 {
