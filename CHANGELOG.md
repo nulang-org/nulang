@@ -421,6 +421,8 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Added since 1.0.0-frozen — 2026-09-16 (universal app vertical-slice + benchmark gates)
+- **Universal app vertical-slice definition and benchmark gates** (docs, PR #147). Documented the universal-app vertical-slice scope and its benchmark-gate criteria.
 ### Actor-capable `.nbc` execution — 2026-09-22
 - **Precompiled actor/workflow artifacts execute through the real Runtime**
   instead of standalone VM actor callbacks. Serialized modules carrying actor
