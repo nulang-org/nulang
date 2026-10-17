@@ -927,7 +927,10 @@ mod tests {
         }
         assert_eq!(actor.heap.live_count(), 0);
         let inline = crate::vm::Value::try_int(i64::MAX);
-        assert!(inline.is_none(), "must not alias an existing 48-bit integer");
+        assert!(
+            inline.is_none(),
+            "must not alias an existing 48-bit integer"
+        );
     }
 
     #[test]
