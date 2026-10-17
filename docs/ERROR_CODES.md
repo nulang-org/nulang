@@ -89,6 +89,21 @@ nulang --explain E0201   # stable category-scoped (same diagnostic)
 | `E012` | `E0302` |
 | `E013` | `E0208` |
 
+## Machine-readable typo suggestions
+
+`nulang --check <file> --json` uses the existing version-1 diagnostics
+schema. An `E0202` (unbound identifier) may include a
+`suggestion.replacement` string when **exactly one** in-scope spelling
+candidate exists and the error's source span covers the misspelled identifier
+exactly. The edit range is `diagnostic.span`. For example, a `countr`
+reference might suggest `counter` when it is the only candidate.
+
+When candidates are ambiguous, the source span is unavailable or mismatched,
+or the error isn't an unbound identifier, `replacement` remains `null`.
+Automated consumers must only apply replacements to the exact source revision
+that produced the diagnostic and should rerun type checking afterward.
+This is not an automatic edit of the user's source file.
+
 ## Warning codes
 
 Non-fatal diagnostics use a parallel `Wxxxx` scheme with the same stability

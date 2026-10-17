@@ -99,8 +99,9 @@ pub struct JsonSpan {
     pub end_col: usize,
 }
 
-/// A suggested fix. `message` mirrors the existing human-facing help text;
-/// `replacement` stays null unless a machine-applicable edit exists.
+/// A suggested fix. `replacement` is non-null only for a single compiler-
+/// verified name correction whose diagnostic span exactly matches the source
+/// identifier. All other suggestions remain human-readable only.
 #[derive(Debug, Clone, Serialize)]
 pub struct JsonSuggestion {
     pub message: String,
@@ -139,11 +140,48 @@ fn diagnostic_from_single(err: &NuError) -> JsonDiagnostic {
         message: json_message(err),
         span: err.primary_span().and_then(json_span),
         notes: crate::diagnostic::diagnostic_notes(err),
-        suggestion: err.suggestion().map(|msg| JsonSuggestion {
-            message: msg.to_string(),
-            replacement: None,
-        }),
+        suggestion: machine_identifier_replacement(err)
+            .map(|replacement| JsonSuggestion {
+                message: format!("Replace misspelled identifier with '{replacement}'"),
+                replacement: Some(replacement),
+            })
+            .or_else(|| {
+                err.suggestion().map(|msg| JsonSuggestion {
+                    message: msg.to_string(),
+                    replacement: None,
+                })
+            }),
     }
+}
+
+/// An unambiguous spelling suggestion is machine-applicable only when the
+/// compiler's source span covers precisely the unknown identifier. We refuse
+/// all other edits; a free-text hint is not sufficient evidence for a fix.
+fn machine_identifier_replacement(err: &NuError) -> Option<String> {
+    let NuError::TypeError {
+        msg,
+        span,
+        similar_names: Some(candidates),
+        ..
+    } = err
+    else {
+        return None;
+    };
+
+    let missing = msg
+        .strip_prefix("Unbound variable: '")?
+        .strip_suffix("'")?;
+    let [replacement] = candidates.as_slice() else {
+        return None;
+    };
+    if replacement.is_empty() || replacement == missing {
+        return None;
+    }
+    let source = current_source_text()?;
+    if source.get(span.start as usize..span.end as usize)? != missing {
+        return None;
+    }
+    Some(replacement.clone())
 }
 
 /// The core message without position prefixes or structured-field suffixes.
@@ -253,6 +291,62 @@ mod tests {
         assert_eq!(v["command"], "check");
         assert_eq!(v["ok"], false);
         assert!(v["diagnostics"].is_array());
+        clear_source_map();
+    }
+
+    #[test]
+    fn test_unique_unbound_name_emits_exact_machine_replacement() {
+        let source = "fn main() = countr + 1\n";
+        set_source_map_with_file(source, Some("typo.nula"));
+        let start = "fn main() = ".len() as u32;
+        let err = NuError::unbound_variable(
+            "countr",
+            Span::new(start, start + 6),
+            Some(vec!["counter".to_owned()]),
+        );
+        let diagnostic = diagnostics_from_error(&err).remove(0);
+        let fix = diagnostic.suggestion.expect("unambiguous fix");
+        assert_eq!(fix.replacement.as_deref(), Some("counter"));
+        assert_eq!(diagnostic.span.expect("source range").file, "typo.nula");
+        clear_source_map();
+    }
+
+    #[test]
+    fn test_ambiguous_typo_does_not_emit_machine_replacement() {
+        set_source_map_with_file("fn main() = countr\n", Some("ambiguous.nula"));
+        let start = "fn main() = ".len() as u32;
+        let err = NuError::unbound_variable(
+            "countr",
+            Span::new(start, start + 6),
+            Some(vec!["counter".to_owned(), "count".to_owned()]),
+        );
+        let diagnostic = diagnostics_from_error(&err).remove(0);
+        assert!(
+            diagnostic
+                .suggestion
+                .and_then(|fix| fix.replacement)
+                .is_none(),
+            "never auto-apply ambiguous name fixes"
+        );
+        clear_source_map();
+    }
+
+    #[test]
+    fn test_wrong_source_span_does_not_emit_machine_replacement() {
+        set_source_map_with_file("fn main() = countr\n", Some("mismatch.nula"));
+        let err = NuError::unbound_variable(
+            "countr",
+            Span::new(0, 6),
+            Some(vec!["counter".to_owned()]),
+        );
+        let diagnostic = diagnostics_from_error(&err).remove(0);
+        assert!(
+            diagnostic
+                .suggestion
+                .and_then(|fix| fix.replacement)
+                .is_none(),
+            "a suggested edit must identify the exact unknown identifier"
+        );
         clear_source_map();
     }
 
