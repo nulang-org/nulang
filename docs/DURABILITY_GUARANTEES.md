@@ -98,7 +98,7 @@ the external provider supplies.
 `DurableEffectCoordinator::execute_compiled_async_with_deduplication`
 takes the live owning `Actor`, an exact typed `AuthorityGrant`, a verified
 compiled module, exact effect-site PC, replay-stable execution key and occurrence,
-request bytes, and a provider callback. It rejects a mismatched actor ID or
+request bytes, and a provider callback. It rejects a mismatched actor ID, terminated actor, or
 activation epoch, requires the complete current actor grant manifest to parse,
 and verifies that an unparameterized `Other(Namespace::Operation)` grant
 matches the compiler's `Namespace.operation` effect site. All of these checks
@@ -110,8 +110,10 @@ resource-parameterized or built-in grants (`Net::TcpOut`, `Fs::Read`,
 exact evaluated destination/resource to authority. The host must supply a
 trusted live actor and correctly matched provider; caller-controlled actor
 objects, forged artifacts, or a provider closure that invokes a different
-operation are outside this proof. It obtains one
-canonical effect ID, commits `Prepared` **before** calling the provider,
+operation are outside this proof.
+
+Once authorized, the coordinator obtains one canonical effect ID and commits
+`Prepared` **before** calling the provider,
 supplies the stable idempotency key, persists a terminal receipt, and replays
 a completed result without redispatch. Provider errors leave `Prepared`
 intact because the external operation may already have committed.
@@ -125,7 +127,7 @@ between the epoch check and external dispatch. The external provider must
 actually deduplicate the idempotency key.
 
 `tests/authorized_compiled_durable_dispatch.rs` also covers missing
-or malformed grants, wrong actor or activation epoch, unrelated/parameterized
+or malformed grants, wrong or terminated actor, wrong activation epoch, unrelated/parameterized
 authority, revocation before retry or read-only receipt replay, and valid
 grant/receipt reuse. These cases assert no journal mutation on denial.
 
