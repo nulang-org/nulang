@@ -221,10 +221,10 @@ fn stale_activation_does_not_call_provider_for_prepared_effect() {
     let mut stale = DurableEffectCoordinator::new(&mut store, 42, 1);
     let result = stale.execute_compiled_async_with_deduplication(
         &module,
-            pc,
-            "order:42:payment",
-            0,
-            b"charge=100",
+        pc,
+        "order:42:payment",
+        0,
+        b"charge=100",
         |_, _| panic!("stale owner must not redispatch"),
     );
     assert!(matches!(
