@@ -6562,6 +6562,76 @@ mod vm_tests {
     }
 
     #[test]
+    fn perform_async_rejects_out_of_bounds_instruction_site_before_dispatch() {
+        let sites = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut vm = VM::new_without_jit();
+        let mut module = CodeModule::new("async_out_of_bounds");
+        let constant = module.add_string_constant("Inference.ask");
+        let instr = Instruction::new3(
+            OpCode::PerformAsync,
+            (constant >> 8) as u8,
+            constant as u8,
+            7,
+        );
+        module.emit(instr);
+        vm.load_module(module);
+        vm.set_actor_callbacks(Box::new(SiteAwareEffectCallbacks {
+            heap_callbacks: ReadyValueCallbacks::new(),
+            sites: sites.clone(),
+            pending_once: false,
+        }));
+
+        let mut frame = Frame::new(None, 0);
+        frame.pc = 2; // No instruction at PC 1.
+        vm.frames.push(frame);
+        vm.current_frame_idx = Some(0);
+
+        assert!(matches!(
+            vm.step_perform_async(0, 0, instr),
+            Err(NuError::VMError { .. })
+        ));
+        assert!(sites.borrow().is_empty(), "invalid PC reached the host");
+    }
+
+    #[test]
+    fn perform_async_rejects_instruction_mismatch_before_dispatch() {
+        let sites = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut vm = VM::new_without_jit();
+        let mut module = CodeModule::new("async_mismatched_instruction");
+        let constant = module.add_string_constant("Inference.ask");
+        let instr = Instruction::new3(
+            OpCode::PerformAsync,
+            (constant >> 8) as u8,
+            constant as u8,
+            7,
+        );
+        module.emit(instr);
+        vm.load_module(module);
+        vm.set_actor_callbacks(Box::new(SiteAwareEffectCallbacks {
+            heap_callbacks: ReadyValueCallbacks::new(),
+            sites: sites.clone(),
+            pending_once: false,
+        }));
+
+        let mut frame = Frame::new(None, 0);
+        frame.pc = 1;
+        vm.frames.push(frame);
+        vm.current_frame_idx = Some(0);
+
+        let wrong_instruction = Instruction::new3(
+            OpCode::PerformAsync,
+            (constant >> 8) as u8,
+            constant as u8,
+            8,
+        );
+        assert!(matches!(
+            vm.step_perform_async(0, 0, wrong_instruction),
+            Err(NuError::VMError { .. })
+        ));
+        assert!(sites.borrow().is_empty(), "mismatched opcode reached the host");
+    }
+
+    #[test]
     fn perform_async_rejects_missing_fetched_pc_before_host_dispatch() {
         let sites = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let mut vm = VM::new_without_jit();
