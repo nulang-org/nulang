@@ -88,23 +88,7 @@ impl LlmClient for OpenAiClient {
             message.content
         };
 
-        let tool_calls: Vec<ToolCall> = message
-            .tool_calls
-            .unwrap_or_default()
-            .into_iter()
-            .map(|tc| {
-                let arguments = match tc.function.arguments {
-                    serde_json::Value::Object(map) => map,
-                    serde_json::Value::String(s) => serde_json::from_str(&s).unwrap_or_default(),
-                    _ => serde_json::Map::new(),
-                };
-                ToolCall {
-                    id: tc.id,
-                    name: tc.function.name,
-                    arguments,
-                }
-            })
-            .collect();
+        let tool_calls = parse_tool_calls(message.tool_calls.unwrap_or_default())?;
 
         let usage = response.usage.unwrap_or_default();
 
@@ -116,6 +100,38 @@ impl LlmClient for OpenAiClient {
             usage: TokenUsage::new(usage.prompt_tokens, usage.completion_tokens),
         })
     }
+}
+
+/// Parse provider tool calls without inventing empty arguments for invalid data.
+/// Fail the entire response rather than dispatching a partially parsed batch.
+fn parse_tool_calls(calls: Vec<OpenAiToolCall>) -> Result<Vec<ToolCall>, LlmError> {
+    calls
+        .into_iter()
+        .map(|call| {
+            let arguments = match call.function.arguments {
+                serde_json::Value::String(encoded) => {
+                    serde_json::from_str::<serde_json::Value>(&encoded).map_err(|_| {
+                        LlmError::new(
+                            LlmErrorKind::FormatError,
+                            "OpenAI tool call arguments contain invalid JSON",
+                        )
+                    })?
+                }
+                value => value,
+            };
+            let serde_json::Value::Object(arguments) = arguments else {
+                return Err(LlmError::new(
+                    LlmErrorKind::FormatError,
+                    "OpenAI tool call arguments must be a JSON object",
+                ));
+            };
+            Ok(ToolCall {
+                id: call.id,
+                name: call.function.name,
+                arguments,
+            })
+        })
+        .collect()
 }
 
 // -- Error classification helpers -------------------------------------------
@@ -362,12 +378,96 @@ mod tests {
 
     #[test]
     fn test_argument_string_parsing_roundtrip() {
-        let raw = json!("{\"location\":\"NYC\"}");
-        let arguments = match raw {
-            serde_json::Value::Object(map) => map,
-            serde_json::Value::String(s) => serde_json::from_str(&s).unwrap_or_default(),
-            _ => serde_json::Map::new(),
+        let call = OpenAiToolCall {
+            id: "call_1".into(),
+            function: OpenAiToolCallFunction {
+                name: "get_weather".into(),
+                arguments: json!("{\"location\":\"NYC\"}"),
+            },
         };
-        assert_eq!(arguments.get("location").unwrap(), "NYC");
+        let parsed = parse_tool_calls(vec![call]).unwrap();
+        assert_eq!(parsed[0].arguments.get("location"), Some(&json!("NYC")));
+    }
+
+    #[test]
+    fn tool_calls_accept_object_and_json_encoded_object_arguments() {
+        let calls = vec![
+            OpenAiToolCall {
+                id: "direct".into(),
+                function: OpenAiToolCallFunction {
+                    name: "lookup".into(),
+                    arguments: json!({"id": 42}),
+                },
+            },
+            OpenAiToolCall {
+                id: "encoded".into(),
+                function: OpenAiToolCallFunction {
+                    name: "lookup".into(),
+                    arguments: json!("{\"id\":43}"),
+                },
+            },
+        ];
+        let parsed = parse_tool_calls(calls).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].arguments.get("id"), Some(&json!(42)));
+        assert_eq!(parsed[1].arguments.get("id"), Some(&json!(43)));
+    }
+
+    #[test]
+    fn tool_calls_reject_malformed_json_instead_of_executing_with_empty_arguments() {
+        let calls = vec![OpenAiToolCall {
+            id: "bad".into(),
+            function: OpenAiToolCallFunction {
+                name: "delete_resource".into(),
+                arguments: json!("{\"resource\":"),
+            },
+        }];
+        let error = parse_tool_calls(calls).unwrap_err();
+        assert_eq!(error.kind, LlmErrorKind::FormatError);
+    }
+
+    #[test]
+    fn tool_calls_reject_non_object_json_arguments() {
+        for arguments in [
+            json!("[]"),
+            json!("null"),
+            json!([1, 2]),
+            json!(null),
+            json!(42),
+        ] {
+            let calls = vec![OpenAiToolCall {
+                id: "bad".into(),
+                function: OpenAiToolCallFunction {
+                    name: "delete_resource".into(),
+                    arguments,
+                },
+            }];
+            let error = parse_tool_calls(calls).unwrap_err();
+            assert_eq!(error.kind, LlmErrorKind::FormatError);
+        }
+    }
+
+    #[test]
+    fn tool_calls_reject_entire_batch_when_later_call_is_malformed() {
+        let calls = vec![
+            OpenAiToolCall {
+                id: "valid".into(),
+                function: OpenAiToolCallFunction {
+                    name: "lookup".into(),
+                    arguments: json!({"id": 1}),
+                },
+            },
+            OpenAiToolCall {
+                id: "invalid".into(),
+                function: OpenAiToolCallFunction {
+                    name: "delete_resource".into(),
+                    arguments: json!("not-json"),
+                },
+            },
+        ];
+        assert_eq!(
+            parse_tool_calls(calls).unwrap_err().kind,
+            LlmErrorKind::FormatError
+        );
     }
 }
