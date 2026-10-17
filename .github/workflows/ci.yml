@@ -48,6 +48,9 @@ jobs:
       - name: Smoke test browser playground
         run: node playground/web/test/smoke.mjs
 
+      - name: Smoke test generated Nulang Web client runtime
+        run: node scripts/tests/web_client_runtime.mjs
+
       - name: Install docs dependencies
         run: |
           cd docs
