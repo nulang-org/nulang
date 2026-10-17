@@ -64,3 +64,14 @@ After the tag workflow publishes the release:
 - [ ] Extract each native-host archive and run `nulang --version`
 - [ ] Follow the README install commands from a clean environment rather than
       relying on a maintainer checkout
+- [ ] The tag-triggered Release workflow has passed **packaged executable**
+      smoke checks for Linux x86_64, Linux aarch64, macOS aarch64, and Windows
+      x86_64. A source-only Cargo test is not enough.
+- [ ] Linux x86_64 passes inside the workflow's clean Ubuntu 24.04 container
+      with the documented **runtime** shared libraries only (no build SDK).
+- [ ] Linux arm64 passes on the native Ubuntu 24.04 arm64 runner, using the
+      published artifact, not a rebuilt binary.
+- [ ] Confirm the target's declared system-library requirements remain
+      accurate. A passing Ubuntu 24.04 test does **not** imply arbitrary
+      distribution compatibility, nor remove the need for macOS/Windows
+      clean-machine acceptance testing.
