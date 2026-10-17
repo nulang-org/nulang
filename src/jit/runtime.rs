@@ -320,17 +320,18 @@ pub extern "C" fn nulang_icmp_ge(a: u64, b: u64) -> u64 {
 
 #[no_mangle]
 pub extern "C" fn nulang_fadd(a: u64, b: u64) -> u64 {
-    Value::float(f64::from_bits(a) + f64::from_bits(b)).as_raw()
+    // FAdd treats a runtime non-float (e.g. nil from FDiv) as 0.0.
+    Value::float(fval(a) + fval(b)).as_raw()
 }
 
 #[no_mangle]
 pub extern "C" fn nulang_fsub(a: u64, b: u64) -> u64 {
-    Value::float(f64::from_bits(a) - f64::from_bits(b)).as_raw()
+    Value::float(fval(a) - fval(b)).as_raw()
 }
 
 #[no_mangle]
 pub extern "C" fn nulang_fmul(a: u64, b: u64) -> u64 {
-    Value::float(f64::from_bits(a) * f64::from_bits(b)).as_raw()
+    Value::float(fval(a) * fval(b)).as_raw()
 }
 
 /// Float arithmetic that coerces a non-float (nil) operand to 0.0, matching
@@ -2129,6 +2130,28 @@ pub unsafe extern "C" fn nulang_aot_receive_pop() -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_jit_float_arithmetic_coerces_nil_operands_like_interpreter() {
+        use crate::vm::Value;
+
+        let nil = Value::nil().as_raw();
+        let two = Value::float(2.0).as_raw();
+        let three = Value::float(3.0).as_raw();
+        let value = |raw| unsafe { Value::from_raw(raw) }.as_float();
+
+        // A zero-divisor result is nil; a subsequent FAdd must treat
+        // that tagged result as 0.0, not reinterpret its NaN-boxed bits.
+        let div_zero = super::nulang_fdiv(two, Value::float(0.0).as_raw());
+        assert_eq!(div_zero, nil);
+        assert_eq!(value(super::nulang_fadd(div_zero, three)), Some(3.0));
+        assert_eq!(value(super::nulang_fadd(three, nil)), Some(3.0));
+        assert_eq!(value(super::nulang_fsub(nil, three)), Some(-3.0));
+        assert_eq!(value(super::nulang_fsub(three, nil)), Some(3.0));
+        assert_eq!(value(super::nulang_fmul(nil, three)), Some(0.0));
+        assert_eq!(value(super::nulang_fmul(three, nil)), Some(0.0));
+        assert_eq!(value(super::nulang_fadd(two, three)), Some(5.0));
+    }
 
     #[test]
     fn test_native_float_division_coerces_nil_like_interpreter() {

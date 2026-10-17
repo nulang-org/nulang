@@ -1000,6 +1000,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn differential_fuzz_float_nil_addition_through_array_index_agrees() {
+        // Exact Oct 15 nightly repro: interpreter returned 2.5 while
+        // warmed JIT returned nil after the division-by-zero result.
+        let source = "let a = [1.5, 2.5]; 1.0 / 0.0 + a[1]";
+        let outcome = differential_fuzz_one(source)
+            .expect("interpreter/JIT/AOT must agree after float nil coercion");
+        assert!(
+            matches!(outcome, DiffOutcome::Agreed { .. }),
+            "the regression must execute and compare backends: {:?}",
+            outcome
+        );
+    }
+
     /// Differential regression cases: known kernels that must agree across
     /// all backends. Added from nightly fuzz captures (2026-10-10).
     #[test]
