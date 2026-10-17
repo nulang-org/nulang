@@ -72,13 +72,33 @@ pub enum ActorRunState {
     Running,
 }
 
-// -- Flight recorder (deterministic replay support) ---------------------
+// -- Flight recorder (actor delivery diagnostics) ------------------------
 
-/// A single entry in an actor's flight-recorder trace.  Captures enough
-/// information to deterministically replay the message sequence that led
-/// to a crash or unexpected behavior.
+/// Delivery lifecycle observed by the local runtime. A dequeued message is
+/// not necessarily completed successfully; this is not an execution replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceEventKind {
+    Admitted,
+    Backpressured,
+    Dequeued,
+}
+
+impl TraceEventKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Admitted => "admitted",
+            Self::Backpressured => "backpressured",
+            Self::Dequeued => "dequeued",
+        }
+    }
+}
+
+/// A single entry in an actor's opt-in flight-recorder trace.
+/// Entries are local, non-durable diagnostics, not replayable events.
 #[derive(Debug, Clone)]
 pub struct TraceEntry {
+    /// Admission, backpressure, or dequeue outcome.
+    pub event: TraceEventKind,
     /// Per-actor monotonic sequence number (arrival order).
     pub seq: u64,
     /// Actor ID of the sender (0 = system/runtime message).
@@ -169,20 +189,71 @@ impl FlightRecorder {
             payload_summary.push_str(&value.to_string_repr());
         }
 
-        let entry = TraceEntry {
+        self.push_entry(TraceEntry {
+            event: TraceEventKind::Admitted,
             seq,
             sender,
             behavior_id,
             payload_len,
             payload_summary,
-        };
+        });
+    }
 
+    /// Record delivery metadata without reading, formatting, or retaining
+    /// message values. Disabled recorders never allocate for this path.
+    pub fn record_metadata(
+        &mut self,
+        event: TraceEventKind,
+        sender: u64,
+        behavior_id: u16,
+        payload_len: usize,
+    ) {
+        if self.max_entries == 0 {
+            return;
+        }
+
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.push_entry(TraceEntry {
+            event,
+            seq,
+            sender,
+            behavior_id,
+            payload_len,
+            payload_summary: String::new(),
+        });
+    }
+
+    fn push_entry(&mut self, entry: TraceEntry) {
         if self.entries.len() < self.max_entries {
             self.entries.push(entry);
         } else {
             self.entries[self.cursor] = entry;
             self.cursor = (self.cursor + 1) % self.max_entries;
         }
+    }
+
+    /// Export oldest-to-newest structured diagnostic records.
+    ///
+    /// The JSONL representation deliberately excludes `payload_summary`
+    /// (which may contain secrets) and all payload values. It contains only
+    /// actor/behavior identifiers, counts, lifecycle outcomes and sequence
+    /// numbers. It is not a durable journal or complete execution replay.
+    pub fn to_metadata_jsonl(&self, actor_id: u64) -> String {
+        let mut out = String::new();
+        for entry in self.ordered_entries() {
+            let line = serde_json::json!({
+                "actor_id": actor_id,
+                "seq": entry.seq,
+                "event": entry.event.as_str(),
+                "sender": entry.sender,
+                "behavior_id": entry.behavior_id,
+                "payload_len": entry.payload_len,
+            });
+            out.push_str(&line.to_string());
+            out.push('\n');
+        }
+        out
     }
 
     /// Return all recorded entries (raw ring buffer — use ordered_entries()
