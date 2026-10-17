@@ -2619,7 +2619,7 @@ mod tests {
         // 1. Absent language => ok
         assert!(prepare_package().is_ok());
 
-        // 2. Matching language => ok (our format is 1.0.0-frozen, so 1.0.0 should match)
+        // 2. Matching numeric language version is accepted across status labels.
         let mut manifest = Manifest::load(&dir).expect("manifest should load");
         manifest.package.language = Some("1.0.0".to_string());
         manifest.save(&dir).unwrap();

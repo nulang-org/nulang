@@ -30,6 +30,15 @@ Unless otherwise noted, examples in sections describing *implemented* features a
 
 ---
 
+> **Core stability note (2026-10-17):** The source-language Core described
+> below is **Incubating**, not permanently Frozen or subject to Stable-tier
+> deprecation requirements. See `GOVERNANCE.md` and
+> `RFC/0032-incubating-core-and-value-semantics.md`. Historical references to
+> a "Frozen Core" and `1.0.0-frozen` refer to previous design/metadata rather
+> than the active pre-adoption change policy. Existing published v1 bytecode,
+> wire, and value layouts remain versioned archival contracts. The current VM
+> still uses 48-bit immediate integers, not general full-width `Int64` values.
+
 # Implementation Status (Current Alpha)
 
 This document is the design target for Nulang 2.0. The implementation in this repository is an alpha (the v0.9 series) that realizes a substantial subset of the design. This section records, as of the current commit, what is implemented and what remains planned, so readers can distinguish descriptions of working behavior from aspirational ones. Sections that describe unimplemented surface are marked **Planned** inline.

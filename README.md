@@ -206,15 +206,17 @@ nulang nula doc              # generate Markdown API docs
 
 Nulang is **alpha software**. Existing v1 artifacts still carry the historical
 `1.0.0-frozen` language metadata, but accepted RFC 0021 no longer treats
-pre-adoption source semantics as permanently Frozen. Published formats remain
-archival compatibility obligations, while source semantics stay Stable until
-the external-adoption freeze gate is satisfied. See
+pre-adoption source semantics as permanently Frozen. RFC 0032 now places
+pre-adoption Nulang Core in the **Incubating** tier, removing mandatory
+two-major deprecation cycles while keeping explicit safety and versioning
+requirements. Published formats remain archival compatibility obligations. See
 [`GOVERNANCE.md`](GOVERNANCE.md) for the full definitions:
 
 | Tier | Scope |
 |------|-------|
-| **Frozen** | Published v1 compatibility contracts: `.nbc` format v1, NUL0 v1, value layout v1, plus any explicitly Frozen effect contracts. Old versions are never silently reinterpreted; future versions may evolve behind explicit version boundaries. |
-| **Stable** | Nulang Core (pre-adoption), HM type system, effect rows, capability lattice, actor surface. Breaking changes require an RFC, an explicit version transition, diagnostics, and a migration path. |
+| **Frozen** | Published v1 compatibility contracts: `.nbc` format v1, NUL0 v1, value layout v1. Old versions are never silently reinterpreted; future versions may evolve behind explicit version boundaries. |
+| **Incubating** | Pre-adoption Nulang Core, HM types, effect rows, capability lattice, built-in effects, and actor source semantics. Changes need specification, tests and explicit artifact/ABI versioning when relevant, but no mandatory RFC or multi-major deprecation. |
+| **Stable** | Explicitly promoted interfaces outside Incubating Core; breaking changes require an RFC and deprecation policy. |
 | **Experimental** | Everything else — including `wasm-backend`/`wasmfx-backend`, `cache-server`, the AI runtime, Fabric, typed actor-protocol hardening, multi-node distribution, CRDTs (Rust-level only so far), optional persistence backends, and other items marked Experimental in [`CHANGELOG.md`](CHANGELOG.md). |
 
 > **Pre-1.0 disclaimer:** Nulang does not have external users yet. The tier

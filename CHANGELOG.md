@@ -1,4 +1,10 @@
 # Nulang Changelog
+### Incubating Core and tagged-value safety — 2026-10-17 (draft PR)
+- **Governance:** Pre-adoption Nulang Core is now Incubating rather than Stable, pending independent adoption evidence. Language semantics can be revised with spec, changelog, and conformance evidence without a two-major-version deprecation cycle. The existing v1 bytecode, wire, and value-format archival contracts remain separately versioned.
+- **Runtime:** `Value::try_actor_ref` rejects 64-bit IDs that cannot fit in its 48-bit inline handle. `Value::actor_ref` now fails loudly instead of wrapping to an unrelated actor. This is not yet a full-width logical identity implementation.
+- **Virtual actors:** Known local grain hash collisions are rejected before mapping overwrite, hydration, or cross-shard delivery. Local and explicitly targeted remote sends also reject known conflicting handles. Cluster-global collision freedom still requires identity-separated addressing.
+- **VM floats:** `Value::float` now applies canonical NaN encoding before tag discrimination. Regression tests cover hardware-NaN and tag-shaped NaN inputs.
+
 ### Bounded Nulang Web development-server connections — 2026-10-16
 - **The experimental Web development listener caps active connections at 64**, including SSE, and returns `503` with `Retry-After: 1` when full.
 - **Worker capacity is returned by a scoped RAII lease** after normal completion, panic, or thread-spawn failure. One shared `Arc` route table replaces per-connection clones of compiled route modules.

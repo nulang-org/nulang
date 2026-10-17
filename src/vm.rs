@@ -1953,9 +1953,11 @@ impl Value {
         }
     }
 
-    /// Create a float value.
+    /// Create a float value, canonicalizing NaNs so they cannot alias tags.
     pub fn float(f: f64) -> Self {
-        Value { raw: f.to_bits() }
+        Value {
+            raw: crate::value_layout::float_bits(f),
+        }
     }
 
     /// Create a boolean value.
@@ -1970,11 +1972,24 @@ impl Value {
         Value { raw: TAG_UNIT }
     }
 
-    /// Create an actor reference.
-    pub fn actor_ref(id: u64) -> Self {
-        Value {
-            raw: TAG_ACTOR | (id & PAYLOAD_MASK),
+    /// Try to encode an actor ID as an inline 48-bit runtime handle.
+    ///
+    /// IDs wider than the inline payload must be represented by a separate
+    /// logical address/handle mapping, never silently truncated. A truncated
+    /// value could address an unrelated actor.
+    pub fn try_actor_ref(id: u64) -> Option<Self> {
+        if id & !PAYLOAD_MASK != 0 {
+            return None;
         }
+        Some(Value {
+            raw: TAG_ACTOR | id,
+        })
+    }
+
+    /// Create an actor reference, rejecting IDs that do not fit the inline
+    /// value representation. Use `try_actor_ref` at fallible boundaries.
+    pub fn actor_ref(id: u64) -> Self {
+        Self::try_actor_ref(id).expect("actor ID exceeds the 48-bit inline handle range")
     }
 
     /// Create a closure reference.

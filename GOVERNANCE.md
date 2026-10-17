@@ -7,12 +7,14 @@
 > **Status:** Ratified 2026-07-19 and amended by accepted RFC 0021
 > (Compatibility Before Permanent Freeze) on 2026-09-21.
 >
-> **Pre-adoption reality check:** Nulang is alpha software without meaningful
-> external adoption yet. Published artifacts/protocols remain explicit
-> compatibility obligations, but source semantics are not permanently Frozen
-> until the evidence-bearing adoption gate in RFC 0021 is met. Semantic breaks
-> still require an RFC, an explicit language-version transition, diagnostics,
-> and a migration story; silent churn is never permitted.
+> **Pre-adoption reality check (2026-10-17):** Nulang is alpha software without
+> independent production adopters. Source-language Core semantics are now
+> **Incubating**, not Frozen or Stable: deliberate changes can proceed without
+> a two-major-version deprecation cycle or one RFC per revision. Every semantic
+> change still needs an explicit specification, regression/conformance evidence,
+> and versioning when a persisted or independently deployed boundary changes.
+> Previously published artifact/protocol versions remain separately versioned
+> and must not be silently reinterpreted. See RFC 0032.
 
 ## 1. Purpose
 
@@ -29,7 +31,7 @@ contract and a process that makes breaking changes expensive and survivable.
 
 ## 2. Stability Tiers
 
-Every public surface of Nulang is classified into one of three tiers. The tier
+Every public surface of Nulang is classified into one of four tiers. The tier
 determines what changes are permitted and how. See `CHANGELOG.md` for the
 current classification.
 
@@ -42,20 +44,29 @@ applies to the named published version, not to internal implementation choices.
 - `.nbc` bytecode format version 1 (`src/format/constants.rs`).
 - NUL0 wire protocol version 1.
 - Value layout version 1 (`src/value_layout.rs`).
-- The currently published `IO`, `Spawn`, `Send`, `Receive` built-in
-  effect contracts remain Frozen pending a dedicated reclassification RFC.
+
+### Incubating (pre-adoption language semantics)
+Core syntax, evaluation, types, effects, capabilities, and built-in
+`IO`/`Spawn`/`Send`/`Receive` source contracts may change while Nulang
+has no independent production consumers. Changes must be intentional, reviewed,
+documented in `CHANGELOG.md` and `SPEC2.md`, and covered by conformance and
+cross-backend tests where relevant. A breaking change to a serialized format,
+wire protocol, durable history, or public embedder ABI still needs a new
+version or explicit migration/rejection path; incubation does not waive data
+integrity or authority guarantees.
+
+Incubating changes do **not** require a mandatory RFC, two-major-version
+deprecation cycle, or artificial compatibility shim. The adoption gate in
+RFC 0021 controls when any named semantic surface can be promoted to Stable
+or Frozen. A substantial design may still use an RFC for review.
 
 ### Stable
 Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions (the deprecated surface remains functional, emits a
 warning, and is removed only in the version after next).
 
-- Nulang Core syntax and semantics (RFC 0002), reclassified from Frozen by
-  RFC 0021 until the external-adoption freeze gate is satisfied.
-- The full HM type system and inference rules.
-- The effect-row system (closed/open, regions).
-- The capability lattice (`iso/trn/ref/val/box/tag/lineariso`) and subtyping.
-- The actor surface (`spawn`, `send`, `receive`, supervision).
+- Public surfaces explicitly designated Stable by their own accepted RFC,
+  excluding the pre-adoption language Core and its immediate built-ins.
 - ~~CRDT operations and their merge semantics~~ — **erratum (2026-08-02):**
   removed. This was never an accurate claim: there is no `.nula`-level
   syntax to construct or operate on any CRDT type today (no type
@@ -118,6 +129,8 @@ is audited in `SPEC2.md` §Implementation Status.
 ### Implementers
 - May fix bugs and add Experimental-tier features without an RFC.
 - Must not change Frozen or Stable surfaces without an accepted RFC.
+- May revise Incubating Core with tests, spec/changelog updates, and explicit
+  artifact/ABI versioning where affected; a separate RFC is optional.
 - Must record every user-visible change in `CHANGELOG.md` under the correct
   tier.
 
@@ -148,10 +161,13 @@ RFC.
 - **Crate version** (`Cargo.toml` `version`): the implementation version. May
   rev freely (semver) for bug fixes, performance, and Experimental features.
 - **Language version** (`Cargo.toml` `[package.metadata] language-version`,
-  and the `LANGUAGE_VERSION` const in `src/format/constants.rs`): moves only
-  on RFC-ratified change to Frozen or Stable surfaces. Recorded in every
-  `.nbc` artifact. A runtime rejects an artifact whose language version
-  exceeds its own (`FormatError::IncompatibleLanguage`).
+  and the `LANGUAGE_VERSION` const in `src/format/constants.rs`):
+  increment/identify the semantic generation when a released Incubating change
+  makes prior compiled artifacts incompatible. Frozen and Stable changes
+  additionally require an RFC. The version is recorded in `.nbc` artifacts,
+  and newer incompatible versions are rejected rather than guessed.
+  The historical string `1.0.0-frozen` denotes existing v1 metadata, not
+  a promise that the active source Core is permanently frozen.
 
 ## 6. Deprecation
 

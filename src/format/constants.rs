@@ -43,13 +43,14 @@ pub const WIRE_VERSION: u32 = 1;
 /// compiled artifact and every wire peer; it requires an RFC.
 pub const VALUE_LAYOUT_VERSION: u32 = 1;
 
-/// Nulang *language* version, recorded in every `.nbc` artifact. This is
-/// distinct from the crate (`Cargo.toml`) version: the crate may rev freely,
-/// but the language version moves only on RFC-ratified change. See
-/// `CHANGELOG.md` and `GOVERNANCE.md`.
+/// Nulang *language* generation, recorded in every `.nbc` artifact.
+/// Distinct from the crate version. The pre-adoption Core is Incubating:
+/// semantic revisions do not require a separate RFC, but incompatible
+/// released artifacts must use an explicit generation/version transition.
+/// Historical v1 artifacts remain distinguishable; see GOVERNANCE.md.
 pub const LANGUAGE_VERSION: u32 = 1;
 /// String form of [`LANGUAGE_VERSION`] for telemetry and CLI output.
-pub const LANGUAGE_VERSION_STR: &str = "1.0.0-frozen";
+pub const LANGUAGE_VERSION_STR: &str = "1.0.0-incubating";
 
 /// Length of a `.nbc` file header in bytes (magic + format_version +
 /// language_version + source_hash + instr_count).

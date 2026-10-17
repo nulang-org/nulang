@@ -8128,6 +8128,63 @@ fn test_grain_ref_builtin_string_key() {
 }
 
 #[test]
+fn test_grain_ref_rejects_conflicting_stable_id_without_overwriting_mapping() {
+    let mut rt = Runtime::new();
+    let grain_id = GrainId::new("Counter", "alpha");
+    let conflicting = GrainId::new("Different", "identity");
+    let stable_id = grain_actor_id(&grain_id);
+    rt.grain_actor_ids.insert(stable_id, conflicting.clone());
+
+    let constants = vec![
+        Constant::String("Counter".to_string()),
+        Constant::String("alpha".to_string()),
+    ];
+    let regs = vec![Value::string(0), Value::string(1)];
+    assert_eq!(
+        rt.perform_grain_builtin(Some("ref"), &constants, &regs),
+        Some(Value::nil()),
+        "a colliding grain identity must never steal another grain's actor handle"
+    );
+    assert_eq!(rt.grain_actor_ids.get(&stable_id), Some(&conflicting));
+}
+
+#[test]
+fn test_grain_hydration_rejects_conflicting_stable_id_before_mutation() {
+    let mut rt = Runtime::new();
+    register_test_grain(&mut rt, "Counter");
+
+    let grain_id = GrainId::new("Counter", "alpha");
+    let conflicting = GrainId::new("Different", "identity");
+    let stable_id = grain_actor_id(&grain_id);
+    rt.grain_actor_ids.insert(stable_id, conflicting.clone());
+
+    assert!(
+        rt.resolve_or_hydrate_grain(grain_id.clone()).is_err(),
+        "hash collision must fail before actor or recovery state is modified"
+    );
+    assert_eq!(rt.grain_actor_ids.get(&stable_id), Some(&conflicting));
+    assert!(!rt.actors.contains_key(&stable_id));
+    assert!(!rt.grain_residents.contains_key(&grain_id));
+}
+
+#[test]
+fn test_cross_shard_grain_delivery_does_not_hijack_unrelated_actor() {
+    let mut rt = Runtime::new();
+    let grain_id = GrainId::new("Counter", "alpha");
+    let handle = grain_actor_id(&grain_id);
+    rt.actors
+        .insert(handle, Actor::new(handle, "unrelated-actor".to_string(), 0));
+    let holds = ObjectRefLease::acquire(&rt.object_store, &[]).unwrap();
+
+    rt.deliver_cross_shard_message(handle, 0, Vec::new(), 0, None, Some(grain_id), holds);
+
+    assert!(
+        rt.actors.get(&handle).unwrap().mailbox.is_empty(),
+        "cross-shard virtual actor traffic must not be delivered to a non-grain actor with a colliding handle"
+    );
+}
+
+#[test]
 fn test_grain_ref_builtin_int_key() {
     let mut rt = Runtime::new();
     let constants = vec![Constant::String("User".to_string())];
