@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Static route local-call effect inference — 2026-10-17
+- **Explicitly static route handlers now include compiler-inferred effects from direct same-module helper calls**, including transitive local call chains, rather than trusting only the handler's declared effect row. Known Request/Time/Net/DB effects thus reach existing fail-closed static validation.
+- **Inference failures or unresolved local static handler bodies become contract diagnostics.** Pure helper chains remain eligible for explicit static placement. This is not a complete proof for dynamically dispatched, imported, or arbitrary indirect calls; complete package-linked effect verification remains future work.
+
 ### Conservative Web placement and stale-route cleanup — 2026-10-17
 - **Unannotated routes now default to server execution**, even for literal GET/HEAD paths. Static generation is opt-in through an explicit `@placement(static)` route handler.
 - **Known unsafe explicit static contracts are rejected**, including dynamic paths, request-bound inputs, and declared effects other than `Render`. This is not yet a full transitive-purity proof for unannotated helper calls.
