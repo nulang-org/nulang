@@ -10,8 +10,8 @@ mod workflow_impl;
 pub(crate) use workflow_impl::{
     actor_is_workflow, append_saga_compensated, append_signal_received, append_timer_fired,
     checkpoint_actor, commit_step_completed, commit_workflow_command, emit_event, next_sequence,
-    query_workflow, register_workflow_query, schedule_workflow_timer, signal_workflow,
-    try_checkpoint_actor,
+    persist_step_completed, persist_step_failed, query_workflow, register_workflow_query,
+    schedule_workflow_timer, signal_workflow, try_checkpoint_actor, workflow_has_atomic_tail,
 };
 
 #[allow(dead_code)]
