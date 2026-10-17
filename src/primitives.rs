@@ -29,17 +29,82 @@ pub enum ExecutionDomain {
     Actor,
 }
 
-/// Persistence semantics are orthogonal to the execution domain.
+/// Whether runtime-managed state survives its owning execution lifetime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PersistenceSemantics {
-    /// State/computation disappears when its owning execution lifetime ends.
+pub enum Durability {
     Ephemeral,
-    /// Runtime-managed state/history survives restart.
     Durable,
-    /// An append-only domain-event history is the source of truth.
+}
+
+/// Whether state is represented by its current value or by an event history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HistorySemantics {
+    CurrentState,
     EventSourced,
-    /// State is replicated/merged according to an explicit convergence model.
+}
+
+/// Whether state participates in an explicitly defined replication model.
+///
+/// `Replicated` does not by itself promise convergence, consistency, or
+/// cross-node durability. Those guarantees belong to the configured backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReplicationSemantics {
+    Local,
     Replicated,
+}
+
+/// Orthogonal state properties, independent of the execution domain.
+///
+/// Event sourcing and replication may coexist with durable state. This is
+/// compiler/runtime vocabulary only: it does not change serialized formats,
+/// state backends, recovery contracts, or source-language syntax.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PersistenceSemantics {
+    pub durability: Durability,
+    pub history: HistorySemantics,
+    pub replication: ReplicationSemantics,
+}
+
+impl PersistenceSemantics {
+    pub const EPHEMERAL: Self = Self::new(
+        Durability::Ephemeral,
+        HistorySemantics::CurrentState,
+        ReplicationSemantics::Local,
+    );
+
+    pub const DURABLE: Self = Self::new(
+        Durability::Durable,
+        HistorySemantics::CurrentState,
+        ReplicationSemantics::Local,
+    );
+
+    pub const fn new(
+        durability: Durability,
+        history: HistorySemantics,
+        replication: ReplicationSemantics,
+    ) -> Self {
+        Self {
+            durability,
+            history,
+            replication,
+        }
+    }
+
+    pub const fn with_history(self, history: HistorySemantics) -> Self {
+        Self {
+            durability: self.durability,
+            history,
+            replication: self.replication,
+        }
+    }
+
+    pub const fn with_replication(self, replication: ReplicationSemantics) -> Self {
+        Self {
+            durability: self.durability,
+            history: self.history,
+            replication,
+        }
+    }
 }
 
 /// Identity semantics are orthogonal to both execution and persistence.
@@ -91,19 +156,19 @@ impl ExecutionSemantics {
 
     pub const LOCAL: Self = Self::new(
         ExecutionDomain::Local,
-        PersistenceSemantics::Ephemeral,
+        PersistenceSemantics::EPHEMERAL,
         IdentitySemantics::Anonymous,
     );
 
     pub const SCOPED_TASK: Self = Self::new(
         ExecutionDomain::ScopedTask,
-        PersistenceSemantics::Ephemeral,
+        PersistenceSemantics::EPHEMERAL,
         IdentitySemantics::Scoped,
     );
 
     pub const ACTOR: Self = Self::new(
         ExecutionDomain::Actor,
-        PersistenceSemantics::Ephemeral,
+        PersistenceSemantics::EPHEMERAL,
         IdentitySemantics::Runtime,
     );
 }
@@ -327,23 +392,70 @@ mod tests {
     use super::*;
 
     #[test]
+    fn durable_history_and_replication_are_independent_state_properties() {
+        let state = PersistenceSemantics {
+            durability: Durability::Durable,
+            history: HistorySemantics::EventSourced,
+            replication: ReplicationSemantics::Replicated,
+        };
+        let execution =
+            ExecutionSemantics::new(ExecutionDomain::Actor, state, IdentitySemantics::Stable);
+
+        assert_eq!(execution.persistence.durability, Durability::Durable);
+        assert_eq!(execution.persistence.history, HistorySemantics::EventSourced);
+        assert_eq!(execution.persistence.replication, ReplicationSemantics::Replicated);
+        assert_eq!(execution.domain, ExecutionDomain::Actor);
+        assert_eq!(execution.identity, IdentitySemantics::Stable);
+    }
+
+    #[test]
+    fn default_state_is_local_current_state_and_ephemeral() {
+        assert_eq!(PersistenceSemantics::EPHEMERAL.durability, Durability::Ephemeral);
+        assert_eq!(PersistenceSemantics::EPHEMERAL.history, HistorySemantics::CurrentState);
+        assert_eq!(
+            PersistenceSemantics::EPHEMERAL.replication,
+            ReplicationSemantics::Local
+        );
+    }
+
+    #[test]
     fn execution_domain_is_independent_from_persistence_and_identity() {
         let ephemeral_actor = ExecutionSemantics::ACTOR;
         let durable_entity = ExecutionSemantics::new(
             ExecutionDomain::Actor,
-            PersistenceSemantics::Durable,
+            PersistenceSemantics::DURABLE,
             IdentitySemantics::Stable,
         );
         let event_sourced_entity = ExecutionSemantics::new(
             ExecutionDomain::Actor,
-            PersistenceSemantics::EventSourced,
+            PersistenceSemantics::DURABLE.with_history(HistorySemantics::EventSourced),
             IdentitySemantics::Stable,
         );
 
         assert_eq!(ephemeral_actor.domain, durable_entity.domain);
         assert_ne!(ephemeral_actor.persistence, durable_entity.persistence);
-        assert_ne!(durable_entity.persistence, event_sourced_entity.persistence);
+        assert_eq!(
+            durable_entity.persistence.durability,
+            event_sourced_entity.persistence.durability
+        );
+        assert_ne!(
+            durable_entity.persistence.history,
+            event_sourced_entity.persistence.history
+        );
         assert_eq!(durable_entity.identity, IdentitySemantics::Stable);
+    }
+
+    #[test]
+    fn applying_independent_state_policies_is_order_independent() {
+        let history_first = PersistenceSemantics::DURABLE
+            .with_history(HistorySemantics::EventSourced)
+            .with_replication(ReplicationSemantics::Replicated);
+        let replication_first = PersistenceSemantics::DURABLE
+            .with_replication(ReplicationSemantics::Replicated)
+            .with_history(HistorySemantics::EventSourced);
+
+        assert_eq!(history_first, replication_first);
+        assert_eq!(history_first.durability, Durability::Durable);
     }
 
     #[test]
@@ -354,7 +466,7 @@ mod tests {
         );
         assert_eq!(
             ExecutionSemantics::SCOPED_TASK.persistence,
-            PersistenceSemantics::Ephemeral
+            PersistenceSemantics::EPHEMERAL
         );
         assert_eq!(
             ExecutionSemantics::SCOPED_TASK.identity,
