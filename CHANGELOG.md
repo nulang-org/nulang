@@ -1,4 +1,9 @@
 # Nulang Changelog
+
+### Experimental Web mutation-origin admission — 2026-10-17
+- **The experimental routed Web development host rejects missing, cross-origin, or ambiguous provenance on state-changing requests before dispatching handlers.** It verifies Host, Origin/Referer, and Sec-Fetch-Site using an explicit trusted public origin for proxied deployments; malformed requests return HTTP 403. Standalone `Http.serve` is outside this Web admission policy.
+- This is a browser CSRF defense, not session authentication or resource authorization. Existing non-browser API POST callers must supply an appropriate Origin; tests cover direct loopback HTTP and independent origin validation.
+
 ### Bounded Nulang Web development-server connections — 2026-10-16
 - **The experimental Web development listener caps active connections at 64**, including SSE, and returns `503` with `Retry-After: 1` when full.
 - **Worker capacity is returned by a scoped RAII lease** after normal completion, panic, or thread-spawn failure. One shared `Arc` route table replaces per-connection clones of compiled route modules.
