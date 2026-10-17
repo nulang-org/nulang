@@ -60,7 +60,10 @@ fn missing_authority_blocks_preparation_and_provider_dispatch() {
         b"request",
         |_, _| panic!("missing grant must not call provider"),
     );
-    assert!(matches!(result, Err(DurableAsyncDispatchError::Authorization(_))));
+    assert!(matches!(
+        result,
+        Err(DurableAsyncDispatchError::Authorization(_))
+    ));
     assert_eq!(store.latest_sequence(42), 0);
 }
 
@@ -82,7 +85,8 @@ fn actor_identity_and_activation_must_match_coordinator() {
                 "order:42:payment",
                 0,
                 b"request",
-                |_, _| panic!("wrong actor must not dispatch")),
+                |_, _| panic!("wrong actor must not dispatch")
+            ),
             Err(DurableAsyncDispatchError::ActorMismatch { .. })
         ));
     }
@@ -97,7 +101,8 @@ fn actor_identity_and_activation_must_match_coordinator() {
                 "order:42:payment",
                 0,
                 b"request",
-                |_, _| panic!("stale activation must not dispatch")),
+                |_, _| panic!("stale activation must not dispatch")
+            ),
             Err(DurableAsyncDispatchError::ActorEpochMismatch { .. })
         ));
     }
@@ -130,7 +135,8 @@ fn unrelated_or_resource_parameterized_grants_cannot_authorize_inference_site() 
                 "order:42:payment",
                 0,
                 b"request",
-                |_, _| panic!("wrong authority must not dispatch")),
+                |_, _| panic!("wrong authority must not dispatch")
+            ),
             Err(DurableAsyncDispatchError::GrantOperationMismatch { .. })
         ));
     }
@@ -142,7 +148,9 @@ fn malformed_live_manifest_fails_closed_even_with_matching_grant() {
     let module = compiled_source();
     let grant = inference_grant();
     let mut actor = actor_with_grants(42, 1, vec![grant.clone()]);
-    actor.capabilities.insert("invalid-authority-metadata".into());
+    actor
+        .capabilities
+        .insert("invalid-authority-metadata".into());
     let mut store = MemoryStore::new();
     let mut coordinator = DurableEffectCoordinator::new(&mut store, 42, 1);
     assert!(matches!(
@@ -154,7 +162,8 @@ fn malformed_live_manifest_fails_closed_even_with_matching_grant() {
             "order:42:payment",
             0,
             b"request",
-            |_, _| panic!("corrupt manifest must not dispatch")),
+            |_, _| panic!("corrupt manifest must not dispatch")
+        ),
         Err(DurableAsyncDispatchError::Authorization(_))
     ));
     assert_eq!(store.latest_sequence(42), 0);
@@ -178,7 +187,8 @@ fn revocation_blocks_prepared_retry_and_completed_receipt_read() {
                 "order:42:payment",
                 0,
                 b"request",
-                |_, _| Err(io::Error::new(io::ErrorKind::TimedOut, "ambiguous result"))),
+                |_, _| Err(io::Error::new(io::ErrorKind::TimedOut, "ambiguous result"))
+            ),
             Err(DurableAsyncDispatchError::Provider(_))
         ));
     }
@@ -194,23 +204,26 @@ fn revocation_blocks_prepared_retry_and_completed_receipt_read() {
                 "order:42:payment",
                 0,
                 b"request",
-                |_, _| panic!("revoked provider must not retry")),
+                |_, _| panic!("revoked provider must not retry")
+            ),
             Err(DurableAsyncDispatchError::Authorization(_))
         ));
     }
     assert_eq!(store.latest_sequence(42), 1);
     {
         let mut coordinator = DurableEffectCoordinator::new(&mut store, 42, 1);
-        coordinator.execute_compiled_async_with_deduplication(
-            &authorized,
-            &grant,
-            &module,
-            module.effect_sites[0].pc,
-            "order:42:payment",
-            0,
-            b"request",
-            |_, _| Ok(b"receipt".to_vec()),
-        ).unwrap();
+        coordinator
+            .execute_compiled_async_with_deduplication(
+                &authorized,
+                &grant,
+                &module,
+                module.effect_sites[0].pc,
+                "order:42:payment",
+                0,
+                b"request",
+                |_, _| Ok(b"receipt".to_vec()),
+            )
+            .unwrap();
     }
     assert_eq!(store.latest_sequence(42), 2);
     let mut coordinator = DurableEffectCoordinator::new(&mut store, 42, 1);
@@ -223,7 +236,8 @@ fn revocation_blocks_prepared_retry_and_completed_receipt_read() {
             "order:42:payment",
             0,
             b"request",
-            |_, _| panic!("revoked receipt must not be read")),
+            |_, _| panic!("revoked receipt must not be read")
+        ),
         Err(DurableAsyncDispatchError::Authorization(_))
     ));
     assert_eq!(store.latest_sequence(42), 2);
@@ -247,7 +261,10 @@ fn terminated_actor_cannot_dispatch_even_with_exact_grant() {
         b"request",
         |_, _| panic!("terminated actor must not dispatch"),
     );
-    assert!(matches!(result, Err(DurableAsyncDispatchError::ActorNotLive)));
+    assert!(matches!(
+        result,
+        Err(DurableAsyncDispatchError::ActorNotLive)
+    ));
     assert_eq!(store.latest_sequence(42), 0);
 }
 
@@ -259,7 +276,25 @@ fn exact_live_grant_keeps_stable_deduplication_and_replay() {
     let mut store = MemoryStore::new();
     let first = {
         let mut coordinator = DurableEffectCoordinator::new(&mut store, 42, 1);
-        coordinator.execute_compiled_async_with_deduplication(
+        coordinator
+            .execute_compiled_async_with_deduplication(
+                &actor,
+                &grant,
+                &module,
+                module.effect_sites[0].pc,
+                "order:42:payment",
+                0,
+                b"request",
+                |key, _| {
+                    assert_eq!(key.len(), 64);
+                    Ok(b"receipt".to_vec())
+                },
+            )
+            .unwrap()
+    };
+    let mut coordinator = DurableEffectCoordinator::new(&mut store, 42, 1);
+    let replay = coordinator
+        .execute_compiled_async_with_deduplication(
             &actor,
             &grant,
             &module,
@@ -267,23 +302,9 @@ fn exact_live_grant_keeps_stable_deduplication_and_replay() {
             "order:42:payment",
             0,
             b"request",
-            |key, _| {
-                assert_eq!(key.len(), 64);
-                Ok(b"receipt".to_vec())
-            },
-        ).unwrap()
-    };
-    let mut coordinator = DurableEffectCoordinator::new(&mut store, 42, 1);
-    let replay = coordinator.execute_compiled_async_with_deduplication(
-        &actor,
-        &grant,
-        &module,
-        module.effect_sites[0].pc,
-        "order:42:payment",
-        0,
-        b"request",
-        |_, _| panic!("completed effect must replay only"),
-    ).unwrap();
+            |_, _| panic!("completed effect must replay only"),
+        )
+        .unwrap();
     assert_eq!(first, replay);
     assert_eq!(store.latest_sequence(42), 2);
 }
