@@ -587,6 +587,33 @@ mod scheduler_tests {
     use std::sync::Arc;
 
     #[test]
+    fn test_ready_depth_tracks_priority_and_batched_local_work() {
+        let s = Scheduler::new(2);
+        for id in 1..=16 {
+            s.enqueue_with_priority(id, ActorPriority::Low);
+        }
+        s.enqueue_with_priority(100, ActorPriority::High);
+        s.enqueue_local_with_priority(1, 200, ActorPriority::Normal);
+
+        let before = s.stats();
+        assert_eq!(before.ready_high, 1);
+        assert_eq!(before.ready_normal, 1);
+        assert_eq!(before.ready_low, 16);
+
+        assert_eq!(s.dequeue(), Some(100));
+        assert_eq!(s.stats().ready_high, 0);
+        assert_eq!(s.dequeue(), Some(200));
+        assert_eq!(s.stats().ready_normal, 0);
+
+        assert!(s.next_task(0).is_some());
+        // The remaining tasks may be distributed between a batched worker
+        // deque and the injector. Pressure must account for both locations.
+        assert_eq!(s.stats().ready_low, 15);
+        s.reset_stats();
+        assert_eq!(s.stats().ready_low, 15);
+    }
+
+    #[test]
     fn test_enqueue_dequeue() {
         let s = Scheduler::new(2);
         s.enqueue(42);
