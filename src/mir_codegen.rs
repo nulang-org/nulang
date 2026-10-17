@@ -1670,8 +1670,21 @@ fn collect_const_locals(func: &mir::Function) -> std::collections::HashMap<mir::
         std::collections::HashMap::new();
     for block in &func.blocks {
         for stmt in &block.stmts {
-            if let mir::Stmt::Assign { dst, .. } = stmt {
+            if let mir::Stmt::Assign { dst, op } = stmt {
                 *assign_count.entry(*dst).or_insert(0) += 1;
+                // Selective receive writes its match index to dst and
+                // message payloads to dst+1..dst+max_params. These implicit
+                // definitions must invalidate any apparent single-assignment
+                // constant in a payload local.
+                if let mir::RValue::ReceiveMatch { max_params, .. }
+                | mir::RValue::ReceiveWait { max_params, .. } = op
+                {
+                    for offset in 1..=(*max_params).min(func.locals.len()) {
+                        if let Some(id) = dst.0.checked_add(offset as u32) {
+                            *assign_count.entry(mir::LocalId(id)).or_insert(0) += 1;
+                        }
+                    }
+                }
             }
         }
     }
@@ -1708,10 +1721,9 @@ fn fold_function(
     for block in &mut func.blocks {
         for stmt in &mut block.stmts {
             if let mir::Stmt::Assign { op, .. } = stmt {
-                let mut original = mir::RValue::Const(Constant::Nil);
-                std::mem::swap(op, &mut original);
-                let folded = fold_rvalue(original, const_locals, is_float);
-                if folded != *op {
+                let original = op.clone();
+                let folded = fold_rvalue(original.clone(), const_locals, is_float);
+                if folded != original {
                     *op = folded;
                     changed = true;
                 }
