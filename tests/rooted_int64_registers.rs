@@ -11,10 +11,8 @@ fn wide_and_inline_values_roundtrip_and_release_with_the_register_bank() {
     let mut actor = Actor::new(51, "int-register-owner", 0);
     {
         let mut regs = RootedIntRegisters::new(&mut actor, 4);
-        for (index, value) in [i64::MIN, i64::MAX, -(1_i64 << 47), (1_i64 << 47)] 
-            .into_iter()
-            .enumerate()
-        {
+        let values = [i64::MIN, i64::MAX, -(1_i64 << 47), 1_i64 << 47];
+        for (index, value) in values.into_iter().enumerate() {
             regs.store(index, value).unwrap();
             assert_eq!(regs.read(index).unwrap(), Some(value));
         }
