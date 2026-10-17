@@ -173,6 +173,10 @@ pub struct JitSession {
     /// native regions. These are not ordinary hot-entry regions: they execute
     /// against an isolated register buffer owned by the direct-call helper.
     native_leaf_calls: FxHashMap<(usize, usize), NativeLeafCall>,
+    /// Per-module native-leaf dispatch entries, built at compile time and
+    /// borrowed directly on compiled-region entry. Avoid filtering the
+    /// session-wide HashMap and allocating a temporary Vec on every call.
+    native_leaf_dispatch: Vec<Vec<(usize, *const u8, u8, usize)>>,
     /// Monotonic suffix for replacement compilations. Cranelift keeps prior
     /// function declarations alive, so every promotion needs a fresh symbol.
     promotion_serial: u64,
@@ -195,6 +199,7 @@ impl JitSession {
             region_planner: RegionPlanner::default(),
             tier2_counters: FxHashMap::default(),
             native_leaf_calls: FxHashMap::default(),
+            native_leaf_dispatch: Vec::new(),
             promotion_serial: 0,
         })
     }
@@ -466,6 +471,37 @@ impl JitSession {
         self.tier2_counters.clear();
     }
 
+    /// Cache a native leaf in its module's dispatch slice. Replacement is
+    /// idempotent: recompiling a leaf may update its pointer, not duplicate
+    /// its function index.
+    fn cache_native_leaf_call(
+        &mut self,
+        module_idx: usize,
+        func_idx: usize,
+        call: NativeLeafCall,
+    ) {
+        self.native_leaf_calls.insert((module_idx, func_idx), call);
+        if self.native_leaf_dispatch.len() <= module_idx {
+            self.native_leaf_dispatch
+                .resize_with(module_idx + 1, Vec::new);
+        }
+        let entries = &mut self.native_leaf_dispatch[module_idx];
+        let entry = (func_idx, call.ptr, call.return_reg, call.required_args);
+        if let Some(existing) = entries.iter_mut().find(|existing| existing.0 == func_idx) {
+            *existing = entry;
+        } else {
+            entries.push(entry);
+        }
+    }
+
+    #[inline]
+    fn native_leaf_calls_for_module(&self, module_idx: usize) -> &[(usize, *const u8, u8, usize)] {
+        self.native_leaf_dispatch
+            .get(module_idx)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
     fn ensure_native_leaf_call(
         &mut self,
         module_idx: usize,
@@ -505,7 +541,7 @@ impl JitSession {
             return_reg: plan.return_reg,
             required_args: plan.required_args,
         };
-        self.native_leaf_calls.insert((module_idx, func_idx), call);
+        self.cache_native_leaf_call(module_idx, func_idx, call);
         Some(call)
     }
 
@@ -1057,19 +1093,13 @@ impl crate::backends::JitBackend for JitSession {
             return crate::backends::TieredAction::RanJit;
         }
 
-        let leaf_calls: Vec<(usize, *const u8, u8, usize)> = self
-            .native_leaf_calls
-            .iter()
-            .filter_map(|(&(leaf_module, func_idx), call)| {
-                (leaf_module == module_idx).then_some((
-                    func_idx,
-                    call.ptr,
-                    call.return_reg,
-                    call.required_args,
-                ))
-            })
-            .collect();
-        crate::jit::runtime::set_jit_leaf_calls(&leaf_calls, constants.as_ptr());
+        // Borrow persistent per-module entries. Installing them in the TLS
+        // scratch table retains the existing reentrant-call protocol without
+        // allocating or filtering a temporary list on each native entry.
+        crate::jit::runtime::set_jit_leaf_calls(
+            self.native_leaf_calls_for_module(module_idx),
+            constants.as_ptr(),
+        );
         func(regs.as_mut_ptr(), constants.as_ptr());
         crate::jit::runtime::clear_jit_leaf_calls();
         crate::backends::TieredAction::RanJit
