@@ -40,6 +40,11 @@
   wrapping. Focused CoreVM, AOT, and JIT regression tests added; no change to
   source type inference or WASM source semantics.
 
+### Fail-closed legacy workflow completion and recovery — 2026-10-10
+- Consolidate the suspended signal, timer, receive, and LLM resume terminal-persistence guards; failed terminal event or checkpoint persistence quarantines the live workflow actor before further dispatch.
+- Cover immediate legacy step terminal/checkpoint sequencing and fail closed when recovery encounters orphan terminal workflow history beyond the last safe snapshot.
+- This is a safety fence for the legacy two-write path, **not** RFC 0022 atomic activation replay or an exactly-once guarantee. The durable transition/recovery contract remains a separate milestone.
+
 ### Actor scheduler LIFO handoff and lifecycle pooling — 2026-10-10
 - **Performance:** Optimized actor scheduler LIFO handoff with strict
   priority gating, and added actor lifecycle pooling.
