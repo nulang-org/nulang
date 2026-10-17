@@ -4,17 +4,67 @@
 //! rollbackable on ordinary errors but is not an atomic swap under a crash.
 
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_STAGE: AtomicU64 = AtomicU64::new(1);
+
+/// A cooperative, per-output build lock. The create_new operation is atomic
+/// across processes on ordinary local filesystems. We never steal a lock:
+/// after a crash, a human must confirm the PID is no longer running and
+/// remove the orphaned lockfile explicitly.
+struct WebBuildLock {
+    path: PathBuf,
+    handle: Option<fs::File>,
+}
+
+impl WebBuildLock {
+    fn acquire(parent: &Path, name: &str) -> io::Result<Self> {
+        let path = parent.join(format!(".{name}.nulang-build.lock"));
+        let handle = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| {
+                if e.kind() == io::ErrorKind::AlreadyExists {
+                    io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!(
+                            "another Nulang web build owns {}; verify the process before removing a stale lock",
+                            path.display()
+                        ),
+                    )
+                } else {
+                    e
+                }
+            })?;
+        let mut lock = Self {
+            path,
+            handle: Some(handle),
+        };
+        if let Some(handle) = lock.handle.as_mut() {
+            writeln!(handle, "pid={}", std::process::id())?;
+        }
+        Ok(lock)
+    }
+}
+
+impl Drop for WebBuildLock {
+    fn drop(&mut self) {
+        // Close the handle before unlinking for Windows compatibility.
+        self.handle.take();
+        let _ = fs::remove_file(&self.path);
+    }
+}
 
 pub(super) struct StagedWebOutput {
     target: PathBuf,
     stage: PathBuf,
     backup: PathBuf,
     published: bool,
+    // Held throughout copying, building, promotion and backup cleanup.
+    _lock: WebBuildLock,
 }
 
 impl StagedWebOutput {
@@ -35,25 +85,29 @@ impl StagedWebOutput {
                 )
             })?;
         fs::create_dir_all(parent)?;
+        let parent = fs::canonicalize(parent)?;
+        let target = parent.join(name);
+        let lock = WebBuildLock::acquire(&parent, name)?;
         let serial = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
         let label = format!("{}-{}-{}", name, std::process::id(), serial);
         let stage = parent.join(format!(".{label}.staging"));
         let backup = parent.join(format!(".{label}.previous"));
         fs::create_dir(&stage)?;
         let output = Self {
-            target: target.to_path_buf(),
+            target: target.clone(),
             stage,
             backup,
             published: false,
+            _lock: lock,
         };
-        match fs::symlink_metadata(target) {
+        match fs::symlink_metadata(&target) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "existing web output must be a real directory",
                 ));
             }
-            Ok(_) => copy_regular_tree(target, &output.stage)?,
+            Ok(_) => copy_regular_tree(&target, &output.stage)?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         };
