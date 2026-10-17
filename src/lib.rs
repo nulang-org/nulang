@@ -55,8 +55,8 @@ pub mod fuzz;
 pub mod hir;
 pub mod hir_lower;
 pub mod host_effect_abi;
-pub mod integration_tests;
 pub mod int64_semantics;
+pub mod integration_tests;
 pub mod iso_arena;
 #[cfg(feature = "native-codegen")]
 pub mod jit;
