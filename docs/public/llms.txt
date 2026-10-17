@@ -3,6 +3,8 @@
 
 ## For AI Agents
 
+**Writing Nulang code with an AI assistant?** Begin with the [AI Coding Agents guide](https://nulang.org/getting-started/ai-coding-agents.md): a compiler-first workflow, verified CLI commands, supported execution targets, and explicit limitations.
+
 Nulang is a systems language with static types, algebraic effects, capability checking, and actor-based distribution. For AI-assisted development, treat compiler-derived types, effect rows, capabilities, protocol identities, and durable-state identities as the source of truth rather than reconstructing semantics in tools. The repository is still alpha: its frozen/stable policy is documented, but pre-1.0 compatibility promises are under explicit review as external validation grows.
 
 ## When to use Nulang
@@ -21,7 +23,6 @@ Nulang is a systems language with static types, algebraic effects, capability ch
 - Secondary native AOT backend for supported subsets and differential/conformance work; do not assume full bytecode parity
 - Experimental Fabric messaging/streams and an experimental RESP-compatible cache kernel with Redis Cluster routing
 - Optional AI runtime workspace: provider-agnostic LLM clients, agent declarations, memory, pipelines, debates, supervisor teams, and director/manager/worker support crates
-- Register-based bytecode VM with 135 opcodes and 256-register frames
 
 ## Status and backend contract
 - **Status:** alpha. Treat experimental surfaces as changeable and verify current behavior against the repository and changelog.
@@ -32,37 +33,28 @@ Nulang is a systems language with static types, algebraic effects, capability ch
 - **Experimental surfaces:** WasmFX, Fabric, RESP cache server, typed protocol hardening, multi-node distribution, and other items marked Experimental in the changelog.
 - **CRDT caveat:** Rust/runtime CRDT types exist, but `.nula` `state crdt` fields are not yet fully wired and currently behave as durable state.
 
-## Quick Install
+## Getting started
+Prefer a checksummed tagged binary when available; see [Installation](https://nulang.org/getting-started/installation.md) for platform support, runtime dependencies, and release verification. To build from source:
+
 ```bash
 git clone https://github.com/nulang-org/nulang.git
 cd nulang
-cargo build --release
-cargo run -- --repl
+cargo build --locked --release
+./target/release/nulang --repl
 ```
 
-## Quick Example
+## Small verifiable example
+Save as `hello.nula`, then run `nulang --check hello.nula` and `nulang hello.nula` using the native compiler.
+
 ```nulang
-actor Counter {
-    state count: Int = 0
-    behavior inc() { self.count = self.count + 1 }
-    behavior get(sender) { send sender reply(self.count :cap val) }
+fn main() {
+    perform Test.assert_eq(6 * 7, 42)
+    perform IO.print("Hello from Nulang")
 }
-actor Client {
-    behavior reply(v: Int) { v }
-    behavior run(counter) {
-        send counter get(self :cap val)
-        receive {
-            | reply(v) => perform IO.print("Count: " + perform Int.to_string(v))
-        } after 5000 => perform IO.print("timeout")
-    }
-}
-let counter = spawn Counter {}
-send counter inc()
-let client = spawn Client {}
-send client run(counter)
 ```
 
 ## Documentation
+- [For AI Coding Agents](https://nulang.org/getting-started/ai-coding-agents.md): Source-of-truth order, compiler checks, runtime boundaries, and verification workflow.
 - [Installation](https://nulang.org/getting-started/installation/): Build from source, prerequisites, feature flags.
 - [Quick Start](https://nulang.org/getting-started/quick-start/): Hello World, actors, algebraic effects.
 - [Syntax Basics](https://nulang.org/language/syntax/): Functions, bindings, control flow, records, variants.
@@ -81,6 +73,7 @@ send client run(counter)
 - [Signals, Timers & Queries](https://nulang.org/workflows/signals-timers/): Suspension/resume primitives for workflows.
 
 ## For AI Agents: Machine-Readable Surfaces
+- Start with this curated index, fetch only the documentation pages needed for the task, and verify generated code against the installed compiler. This file is guidance, not evidence that any AI crawler automatically consumes it.
 - Full documentation as one file: https://nulang.org/llms-full.txt
 - Every doc page has a clean Markdown twin at the same path + `.md` (e.g. https://nulang.org/language/types.md).
 
