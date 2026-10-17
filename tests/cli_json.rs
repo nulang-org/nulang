@@ -353,7 +353,7 @@ fn wasm_cli_emits_compiler_owned_behavior_manifest_bound_to_exact_bytes() {
     );
 
     let wasm = std::fs::read(&wasm_path).expect("WASM bytes");
-    assert!(wasm.starts_with(b"\\0asm"), "compiled artifact must be WebAssembly");
+    assert!(wasm.starts_with(b"\0asm"), "compiled artifact must be WebAssembly");
     let manifest_bytes = std::fs::read(&manifest_path).expect("compiler-owned WASM sidecar");
     let manifest = nulang::behavior_manifest::BehaviorManifest::from_json(&manifest_bytes)
         .expect("parse exact emitted manifest");
