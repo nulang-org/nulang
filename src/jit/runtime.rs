@@ -512,6 +512,25 @@ pub fn aot_take_pending_error() -> Option<String> {
     AOT_PENDING_ERROR.with(|e| e.borrow_mut().take())
 }
 
+#[cfg(test)]
+mod pending_error_regression_tests {
+    use super::{aot_set_pending_error, aot_take_pending_error};
+
+    #[test]
+    fn aot_keeps_first_arithmetic_error_when_following_helpers_fail() {
+        // Compiled helpers return nil when recording an exception.
+        // Later operations on nil must not replace the original exception.
+        let _ = aot_take_pending_error();
+        aot_set_pending_error("invalid original operand".to_string());
+        aot_set_pending_error("secondary nil operand".to_string());
+        assert_eq!(
+            aot_take_pending_error().as_deref(),
+            Some("invalid original operand")
+        );
+        assert_eq!(aot_take_pending_error(), None);
+    }
+}
+
 pub unsafe fn set_jit_callbacks(cb: *mut dyn crate::vm::ActorVmCallbacks) {
     JIT_CALLBACKS.with(|cell| {
         *cell.get() = CbPair::from_ptr(cb);
