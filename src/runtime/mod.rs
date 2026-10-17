@@ -3263,14 +3263,19 @@ impl Runtime {
     /// local scheduler in an infinite loop.  This method never returns
     /// under normal circumstances; the node terminates on SIGINT/SIGTERM.
     pub fn run_distributed_node(&mut self) {
+        // Preserve periodic timer/send-failure maintenance and a fallback for
+        // test transports that cannot signal arrivals directly.
+        const MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
         loop {
             self.process_network();
             self.run_scheduler();
-            // run_scheduler returns when the local queue is quiescent.
-            // Network packets may have arrived while we ran, so loop
-            // again after a brief pause to avoid busy-waiting when
-            // truly idle.
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            // TCP blocks on its incoming channel and stages the first packet
+            // for process_network's next receive; no packet is consumed here.
+            if let Some(transport) = self.distributed.transport.as_ref() {
+                transport.wait_for_activity(MAINTENANCE_INTERVAL);
+            } else {
+                std::thread::sleep(MAINTENANCE_INTERVAL);
+            }
         }
     }
 
