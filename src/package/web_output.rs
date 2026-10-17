@@ -281,10 +281,7 @@ mod tests {
         fs::write(first.path().join("index.html"), b"first").unwrap();
         first.publish().unwrap();
         let next = StagedWebOutput::prepare(&fixture.output()).unwrap();
-        assert_eq!(
-            fs::read(next.path().join("index.html")).unwrap(),
-            b"first"
-        );
+        assert_eq!(fs::read(next.path().join("index.html")).unwrap(), b"first");
     }
 
     #[cfg(unix)]
