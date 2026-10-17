@@ -8,6 +8,37 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(target_os = "linux")]
+fn linux_atomic_exchange(stage: &Path, target: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let stage = CString::new(stage.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "NUL in staging path")
+    })?;
+    let target = CString::new(target.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "NUL in output path")
+    })?;
+
+    // On Linux, RENAME_EXCHANGE swaps both existing directories as a single
+    // namespace operation. Unsupported kernels/filesystems fail closed.
+    // SAFETY: both paths are valid NUL-terminated C strings owned by us.
+    let rc = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            stage.as_ptr(),
+            libc::AT_FDCWD,
+            target.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 static NEXT_STAGE: AtomicU64 = AtomicU64::new(1);
 
 /// A cooperative, per-output build lock. The create_new operation is atomic
@@ -61,6 +92,7 @@ impl Drop for WebBuildLock {
 pub(super) struct StagedWebOutput {
     target: PathBuf,
     stage: PathBuf,
+    #[cfg(not(target_os = "linux"))]
     backup: PathBuf,
     published: bool,
     // Held throughout copying, building, promotion and backup cleanup.
@@ -91,11 +123,13 @@ impl StagedWebOutput {
         let serial = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
         let label = format!("{}-{}-{}", name, std::process::id(), serial);
         let stage = parent.join(format!(".{label}.staging"));
+        #[cfg(not(target_os = "linux"))]
         let backup = parent.join(format!(".{label}.previous"));
         fs::create_dir(&stage)?;
         let output = Self {
             target: target.clone(),
             stage,
+            #[cfg(not(target_os = "linux"))]
             backup,
             published: false,
             _lock: lock,
@@ -130,29 +164,56 @@ impl StagedWebOutput {
             Err(e) if e.kind() == io::ErrorKind::NotFound => false,
             Err(e) => return Err(e),
         };
+
         if had_previous {
-            fs::rename(&self.target, &self.backup)?;
-        }
-        if let Err(e) = fs::rename(&self.stage, &self.target) {
-            if had_previous {
-                if let Err(rollback_error) = fs::rename(&self.backup, &self.target) {
-                    return Err(io::Error::other(format!(
-                        "cannot publish web output: {e}; cannot restore previous output: {rollback_error}"
-                    )));
+            #[cfg(target_os = "linux")]
+            {
+                // The output name always resolves to either the complete old
+                // directory or the complete new one, never a missing path.
+                // Do not fall back to two renames if exchange is unsupported.
+                linux_atomic_exchange(&self.stage, &self.target)?;
+                self.published = true;
+                // After exchange, the old release is at the former stage path.
+                // Failure to remove it leaves a reclaimable backup, not a
+                // failed or partially published deployment.
+                if let Err(e) = fs::remove_dir_all(&self.stage) {
+                    eprintln!(
+                        "warning: atomic web publication succeeded but old release {} could not be removed: {}",
+                        self.stage.display(),
+                        e
+                    );
                 }
+                return Ok(());
             }
-            return Err(e);
+
+            #[cfg(not(target_os = "linux"))]
+            {
+                // Other platforms retain the rollbackable portable behavior,
+                // which is not crash-atomic for an existing destination.
+                fs::rename(&self.target, &self.backup)?;
+                if let Err(e) = fs::rename(&self.stage, &self.target) {
+                    if let Err(rollback_error) = fs::rename(&self.backup, &self.target) {
+                        return Err(io::Error::other(format!(
+                            "cannot publish web output: {e}; cannot restore previous output: {rollback_error}"
+                        )));
+                    }
+                    return Err(e);
+                }
+                self.published = true;
+                if let Err(e) = fs::remove_dir_all(&self.backup) {
+                    eprintln!(
+                        "warning: web output published but old build backup {} could not be removed: {}",
+                        self.backup.display(),
+                        e
+                    );
+                }
+                return Ok(());
+            }
         }
+
+        // An initial deployment has no previous output to exchange.
+        fs::rename(&self.stage, &self.target)?;
         self.published = true;
-        if had_previous {
-            if let Err(e) = fs::remove_dir_all(&self.backup) {
-                eprintln!(
-                    "warning: web output published but old build backup {} could not be removed: {}",
-                    self.backup.display(),
-                    e
-                );
-            }
-        }
         Ok(())
     }
 }
