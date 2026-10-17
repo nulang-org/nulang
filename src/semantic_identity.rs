@@ -987,6 +987,11 @@ impl Encoder {
                 self.u32(ids.local(*left));
                 self.u32(ids.local(*right));
             }
+            RValue::Intrinsic(intrinsic) => {
+                self.byte(33);
+                self.string(intrinsic.op.stable_name());
+                self.locals(&intrinsic.args, ids);
+            }
             RValue::StringEq(left, right) => {
                 self.byte(10);
                 self.u32(ids.local(*left));
