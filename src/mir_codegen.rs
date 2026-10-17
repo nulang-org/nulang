@@ -1749,7 +1749,13 @@ fn fold_rvalue(
         },
         RValue::Unary(uop, local) => match const_locals.get(&local) {
             Some(c) => match (uop, c) {
-                (UnOp::Neg, Int(n)) => RValue::Const(Int(n.wrapping_neg())),
+                // Value::int sign-extends a 48-bit payload. Negating
+                // INT48_MIN is an error in the VM, not wrapping arithmetic.
+                (UnOp::Neg, Int(n))
+                    if canonical_int48(*n) != crate::value_layout::INT48_MIN =>
+                {
+                    RValue::Const(Int(-canonical_int48(*n)))
+                }
                 (UnOp::Neg, Float(f)) => RValue::Const(Float(-f)),
                 (UnOp::Not, Bool(b)) => RValue::Const(Bool(!b)),
                 // The remaining Not rules never fire on well-typed MIR
@@ -1805,6 +1811,12 @@ fn fold_rvalue(
     }
 }
 
+/// Interpret an integer constant exactly as Value::int/as_int do at runtime.
+/// Values outside the signed 48-bit payload range are truncated on load.
+fn canonical_int48(n: i64) -> i64 {
+    crate::value_layout::sext48((n as u64) & crate::value_layout::PAYLOAD_MASK)
+}
+
 /// Constant-fold `Const op Const` per the VM's integer/float handler
 /// semantics. Returns None when no rule applies (mixed int/float, float
 /// Eq/Ne — the VM uses epsilon equality there — nil comparisons, ...).
@@ -1812,6 +1824,19 @@ fn fold_binary_consts(bop: crate::ast::BinOp, a: &Constant, b: &Constant) -> Opt
     use crate::ast::BinOp;
     use mir::RValue;
     use Constant::{Bool, Float, Int, Nil, String as CString};
+
+    // Constants are stored as i64 in MIR but encoded as signed Int48 by
+    // Value::int. Compare, divide and shift their *runtime* values.
+    let normalized_a = match a {
+        Int(n) => Some(Int(canonical_int48(*n))),
+        _ => None,
+    };
+    let normalized_b = match b {
+        Int(n) => Some(Int(canonical_int48(*n))),
+        _ => None,
+    };
+    let a = normalized_a.as_ref().unwrap_or(a);
+    let b = normalized_b.as_ref().unwrap_or(b);
 
     Some(match (bop, a, b) {
         // -- Int arithmetic (i64 wrapping; the constant pool truncates to
@@ -1881,6 +1906,12 @@ fn fold_one_const(
     use crate::ast::BinOp;
     use mir::RValue;
     use Constant::{Bool, Int, Nil};
+
+    let normalized = match c {
+        Int(n) => Some(Int(canonical_int48(*n))),
+        _ => None,
+    };
+    let c = normalized.as_ref().unwrap_or(c);
 
     // Skip when the live operand may hold a float: the VM's F* handlers
     // coerce the int constant, and IEEE semantics differ at ±0.0/NaN.
