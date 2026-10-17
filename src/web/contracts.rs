@@ -729,6 +729,87 @@ fn web_main() {
     }
 
     #[test]
+    fn static_contract_includes_transitive_local_function_effects() {
+        let module = parse(
+            r#"
+fn leaf() -> Html {
+    let _ = perform Time.now_ms()
+    text("current time")
+}
+
+fn middle() -> Html {
+    leaf()
+}
+
+@placement(static)
+fn page() -> Html {
+    middle()
+}
+
+fn web_main() {
+    perform Web.route("GET", "/dashboard", page)
+}
+"#,
+        );
+        let compiled = compile_module_contracts(&module);
+        assert_eq!(compiled.routes.len(), 1);
+        assert!(
+            compiled.routes[0].effects.iter().any(|effect| effect == "Time"),
+            "static handler must retain effects of local transitive callees"
+        );
+        let errors = crate::web::validation::validate_compilation(compiled).unwrap_err();
+        assert!(errors.iter().any(|error| {
+            error.contains("static placement") && error.contains("GET /dashboard")
+        }));
+    }
+
+    #[test]
+    fn annotated_static_contract_cannot_hide_effectful_local_helper() {
+        let module = parse(
+            r#"
+fn helper() -> Html {
+    perform Time.now_ms()
+    text("dynamic")
+}
+@placement(static)
+fn page() -> Html ! {Render} {
+    helper()
+}
+fn web_main() {
+    perform Web.route("GET", "/page", page)
+}
+"#,
+        );
+        let compiled = compile_module_contracts(&module);
+        assert_eq!(compiled.routes.len(), 1);
+        assert!(
+            compiled.routes[0].effects.iter().any(|effect| effect == "Time"),
+            "explicitly declared Render must not erase inferred effects"
+        );
+    }
+
+    #[test]
+    fn pure_local_helpers_preserve_explicit_static_contract() {
+        let module = parse(
+            r#"
+fn helper() -> Html { text("hello") }
+@placement(static)
+fn page() -> Html { helper() }
+fn web_main() {
+    perform Web.route("GET", "/about", page)
+}
+"#,
+        );
+        let compiled = compile_module_contracts(&module);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        assert!(crate::web::validation::validate_compilation(compiled).is_ok());
+    }
+
+    #[test]
     fn typed_path_matches_handler_parameter_type() {
         let module = parse(
             r#"
