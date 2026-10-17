@@ -249,6 +249,9 @@ fn summarize_expr(expr: &Expr, bound: &HashSet<String>, out: &mut ParallelBranch
         } => {
             if rooted_at_self(base) {
                 out.state_reads.insert(state_path(base, field));
+                // Even though the field is actor state, computed indices on
+                // the path may themselves have effects or outer captures.
+                summarize_state_indices(base, bound, out);
             } else {
                 summarize_expr(base, bound, out);
             }
@@ -405,7 +408,11 @@ fn summarize_expr(expr: &Expr, bound: &HashSet<String>, out: &mut ParallelBranch
         }
         Expr::Consume { expr, .. } => {
             summarize_expr(expr, bound, out);
-            if let Some(name) = root_var(expr) {
+            if rooted_at_self(expr) {
+                // Moving out of actor-owned state is a mutation, even when
+                // there is no ordinary root variable to record as a write.
+                out.state_writes.insert(state_target_path(expr));
+            } else if let Some(name) = root_var(expr) {
                 if !bound.contains(name) {
                     out.writes.insert(name.to_string());
                 }
@@ -424,6 +431,12 @@ fn summarize_assignment_target(
     out: &mut ParallelBranchSummary,
 ) {
     match target {
+        Expr::SelfRef(_) => {
+            out.state_writes.insert("self".to_string());
+        }
+        Expr::CapAnnotate { expr, .. } | Expr::TypeAnnotate { expr, .. } => {
+            summarize_assignment_target(expr, bound, out);
+        }
         Expr::Var(name, _) => {
             if !bound.contains(name) {
                 out.writes.insert(name.clone());
@@ -433,6 +446,7 @@ fn summarize_assignment_target(
             expr: base, field, ..
         } if rooted_at_self(base) => {
             out.state_writes.insert(state_path(base, field));
+            summarize_state_indices(base, bound, out);
         }
         Expr::FieldAccess { expr: base, .. } => {
             summarize_expr(base, bound, out);
@@ -441,6 +455,13 @@ fn summarize_assignment_target(
                     out.heap_mutations.insert(name.to_string());
                 }
             }
+        }
+        Expr::Index { arr, idx, .. } if rooted_at_self(arr) => {
+            // Index assignment mutates actor state even when the target is
+            // self.items[i] rather than a direct self.field assignment.
+            out.state_writes.insert(state_target_path(target));
+            summarize_state_indices(arr, bound, out);
+            summarize_expr(idx, bound, out);
         }
         Expr::Index { arr, idx, .. } => {
             summarize_expr(arr, bound, out);
@@ -459,6 +480,40 @@ fn summarize_assignment_target(
                 }
             }
         }
+    }
+}
+
+/// Collect effects and captures from computed indices on a self-rooted path.
+/// FieldAccess on self is summarized as one state read, so normal recursion
+/// would otherwise skip indices nested under that field access.
+fn summarize_state_indices(
+    expr: &Expr,
+    bound: &HashSet<String>,
+    out: &mut ParallelBranchSummary,
+) {
+    match expr {
+        Expr::Index { arr, idx, .. } => {
+            summarize_state_indices(arr, bound, out);
+            summarize_expr(idx, bound, out);
+        }
+        Expr::FieldAccess { expr, .. }
+        | Expr::CapAnnotate { expr, .. }
+        | Expr::TypeAnnotate { expr, .. } => summarize_state_indices(expr, bound, out),
+        _ => {}
+    }
+}
+
+fn state_target_path(expr: &Expr) -> String {
+    match expr {
+        Expr::SelfRef(_) => "self".to_string(),
+        Expr::FieldAccess { expr, field, .. } => {
+            format!("{}.{}", state_target_path(expr), field)
+        }
+        Expr::Index { arr, .. } => format!("{}[*]", state_target_path(arr)),
+        Expr::CapAnnotate { expr, .. } | Expr::TypeAnnotate { expr, .. } => {
+            state_target_path(expr)
+        }
+        _ => "self".to_string(),
     }
 }
 
@@ -589,6 +644,69 @@ mod tests {
             int(2),
         ];
         assert!(validate_parallel_branches(&branches, sp()).is_err());
+    }
+
+    #[test]
+    fn indexed_actor_state_mutation_is_rejected() {
+        let branches = vec![
+            Expr::Assign {
+                target: Box::new(Expr::Index {
+                    arr: Box::new(Expr::FieldAccess {
+                        expr: Box::new(Expr::SelfRef(sp())),
+                        field: "items".to_string(),
+                        span: sp(),
+                    }),
+                    idx: Box::new(int(0)),
+                    span: sp(),
+                }),
+                value: Box::new(int(1)),
+                span: sp(),
+            },
+            int(2),
+        ];
+        let err = validate_parallel_branches(&branches, sp()).unwrap_err();
+        assert!(err.to_string().contains("mutates actor state"));
+    }
+
+    #[test]
+    fn consuming_actor_state_is_rejected() {
+        let branches = vec![
+            Expr::Consume {
+                expr: Box::new(Expr::FieldAccess {
+                    expr: Box::new(Expr::SelfRef(sp())),
+                    field: "items".to_string(),
+                    span: sp(),
+                }),
+                span: sp(),
+            },
+            int(2),
+        ];
+        let err = validate_parallel_branches(&branches, sp()).unwrap_err();
+        assert!(err.to_string().contains("mutates actor state"));
+    }
+
+    #[test]
+    fn nested_actor_state_index_effect_is_summarized() {
+        let branch = Expr::FieldAccess {
+            expr: Box::new(Expr::Index {
+                arr: Box::new(Expr::FieldAccess {
+                    expr: Box::new(Expr::SelfRef(sp())),
+                    field: "items".to_string(),
+                    span: sp(),
+                }),
+                idx: Box::new(Expr::Perform {
+                    effect: "IO".to_string(),
+                    op: "read".to_string(),
+                    args: vec![],
+                    span: sp(),
+                }),
+                span: sp(),
+            }),
+            field: "value".to_string(),
+            span: sp(),
+        };
+        let summary = summarize_branch(0, &branch);
+        assert!(summary.effects.contains("IO.read"));
     }
 
     #[test]
