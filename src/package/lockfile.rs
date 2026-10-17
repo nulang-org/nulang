@@ -278,6 +278,20 @@ impl Lockfile {
     }
 
     fn validate_identities(&self) -> NuResult<()> {
+        // Duplicate exact pins make identity lookup and dependency reproducibility
+        // ambiguous even when the optional identity sidecar is absent.
+        let mut seen_packages = BTreeSet::new();
+        for package in &self.package {
+            if !seen_packages.insert((&package.name, &package.version, &package.source)) {
+                return Err(NuError::PackageError {
+                    msg: format!(
+                        "duplicate locked package '{}' {} from {}",
+                        package.name, package.version, package.source
+                    ),
+                    span: Span::default(),
+                });
+            }
+        }
         let mut seen = BTreeSet::new();
         for identity in &self.identity {
             let key = (
