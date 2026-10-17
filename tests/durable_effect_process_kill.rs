@@ -7,7 +7,7 @@
 
 use nulang::authority::{AuthorityGrant, AuthorityManifest};
 use nulang::bytecode::CodeModule;
-use nulang::durable_effect_runtime::DurableEffectCoordinator;
+use nulang::durable_effect_runtime::{DurableAsyncDispatchError, DurableEffectCoordinator};
 use nulang::hir_lower;
 use nulang::lexer::Lexer;
 use nulang::mir_codegen;
@@ -207,6 +207,32 @@ fn verify_crash_recovery(stage: &str) {
     let module = compiled_source();
     let pc = module.effect_sites[0].pc;
     let (actor, grant) = authorized_actor();
+
+    if stage == "provider_committed" {
+        // A crash must not allow a provider-side success to bypass a revoked
+        // live grant when the effect is still Prepared and needs recovery.
+        let mut revoked = Actor::new(ACTOR_ID, "Payments", 16);
+        revoked.persistent = true;
+        revoked.activation_epoch = 1;
+        revoked.install_authority_manifest(&AuthorityManifest::from_grants(
+            Vec::<AuthorityGrant>::new(),
+        ));
+        let mut coordinator = DurableEffectCoordinator::new(&mut store, ACTOR_ID, 1);
+        let error = coordinator.execute_compiled_async_with_deduplication(
+            &revoked,
+            &grant,
+            &module,
+            pc,
+            EXECUTION_KEY,
+            0,
+            REQUEST,
+            |_, _| panic!("revoked grant must not redispatch provider"),
+        );
+        assert!(matches!(error, Err(DurableAsyncDispatchError::Authorization(_))));
+        assert_eq!(store.latest_sequence(ACTOR_ID), 1);
+        assert!(provider_path.exists(), "provider receipt remains recoverable");
+    }
+
     let mut calls = 0;
     let receipt = {
         let mut coordinator = DurableEffectCoordinator::new(&mut store, ACTOR_ID, 1);
