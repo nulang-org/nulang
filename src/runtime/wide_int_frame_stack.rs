@@ -64,14 +64,19 @@ impl<'a> RootedIntFrameStack<'a> {
     /// roots for every wide integer. No raw Value pointer is duplicated
     /// without a preceding ORCA local_ref barrier.
     pub fn clone_top(&mut self) -> Result<usize, IntFrameStackError> {
-        let original = self.frames.last().copied().ok_or(IntFrameStackError::EmptyStack)?;
+        let original = self
+            .frames
+            .last()
+            .copied()
+            .ok_or(IntFrameStackError::EmptyStack)?;
         let previous_base = (self.frames.len() - 1) * FRAME_REGISTERS;
         let index = self.push_empty(original.module_idx);
         let new_base = index * FRAME_REGISTERS;
         for reg in 0..FRAME_REGISTERS {
             // These indices are in bounds; copying nil/inline values cannot
             // fail, and copying a wide object retains before overwriting.
-            self.registers.copy_into(new_base + reg, previous_base + reg)?;
+            self.registers
+                .copy_into(new_base + reg, previous_base + reg)?;
         }
         Ok(index)
     }
@@ -93,16 +98,14 @@ impl<'a> RootedIntFrameStack<'a> {
             return Err(IntFrameStackError::InvalidFrame);
         }
         if register >= FRAME_REGISTERS {
-            return Err(IntFrameStackError::Register(IntRegisterError::InvalidRegister));
+            return Err(IntFrameStackError::Register(
+                IntRegisterError::InvalidRegister,
+            ));
         }
         Ok(frame * FRAME_REGISTERS + register)
     }
 
-    pub fn read(
-        &self,
-        frame: usize,
-        register: usize,
-    ) -> Result<Option<i64>, IntFrameStackError> {
+    pub fn read(&self, frame: usize, register: usize) -> Result<Option<i64>, IntFrameStackError> {
         Ok(self.registers.read(self.slot(frame, register)?)?)
     }
 
@@ -167,11 +170,15 @@ impl<'a> RootedIntFrameStack<'a> {
         let left = self
             .registers
             .read(lhs)?
-            .ok_or(IntFrameStackError::Register(IntRegisterError::EmptyRegister))?;
+            .ok_or(IntFrameStackError::Register(
+                IntRegisterError::EmptyRegister,
+            ))?;
         let right = self
             .registers
             .read(rhs)?
-            .ok_or(IntFrameStackError::Register(IntRegisterError::EmptyRegister))?;
+            .ok_or(IntFrameStackError::Register(
+                IntRegisterError::EmptyRegister,
+            ))?;
         let value = int64_semantics::add(left, right)
             .map_err(|e| IntFrameStackError::Register(IntRegisterError::Arithmetic(e)))?;
         Ok(self.registers.store(dst, value)?)
