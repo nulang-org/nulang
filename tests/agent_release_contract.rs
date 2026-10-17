@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use nulang::agent_release::{
     asset_digest, AgentReleaseDefinition, AgentReleaseEnvelope, ModelBinding, NamedAsset,
     RELEASE_SCHEMA,
@@ -19,8 +17,14 @@ fn fixture() -> AgentReleaseDefinition {
             revision: "2026-10-17".into(),
         },
         skills: vec![
-            NamedAsset { name: "z-summary".into(), digest: asset_digest(b"summary") },
-            NamedAsset { name: "a-research".into(), digest: asset_digest(b"research") },
+            NamedAsset {
+                name: "z-summary".into(),
+                digest: asset_digest(b"summary"),
+            },
+            NamedAsset {
+                name: "a-research".into(),
+                digest: asset_digest(b"research"),
+            },
         ],
         tools: vec![NamedAsset {
             name: "web-search".into(),
@@ -49,11 +53,15 @@ fn tampering_with_any_bound_asset_or_model_is_rejected() {
     let sealed = AgentReleaseEnvelope::seal(fixture()).unwrap();
     let mut mutated = serde_json::to_value(&sealed).unwrap();
     mutated["definition"]["model"]["revision"] = serde_json::json!("other");
-    assert!(AgentReleaseEnvelope::parse_and_verify(&serde_json::to_vec(&mutated).unwrap()).is_err());
+    assert!(
+        AgentReleaseEnvelope::parse_and_verify(&serde_json::to_vec(&mutated).unwrap()).is_err()
+    );
 
     let mut mutated = serde_json::to_value(&sealed).unwrap();
     mutated["definition"]["policy"] = serde_json::json!(asset_digest(b"allow writes"));
-    assert!(AgentReleaseEnvelope::parse_and_verify(&serde_json::to_vec(&mutated).unwrap()).is_err());
+    assert!(
+        AgentReleaseEnvelope::parse_and_verify(&serde_json::to_vec(&mutated).unwrap()).is_err()
+    );
 }
 
 #[test]
@@ -77,7 +85,9 @@ fn malformed_inputs_fail_closed() {
     let sealed = AgentReleaseEnvelope::seal(fixture()).unwrap();
     let mut unknown = serde_json::to_value(&sealed).unwrap();
     unknown["definition"]["provider_api_key"] = serde_json::json!("secret");
-    assert!(AgentReleaseEnvelope::parse_and_verify(&serde_json::to_vec(&unknown).unwrap()).is_err());
+    assert!(
+        AgentReleaseEnvelope::parse_and_verify(&serde_json::to_vec(&unknown).unwrap()).is_err()
+    );
 
     let too_big = vec![b' '; 65 * 1024];
     assert!(AgentReleaseEnvelope::parse_and_verify(&too_big).is_err());
