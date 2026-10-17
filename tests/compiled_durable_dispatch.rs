@@ -2,9 +2,7 @@
 //! This does not exercise the VM's live PerformAsync callback or process restarts.
 
 use nulang::bytecode::CodeModule;
-use nulang::durable_effect_runtime::{
-    DurableAsyncDispatchError, DurableEffectCoordinator,
-};
+use nulang::durable_effect_runtime::{DurableAsyncDispatchError, DurableEffectCoordinator};
 use nulang::hir_lower;
 use nulang::lexer::Lexer;
 use nulang::mir_codegen;
@@ -94,7 +92,10 @@ fn lost_provider_response_keeps_prepared_intent_and_retries_same_key() {
             |key, _| {
                 calls += 1;
                 provider.insert(key.to_string(), b"receipt".to_vec());
-                Err(io::Error::new(io::ErrorKind::TimedOut, "lost provider response"))
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "lost provider response",
+                ))
             },
         );
         assert!(matches!(
@@ -149,7 +150,10 @@ fn metadata_or_request_drift_never_reaches_provider() {
             b"charge=100",
             |_, _| panic!("invalid compiler metadata must not dispatch"),
         );
-        assert!(matches!(failure, Err(DurableAsyncDispatchError::InvalidSite(_))));
+        assert!(matches!(
+            failure,
+            Err(DurableAsyncDispatchError::InvalidSite(_))
+        ));
     }
     assert_eq!(store.latest_sequence(42), 0);
 
@@ -169,7 +173,11 @@ fn metadata_or_request_drift_never_reaches_provider() {
     let mut replay = DurableEffectCoordinator::new(&mut store, 42, 1);
     assert!(matches!(
         replay.execute_compiled_async_with_deduplication(
-            &module, pc, "order:42:payment", 0, b"charge=200",
+            &module,
+            pc,
+            "order:42:payment",
+            0,
+            b"charge=200",
             |_, _| panic!("request drift must not dispatch")
         ),
         Err(DurableAsyncDispatchError::Recovery(_))
@@ -185,10 +193,17 @@ fn stale_activation_does_not_call_provider_for_prepared_effect() {
     {
         let mut first = DurableEffectCoordinator::new(&mut store, 42, 1);
         let failed = first.execute_compiled_async_with_deduplication(
-            &module, pc, "order:42:payment", 0, b"charge=100",
+            &module,
+            pc,
+            "order:42:payment",
+            0,
+            b"charge=100",
             |_, _| Err(io::Error::new(io::ErrorKind::TimedOut, "no receipt")),
         );
-        assert!(matches!(failed, Err(DurableAsyncDispatchError::Provider(_))));
+        assert!(matches!(
+            failed,
+            Err(DurableAsyncDispatchError::Provider(_))
+        ));
     }
     {
         // Claim newer epoch by committing a distinct durable effect.
@@ -197,7 +212,7 @@ fn stale_activation_does_not_call_provider_for_prepared_effect() {
         let other = DurableEffectSpec::new(
             DurableEffectId::derive(42, "epoch-2-claim", 0, "Test.claim"),
             "Test.claim",
-            EffectBoundary::Local,
+            EffectBoundary::External,
             DeliverySemantics::AtLeastOnce,
         );
         let mut claimed = DurableEffectCoordinator::new(&mut store, 42, 2);
@@ -205,9 +220,16 @@ fn stale_activation_does_not_call_provider_for_prepared_effect() {
     }
     let mut stale = DurableEffectCoordinator::new(&mut store, 42, 1);
     let result = stale.execute_compiled_async_with_deduplication(
-        &module, pc, "order:42:payment", 0, b"charge=100",
+        &module,
+            pc,
+            "order:42:payment",
+            0,
+            b"charge=100",
         |_, _| panic!("stale owner must not redispatch"),
     );
-    assert!(matches!(result, Err(DurableAsyncDispatchError::Recovery(_))));
+    assert!(matches!(
+        result,
+        Err(DurableAsyncDispatchError::Recovery(_))
+    ));
     assert_eq!(store.latest_sequence(42), 2);
 }
