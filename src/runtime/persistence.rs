@@ -1388,6 +1388,7 @@ mod libsql_remote_url_validation_tests {
             "http://localhost.evil.invalid",
             "http://127.0.0.1.evil.invalid",
             "http://127.0.0.1@192.0.2.10",
+            r"http://localhost\@external.invalid",
             "https://alice:password@database.turso.io",
             "https://database.turso.io#fragment",
             "ftp://database.turso.io",
