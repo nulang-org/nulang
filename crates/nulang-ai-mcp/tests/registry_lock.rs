@@ -22,14 +22,16 @@ impl ToolHandler for RegisterDuringCall {
     async fn call(&self, _args: Value) -> Result<Value, String> {
         let registry = self.registry.upgrade().expect("registry still alive");
         // Reentrancy must not deadlock: tool handlers may discover/register tools.
-        registry.register(
-            ToolSpec {
-                name: "discovered".into(),
-                description: "Registered during the parent tool call".into(),
-                parameters: json!({"type":"object"}),
-            },
-            Arc::new(NoopHandler),
-        ).await;
+        registry
+            .register(
+                ToolSpec {
+                    name: "discovered".into(),
+                    description: "Registered during the parent tool call".into(),
+                    parameters: json!({"type":"object"}),
+                },
+                Arc::new(NoopHandler),
+            )
+            .await;
         Ok(json!({"registered": true}))
     }
 }
@@ -37,14 +39,18 @@ impl ToolHandler for RegisterDuringCall {
 #[tokio::test]
 async fn tool_handler_can_register_another_tool_without_deadlock() {
     let registry = Arc::new(ToolRegistry::new());
-    registry.register(
-        ToolSpec {
-            name: "register".into(),
-            description: "Discover a tool".into(),
-            parameters: json!({"type":"object"}),
-        },
-        Arc::new(RegisterDuringCall { registry: Arc::downgrade(&registry) }),
-    ).await;
+    registry
+        .register(
+            ToolSpec {
+                name: "register".into(),
+                description: "Discover a tool".into(),
+                parameters: json!({"type":"object"}),
+            },
+            Arc::new(RegisterDuringCall {
+                registry: Arc::downgrade(&registry),
+            }),
+        )
+        .await;
 
     let server = McpServer::new(Arc::clone(&registry));
     let response = tokio::time::timeout(
@@ -55,7 +61,13 @@ async fn tool_handler_can_register_another_tool_without_deadlock() {
             method: "tools/call".into(),
             params: Some(json!({"name":"register", "arguments": {}})),
         }),
-    ).await.expect("tool call blocked registry mutation while awaiting handler");
-    assert!(response.error.is_none(), "unexpected MCP error: {:?}", response.error);
+    )
+    .await
+    .expect("tool call blocked registry mutation while awaiting handler");
+    assert!(
+        response.error.is_none(),
+        "unexpected MCP error: {:?}",
+        response.error
+    );
     assert_eq!(registry.list_tools().await.len(), 2);
 }
