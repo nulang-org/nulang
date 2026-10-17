@@ -62,6 +62,17 @@ pub fn validation_diagnostics(compilation: &ContractCompilation) -> Vec<String> 
     let mut diagnostics = compilation.diagnostics.clone();
     for route in &compilation.routes {
         diagnostics.extend(compile_route_bindings(route).diagnostics);
+        // Static artifacts are only meaningful for safe retrieval methods.
+        // A declared static mutation must fail before build tooling can
+        // execute its handler to generate an HTML artifact.
+        if route.placement.as_deref() == Some("static")
+            && !matches!(route.method.as_str(), "GET" | "HEAD")
+        {
+            diagnostics.push(format!(
+                "route {} {}: static placement only supports GET or HEAD",
+                route.method, route.path
+            ));
+        }
     }
 
     let mut seen = HashSet::new();
