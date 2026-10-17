@@ -3117,6 +3117,65 @@ app "counter" {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn web_build_only_prerenders_routes_marked_static_in_deployment_ir() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_build_web_placement_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        scaffold_package(&dir, "placement-app", "web").expect("scaffold should succeed");
+        std::fs::write(
+            dir.join("src/main.nula"),
+            r#"import stdlib::web::html
+import stdlib::web::types
+
+@placement(static)
+fn home() -> Html {
+    text("Public home")
+}
+
+@placement(server)
+fn dashboard() -> Html {
+    text("Server-only dashboard")
+}
+
+app "placement" {
+    route "GET" "/" -> home
+    route "GET" "/dashboard" -> dashboard
+}
+"#,
+        )
+        .unwrap();
+
+        let _guard = ChangeDir::new(&dir);
+        cmd_build_web().expect("hybrid web build should succeed");
+
+        let home = std::fs::read_to_string(dir.join("dist/index.html"))
+            .expect("static home should be prerendered");
+        assert!(home.contains("Public home"));
+        assert!(
+            !dir.join("dist/dashboard/index.html").exists(),
+            "server routes must never be emitted as static HTML"
+        );
+
+        let manifest = std::fs::read_to_string(dir.join("dist/nulang-app.ir.json"))
+            .expect("web deployment IR should be emitted");
+        let ir: crate::web::ir::DeploymentIr =
+            serde_json::from_str(&manifest).expect("valid deployment IR");
+        assert!(ir.routes.iter().any(|route| {
+            route.path == "/" && route.placement == "static"
+                && route.artifact.as_deref() == Some("index.html")
+        }));
+        assert!(ir.routes.iter().any(|route| {
+            route.path == "/dashboard" && route.placement == "server"
+                && route.artifact.is_none()
+        }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(feature = "ureq")]
     #[test]
     fn test_cmd_deploy_dry_run_emits_ir_and_dist() {
