@@ -44,6 +44,7 @@ applies to the named published version, not to internal implementation choices.
 - `.nbc` bytecode format version 1 (`src/format/constants.rs`).
 - NUL0 wire protocol version 1.
 - Value layout version 1 (`src/value_layout.rs`).
+
 ### Incubating (pre-adoption language semantics)
 Core syntax, evaluation, types, effects, capabilities, and built-in
 `IO`/`Spawn`/`Send`/`Receive` source contracts may change while Nulang
