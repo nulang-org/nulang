@@ -75,7 +75,9 @@ fn invalid_frame_and_slot_accesses_are_nonmutating() {
         );
         assert_eq!(
             stack.read(root, 256),
-            Err(IntFrameStackError::Register(IntRegisterError::InvalidRegister))
+            Err(IntFrameStackError::Register(
+                IntRegisterError::InvalidRegister
+            ))
         );
         assert_eq!(
             stack.copy_into(root, 0, root + 1, 0),
@@ -104,7 +106,9 @@ fn signed_64_bit_arithmetic_updates_only_the_target_frame() {
         );
         assert_eq!(stack.read(callee, 1).unwrap(), Some(-7));
         stack.store(caller, 0, (1_i64 << 47) - 1).unwrap();
-        stack.checked_add_into(callee, 1, caller, 0, callee, 0).unwrap();
+        stack
+            .checked_add_into(callee, 1, caller, 0, callee, 0)
+            .unwrap();
         assert_eq!(stack.read(callee, 1).unwrap(), Some(1_i64 << 47));
         stack.pop().unwrap();
         assert_eq!(stack.read(caller, 0).unwrap(), Some((1_i64 << 47) - 1));
