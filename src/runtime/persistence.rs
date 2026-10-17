@@ -4065,12 +4065,10 @@ mod durable_transition_tests {
     fn durable_transition_rejects_cross_actor_timer_replay_identity_without_writing() {
         let mut store = MemoryStore::new();
         let mut candidate = transition(10, 1, 1);
+        let replay_id = WorkflowReplayEventId::new(WorkflowActivationId::new(11, 1), 0);
         candidate.workflow_events = vec![WorkflowEvent::TimerSet {
             sequence: 1,
-            replay_id: Some(WorkflowReplayEventId::new(
-                WorkflowActivationId::new(11, 1),
-                0,
-            )),
+            replay_id: Some(replay_id),
             name: "wake".to_string(),
             duration_ms: 100,
         }];
@@ -4085,12 +4083,10 @@ mod durable_transition_tests {
     #[test]
     fn durable_transition_rejects_intermediate_replay_identity_for_wrong_command() {
         let mut candidate = transition(10, 1, 1);
+        let replay_id = WorkflowReplayEventId::new(WorkflowActivationId::new(10, 99), 0);
         candidate.workflow_events = vec![WorkflowEvent::Custom {
             sequence: 1,
-            replay_id: Some(WorkflowReplayEventId::new(
-                WorkflowActivationId::new(10, 99),
-                0,
-            )),
+            replay_id: Some(replay_id),
             name: "audit".to_string(),
             args: vec![],
         }];
@@ -4108,12 +4104,10 @@ mod durable_transition_tests {
         // Intermediate events may be committed after their command was admitted,
         // without creating a second command journal entry.
         candidate.command = None;
+        let replay_id = WorkflowReplayEventId::new(WorkflowActivationId::new(10, 1), 0);
         candidate.workflow_events = vec![WorkflowEvent::TimerSet {
             sequence: 2,
-            replay_id: Some(WorkflowReplayEventId::new(
-                WorkflowActivationId::new(10, 1),
-                0,
-            )),
+            replay_id: Some(replay_id),
             name: "wake".to_string(),
             duration_ms: 100,
         }];
