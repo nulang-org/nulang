@@ -6,7 +6,7 @@ on:
       runs:
         description: Measured runs per runtime
         required: false
-        default: '5'
+        default: '8'
       warmup:
         description: Warm-up runs per runtime
         required: false
@@ -25,6 +25,8 @@ on:
       - 'benchmarks/cross_runtime/**'
       - 'benchmarks/README.md'
       - 'scripts/cross_runtime_bench.py'
+      - 'scripts/cross_runtime_order.py'
+      - 'scripts/tests/test_cross_runtime*.py'
       - 'src/benchmarks.rs'
       - 'src/bin/nulang_savina.rs'
       - 'benchmarks/SAVINA.md'
@@ -41,6 +43,9 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
+
+      - name: Test comparative benchmark ordering
+        run: python3 -m unittest discover -s scripts/tests -p 'test_cross_runtime*.py' -v
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -60,7 +65,7 @@ jobs:
 
       - name: Run cross-runtime baselines
         env:
-          RUNS: "${{ inputs.runs || '3' }}"
+          RUNS: "${{ inputs.runs || '8' }}"
           WARMUP: "${{ inputs.warmup || '1' }}"
           CPU_MODE: "${{ inputs.cpu_mode || 'single' }}"
         run: |

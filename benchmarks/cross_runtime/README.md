@@ -21,15 +21,21 @@ primitive:
 Run all installed runtimes on the same host:
 
 ```bash
-python3 scripts/cross_runtime_bench.py --runs 5 --warmup 1 \
+python3 scripts/cross_runtime_bench.py --runs 8 --warmup 1 \
   --cpu-mode single \
   --output /tmp/nulang-cross-runtime.json
 ```
 
 The runner compiles each external fixture once, performs warm-up runs, then
 records exact nanosecond timings from each runtime and reports the median for
-every workload. The JSON also records OS/CPU counts, git SHA, toolchain
-versions, and the CPU topology used for measurement.
+every workload. Measured rounds counterbalance runtime order by rotating each
+pair and reversing its second round. Over **2 × the number of selected runtimes**
+measured rounds (eight for the default four), every runtime occupies each
+execution position twice. Smaller run counts are only partially balanced.
+Warm-ups do not shift the measured-round schedule. The JSON records
+`measured_execution_orders` so comparisons can audit actual execution order.
+The JSON also records OS/CPU counts, git SHA, toolchain versions, and the CPU
+topology used for measurement.
 
 ## CPU-topology rule
 
