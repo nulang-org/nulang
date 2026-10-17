@@ -172,6 +172,25 @@ mod tests {
     }
 
     #[test]
+    fn static_placement_rejects_post_routes_before_static_build() {
+        let compilation = ContractCompilation {
+            routes: vec![RouteContract {
+                method: "POST".to_string(),
+                path: "/submit".to_string(),
+                handler: Some("submit".to_string()),
+                placement: Some("static".to_string()),
+                ..RouteContract::default()
+            }],
+            diagnostics: Vec::new(),
+        };
+
+        let errors = validate_compilation(compilation).unwrap_err();
+        assert!(errors.iter().any(|message| {
+            message.contains("POST /submit") && message.contains("static placement")
+        }));
+    }
+
+    #[test]
     fn validate_compilation_rejects_invalid_contracts() {
         let compilation = ContractCompilation {
             routes: vec![contract("/users/{id: UserId}", Vec::new())],
