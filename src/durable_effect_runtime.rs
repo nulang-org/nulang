@@ -5,6 +5,8 @@
 //! effect identity for callers: the caller must provide a replay-stable
 //! `DurableEffectSpec` derived from semantic execution identity.
 
+use crate::authority::AuthorityGrant;
+use crate::authority_runtime::RuntimeAuthorityError;
 use crate::bytecode::CodeModule;
 use crate::durable_effect::{
     CompiledEffectSpecError, DurableEffectId, DurableEffectRecord, DurableEffectRecoveryAction,
@@ -13,7 +15,7 @@ use crate::durable_effect::{
 use crate::primitives::{DeliverySemantics, EffectBoundary};
 use crate::durable_effect_persistence::DurableEffectPersistenceRecord;
 use crate::runtime::{
-    DurableCommit, DurableTransition, PersistenceStore, DURABLE_TRANSITION_VERSION,
+    Actor, DurableCommit, DurableTransition, PersistenceStore, DURABLE_TRANSITION_VERSION,
 };
 use std::fmt;
 use std::io;
@@ -90,6 +92,10 @@ impl From<DurableEffectRequestMismatch> for DurableEffectRuntimeError {
 #[derive(Debug)]
 pub enum DurableAsyncDispatchError {
     InvalidSite(CompiledEffectSpecError),
+    Authorization(RuntimeAuthorityError),
+    ActorMismatch { expected: u64, actual: u64 },
+    ActorEpochMismatch { expected: u64, actual: u64 },
+    GrantOperationMismatch { operation: String, grant: AuthorityGrant },
     Recovery(DurableEffectRuntimeError),
     Provider(io::Error),
     UnexpectedDecision,
@@ -99,6 +105,19 @@ impl fmt::Display for DurableAsyncDispatchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidSite(error) => error.fmt(f),
+            Self::Authorization(error) => error.fmt(f),
+            Self::ActorMismatch { expected, actual } => write!(
+                f,
+                "durable effect actor mismatch: expected {expected}, got {actual}"
+            ),
+            Self::ActorEpochMismatch { expected, actual } => write!(
+                f,
+                "durable effect activation epoch mismatch: expected {expected}, got {actual}"
+            ),
+            Self::GrantOperationMismatch { operation, grant } => write!(
+                f,
+                "durable effect {operation} cannot be authorized by unrelated or parameterized grant {grant}"
+            ),
             Self::Recovery(error) => error.fmt(f),
             Self::Provider(error) => write!(f, "durable effect provider error: {error}"),
             Self::UnexpectedDecision => write!(
@@ -181,13 +200,21 @@ impl<'a> DurableEffectCoordinator<'a> {
     /// The provider MUST honor the supplied stable idempotency key. A provider
     /// timeout or error leaves Prepared intact for a future deduplicated retry.
     ///
-    /// This does not itself attach the VM's PerformAsync callback, enforce
-    /// external authority, or provide a distributed lease. Callers must enforce
-    /// authority and ownership before invoking this method, and the persisted
-    /// activation epoch must still match on retries. A competing owner can
-    /// advance the epoch after a read fence; provider dedup remains necessary.
+    /// Require a live actor with the exact ID, activation epoch and typed
+    /// authority for the compiler's effect operation BEFORE journaling, replay,
+    /// or provider dispatch. For now this bridge intentionally permits only an
+    /// unparameterized Other(Namespace::Operation) grant matching the compiled
+    /// Namespace.operation site. Resource-scoped grants need a separate adapter
+    /// that validates the actual destination/arguments, not a guessed string.
+    ///
+    /// This is a trusted-host Rust boundary, not VM integration. The host must
+    /// supply the actual live actor and ensure the provider closure implements
+    /// the compiled operation. A competing owner can still claim a newer epoch
+    /// after this check; provider-side deduplication remains mandatory.
     pub fn execute_compiled_async_with_deduplication<F>(
         &mut self,
+        actor: &Actor,
+        authority: &AuthorityGrant,
         module: &CodeModule,
         pc: usize,
         execution_key: &str,
@@ -198,6 +225,19 @@ impl<'a> DurableEffectCoordinator<'a> {
     where
         F: FnOnce(&str, &[u8]) -> io::Result<Vec<u8>>,
     {
+        if actor.id != self.actor_id {
+            return Err(DurableAsyncDispatchError::ActorMismatch {
+                expected: self.actor_id,
+                actual: actor.id,
+            });
+        }
+        if actor.activation_epoch != self.activation_epoch {
+            return Err(DurableAsyncDispatchError::ActorEpochMismatch {
+                expected: self.activation_epoch,
+                actual: actor.activation_epoch,
+            });
+        }
+
         let spec = DurableEffectSpec::from_compiled_async_site(
             module,
             pc,
@@ -207,6 +247,26 @@ impl<'a> DurableEffectCoordinator<'a> {
             EffectBoundary::External,
             DeliverySemantics::EffectivelyOnceWithDeduplication,
         )?;
+
+        // Never infer a resource-scoped grant from a static call site: a
+        // mutable request may name a different path, endpoint, or secret.
+        // Until the compiler emits resource-binding descriptors only exact,
+        // unparameterized extension operations can use this generic bridge.
+        let matches_operation = matches!(
+            authority,
+            AuthorityGrant::Other { namespace, operation, argument: None }
+                if spec.effect_operation.split_once('.')
+                    == Some((namespace.as_str(), operation.as_str()))
+        );
+        if !matches_operation {
+            return Err(DurableAsyncDispatchError::GrantOperationMismatch {
+                operation: spec.effect_operation.clone(),
+                grant: authority.clone(),
+            });
+        }
+        actor
+            .require_authority(authority)
+            .map_err(DurableAsyncDispatchError::Authorization)?;
 
         match self.begin(spec, request)? {
             DurableEffectDispatchDecision::ReplayRecordedResult(receipt) => Ok(receipt),
