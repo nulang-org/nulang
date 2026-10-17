@@ -178,13 +178,10 @@ pub fn generate_deployment_ir(
     }
 }
 
-fn default_route_placement(method: &str, path: &str) -> String {
-    let dynamic_path = path.contains(':') || (path.contains('{') && path.contains('}'));
-    if dynamic_path || !matches!(method, "GET" | "HEAD") {
-        "server".to_string()
-    } else {
-        "static".to_string()
-    }
+fn default_route_placement(_method: &str, _path: &str) -> String {
+    // A simple GET path is not evidence of purity. Only an explicitly
+    // authorized static route may run at build time; unknown stays on server.
+    "server".to_string()
 }
 
 fn route_path_to_artifact(path: &str) -> String {
