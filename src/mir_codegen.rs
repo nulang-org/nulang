@@ -3816,6 +3816,37 @@ mod optimize_tests {
     }
 
     #[test]
+    fn test_dce_preserves_unused_negation_that_can_trap() {
+        let mut b = mir::FunctionBuilder::new("unused_trap", Some(Type::int()));
+        let source = b.add_temp(Type::int());
+        let unused = b.add_temp(Type::int());
+        let returned = b.add_temp(Type::int());
+        b.assign(
+            source,
+            mir::RValue::Const(Constant::Int(crate::value_layout::INT48_MIN)),
+        );
+        b.assign(unused, mir::RValue::Unary(crate::ast::UnOp::Neg, source));
+        b.assign(returned, mir::RValue::Const(Constant::Int(1)));
+        b.terminate(mir::Terminator::Return(Some(returned)));
+
+        let mut func = b.build();
+        optimize_function(&mut func, &mut Vec::new());
+
+        assert!(
+            func.blocks[0].stmts.iter().any(|stmt| {
+                matches!(
+                    stmt,
+                    mir::Stmt::Assign {
+                        op: mir::RValue::Unary(crate::ast::UnOp::Neg, _),
+                        ..
+                    }
+                )
+            }),
+            "unused negation must still execute when it can raise an overflow error"
+        );
+    }
+
+    #[test]
     fn test_fold_int48_out_of_payload_negation_preserves_overflow() {
         let src = mir::LocalId(0);
         let mut consts = std::collections::HashMap::new();
