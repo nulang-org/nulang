@@ -1692,9 +1692,34 @@ fn collect_const_locals(func: &mir::Function) -> std::collections::HashMap<mir::
     disallowed.extend(func.params.iter().copied());
     disallowed.extend(func.captures.iter().copied());
 
+    // The returned map is function-wide: it can only contain constants
+    // guaranteed available at *every* use. A literal defined in a branch
+    // does not dominate its join, even when it is the sole assignment.
+    // Restrict candidates to the entry block until the optimizer has an
+    // explicit CFG/dominator-aware per-program-point constant lattice.
+    let Some(entry) = func.blocks.iter().find(|block| block.id == func.entry) else {
+        return std::collections::HashMap::new();
+    };
+    let mut initialized = HashSet::new();
+    for stmt in &entry.stmts {
+        let mut reads = HashSet::new();
+        stmt_reads(stmt, &mut reads);
+        for read in reads {
+            if !initialized.contains(&read) {
+                disallowed.insert(read);
+            }
+        }
+        if let mir::Stmt::Assign { dst, .. } = stmt {
+            initialized.insert(*dst);
+        }
+    }
+
     let mut const_locals: std::collections::HashMap<mir::LocalId, Constant> =
         std::collections::HashMap::new();
     for block in &func.blocks {
+        if block.id != func.entry {
+            continue;
+        }
         for stmt in &block.stmts {
             if let mir::Stmt::Assign {
                 dst,
