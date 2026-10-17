@@ -905,6 +905,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "cranelift-object"
+version = "0.132.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f7a263727954f7b310796e1b5543e6dfd6afed7e15c62f2454b51b6f38a39e1"
+dependencies = [
+ "anyhow",
+ "cranelift-codegen 0.132.3",
+ "cranelift-control 0.132.3",
+ "cranelift-module",
+ "log",
+ "object",
+ "target-lexicon",
+]
+
+[[package]]
 name = "cranelift-srcgen"
 version = "0.132.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2436,6 +2451,7 @@ dependencies = [
  "cranelift-jit",
  "cranelift-module",
  "cranelift-native 0.132.3",
+ "cranelift-object",
  "criterion",
  "crossbeam",
  "ed25519-dalek",
@@ -2470,6 +2486,7 @@ dependencies = [
  "serde_json",
  "tar",
  "target-lexicon",
+ "tempfile",
  "tokio",
  "toml 1.1.4+spec-1.1.0",
  "tower-lsp",
