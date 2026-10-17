@@ -96,9 +96,24 @@ the external provider supplies.
 ## Compiled external-effect dispatch helper (experimental)
 
 `DurableEffectCoordinator::execute_compiled_async_with_deduplication`
-takes a verified compiled module, exact effect-site PC, replay-stable execution
-key and occurrence, request bytes, and a provider callback. It obtains one
-canonical effect ID, commits `Prepared` **before** calling the provider,
+takes the live owning `Actor`, an exact typed `AuthorityGrant`, a verified
+compiled module, exact effect-site PC, replay-stable execution key and occurrence,
+request bytes, and a provider callback. It rejects a mismatched actor ID, terminated actor, or
+activation epoch, requires the complete current actor grant manifest to parse,
+and verifies that an unparameterized `Other(Namespace::Operation)` grant
+matches the compiler's `Namespace.operation` effect site. All of these checks
+happen before journal reads, `Prepared` writes, or provider dispatch.
+
+**Fail-closed restriction:** This generic bridge does not authorize
+resource-parameterized or built-in grants (`Net::TcpOut`, `Fs::Read`,
+`Secret::Read`, etc.). Those require specialized host adapters that bind the
+exact evaluated destination/resource to authority. The host must supply a
+trusted live actor and correctly matched provider; caller-controlled actor
+objects, forged artifacts, or a provider closure that invokes a different
+operation are outside this proof.
+
+Once authorized, the coordinator obtains one canonical effect ID and commits
+`Prepared` **before** calling the provider,
 supplies the stable idempotency key, persists a terminal receipt, and replays
 a completed result without redispatch. Provider errors leave `Prepared`
 intact because the external operation may already have committed.
@@ -111,13 +126,18 @@ This is a **read fence**, not a lease or a proof that an owner cannot change
 between the epoch check and external dispatch. The external provider must
 actually deduplicate the idempotency key.
 
+`tests/authorized_compiled_durable_dispatch.rs` also covers missing
+or malformed grants, wrong or terminated actor, wrong activation epoch, unrelated/parameterized
+authority, revocation before retry or read-only receipt replay, and valid
+grant/receipt reuse. These cases assert no journal mutation on denial.
+
 `tests/compiled_durable_dispatch.rs` exercises source-compiled effect
 metadata through the coordinator, timeout recovery, stable provider
 deduplication and replay, drift rejection, and stale-epoch rejection using
 `MemoryStore`. This is a Rust integration path; it is **not** proof that
 the VM's ordinary `.nula` `PerformAsync` host callback uses the helper
-or that process restarts, multi-owner race conditions, external authority and
-transactional actor-turn completion have been validated.
+or that process restarts, multi-owner race conditions, all resource-scoped
+external authority, and transactional actor-turn completion have been validated.
 
 ## What is not yet a production-wide guarantee
 
