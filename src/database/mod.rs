@@ -8,6 +8,7 @@ pub mod checkpoint;
 pub mod store;
 pub mod tablet;
 pub mod wal;
+pub mod wal_batch;
 
 #[cfg(test)]
 mod interruption;
