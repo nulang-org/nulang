@@ -158,6 +158,17 @@ impl MetricsSnapshot {
             s.empty_polls
         );
 
+        // Best-effort queue pressure gauges, including batched worker-local work.
+        out.push_str("# HELP nulang_scheduler_ready_high Runnable High-priority queue depth\n");
+        out.push_str("# TYPE nulang_scheduler_ready_high gauge\n");
+        out.push_str(&format!("nulang_scheduler_ready_high {}\n", s.ready_high));
+        out.push_str("# HELP nulang_scheduler_ready_normal Runnable Normal-priority queue depth\n");
+        out.push_str("# TYPE nulang_scheduler_ready_normal gauge\n");
+        out.push_str(&format!("nulang_scheduler_ready_normal {}\n", s.ready_normal));
+        out.push_str("# HELP nulang_scheduler_ready_low Runnable Low-priority queue depth\n");
+        out.push_str("# TYPE nulang_scheduler_ready_low gauge\n");
+        out.push_str(&format!("nulang_scheduler_ready_low {}\n", s.ready_low));
+
         // GC counters
         let g = &self.gc;
         counter!(
