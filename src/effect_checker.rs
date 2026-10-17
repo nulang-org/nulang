@@ -34,18 +34,15 @@ pub fn effect_row_subset(sub: &EffectRow, sup: &EffectRow) -> bool {
         (EffectRow::Closed(sub_effs), EffectRow::Open(sup_effs, _)) => {
             sub_effs.iter().all(|e| sup_effs.contains(e))
         }
-        // Open sub, closed sup: the open row *might* contain effects beyond
-        // its concrete list, so it is only a subset if the concrete list
-        // itself is already a subset and the open row is empty except for the
-        // variable that could introduce new effects.
-        (EffectRow::Open(sub_effs, _), EffectRow::Closed(sup_effs)) => {
-            sub_effs.iter().all(|e| sup_effs.contains(e))
-        }
-        // Open sub, open sup: both row variables could introduce arbitrary
-        // effects.  We only require that the concrete effects of sub are
-        // contained in the concrete effects of sup.
-        (EffectRow::Open(sub_effs, _), EffectRow::Open(sup_effs, _)) => {
-            sub_effs.iter().all(|e| sup_effs.contains(e))
+        // Open sub, closed sup: an unresolved row variable may contain
+        // effects outside the closed policy even when all known effects fit.
+        // Resolve the inferred row before using a closed authority boundary.
+        (EffectRow::Open(_, _), EffectRow::Closed(_)) => false,
+        // Open sub, open sup: unresolved tails can be compared only if
+        // they refer to the SAME row variable. Distinct region variables
+        // have independent unknown effects, even if known effects match.
+        (EffectRow::Open(sub_effs, sub_region), EffectRow::Open(sup_effs, sup_region)) => {
+            sub_region == sup_region && sub_effs.iter().all(|e| sup_effs.contains(e))
         }
     }
 }
@@ -2947,6 +2944,61 @@ mod tests {
         let closed = EffectRow::Closed(vec![Effect::IO]);
         let open = EffectRow::Open(vec![Effect::IO], Region::fresh());
         assert!(effect_row_subset(&closed, &open));
+    }
+
+    #[test]
+    fn test_unresolved_open_effect_row_cannot_satisfy_closed_policy() {
+        // An unresolved row variable may hide IO even when no concrete
+        // effects have been inferred yet. It is not evidence of purity.
+        let unresolved = EffectRow::Open(vec![], Region::fresh());
+        let pure_policy = EffectRow::Closed(vec![]);
+        assert!(!effect_row_subset(&unresolved, &pure_policy));
+
+        // Merely listing known effects on both sides does not close the
+        // inferred row variable or prove that it contains nothing else.
+        let inferred = EffectRow::Open(vec![Effect::IO], Region::fresh());
+        let allowed = EffectRow::Closed(vec![Effect::IO]);
+        assert!(!effect_row_subset(&inferred, &allowed));
+    }
+
+    #[test]
+    fn test_open_effect_row_subset_requires_same_unresolved_variable() {
+        // Distinct row variables represent independent unknown effect sets.
+        // Having the same known IO effect does not constrain their tails.
+        let first = EffectRow::Open(vec![Effect::IO], Region::fresh());
+        let second = EffectRow::Open(vec![Effect::IO], Region::fresh());
+        assert!(!effect_row_subset(&first, &second));
+
+        // Identical variable identity preserves valid effect polymorphism.
+        let shared = Region::fresh();
+        let inferred = EffectRow::Open(vec![Effect::IO], shared);
+        let allowed = EffectRow::Open(vec![Effect::IO, Effect::FS], shared);
+        assert!(effect_row_subset(&inferred, &allowed));
+    }
+
+    #[test]
+    fn test_closed_effect_policy_rejects_unresolved_direct_callee() {
+        // A declared function can carry unknown effects through its row tail.
+        // Checking the call site must not discard that uncertainty when the
+        // enclosing function declares a closed authority allowance.
+        let mut checker = EffectChecker::new();
+        checker.fn_rows.insert(
+            "unknown_effects".to_string(),
+            EffectRow::Open(vec![Effect::IO], Region::fresh()),
+        );
+
+        let call = Expr::App {
+            func: Box::new(Expr::Var("unknown_effects".to_string(), s())),
+            args: vec![],
+            span: s(),
+        };
+        let allowed = EffectRow::Closed(vec![Effect::IO]);
+        let result = checker.check_effects(&EffectContext::empty(), &call, &allowed);
+
+        assert!(
+            matches!(result, Err(NuError::EffectError { .. })),
+            "unknown transitive effects must not satisfy a closed authority boundary"
+        );
     }
 
     #[test]
