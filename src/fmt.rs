@@ -29,29 +29,100 @@ pub fn format_source(source: &str) -> Result<String, String> {
         fmt_decl(&mut out, decl, 0, &mut had_unhandled);
     }
     if had_unhandled {
-        return Err("file contains constructs not yet supported by the formatter (e.g. workflow, agent, let-binding, class, impl). The file was not modified.".to_string());
+        return Err("formatting refused: an unsupported construct cannot be preserved safely; the file was not modified".to_string());
     }
     if !out.ends_with('\n') {
         out.push('\n');
     }
+
+    // The AST printer is not yet lossless: it can omit visibility, generic
+    // parameters, defaults, comments, and other source-level information.
+    // Until a trivia-preserving formatter is available, refuse any rewrite
+    // that changes a significant token (including comments and literals).
+    // Newlines are allowed to change because formatting adjusts layout.
+    if significant_tokens(source)? != significant_tokens(&out)? {
+        return Err(
+            "formatting refused: output would change or remove source tokens; the file was not modified".to_string(),
+        );
+    }
+    // Token equivalence is necessary but not sufficient: always require the
+    // formatted program to parse successfully before returning any edits.
+    let tokens = crate::lexer::Lexer::new(&out)
+        .lex()
+        .map_err(|e| format!("formatted source is not lexically valid: {e}"))?;
+    crate::parser::Parser::new(tokens)
+        .parse_module()
+        .map_err(|e| format!("formatted source does not parse: {e}"))?;
     Ok(out)
+}
+
+/// Compare semantic tokens and source comments while ignoring layout newlines.
+/// This guard deliberately errs on the side of rejecting valid formatting.
+fn significant_tokens(source: &str) -> Result<Vec<crate::lexer::TokenKind>, String> {
+    use crate::lexer::TokenKind;
+    if source.starts_with("#!") {
+        return Err("formatting refused: shebangs are not yet preserved".to_string());
+    }
+    crate::lexer::Lexer::new(source)
+        .lex_with_comments()
+        .map(|tokens| {
+            tokens
+                .into_iter()
+                .filter_map(|t| match t.kind {
+                    TokenKind::Newline | TokenKind::Eof => None,
+                    kind => Some(kind),
+                })
+                .collect()
+        })
+        .map_err(|e| e.to_string())
 }
 
 /// Recursively format all `.nula` files under `dir`.
 ///
-/// When `check_only` is true files are never modified; an error is returned
-/// on the first file that *would* be reformatted instead.
+/// Preflight the entire tree before changing any source. A late parse or
+/// losslessness failure must never leave previously visited files rewritten.
+/// Filesystem write failures are still reported and are not transactional.
+///
+/// With `check_only`, no files are changed; return an error when any file
+/// would change.
 pub fn format_directory(dir: &Path, check_only: bool) -> NuResult<()> {
-    walk_format(dir, check_only)
+    let mut planned = Vec::new();
+    collect_formatted_files(dir, &mut planned)?;
+
+    if check_only {
+        if let Some((path, _)) = planned.first() {
+            return Err(NuError::parse_error(
+                format!("Would reformat {}", path.display()),
+                Span::default(),
+            ));
+        }
+        return Ok(());
+    }
+
+    for (path, formatted) in planned {
+        std::fs::write(&path, formatted.as_bytes()).map_err(|e| {
+            NuError::vm_error(
+                format!("Cannot write '{}': {}", path.display(), e),
+                Span::default(),
+            )
+        })?;
+        println!("Formatted {}", path.display());
+    }
+    Ok(())
 }
 
-fn walk_format(dir: &Path, check_only: bool) -> NuResult<()> {
+/// Build a deterministic write plan without mutating any input files.
+fn collect_formatted_files(
+    dir: &Path,
+    planned: &mut Vec<(std::path::PathBuf, String)>,
+) -> NuResult<()> {
     let entries = std::fs::read_dir(dir).map_err(|e| {
         NuError::vm_error(
             format!("Cannot read directory '{}': {}", dir.display(), e),
             Span::default(),
         )
     })?;
+    let mut paths = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|e| {
             NuError::vm_error(
@@ -59,40 +130,25 @@ fn walk_format(dir: &Path, check_only: bool) -> NuResult<()> {
                 Span::default(),
             )
         })?;
-        let path = entry.path();
+        paths.push(entry.path());
+    }
+    paths.sort();
+
+    for path in paths {
         if path.is_dir() {
-            walk_format(&path, check_only)?;
-        } else if path.extension().map_or(false, |ext| ext == "nula") {
+            collect_formatted_files(&path, planned)?;
+        } else if path.extension().is_some_and(|ext| ext == "nula") {
             let source = std::fs::read_to_string(&path).map_err(|e| {
                 NuError::vm_error(
                     format!("Cannot read '{}': {}", path.display(), e),
                     Span::default(),
                 )
             })?;
-            match format_source(&source) {
-                Ok(formatted) => {
-                    if formatted != source {
-                        if check_only {
-                            return Err(NuError::parse_error(
-                                format!("Would reformat {}", path.display()),
-                                Span::default(),
-                            ));
-                        }
-                        std::fs::write(&path, formatted.as_bytes()).map_err(|e| {
-                            NuError::vm_error(
-                                format!("Cannot write '{}': {}", path.display(), e),
-                                Span::default(),
-                            )
-                        })?;
-                        println!("Formatted {}", path.display());
-                    }
-                }
-                Err(e) => {
-                    return Err(NuError::parse_error(
-                        format!("{}: {}", path.display(), e),
-                        Span::default(),
-                    ));
-                }
+            let formatted = format_source(&source).map_err(|e| {
+                NuError::parse_error(format!("{}: {}", path.display(), e), Span::default())
+            })?;
+            if formatted != source {
+                planned.push((path, formatted));
             }
         }
     }
@@ -1214,7 +1270,79 @@ fn op_sym_unary(op: crate::ast::UnOp) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::format_source;
+    use super::{format_directory, format_source};
+
+    #[test]
+    fn test_fmt_rejects_losing_public_api_or_generic_declaration() {
+        let source = "pub fn identity[T](value: T) -> T { value }\n";
+        assert!(
+            format_source(source).is_err(),
+            "formatting must not silently change the exported public API"
+        );
+    }
+
+    #[test]
+    fn test_fmt_rejects_losing_regular_and_doc_comments() {
+        let regular = "fn main() {\n  // keep this explanation\n  perform IO.print(\"hello\")\n}\n";
+        let documented = "/// important API docs\nfn greet() { 1 }\n";
+        assert!(
+            format_source(regular).is_err(),
+            "comments must never be dropped"
+        );
+        assert!(
+            format_source(documented).is_err(),
+            "doc comments must never be dropped"
+        );
+    }
+
+    #[test]
+    fn test_fmt_rejects_losing_default_arguments() {
+        let source = "fn greet(name: String = \"world\") -> String { name }\n";
+        assert!(
+            format_source(source).is_err(),
+            "formatting must not silently remove parameter defaults"
+        );
+    }
+
+    #[test]
+    fn test_directory_preflight_prevents_partial_writes_on_unsafe_source() {
+        let root = std::env::temp_dir().join(format!(
+            "nulang_fmt_preflight_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("create scratch directory");
+
+        // Both files are valid source. The first is safely formattable; the
+        // second has a comment that the AST printer cannot yet preserve.
+        let safe = root.join("a.nula");
+        let unsafe_file = root.join("z.nula");
+        let original = "import Foo::Bar";
+        std::fs::write(&safe, original).expect("write first source");
+        std::fs::write(&unsafe_file, "fn f() { 1 } // keep this comment\\n")
+            .expect("write unsafe source");
+
+        let result = format_directory(&root, false);
+        assert!(
+            result.is_err(),
+            "unsafe file must refuse the directory format"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&safe).expect("read first source"),
+            original,
+            "directory formatting must not mutate earlier files if preflight fails"
+        );
+        assert!(
+            std::fs::read_to_string(&unsafe_file)
+                .expect("read unsafe source")
+                .contains("// keep this comment"),
+            "unsafe source must remain intact"
+        );
+        std::fs::remove_dir_all(root).expect("remove scratch directory");
+    }
 
     /// Formatting must be idempotent: formatting the formatted output is a
     /// no-op (returns the same text), so repeated `fmt` runs converge.
@@ -1384,9 +1512,10 @@ fn main() {
 
     #[test]
     fn test_fmt_spawn_handle_receive() {
+        // Source without explicit semicolons can be formatted conservatively.
         let src = r#"
 fn main() {
-    let a = spawn Greeter();
+    let a = spawn Greeter()
     receive { | Msg(x) if x > 0 => x }
     emit Event(1)
 }"#;
@@ -1395,5 +1524,14 @@ fn main() {
         assert!(out.contains("receive {"), "got: {out}");
         assert!(out.contains("emit Event(1)"), "got: {out}");
         assert_idempotent(src);
+    }
+
+    #[test]
+    fn test_fmt_rejects_dropping_explicit_semicolons() {
+        let src = "fn main() { let a = 1; a }";
+        assert!(
+            format_source(src).is_err(),
+            "an AST printer that drops source semicolons must refuse this edit"
+        );
     }
 }
