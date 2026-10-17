@@ -1,7 +1,5 @@
 use chrono::Utc;
-use nulang_ai_core::{
-    project_recent_messages, ContextProjectionError, ConversationMessage,
-};
+use nulang_ai_core::{project_recent_messages, ContextProjectionError, ConversationMessage};
 
 fn message(role: &str, content: &str) -> ConversationMessage {
     ConversationMessage {
