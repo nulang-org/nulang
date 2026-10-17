@@ -1,0 +1,7 @@
+var sum = 0;
+var i = 0;
+while i < 9000000 {
+    sum = sum + i * 3 - i / 7;
+    i = i + 1;
+};
+sum
