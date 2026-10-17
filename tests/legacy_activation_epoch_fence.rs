@@ -3,7 +3,7 @@
 //! Both persistence backends must reject stale activations without mutation.
 
 use nulang::runtime::{
-    ActorSnapshot, DurableTransition, DurableTailPosition, MemoryStore, PersistenceStore,
+    ActorSnapshot, DurableTailPosition, DurableTransition, MemoryStore, PersistenceStore,
     DURABLE_TRANSITION_VERSION,
 };
 use std::io;
@@ -47,9 +47,14 @@ fn assert_legacy_epoch_fences_first_atomic_commit(store: &mut dyn PersistenceSto
         .expect_err("an older owner must not promote a legacy history");
     assert_eq!(stale.kind(), io::ErrorKind::PermissionDenied);
 
-    let untouched = store.load_snapshot(actor_id).expect("legacy snapshot remains");
+    let untouched = store
+        .load_snapshot(actor_id)
+        .expect("legacy snapshot remains");
     assert_eq!(untouched.sequence, 5, "rejection must not advance state");
-    assert_eq!(untouched.activation_epoch, 9, "rejection must not replace the owner");
+    assert_eq!(
+        untouched.activation_epoch, 9,
+        "rejection must not replace the owner"
+    );
     assert_eq!(
         store.load_durable_tail_position(actor_id).unwrap(),
         None,
@@ -81,4 +86,40 @@ fn memory_store_legacy_snapshot_epoch_fences_first_atomic_commit() {
 fn libsql_legacy_snapshot_epoch_fences_first_atomic_commit() {
     let mut store = LibsqlStore::in_memory().expect("in-memory libsql");
     assert_legacy_epoch_fences_first_atomic_commit(&mut store, 742_002);
+}
+
+fn assert_zero_epoch_legacy_snapshot_cannot_be_promoted(
+    store: &mut dyn PersistenceStore,
+    actor_id: u64,
+) {
+    store
+        .save_snapshot(ActorSnapshot {
+            actor_id,
+            sequence: 3,
+            activation_epoch: 0,
+            ..ActorSnapshot::default()
+        })
+        .expect("store malformed legacy fixture");
+
+    let error = store
+        .commit_transition(transition(actor_id, 1, 4))
+        .expect_err("legacy snapshot with invalid epoch zero must fail closed");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    let snapshot = store.load_snapshot(actor_id).expect("snapshot remains");
+    assert_eq!(snapshot.sequence, 3);
+    assert_eq!(snapshot.activation_epoch, 0);
+    assert_eq!(store.load_durable_tail_position(actor_id).unwrap(), None);
+}
+
+#[test]
+fn memory_store_rejects_invalid_zero_epoch_legacy_promotion() {
+    let mut store = MemoryStore::new();
+    assert_zero_epoch_legacy_snapshot_cannot_be_promoted(&mut store, 742_003);
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn libsql_rejects_invalid_zero_epoch_legacy_promotion() {
+    let mut store = LibsqlStore::in_memory().expect("in-memory libsql");
+    assert_zero_epoch_legacy_snapshot_cannot_be_promoted(&mut store, 742_004);
 }
