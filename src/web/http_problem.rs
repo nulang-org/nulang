@@ -25,8 +25,21 @@ pub struct ProblemHttpResponse {
 /// that policy in the compiler/runtime error contract prevents HTTP adapters
 /// from independently reclassifying the same failure.
 pub fn request_decode_problem_response(error: &RequestDecodeError) -> ProblemHttpResponse {
-    let body = serde_json::to_vec(&error.problem_details()).unwrap_or_else(|_| {
-        br#"{\"type\":\"urn:nulang:web:problem-serialization\",\"title\":\"Internal Server Error\",\"status\":500}"#
+    // Keep detailed compiler/runtime diagnostics available on the error object,
+    // but never serialize internal handler names, slots or source metadata to
+    // an HTTP client when the binding plan itself is invalid.
+    let public_problem = if error.is_client_error() {
+        error.problem_details()
+    } else {
+        serde_json::json!({
+            "type": "about:blank",
+            "title": "Internal Server Error",
+            "status": 500,
+            "code": "internal_server_error",
+        })
+    };
+    let body = serde_json::to_vec(&public_problem).unwrap_or_else(|_| {
+        br#"{"type":"about:blank","title":"Internal Server Error","status":500,"code":"internal_server_error"}"#
             .to_vec()
     });
 
