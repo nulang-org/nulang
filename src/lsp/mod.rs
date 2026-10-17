@@ -662,7 +662,18 @@ impl LanguageServer for NulangLanguageServer {
             .ok()
             .and_then(|p| p.parent().map(|p| p.to_path_buf()));
         let import_index = self.import_index(doc_dir.as_deref());
-        Ok(Self::code_actions(&source, range, &uri, &import_index))
+        let mut actions = Self::code_actions(&source, range, &uri, &import_index)
+            .unwrap_or_default();
+        actions.extend(Self::diagnostic_fix_actions(
+            &source,
+            &uri,
+            &params.context.diagnostics,
+        ));
+        if actions.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(actions))
+        }
     }
 
     async fn folding_range(&self, params: FoldingRangeParams) -> Result<Option<Vec<FoldingRange>>> {
@@ -1571,6 +1582,69 @@ impl NulangLanguageServer {
             .collect()
     }
 
+    /// Convert a UTF-8 byte offset into a zero-based LSP position. Unlike
+    /// Span::column(), LSP characters are UTF-16 code units.
+    fn source_position(source: &str, byte_offset: usize) -> Option<Position> {
+        let prefix = source.get(..byte_offset)?;
+        let line = prefix.as_bytes().iter().filter(|b| **b == b'\n').count() as u32;
+        let character = prefix.rsplit('\n').next()?.encode_utf16().count() as u32;
+        Some(Position::new(line, character))
+    }
+
+    /// Consume only compiler-produced edits whose original bytes still match
+    /// the current document. Typo replacements are not preferred/automatic.
+    fn diagnostic_fix_actions(
+        source: &str,
+        uri: &Url,
+        diagnostics: &[Diagnostic],
+    ) -> Vec<CodeActionOrCommand> {
+        use crate::diagnostic::{DiagnosticSourceEdit, EditApplicability};
+
+        let mut actions = Vec::new();
+        for diagnostic in diagnostics {
+            let Some(data) = diagnostic.data.as_ref() else {
+                continue;
+            };
+            let Ok(edit) = serde_json::from_value::<DiagnosticSourceEdit>(data.clone()) else {
+                continue;
+            };
+            if edit.start >= edit.end
+                || source.get(edit.start as usize..edit.end as usize)
+                    != Some(edit.expected.as_str())
+            {
+                continue;
+            }
+            let Some(start) = Self::source_position(source, edit.start as usize) else {
+                continue;
+            };
+            let Some(end) = Self::source_position(source, edit.end as usize) else {
+                continue;
+            };
+            let mut changes = HashMap::new();
+            changes.insert(
+                uri.clone(),
+                vec![TextEdit {
+                    range: Range::new(start, end),
+                    new_text: edit.replacement.clone(),
+                }],
+            );
+            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                title: format!("Replace `{}` with `{}`", edit.expected, edit.replacement),
+                kind: Some(CodeActionKind::QUICKFIX),
+                diagnostics: Some(vec![diagnostic.clone()]),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(changes),
+                    ..WorkspaceEdit::default()
+                }),
+                command: None,
+                is_preferred: Some(edit.applicability == EditApplicability::MachineApplicable),
+                disabled: None,
+                data: None,
+            }));
+        }
+        actions
+    }
+
     fn code_actions(
         source: &str,
         range: Option<Range>,
@@ -2366,6 +2440,9 @@ fn nu_error_to_diagnostic(err: NuError) -> Vec<Diagnostic> {
 
 /// Build a single LSP Diagnostic from a non-Multiple NuError.
 fn single_diagnostic(err: NuError) -> Diagnostic {
+    let edit_data = crate::types::current_source_text()
+        .and_then(|source| crate::diagnostic::suggested_source_edit(&err, &source))
+        .and_then(|edit| serde_json::to_value(edit).ok());
     let (message, start_line, start_col, end_line, end_col) = match err {
         NuError::LexError { msg, span }
         | NuError::ParseError { msg, span, .. }
@@ -2412,7 +2489,7 @@ fn single_diagnostic(err: NuError) -> Diagnostic {
         message,
         related_information: None,
         tags: None,
-        data: None,
+        data: edit_data,
     }
 }
 
@@ -3859,6 +3936,130 @@ mod lsp_tests {
     }
 
     // -- Crash-safety regression tests --
+
+    #[test]
+    fn test_compiler_typo_quick_fix_removes_original_error() {
+        let source = "fn main() { let counter: Int = 41; countr + 1 }";
+        let before = NulangLanguageServer::compute_diagnostics(source);
+        assert!(
+            before
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("Unbound variable")),
+            "the compiler must diagnose the misspelled name: {:?}",
+            before.diagnostics
+        );
+        let uri = Url::parse("file:///test.nula").unwrap();
+        let actions = NulangLanguageServer::diagnostic_fix_actions(
+            source,
+            &uri,
+            &before.diagnostics,
+        );
+        assert_eq!(actions.len(), 1);
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("expected source edit");
+        };
+        let edit = &action.edit.as_ref().unwrap().changes.as_ref().unwrap()[&uri][0];
+        assert_eq!(edit.new_text, "counter");
+        // The fixture is ASCII, so LSP UTF-16 character offsets are also
+        // byte offsets; apply the actual emitted edit rather than searching
+        // the source for the misspelled name independently.
+        let start = edit.range.start.character as usize;
+        let end = edit.range.end.character as usize;
+        assert_eq!(&source[start..end], "countr");
+        let fixed = format!("{}{}{}", &source[..start], edit.new_text, &source[end..]);
+        let after = NulangLanguageServer::compute_diagnostics(&fixed);
+        assert!(
+            !after
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("Unbound variable")),
+            "the edit should remove the unknown-name diagnostic: {:?}",
+            after.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_compiler_typo_edit_reaches_lsp_quick_fix() {
+        let source = "fn main() = countr + 1\n";
+        crate::types::set_source_map_with_file(source, Some("test.nula"));
+        let start = "fn main() = ".len() as u32;
+        let error = NuError::unbound_variable(
+            "countr",
+            crate::types::Span::new(start, start + 6),
+            Some(vec!["counter".to_string()]),
+        );
+        let diagnostic = single_diagnostic(error);
+        let uri = Url::parse("file:///test.nula").unwrap();
+        let actions = NulangLanguageServer::diagnostic_fix_actions(
+            source,
+            &uri,
+            &[diagnostic],
+        );
+        assert_eq!(actions.len(), 1);
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("expected compiler-derived code action");
+        };
+        assert_eq!(action.is_preferred, Some(false));
+        let edits = action
+            .edit
+            .as_ref()
+            .and_then(|workspace| workspace.changes.as_ref())
+            .and_then(|changes| changes.get(&uri))
+            .expect("workspace edit");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "counter");
+        assert_eq!(edits[0].range.start, Position::new(0, start));
+        assert_eq!(edits[0].range.end, Position::new(0, start + 6));
+        crate::types::clear_source_map();
+    }
+
+    #[test]
+    fn test_compiler_quick_fix_rejects_stale_source() {
+        let source = "fn main() = countr + 1\n";
+        crate::types::set_source_map_with_file(source, Some("test.nula"));
+        let start = "fn main() = ".len() as u32;
+        let diagnostic = single_diagnostic(NuError::unbound_variable(
+            "countr",
+            crate::types::Span::new(start, start + 6),
+            Some(vec!["counter".to_string()]),
+        ));
+        let uri = Url::parse("file:///test.nula").unwrap();
+        assert!(NulangLanguageServer::diagnostic_fix_actions(
+            "fn main() = cactus + 1\n",
+            &uri,
+            &[diagnostic],
+        )
+        .is_empty());
+        crate::types::clear_source_map();
+    }
+
+    #[test]
+    fn test_compiler_quick_fix_uses_utf16_columns() {
+        let source = "fn café() = countr\n";
+        crate::types::set_source_map_with_file(source, Some("test.nula"));
+        let start = "fn café() = ".len() as u32;
+        let diagnostic = single_diagnostic(NuError::unbound_variable(
+            "countr",
+            crate::types::Span::new(start, start + 6),
+            Some(vec!["counter".to_string()]),
+        ));
+        let uri = Url::parse("file:///test.nula").unwrap();
+        let actions = NulangLanguageServer::diagnostic_fix_actions(
+            source,
+            &uri,
+            &[diagnostic],
+        );
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("expected code action");
+        };
+        let edit = &action.edit.as_ref().unwrap().changes.as_ref().unwrap()[&uri][0];
+        assert_eq!(
+            edit.range.start,
+            Position::new(0, "fn café() = ".encode_utf16().count() as u32)
+        );
+        crate::types::clear_source_map();
+    }
 
     #[test]
     fn test_code_action_let_binding_without_rhs() {

@@ -110,6 +110,24 @@ by `render_warning`/`format_warning` (src/diagnostic.rs) with a
 
 See `docs/MIGRATION_RFC_0015.md` for the `catch`/`fail` migration guide.
 
+## Structured source edits
+
+Compiler suggestions may include an optional `suggestion.edit` in JSON
+diagnostics. The edit carries UTF-8 byte offsets `start`/`end`, an
+`expected` source fragment, a `replacement`, and an `applicability`
+classification (`machine_applicable` or `maybe_incorrect`).
+
+Today, an E0202 unbound-variable error with exactly one similar name emits a
+`maybe_incorrect` edit. Naming guesses are **not** automatically safe and the
+legacy `suggestion.replacement` remains null for those suggestions. Missing
+source, ambiguous candidates, invalid spans, and non-identifier spans do not
+produce edits. This is an additive field of the existing JSON schema v1.
+
+The LSP maps compiler edits to quick fixes using UTF-16 editor positions
+and checks that `expected` matches the current document first. An edit from a
+stale diagnostic is therefore not offered. Compiler edits are not marked as
+preferred until their applicability is `machine_applicable`.
+
 ## Output modes
 
 - **tty**: ariadne report — `[Exxxx] Error: msg` header, `╭─[file:line:col]`

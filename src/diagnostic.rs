@@ -21,6 +21,79 @@ use ariadne::{Color, Config, Label, Report, ReportKind, Source};
 
 use crate::types::{current_source_text, source_map_file, ErrorCode, NuError, NuWarning, Span};
 
+/// Whether a suggested edit can be applied mechanically without a semantic
+/// decision. Typo candidates are always suggestions, never automatic repairs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditApplicability {
+    MachineApplicable,
+    MaybeIncorrect,
+}
+
+/// Compiler-owned source edit shared by JSON diagnostics and LSP code actions.
+///
+/// Offsets are UTF-8 bytes in the original source, not line/column indices.
+/// Consumers must verify `expected` still matches before offering the edit.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DiagnosticSourceEdit {
+    pub start: u32,
+    pub end: u32,
+    pub expected: String,
+    pub replacement: String,
+    pub applicability: EditApplicability,
+}
+
+/// Suggest a replacement only when the compiler identified exactly one
+/// candidate and the recorded span still covers a valid identifier.
+/// This deliberately does not mark name guesses as machine-applicable.
+pub fn suggested_source_edit(err: &NuError, source: &str) -> Option<DiagnosticSourceEdit> {
+    if err.error_code() != Some(ErrorCode::E002UnboundVariable) {
+        return None;
+    }
+    let NuError::TypeError {
+        msg,
+        similar_names: Some(names),
+        span,
+        ..
+    } = err
+    else {
+        return None;
+    };
+    let [replacement] = names.as_slice() else {
+        return None;
+    };
+    let original = source.get(span.start as usize..span.end as usize)?;
+    let before = source.get(..span.start as usize)?.chars().next_back();
+    let after = source.get(span.end as usize..)?.chars().next();
+    let continues_identifier = |ch: char| ch.is_alphanumeric() || ch == '_';
+    // Source spans must cover an entire identifier. Replacing only a prefix
+    // or suffix can silently corrupt unrelated source after error recovery.
+    if before.is_some_and(continues_identifier) || after.is_some_and(continues_identifier) {
+        return None;
+    }
+    let valid_identifier = |name: &str| {
+        let mut chars = name.chars();
+        matches!(chars.next(), Some(c) if c.is_alphabetic() || c == '_')
+            && chars.all(|c| c.is_alphanumeric() || c == '_')
+    };
+    // Do not trust a stale or overly broad error span: it must name the
+    // precise identifier diagnosed by the compiler, not merely any token.
+    if msg != &format!("Unbound variable: '{}'", original)
+        || !valid_identifier(original)
+        || !valid_identifier(replacement)
+        || original == replacement
+    {
+        return None;
+    }
+    Some(DiagnosticSourceEdit {
+        start: span.start,
+        end: span.end,
+        expected: original.to_owned(),
+        replacement: replacement.clone(),
+        applicability: EditApplicability::MaybeIncorrect,
+    })
+}
+
 impl NuError {
     /// Return the stable, category-scoped diagnostic code for this error.
     ///

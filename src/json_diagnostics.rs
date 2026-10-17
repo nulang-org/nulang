@@ -34,6 +34,8 @@
 
 use serde::Serialize;
 
+use crate::diagnostic::{suggested_source_edit, DiagnosticSourceEdit};
+
 use crate::types::{current_source_text, source_map_file, NuError, Span};
 
 /// Current JSON diagnostics schema version.
@@ -105,6 +107,9 @@ pub struct JsonSpan {
 pub struct JsonSuggestion {
     pub message: String,
     pub replacement: Option<String>,
+    /// Exact byte-offset edit. Omitted for diagnostics without a safe source span.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edit: Option<DiagnosticSourceEdit>,
 }
 
 /// Per-test result for `nula test --json`.
@@ -133,16 +138,30 @@ pub fn diagnostics_from_error(err: &NuError) -> Vec<JsonDiagnostic> {
 }
 
 fn diagnostic_from_single(err: &NuError) -> JsonDiagnostic {
+    let edit = current_source_text()
+        .and_then(|source| suggested_source_edit(err, &source));
+    let suggestion = if let Some(edit) = edit {
+        Some(JsonSuggestion {
+            message: format!("Consider replacing `{}` with `{}`", edit.expected, edit.replacement),
+            // A compiler guess is not guaranteed correct. Only automatic edits
+            // may use the legacy shorthand replacement field.
+            replacement: None,
+            edit: Some(edit),
+        })
+    } else {
+        err.suggestion().map(|msg| JsonSuggestion {
+            message: msg.to_string(),
+            replacement: None,
+            edit: None,
+        })
+    };
     JsonDiagnostic {
         code: err.stable_code().map(|s| s.to_string()),
         severity: "error".to_string(),
         message: json_message(err),
         span: err.primary_span().and_then(json_span),
         notes: crate::diagnostic::diagnostic_notes(err),
-        suggestion: err.suggestion().map(|msg| JsonSuggestion {
-            message: msg.to_string(),
-            replacement: None,
-        }),
+        suggestion,
     }
 }
 
@@ -253,6 +272,111 @@ mod tests {
         assert_eq!(v["command"], "check");
         assert_eq!(v["ok"], false);
         assert!(v["diagnostics"].is_array());
+        clear_source_map();
+    }
+
+    #[test]
+    fn test_unique_unbound_name_emits_scoped_nonautomatic_edit() {
+        let source = "fn main() = countr + 1\n";
+        set_source_map_with_file(source, Some("test.nula"));
+        let start = "fn main() = ".len() as u32;
+        let err = NuError::unbound_variable(
+            "countr",
+            Span::new(start, start + 6),
+            Some(vec!["counter".to_string()]),
+        );
+        let diag = diagnostics_from_error(&err).remove(0);
+        let suggestion = diag.suggestion.expect("unique typo must have a suggestion");
+        let edit = suggestion.edit.expect("suggestion must carry a scoped source edit");
+        assert_eq!(edit.expected, "countr");
+        assert_eq!(edit.replacement, "counter");
+        assert_eq!(edit.start, start);
+        assert_eq!(edit.end, start + 6);
+        assert_eq!(
+            edit.applicability,
+            crate::diagnostic::EditApplicability::MaybeIncorrect
+        );
+        let fixed = format!(
+            "{}{}{}",
+            &source[..edit.start as usize],
+            edit.replacement,
+            &source[edit.end as usize..]
+        );
+        assert_eq!(fixed, "fn main() = counter + 1\n");
+        clear_source_map();
+    }
+
+    #[test]
+    fn test_ambiguous_or_out_of_bounds_typo_has_no_edit() {
+        let source = "fn main() = countr + 1\n";
+        set_source_map_with_file(source, Some("test.nula"));
+        let start = "fn main() = ".len() as u32;
+        let ambiguous = NuError::unbound_variable(
+            "countr",
+            Span::new(start, start + 6),
+            Some(vec!["counter".into(), "county".into()]),
+        );
+        assert!(
+            diagnostics_from_error(&ambiguous)[0]
+                .suggestion
+                .as_ref()
+                .and_then(|s| s.edit.as_ref())
+                .is_none()
+        );
+        let invalid = NuError::unbound_variable(
+            "countr",
+            Span::new(9000, 9010),
+            Some(vec!["counter".into()]),
+        );
+        assert!(
+            diagnostics_from_error(&invalid)[0]
+                .suggestion
+                .as_ref()
+                .and_then(|s| s.edit.as_ref())
+                .is_none()
+        );
+        clear_source_map();
+    }
+
+    #[test]
+    fn test_typo_edit_rejects_span_for_another_identifier() {
+        let source = "fn main() = counter + countr\n";
+        set_source_map_with_file(source, Some("test.nula"));
+        let start = "fn main() = ".len() as u32;
+        let err = NuError::unbound_variable(
+            "countr",
+            Span::new(start, start + 7),
+            Some(vec!["counter".to_string()]),
+        );
+        assert!(
+            diagnostics_from_error(&err)[0]
+                .suggestion
+                .as_ref()
+                .and_then(|suggestion| suggestion.edit.as_ref())
+                .is_none(),
+            "source span must refer to the exact misspelled name"
+        );
+        clear_source_map();
+    }
+
+    #[test]
+    fn test_typo_edit_rejects_substring_of_larger_identifier() {
+        let source = "fn main() = countrx + 1\n";
+        set_source_map_with_file(source, Some("test.nula"));
+        let start = "fn main() = ".len() as u32;
+        let err = NuError::unbound_variable(
+            "countr",
+            Span::new(start, start + 6),
+            Some(vec!["counter".to_string()]),
+        );
+        assert!(
+            diagnostics_from_error(&err)[0]
+                .suggestion
+                .as_ref()
+                .and_then(|suggestion| suggestion.edit.as_ref())
+                .is_none(),
+            "suggestions must replace complete identifiers, not their prefixes"
+        );
         clear_source_map();
     }
 
