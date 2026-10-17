@@ -33,8 +33,12 @@ fn remote_connector_preserves_bearer_authentication() {
 
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("client must connect");
-        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
 
         let mut request = Vec::new();
         let mut chunk = [0u8; 4096];
@@ -46,10 +50,14 @@ fn remote_connector_preserves_bearer_authentication() {
             request.extend_from_slice(&chunk[..read]);
         }
 
-        sender.send(String::from_utf8_lossy(&request).into_owned()).unwrap();
-        stream.write_all(
-            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        ).unwrap();
+        sender
+            .send(String::from_utf8_lossy(&request).into_owned())
+            .unwrap();
+        stream
+            .write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
     });
 
     let secret = "nulang-remote-auth-secret-do-not-log";
@@ -61,7 +69,9 @@ fn remote_connector_preserves_bearer_authentication() {
 
     let request = receiver.recv_timeout(Duration::from_secs(8)).unwrap();
     assert!(
-        request.to_ascii_lowercase().contains(&format!("authorization: bearer {secret}")),
+        request
+            .to_ascii_lowercase()
+            .contains(&format!("authorization: bearer {secret}")),
         "remote connector must retain the authorization header"
     );
     assert!(
@@ -94,8 +104,12 @@ fn remote_https_rejects_untrusted_certificates() {
         loop {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-                    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
                     let mut tls = rustls::ServerConnection::new(Arc::new(server_config)).unwrap();
                     let rejected = tls.complete_io(&mut stream).is_err();
                     sender.send(rejected).unwrap();
