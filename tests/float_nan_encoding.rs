@@ -7,7 +7,10 @@ use nulang::vm::Value;
 fn float_nan_remains_a_float_instead_of_aliasing_nil() {
     let value = Value::float(f64::NAN);
     assert!(value.is_float(), "NaN must retain its Float type");
-    assert!(!value.is_nil(), "hardware canonical NaN must not alias TAG_NIL");
+    assert!(
+        !value.is_nil(),
+        "hardware canonical NaN must not alias TAG_NIL"
+    );
     assert!(value.as_float().expect("float payload").is_nan());
 }
 
