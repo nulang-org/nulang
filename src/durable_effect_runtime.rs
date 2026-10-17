@@ -5,11 +5,13 @@
 //! effect identity for callers: the caller must provide a replay-stable
 //! `DurableEffectSpec` derived from semantic execution identity.
 
+use crate::bytecode::CodeModule;
 use crate::durable_effect::{
-    DurableEffectId, DurableEffectRecord, DurableEffectRecoveryAction,
+    CompiledEffectSpecError, DurableEffectId, DurableEffectRecord, DurableEffectRecoveryAction,
     DurableEffectRequestMismatch, DurableEffectSpec,
 };
 use crate::durable_effect_persistence::DurableEffectPersistenceRecord;
+use crate::primitives::{DeliverySemantics, EffectBoundary};
 use crate::runtime::{
     DurableCommit, DurableTransition, PersistenceStore, DURABLE_TRANSITION_VERSION,
 };
@@ -82,6 +84,45 @@ impl From<DurableEffectRequestMismatch> for DurableEffectRuntimeError {
     }
 }
 
+/// Failure while dispatching one compiled external effect through a durable
+/// intent/receipt boundary. A provider error leaves the prepared record intact
+/// because the remote operation may have committed before its reply was lost.
+#[derive(Debug)]
+pub enum DurableAsyncDispatchError {
+    InvalidSite(CompiledEffectSpecError),
+    Recovery(DurableEffectRuntimeError),
+    Provider(io::Error),
+    UnexpectedDecision,
+}
+
+impl fmt::Display for DurableAsyncDispatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidSite(error) => error.fmt(f),
+            Self::Recovery(error) => error.fmt(f),
+            Self::Provider(error) => write!(f, "durable effect provider error: {error}"),
+            Self::UnexpectedDecision => write!(
+                f,
+                "compiled idempotent external effect returned incompatible dispatch semantics"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DurableAsyncDispatchError {}
+
+impl From<CompiledEffectSpecError> for DurableAsyncDispatchError {
+    fn from(error: CompiledEffectSpecError) -> Self {
+        Self::InvalidSite(error)
+    }
+}
+
+impl From<DurableEffectRuntimeError> for DurableAsyncDispatchError {
+    fn from(error: DurableEffectRuntimeError) -> Self {
+        Self::Recovery(error)
+    }
+}
+
 /// Coordinates one actor/entity/workflow's durable external effects.
 ///
 /// `activation_epoch` is supplied by the owning runtime/placement layer. A
@@ -114,7 +155,17 @@ impl<'a> DurableEffectCoordinator<'a> {
     ) -> Result<DurableEffectDispatchDecision, DurableEffectRuntimeError> {
         if let Some(existing) = self.store.load_durable_effect(self.actor_id, spec.id)? {
             self.validate_existing(&spec, request, existing.effect())?;
-            return Ok(decision(existing.effect()));
+            let recovered = decision(existing.effect());
+            // A completed receipt can be read without provider dispatch.
+            // Prepared effects, however, must never authorize a stale or
+            // unclaimed future activation to retry the external operation.
+            if !matches!(
+                recovered,
+                DurableEffectDispatchDecision::ReplayRecordedResult(_)
+            ) {
+                self.require_claimed_activation()?;
+            }
+            return Ok(recovered);
         }
 
         let prepared = DurableEffectRecord::prepare(spec, request);
@@ -122,6 +173,54 @@ impl<'a> DurableEffectCoordinator<'a> {
             prepared.clone(),
         ))?;
         Ok(decision(&prepared))
+    }
+
+    /// Execute a compiler-identified external operation with an idempotent
+    /// provider, journaling Prepared before the provider and Completed after
+    /// a successful receipt. A completed effect replays without dispatch.
+    ///
+    /// The caller MUST supply a verified/pinned CodeModule, a durable and
+    /// replay-stable execution key, and the same occurrence index on retry.
+    /// The provider MUST honor the supplied stable idempotency key. A provider
+    /// timeout or error leaves Prepared intact for a future deduplicated retry.
+    ///
+    /// This does not itself attach the VM's PerformAsync callback, enforce
+    /// external authority, or provide a distributed lease. Callers must enforce
+    /// authority and ownership before invoking this method, and the persisted
+    /// activation epoch must still match on retries. A competing owner can
+    /// advance the epoch after a read fence; provider dedup remains necessary.
+    pub fn execute_compiled_async_with_deduplication<F>(
+        &mut self,
+        module: &CodeModule,
+        pc: usize,
+        execution_key: &str,
+        occurrence_index: u32,
+        request: &[u8],
+        dispatch: F,
+    ) -> Result<Vec<u8>, DurableAsyncDispatchError>
+    where
+        F: FnOnce(&str, &[u8]) -> io::Result<Vec<u8>>,
+    {
+        let spec = DurableEffectSpec::from_compiled_async_site(
+            module,
+            pc,
+            self.actor_id,
+            execution_key,
+            occurrence_index,
+            EffectBoundary::External,
+            DeliverySemantics::EffectivelyOnceWithDeduplication,
+        )?;
+
+        match self.begin(spec, request)? {
+            DurableEffectDispatchDecision::ReplayRecordedResult(receipt) => Ok(receipt),
+            DurableEffectDispatchDecision::DispatchWithDeduplication { operation_id } => {
+                let key = operation_id.idempotency_key();
+                let receipt =
+                    dispatch(&key, request).map_err(DurableAsyncDispatchError::Provider)?;
+                Ok(self.complete(operation_id, request, receipt)?)
+            }
+            _ => Err(DurableAsyncDispatchError::UnexpectedDecision),
+        }
     }
 
     /// Persist the terminal result for a previously prepared effect.
@@ -154,6 +253,32 @@ impl<'a> DurableEffectCoordinator<'a> {
         };
         self.commit_record(DurableEffectPersistenceRecord::from_effect(completed))?;
         Ok(durable_result)
+    }
+
+    /// A prepared intent may predate an actor's current activation, but
+    /// redispatch is allowed only after the owner's new epoch is durably
+    /// claimed. This read fence does not replace provider-side deduplication
+    /// or prevent a competing claim after the check.
+    fn require_claimed_activation(&self) -> Result<(), DurableEffectRuntimeError> {
+        let tail = self
+            .store
+            .load_durable_tail_position(self.actor_id)?
+            .ok_or_else(|| {
+                DurableEffectRuntimeError::Storage(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "prepared durable effect exists without a committed activation tail",
+                ))
+            })?;
+        if tail.activation_epoch != self.activation_epoch {
+            return Err(DurableEffectRuntimeError::Storage(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "durable effect redispatch epoch {} is not the committed owner epoch {}",
+                    self.activation_epoch, tail.activation_epoch
+                ),
+            )));
+        }
+        Ok(())
     }
 
     fn validate_existing(
@@ -395,5 +520,81 @@ mod tests {
                 if source.kind() == io::ErrorKind::PermissionDenied
         ));
         assert_eq!(store.latest_sequence(42), 1);
+    }
+
+    #[test]
+    fn stale_activation_cannot_redispatch_an_already_prepared_effect() {
+        let mut store = MemoryStore::new();
+        let prepared = spec(
+            42,
+            "turn:prepared",
+            DeliverySemantics::EffectivelyOnceWithDeduplication,
+        );
+        {
+            let mut first = DurableEffectCoordinator::new(&mut store, 42, 1);
+            first.begin(prepared.clone(), b"charge").unwrap();
+        }
+        {
+            let mut next = DurableEffectCoordinator::new(&mut store, 42, 2);
+            next.begin(
+                spec(42, "turn:advance", DeliverySemantics::AtLeastOnce),
+                b"other",
+            )
+            .unwrap();
+        }
+        let mut stale = DurableEffectCoordinator::new(&mut store, 42, 1);
+        assert!(matches!(
+            stale.begin(prepared, b"charge"),
+            Err(DurableEffectRuntimeError::Storage(ref error))
+                if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+        assert_eq!(store.latest_sequence(42), 2);
+    }
+
+    #[test]
+    fn unclaimed_future_activation_cannot_redispatch_existing_intent() {
+        let mut store = MemoryStore::new();
+        let prepared = spec(42, "turn:prepared", DeliverySemantics::AtLeastOnce);
+        {
+            let mut original = DurableEffectCoordinator::new(&mut store, 42, 1);
+            original.begin(prepared.clone(), b"request").unwrap();
+        }
+
+        // Epoch 2 has not made a durable claim. It cannot safely assume
+        // that the epoch-1 owner has been fenced away.
+        let mut unclaimed = DurableEffectCoordinator::new(&mut store, 42, 2);
+        assert!(matches!(
+            unclaimed.begin(prepared, b"request"),
+            Err(DurableEffectRuntimeError::Storage(ref error))
+                if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+        assert_eq!(store.latest_sequence(42), 1);
+    }
+
+    #[test]
+    fn completed_result_can_be_read_without_dispatch_from_old_epoch() {
+        let mut store = MemoryStore::new();
+        let prepared = spec(42, "turn:receipt", DeliverySemantics::AtLeastOnce);
+        {
+            let mut first = DurableEffectCoordinator::new(&mut store, 42, 1);
+            first.begin(prepared.clone(), b"request").unwrap();
+            first
+                .complete(prepared.id, b"request", b"receipt".to_vec())
+                .unwrap();
+        }
+        {
+            let mut next = DurableEffectCoordinator::new(&mut store, 42, 2);
+            next.begin(
+                spec(42, "turn:advance", DeliverySemantics::AtLeastOnce),
+                b"other",
+            )
+            .unwrap();
+        }
+        let mut old = DurableEffectCoordinator::new(&mut store, 42, 1);
+        assert_eq!(
+            old.begin(prepared, b"request").unwrap(),
+            DurableEffectDispatchDecision::ReplayRecordedResult(b"receipt".to_vec())
+        );
+        assert_eq!(store.latest_sequence(42), 3);
     }
 }
