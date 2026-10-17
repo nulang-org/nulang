@@ -2117,6 +2117,36 @@ pub unsafe extern "C" fn nulang_aot_receive_pop() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reentrant_jit_leaf_state_is_moved_and_restored_without_cloning() {
+        // Isolate TLS from unrelated tests; the saved state owns the exact
+        // Vec buffer and its module-local contents across nested execution.
+        std::thread::spawn(|| {
+            super::set_jit_leaf_calls(&[(7, std::ptr::null(), 2, 1)], std::ptr::null());
+            let outer_ptr =
+                super::JIT_LEAF_CALLS.with(|slot| slot.borrow().as_ptr());
+            let saved = super::save_jit_thread_state();
+
+            super::JIT_LEAF_CALLS.with(|slot| {
+                assert!(slot.borrow().is_empty(), "nested execution must not see stale outer dispatch");
+            });
+            super::set_jit_leaf_calls(&[(9, std::ptr::null(), 3, 2)], std::ptr::null());
+            super::restore_jit_thread_state(saved);
+
+            super::JIT_LEAF_CALLS.with(|slot| {
+                let entries = slot.borrow();
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].func_idx, 7);
+                assert_eq!(entries[0].return_reg, 2);
+                assert_eq!(entries[0].required_args, 1);
+                assert_eq!(entries.as_ptr(), outer_ptr, "restoration must reuse the original allocation");
+            });
+            super::clear_jit_leaf_calls();
+        })
+        .join()
+        .expect("TLS test thread");
+    }
+
 
     #[test]
     fn test_jit_status_slots_are_thread_local() {
