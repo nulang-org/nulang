@@ -3160,6 +3160,56 @@ impl Runtime {
             .max(1)
     }
 
+    /// Process at most `max_turns` ready actor mailbox messages without
+    /// entering the standalone scheduler's idle wait loop.
+    ///
+    /// This host-driven entry point is intended for embedders that own their
+    /// event loop. Each claimed actor receives one `step_actor` call before
+    /// its ready token is returned to the scheduler, preserving priority
+    /// ordering and leaving remaining messages queued for a later poll.
+    ///
+    /// Pending timers and background completions are checked once at the
+    /// start. This method does not block deliberately for future timers or
+    /// invoke `idle_callback`. Native behavior code can still block by itself,
+    /// so the budget bounds actor turns, not elapsed time.
+    ///
+    /// A zero budget is a strict no-op (including no timer or GC progress).
+    /// Call the method again to make progress on new events.
+    pub fn pump_ready(&mut self, max_turns: usize) -> usize {
+        if max_turns == 0 {
+            return 0;
+        }
+
+        #[cfg(feature = "ai-runtime")]
+        self.poll_llm_completions();
+        self.tick_timers();
+
+        let mut processed = 0;
+        while processed < max_turns {
+            self.drain_cross_shard_messages();
+            let Some(actor_id) = self.claim_next_ready_actor() else {
+                break;
+            };
+            // Spawning an actor creates a ready token before any message is
+            // sent. Drain that bookkeeping token without counting it against
+            // the host's message budget. Likewise, a suspended actor cannot
+            // execute a new mailbox message until it resumes.
+            let has_runnable_message = self
+                .actors
+                .get(&actor_id)
+                .map(|actor| !actor.mailbox.is_empty() && actor.suspended_execution.is_none())
+                .unwrap_or(false);
+            if has_runnable_message {
+                self.step_actor(actor_id);
+                processed += 1;
+            }
+            self.finish_actor_turn(actor_id);
+        }
+        self.process_gc_ops();
+        self.process_deferred_all();
+        processed
+    }
+
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn run_scheduler(&mut self) {
         let mut ticks: u64 = 0;
