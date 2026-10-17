@@ -78,7 +78,7 @@ pub fn run(args: &[String]) -> NuResult<()> {
         Some("init") => cmd_init(),
         Some("inspect") => match &args[1..] {
             [] => cmd_inspect(false),
-            [flag] if flag == "--json" => cmd_inspect(true),
+            [flag] if flag.as_str() == "--json" => cmd_inspect(true),
             _ => Err(NuError::PackageError {
                 msg: "usage: nulang nula inspect [--json]".to_string(),
                 span: Span::default(),
@@ -330,8 +330,16 @@ fn cmd_inspect(json: bool) -> NuResult<()> {
                 capabilities.join(", ")
             }
         );
-        println!("Dependencies: {}", project["dependencies"].as_array().map_or(0, Vec::len));
-        println!("Lockfile: {}", if project["lockfile_present"] == true { "present" } else { "missing" });
+        println!(
+            "Dependencies: {}",
+            project["dependencies"].as_array().map_or(0, Vec::len)
+        );
+        let lockfile = if project["lockfile_present"].as_bool().unwrap_or(false) {
+            "present"
+        } else {
+            "missing"
+        };
+        println!("Lockfile: {lockfile}");
     }
     Ok(())
 }
@@ -346,7 +354,7 @@ fn print_usage() {
     println!("                Scaffold a new package directory");
     println!("                Templates: default, cli, lib, full");
     println!("  init          Scaffold a new package in the current directory");
-    println!("  inspect [--json]  Inspect project metadata without revealing registry credentials");
+    println!("  inspect [--json]  Inspect safe project metadata for coding agents");
     println!("  build         Build .nbc + RFC 0020 behavior sidecar in .nula/dist/");
     println!("  build-wasm    Build package to .wasm + .cwasm in .nula/dist/");
     println!("  test [--filter <substr>] [--verbose|-v] [--watch|-w]  Run .nula test files");
