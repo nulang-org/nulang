@@ -64,7 +64,10 @@ impl<'a> RootedIntRegisters<'a> {
     /// Unwind registers in reverse order, dropping each ORCA root before
     /// truncation. Never use plain Vec::truncate on owned pointer slots.
     pub(crate) fn unwind_to(&mut self, new_len: usize) {
-        assert!(new_len <= self.slots.len(), "invalid rooted register unwind");
+        assert!(
+            new_len <= self.slots.len(),
+            "invalid rooted register unwind"
+        );
         while self.slots.len() > new_len {
             if let Some(value) = self.slots.pop() {
                 self.release(value);
