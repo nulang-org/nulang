@@ -2150,6 +2150,9 @@ fn rvalue_side_effecting(rv: &mir::RValue) -> bool {
     matches!(
         rv,
         mir::RValue::Panic(_)
+            // Integer negation raises an overflow error for INT48_MIN and
+            // may raise a type error; unused results cannot be discarded.
+            | mir::RValue::Unary(crate::ast::UnOp::Neg, _)
             | mir::RValue::Call { .. }
             | mir::RValue::Perform { .. }
             | mir::RValue::PerformAsync { .. }
