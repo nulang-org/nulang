@@ -72,13 +72,21 @@ pub enum ActorRunState {
     Running,
 }
 
-// -- Flight recorder (deterministic replay support) ---------------------
+// -- Flight recorder (bounded, privacy-preserving diagnostics) ----------
 
-/// A single entry in an actor's flight-recorder trace.  Captures enough
-/// information to deterministically replay the message sequence that led
-/// to a crash or unexpected behavior.
+/// Recorder events currently emitted by the local mailbox admission path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlightEventKind {
+    MessageAdmitted,
+    MailboxBackpressure,
+}
+
+/// A diagnostic breadcrumb, not a deterministic replay log. Message payloads
+/// and external effect results are deliberately omitted.
 #[derive(Debug, Clone)]
 pub struct TraceEntry {
+    /// Event type, independent of the behavior ID.
+    pub kind: FlightEventKind,
     /// Per-actor monotonic sequence number (arrival order).
     pub seq: u64,
     /// Actor ID of the sender (0 = system/runtime message).
@@ -87,13 +95,13 @@ pub struct TraceEntry {
     pub behavior_id: u16,
     /// Number of payload arguments.
     pub payload_len: usize,
-    /// Human-readable summary of the first few payload values.
+    /// Redacted placeholder for non-empty payloads; never stores application values.
     pub payload_summary: String,
 }
 
-/// A fixed-size ring buffer that records the most recent N messages
-/// delivered to an actor.  When the buffer is full, oldest entries are
-/// overwritten.
+/// A fixed-size ring buffer of local mailbox admission diagnostics.
+/// When full, oldest entries are overwritten. This is not sufficient for
+/// deterministic replay because values, effects, and scheduling are omitted.
 #[derive(Debug, Clone)]
 pub struct FlightRecorder {
     entries: Vec<TraceEntry>,
@@ -138,7 +146,7 @@ impl FlightRecorder {
     /// Create the runtime-default flight recorder.
     ///
     /// Per-actor flight recording is intentionally opt-in in production
-    /// because payload summarization formats values and the ring can grow to a
+    /// because even redacted metadata and the ring can grow to a
     /// meaningful amount of memory across large actor populations. Set
     /// `NULANG_FLIGHT_RECORDER=1` (or `true`) to enable it for actors
     /// created by the runtime. Direct callers of `FlightRecorder::new` retain
@@ -151,30 +159,49 @@ impl FlightRecorder {
         }
     }
 
-    /// Record a message delivery.
+    /// Record a successfully admitted local message.
     pub fn record(&mut self, sender: u64, behavior_id: u16, payload: &[Value]) {
+        self.record_event(FlightEventKind::MessageAdmitted, sender, behavior_id, payload);
+    }
+
+    /// Record a local mailbox admission rejected due to bounded capacity.
+    /// The rejected message is not delivered; this event only captures metadata.
+    pub fn record_backpressure(&mut self, sender: u64, behavior_id: u16, payload: &[Value]) {
+        self.record_event(
+            FlightEventKind::MailboxBackpressure,
+            sender,
+            behavior_id,
+            payload,
+        );
+    }
+
+    fn record_event(
+        &mut self,
+        kind: FlightEventKind,
+        sender: u64,
+        behavior_id: u16,
+        payload: &[Value],
+    ) {
         if self.max_entries == 0 {
             return;
         }
 
         let seq = self.next_seq;
-        self.next_seq += 1;
+        self.next_seq = self.next_seq.wrapping_add(1);
 
-        let payload_len = payload.len();
-        let mut payload_summary = String::new();
-        for (idx, value) in payload.iter().take(3).enumerate() {
-            if idx != 0 {
-                payload_summary.push_str(", ");
-            }
-            payload_summary.push_str(&value.to_string_repr());
-        }
-
+        // Never format payload values: numeric data and interned strings can
+        // contain tenant secrets or credentials. Length is useful for diagnostics.
         let entry = TraceEntry {
+            kind,
             seq,
             sender,
             behavior_id,
-            payload_len,
-            payload_summary,
+            payload_len: payload.len(),
+            payload_summary: if payload.is_empty() {
+                String::new()
+            } else {
+                "[redacted]".to_owned()
+            },
         };
 
         if self.entries.len() < self.max_entries {
@@ -942,7 +969,8 @@ mod tests {
         assert!(recorder.entries.capacity() > 0);
         assert_eq!(recorder.entries()[0].sender, 7);
         assert_eq!(recorder.entries()[0].behavior_id, 3);
-        assert_eq!(recorder.entries()[0].payload_summary, "42");
+        assert_eq!(recorder.entries()[0].payload_summary, "[redacted]");
+        assert_eq!(recorder.entries()[0].kind, FlightEventKind::MessageAdmitted);
     }
 
     #[test]
@@ -951,6 +979,49 @@ mod tests {
         recorder.record(7, 3, &[Value::int(42)]);
 
         assert!(recorder.is_empty());
+        assert_eq!(recorder.entries.capacity(), 0);
+        assert_eq!(recorder.next_seq, 0);
+    }
+    #[test]
+    fn flight_recorder_keeps_bounded_typed_events_in_arrival_order() {
+        let mut recorder = FlightRecorder::new(2);
+        recorder.record(1, 3, &[Value::int(41)]);
+        recorder.record_backpressure(2, 4, &[Value::int(999)]);
+        recorder.record(3, 5, &[]);
+
+        let events = recorder.ordered_entries();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].seq, 1);
+        assert_eq!(events[0].kind, FlightEventKind::MailboxBackpressure);
+        assert_eq!(events[0].payload_summary, "[redacted]");
+        assert_eq!(events[1].seq, 2);
+        assert_eq!(events[1].kind, FlightEventKind::MessageAdmitted);
+        assert_eq!(events[1].payload_len, 0);
+        assert_eq!(events[1].payload_summary, "");
+    }
+
+    #[test]
+    fn runtime_reports_local_mailbox_backpressure_without_payload_values() {
+        let mut runtime = Runtime::new();
+        let actor_id = runtime.spawn_actor(Box::new(Vec::new));
+        runtime.actors.get_mut(&actor_id).unwrap().mailbox.reset(1);
+
+        runtime.send_message_by_id(actor_id, 0, &[Value::int(424242)]);
+        runtime.send_message_by_id(actor_id, 0, &[Value::int(999999)]);
+
+        let actor = runtime.actors.get(&actor_id).unwrap();
+        let events = actor.flight_recorder.ordered_entries();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, FlightEventKind::MessageAdmitted);
+        assert_eq!(events[1].kind, FlightEventKind::MailboxBackpressure);
+        assert_eq!(events[1].payload_summary, "[redacted]");
+        assert_eq!(events[1].payload_len, 1);
+    }
+
+    #[test]
+    fn disabled_recorder_ignores_backpressure_without_allocation() {
+        let mut recorder = FlightRecorder::new(0);
+        recorder.record_backpressure(1, 2, &[Value::int(12)]);
         assert_eq!(recorder.entries.capacity(), 0);
         assert_eq!(recorder.next_seq, 0);
     }
