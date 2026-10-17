@@ -375,6 +375,27 @@ mod tests {
     }
 
     #[test]
+    fn cross_shard_numeric_messages_reach_the_owning_actor_in_order() {
+        let mut shards = nulang::runtime::Runtime::new_sharded(2);
+        let target = super::spawn_counter_for_shard(&mut shards[1], 1, 2);
+        shards[1].run_scheduler();
+
+        // Stay below the bounded cross-shard channel capacity so the sender
+        // can enqueue before the receiving scheduler is driven.
+        for _ in 0..32 {
+            shards[0].send_message_by_id(target, 0, &[]);
+        }
+        shards[1].run_scheduler();
+
+        let count = shards[1]
+            .actors
+            .get(&target)
+            .and_then(|actor| actor.get_state_field("count"))
+            .and_then(|value| value.as_int());
+        assert_eq!(count, Some(32));
+    }
+
+    #[test]
     fn two_shards_process_the_exact_fixed_workload() {
         let measurement = super::run_independent(2, 2_048);
         assert_eq!(measurement.shards, 2);
