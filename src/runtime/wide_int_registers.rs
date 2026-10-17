@@ -53,6 +53,25 @@ impl<'a> RootedIntRegisters<'a> {
             .ok_or(IntRegisterError::InvalidRegister)
     }
 
+    /// Add empty register roots for a newly entered VM-shaped frame.
+    /// These slots do not own any ORCA references until written.
+    pub(crate) fn append_nil_slots(&mut self, count: usize) -> usize {
+        let start = self.slots.len();
+        self.slots.resize(start + count, Value::nil());
+        start
+    }
+
+    /// Unwind registers in reverse order, dropping each ORCA root before
+    /// truncation. Never use plain Vec::truncate on owned pointer slots.
+    pub(crate) fn unwind_to(&mut self, new_len: usize) {
+        assert!(new_len <= self.slots.len(), "invalid rooted register unwind");
+        while self.slots.len() > new_len {
+            if let Some(value) = self.slots.pop() {
+                self.release(value);
+            }
+        }
+    }
+
     /// Read the owned scalar; empty registers return `None`.
     pub fn read(&self, index: usize) -> Result<Option<i64>, IntRegisterError> {
         let value = self.slot(index)?;
