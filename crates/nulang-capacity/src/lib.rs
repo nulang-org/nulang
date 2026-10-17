@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use thiserror::Error;
 
+pub mod actor;
 pub mod broker;
 pub mod health;
 pub mod interruption;
