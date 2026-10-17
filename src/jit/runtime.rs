@@ -2157,7 +2157,6 @@ mod tests {
         .expect("TLS test thread");
     }
 
-
     #[test]
     fn test_jit_status_slots_are_thread_local() {
         let left = std::thread::spawn(|| {
