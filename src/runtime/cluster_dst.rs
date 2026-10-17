@@ -227,6 +227,18 @@ impl DeterministicCluster {
         {
             rt.join_cluster(seed);
         }
+        // Preserve the logical durable backend while discarding the old
+        // process runtime. The simulation models persistent storage as an
+        // independently surviving resource: actor heaps, mailboxes, timers
+        // and transport are rebuilt, but committed snapshots/journals stay
+        // available to the new Runtime's real recovery path.
+        //
+        // This does not simulate closing/reopening a disk connection or
+        // power loss during a write; those require backend-specific tests.
+        rt.persistence = std::mem::replace(
+            &mut self.nodes[index].persistence,
+            Box::new(super::persistence::MemoryStore::new()),
+        );
         self.nodes[index] = rt;
         self.crashed[index] = false;
         self.partitions[index].clear();
