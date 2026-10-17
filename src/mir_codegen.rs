@@ -1721,12 +1721,12 @@ fn fold_function(
     for block in &mut func.blocks {
         for stmt in &mut block.stmts {
             if let mir::Stmt::Assign { op, .. } = stmt {
-                let original = op.clone();
+                let original = std::mem::replace(op, mir::RValue::Const(Constant::Nil));
                 let folded = fold_rvalue(original.clone(), const_locals, is_float);
                 if folded != original {
-                    *op = folded;
                     changed = true;
                 }
+                *op = folded;
             }
         }
     }
@@ -4034,6 +4034,30 @@ mod optimize_tests {
         );
         b.terminate(mir::Terminator::Return(None));
         assert!(plan_consuming_send_args(&b.build()).args_by_stmt.is_empty());
+    }
+
+    #[test]
+    fn test_fold_function_reports_only_the_first_real_change() {
+        let mut b = mir::FunctionBuilder::new("fold_once", Some(Type::bool()));
+        let source = b.add_temp(Type::bool());
+        let result = b.add_temp(Type::bool());
+        b.assign(source, mir::RValue::Const(Constant::Bool(true)));
+        b.assign(result, mir::RValue::Unary(crate::ast::UnOp::Not, source));
+        b.terminate(mir::Terminator::Return(Some(result)));
+        let mut func = b.build();
+
+        let constants = collect_const_locals(&func);
+        let floats = float_locals(&func);
+        assert!(fold_function(&mut func, &constants, &floats));
+        assert_eq!(
+            func.blocks[0].stmts[1],
+            mir::Stmt::Assign {
+                dst: result,
+                op: mir::RValue::Const(Constant::Bool(false)),
+            }
+        );
+        let constants = collect_const_locals(&func);
+        assert!(!fold_function(&mut func, &constants, &floats));
     }
 
     #[test]
