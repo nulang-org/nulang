@@ -5,6 +5,11 @@
 - **Virtual actors:** Known local grain hash collisions are rejected before mapping overwrite, hydration, or cross-shard delivery. Local and explicitly targeted remote sends also reject known conflicting handles. Cluster-global collision freedom still requires identity-separated addressing.
 - **VM floats:** `Value::float` now applies canonical NaN encoding before tag discrimination. Regression tests cover hardware-NaN and tag-shaped NaN inputs.
 
+### Bounded Nulang Web development-server connections — 2026-10-16
+- **The experimental Web development listener caps active connections at 64**, including SSE, and returns `503` with `Retry-After: 1` when full.
+- **Worker capacity is returned by a scoped RAII lease** after normal completion, panic, or thread-spawn failure. One shared `Arc` route table replaces per-connection clones of compiled route modules.
+- **Existing deterministic capacity and concurrent-admission regressions are preserved** from draft #1774; current-main static containment and bounded HTTP framing remain intact. Exact-head CI and real TCP saturation validation are required before promotion.
+
 ### Web static-root containment — 2026-10-15
 - **Experimental Web static file serving refuses parent traversal and symlinks escaping configured roots.** Canonical candidate paths must remain inside their canonicalized static or output root, and normal in-root files remain serveable.
 - **A filesystem regression verifies parent and symlink escape rejection.** This is a clean current-main successor to draft #1676; it does not change SSE or claim protection from malicious concurrent mutation of a trusted static root.
