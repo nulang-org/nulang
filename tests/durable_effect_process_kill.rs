@@ -126,7 +126,12 @@ fn run_until_ack_then_kill(dir: &Path, stage: &str) {
     let provider_path = dir.join("provider.mutation");
 
     let mut child = Command::new(std::env::current_exe().expect("integration test executable"))
-        .args(["--exact", "durable_effect_crash_fixture_child", "--ignored", "--nocapture"])
+        .args([
+            "--exact",
+            "durable_effect_crash_fixture_child",
+            "--ignored",
+            "--nocapture",
+        ])
         .env("NULANG_DURABLE_EFFECT_CRASH_DB", &db_path)
         .env("NULANG_DURABLE_EFFECT_CRASH_STAGE", stage)
         .env("NULANG_DURABLE_EFFECT_CRASH_ACK", &ack_path)
