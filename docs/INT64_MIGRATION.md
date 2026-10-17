@@ -85,7 +85,35 @@ containers, FFI and NLCS v1 snapshots cannot carry these wide roots. The
 source language's `Int` remains 48-bit until backend and durability
 parity are proven.
 
-## Current code in this PR
+## Current code in this PR## Phase 1d — bounded interoperability with production VM Frame
+
+`RootedIntFrame` now provides a fail-closed numeric adapter to
+`crate::vm::Frame`, the *actual* production VM activation frame with
+256 raw `Value` registers. The existing Frame is publicly cloneable,
+and continuations/suspended executions duplicate or move its raw registers
+without retaining ORCA roots. Consequently, **wide pointer values must not
+be placed directly into a legacy Frame** before its full ownership redesign.
+
+The adapter imports legacy frames only when every register is either nil
+or a signed inline integer, and rejects closure environments or spilled
+slots. It explicitly refuses exports containing full-width integers that
+do not fit the old 48-bit payload. No raw tagged pointer escapes.
+
+The VM now exposes `VM::install_numeric_rooted_frame`, which checks the entire rooted frame and installs it using the existing `set_current_frame` only if every value is representable by the legacy inline ABI. Failed wide-value exports leave the VM's previous frame unchanged. This is a real production VM entrypoint, but intentionally not a wide-integer execution path.
+
+A semantic, pointer-free `FrameInt64Snapshot` can capture signed 64-bit
+values and restore them as *new* actor-owned ORCA roots. This is only an
+in-process staging snapshot, **not** a versioned persistence, wire or
+bytecode format. The actor heap is exclusively borrowed while rooted
+frames exist.
+
+The remaining production-VM integration requires explicit retain/release
+barriers at every Frame clone/copy/drop, register/spill overwrite, closure
+capture, JIT/AOT ABI boundary, actor message and persistence/replay edge.
+Until those are implemented and differential tests pass, the public source
+language remains 48-bit and existing Frame behavior is unchanged.
+
+
 
 `src/int64_semantics.rs` implements the target **pure checked arithmetic
 kernel** and an **opaque staging** `Int64Storage` that distinguishes inline

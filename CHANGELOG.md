@@ -1,4 +1,10 @@
 # Nulang Changelog
+### Numeric VM Frame boundary for Int64 — 2026-10-17
+- **Production-frame interoperability:** Added a numeric-only `RootedIntFrame` adapter for the actual cloneable `vm::Frame` type, preserving program counter, module, caller and return-register metadata. `VM::install_numeric_rooted_frame` accepts compatible frames atomically and preserves the active frame on a wide-integer rejection.
+- **Fail-closed ownership:** Import rejects pointer-bearing, nonnumeric, spilled or closure-capturing frames without dereferencing external pointers. Export rejects any wide value rather than inserting unrooted ORCA pointers into freely cloneable legacy VM registers.
+- **Scoped semantic snapshots:** Wide signed integer registers can be captured as ordinary signed 64-bit values and reconstituted as fresh ORCA roots; snapshots are explicitly *not* durable wire artifacts.
+- **Tests:** Real `vm::Frame` import/export, wide export rejection, unsupported legacy values, spills/closures, snapshot restore and checked arithmetic nonmutation. Source-language Int and executable VM/JIT/AOT/WASM are unchanged.
+
 ### Rooted Int64 generic-register staging — 2026-10-17
 - **VM-shaped root safety:** Added an actor-borrowed `RootedIntRegisters` bank using existing 8-byte `Value` words for inline integers and ORCA-owned `WideInt` pointers for full-width signed 64-bit values.
 - **Reference barriers:** Copy retains before replacing; move transfers a root; clear, overwrite and drop release local references. Checked addition updates the destination only after arithmetic and allocation succeed.

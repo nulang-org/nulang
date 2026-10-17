@@ -3009,6 +3009,23 @@ impl VM {
         self.step_count = state.step_count;
     }
 
+    /// Install a numeric, ORCA-rooted Int64 staging frame into the actual
+    /// bytecode VM only when every register can be represented safely in
+    /// the existing, freely cloneable 48-bit inline Frame ABI.
+    ///
+    /// This method does not enable wide Int64 bytecode execution. A wide
+    /// register returns an error *before* mutating the VM's active frame.
+    /// Until every Frame clone/drop/spill/continuation/JIT boundary owns an
+    /// ORCA root, inserting tagged wide pointers here would be unsafe.
+    pub fn install_numeric_rooted_frame(
+        &mut self,
+        rooted: &crate::runtime::RootedIntFrame<'_>,
+    ) -> Result<(), crate::runtime::FrameInt64BoundaryError> {
+        let legacy = rooted.try_export()?;
+        self.set_current_frame(legacy);
+        Ok(())
+    }
+
     /// Set the current execution frame. Used by the runtime to execute actor
     /// bytecode behavior handlers.
     pub fn set_current_frame(&mut self, frame: Frame) {
