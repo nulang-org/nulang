@@ -43,6 +43,27 @@ require a representation that preserves the entire value:
 - The existing v1 `.nbc`, NUL0 and value-layout artifacts must be
   versioned/migrated or explicitly rejected, not silently reinterpreted.
 
+## Phase 1b — ORCA-owned, scoped wide-int allocation
+
+Stacked follow-up PR after the pure Int64 kernel:
+
+- A dedicated `TypeTag::WideInt = 9` is an **in-memory** ORCA scalar with an
+  8-byte aligned `i64` payload. It is not a publicly serialized TypeTag.
+- `Actor::lease_wide_int` uses `OrcaGc::alloc_object` and returns an
+  exclusive lifetime-scoped `WideIntLease`. The scalar remains readable
+  without truncation; dropping the lease releases exactly one local ORCA ref.
+- The lease intentionally exposes **no raw pointer and no VM `Value`**.
+  It cannot outlive the actor, enter actor state, cross a mailbox, be
+  captured into a durable frame, or cross FFI. This conservative boundary
+  avoids accidentally making an unsupported transport promise.
+- `serialize_continuation` refuses a reachable wide-int heap object in
+  NLCS v1. The v1 decoder continues to reject discriminant 9 as unknown,
+  preserving existing format semantics instead of reading incompatible data.
+- This is an ownership proof for scoped scalars, **not yet** the eventual
+  boxed generic `Value` representation. A future ref-counted wide Value
+  must integrate stack-slot barriers, GC root scans, containers, actor sends,
+  snapshots, and backend helper ABI before source-level `Int` is widened.
+
 ## Current code in this PR
 
 `src/int64_semantics.rs` implements the target **pure checked arithmetic
