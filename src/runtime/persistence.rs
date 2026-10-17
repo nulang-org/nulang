@@ -919,6 +919,27 @@ impl PersistenceStore for MemoryStore {
                 ));
             }
         } else {
+            // A legacy snapshot is also an ownership authority, not merely a
+            // sequence boundary. A stale activation must not establish the
+            // first atomic tail over a newer snapshot's fencing epoch.
+            if let Some(snapshot) = self.snapshots.get(&transition.actor_id) {
+                if snapshot.activation_epoch == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid zero legacy snapshot activation epoch",
+                    ));
+                }
+                if transition.activation_epoch < snapshot.activation_epoch {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "stale durable activation epoch {}; legacy snapshot epoch is {}",
+                            transition.activation_epoch, snapshot.activation_epoch
+                        ),
+                    ));
+                }
+            }
+
             // Atomic transitions may begin after legacy snapshot/journal history.
             // The first atomic commit must extend the actually persisted legacy
             // tail rather than pretending that history started at sequence 0.
@@ -1915,6 +1936,50 @@ impl PersistenceStore for LibsqlStore {
                     .get(0)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                 drop(rows);
+
+                // The first atomic transition must inherit the legacy
+                // snapshot's ownership fence as well as its sequence. Read
+                // under the same write transaction to prevent a concurrent
+                // legacy writer from changing the observed owner.
+                let snapshot_epoch = {
+                    let mut epoch_rows = tx
+                        .query(
+                            "SELECT activation_epoch FROM snapshots WHERE actor_id = ?1",
+                            libsql::params![transition.actor_id as i64],
+                        )
+                        .await
+                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    match epoch_rows
+                        .next()
+                        .await
+                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+                    {
+                        Some(row) => Some(row.get::<i64>(0).map_err(|e| {
+                            io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                        })?),
+                        None => None,
+                    }
+                };
+                if let Some(snapshot_epoch) = snapshot_epoch {
+                    if snapshot_epoch <= 0 {
+                        let _ = tx.rollback().await;
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid nonpositive legacy snapshot activation epoch",
+                        ));
+                    }
+                    if transition.activation_epoch < snapshot_epoch as u64 {
+                        let _ = tx.rollback().await;
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            format!(
+                                "stale durable activation epoch {}; legacy snapshot epoch is {}",
+                                transition.activation_epoch, snapshot_epoch
+                            ),
+                        ));
+                    }
+                }
+
                 if transition.expected_previous_sequence != legacy_tail as u64 {
                     let _ = tx.rollback().await;
                     return Err(io::Error::new(
