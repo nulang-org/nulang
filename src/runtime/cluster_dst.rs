@@ -438,7 +438,10 @@ mod tests {
                     "seed {seed}: node {node} must advance without a clock discontinuity"
                 );
             }
-            assert_eq!(cluster.limit_hits, 0, "seed {seed}: scheduler budget exhausted");
+            assert_eq!(
+                cluster.limit_hits, 0,
+                "seed {seed}: scheduler budget exhausted"
+            );
         }
     }
 
