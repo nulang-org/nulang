@@ -29,11 +29,84 @@ pub struct MinimizedTrace<T> {
 /// certify the input as failing. The returned trace remains a subsequence
 /// of the original, preserving the order of retained operations.
 pub fn minimize_failing_trace<T: Clone, F: FnMut(&[T]) -> bool>(
-    _trace: &[T],
-    _max_replays: usize,
-    _still_fails: F,
+    trace: &[T],
+    max_replays: usize,
+    mut still_fails: F,
 ) -> MinimizedTrace<T> {
-    todo!("implement bounded trace shrinking")
+    // A reported reproducer must first be independently verified. Exhaustion
+    // is a separate outcome: neither a zero budget nor a nonreproducible
+    // baseline may be mislabeled as a minimized failure.
+    if max_replays == 0 {
+        return MinimizedTrace {
+            trace: trace.to_vec(),
+            replays: 0,
+            status: MinimizationStatus::BudgetExhausted,
+        };
+    }
+
+    let mut replays = 1;
+    if !still_fails(trace) {
+        return MinimizedTrace {
+            trace: trace.to_vec(),
+            replays,
+            status: MinimizationStatus::NotFailing,
+        };
+    }
+
+    let mut current = trace.to_vec();
+    let mut granularity = 2usize;
+
+    // Standard ddmin complement reduction. Each candidate is a contiguous
+    // deletion from the current sequence, so the final trace is always an
+    // ordered subsequence. Deterministic chunk order and no RNG make the
+    // entire replay sequence stable across runs.
+    while !current.is_empty() {
+        let chunk_size =
+            current.len() / granularity + usize::from(current.len() % granularity != 0);
+        let mut start = 0;
+        let mut reduced = false;
+
+        while start < current.len() {
+            if replays >= max_replays {
+                return MinimizedTrace {
+                    trace: current,
+                    replays,
+                    status: MinimizationStatus::BudgetExhausted,
+                };
+            }
+
+            let end = start.saturating_add(chunk_size).min(current.len());
+            let candidate: Vec<T> = current[..start]
+                .iter()
+                .chain(current[end..].iter())
+                .cloned()
+                .collect();
+
+            replays += 1;
+            if still_fails(&candidate) {
+                current = candidate;
+                granularity = granularity.saturating_sub(1).max(2);
+                reduced = true;
+                break;
+            }
+            start = end;
+        }
+
+        if !reduced {
+            if granularity >= current.len() {
+                // Every single-element deletion has been evaluated (or the
+                // trace is empty), establishing 1-minimality for this oracle.
+                break;
+            }
+            granularity = granularity.saturating_mul(2).min(current.len());
+        }
+    }
+
+    MinimizedTrace {
+        trace: current,
+        replays,
+        status: MinimizationStatus::OneMinimal,
+    }
 }
 
 #[cfg(test)]
