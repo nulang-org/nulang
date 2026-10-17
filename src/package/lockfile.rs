@@ -550,6 +550,41 @@ source_id = "not-a-source-id"
     }
 
     #[test]
+    fn test_lockfile_parse_rejects_duplicate_exact_package_pins() {
+        let source = r#"
+version = 1
+
+[[package]]
+name = "util"
+version = "0.1.0"
+source = "path+/tmp/util"
+
+[[package]]
+name = "util"
+version = "0.1.0"
+source = "path+/tmp/util"
+"#;
+        let error = Lockfile::parse(source).expect_err("duplicate exact pins must be rejected");
+        match error {
+            NuError::PackageError { msg, .. } => assert!(msg.contains("duplicate locked package")),
+            other => panic!("expected PackageError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_lockfile_serialization_rejects_duplicate_exact_package_pins() {
+        let mut lockfile = sample_lockfile();
+        lockfile.package.push(lockfile.package[0].clone());
+        let error = lockfile
+            .to_toml()
+            .expect_err("serialization must reject duplicate exact pins");
+        match error {
+            NuError::PackageError { msg, .. } => assert!(msg.contains("duplicate locked package")),
+            other => panic!("expected PackageError, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_duplicate_identity_metadata_is_rejected() {
         let source_id = SourceId::from_bytes(b"source");
         let source = format!(
