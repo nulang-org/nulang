@@ -125,7 +125,6 @@ fn two_same_operation_sites_map_to_two_distinct_effect_opcodes() {
     }
 }
 
-
 #[test]
 fn compiled_source_effect_drives_recovery_using_one_stable_operation_id() {
     use nulang::durable_effect::DurableEffectSpec;
@@ -135,7 +134,8 @@ fn compiled_source_effect_drives_recovery_using_one_stable_operation_id() {
     use nulang::primitives::{DeliverySemantics, EffectBoundary};
     use nulang::runtime::{MemoryStore, PersistenceStore};
 
-    let source = "actor Assistant { behavior ask(prompt: String) { perform Inference.ask(prompt) } }";
+    let source =
+        "actor Assistant { behavior ask(prompt: String) { perform Inference.ask(prompt) } }";
     let module = compile_module(source);
     let bytes = module.to_nbc(None).expect("NBC encode");
     let recovered = CodeModule::from_nbc(&bytes).expect("NBC decode").module;
@@ -172,13 +172,19 @@ actor Assistant {
     .expect("formatting preserves semantic site identity");
     assert_eq!(spec, formatted_spec);
     assert_eq!(spec.effect_operation, "Inference.ask");
-    let canonical_site = nulang::semantic_identity::effect_site_id(
-        "effect-site-artifact",
-        nulang::semantic_identity::EffectSiteOwnerKind::Behavior,
-        "Assistant.ask",
-        "Inference.ask",
-        0,
-    );
+    // The MIR lowering stage owns the canonical module/behavior identity.
+    // Do not guess the MIR module name from the bytecode output filename:
+    // those names are not required to match.
+    let tokens = Lexer::new(source).lex().unwrap();
+    let ast = Parser::new(tokens).parse_module().unwrap();
+    let mut types = TypeChecker::new();
+    types.check_module(&ast).unwrap();
+    let hir = hir_lower::lower_module(&ast, &types.inferred_decl_types);
+    let mir = mir_lower::lower_module(&hir).unwrap();
+    let semantic_sites = nulang::semantic_identity::effect_sites_for_mir(&mir);
+    assert_eq!(semantic_sites.len(), 1);
+    let canonical_site = semantic_sites[0].id;
+    assert_eq!(site.id, *canonical_site.as_bytes());
     assert_eq!(
         spec.id,
         nulang::durable_effect::DurableEffectId::derive_from_site(
@@ -214,7 +220,9 @@ actor Assistant {
     {
         let mut recovered_coordinator = DurableEffectCoordinator::new(&mut store, 42, 1);
         assert_eq!(
-            recovered_coordinator.begin(formatted_spec, request).unwrap(),
+            recovered_coordinator
+                .begin(formatted_spec, request)
+                .unwrap(),
             DurableEffectDispatchDecision::DispatchWithDeduplication {
                 operation_id: spec.id
             }
@@ -279,7 +287,11 @@ fn compiled_async_effect_rejects_opcode_and_constant_drift() {
     let pc = module.effect_sites[0].pc;
     let create = |module: &CodeModule| {
         DurableEffectSpec::from_compiled_async_site(
-            module, pc, 42, "turn:1", 0,
+            module,
+            pc,
+            42,
+            "turn:1",
+            0,
             EffectBoundary::External,
             DeliverySemantics::AtLeastOnce,
         )
@@ -323,7 +335,11 @@ fn compiled_async_effect_rejects_missing_turn_identity_and_distinguishes_occurre
     );
     let build = |pc, key, occurrence| {
         DurableEffectSpec::from_compiled_async_site(
-            &module, pc, 42, key, occurrence,
+            &module,
+            pc,
+            42,
+            key,
+            occurrence,
             EffectBoundary::External,
             DeliverySemantics::AtLeastOnce,
         )
