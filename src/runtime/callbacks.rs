@@ -268,6 +268,64 @@ fn authorize_actor_host_effect(
         .map_err(|error| error.to_string())
 }
 
+/// Execute only these explicitly supported CLI builtins after the actor-host
+/// authority check in `perform_builtin_effect_in_module`. Do not invoke this
+/// function from the unguarded `perform_builtin_effect` callback: actor-backed
+/// host operations must not bypass exact actor authority grants.
+fn perform_authorized_cli_builtin(
+    callbacks: &mut dyn crate::vm::ActorVmCallbacks,
+    effect_name: &str,
+    op_name: Option<&str>,
+    constants: &[crate::bytecode::Constant],
+    regs: &[crate::vm::Value],
+) -> Option<crate::vm::Value> {
+    use crate::vm::Value;
+
+    // Reuse the VM callback's allocation contract (including pointer value
+    // provenance and current actor/main heap ownership), rather than
+    // duplicating unsafe pointer construction here.
+    fn allocate_string(
+        callbacks: &mut dyn crate::vm::ActorVmCallbacks,
+        text: &str,
+    ) -> Value {
+        callbacks.alloc_string(text)
+    }
+
+    match (effect_name, op_name) {
+        ("Env", Some("get")) => {
+            let name = regs
+                .first()
+                .map(|value| crate::vm::resolve_value_string(constants, *value))
+                .unwrap_or_default();
+            Some(match std::env::var(&name) {
+                Ok(value) => allocate_string(callbacks, &value),
+                Err(_) => Value::nil(),
+            })
+        }
+        ("System", Some("arg")) => {
+            let index = regs.first().and_then(|value| value.as_int()).unwrap_or(-1);
+            if index < 0 {
+                return Some(Value::nil());
+            }
+            Some(match std::env::args().nth(index as usize) {
+                Some(value) => allocate_string(callbacks, &value),
+                None => Value::nil(),
+            })
+        }
+        ("FS", Some("read")) => {
+            let path = regs
+                .first()
+                .map(|value| crate::vm::resolve_value_string(constants, *value))
+                .unwrap_or_default();
+            Some(match std::fs::read_to_string(path) {
+                Ok(content) => allocate_string(callbacks, &content),
+                Err(_) => Value::nil(),
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Enforce an exact actor-backed foreign-function authority grant.
 ///
 /// The grant argument includes both library and symbol so permission to call
@@ -1101,6 +1159,15 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
                 Err(_) => Some(crate::vm::Value::nil()),
             };
         }
+        if let Some(value) = perform_authorized_cli_builtin(
+            self,
+            effect_name,
+            op_name,
+            &module.constants,
+            regs,
+        ) {
+            return Some(value);
+        }
         self.perform_builtin_effect(effect_name, op_name, &module.constants, regs)
     }
 
@@ -1915,6 +1982,15 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
                     }
                     Err(_) => Some(crate::vm::Value::nil()),
                 };
+            }
+            if let Some(value) = perform_authorized_cli_builtin(
+                self,
+                effect_name,
+                op_name,
+                &module.constants,
+                regs,
+            ) {
+                return Some(value);
             }
             self.perform_builtin_effect(effect_name, op_name, &module.constants, regs)
         }
@@ -3046,5 +3122,243 @@ mod host_authority_tests {
         assert!(
             authorize_actor_host_effect(&rt, None, "FS", Some("read"), &constants, &regs,).is_ok()
         );
+    }
+
+    #[test]
+    fn actor_backed_main_handles_environment_and_argument_effects() {
+        use crate::vm::ActorVmCallbacks;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let expected_path = std::env::var("PATH").expect("test runner needs PATH");
+        let expected_arg0 = std::env::args().next().expect("test runner has argv0");
+        let runtime = Rc::new(RefCell::new(Runtime::new()));
+        let mut callbacks = super::RuntimeVmCallbacks::new(runtime);
+
+        let mut env_module = crate::bytecode::CodeModule::new("host-env");
+        env_module.add_constant(Constant::String("PATH".into()));
+        let env_result = callbacks
+            .perform_builtin_effect_in_module(
+                "Env",
+                Some("get"),
+                &env_module,
+                &[Value::string(0)],
+            )
+            .expect("actor-backed main must handle Env.get");
+        assert_eq!(
+            crate::vm::resolve_value_string(&env_module.constants, env_result),
+            expected_path
+        );
+
+        let arg_module = crate::bytecode::CodeModule::new("host-argv");
+        let arg_result = callbacks
+            .perform_builtin_effect_in_module(
+                "System",
+                Some("arg"),
+                &arg_module,
+                &[Value::int(0)],
+            )
+            .expect("actor-backed main must handle System.arg");
+        assert_eq!(crate::vm::resolve_value_string(&[], arg_result), expected_arg0);
+
+        assert!(
+            callbacks
+                .perform_builtin_effect_in_module("Env", Some("unknown"), &env_module, &[])
+                .is_none(),
+            "unknown host operations must remain unhandled"
+        );
+    }
+
+    #[test]
+    fn actor_environment_and_arguments_require_exact_grants() {
+        use crate::vm::ActorVmCallbacks;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let actor_id = 800_103;
+        let runtime = Rc::new(RefCell::new(Runtime::new()));
+        {
+            let mut rt = runtime.borrow_mut();
+            rt.actors
+                .insert(actor_id, Actor::new(actor_id, "env-argument-authority", 8));
+            rt.current_actor = Some(actor_id);
+        }
+
+        let mut env_module = crate::bytecode::CodeModule::new("actor-env");
+        env_module.add_constant(Constant::String("PATH".into()));
+        let arg_module = crate::bytecode::CodeModule::new("actor-arg");
+        let mut callbacks = super::RuntimeVmCallbacks::new(runtime.clone());
+
+        let denied_env = callbacks
+            .perform_builtin_effect_in_module(
+                "Env",
+                Some("get"),
+                &env_module,
+                &[Value::string(0)],
+            )
+            .expect("unauthorized Env.get must be handled");
+        assert!(denied_env.is_nil());
+
+        let denied_arg = callbacks
+            .perform_builtin_effect_in_module(
+                "System",
+                Some("arg"),
+                &arg_module,
+                &[Value::int(0)],
+            )
+            .expect("unauthorized System.arg must be handled");
+        assert!(denied_arg.is_nil());
+
+        let manifest =
+            AuthorityManifest::from_tokens(["Env::Read(PATH)", "System::Arg(0)"]).unwrap();
+        runtime
+            .borrow_mut()
+            .actors
+            .get_mut(&actor_id)
+            .unwrap()
+            .install_authority_manifest(&manifest);
+
+        let allowed_env = callbacks
+            .perform_builtin_effect_in_module(
+                "Env",
+                Some("get"),
+                &env_module,
+                &[Value::string(0)],
+            )
+            .expect("authorized Env.get must be dispatched");
+        assert_eq!(
+            crate::vm::resolve_value_string(&env_module.constants, allowed_env),
+            std::env::var("PATH").unwrap()
+        );
+
+        let allowed_arg = callbacks
+            .perform_builtin_effect_in_module(
+                "System",
+                Some("arg"),
+                &arg_module,
+                &[Value::int(0)],
+            )
+            .expect("authorized System.arg must be dispatched");
+        assert_eq!(
+            crate::vm::resolve_value_string(&arg_module.constants, allowed_arg),
+            std::env::args().next().unwrap()
+        );
+
+        let other_arg = callbacks
+            .perform_builtin_effect_in_module(
+                "System",
+                Some("arg"),
+                &arg_module,
+                &[Value::int(1)],
+            )
+            .expect("unauthorized argument index must be denied");
+        assert!(other_arg.is_nil());
+    }
+
+    #[test]
+    fn actor_backed_file_read_requires_exact_grant_and_returns_file_contents() {
+        use crate::vm::ActorVmCallbacks;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let filename = format!(
+            "nulang-actor-fs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(filename);
+        std::fs::write(&path, "actor-readable-data").unwrap();
+        let filename = path.to_string_lossy().into_owned();
+
+        let actor_id = 800_101;
+        let runtime = Rc::new(RefCell::new(Runtime::new()));
+        {
+            let mut rt = runtime.borrow_mut();
+            rt.actors.insert(actor_id, Actor::new(actor_id, "fs-read", 8));
+            rt.current_actor = Some(actor_id);
+        }
+        let mut module = crate::bytecode::CodeModule::new("host-file");
+        module.add_constant(Constant::String(filename.clone()));
+        let mut callbacks = super::RuntimeVmCallbacks::new(runtime.clone());
+
+        let denied = callbacks
+            .perform_builtin_effect_in_module(
+                "FS",
+                Some("read"),
+                &module,
+                &[Value::string(0)],
+            )
+            .expect("denied operation must be handled");
+        assert!(denied.is_nil(), "missing authority must fail closed");
+
+        {
+            let grant = format!("Fs::Read({filename})");
+            let manifest = AuthorityManifest::from_tokens([grant.as_str()]).unwrap();
+            runtime
+                .borrow_mut()
+                .actors
+                .get_mut(&actor_id)
+                .unwrap()
+                .install_authority_manifest(&manifest);
+        }
+        let allowed = callbacks
+            .perform_builtin_effect_in_module(
+                "FS",
+                Some("read"),
+                &module,
+                &[Value::string(0)],
+            )
+            .expect("authorized FS.read must be dispatched");
+        assert_eq!(
+            crate::vm::resolve_value_string(&module.constants, allowed),
+            "actor-readable-data"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn scheduler_driven_actor_can_read_exactly_authorized_file() {
+        use crate::vm::ActorVmCallbacks;
+
+        let filename = format!(
+            "nulang-scheduler-fs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(filename);
+        std::fs::write(&path, "scheduler-readable-data").unwrap();
+        let filename = path.to_string_lossy().into_owned();
+
+        let actor_id = 800_102;
+        let mut rt = Runtime::new();
+        let mut actor = Actor::new(actor_id, "scheduler-fs", 8);
+        let grant = format!("Fs::Read({filename})");
+        let manifest = AuthorityManifest::from_tokens([grant.as_str()]).unwrap();
+        actor.install_authority_manifest(&manifest);
+        rt.actors.insert(actor_id, actor);
+
+        let mut module = crate::bytecode::CodeModule::new("scheduler-file");
+        module.add_constant(Constant::String(filename));
+        let mut callbacks =
+            super::BytecodeRuntimeCallbacks::new(&mut rt as *mut Runtime, actor_id);
+        let result = callbacks
+            .perform_builtin_effect_in_module(
+                "FS",
+                Some("read"),
+                &module,
+                &[Value::string(0)],
+            )
+            .expect("scheduler actor must dispatch authorized FS.read");
+        assert_eq!(
+            crate::vm::resolve_value_string(&module.constants, result),
+            "scheduler-readable-data"
+        );
+        std::fs::remove_file(path).unwrap();
     }
 }
