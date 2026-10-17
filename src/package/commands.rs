@@ -1417,7 +1417,7 @@ fn cmd_build_web() -> NuResult<()> {
 
     // Resolve deployment placement from the validated contract set before
     // executing any route handler. A server/edge/client route must not run as
-    // a static build step or leave behind a misleading prerendered document.
+    // a static build step or generate a misleading prerendered document.
     let signals_path = output_dir.join("app.signals.json");
     nulang_exe(&[
         "--emit-signals",
@@ -1431,7 +1431,11 @@ fn cmd_build_web() -> NuResult<()> {
         &manifest.budgets,
         &validated_contracts,
     );
-    let static_count = ir.routes.iter().filter(|route| route.placement == "static").count();
+    let static_count = ir
+        .routes
+        .iter()
+        .filter(|route| route.placement == "static")
+        .count();
     eprintln!("  Rendering {} static route(s)...", static_count);
     // DeploymentIr is generated in registration order from this exact list.
     for (route, ir_route) in routes.iter().zip(&ir.routes) {
@@ -3124,10 +3128,8 @@ app "counter" {
 
     #[test]
     fn web_build_only_prerenders_routes_marked_static_in_deployment_ir() {
-        let dir = std::env::temp_dir().join(format!(
-            "nulang_build_web_placement_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("nulang_build_web_placement_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -3171,12 +3173,12 @@ app "placement" {
         let ir: crate::web::ir::DeploymentIr =
             serde_json::from_str(&manifest).expect("valid deployment IR");
         assert!(ir.routes.iter().any(|route| {
-            route.path == "/" && route.placement == "static"
+            route.path == "/"
+                && route.placement == "static"
                 && route.artifact.as_deref() == Some("index.html")
         }));
         assert!(ir.routes.iter().any(|route| {
-            route.path == "/dashboard" && route.placement == "server"
-                && route.artifact.is_none()
+            route.path == "/dashboard" && route.placement == "server" && route.artifact.is_none()
         }));
         let _ = std::fs::remove_dir_all(&dir);
     }
