@@ -168,7 +168,13 @@ pub(crate) fn reap_living_actor(rt: &mut Runtime, actor_id: u64, reason: ExitRea
             continue;
         }
 
-        if is_abnormal {
+        let traps = rt
+            .actors
+            .get(&linked_id)
+            .map(|a| a.trap_exits)
+            .unwrap_or(false);
+        // Trapping peers receive normal exit signals; nontrapping peers ignore them.
+        if is_abnormal || traps {
             if matches!(reason, ExitReason::Kill) {
                 let kill_reason = ExitReason::Killed;
                 if let Some(actor) = rt.actors.get_mut(&linked_id) {
@@ -177,11 +183,6 @@ pub(crate) fn reap_living_actor(rt: &mut Runtime, actor_id: u64, reason: ExitRea
                 handle_actor_exit(rt, linked_id, kill_reason);
                 continue;
             }
-            let traps = rt
-                .actors
-                .get(&linked_id)
-                .map(|a| a.trap_exits)
-                .unwrap_or(false);
             if traps {
                 let exit_msg = Message {
                     behavior_id: 0,
