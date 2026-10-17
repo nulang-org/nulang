@@ -450,7 +450,10 @@ mod tests {
                     "seed {seed}: node {node} must advance without a clock discontinuity"
                 );
             }
-            assert_eq!(cluster.limit_hits, 0, "seed {seed}: scheduler budget exhausted");
+            assert_eq!(
+                cluster.limit_hits, 0,
+                "seed {seed}: scheduler budget exhausted"
+            );
         }
     }
 
@@ -517,7 +520,9 @@ mod tests {
             assert_eq!(actor.activation_epoch, 1, "seed {seed}");
             assert_eq!(actor.sequence, 1, "seed {seed}");
             assert_eq!(
-                actor.get_state_field("count").and_then(|value| value.as_int()),
+                actor
+                    .get_state_field("count")
+                    .and_then(|value| value.as_int()),
                 Some(10),
                 "seed {seed}: recovered state must match committed snapshot"
             );
@@ -547,7 +552,9 @@ mod tests {
             assert_eq!(actor.activation_epoch, 2, "seed {seed}");
             assert_eq!(actor.sequence, 2, "seed {seed}");
             assert_eq!(
-                actor.get_state_field("count").and_then(|value| value.as_int()),
+                actor
+                    .get_state_field("count")
+                    .and_then(|value| value.as_int()),
                 Some(20),
                 "seed {seed}: stale write must not change recovered state"
             );
