@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Ask a question or discuss a design
+    url: https://github.com/nulang-org/nulang/discussions
+    about: For support, onboarding questions, and proposals that need discussion before implementation.
+  - name: Report a security vulnerability privately
+    url: https://github.com/nulang-org/nulang/blob/main/SECURITY.md
+    about: Read the private disclosure instructions; do not post exploit details in a public issue.
