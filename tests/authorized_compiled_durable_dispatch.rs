@@ -10,12 +10,13 @@ use nulang::lexer::Lexer;
 use nulang::mir_codegen;
 use nulang::mir_lower;
 use nulang::parser::Parser;
-use nulang::runtime::{Actor, MemoryStore, PersistenceStore};
+use nulang::runtime::{Actor, ActorState, MemoryStore, PersistenceStore};
 use nulang::typechecker::TypeChecker;
 use std::io;
 
 fn compiled_source() -> CodeModule {
-    let source = "actor Payments { behavior charge(order: String) { perform Inference.ask(order) } }";
+    let source =
+        "actor Payments { behavior charge(order: String) { perform Inference.ask(order) } }";
     let tokens = Lexer::new(source).lex().unwrap();
     let ast = Parser::new(tokens).parse_module().unwrap();
     let mut types = TypeChecker::new();
@@ -226,6 +227,28 @@ fn revocation_blocks_prepared_retry_and_completed_receipt_read() {
         Err(DurableAsyncDispatchError::Authorization(_))
     ));
     assert_eq!(store.latest_sequence(42), 2);
+}
+
+#[test]
+fn terminated_actor_cannot_dispatch_even_with_exact_grant() {
+    let module = compiled_source();
+    let grant = inference_grant();
+    let mut actor = actor_with_grants(42, 1, vec![grant.clone()]);
+    actor.state = ActorState::Terminated;
+    let mut store = MemoryStore::new();
+    let mut coordinator = DurableEffectCoordinator::new(&mut store, 42, 1);
+    let result = coordinator.execute_compiled_async_with_deduplication(
+        &actor,
+        &grant,
+        &module,
+        module.effect_sites[0].pc,
+        "order:42:payment",
+        0,
+        b"request",
+        |_, _| panic!("terminated actor must not dispatch"),
+    );
+    assert!(matches!(result, Err(DurableAsyncDispatchError::ActorNotLive)));
+    assert_eq!(store.latest_sequence(42), 0);
 }
 
 #[test]
