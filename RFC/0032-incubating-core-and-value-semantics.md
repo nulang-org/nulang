@@ -41,7 +41,7 @@ the format inventory proves they can be retired. A label such as
 ### Phase 1: Fail closed without changing v1 encoding
 
 1. Make actor-reference construction reject IDs beyond the inline payload.
-2. Reject known grain-hash collisions before changing actor/persistence indices.
+2. Reject known grain-hash collisions before changing actor/persistence indices or delivering cross-shard traffic to an unrelated resident actor.
 3. Canonicalize floats through the existing `float_bits` function.
 4. Pin the behavior with regression tests.
 
