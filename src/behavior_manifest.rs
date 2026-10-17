@@ -913,7 +913,7 @@ mod tests {
 
     #[test]
     fn wasm_manifest_requires_exact_wasm_bytes_and_matching_backend() {
-        let wasm = b"\\0asm\\x01\\0\\0\\0";
+        let wasm = b"\0asm\x01\0\0\0";
         let wasm_identity = ArtifactIdentityManifest::new(
             Some(SourceId::from_bytes(b"fn main() = 42")),
             SemanticId::from_canonical_bytes(b"wasm-program", []),
