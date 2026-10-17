@@ -118,7 +118,11 @@ impl BehaviorManifest {
         hir: &hir::Module,
     ) -> Result<Self, BehaviorManifestError> {
         Self::from_typed_hir_with_kind(
-            package_name, package_version, artifact, artifact_bytes, hir,
+            package_name,
+            package_version,
+            artifact,
+            artifact_bytes,
+            hir,
             BEHAVIOR_ARTIFACT_KIND_NBC_V1,
         )
     }
@@ -133,7 +137,11 @@ impl BehaviorManifest {
         hir: &hir::Module,
     ) -> Result<Self, BehaviorManifestError> {
         Self::from_typed_hir_with_kind(
-            package_name, package_version, artifact, artifact_bytes, hir,
+            package_name,
+            package_version,
+            artifact,
+            artifact_bytes,
+            hir,
             BEHAVIOR_ARTIFACT_KIND_WASM_MODULE,
         )
     }
@@ -924,7 +932,11 @@ mod tests {
             std::iter::empty::<&str>(),
         );
         let manifest = BehaviorManifest::from_typed_hir_for_wasm(
-            "wasm-check", "0.2.0", &wasm_identity, wasm, &typed_hir(1),
+            "wasm-check",
+            "0.2.0",
+            &wasm_identity,
+            wasm,
+            &typed_hir(1),
         )
         .expect("WASM manifest");
         assert_eq!(manifest.artifact.kind, BEHAVIOR_ARTIFACT_KIND_WASM_MODULE);
