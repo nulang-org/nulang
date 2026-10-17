@@ -7,9 +7,7 @@ use uuid::Uuid;
 
 pub mod context;
 pub mod orchestration;
-pub use context::{
-    project_recent_messages, ContextProjection, ContextProjectionError,
-};
+pub use context::{project_recent_messages, ContextProjection, ContextProjectionError};
 pub use orchestration::{ProgressEvent, ProgressLedger};
 
 mod duration_secs {
