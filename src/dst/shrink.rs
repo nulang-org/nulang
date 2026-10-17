@@ -192,7 +192,13 @@ mod tests {
 
     #[test]
     fn same_input_and_predicate_have_identical_replay_sequence() {
-        let events = [Event::Noise, Event::Send, Event::Noise, Event::Crash, Event::Restart];
+        let events = [
+            Event::Noise,
+            Event::Send,
+            Event::Noise,
+            Event::Crash,
+            Event::Restart,
+        ];
         let mut first_checked = Vec::new();
         let first = minimize_failing_trace(&events, 100, |candidate| {
             first_checked.push(candidate.to_vec());
@@ -210,9 +216,8 @@ mod tests {
     #[test]
     fn single_event_failure_is_one_minimal() {
         let events = [Event::Noise, Event::Crash, Event::Noise];
-        let minimized = minimize_failing_trace(&events, 100, |candidate| {
-            candidate.contains(&Event::Crash)
-        });
+        let minimized =
+            minimize_failing_trace(&events, 100, |candidate| candidate.contains(&Event::Crash));
         assert_eq!(minimized.trace, vec![Event::Crash]);
         assert_eq!(minimized.status, MinimizationStatus::OneMinimal);
     }
