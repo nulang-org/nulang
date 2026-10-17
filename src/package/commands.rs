@@ -3254,6 +3254,7 @@ app "counter" {
             "version": 1,
             "routes": [
                 {"method": "GET", "path": "/old", "placement": "static", "artifact": "old/index.html"},
+                {"method": "POST", "path": "/old", "placement": "server", "artifact": null},
                 {"method": "GET", "path": "/keep", "placement": "static", "artifact": "keep/index.html"},
                 {"method": "GET", "path": "/removed", "placement": "static", "artifact": "removed/index.html"}
             ],
