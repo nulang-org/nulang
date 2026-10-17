@@ -1835,13 +1835,9 @@ impl Runtime {
                 }
             }
         }
-        // End the VM-execution window only after the match above: the
-        // re-capture arm reads the shared VM's frames, which draining
-        // deferred wakes would clobber; the compensation arm runs nested
-        // bytecode whose own begin/end must stay inside this window. Runs
-        // on every path so wakes of other actors are not lost.
-        // No VM/actor heap can still be borrowed here. Quarantine before
-        // draining deferred receive wakes, so uncommitted state cannot run.
+        // Re-capture any suspension before ending the VM execution window.
+        // The VM resume borrow is now released; quarantine before draining
+        // deferred wakes, so uncommitted state cannot run.
         if terminal_commit_failed {
             self.actors.remove(&actor_id);
         }
@@ -5195,13 +5191,9 @@ impl Runtime {
                     }
                 },
             }
-            // End the VM-execution window only after any suspend-state
-            // re-capture above: draining deferred wakes runs other actors
-            // on the shared VM, which would clobber the frames an
-            // un-captured suspend still needs. Runs on every path, so
-            // wakes of other actors are not lost when THIS one suspends.
         }
-        // The VM borrow ended; unpublish before draining deferred wakes.
+        // Suspension state has been re-captured while the VM borrow was live.
+        // The borrow is now released; quarantine before draining deferred wakes.
         if terminal_commit_failed {
             self.actors.remove(&actor_id);
         }
