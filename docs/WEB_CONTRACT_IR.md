@@ -239,6 +239,11 @@ the binding plan is equivalent to:
 
 ## Static-build execution boundary
 
+Static prerendering now requires an explicit `@placement(static)` on the handler. A plain GET route is classified `server` unless the compiler contract supplies a placement. Static contracts reject dynamic paths, request-source bindings, mutation methods, and known disallowed declared effects. This is a conservative structural gate rather than a proof of transitive effect purity: effect inference and helper-call analysis remain a compiler follow-up.
+
+On a repeated build, the previous deployment IR is read to find obsolete route HTML. Paths are checked for containment before removing files that no longer correspond to static routes (including legacy server routes previously rendered by older versions). Unrelated assets and retained static routes are not deleted. Rebuilds are not yet atomic: a failure after stale cleanup can leave partial output, so do not deploy a failed build.
+
+
 `nula build --web` generates the deployment IR from the same validated route contracts used for runtime dispatch **before** prerendering. Only routes classified `static` are executed to generate HTML artifacts; routes classified `server`, `edge`, or `client` remain manifest entries and must be dispatched by an appropriate host. This prevents the build step from executing known non-static route handlers, but does not itself prove that implicit `static` inference is sound or remove stale output from older builds.
 
 ## Architectural direction
