@@ -198,6 +198,11 @@ name = "nulang"
 path = "src/main.rs"
 
 [[bin]]
+name = "nula-sql-check"
+path = "src/bin/nula_sql_check.rs"
+required-features = ["postgres"]
+
+[[bin]]
 name = "nula_difffuzz"
 path = "src/bin/nula_difffuzz.rs"
 required-features = ["difffuzz"]
