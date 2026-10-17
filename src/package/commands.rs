@@ -3373,6 +3373,22 @@ app "placement" {
                 && route.placement == "server"
                 && route.artifact.is_none()
         }));
+
+        // Rebuild the same output directory with the former static page now
+        // explicitly server-hosted. It must not retain a stale index.html.
+        let source_path = dir.join("src/main.nula");
+        let source = std::fs::read_to_string(&source_path).unwrap();
+        std::fs::write(
+            &source_path,
+            source.replace("@placement(static)", "@placement(server)"),
+        )
+        .unwrap();
+        cmd_build_web().expect("incremental hybrid build should succeed");
+        assert!(
+            !dir.join("dist/index.html").exists(),
+            "a route switched to server placement must lose its old HTML"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
