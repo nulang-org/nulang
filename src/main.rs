@@ -120,9 +120,9 @@ fn main() {
                 &opts.with_capabilities,
                 opts.store_path.as_deref(),
                 opts.deny_warnings,
-            )    opts.emit_behavior_manifest.as_deref(),
-            )    opts.behavior_package_name.as_deref(),
-            )    opts.behavior_package_version.as_deref(),
+                opts.emit_behavior_manifest.as_deref(),
+                opts.behavior_package_name.as_deref(),
+                opts.behavior_package_version.as_deref(),
             ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
@@ -724,9 +724,9 @@ fn main() {
                         &opts.with_capabilities,
                         opts.store_path.as_deref(),
                         opts.deny_warnings,
-                    )    opts.emit_behavior_manifest.as_deref(),
-                    )    opts.behavior_package_name.as_deref(),
-                    )    opts.behavior_package_version.as_deref(),
+                        opts.emit_behavior_manifest.as_deref(),
+                        opts.behavior_package_name.as_deref(),
+                        opts.behavior_package_version.as_deref(),
                     ) {
                         print_error(&e, uc);
                     }
@@ -774,9 +774,9 @@ fn main() {
                         &opts.with_capabilities,
                         opts.store_path.as_deref(),
                         opts.deny_warnings,
-                    )    opts.emit_behavior_manifest.as_deref(),
-                    )    opts.behavior_package_name.as_deref(),
-                    )    opts.behavior_package_version.as_deref(),
+                        opts.emit_behavior_manifest.as_deref(),
+                        opts.behavior_package_name.as_deref(),
+                        opts.behavior_package_version.as_deref(),
                     )
                 },
                 n,
@@ -796,9 +796,9 @@ fn main() {
                 &opts.with_capabilities,
                 opts.store_path.as_deref(),
                 opts.deny_warnings,
-            )    opts.emit_behavior_manifest.as_deref(),
-            )    opts.behavior_package_name.as_deref(),
-            )    opts.behavior_package_version.as_deref(),
+                opts.emit_behavior_manifest.as_deref(),
+                opts.behavior_package_name.as_deref(),
+                opts.behavior_package_version.as_deref(),
             ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
@@ -967,9 +967,9 @@ fn main() {
                         &opts.with_capabilities,
                         opts.store_path.as_deref(),
                         opts.deny_warnings,
-                    )    opts.emit_behavior_manifest.as_deref(),
-                    )    opts.behavior_package_name.as_deref(),
-                    )    opts.behavior_package_version.as_deref(),
+                        opts.emit_behavior_manifest.as_deref(),
+                        opts.behavior_package_name.as_deref(),
+                        opts.behavior_package_version.as_deref(),
                     )
                 },
                 n,
@@ -989,9 +989,9 @@ fn main() {
                 &opts.with_capabilities,
                 opts.store_path.as_deref(),
                 opts.deny_warnings,
-            )    opts.emit_behavior_manifest.as_deref(),
-            )    opts.behavior_package_name.as_deref(),
-            )    opts.behavior_package_version.as_deref(),
+                opts.emit_behavior_manifest.as_deref(),
+                opts.behavior_package_name.as_deref(),
+                opts.behavior_package_version.as_deref(),
             ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
@@ -1027,9 +1027,9 @@ fn main() {
             &opts.with_capabilities,
             opts.store_path.as_deref(),
             opts.deny_warnings,
-        )    opts.emit_behavior_manifest.as_deref(),
-        )    opts.behavior_package_name.as_deref(),
-        )    opts.behavior_package_version.as_deref(),
+            opts.emit_behavior_manifest.as_deref(),
+            opts.behavior_package_name.as_deref(),
+            opts.behavior_package_version.as_deref(),
         ) {
             print_error(&e, use_color);
             std::process::exit(exit_code(&e));
