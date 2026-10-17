@@ -530,7 +530,6 @@ enum RedirectTarget {
     Invalid,
 }
 
-
 /// Set the request context for the current thread, run `f`, then clear it.
 pub fn with_request_context<F, R>(ctx: RequestContext, f: F) -> R
 where
