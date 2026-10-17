@@ -105,6 +105,32 @@ artifact, but scaling ratios from shared CI hosts are diagnostic only. Publish
 multicore claims only from pinned/controlled hardware and report the host CPU
 topology alongside them.
 
+## Actor dispatch stage profile and JIT provenance
+
+The same-runner A/B workload suite emits several Nulang-only measurements
+with deliberately **different boundaries**. Do not add their rates directly:
+
+| Record | Timed work | Purpose |
+| --- | --- | --- |
+| `mailbox_push_inline_1` | push one inline argument directly into a Mailbox | queue-admission lower bound |
+| `enqueue_payload_1` | route/send an inline argument to an actor, excluding execution | routing + ready-publication admission cost |
+| `native_noop_drain` | drain pre-enqueued messages through the scheduler with a registered native noop behavior | native scheduler/dispatch lower bound |
+| `bytecode_actor_drain_warm` | drain pre-enqueued messages through JIT-enabled bytecode state-updating actor behavior | bytecode scheduling + state execution, *not automatically native JIT* |
+| `aot_actor_drain` | drain the identical state-updating actor through Cranelift AOT | matched AOT comparison |
+
+The AOT comparison now emits `[backend-provenance]` with
+`jit_compiled_regions` and `jit_compilation_verified` for its bytecode
+counterpart. `jit_compilation_verified=false` means the short warmed actor
+behavior **did not cause native JIT compilation**. The previous wording
+`bytecode/JIT` was too strong. A nonzero region count shows only that the actor VM compiled at least one
+region; it does **not** prove native execution even occurred, much less that
+all timed messages executed in native code.
+
+Never interpret the native noop drain as an isolated arithmetic decomposition
+of the state-updating actor workload; it does less application work. The
+per-stage measurements identify where further controlled profiling matters,
+not an algebraic subtraction of percentages.
+
 ## Same-runner Nulang A/B
 
 `scripts/nulang_ab_bench.py` compares the current checkout against an exact
