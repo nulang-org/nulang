@@ -42,7 +42,11 @@ fn native_leaf_dispatch_cache_is_module_scoped_and_deduplicated() {
     jit.cache_native_leaf_call(1, 7, leaf);
 
     let module_one = jit.native_leaf_dispatch.get(1).expect("module 1 cache");
-    assert_eq!(module_one.len(), 2, "repeated registration must not duplicate callees");
+    assert_eq!(
+        module_one.len(),
+        2,
+        "repeated registration must not duplicate callees"
+    );
     assert_eq!(module_one[0].0, 7);
     assert_eq!(module_one[1].0, 9);
     assert_eq!(module_one[0].2, 3);
@@ -58,7 +62,6 @@ fn native_leaf_dispatch_cache_is_module_scoped_and_deduplicated() {
     assert_eq!(jit.native_leaf_calls_for_module(1).as_ptr(), cached_ptr);
     assert!(jit.native_leaf_calls_for_module(99).is_empty());
 }
-
 
 #[test]
 fn test_jit_session_creation() {
