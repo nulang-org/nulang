@@ -44,6 +44,14 @@ Signal, timer-sleep, receive-wait, and LLM continuation paths use the same
 atomic terminal success/failure helpers. A suspended command retains its
 activation until its final result has committed.
 
+If a resumed terminal transition is rejected, the helper reports failure
+without freeing the actor inside the shared-VM execution window. The resume
+caller unpublishes that actor only after its active VM borrow ends and before
+deferred receive wakes are drained. This fails closed: it does **not** yet
+implement an automatic restart/recovery of the rejected activation, nor prove
+end-to-end crash consistency. The remaining requirement is injected
+timer/receive/LLM failures proving replay from the last committed snapshot.
+
 **Not yet fully covered:** internal workflow behaviors, the legacy
 suspension-marker snapshot update, compensation-retry recovery after an
 ambiguous external effect, and non-workflow event-source writes have

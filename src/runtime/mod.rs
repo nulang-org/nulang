@@ -1674,19 +1674,19 @@ impl Runtime {
         actor_id: u64,
         activation: Option<WorkflowActivationId>,
         step_name: String,
-    ) {
+    ) -> bool {
         if let Err(error) = workflow::commit_step_completed(self, actor_id, activation, step_name) {
             tracing::error!(
                 actor_id,
                 %error,
-                "nulang-workflow: resumed step completion was not durable; unpublishing actor"
+                "nulang-workflow: resumed step completion was not durable; deferring actor quarantine until after the VM borrow ends"
             );
-            self.actors.remove(&actor_id);
-            return;
+            return false;
         }
         if let Some(actor) = self.actors.get_mut(&actor_id) {
             actor.current_workflow_activation = None;
         }
+        true
     }
 
     /// A resumed VM error is terminal only when the failure snapshot and
@@ -1698,7 +1698,7 @@ impl Runtime {
         step_name: String,
         error_message: String,
         behavior_idx: usize,
-    ) {
+    ) -> bool {
         if let Err(error) = workflow::commit_step_failed(
             self,
             actor_id,
@@ -1709,15 +1709,15 @@ impl Runtime {
             tracing::error!(
                 actor_id,
                 %error,
-                "nulang-workflow: resumed StepFailed was not durable; unpublishing actor"
+                "nulang-workflow: resumed StepFailed was not durable; deferring actor quarantine until after the VM borrow ends"
             );
-            self.actors.remove(&actor_id);
-            return;
+            return false;
         }
         if let Some(actor) = self.actors.get_mut(&actor_id) {
             actor.current_workflow_activation = None;
         }
         self.run_saga_compensation(actor_id, behavior_idx);
+        true
     }
 
     /// Resume a workflow actor that is suspended waiting for a signal.
@@ -1767,6 +1767,7 @@ impl Runtime {
             actor.waiting_signal = None;
         }
 
+        let mut terminal_commit_failed = false;
         match result {
             Ok(_) => {
                 if self.actor_is_workflow(actor_id) {
@@ -1777,7 +1778,7 @@ impl Runtime {
                             actor.set_state_field("step_index", Value::int(n + 1));
                         }
                     }
-                    self.commit_resumed_workflow_success(
+                    terminal_commit_failed = !self.commit_resumed_workflow_success(
                         actor_id,
                         suspended.activation,
                         step_name,
@@ -1824,7 +1825,7 @@ impl Runtime {
             }
             Err(error) => {
                 if self.actor_is_workflow(actor_id) {
-                    self.commit_resumed_workflow_failure(
+                    terminal_commit_failed = !self.commit_resumed_workflow_failure(
                         actor_id,
                         suspended.activation,
                         step_name,
@@ -1834,12 +1835,16 @@ impl Runtime {
                 }
             }
         }
-        // End the VM-execution window only after the match above: the
-        // re-capture arm reads the shared VM's frames, which draining
-        // deferred wakes would clobber; the compensation arm runs nested
-        // bytecode whose own begin/end must stay inside this window. Runs
-        // on every path so wakes of other actors are not lost.
+        // Re-capture any suspension before ending the VM execution window.
+        // The VM resume borrow is now released; quarantine before draining
+        // deferred wakes, so uncommitted state cannot run.
+        if terminal_commit_failed {
+            self.actors.remove(&actor_id);
+        }
         self.vm_exec_end();
+        if terminal_commit_failed {
+            return;
+        }
         // The suspension resolved (completed or failed): drain any mail
         // that queued up while the step was suspended.
         self.requeue_if_mail_pending(actor_id);
@@ -4981,6 +4986,7 @@ impl Runtime {
             return;
         }
         self.restore_suspended_workflow_activation(actor_id, suspended.activation);
+        let mut terminal_commit_failed = false;
         let self_ptr: *mut Runtime = self;
         unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -5013,7 +5019,7 @@ impl Runtime {
                                 actor.set_state_field("step_index", Value::int(n + 1));
                             }
                         }
-                        (*self_ptr).commit_resumed_workflow_success(
+                        terminal_commit_failed = !(*self_ptr).commit_resumed_workflow_success(
                             actor_id,
                             suspended.activation,
                             suspended.step_name.clone(),
@@ -5042,7 +5048,7 @@ impl Runtime {
                         actor.suspended_execution = None;
                     }
                     if (*self_ptr).actor_is_workflow(actor_id) {
-                        (*self_ptr).commit_resumed_workflow_failure(
+                        terminal_commit_failed = !(*self_ptr).commit_resumed_workflow_failure(
                             actor_id,
                             suspended.activation,
                             suspended.step_name.clone(),
@@ -5052,7 +5058,15 @@ impl Runtime {
                     }
                 }
             }
-            (*self_ptr).vm_exec_end();
+        }
+        // Drop the shared VM borrow before quarantining the actor. Deferred
+        // receive wakes cannot observe speculative state after failed commit.
+        if terminal_commit_failed {
+            self.actors.remove(&actor_id);
+        }
+        self.vm_exec_end();
+        if terminal_commit_failed {
+            return;
         }
         // Re-enqueue so the scheduler can continue processing the actor.
         self.enqueue_actor(actor_id);
@@ -5081,6 +5095,7 @@ impl Runtime {
         }
 
         self.restore_suspended_workflow_activation(actor_id, suspended.activation);
+        let mut terminal_commit_failed = false;
         let self_ptr: *mut Runtime = self;
         unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -5113,7 +5128,7 @@ impl Runtime {
                                 actor.set_state_field("step_index", Value::int(n + 1));
                             }
                         }
-                        (*self_ptr).commit_resumed_workflow_success(
+                        terminal_commit_failed = !(*self_ptr).commit_resumed_workflow_success(
                             actor_id,
                             suspended.activation,
                             suspended.step_name,
@@ -5166,7 +5181,7 @@ impl Runtime {
                 Err(error) => {
                     (*self_ptr).clear_receive_wait(actor_id);
                     if (*self_ptr).actor_is_workflow(actor_id) {
-                        (*self_ptr).commit_resumed_workflow_failure(
+                        terminal_commit_failed = !(*self_ptr).commit_resumed_workflow_failure(
                             actor_id,
                             suspended.activation,
                             suspended.step_name,
@@ -5176,12 +5191,15 @@ impl Runtime {
                     }
                 },
             }
-            // End the VM-execution window only after any suspend-state
-            // re-capture above: draining deferred wakes runs other actors
-            // on the shared VM, which would clobber the frames an
-            // un-captured suspend still needs. Runs on every path, so
-            // wakes of other actors are not lost when THIS one suspends.
-            (*self_ptr).vm_exec_end();
+        }
+        // Suspension state has been re-captured while the VM borrow was live.
+        // The borrow is now released; quarantine before draining deferred wakes.
+        if terminal_commit_failed {
+            self.actors.remove(&actor_id);
+        }
+        self.vm_exec_end();
+        if terminal_commit_failed {
+            return;
         }
         // The suspension resolved (completed or failed): if messages queued
         // up while the behavior was suspended, schedule the actor to drain
