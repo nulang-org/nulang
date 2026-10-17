@@ -85,7 +85,31 @@ containers, FFI and NLCS v1 snapshots cannot carry these wide roots. The
 source language's `Int` remains 48-bit until backend and durability
 parity are proven.
 
-## Current code in this PR## Phase 1d — bounded interoperability with production VM Frame
+## Current code in this PR## Phase 1e — actor-scoped frame duplication and unwind
+
+`RootedIntFrameStack` models 256-register VM call frames over a single
+actor-borrowed, ORCA-rooted `Value` bank. Every wide register owns a counted
+local root. `clone_top` creates independent roots with a retain barrier,
+`pop` releases all roots of the unwound frame, and cross-frame copy/move
+observe the same ownership protocol. Checked arithmetic computes first and
+commits only if the operation and allocation succeed. Focused tests exercise
+clone, unwind, cross-frame transfer, self-copy, empty-stack and bounds
+errors, and overflow atomicity. The actor-scoped stack also supports
+`RootedIntFrameStack::suspend` and `::resume`: suspension consumes and
+drops the ORCA-owning stack, retaining only pointer-free signed numeric
+values and frame module indices; resume builds new counted roots in an
+independent actor heap. One checkpoint may be resumed more than once
+without sharing ORCA object addresses. This is **not** the production
+VM's `SuspendedVmState` or the versioned durable format.
+
+**Promotion boundary:** This is a controlled ownership model, **not** a
+replacement for the production VM's raw `Vec<Frame>` or captured
+`Continuation`. The production VM has publicly cloneable frames and
+additional pointer-bearing register types. Full source-level Int64 is
+still blocked on stack root barriers, effects/suspension, GC scanning,
+actor messaging, JIT/AOT/WASM, and a versioned durability ABI.
+
+## Phase 1d — bounded interoperability with production VM Frame
 
 `RootedIntFrame` now provides a fail-closed numeric adapter to
 `crate::vm::Frame`, the *actual* production VM activation frame with
