@@ -470,6 +470,21 @@ impl Mailbox {
         // candidate was rejected by its pattern/guard. It remains `tried` for
         // this receive expression but is no longer the commit target.
         self.active_match = None;
+        // The relaxed queued_count is capacity bookkeeping, not a
+        // synchronization barrier for concurrent queue publication. A zero
+        // count must not hide a published message or a staged candidate.
+        // Inspect the actual queues and staged lanes instead: an entirely
+        // empty receive stays index-allocation-free, even if a producer has
+        // reserved capacity but has not published the message yet.
+        if self.system_skip_buffer.is_empty()
+            && self.local_skip_buffer.is_empty()
+            && self.skip_buffer.is_empty()
+            && self.local_queue.is_empty()
+            && self.system_queue.is_empty()
+            && self.normal_queue.is_empty()
+        {
+            return None;
+        }
         self.ensure_receive_indexes();
         self.stage_arrivals();
 
@@ -922,6 +937,81 @@ mod transactional_receive_tests {
 
         assert_eq!(mb.pop().unwrap().sender, 1);
         assert!(mb.is_empty());
+    }
+
+    #[test]
+    fn test_selective_receive_finds_published_messages_when_count_reads_stale_zero() {
+        // Concurrent producers reserve a slot before publishing to SegQueue.
+        // The relaxed counter is capacity bookkeeping, not a publication
+        // barrier. Simulate a stale zero observation deterministically: the
+        // message is already published, but the counter read is zero.
+        // Restore the count before committing so the test does not corrupt
+        // the mailbox's accounting invariant.
+        for priority in [MessagePriority::System, MessagePriority::Normal] {
+            let mut mb = Mailbox::new(4);
+            mb.push(msg(7, 41, priority))
+                .expect("published message fits");
+            mb.queued_count.store(0, Ordering::Relaxed);
+            let result = mb.receive_match(&[7]);
+            mb.queued_count.store(1, Ordering::Relaxed);
+            let (arm, payload) =
+                result.expect("published message must not be hidden by stale count");
+            assert_eq!(arm, 0);
+            assert_eq!(payload[0].as_int(), Some(41));
+            assert_eq!(mb.commit_receive_match().expect("commit"), payload);
+            assert!(mb.is_empty());
+        }
+
+        // A staged selective-receive candidate is also logically present
+        // independently of what a relaxed count read happens to observe.
+        let mut mb = Mailbox::new(4);
+        mb.push_local(msg(7, 42, MessagePriority::Normal))
+            .expect("staged message fits");
+        assert!(mb.receive_match(&[99]).is_none());
+        mb.queued_count.store(0, Ordering::Relaxed);
+        let result = mb.receive_match(&[7]);
+        mb.queued_count.store(1, Ordering::Relaxed);
+        let (_, payload) = result.expect("staged message remains visible");
+        assert_eq!(payload[0].as_int(), Some(42));
+        assert_eq!(mb.commit_receive_match().expect("commit"), payload);
+        assert!(mb.is_empty());
+    }
+
+    #[test]
+    fn test_empty_poll_does_not_allocate_when_count_is_only_reserved() {
+        let mut mb = Mailbox::new(4);
+        // A producer may have reserved capacity but not yet published a
+        // message. Index construction is unnecessary in that state.
+        mb.queued_count.store(1, Ordering::Relaxed);
+        assert!(mb.receive_match(&[7]).is_none());
+        mb.queued_count.store(0, Ordering::Relaxed);
+        assert!(
+            mb.receive_indexes.is_none(),
+            "an unpublished reservation must not allocate receive indexes"
+        );
+    }
+
+    #[test]
+    fn test_empty_selective_receive_avoids_index_allocation_and_observes_later_arrival() {
+        let mut mb = Mailbox::new(1);
+        for _ in 0..32 {
+            assert!(mb.receive_match(&[7]).is_none());
+            assert!(
+                mb.receive_indexes.is_none(),
+                "an empty receive must not allocate per-lane indexes"
+            );
+            assert_eq!(mb.len(), 0);
+        }
+
+        mb.push_local(msg(7, 41, MessagePriority::Normal))
+            .expect("a new message fits after an empty poll");
+        let (arm, payload) = mb.receive_match(&[7]).expect("later arrival is visible");
+        assert_eq!(arm, 0);
+        assert_eq!(payload[0].as_int(), Some(41));
+        assert_eq!(mb.len(), 1, "candidate must remain capacity-accounted");
+        assert!(mb.receive_indexes.is_some());
+        assert_eq!(mb.commit_receive_match().expect("commit"), payload);
+        assert!(mb.is_empty(), "committing the candidate releases the slot");
     }
 
     #[test]

@@ -199,6 +199,59 @@ fn selective_receive_mailbox(depth: usize, hit_behavior: u16) -> Mailbox {
     mailbox
 }
 
+/// Empty selective receives often precede the actor's first message. Split
+/// the first poll (which previously allocated receive indexes) from repeated
+/// polls of an already-waiting mailbox; both exclude mailbox construction.
+fn bench_empty_selective_receive(c: &mut Criterion) {
+    let mut group = c.benchmark_group("actor/selective_receive_empty");
+    group.bench_function("first_poll", |b| {
+        b.iter_batched_ref(
+            || Mailbox::new(0),
+            |mailbox| black_box(mailbox.receive_match(black_box(&[42]))),
+            BatchSize::SmallInput,
+        )
+    });
+    group.bench_function("repeated_poll", |b| {
+        let mut mailbox = Mailbox::new(0);
+        // The receiver is opaque to the optimizer: benchmark the actual
+        // no-message code path instead of an elided constant-None expression.
+        b.iter(|| black_box(black_box(&mut mailbox).receive_match(black_box(&[42]))))
+    });
+    // The first actual delivery may pay for indexes deferred by empty polls.
+    // Benchmark the full empty-poll → enqueue → match → commit sequence, not
+    // only the empty fast path, so a shifted cost cannot look like a free win.
+    group.bench_function("empty_then_arrival", |b| {
+        b.iter_batched_ref(
+            || Mailbox::new(0),
+            |mailbox| {
+                assert!(mailbox.receive_match(black_box(&[42])).is_none());
+                mailbox
+                    .push_local(Message {
+                        behavior_id: 42,
+                        payload: MessagePayload::from_slice(&[Value::int(42)]),
+                        sender: 0,
+                        priority: MessagePriority::Normal,
+                        trace_id: None,
+                    })
+                    .expect("unbounded mailbox must accept first arrival");
+                let (arm, payload) = mailbox
+                    .receive_match(black_box(&[42]))
+                    .expect("first arrival must be visible");
+                assert_eq!(arm, 0);
+                assert_eq!(payload[0].as_int(), Some(42));
+                black_box(
+                    mailbox
+                        .commit_receive_match()
+                        .expect("first arrival must commit"),
+                );
+                assert!(mailbox.is_empty());
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.finish();
+}
+
 fn bench_selective_receive(c: &mut Criterion) {
     const HIT: u16 = 60_000;
 
@@ -267,5 +320,6 @@ criterion_group!(
     bench_spawn_send_receive,
     bench_message_enqueue,
     bench_message_drain,
+    bench_empty_selective_receive,
     bench_selective_receive
 );
