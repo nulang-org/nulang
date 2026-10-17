@@ -39,6 +39,33 @@ content hashes. Model revision MUST refer to an immutable provider revision,
 not a floating alias. Validating the revision string does not prove provider
 immutability; trusted Cloud policy must independently establish that.
 
+## Developer workflow
+
+Nulang emits the sealed envelope directly to stdout; it does not access the
+network or execute the agent:
+
+```sh
+nulang nula release seal ./release-definition.json > ./agent-release.json
+nulang nula release verify ./agent-release.json
+```
+
+The second command emits a single JSON object with `schema_version`,
+`command: "release.verify"`, and `release_id`. A nonzero exit code and
+stderr diagnostics indicate rejection. Do not treat successful local
+verification as permission to deploy.
+
+Nulang Cloud exposes a pure library validator for future trusted admission:
+
+```rust
+use nlc_deploy::agent_release::AgentReleaseEnvelope;
+let release = AgentReleaseEnvelope::parse_and_verify(&manifest_bytes)?;
+```
+
+To validate stored prompt/policy/tool/skill contents, call `verify_asset`
+against each declared digest using bytes obtained from trusted tenant-scoped
+storage. Only then can higher-level admission compare the release ID against
+the deployment's trusted expected identity.
+
 ## Canonical release ID
 
 ```text
