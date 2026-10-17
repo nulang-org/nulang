@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Staged Web build output and rollback — 2026-10-17
+- **`nula build --web` now prepares output in a sibling staging directory**, starting from a symlink-safe copy of the previous output so unrelated assets can survive. Compilation, prerendering, cleanup, IR generation and budgets run against staging, leaving the last published `dist/` intact on normal build failures.
+- **Successful builds promote the completed staging directory with rollback on rename errors.** Existing-directory replacement uses two portable renames and is not crash-atomic or safe from simultaneous builds; atomic exchange and build locking remain future work. Stale backups may require cleanup after interruption.
+- **Tests exercise successful publication, failed-build preservation and output-root symlink refusal.** Full exact-head CI is required before promotion.
+
 ### Conservative Web placement and stale-route cleanup — 2026-10-17
 - **Unannotated routes now default to server execution**, even for literal GET/HEAD paths. Static generation is opt-in through an explicit `@placement(static)` route handler.
 - **Known unsafe explicit static contracts are rejected**, including dynamic paths, request-bound inputs, and declared effects other than `Render`. This is not yet a full transitive-purity proof for unannotated helper calls.
