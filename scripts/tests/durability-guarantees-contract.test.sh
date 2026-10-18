@@ -19,6 +19,7 @@ bash "$ROOT/scripts/test-durability-guarantees.sh"
 grep -Fqx 'test --locked --no-default-features --features sqlite --test workflow_effect_tail_recovery' "$CAPTURE_CALLS"
 grep -Fqx 'test --locked --no-default-features --features sqlite --test workflow_timer_process_restart_replay' "$CAPTURE_CALLS"
 grep -Fqx 'test --locked --no-default-features --test nudb_crash_recovery' "$CAPTURE_CALLS"
+grep -Fqx 'test --locked --no-default-features --features sqlite --test durable_compiled_store_restart' "$CAPTURE_CALLS"
 if grep -F -- '--no-default-features --test workflow_timer_process_restart_replay' "$CAPTURE_CALLS"; then
   echo 'SQLite-only restart tests must never run without SQLite' >&2
   exit 1
