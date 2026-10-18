@@ -147,7 +147,9 @@ pub fn inspect_mir(module: &mir::Module, backend: &str, native_target: &str) -> 
                 InspectionStatus::Unavailable,
                 summary,
                 "backend.unknown",
-                format!("unknown inspection backend '{backend}' (expected bytecode | native | wasm)"),
+                format!(
+                    "unknown inspection backend '{backend}' (expected bytecode | native | wasm)"
+                ),
             );
         }
     };
