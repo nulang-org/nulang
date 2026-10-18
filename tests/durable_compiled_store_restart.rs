@@ -95,7 +95,7 @@ fn actor(authorized: bool) -> Actor {
 }
 
 #[test]
-fn compiled_receipt_replays_after_sqlite_reopen_without_provider_or_journal_mutation() {
+fn test_compiled_receipt_replays_after_sqlite_reopen_without_provider_or_journal_mutation() {
     let db = TestDb::new("completed");
     let module = compiled_nbc();
     let pc = module.effect_sites[0].pc;
@@ -187,7 +187,7 @@ fn compiled_receipt_replays_after_sqlite_reopen_without_provider_or_journal_muta
 }
 
 #[test]
-fn sqlite_reopen_retries_prepared_effect_with_same_key_but_requires_live_authority() {
+fn test_sqlite_reopen_retries_prepared_effect_with_same_key_but_requires_live_authority() {
     let db = TestDb::new("prepared");
     let module = compiled_nbc();
     let pc = module.effect_sites[0].pc;
