@@ -46,13 +46,15 @@ def normalize_file(name, root):
         return name
     path = Path(name)
     root = root.resolve()
-    if path.is_absolute():
-        try:
-            path = path.resolve().relative_to(root)
-        except ValueError as exc:
-            raise InputError(f'source outside --root: {name}') from exc
-    if not path.parts or '..' in path.parts:
+    if not path.parts or (not path.is_absolute() and '..' in path.parts):
         raise InputError(f'unsafe source path: {name}')
+    try:
+        # Relative filenames need the same containment check as absolute
+        # filenames: a symlink inside the source tree may point outside it.
+        candidate = path if path.is_absolute() else root / path
+        path = candidate.resolve().relative_to(root)
+    except (ValueError, OSError, RuntimeError) as exc:
+        raise InputError(f'source outside --root or cannot be resolved: {name}') from exc
     return path.as_posix()
 
 
