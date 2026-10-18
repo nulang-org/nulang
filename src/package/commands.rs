@@ -3107,7 +3107,10 @@ app "counter" {
             html.contains("data-action-placement="),
             "data-action-placement missing"
         );
-        assert!(html.contains("data-signal="), "data-signal missing");
+        assert!(
+            html.contains("<!--nulang-signal:"),
+            "signal comment anchors missing"
+        );
 
         let js = std::fs::read_to_string(dir.join("dist/app.client.js"))
             .expect("app.client.js should exist");
