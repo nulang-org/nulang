@@ -256,15 +256,14 @@ fn sqlite_reopen_retries_prepared_effect_with_same_key_but_requires_live_authori
                 },
             )
             .unwrap();
-        assert_eq!(receipt, b"deduplicated-provider-receipt");
+        assert_eq!(receipt.as_slice(), b"deduplicated-provider-receipt");
         assert_eq!(reopened.latest_sequence(ACTOR_ID), 2);
     }
 
     {
         let mut reopened = LibsqlStore::new(&db.path).unwrap();
         let mut coordinator = DurableEffectCoordinator::new(&mut reopened, ACTOR_ID, 1);
-        assert_eq!(
-            coordinator
+        let replayed = coordinator
                 .execute_compiled_async_with_deduplication(
                     &authorized,
                     &grant(),
@@ -275,9 +274,8 @@ fn sqlite_reopen_retries_prepared_effect_with_same_key_but_requires_live_authori
                     REQUEST,
                     |_, _| panic!("terminal receipt must not redispatch"),
                 )
-                .unwrap(),
-            b"deduplicated-provider-receipt"
-        );
+                .unwrap();
+        assert_eq!(replayed.as_slice(), b"deduplicated-provider-receipt");
         assert_eq!(reopened.latest_sequence(ACTOR_ID), 2);
     }
 }
