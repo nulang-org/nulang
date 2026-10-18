@@ -9,7 +9,7 @@
 //! by `nula build --web` and `nula dev`. It is intentionally conservative:
 //! it only reports dependencies that are statically visible in the same module.
 
-use crate::ast::{AstModule, Decl, Expr, Literal};
+use crate::ast::{AstModule, Decl, Expr, Literal, Pattern};
 use crate::effect_checker::EffectChecker;
 use crate::types::{Effect, EffectRow, Span};
 pub use nulang_ui_protocol::ActionPlacement;
@@ -204,14 +204,63 @@ pub fn analyze_module(module: &AstModule, checker: Option<&EffectChecker>) -> Si
         }
     }
 
-    // Pass 2: scan function bodies for HTML expressions and action attributes.
+    // Pass 2: resolve function-local names before scanning HTML expressions.
     for decl in &module.decls {
-        if let Decl::Function { body, .. } = decl {
-            scan_expr(body, &mut Vec::new(), false, &signals, &mut graph, checker);
+        if let Decl::Function {
+            body,
+            params,
+            using_params,
+            ..
+        } = decl
+        {
+            let visible = without_bindings(
+                &signals,
+                params
+                    .iter()
+                    .chain(using_params)
+                    .map(|param| param.name.as_str()),
+            );
+            scan_expr(body, &mut Vec::new(), false, &visible, &mut graph, checker);
         }
     }
 
     graph
+}
+
+/// Remove local bindings from the visible global signals. Resolve lexical names
+/// in the compiler pass rather than letting a similarly named local capture a
+/// browser-side global signal binding.
+fn without_bindings<'a>(
+    signals: &HashSet<String>,
+    names: impl IntoIterator<Item = &'a str>,
+) -> HashSet<String> {
+    let mut visible = signals.clone();
+    for name in names {
+        visible.remove(name);
+    }
+    visible
+}
+
+fn pattern_bindings(pattern: &Pattern, names: &mut Vec<String>) {
+    match pattern {
+        Pattern::Var(name) => names.push(name.clone()),
+        Pattern::Alias(name, nested) => {
+            names.push(name.clone());
+            pattern_bindings(nested, names);
+        }
+        Pattern::Tuple(parts) => {
+            for part in parts {
+                pattern_bindings(part, names);
+            }
+        }
+        Pattern::Record(fields) => {
+            for (_, part) in fields {
+                pattern_bindings(part, names);
+            }
+        }
+        Pattern::Variant(_, Some(inner)) => pattern_bindings(inner, names),
+        Pattern::Wild | Pattern::Lit(_) | Pattern::Variant(_, None) => {}
+    }
 }
 
 /// Scan an expression for signal reads and action attributes.
@@ -302,16 +351,34 @@ fn scan_expr(
             });
         }
 
-        Expr::Lambda { body, .. } => scan_expr(body, path, in_html, signals, graph, checker),
+        Expr::Lambda { params, body, .. } => {
+            let visible = without_bindings(signals, params.iter().map(|p| p.name.as_str()));
+            scan_expr(body, path, in_html, &visible, graph, checker);
+        }
         Expr::App { func, args, .. } => {
             scan_expr(func, path, in_html, signals, graph, checker);
             for arg in args {
                 scan_expr(arg, path, in_html, signals, graph, checker);
             }
         }
-        Expr::Let { value, body, .. } | Expr::LetRec { value, body, .. } => {
+        Expr::Let {
+            name, value, body, ..
+        } => {
             scan_expr(value, path, in_html, signals, graph, checker);
-            scan_expr(body, path, in_html, signals, graph, checker);
+            let visible = without_bindings(signals, std::iter::once(name.as_str()));
+            scan_expr(body, path, in_html, &visible, graph, checker);
+        }
+        Expr::LetRec {
+            name,
+            params,
+            value,
+            body,
+            ..
+        } => {
+            let visible = without_bindings(signals, std::iter::once(name.as_str()));
+            let recursive = without_bindings(&visible, params.iter().map(|p| p.name.as_str()));
+            scan_expr(value, path, in_html, &recursive, graph, checker);
+            scan_expr(body, path, in_html, &visible, graph, checker);
         }
         Expr::If {
             cond,
@@ -329,11 +396,14 @@ fn scan_expr(
             scrutinee, arms, ..
         } => {
             scan_expr(scrutinee, path, in_html, signals, graph, checker);
-            for (_, guard, body) in arms {
+            for (pattern, guard, body) in arms {
+                let mut names = Vec::new();
+                pattern_bindings(pattern, &mut names);
+                let visible = without_bindings(signals, names.iter().map(String::as_str));
                 if let Some(guard) = guard {
-                    scan_expr(guard, path, in_html, signals, graph, checker);
+                    scan_expr(guard, path, in_html, &visible, graph, checker);
                 }
-                scan_expr(body, path, in_html, signals, graph, checker);
+                scan_expr(body, path, in_html, &visible, graph, checker);
             }
         }
         Expr::Block { exprs, .. } | Expr::Par { exprs, .. } => {
@@ -369,9 +439,15 @@ fn scan_expr(
             scan_expr(left, path, in_html, signals, graph, checker);
             scan_expr(right, path, in_html, signals, graph, checker);
         }
-        Expr::For { iterable, body, .. } => {
+        Expr::For {
+            var,
+            iterable,
+            body,
+            ..
+        } => {
             scan_expr(iterable, path, in_html, signals, graph, checker);
-            scan_expr(body, path, in_html, signals, graph, checker);
+            let visible = without_bindings(signals, std::iter::once(var.as_str()));
+            scan_expr(body, path, in_html, &visible, graph, checker);
         }
         Expr::While { cond, body, .. } => {
             scan_expr(cond, path, in_html, signals, graph, checker);
@@ -400,7 +476,8 @@ fn scan_expr(
         Expr::Handle { body, handlers, .. } => {
             scan_expr(body, path, in_html, signals, graph, checker);
             for h in handlers {
-                scan_expr(&h.body, path, in_html, signals, graph, checker);
+                let visible = without_bindings(signals, h.params.iter().map(String::as_str));
+                scan_expr(&h.body, path, in_html, &visible, graph, checker);
             }
         }
         Expr::Perform { args, .. } => {
@@ -428,11 +505,16 @@ fn scan_expr(
             }
         }
         Expr::Receive { arms, after, .. } => {
-            for (_, _, guard, body) in arms {
-                if let Some(guard) = guard {
-                    scan_expr(guard, path, in_html, signals, graph, checker);
+            for (_, patterns, guard, body) in arms {
+                let mut names = Vec::new();
+                for pattern in patterns {
+                    pattern_bindings(pattern, &mut names);
                 }
-                scan_expr(body, path, in_html, signals, graph, checker);
+                let visible = without_bindings(signals, names.iter().map(String::as_str));
+                if let Some(guard) = guard {
+                    scan_expr(guard, path, in_html, &visible, graph, checker);
+                }
+                scan_expr(body, path, in_html, &visible, graph, checker);
             }
             if let Some((t, b)) = after {
                 scan_expr(t, path, in_html, signals, graph, checker);
@@ -595,8 +677,21 @@ pub fn rewrite_module(module: &mut AstModule, checker: Option<&EffectChecker>) {
         }
     }
     for decl in &mut module.decls {
-        if let Decl::Function { body, .. } = decl {
-            rewrite_expr(body, false, &signals, checker);
+        if let Decl::Function {
+            body,
+            params,
+            using_params,
+            ..
+        } = decl
+        {
+            let visible = without_bindings(
+                &signals,
+                params
+                    .iter()
+                    .chain(using_params.iter())
+                    .map(|param| param.name.as_str()),
+            );
+            rewrite_expr(body, false, &visible, checker);
         }
     }
 }
@@ -682,16 +777,34 @@ fn rewrite_expr(
         }
 
         // Recurse through other expression forms.
-        Expr::Lambda { body, .. } => rewrite_expr(body, in_html, signals, checker),
+        Expr::Lambda { params, body, .. } => {
+            let visible = without_bindings(signals, params.iter().map(|p| p.name.as_str()));
+            rewrite_expr(body, in_html, &visible, checker);
+        }
         Expr::App { func, args, .. } => {
             rewrite_expr(func, in_html, signals, checker);
             for arg in args.iter_mut() {
                 rewrite_expr(arg, in_html, signals, checker);
             }
         }
-        Expr::Let { value, body, .. } | Expr::LetRec { value, body, .. } => {
+        Expr::Let {
+            name, value, body, ..
+        } => {
             rewrite_expr(value, in_html, signals, checker);
-            rewrite_expr(body, in_html, signals, checker);
+            let visible = without_bindings(signals, std::iter::once(name.as_str()));
+            rewrite_expr(body, in_html, &visible, checker);
+        }
+        Expr::LetRec {
+            name,
+            params,
+            value,
+            body,
+            ..
+        } => {
+            let visible = without_bindings(signals, std::iter::once(name.as_str()));
+            let recursive = without_bindings(&visible, params.iter().map(|p| p.name.as_str()));
+            rewrite_expr(value, in_html, &recursive, checker);
+            rewrite_expr(body, in_html, &visible, checker);
         }
         Expr::If {
             cond,
@@ -709,11 +822,14 @@ fn rewrite_expr(
             scrutinee, arms, ..
         } => {
             rewrite_expr(scrutinee, in_html, signals, checker);
-            for (_, guard, body) in arms {
+            for (pattern, guard, body) in arms {
+                let mut names = Vec::new();
+                pattern_bindings(pattern, &mut names);
+                let visible = without_bindings(signals, names.iter().map(String::as_str));
                 if let Some(guard) = guard {
-                    rewrite_expr(guard, in_html, signals, checker);
+                    rewrite_expr(guard, in_html, &visible, checker);
                 }
-                rewrite_expr(body, in_html, signals, checker);
+                rewrite_expr(body, in_html, &visible, checker);
             }
         }
         Expr::Block { exprs, .. } | Expr::Par { exprs, .. } => {
@@ -749,9 +865,15 @@ fn rewrite_expr(
             rewrite_expr(left, in_html, signals, checker);
             rewrite_expr(right, in_html, signals, checker);
         }
-        Expr::For { iterable, body, .. } => {
+        Expr::For {
+            var,
+            iterable,
+            body,
+            ..
+        } => {
             rewrite_expr(iterable, in_html, signals, checker);
-            rewrite_expr(body, in_html, signals, checker);
+            let visible = without_bindings(signals, std::iter::once(var.as_str()));
+            rewrite_expr(body, in_html, &visible, checker);
         }
         Expr::While { cond, body, .. } => {
             rewrite_expr(cond, in_html, signals, checker);
@@ -780,7 +902,8 @@ fn rewrite_expr(
         Expr::Handle { body, handlers, .. } => {
             rewrite_expr(body, in_html, signals, checker);
             for h in handlers.iter_mut() {
-                rewrite_expr(&mut h.body, in_html, signals, checker);
+                let visible = without_bindings(signals, h.params.iter().map(String::as_str));
+                rewrite_expr(&mut h.body, in_html, &visible, checker);
             }
         }
         Expr::Perform { args, .. } => {
@@ -808,11 +931,16 @@ fn rewrite_expr(
             }
         }
         Expr::Receive { arms, after, .. } => {
-            for (_, _, guard, body) in arms {
-                if let Some(guard) = guard {
-                    rewrite_expr(guard, in_html, signals, checker);
+            for (_, patterns, guard, body) in arms {
+                let mut names = Vec::new();
+                for pattern in patterns {
+                    pattern_bindings(pattern, &mut names);
                 }
-                rewrite_expr(body, in_html, signals, checker);
+                let visible = without_bindings(signals, names.iter().map(String::as_str));
+                if let Some(guard) = guard {
+                    rewrite_expr(guard, in_html, &visible, checker);
+                }
+                rewrite_expr(body, in_html, &visible, checker);
             }
             if let Some((t, b)) = after {
                 rewrite_expr(t, in_html, signals, checker);
@@ -1030,6 +1158,216 @@ mod tests {
     fn parse(source: &str) -> AstModule {
         let tokens = Lexer::new(source).lex().unwrap();
         Parser::new(tokens).parse_module().unwrap()
+    }
+
+    #[test]
+    fn test_shadowed_function_parameter_is_not_a_signal_read() {
+        let mut module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+signal count: Html = text("global")
+
+fn view(count: Html) -> Html {
+    <span>{count}</span>
+}
+"#,
+        );
+
+        let graph = analyze_module(&module, None);
+        assert!(graph.nodes.contains(&GraphNode::Signal {
+            name: "count".to_string(),
+        }));
+        let has_shadowed_read = graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node, GraphNode::Read { signal, .. } if signal == "count"));
+        assert!(
+            !has_shadowed_read,
+            "a function parameter must shadow the global signal"
+        );
+
+        rewrite_module(&mut module, None);
+        let html = format!("{:?}", find_function_body(&module, "view"));
+        assert!(
+            !html.contains("data-signal"),
+            "shadowed reads must not hydrate"
+        );
+    }
+
+    #[test]
+    fn test_using_parameter_shadows_global_signal_in_graph_and_rewrite() {
+        let mut module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+signal count: Html = text("global")
+
+fn view() -> Html {
+    <span>{count}</span>
+}
+"#,
+        );
+
+        // Construct a contextual/using parameter explicitly to exercise both
+        // immutable graph analysis and mutable AST rewriting on the same input.
+        let view = module
+            .decls
+            .iter_mut()
+            .find(|decl| matches!(decl, Decl::Function { name, .. } if name == "view"))
+            .expect("view function");
+        if let Decl::Function { using_params, .. } = view {
+            using_params.push(crate::ast::Param::new("count", None));
+        }
+
+        let graph = analyze_module(&module, None);
+        assert!(
+            !graph
+                .nodes
+                .iter()
+                .any(|node| matches!(node, GraphNode::Read { signal, .. } if signal == "count")),
+            "using parameter must shadow the global signal"
+        );
+
+        rewrite_module(&mut module, None);
+        let html = format!("{:?}", find_function_body(&module, "view"));
+        assert!(
+            !html.contains("data-signal"),
+            "a using parameter must not produce a hydration marker"
+        );
+    }
+
+    #[test]
+    fn test_local_binding_shadows_signal_only_in_its_body() {
+        let mut module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+signal count: Html = text("global")
+
+fn view() -> Html {
+    let earlier = <p>{count}</p>
+    let count = text("local");
+    <span>{count}</span>
+}
+"#,
+        );
+
+        let graph = analyze_module(&module, None);
+        let reads: Vec<_> = graph
+            .nodes
+            .iter()
+            .filter(|node| matches!(node, GraphNode::Read { signal, .. } if signal == "count"))
+            .collect();
+        assert_eq!(
+            reads.len(),
+            1,
+            "the earlier read resolves to the global signal"
+        );
+        assert_eq!(
+            reads[0],
+            &GraphNode::Read {
+                signal: "count".to_string(),
+                path: "p".to_string(),
+            }
+        );
+
+        rewrite_module(&mut module, None);
+        let html = format!("{:?}", find_function_body(&module, "view"));
+        assert_eq!(
+            html.matches("data-signal").count(),
+            1,
+            "only the unshadowed signal read should be hydrated"
+        );
+    }
+
+    fn assert_shadowed_expression_has_no_signal_binding(mut expr: Expr) {
+        let signals = HashSet::from(["count".to_string()]);
+        let mut graph = SignalGraph::default();
+        scan_expr(&expr, &mut Vec::new(), false, &signals, &mut graph, None);
+        let has_shadowed_read = graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node, GraphNode::Read { signal, .. } if signal == "count"));
+        assert!(
+            !has_shadowed_read,
+            "a locally bound count must not be tracked as a global signal"
+        );
+
+        rewrite_expr(&mut expr, false, &signals, None);
+        assert!(
+            !format!("{expr:?}").contains("data-signal"),
+            "a locally bound count must not receive a hydration marker"
+        );
+    }
+
+    #[test]
+    fn test_lambda_parameter_shadows_global_signal() {
+        let module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+signal count: Html = text("global")
+
+fn view() -> Html { <span>{count}</span> }
+"#,
+        );
+        let html = find_function_body(&module, "view").clone();
+        let expr = Expr::Lambda {
+            params: vec![crate::ast::Param::new("count", None)],
+            ret_type: None,
+            body: Box::new(html),
+            effect: None,
+            span: Span::default(),
+        };
+        assert_shadowed_expression_has_no_signal_binding(expr);
+    }
+
+    #[test]
+    fn test_match_pattern_shadows_global_signal() {
+        let module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+signal count: Html = text("global")
+
+fn view() -> Html { <span>{count}</span> }
+"#,
+        );
+        let html = find_function_body(&module, "view").clone();
+        let expr = Expr::Match {
+            scrutinee: Box::new(Expr::Literal(Literal::Int(1), Span::default())),
+            arms: vec![(Pattern::Var("count".to_string()), None, html)],
+            span: Span::default(),
+        };
+        assert_shadowed_expression_has_no_signal_binding(expr);
+    }
+
+    #[test]
+    fn test_for_binding_shadows_global_signal() {
+        let module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+signal count: Html = text("global")
+
+fn view() -> Html { <span>{count}</span> }
+"#,
+        );
+        let html = find_function_body(&module, "view").clone();
+        let expr = Expr::For {
+            var: "count".to_string(),
+            iterable: Box::new(Expr::Array(Vec::new(), Span::default())),
+            body: Box::new(html),
+            span: Span::default(),
+        };
+        assert_shadowed_expression_has_no_signal_binding(expr);
     }
 
     #[test]
