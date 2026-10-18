@@ -1167,6 +1167,73 @@ fn view() -> Html {
     }
 
     #[test]
+    fn test_shadowed_parameter_does_not_emit_reactive_dom_parts() {
+        let mut module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+signal count: Html = text("global")
+
+fn view(count: Html) -> Html {
+    el("span", [("title", count), ("aria-label", count)], [count])
+}
+"#,
+        );
+        let graph = analyze_module(&module, None);
+        assert!(
+            graph.parts.is_empty(),
+            "a function parameter must shadow the global signal for all part types"
+        );
+        assert!(
+            !graph
+                .nodes
+                .iter()
+                .any(|node| matches!(node, GraphNode::Read { signal, .. } if signal == "count")),
+            "shadowed child reads must not be registered"
+        );
+        rewrite_module(&mut module, None);
+        let body = find_function_body(&module, "view");
+        let html = format!("{body:?}");
+        assert!(!html.contains("data-nulang-attrs"));
+        assert!(!html.contains("data-signal"));
+    }
+
+    #[test]
+    fn test_global_signal_remains_reactive_outside_shadowed_scope() {
+        let mut module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+signal count: Html = text("global")
+
+fn global_view() -> Html {
+    el("span", [("title", count)], [count])
+}
+
+fn local_view(count: Html) -> Html {
+    el("span", [("title", count)], [count])
+}
+"#,
+        );
+        let graph = analyze_module(&module, None);
+        assert_eq!(
+            graph.parts
+                .iter()
+                .filter(|part| matches!(part, DomBindingPart::Attribute { signal, .. } if signal == "count"))
+                .count(),
+            1,
+            "only the unshadowed view has an attribute binding"
+        );
+        rewrite_module(&mut module, None);
+        assert!(format!("{:?}", find_function_body(&module, "global_view"))
+            .contains("data-nulang-attrs"));
+        assert!(!format!("{:?}", find_function_body(&module, "local_view"))
+            .contains("data-nulang-attrs"));
+    }
+
+    #[test]
     fn test_compiler_records_typed_dom_binding_parts() {
         let module = parse(
             r#"
