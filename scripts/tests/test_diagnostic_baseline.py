@@ -89,5 +89,28 @@ class DiagnosticBaselineTests(unittest.TestCase):
         self.assertEqual(self.run_gate().returncode, 1)
 
 
+    def test_relative_symlink_outside_root_is_rejected(self):
+        outside = self.root.parent / (self.root.name + '-outside.nula')
+        outside.write_text('external source', encoding='utf-8')
+        self.addCleanup(outside.unlink)
+        (self.root / 'external.nula').symlink_to(outside)
+        self.write_report([diagnostic(file='external.nula')])
+        result = self.run_gate('--update')
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('outside --root', result.stderr)
+        self.assertFalse(self.baseline.exists())
+
+    def test_relative_symlink_inside_root_is_canonicalized(self):
+        source_dir = self.root / 'src'
+        source_dir.mkdir()
+        (source_dir / 'main.nula').write_text('let n = 1', encoding='utf-8')
+        (self.root / 'alias.nula').symlink_to(source_dir / 'main.nula')
+        self.write_report([diagnostic(file='alias.nula')])
+        result = self.run_gate('--update')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entries = json.loads(self.baseline.read_text(encoding='utf-8'))['warnings']
+        self.assertEqual(entries[0]['file'], 'src/main.nula')
+
+
 if __name__ == '__main__':
     unittest.main()
