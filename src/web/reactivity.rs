@@ -991,6 +991,16 @@ pub fn generate_client_runtime() -> String {
   // Object.prototype (e.g. constructor, toString, __proto__).
   const signals = Object.create(null);
   const signalBindings = Object.create(null);
+  // Explicit batching is synchronous: outside a batch, signal writes remain
+  // immediately visible to legacy consumers.
+  const pendingSignals = new Set();
+  let batchDepth = 0;
+
+  function flushSignalUpdates() {
+    const changed = Array.from(pendingSignals);
+    pendingSignals.clear();
+    changed.forEach(refreshSignal);
+  }
 
   function refreshSignal(name) {
     const bindings = signalBindings[name];
@@ -1177,10 +1187,25 @@ pub fn generate_client_runtime() -> String {
       return {
         get: function () { return signals[name]; },
         set: function (value) {
+          if (Object.is(signals[name], value)) return;
           signals[name] = value;
-          refreshSignal(name);
+          if (batchDepth > 0) {
+            pendingSignals.add(name);
+          } else {
+            refreshSignal(name);
+          }
         }
       };
+    },
+    batch: function (callback) {
+      if (typeof callback !== 'function') throw new TypeError('batch expects a function');
+      batchDepth += 1;
+      try {
+        return callback();
+      } finally {
+        batchDepth -= 1;
+        if (batchDepth === 0) flushSignalUpdates();
+      }
     }
   };
 
