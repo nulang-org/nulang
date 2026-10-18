@@ -23,4 +23,6 @@ for suite in \
   cargo test --locked --no-default-features --features sqlite --test "$suite"
 done
 
+cargo test --locked --no-default-features --features sqlite --test durable_compiled_store_restart
+
 cargo test --locked --no-default-features durable_effect
