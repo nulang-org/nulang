@@ -32,7 +32,6 @@ pub enum GraphNode {
     },
 }
 
-/// Compile-time signal/reactivity graph for a web module.
 /// Compiler-owned DOM parts. This additive manifest describes only bindings
 /// the current browser micro-runtime can update safely.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +41,7 @@ pub enum DomBindingPart {
     Attribute { signal: String, path: String, name: String },
 }
 
+/// Compile-time signal/reactivity graph for a web module.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SignalGraph {
     pub nodes: Vec<GraphNode>,
@@ -1279,6 +1279,13 @@ fn view() -> Html {
         let out = inject_client_runtime_script(html);
         assert!(out.contains(r#"<script src="/app.client.js"></script>"#));
         assert!(out.find("<script").unwrap() < out.find("</body>").unwrap());
+    }
+
+    #[test]
+    fn test_attribute_only_html_injects_client_script() {
+        let html = r#"<div data-nulang-attrs="title:count" title="2">Hello</div>"#;
+        let out = inject_client_runtime_script(html);
+        assert!(out.contains(r#"<script src="/app.client.js"></script>"#));
     }
 
     #[test]
