@@ -158,12 +158,12 @@ fn invalid_typed_query_does_not_reflect_untrusted_value_over_real_http() {
         .expect("bind typed WebDevServer");
     let sensitive_value = "PRIVATE_CREDENTIAL_INVALID_INT";
     let request = format!(
-        "GET /users?limit={sensitive_value} HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n"
+        "GET /users?limit={sensitive_value} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
     );
     let response = send_raw_request(server.port, &request);
 
     assert!(
-        response.starts_with("HTTP/1.1 400 Bad Request\\r\\n"),
+        response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
         "{response}"
     );
     let problem: serde_json::Value =
