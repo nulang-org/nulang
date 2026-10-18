@@ -118,5 +118,20 @@ class DiagnosticBaselineTests(unittest.TestCase):
         self.assertEqual(entries[0]['file'], 'src/main.nula')
 
 
+    def test_boolean_schema_versions_are_rejected(self):
+        self.write_report([])
+        report = json.loads(self.report.read_text(encoding='utf-8'))
+        report['schema_version'] = True
+        self.report.write_text(json.dumps(report), encoding='utf-8')
+        result = self.run_gate('--update')
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse(self.baseline.exists())
+
+        self.write_report([])
+        self.baseline.write_text('{"schema_version": true, "warnings": []}', encoding='utf-8')
+        result = self.run_gate()
+        self.assertEqual(result.returncode, 2, result.stderr)
+
+
 if __name__ == '__main__':
     unittest.main()
