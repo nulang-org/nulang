@@ -18,6 +18,7 @@ Run `bash scripts/ci-local.sh --reliability` for the crash/replay matrix and a b
 - The SQLite-gated `workflow_effect_tail_recovery` and `workflow_timer_process_restart_replay` tests run under `--no-default-features --features sqlite`. Running them under `--no-default-features` alone reports zero tests and **does not** count.
 - `bash scripts/tests/durability-guarantees-contract.test.sh` verifies the dispatch contract and fail-fast behavior with mocked Cargo. It is *not* a replacement for the actual Rust tests.
 - `.github/workflows/dst-nightly.yml` exercises a larger seed sweep; it is independent evidence, not an exact-head PR gate.
+- `tests/workflow_timer_process_restart_replay.rs` now reopens the durable actor twice and asserts exactly one logical timer record and one in-memory timer after both recoveries.
 
 ## Fail-closed policy
 
