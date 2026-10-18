@@ -1560,7 +1560,7 @@ fn view() -> Html {
         let body = find_function_body(&module, "view");
         let html = format!("{:?}", body);
         assert!(html.contains("nulang-signal:"), "marker missing in {html}");
-        assert!(!html.contains("nulang-signal:"), "wrapper must not be emitted");
+        assert!(!html.contains("data-signal"), "wrapper must not be emitted");
     }
 
     #[test]
