@@ -1718,7 +1718,10 @@ mod tests {
             subscription.history.len() <= 64,
             "unattended rooms must not grow replay history without bound"
         );
-        assert_eq!(subscription.history.last().map(String::as_str), Some("event-95"));
+        assert_eq!(
+            subscription.history.last().map(String::as_str),
+            Some("event-95")
+        );
     }
 
     #[test]
