@@ -146,5 +146,34 @@ fn timer_preparation_replay_survives_process_restart_without_duplicate_history_o
     );
 
     drop(recovered);
+
+    // Reopen a second time: a durable TimerSet remains one logical timer
+    // across repeated worker crashes, not merely the first recovery.
+    let mut second_recovery = Runtime::new();
+    second_recovery.persistence = Box::new(LibsqlStore::new(&db_path).unwrap());
+    assert_eq!(second_recovery.recover_actor(actor_id), Some(actor_id));
+    assert_eq!(
+        second_recovery.actors[&actor_id].current_workflow_activation,
+        Some(activation)
+    );
+    assert_eq!(second_recovery.timer_wheel.len(), 1);
+
+    second_recovery
+        .schedule_workflow_timer(actor_id, "wake", 60_000)
+        .unwrap();
+    let timer_history = second_recovery
+        .persistence
+        .read_workflow_events(actor_id)
+        .into_iter()
+        .filter(|event| matches!(event, WorkflowEvent::TimerSet { .. }))
+        .count();
+    assert_eq!(timer_history, 1, "repeated restarts must not append timer history");
+    assert_eq!(
+        second_recovery.timer_wheel.len(),
+        1,
+        "repeated restarts must never double-arm the same logical timer"
+    );
+
+    drop(second_recovery);
     fs::remove_dir_all(store_dir).unwrap();
 }
