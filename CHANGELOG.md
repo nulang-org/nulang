@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Experimental Web wrapper-free signal anchors — 2026-10-18
+- **Direct reactive HTML child reads now use paired compiler-generated comment markers instead of injected `span` elements.** Hex-encoded marker payloads cannot inject markup, while browser hydration pairs anchors, reuses initial text and updates bounded text regions without altering the parent element hierarchy.
+- **Existing `data-signal` runtime hydration remains supported for compatibility.** Rust rewrite/build assertions and a JavaScript DOM regression cover multiple consumers, stable markers and text-only insertion.
+
 ### Experimental Web typed reactive attributes — 2026-10-18
 - **The experimental Web signal compiler now records typed text and safe attribute binding parts.** Direct signal reads can update inert `title`, `alt`, `placeholder`, `class`, `aria-*`, and non-reserved `data-*` attributes in the browser, while URL/event/style attributes remain excluded. Existing text hydration and action placement are preserved.
 - **Rust and JavaScript regressions cover compiler metadata, binding annotations, safe browser updates, and prototype-like signal names.** The change adds no new language-core syntax.
