@@ -33,9 +33,20 @@ pub enum GraphNode {
 }
 
 /// Compile-time signal/reactivity graph for a web module.
+/// Compiler-owned DOM parts. This additive manifest describes only bindings
+/// the current browser micro-runtime can update safely.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DomBindingPart {
+    Text { signal: String, path: String },
+    Attribute { signal: String, path: String, name: String },
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SignalGraph {
     pub nodes: Vec<GraphNode>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<DomBindingPart>,
 }
 
 impl SignalGraph {
@@ -213,6 +224,15 @@ fn scan_expr(
             let children = array_elements(&args[2]);
 
             for (name, value) in &attrs {
+                if let Expr::Var(signal, ..) = value {
+                    if signals.contains(signal) && is_safe_reactive_attribute(name) {
+                        graph.parts.push(DomBindingPart::Attribute {
+                            signal: signal.clone(),
+                            path: path_with_tag(path, &tag),
+                            name: name.clone(),
+                        });
+                    }
+                }
                 if name == "action" {
                     if let Some(handler) = action_handler_name(value) {
                         graph.push(GraphNode::Action {
@@ -234,6 +254,14 @@ fn scan_expr(
 
             path.push(tag);
             for child in &children {
+                if let Expr::Var(signal, ..) = *child {
+                    if signals.contains(signal) {
+                        graph.parts.push(DomBindingPart::Text {
+                            signal: signal.clone(),
+                            path: path_string(path),
+                        });
+                    }
+                }
                 scan_expr(child, path, true, signals, graph, checker);
             }
             path.pop();
@@ -484,6 +512,23 @@ fn array_tuples(expr: &Expr) -> Vec<(String, &Expr)> {
     out
 }
 
+/// Only inert, name-validated attributes are eligible for direct DOM updates.
+/// URL, event, style and framework-owned attributes require distinct checked
+/// binding kinds and are deliberately excluded here.
+fn is_safe_reactive_attribute(name: &str) -> bool {
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return false;
+    }
+    matches!(name, "title" | "alt" | "placeholder" | "class")
+        || (name.starts_with("aria-") && name.len() > 5)
+        || (name.starts_with("data-")
+            && name.len() > 5
+            && !name.starts_with("data-nulang-"))
+}
+
 fn action_handler_name(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Var(name, ..) => Some(name.clone()),
@@ -514,7 +559,10 @@ fn path_with_tag(path: &[String], tag: &str) -> String {
 /// client-side signal micro-runtime can hydrate the page. The tag is placed
 /// just before `</body>` when present, otherwise appended at the end.
 pub fn inject_client_runtime_script(html: &str) -> String {
-    if !html.contains("data-signal=") && !html.contains("data-action=") {
+    if !html.contains("data-signal=")
+        && !html.contains("data-action=")
+        && !html.contains("data-nulang-attrs=")
+    {
         return html.to_string();
     }
     let script = r#"<script src="/app.client.js"></script>"#;
@@ -562,6 +610,7 @@ fn rewrite_expr(
             rewrite_expr(&mut args[2], true, signals, checker);
 
             let mut data_attrs: Vec<Expr> = Vec::new();
+            let mut attribute_bindings = Vec::new();
 
             // Inspect attrs array for action={fn} attributes.
             if let Expr::Array(attrs, _) = &mut args[1] {
@@ -569,6 +618,13 @@ fn rewrite_expr(
                     if let Expr::Tuple(parts, _) = attr {
                         if parts.len() == 2 {
                             if let Some(name) = string_literal(&parts[0]) {
+                                if is_safe_reactive_attribute(&name) {
+                                    if let Expr::Var(signal, ..) = &parts[1] {
+                                        if signals.contains(signal) {
+                                            attribute_bindings.push(format!("{name}:{signal}"));
+                                        }
+                                    }
+                                }
                                 if name == "action" {
                                     if let Some(handler) = action_handler_name(&parts[1]) {
                                         let placement = classify_action(&handler, checker);
@@ -584,6 +640,14 @@ fn rewrite_expr(
                         }
                     }
                 }
+            }
+
+            if !attribute_bindings.is_empty() {
+                data_attrs.push(data_attr(
+                    "data-nulang-attrs",
+                    &attribute_bindings.join(","),
+                    *span,
+                ));
             }
 
             // Wrap direct signal reads in children with <span data-signal="...">.
@@ -791,9 +855,21 @@ pub fn generate_client_runtime() -> String {
   function refreshSignal(name) {
     const bindings = signalBindings[name];
     if (!bindings) return;
-    bindings.forEach(function (el) {
-      el.textContent = signals[name];
+    bindings.forEach(function (binding) {
+      if (binding.kind === 'attribute') {
+        binding.el.setAttribute(binding.attribute, String(signals[name] ?? ''));
+      } else {
+        // Backwards compatible with existing data-signal hydration.
+        binding.textContent = signals[name];
+      }
     });
+  }
+
+  function safeReactiveAttribute(name) {
+    if (!/^[a-z0-9-]+$/.test(name)) return false;
+    return name === 'title' || name === 'alt' || name === 'placeholder' || name === 'class'
+      || (name.startsWith('aria-') && name.length > 5)
+      || (name.startsWith('data-') && name.length > 5 && !name.startsWith('data-nulang-'));
   }
 
   function runClientAction(handler) {
@@ -872,6 +948,20 @@ pub fn generate_client_runtime() -> String {
         signalBindings[name] = [];
       }
       signalBindings[name].push(el);
+    });
+
+    document.querySelectorAll('[data-nulang-attrs]').forEach(function (el) {
+      const encoded = el.getAttribute('data-nulang-attrs') || '';
+      encoded.split(',').forEach(function (entry) {
+        const separator = entry.indexOf(':');
+        if (separator <= 0 || separator === entry.length - 1) return;
+        const attribute = entry.slice(0, separator);
+        const name = entry.slice(separator + 1);
+        if (!safeReactiveAttribute(attribute) || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) return;
+        if (!(name in signals)) signals[name] = el.getAttribute(attribute) ?? '';
+        if (!signalBindings[name]) signalBindings[name] = [];
+        signalBindings[name].push({ kind: 'attribute', el: el, attribute: attribute });
+      });
     });
 
     document.querySelectorAll('[data-action]').forEach(function (el) {
