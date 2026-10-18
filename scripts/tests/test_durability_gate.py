@@ -18,5 +18,19 @@ class DurableReleaseGateTests(unittest.TestCase):
         self.assertIn("set -euo pipefail", gate)
 
 
+    def test_exact_head_ci_runs_real_recovery_gate(self):
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+        self.assertIn("  durability-recovery:\n", workflow)
+        self.assertIn("    name: Durability & Replay Certification\n", workflow)
+        self.assertIn(
+            "run: bash scripts/test-durability-guarantees.sh",
+            workflow,
+        )
+        self.assertIn(
+            "run: cargo test --locked --no-default-features --features sqlite --test workflow_timer_process_restart_replay",
+            workflow,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
