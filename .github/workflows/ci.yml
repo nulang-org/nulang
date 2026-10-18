@@ -58,6 +58,9 @@ jobs:
           node scripts/tests/web_comment_signal_bindings.mjs
           node scripts/tests/web_signal_batching.mjs
 
+      - name: Verify reactive DOM in Chromium
+        run: node --test scripts/tests/web_reactive_browser.test.cjs
+
       - name: Install docs dependencies
         run: |
           cd docs
@@ -108,6 +111,16 @@ jobs:
 
       - name: Build
         run: cargo build --locked --all-targets
+
+      - name: Set up Node 22 for compiled Web E2E
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Compile and verify reactive SSR in Chromium
+        env:
+          NULANG_BIN: /tmp/cargo-target/debug/nulang
+        run: node --test scripts/tests/web_reactive_browser.test.cjs
 
       - name: Test
         # nextest isolates individual tests in their own processes and schedules
