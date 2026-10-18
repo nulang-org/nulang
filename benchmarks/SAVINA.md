@@ -35,6 +35,27 @@ Run one workload with `--benchmark counting` (or `ping_pong`,
 `thread_ring`, `fork_join`, `skynet`). Use `--list` to print the
 supported names.
 
+## Process-level wall-clock baseline (Hyperfine)
+
+```bash
+# Optional, local only. Requires just and hyperfine on PATH.
+just bench-actor-wall
+# Set a custom JSON output path:
+HYPERFINE_OUTPUT=/tmp/nulang-ping-pong.json just bench-actor-wall
+```
+
+The Justfile recipe builds the optimized `nulang-savina` executable
+**before** timing. Hyperfine then measures ten separate process executions of
+the `ping_pong` workload after two warm-ups. Results default to
+`/tmp/nulang-actor-wall.json`. The binary is read from `CARGO_TARGET_DIR`
+when set, otherwise the repository's Cargo-configured `/tmp/cargo-target`.
+
+This **measures total process time**, including startup, parsing and output.
+It does not replace the runner's `elapsed_ns` measurement of the actor
+runtime. For comparisons, use the same machine, CPU governor, build profile,
+feature set, input, and idle system state; use the saved JSON for review.
+No GitHub Actions job runs Hyperfine automatically.
+
 ## Output schema
 
 Each JSONL row contains:
