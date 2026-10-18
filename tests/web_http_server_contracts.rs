@@ -159,8 +159,9 @@ fn duplicate_canonical_action_form_fields_fail_over_real_http() {
     let server = WebDevServer::bind(0, None, None, vec![route]).expect("bind WebDevServer");
 
     let form = "title=admin&title=user&__nulang_ui_message=invalid";
+    let host = format!("localhost:{}", server.port);
     let request = format!(
-        "POST /legacy HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "POST /legacy HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         form.len(),
         form
     );
