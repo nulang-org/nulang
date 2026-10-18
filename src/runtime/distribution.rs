@@ -196,7 +196,7 @@ pub(crate) fn is_acked(rt: &Runtime, seq: u64) -> bool {
     rt.acked_packets.contains(&seq)
 }
 /// Check whether a specific peer acknowledged a packet sequence.
-pub(crate) fn is_acked_from(rt: &Runtime, peer: crate::runtime::network::NodeId, seq: u64) -> bool {
+pub(crate) fn is_acked_from(rt: &Runtime, peer: NodeId, seq: u64) -> bool {
     rt.acked_packets_by_peer.contains(&(peer.0, seq))
 }
 
