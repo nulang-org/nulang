@@ -1193,7 +1193,7 @@ fn view() -> Html {
             }));
         }
         assert_eq!(graph.parts.len(), 3, "unsafe attributes are not live bindings");
-        assert!(graph.to_json().contains("\\"kind\\": \\"attribute\\""));
+        assert!(graph.to_json().contains(r#""kind": "attribute""#));
     }
 
     #[test]
