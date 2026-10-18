@@ -604,7 +604,9 @@ fn main() {
             || opts.explain.is_some()
             || opts.emit_stdlib_docs.is_some()
         {
-            eprintln!("Error: --inspect requires exactly one source FILE and no other execution mode");
+            eprintln!(
+                "Error: --inspect requires exactly one source FILE and no other execution mode"
+            );
             std::process::exit(2);
         }
 
@@ -626,14 +628,11 @@ fn main() {
                     error.to_string(),
                 ),
                 Ok((ast, checker)) => {
-                    let hir =
-                        nulang::hir_lower::lower_module(&ast, &checker.inferred_decl_types);
+                    let hir = nulang::hir_lower::lower_module(&ast, &checker.inferred_decl_types);
                     match nulang::mir_lower::lower_module(&hir) {
-                        Ok(mir) => nulang::backend_inspect::inspect_mir(
-                            &mir,
-                            &opts.backend,
-                            &opts.target,
-                        ),
+                        Ok(mir) => {
+                            nulang::backend_inspect::inspect_mir(&mir, &opts.backend, &opts.target)
+                        }
                         Err(error) => {
                             nulang::backend_inspect::BackendInspection::frontend_rejected(
                                 &opts.backend,
