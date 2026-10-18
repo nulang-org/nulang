@@ -37,8 +37,15 @@ pub enum GraphNode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DomBindingPart {
-    Text { signal: String, path: String },
-    Attribute { signal: String, path: String, name: String },
+    Text {
+        signal: String,
+        path: String,
+    },
+    Attribute {
+        signal: String,
+        path: String,
+        name: String,
+    },
 }
 
 /// Compile-time signal/reactivity graph for a web module.
@@ -524,9 +531,7 @@ fn is_safe_reactive_attribute(name: &str) -> bool {
     }
     matches!(name, "title" | "alt" | "placeholder" | "class")
         || (name.starts_with("aria-") && name.len() > 5)
-        || (name.starts_with("data-")
-            && name.len() > 5
-            && !name.starts_with("data-nulang-"))
+        || (name.starts_with("data-") && name.len() > 5 && !name.starts_with("data-nulang-"))
 }
 
 fn action_handler_name(expr: &Expr) -> Option<String> {
@@ -1192,7 +1197,11 @@ fn view() -> Html {
                 name: name.to_string(),
             }));
         }
-        assert_eq!(graph.parts.len(), 3, "unsafe attributes are not live bindings");
+        assert_eq!(
+            graph.parts.len(),
+            3,
+            "unsafe attributes are not live bindings"
+        );
         assert!(graph.to_json().contains(r#""kind": "attribute""#));
     }
 
