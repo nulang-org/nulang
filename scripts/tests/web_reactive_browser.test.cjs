@@ -9,7 +9,7 @@ const { spawn, spawnSync } = require('node:child_process');
 const test = require('node:test');
 
 function runtime() {
-  const source = fs.readFileSync(path.join(__dirname, '../src/web/reactivity.rs'), 'utf8');
+  const source = fs.readFileSync(path.join(__dirname, '../../src/web/reactivity.rs'), 'utf8');
   const start = source.indexOf('pub fn generate_client_runtime() -> String {');
   assert.ok(start >= 0);
   const begin = source.indexOf('r#"', start) + 3;
@@ -206,7 +206,7 @@ test('compiler-generated SSR hydrates in Chromium', {
     ], {
       // The fixture's cwd is a temporary project. The contract parser must
       // still resolve imported opaque web types from the checked-in stdlib.
-      env: { ...process.env, NULANG_STDLIB: path.resolve(__dirname, '../src/stdlib') },
+      env: { ...process.env, NULANG_STDLIB: path.resolve(__dirname, '../../src/stdlib') },
       cwd: dir,
       encoding: 'utf8',
       timeout: 65000,
