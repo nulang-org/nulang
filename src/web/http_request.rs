@@ -5,16 +5,21 @@
 //! coupling the decoder to the runtime server implementation.
 
 use crate::web::request_bindings::{
-    parse_cookie_header, parse_urlencoded, split_request_target, RequestBindingValues,
+    parse_cookie_header, parse_urlencoded, percent_decode_form, split_request_target,
+    RequestBindingValues,
 };
-use nulang_ui_protocol::{decode_host_message, ActionPlacement, HostToRuntimeMessage};
-use std::collections::HashMap;
+use nulang_ui_protocol::{decode_host_message, ActionPlacement, HostToRuntimeMessage, WireValue};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Why a renderer-neutral action envelope was rejected at the HTTP boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiActionEnvelopeError {
     Malformed,
     ClientPlacement,
+    PayloadMismatch,
+    DuplicateFormField {
+        name: String,
+    },
     LegacyActionMismatch {
         envelope_action: String,
         legacy_action: String,
@@ -27,6 +32,12 @@ impl std::fmt::Display for UiActionEnvelopeError {
             Self::Malformed => f.write_str("malformed or unsupported UI action envelope"),
             Self::ClientPlacement => {
                 f.write_str("client-placement UI action cannot be invoked over server transport")
+            }
+            Self::PayloadMismatch => {
+                f.write_str("UI action payload does not match submitted form values")
+            }
+            Self::DuplicateFormField { name } => {
+                write!(f, "duplicate field '{name}' in canonical UI action form")
             }
             Self::LegacyActionMismatch {
                 envelope_action,
@@ -78,7 +89,19 @@ impl HttpRequestBindingInputs {
         } else {
             HashMap::new()
         };
-        let (ui_message, ui_message_error) = capture_ui_action_message(&form);
+        // A canonical action must have a single unambiguous interpretation.
+        // The legacy form path remains unchanged until its own contract migrates.
+        let (ui_message, ui_message_error) = if form.contains_key("__nulang_ui_message") {
+            match find_duplicate_form_field(body) {
+                Some(name) => (
+                    None,
+                    Some(UiActionEnvelopeError::DuplicateFormField { name }),
+                ),
+                None => capture_ui_action_message(&form),
+            }
+        } else {
+            (None, None)
+        };
 
         Self {
             query,
@@ -106,6 +129,23 @@ impl HttpRequestBindingInputs {
             form: &self.form,
         }
     }
+}
+
+/// Decode field names with the same rules as the existing form parser, but
+/// preserve multiplicity long enough to reject ambiguity before map collapse.
+fn find_duplicate_form_field(body: &[u8]) -> Option<String> {
+    let mut seen = HashSet::new();
+    for pair in String::from_utf8_lossy(body)
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+    {
+        let key = pair.split_once('=').map_or(pair, |(key, _)| key);
+        let name = percent_decode_form(key);
+        if !seen.insert(name.clone()) {
+            return Some(name);
+        }
+    }
+    None
 }
 
 fn capture_ui_action_message(
@@ -137,6 +177,25 @@ fn capture_ui_action_message(
                 }),
             );
         }
+    }
+
+    // The envelope and the form are both untrusted. Requiring consistency
+    // prevents ambiguous interpretations of one submission by different
+    // framework layers; it does not authenticate or authorize the action.
+    let submitted: BTreeMap<String, WireValue> = form
+        .iter()
+        .filter(|(key, _)| {
+            key.as_str() != "__nulang_action" && key.as_str() != "__nulang_ui_message"
+        })
+        .map(|(key, value)| (key.clone(), WireValue::from(value.clone())))
+        .collect();
+    let matches_payload = match &request.payload {
+        WireValue::Null => submitted.is_empty(),
+        WireValue::Object(fields) => *fields == submitted,
+        _ => false,
+    };
+    if !matches_payload {
+        return (None, Some(UiActionEnvelopeError::PayloadMismatch));
     }
 
     (Some(message), None)
@@ -292,6 +351,139 @@ mod tests {
                 legacy_action: "different_action".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn rejects_duplicate_form_field_in_canonical_action_before_dispatch() {
+        let headers = vec![(
+            "Content-Type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        )];
+        let captured = HttpRequestBindingInputs::capture(
+            "/",
+            &headers,
+            b"role=admin&role=user&__nulang_ui_message=invalid",
+        );
+        assert!(captured.ui_message.is_none());
+        assert_eq!(
+            captured.ui_message_error,
+            Some(UiActionEnvelopeError::DuplicateFormField {
+                name: "role".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_percent_encoded_and_duplicate_control_fields() {
+        let headers = vec![(
+            "Content-Type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        )];
+        let encoded = HttpRequestBindingInputs::capture(
+            "/",
+            &headers,
+            b"role=admin&ro%6Ce=user&__nulang_ui_message=invalid",
+        );
+        assert_eq!(
+            encoded.ui_message_error,
+            Some(UiActionEnvelopeError::DuplicateFormField {
+                name: "role".to_string(),
+            })
+        );
+
+        let controls = HttpRequestBindingInputs::capture(
+            "/",
+            &headers,
+            b"__nulang_ui_message=invalid&__nulang_ui_message=another",
+        );
+        assert_eq!(
+            controls.ui_message_error,
+            Some(UiActionEnvelopeError::DuplicateFormField {
+                name: "__nulang_ui_message".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn keeps_legacy_form_compatibility_for_duplicate_fields() {
+        let headers = vec![(
+            "Content-Type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        )];
+        let legacy = HttpRequestBindingInputs::capture("/", &headers, b"role=admin&role=user");
+        assert!(legacy.ui_message.is_none());
+        assert_eq!(legacy.ui_message_error, None);
+    }
+
+    #[test]
+    fn rejects_action_payload_disagreeing_with_posted_form() {
+        let message = nulang_ui_protocol::HostToRuntimeMessage::invoke_action(
+            nulang_ui_protocol::ActionRequest {
+                document_id: "app".into(),
+                revision: nulang_ui_protocol::Revision(1),
+                action_id: "save".into(),
+                placement: nulang_ui_protocol::ActionPlacement::Server,
+                correlation_id: "corr-1".into(),
+                idempotency_key: "idem-1".into(),
+                payload: nulang_ui_protocol::WireValue::Object(
+                    [(
+                        "title".to_string(),
+                        nulang_ui_protocol::WireValue::from("forged"),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+            },
+        );
+        let encoded = nulang_ui_protocol::encode_host_message(&message).unwrap();
+        let form = format!(
+            "title=actual&__nulang_action=save&__nulang_ui_message={}",
+            percent_encode_form_value(&encoded)
+        );
+        let headers = vec![(
+            "Content-Type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        )];
+        let captured = HttpRequestBindingInputs::capture("/", &headers, form.as_bytes());
+        assert!(captured.ui_message.is_none());
+        assert_eq!(
+            captured.ui_message_error,
+            Some(UiActionEnvelopeError::PayloadMismatch)
+        );
+    }
+
+    #[test]
+    fn accepts_action_payload_matching_posted_form() {
+        let message = nulang_ui_protocol::HostToRuntimeMessage::invoke_action(
+            nulang_ui_protocol::ActionRequest {
+                document_id: "app".into(),
+                revision: nulang_ui_protocol::Revision(1),
+                action_id: "save".into(),
+                placement: nulang_ui_protocol::ActionPlacement::Server,
+                correlation_id: "corr-1".into(),
+                idempotency_key: "idem-1".into(),
+                payload: nulang_ui_protocol::WireValue::Object(
+                    [(
+                        "title".to_string(),
+                        nulang_ui_protocol::WireValue::from("actual"),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+            },
+        );
+        let encoded = nulang_ui_protocol::encode_host_message(&message).unwrap();
+        let form = format!(
+            "title=actual&__nulang_action=save&__nulang_ui_message={}",
+            percent_encode_form_value(&encoded)
+        );
+        let headers = vec![(
+            "Content-Type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        )];
+        let captured = HttpRequestBindingInputs::capture("/", &headers, form.as_bytes());
+        assert_eq!(captured.ui_message, Some(message));
+        assert_eq!(captured.ui_message_error, None);
     }
 
     #[test]
