@@ -59,7 +59,7 @@ def normalize_file(name, root):
 
 
 def report_warnings(report, root):
-    if report.get('schema_version') != SCHEMA_VERSION:
+    if type(report.get('schema_version')) is not int or report['schema_version'] != SCHEMA_VERSION:
         raise InputError('unsupported diagnostic report schema_version')
     diagnostics = report.get('diagnostics')
     if not isinstance(diagnostics, list) or not isinstance(report.get('ok'), bool):
@@ -96,7 +96,8 @@ def read_baseline(path):
     if not path.exists():
         return Counter()
     data = read_object(path)
-    if data.get('schema_version') != SCHEMA_VERSION or not isinstance(data.get('warnings'), list):
+    if (type(data.get('schema_version')) is not int or data['schema_version'] != SCHEMA_VERSION
+            or not isinstance(data.get('warnings'), list)):
         raise InputError('unsupported baseline schema (expected v1 warnings array)')
     counts = Counter()
     for item in data['warnings']:
