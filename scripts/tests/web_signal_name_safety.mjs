@@ -7,10 +7,13 @@ const rust = readFileSync(new URL('../../src/web/reactivity.rs', import.meta.url
 const start = rust.indexOf('pub fn generate_client_runtime() -> String {');
 assert.notEqual(start, -1, 'generate_client_runtime must be defined');
 const match = rust.slice(start).match(/r#"([\s\S]*?)"#\s*\.to_string\(\)/);
-const runtime = match ? match[1] : (() => {
-  assert.match(rust, /include_str!\("client_runtime\.js"\)/, 'find emitted compiler-owned client runtime');
-  return readFileSync(new URL('../../src/web/client_runtime.js', import.meta.url), 'utf8');
-})();
+const extracted = rust.slice(start, start + 200).includes('include_str!("client_runtime.js")');
+const runtime = extracted
+  ? readFileSync(new URL('../../src/web/client_runtime.js', import.meta.url), 'utf8')
+  : (() => {
+      assert.ok(match, 'find emitted client runtime JavaScript in Rust');
+      return match[1];
+    })();
 
 function mount(values, readyState = 'complete') {
   const elements = values.map(([signal, content]) => ({
