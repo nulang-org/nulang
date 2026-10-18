@@ -245,7 +245,7 @@ pub fn compile_module_contracts(module: &AstModule) -> ContractCompilation {
     let mut function_bodies = HashMap::new();
     for declaration in &declarations {
         if let Decl::Function { name, body, .. } = *declaration {
-            function_bodies.insert(name.as_str(), body.as_ref());
+            function_bodies.insert(name.as_str(), body);
         }
     }
 
