@@ -2,7 +2,7 @@ name: PR Title Check
 
 on:
   pull_request:
-    types: [opened, edited, synchronize, reopened, ready_for_review]
+    types: [opened, edited, synchronize, reopened, ready_for_review, converted_to_draft]
 
 # A newer commit on the same PR/head makes the older validation result stale.
 # Keep event types separate so scheduled/default-branch runs do not cancel PR runs.

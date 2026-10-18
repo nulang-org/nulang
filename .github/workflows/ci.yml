@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
 
 # A newer push to the same PR/branch supersedes the previous run. Without
 # this, every push queues a full ~6h run set (including Release Build) and
@@ -313,6 +313,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y python3-dev
@@ -332,7 +334,18 @@ jobs:
 
       # Keep whitespace hygiene blocking alongside formatting.
       - name: Whitespace check
-        run: git diff --check
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BASE_SHA: ${{ github.event.before }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            git diff --check "$PR_BASE_SHA...$PR_HEAD_SHA"
+          elif [ "$PUSH_BASE_SHA" != "0000000000000000000000000000000000000000" ]; then
+            git diff --check "$PUSH_BASE_SHA...$GITHUB_SHA"
+          else
+            git diff --check HEAD^...$GITHUB_SHA
+          fi
 
       # Clippy with default features — correctness lints are blocking.
       - name: Clippy (default features)

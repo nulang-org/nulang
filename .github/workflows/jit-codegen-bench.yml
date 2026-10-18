@@ -8,7 +8,7 @@ on:
         required: false
         default: '5'
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
     paths:
       - '.github/workflows/jit-codegen-bench.yml'
       - 'src/backends/mod.rs'

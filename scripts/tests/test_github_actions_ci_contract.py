@@ -64,6 +64,7 @@ class GitHubActionsCIContractTests(unittest.TestCase):
             source = (WORKFLOW_DIR / filename).read_text(encoding="utf-8")
             with self.subTest(workflow=filename):
                 self.assertIn("ready_for_review", source)
+                self.assertIn("converted_to_draft", source)
                 self.assertIn(
                     "github.event.pull_request.draft == false",
                     source,
@@ -75,6 +76,15 @@ class GitHubActionsCIContractTests(unittest.TestCase):
         release = RELEASE.read_text(encoding="utf-8")
         self.assertIn("needs.release.result == 'success'", ci)
         self.assertIn("needs.preflight.result == 'success'", release)
+        self.assertIn("fetch-depth: 0", ci)
+        self.assertIn(
+            'git diff --check "$PR_BASE_SHA...$PR_HEAD_SHA"',
+            ci,
+        )
+        release_trigger = release.split("  pull_request:\n", 1)[1].split(
+            "    paths:\n", 1
+        )[0]
+        self.assertNotIn("labeled", release_trigger)
 
     def test_release_concurrency_never_cancels_tagged_publish(self):
         source = RELEASE.read_text(encoding="utf-8")

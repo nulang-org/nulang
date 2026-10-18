@@ -2,7 +2,7 @@ name: Remote RTT stage profile
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
     paths:
       - 'tests/remote_rtt_stage_profile.rs'
       - 'tests/remote_rtt_stage_profile_contract.rs'

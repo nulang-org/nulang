@@ -24,7 +24,7 @@ on:
           - core-native
           - default
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
     paths:
       - '.github/workflows/nulang-ab-bench.yml'
       - 'scripts/nulang_ab_bench.py'

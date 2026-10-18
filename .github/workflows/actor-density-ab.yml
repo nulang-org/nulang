@@ -20,7 +20,7 @@ on:
         required: false
         default: '1'
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
     paths:
       - '.github/workflows/actor-density-ab.yml'
       - 'scripts/actor_density_ab_bench.py'

@@ -2,7 +2,7 @@ name: Cluster gossip throttle
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
     paths:
       - 'tests/cluster_gossip_throttle.rs'
       - '.github/workflows/cluster-gossip-throttle-pr.yml'
