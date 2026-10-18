@@ -167,7 +167,10 @@ fn timer_preparation_replay_survives_process_restart_without_duplicate_history_o
         .into_iter()
         .filter(|event| matches!(event, WorkflowEvent::TimerSet { .. }))
         .count();
-    assert_eq!(timer_history, 1, "repeated restarts must not append timer history");
+    assert_eq!(
+        timer_history, 1,
+        "repeated restarts must not append timer history"
+    );
     assert_eq!(
         second_recovery.timer_wheel.len(),
         1,
