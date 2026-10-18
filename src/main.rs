@@ -5,6 +5,7 @@
 //!   nulang --repl
 //!   nulang --eval <CODE>
 //!   nulang --check <FILE>
+//!   nulang --inspect --backend <bytecode|native|wasm> <FILE>
 //!   nulang --lsp
 //!   nulang --dap [FILE]
 //!   nulang agent <init|run|chat|goals|graph>
@@ -26,6 +27,7 @@
 //!                            handlers, no actor mailbox — requires wasm-backend)
 //!   --out <file>             Output file (WASM backends / --emit-nbc)
 //!   --emit-nbc               Compile <FILE> to a .nbc artifact; don't run
+//!   --inspect                Emit versioned compile-only backend report as JSON
 //!   --emit-behavior-manifest <file>  Emit RFC 0020 behavior sidecar with durable schema metadata
 //!   <FILE>.nbc               Run a pre-compiled .nbc artifact directly
 //!   --verify <src>           Verify .nbc source hash against <src>
@@ -440,6 +442,7 @@ fn main() {
                     std::process::exit(1);
                 }
             }
+            "--inspect" => opts.inspect = true,
             "-v" | "--verbose" => opts.verbose = true,
             "--all-errors" => opts.all_errors = true,
             "--json" => opts.json = true,
@@ -544,6 +547,7 @@ fn main() {
                     "--verify",
                     "--bench",
                     "--json",
+                    "--inspect",
                     "--store",
                     "--version",
                     "--verbose",
@@ -579,6 +583,75 @@ fn main() {
     if opts.emit_behavior_manifest.is_some() && !opts.emit_nbc {
         eprintln!("Error: --emit-behavior-manifest currently requires --emit-nbc");
         std::process::exit(1);
+    }
+
+    // Inspection runs before any program execution or artifact emission.
+    // Compiler acceptance does not prove runtime or durable replay equivalence.
+    if opts.inspect {
+        if positional.len() != 1
+            || opts.eval_code.is_some()
+            || opts.check_file.is_some()
+            || opts.emit_nbc
+            || opts.emit_signals.is_some()
+            || opts.rewrite_signals.is_some()
+            || opts.repl
+            || opts.doc
+            || opts.lsp
+            || opts.dap
+            || opts.bench_count.is_some()
+            || opts.watch.is_some()
+            || opts.init.is_some()
+            || opts.explain.is_some()
+            || opts.emit_stdlib_docs.is_some()
+        {
+            eprintln!("Error: --inspect requires exactly one source FILE and no other execution mode");
+            std::process::exit(2);
+        }
+
+        let path = &positional[0];
+        let report = match std::fs::read_to_string(path) {
+            Err(error) => nulang::backend_inspect::BackendInspection::frontend_rejected(
+                &opts.backend,
+                format!("cannot read source file '{path}': {error}"),
+            ),
+            Ok(source) => match run_frontend(
+                &source,
+                Some(path),
+                false, // Keep stdout JSON-only regardless of --verbose.
+                &opts.with_capabilities,
+                opts.deny_warnings,
+            ) {
+                Err(error) => nulang::backend_inspect::BackendInspection::frontend_rejected(
+                    &opts.backend,
+                    error.to_string(),
+                ),
+                Ok((ast, checker)) => {
+                    let hir =
+                        nulang::hir_lower::lower_module(&ast, &checker.inferred_decl_types);
+                    match nulang::mir_lower::lower_module(&hir) {
+                        Ok(mir) => nulang::backend_inspect::inspect_mir(
+                            &mir,
+                            &opts.backend,
+                            &opts.target,
+                        ),
+                        Err(error) => {
+                            nulang::backend_inspect::BackendInspection::frontend_rejected(
+                                &opts.backend,
+                                error.to_string(),
+                            )
+                        }
+                    }
+                }
+            },
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).expect("backend inspection must serialize")
+        );
+        if !report.succeeded() {
+            std::process::exit(1);
+        }
+        return;
     }
 
     // Resolve color mode once after all args are parsed.
@@ -1056,6 +1129,8 @@ struct Options {
     /// Emit machine-readable JSON diagnostics on stdout (see
     /// `nulang::json_diagnostics` for the schema).
     json: bool,
+    /// Compile-only backend compatibility report, emitted as JSON.
+    inspect: bool,
     bench_count: Option<usize>,
     /// Start a Prometheus-format metrics server on this port.
     metrics_port: Option<u16>,
@@ -1106,6 +1181,7 @@ impl Default for Options {
             explain: None,
             all_errors: false,
             json: false,
+            inspect: false,
             bench_count: None,
             metrics_port: None,
             ffi_sandbox: false,
@@ -1123,6 +1199,7 @@ fn print_help() {
     println!("       nulang --repl");
     println!("       nulang --eval <CODE>");
     println!("       nulang --check <FILE>");
+    println!("       nulang --inspect --backend <bytecode|native|wasm> <FILE>");
     println!("       nulang --lsp");
     println!("       nulang --dap");
     println!("       nulang fmt [--check] [<file>]");
@@ -1133,6 +1210,7 @@ fn print_help() {
     println!("  -r, --repl       Start interactive REPL");
     println!("  -e, --eval       Evaluate a code string");
     println!("  -c, --check      Type-check a file (don't run)");
+    println!("  --inspect        JSON report of backend compiler acceptance; never runs input");
     println!("  --doc            Generate Markdown API docs (docs/api.md)");
     println!("  --emit-stdlib-docs <dir>  Generate per-effect stdlib Markdown docs into <dir>");
     println!("  --lsp            Start Language Server (stdio)");
