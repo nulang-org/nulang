@@ -276,17 +276,17 @@ pub fn decode_scalar_constant(raw: &str, ty: Option<&str>) -> Result<Constant, S
         Some("Int") => raw
             .parse::<i64>()
             .map(Constant::Int)
-            .map_err(|_| format!("expected Int, got '{raw}'")),
+            .map_err(|_| "expected Int".to_string()),
         Some("Float") => raw
             .parse::<f64>()
             .ok()
             .filter(|value| value.is_finite())
             .map(Constant::Float)
-            .ok_or_else(|| format!("expected finite Float, got '{raw}'")),
+            .ok_or_else(|| "expected finite Float".to_string()),
         Some("Bool") => match raw {
             "true" => Ok(Constant::Bool(true)),
             "false" => Ok(Constant::Bool(false)),
-            _ => Err(format!("expected Bool ('true' or 'false'), got '{raw}'")),
+            _ => Err("expected Bool ('true' or 'false')".to_string()),
         },
         _ => Ok(Constant::String(raw.to_string())),
     }
