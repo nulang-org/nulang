@@ -93,7 +93,10 @@ class DiagnosticBaselineTests(unittest.TestCase):
         outside = self.root.parent / (self.root.name + '-outside.nula')
         outside.write_text('external source', encoding='utf-8')
         self.addCleanup(outside.unlink)
-        (self.root / 'external.nula').symlink_to(outside)
+        try:
+            (self.root / 'external.nula').symlink_to(outside)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f'file symlinks unavailable on this runner: {exc}')
         self.write_report([diagnostic(file='external.nula')])
         result = self.run_gate('--update')
         self.assertEqual(result.returncode, 2, result.stderr)
@@ -104,7 +107,10 @@ class DiagnosticBaselineTests(unittest.TestCase):
         source_dir = self.root / 'src'
         source_dir.mkdir()
         (source_dir / 'main.nula').write_text('let n = 1', encoding='utf-8')
-        (self.root / 'alias.nula').symlink_to(source_dir / 'main.nula')
+        try:
+            (self.root / 'alias.nula').symlink_to(source_dir / 'main.nula')
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f'file symlinks unavailable on this runner: {exc}')
         self.write_report([diagnostic(file='alias.nula')])
         result = self.run_gate('--update')
         self.assertEqual(result.returncode, 0, result.stderr)
