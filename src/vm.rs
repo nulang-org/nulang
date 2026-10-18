@@ -4428,10 +4428,13 @@ impl VM {
                 msg: "PerformAsync requires an already-fetched bytecode PC".into(),
                 span: Span::default(),
             })?;
-        let module = self.modules.get(module_idx).ok_or_else(|| NuError::VMError {
-            msg: "PerformAsync references a missing bytecode module".into(),
-            span: Span::default(),
-        })?;
+        let module = self
+            .modules
+            .get(module_idx)
+            .ok_or_else(|| NuError::VMError {
+                msg: "PerformAsync references a missing bytecode module".into(),
+                span: Span::default(),
+            })?;
         // Do not hand a forged/stale instruction identity to any host callback:
         // the PC must refer to the exact instruction the VM is executing.
         if instr.opcode != OpCode::PerformAsync || module.instructions.get(pc) != Some(&instr) {
@@ -6640,7 +6643,10 @@ mod vm_tests {
             vm.step_perform_async(0, 0, wrong_instruction),
             Err(NuError::VMError { .. })
         ));
-        assert!(sites.borrow().is_empty(), "mismatched opcode reached the host");
+        assert!(
+            sites.borrow().is_empty(),
+            "mismatched opcode reached the host"
+        );
     }
 
     #[test]
