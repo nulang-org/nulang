@@ -188,3 +188,17 @@ test('legacy HTML server action response falls back to reload', async () => {
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(ctx.reloaded(), 1);
 });
+
+test('preserves __proto__ submitter field in canonical action payload', () => {
+  const { listeners, posted } = boot({
+    withAction: true,
+    fetchResponse: { ok: true, headers: { get() { return 'text/html'; } } },
+  });
+  const listener = listeners.get('submit');
+  assert.equal(typeof listener, 'function');
+  listener({ preventDefault() {}, submitter: { name: '__proto__', value: 'safe-data' } });
+  const body = posted().body;
+  const message = JSON.parse(body.get('__nulang_ui_message'));
+  assert.equal(body.get('__proto__'), 'safe-data');
+  assert.deepEqual(message.request.payload.value.__proto__, { type: 'string', value: 'safe-data' });
+});
