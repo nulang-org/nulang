@@ -1,4 +1,8 @@
 # Nulang Changelog
+### TCP sender connection-generation fencing — 2026-10-16
+- **A failed TCP writer can no longer retire a newer replacement connection for the same peer.** Sender cleanup now checks the generation of the connection that actually failed, preserving replacements installed while the sender was between write and cleanup locks.
+- **A TCP regression verifies replacement delivery after stale cleanup.** Packet retry and acknowledgement semantics are unchanged; this narrows connection lifecycle cleanup without claiming to resolve every intermittent split-brain delivery failure.
+
 ### Bounded Nulang Web development-server connections — 2026-10-16
 - **The experimental Web development listener caps active connections at 64**, including SSE, and returns `503` with `Retry-After: 1` when full.
 - **Worker capacity is returned by a scoped RAII lease** after normal completion, panic, or thread-spawn failure. One shared `Arc` route table replaces per-connection clones of compiled route modules.

@@ -5164,7 +5164,10 @@ fn pump_until_peer_roundtrip(sender: &mut Runtime, peer: &mut Runtime, timeout: 
         peer.process_network();
         sender.process_network();
 
-        if probe_sequences.iter().any(|seq| sender.is_acked(*seq)) {
+        if probe_sequences
+            .iter()
+            .any(|seq| sender.is_acked_from(peer_id, *seq))
+        {
             return;
         }
 

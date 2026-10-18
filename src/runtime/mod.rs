@@ -385,6 +385,10 @@ pub struct Runtime {
     pub cluster_config: ClusterConfig,
     // Acknowledged packet sequence numbers (transport-level reliability).
     pub acked_packets: HashSet<u64>,
+    /// Acknowledged packet sequences keyed by the peer that sent the ACK.
+    /// This prevents a sequence collision from another node from satisfying
+    /// a readiness probe for the wrong peer.
+    pub(crate) acked_packets_by_peer: HashSet<(u64, u64)>,
 
     // Cross-node supervision (RFC 0012)
     pub remote_links: supervision::RemoteLinkRegistry,
@@ -661,6 +665,7 @@ impl Runtime {
             distributed: DistributedContext::new(),
             cluster_config: ClusterConfig::default(),
             acked_packets: HashSet::new(),
+            acked_packets_by_peer: HashSet::new(),
             remote_links: supervision::RemoteLinkRegistry::new(),
             remote_monitors: supervision::RemoteMonitorRegistry::new(),
             migrated_actors: HashMap::new(),
@@ -7394,6 +7399,10 @@ impl Runtime {
     /// acknowledged by the receiver.
     pub fn is_acked(&self, seq: u64) -> bool {
         distribution::is_acked(self, seq)
+    }
+    /// Check whether a specific peer acknowledged a packet sequence.
+    pub(crate) fn is_acked_from(&self, peer: NodeId, seq: u64) -> bool {
+        distribution::is_acked_from(self, peer, seq)
     }
 
     /// Drain and return all acknowledged packet sequence numbers.
