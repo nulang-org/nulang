@@ -55,6 +55,7 @@ jobs:
         run: |
           node scripts/tests/web_signal_name_safety.mjs
           node scripts/tests/web_dom_attribute_bindings.mjs
+          node scripts/tests/web_comment_signal_bindings.mjs
 
       - name: Install docs dependencies
         run: |
