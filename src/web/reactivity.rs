@@ -1072,6 +1072,69 @@ fn view() -> Html {
     }
 
     #[test]
+    fn test_compiler_records_typed_dom_binding_parts() {
+        let module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+signal count: Html = text("2")
+
+fn view() -> Html {
+    el("div", [
+        ("title", count),
+        ("aria-label", count),
+        ("href", count),
+        ("onclick", count)
+    ], [count])
+}
+"#,
+        );
+        let graph = analyze_module(&module, None);
+        assert!(graph.parts.contains(&DomBindingPart::Text {
+            signal: "count".to_string(),
+            path: "div".to_string(),
+        }));
+        for name in ["title", "aria-label"] {
+            assert!(graph.parts.contains(&DomBindingPart::Attribute {
+                signal: "count".to_string(),
+                path: "div".to_string(),
+                name: name.to_string(),
+            }));
+        }
+        assert_eq!(graph.parts.len(), 3, "unsafe attributes are not live bindings");
+        assert!(graph.to_json().contains("\\"kind\\": \\"attribute\\""));
+    }
+
+    #[test]
+    fn test_rewrite_annotates_safe_attributes_only() {
+        let mut module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+signal count: Html = text("2")
+
+fn view() -> Html {
+    el("div", [
+        ("title", count),
+        ("aria-label", count),
+        ("href", count),
+        ("onclick", count)
+    ], [count])
+}
+"#,
+        );
+        rewrite_module(&mut module, None);
+        let body = find_function_body(&module, "view");
+        let html = format!("{:?}", body);
+        assert!(html.contains("data-nulang-attrs"));
+        assert!(html.contains("title:count,aria-label:count"));
+        assert!(!html.contains("href:count"));
+        assert!(!html.contains("onclick:count"));
+    }
+
+    #[test]
     fn test_rewrite_action_data_attrs() {
         let mut module = parse(
             r#"
