@@ -59,7 +59,8 @@ impl Drop for TestDb {
 }
 
 fn compiled_nbc() -> CodeModule {
-    let source = "actor Payments { behavior charge(order: String) { perform Inference.ask(order) } }";
+    let source =
+        "actor Payments { behavior charge(order: String) { perform Inference.ask(order) } }";
     let tokens = Lexer::new(source).lex().unwrap();
     let ast = Parser::new(tokens).parse_module().unwrap();
     let mut types = TypeChecker::new();
@@ -213,7 +214,10 @@ fn sqlite_reopen_retries_prepared_effect_with_same_key_but_requires_live_authori
                 ))
             },
         );
-        assert!(matches!(failure, Err(DurableAsyncDispatchError::Provider(_))));
+        assert!(matches!(
+            failure,
+            Err(DurableAsyncDispatchError::Provider(_))
+        ));
         assert_eq!(store.latest_sequence(ACTOR_ID), 1);
     }
     assert_eq!(prepared_key.len(), 64);
@@ -264,17 +268,17 @@ fn sqlite_reopen_retries_prepared_effect_with_same_key_but_requires_live_authori
         let mut reopened = LibsqlStore::new(&db.path).unwrap();
         let mut coordinator = DurableEffectCoordinator::new(&mut reopened, ACTOR_ID, 1);
         let replayed = coordinator
-                .execute_compiled_async_with_deduplication(
-                    &authorized,
-                    &grant(),
-                    &module,
-                    pc,
-                    EXECUTION_KEY,
-                    0,
-                    REQUEST,
-                    |_, _| panic!("terminal receipt must not redispatch"),
-                )
-                .unwrap();
+            .execute_compiled_async_with_deduplication(
+                &authorized,
+                &grant(),
+                &module,
+                pc,
+                EXECUTION_KEY,
+                0,
+                REQUEST,
+                |_, _| panic!("terminal receipt must not redispatch"),
+            )
+            .unwrap();
         assert_eq!(replayed.as_slice(), b"deduplicated-provider-receipt");
         assert_eq!(reopened.latest_sequence(ACTOR_ID), 2);
     }
