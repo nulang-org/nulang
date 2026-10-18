@@ -9,21 +9,21 @@ SCRIPT = Path(__file__).resolve().parents[1] / "check_release_linux.sh"
 
 READELF = r'''#!/bin/sh
 if [ "$1" = "-d" ]; then
-    [ "\${READELF_DYNAMIC_FAILURE:-0}" = "1" ] && exit 2
-    [ "\${LIBPYTHON:-0}" = "1" ] && printf '0x01 (NEEDED) Shared library: [libpython3.12.so.1.0]\n'
+    [ "${READELF_DYNAMIC_FAILURE:-0}" = "1" ] && exit 2
+    [ "${LIBPYTHON:-0}" = "1" ] && printf '0x01 (NEEDED) Shared library: [libpython3.12.so.1.0]\n'
     exit 0
 fi
 if [ "$1" = "-l" ]; then
-    [ "\${READELF_PROGRAM_FAILURE:-0}" = "1" ] && exit 2
-    [ "\${IS_STATIC:-0}" = "1" ] || printf '[Requesting program interpreter: /lib64/ld-linux-x86-64.so.2]\n'
+    [ "${READELF_PROGRAM_FAILURE:-0}" = "1" ] && exit 2
+    [ "${IS_STATIC:-0}" = "1" ] || printf '[Requesting program interpreter: /lib64/ld-linux-x86-64.so.2]\n'
     exit 0
 fi
 exit 2
 '''
 
 LDD = r'''#!/bin/sh
-[ "\${LDD_FAILURE:-0}" = "1" ] && exit 2
-[ "\${LDD_UNRESOLVED:-0}" = "1" ] && printf 'libmissing.so => not found\n'
+[ "${LDD_FAILURE:-0}" = "1" ] && exit 2
+[ "${LDD_UNRESOLVED:-0}" = "1" ] && printf 'libmissing.so => not found\n'
 exit 0
 '''
 
