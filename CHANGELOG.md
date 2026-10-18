@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Experimental Web explicit signal batching — 2026-10-18
+- **`window.nulang.batch(callback)` deduplicates DOM writes during synchronous nested signal updates.** Signal state changes are immediately readable, the outermost batch flushes even when a callback throws, and ordinary setters remain immediately rendered when no batch is active.
+- **Browser-runtime regression tests pin nested flushing, exceptional completion, and backward-compatible immediate updates.** This does not introduce automatic microtask batching or a second actor scheduler.
+
 ### Experimental Web wrapper-free signal anchors — 2026-10-18
 - **Direct reactive HTML child reads now use paired compiler-generated comment markers instead of injected `span` elements.** Hex-encoded marker payloads cannot inject markup, while browser hydration pairs anchors, reuses initial text and updates bounded text regions without altering the parent element hierarchy.
 - **Existing `data-signal` runtime hydration remains supported for compatibility.** Rust rewrite/build assertions and a JavaScript DOM regression cover multiple consumers, stable markers and text-only insertion.
