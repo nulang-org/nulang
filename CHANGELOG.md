@@ -1,4 +1,9 @@
 # Nulang Changelog
+
+### Bounded experimental SSE transport — 2026-10-17
+- **Limit local in-process realtime replay to 64 messages/64 KiB per room, 128 rooms, eight subscribers per room, eight queued messages per subscriber, and 8 KiB per event.** Disconnect slow receivers, evict inactive rooms at capacity, reject new subscriptions at active-room capacity, and send comment keepalives to release abandoned sockets.
+- SSE remains a public experimental transport: no per-room authorization, replay resume ID, cross-node delivery, or durability guarantee. Regression tests cover replay, subscriber/room limits, byte budgets, and idle heartbeat formatting.
+
 ### Bounded Nulang Web development-server connections — 2026-10-16
 - **The experimental Web development listener caps active connections at 64**, including SSE, and returns `503` with `Retry-After: 1` when full.
 - **Worker capacity is returned by a scoped RAII lease** after normal completion, panic, or thread-spawn failure. One shared `Arc` route table replaces per-connection clones of compiled route modules.
