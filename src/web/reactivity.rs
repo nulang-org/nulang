@@ -649,6 +649,7 @@ pub fn inject_client_runtime_script(html: &str) -> String {
     if !html.contains("data-signal=")
         && !html.contains("data-action=")
         && !html.contains("data-nulang-attrs=")
+        && !html.contains("<!--nulang-signal:")
     {
         return html.to_string();
     }
@@ -750,17 +751,23 @@ fn rewrite_expr(
                 ));
             }
 
-            // Wrap direct signal reads in children with <span data-signal="...">.
+            // Use sibling comment anchors instead of element wrappers. A signal
+            // can appear in table/select/SVG contexts where an extra <span>
+            // would change HTML parsing or layout.
             if let Expr::Array(children, _) = &mut args[2] {
-                for child in children.iter_mut() {
-                    if let Expr::Var(name, child_span) = child {
+                let mut bound = Vec::with_capacity(children.len());
+                for child in std::mem::take(children) {
+                    if let Expr::Var(name, child_span) = &child {
                         if signals.contains(name) {
-                            let name = name.clone();
-                            let child_span = *child_span;
-                            *child = wrap_signal_read(&name, child_span);
+                            bound.push(signal_comment(name, "start", *child_span));
+                            bound.push(child.clone());
+                            bound.push(signal_comment(name, "end", *child_span));
+                            continue;
                         }
                     }
+                    bound.push(child);
                 }
+                *children = bound;
             }
 
             // Add data attributes to the element's attrs.
@@ -991,6 +998,18 @@ pub fn generate_client_runtime() -> String {
     bindings.forEach(function (binding) {
       if (binding.kind === 'attribute') {
         binding.el.setAttribute(binding.attribute, String(signals[name] ?? ''));
+      } else if (binding.kind === 'range') {
+        const parent = binding.start.parentNode;
+        if (!parent || binding.end.parentNode !== parent) return;
+        let node = binding.start.nextSibling;
+        while (node && node !== binding.end) {
+          const next = node.nextSibling;
+          node.remove();
+          node = next;
+        }
+        if (node === binding.end) {
+          parent.insertBefore(document.createTextNode(String(signals[name] ?? '')), binding.end);
+        }
       } else {
         // Backwards compatible with existing data-signal hydration.
         binding.textContent = signals[name];
@@ -1083,6 +1102,43 @@ pub fn generate_client_runtime() -> String {
       signalBindings[name].push(el);
     });
 
+    // Match compiler-owned adjacent comment anchors. These cannot alter
+    // restricted HTML child models (table, select, SVG) unlike <span> wrappers.
+    if (typeof document.createTreeWalker === 'function') {
+      const walker = document.createTreeWalker(document, 128); // SHOW_COMMENT
+      const starts = Object.create(null);
+      let node;
+      while ((node = walker.nextNode())) {
+        const marker = /^nulang-signal:([0-9a-f]+):(start|end)$/.exec(node.data || '');
+        if (!marker || marker[1].length % 4 !== 0) continue;
+        const encoded = marker[1];
+        if (marker[2] === 'start') {
+          if (!starts[encoded]) starts[encoded] = [];
+          starts[encoded].push(node);
+          continue;
+        }
+        const pending = starts[encoded];
+        if (!pending || pending.length === 0) continue;
+        const start = pending.pop();
+        if (!start.parentNode || start.parentNode !== node.parentNode) continue;
+        let name = '';
+        for (let i = 0; i < encoded.length; i += 4) {
+          name += String.fromCharCode(parseInt(encoded.slice(i, i + 4), 16));
+        }
+        if (!(name in signals)) {
+          let current = start.nextSibling;
+          let initial = '';
+          while (current && current !== node) {
+            initial += current.textContent || '';
+            current = current.nextSibling;
+          }
+          signals[name] = initial;
+        }
+        if (!signalBindings[name]) signalBindings[name] = [];
+        signalBindings[name].push({ kind: 'range', start: start, end: node });
+      }
+    }
+
     document.querySelectorAll('[data-nulang-attrs]').forEach(function (el) {
       const encoded = el.getAttribute('data-nulang-attrs') || '';
       encoded.split(',').forEach(function (entry) {
@@ -1137,14 +1193,20 @@ pub fn generate_client_runtime() -> String {
         .to_string()
 }
 
-fn wrap_signal_read(name: &str, span: Span) -> Expr {
+/// Compiler-generated HTML comments are trusted literal markup. Encode the
+/// UTF-16 units of the identifier so even unusual Unicode signal names cannot
+/// inject HTML comments or corrupt the server-rendered document.
+fn signal_comment(name: &str, edge: &str, span: Span) -> Expr {
+    let encoded: String = name
+        .encode_utf16()
+        .map(|unit| format!("{unit:04x}"))
+        .collect();
     Expr::App {
-        func: Box::new(Expr::Var("el".to_string(), span)),
-        args: vec![
-            Expr::Literal(Literal::String("span".to_string()), span),
-            Expr::Array(vec![data_attr("data-signal", name, span)], span),
-            Expr::Array(vec![Expr::Var(name.to_string(), span)], span),
-        ],
+        func: Box::new(Expr::Var("raw".to_string(), span)),
+        args: vec![Expr::Literal(
+            Literal::String(format!("<!--nulang-signal:{encoded}:{edge}-->")),
+            span,
+        )],
         span,
     }
 }
@@ -1191,7 +1253,7 @@ fn view(count: Html) -> Html {
         rewrite_module(&mut module, None);
         let html = format!("{:?}", find_function_body(&module, "view"));
         assert!(
-            !html.contains("data-signal"),
+            !html.contains("nulang-signal:"),
             "shadowed reads must not hydrate"
         );
     }
@@ -1234,7 +1296,7 @@ fn view() -> Html {
         rewrite_module(&mut module, None);
         let html = format!("{:?}", find_function_body(&module, "view"));
         assert!(
-            !html.contains("data-signal"),
+            !html.contains("nulang-signal:"),
             "a using parameter must not produce a hydration marker"
         );
     }
@@ -1278,8 +1340,8 @@ fn view() -> Html {
         rewrite_module(&mut module, None);
         let html = format!("{:?}", find_function_body(&module, "view"));
         assert_eq!(
-            html.matches("data-signal").count(),
-            1,
+            html.matches("nulang-signal:").count(),
+            2,
             "only the unshadowed signal read should be hydrated"
         );
     }
@@ -1497,11 +1559,8 @@ fn view() -> Html {
         rewrite_module(&mut module, Some(&checker));
         let body = find_function_body(&module, "view");
         let html = format!("{:?}", body);
-        assert!(
-            html.contains("data-signal"),
-            "data-signal not found in {}",
-            html
-        );
+        assert!(html.contains("nulang-signal:"), "marker missing in {html}");
+        assert!(!html.contains("nulang-signal:"), "wrapper must not be emitted");
     }
 
     #[test]
@@ -1534,7 +1593,7 @@ fn view(count: Html) -> Html {
         let body = find_function_body(&module, "view");
         let html = format!("{body:?}");
         assert!(!html.contains("data-nulang-attrs"));
-        assert!(!html.contains("data-signal"));
+        assert!(!html.contains("nulang-signal:"));
     }
 
     #[test]
@@ -1700,6 +1759,12 @@ fn view() -> Html {
         let html = r#"<div data-nulang-attrs="title:count" title="2">Hello</div>"#;
         let out = inject_client_runtime_script(html);
         assert!(out.contains(r#"<script src="/app.client.js"></script>"#));
+    }
+
+    #[test]
+    fn test_comment_anchored_html_injects_client_script() {
+        let html = "<div><!--nulang-signal:0063006f0075006e0074:start-->2<!--nulang-signal:0063006f0075006e0074:end--></div>";
+        assert!(inject_client_runtime_script(html).contains("/app.client.js"));
     }
 
     #[test]
