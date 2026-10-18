@@ -223,6 +223,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Validate durability suite dispatch contract
+        run: bash scripts/tests/durability-guarantees-contract.test.sh
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
