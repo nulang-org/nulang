@@ -246,3 +246,22 @@ fn cli_json_check_includes_semantic_warning_and_ok_true() {
         diag["code"] == "W0201" && diag["severity"] == "warning"
     }), "report: {report}");
 }
+
+#[test]
+fn checker_reuse_does_not_leak_semantic_warnings() {
+    let first = "fn choose(flag: Bool) -> Int { match flag { | true => 1 } }";
+    let second = "fn identity(flag: Bool) -> Bool { flag }";
+    let mut checker = nulang::typechecker::TypeChecker::new();
+    for source in [first, second] {
+        let tokens = nulang::lexer::Lexer::new(source).lex().expect("lex");
+        let module = nulang::parser::Parser::new(tokens)
+            .parse_module()
+            .expect("parse");
+        checker.check_module(&module).expect("typecheck");
+        if source == first {
+            assert!(checker.warnings.iter().any(|w| w.code == "W0201"));
+        } else {
+            assert!(checker.warnings.is_empty(), "stale warnings: {:?}", checker.warnings);
+        }
+    }
+}
