@@ -3928,6 +3928,19 @@ mod lsp_tests {
     }
 
     #[test]
+    fn test_semantic_match_warnings_surface_with_stable_codes_in_lsp() {
+        let source = "fn pick(b: Bool) -> Int { match b { | true => 1 } }";
+        let diagnostics = NulangLanguageServer::compute_diagnostics(source).diagnostics;
+        let warning = diagnostics
+            .iter()
+            .find(|d| matches!(&d.code, Some(NumberOrString::String(code)) if code == "W0201"))
+            .expect("LSP should publish finite-domain coverage warning");
+        assert_eq!(warning.severity, Some(DiagnosticSeverity::WARNING));
+        assert!(warning.message.contains("false"));
+        assert_eq!(warning.range.start.line, 0);
+    }
+
+    #[test]
     fn test_diagnostics_frontend_returns_parsed_ast() {
         let source = "fn main() -> Int { 42 }";
         let result = NulangLanguageServer::compute_diagnostics(source);
