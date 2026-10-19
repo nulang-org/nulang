@@ -279,6 +279,39 @@ mod tests {
     }
 
     #[test]
+    fn dropping_reference_executor_signals_a_running_child() {
+        let mut runner = ReferenceExecutor::<(), ()>::new(1, 1).unwrap();
+        let expected = runner.try_submit().unwrap();
+        let mut child_token = None;
+        runner.tick(|id, token| {
+            assert_eq!(id, expected);
+            child_token = Some(token.clone());
+            TaskPoll::Pending
+        });
+        let child_token = child_token.expect("running child received a token");
+        assert!(!child_token.is_cancelled());
+
+        drop(runner);
+
+        assert!(child_token.is_cancelled());
+    }
+
+    #[test]
+    fn premature_reference_join_signals_unfinished_child() {
+        let mut runner = ReferenceExecutor::<(), ()>::new(1, 1).unwrap();
+        runner.try_submit().unwrap();
+        let mut child_token = None;
+        runner.tick(|_, token| {
+            child_token = Some(token.clone());
+            TaskPoll::Pending
+        });
+        let child_token = child_token.expect("running child received a token");
+
+        assert_eq!(runner.into_outcomes(), Err(ScopeError::NotQuiescent));
+        assert!(child_token.is_cancelled());
+    }
+
+    #[test]
     fn tick_does_not_spin_on_tasks_that_remain_pending() {
         let mut runner = ReferenceExecutor::<usize, ()>::new(1, 1).unwrap();
         runner.try_submit().unwrap();
