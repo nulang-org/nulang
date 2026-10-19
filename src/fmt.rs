@@ -153,7 +153,8 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
         } => {
             // Never emit only part of a declaration. These fields affect
             // dispatch, contracts, visibility, effects or authority.
-            if !type_param_constraints.is_empty()
+            if !type_params.is_empty()
+                || !type_param_constraints.is_empty()
                 || !using_params.is_empty()
                 || error_type.is_some()
                 || cap.is_some()
@@ -166,11 +167,7 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
                 *had_unhandled = true;
                 return;
             }
-            out.push_str(&format!("{}fn {}", sp, name));
-            if !type_params.is_empty() {
-                out.push_str(&format!("[{}]", type_params.join(", ")));
-            }
-            out.push('(');
+            out.push_str(&format!("{}fn {}(", sp, name));
             for (i, p) in params.iter().enumerate() {
                 if i > 0 {
                     out.push_str(", ");
