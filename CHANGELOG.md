@@ -1,4 +1,10 @@
 # Nulang Changelog
+### Experimental opt-in weighted-fair actor scheduling — 2026-10-19
+- **Existing RFC 0027 and its fairness-policy tests have been refreshed against current `main`.** The scheduler now exposes an opt-in Rust constructor with validated weights and deterministic priority turns across owner, worker, and external-steal paths.
+- **Production scheduling remains strictly High > Normal > Low by default.** Five scheduler-level tests cover saturated High/Normal/Low workloads and unchanged strict behavior. Fairness is an experimental service-opportunity policy, not a wall-clock scheduling guarantee or production default.
+- **An opt-in, ignored strict-vs-fair scheduler benchmark now emits matched per-round and median queue-throughput/High-queue-p99 samples**, checks exact token delivery, and alternates execution order. This payload-free one-owner probe is not end-to-end actor latency.
+- **Promotion still requires exact-head tests and representative live-actor benchmarks**, including High-priority p99 latency, throughput and multicore contention. No unmeasured performance benefit is claimed.
+
 ### Fabric on-demand mailbox scoring — 2026-10-18
 - **Fabric publish admission now reads mailbox pressure only for matching local subscribers**, instead of allocating and populating an all-actor mailbox snapshot on every publish.
 - **Ported the regression and exact-base matched-fixture A/B harness** from #1708 onto current main. Historical unmatched-publish microbenchmarks were favorable; new-head CI and measurements remain the promotion gate.

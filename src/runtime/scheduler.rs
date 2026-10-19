@@ -2,9 +2,10 @@
 //!
 //! Each worker owns three local queues (High, Normal, Low). Keeping local
 //! queues split by priority lets the scheduler batch-transfer work out of the
-//! shared injectors without weakening the runtime's strict High > Normal > Low
-//! scheduling semantics. Within a priority, workers prefer local work, then
-//! batch from the global injector, then steal from peers.
+//! shared injectors while preserving strict High > Normal > Low by default.
+//! Explicit weighted-fair schedulers instead vary which priority band is tried
+//! first. Within a priority, workers prefer local work, then batch from the
+//! global injector, then steal from peers.
 //!
 //! The live runtime currently has one owning scheduler thread per shard. Its
 //! [`Scheduler::dequeue`] path therefore uses worker slot 0 as a locality
@@ -16,7 +17,7 @@
 //! - lock-free local push/pop on the owning worker
 //! - batched global-to-local transfers to reduce shared-injector contention
 //! - lock-free peer stealing for true multi-worker callers
-//! - strict priority across both global and worker-local queues
+//! - strict priority by default, opt-in weighted service ordering
 //! - no useless peer scans on the current single-owner runtime path
 //! - backoff and sleep for idle workers
 //!
@@ -24,6 +25,7 @@
 //! crossbeam::deque.
 
 use super::actor::ActorPriority;
+use crate::scheduler_fairness::{FairPriorityPolicy, InvalidPriorityWeights, PriorityWeights};
 use crossbeam::deque::{Injector, Steal, Stealer, Worker};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread;
@@ -134,13 +136,12 @@ impl SchedulerStatsInternal {
     }
 }
 
-/// A strict-priority work-stealing scheduler with Chase-Lev deques.
+/// A priority-aware work-stealing scheduler with Chase-Lev deques.
 ///
-/// Each worker has one local deque per actor priority. A single local queue
-/// would allow previously batched Low/Normal work to run in front of newly
-/// arrived High work. Splitting local queues preserves the same priority
-/// contract as the global injectors while still allowing batch transfer and
-/// cache-local dispatch.
+/// Each worker has one local deque per actor priority. Splitting local queues
+/// retains each band's FIFO/admission behavior even when an explicitly
+/// weighted scheduler occasionally prefers Normal or Low over High.
+/// `Scheduler::new` remains strictly High-first by default.
 #[repr(align(64))]
 pub struct Scheduler {
     global_high: Injector<u64>,
@@ -156,6 +157,10 @@ pub struct Scheduler {
     stealers_low: Vec<Stealer<u64>>,
 
     worker_count: usize,
+    /// None preserves strict High > Normal > Low scheduling by default.
+    fair_priority: Option<FairPriorityPolicy>,
+    /// One logical arbitration ticket per dequeue attempt when fairness is opted in.
+    fair_cursor: AtomicU64,
     processed_count: AtomicUsize,
     stats: SchedulerStatsInternal,
 }
@@ -189,6 +194,8 @@ impl Scheduler {
             stealers,
             stealers_low,
             worker_count,
+            fair_priority: None,
+            fair_cursor: AtomicU64::new(0),
             processed_count: AtomicUsize::new(0),
             stats: SchedulerStatsInternal {
                 tasks_from_local_queue: AtomicU64::new(0),
@@ -198,6 +205,35 @@ impl Scheduler {
                 steal_successes: AtomicU64::new(0),
                 empty_polls: AtomicU64::new(0),
             },
+        }
+    }
+
+    /// Construct an explicitly weighted scheduler without changing the strict
+    /// production default. Caller-supplied weights must contain a nonzero band.
+    pub fn new_with_fair_priority(
+        worker_count: usize,
+        weights: PriorityWeights,
+    ) -> Result<Self, InvalidPriorityWeights> {
+        let policy = FairPriorityPolicy::new(weights)?;
+        let mut scheduler = Self::new(worker_count);
+        scheduler.fair_priority = Some(policy);
+        Ok(scheduler)
+    }
+
+    /// Choose one priority order per logical dequeue attempt. Retries inside
+    /// one queue probe must not consume additional fairness turns.
+    #[inline]
+    fn priority_order(&self) -> [ActorPriority; 3] {
+        match &self.fair_priority {
+            Some(policy) => {
+                let ticket = self.fair_cursor.fetch_add(1, Ordering::Relaxed);
+                policy.turn_at(ticket).order
+            }
+            None => [
+                ActorPriority::High,
+                ActorPriority::Normal,
+                ActorPriority::Low,
+            ],
         }
     }
 
@@ -354,24 +390,21 @@ impl Scheduler {
         (None, attempts)
     }
 
-    /// Pop the next actor for a worker while preserving strict priority.
+    /// Pop the next actor for a worker, using the configured priority order.
     ///
-    /// For each priority band in High → Normal → Low order:
+    /// For each band in the selected order:
     /// 1. consume worker-local work,
     /// 2. batch from that priority's global injector,
     /// 3. steal from peers in that priority.
     ///
-    /// This ordering is the key invariant that makes batch transfer safe: a
-    /// previously batched Low task can never run before currently available
-    /// High or Normal work.
+    /// Strict schedulers always try High, then Normal, then Low. Explicit
+    /// weighted schedulers prefer one band per turn, including Low or Normal
+    /// ahead of High on their assigned turns. Each band's local/global
+    /// queue ordering is preserved.
     pub fn next_task(&self, worker_idx: usize) -> Option<u64> {
         let mut steal_attempts = 0u64;
 
-        for priority in [
-            ActorPriority::High,
-            ActorPriority::Normal,
-            ActorPriority::Low,
-        ] {
+        for priority in self.priority_order() {
             if let Some(task) = self.pop_local(worker_idx, priority) {
                 self.record_steal_attempts(steal_attempts);
                 return Some(task);
@@ -395,19 +428,15 @@ impl Scheduler {
         None
     }
 
-    /// Pop work for a scheduler thread that owns one worker-local slot.
+    /// Pop work for the scheduler owner's local slot.
     ///
     /// The current runtime has exactly one owning scheduler thread per shard.
     /// It therefore has no useful peers to steal from even though the
     /// scheduler is provisioned with multiple generic worker slots. Skipping
-    /// peer scans here removes three empty High-band probes from the common
-    /// Normal-priority path while retaining batch transfer and strict priority.
+    /// peer scans here removes unused work on the common owner path, while
+    /// retaining priority-aware batching and the selected service policy.
     fn next_owner_task(&self, worker_idx: usize) -> Option<u64> {
-        for priority in [
-            ActorPriority::High,
-            ActorPriority::Normal,
-            ActorPriority::Low,
-        ] {
+        for priority in self.priority_order() {
             if let Some(task) = self.pop_local(worker_idx, priority) {
                 return Some(task);
             }
@@ -432,16 +461,12 @@ impl Scheduler {
 
     /// Steal one task from any source without owning a local worker slot.
     ///
-    /// Priority is strict: all High global/local sources are inspected before
-    /// Normal, and all Normal sources before Low.
+    /// The default is strict High-first; weighted-fair instances vary their
+    /// preferred priority per turn without changing queue ordering within a band.
     pub fn steal_one(&self) -> Option<u64> {
         let mut steal_attempts = 0u64;
 
-        for priority in [
-            ActorPriority::High,
-            ActorPriority::Normal,
-            ActorPriority::Low,
-        ] {
+        for priority in self.priority_order() {
             if let Some(task) = self.steal_global_for(priority) {
                 self.record_steal_attempts(steal_attempts);
                 return Some(task);
@@ -702,6 +727,196 @@ mod scheduler_tests {
         assert!(s.dequeue().is_some());
         s.enqueue_with_priority(1000, ActorPriority::High);
         assert_eq!(s.dequeue(), Some(1000));
+    }
+
+    #[test]
+    fn fair_owner_dequeue_services_low_and_normal_under_saturated_high() {
+        let s = Scheduler::new_with_fair_priority(1, PriorityWeights::new(8, 4, 1))
+            .expect("valid fairness weights");
+        for i in 0..64u64 {
+            s.enqueue_with_priority(1000 + i, ActorPriority::High);
+            s.enqueue_with_priority(2000 + i, ActorPriority::Normal);
+            s.enqueue_with_priority(3000 + i, ActorPriority::Low);
+        }
+
+        let ids: Vec<_> = (0..13).map(|_| s.dequeue().expect("queued actor")).collect();
+        assert_eq!(ids.iter().filter(|&&id| (1000..2000).contains(&id)).count(), 8);
+        assert_eq!(ids.iter().filter(|&&id| (2000..3000).contains(&id)).count(), 4);
+        assert_eq!(ids.iter().filter(|&&id| (3000..4000).contains(&id)).count(), 1);
+    }
+
+    #[test]
+    fn fair_generic_worker_and_steal_path_include_low_under_high_load() {
+        for steal in [false, true] {
+            let s = Scheduler::new_with_fair_priority(1, PriorityWeights::new(2, 1, 1))
+                .expect("valid fairness weights");
+            for i in 0..12u64 {
+                s.enqueue_with_priority(100 + i, ActorPriority::High);
+                s.enqueue_with_priority(200 + i, ActorPriority::Normal);
+                s.enqueue_with_priority(300 + i, ActorPriority::Low);
+            }
+            let ids: Vec<_> = (0..4)
+                .map(|_| {
+                    if steal {
+                        s.steal_one().expect("pending actor")
+                    } else {
+                        s.next_task(0).expect("pending actor")
+                    }
+                })
+                .collect();
+            assert_eq!(ids.iter().filter(|&&id| (100..200).contains(&id)).count(), 2);
+            assert_eq!(ids.iter().filter(|&&id| (200..300).contains(&id)).count(), 1);
+            assert_eq!(ids.iter().filter(|&&id| (300..400).contains(&id)).count(), 1);
+        }
+    }
+
+    #[test]
+    fn default_scheduler_remains_strictly_high_first() {
+        let s = Scheduler::new(1);
+        for i in 0..32 {
+            s.enqueue_with_priority(i, ActorPriority::Low);
+            s.enqueue_with_priority(100 + i, ActorPriority::High);
+        }
+        for _ in 0..32 {
+            assert!(
+                s.dequeue().is_some_and(|id| id >= 100),
+                "default must preserve existing strict actor priority"
+            );
+        }
+        assert!(s.dequeue().is_some_and(|id| id < 100));
+    }
+
+    #[test]
+    fn fair_turn_falls_back_to_high_when_preferred_queue_is_empty() {
+        let s = Scheduler::new_with_fair_priority(1, PriorityWeights::new(1, 1, 1))
+            .expect("valid weights");
+        for id in 0..12 {
+            s.enqueue_with_priority(100 + id, ActorPriority::High);
+        }
+        for _ in 0..9 {
+            assert!(
+                s.dequeue().is_some_and(|id| id >= 100),
+                "empty preferred priority must not leave runnable high actors idle"
+            );
+        }
+    }
+
+    #[test]
+    fn fairness_opt_in_rejects_zero_weights() {
+        assert!(Scheduler::new_with_fair_priority(1, PriorityWeights::new(0, 0, 0)).is_err());
+    }
+
+    /// Manually executed, payload-free owner-dequeue benchmark. This measures
+    /// scheduler admission + draining, not actor behavior, JIT or wall-clock SLOs.
+    ///
+    /// Run explicitly on an otherwise idle host:
+    /// cargo test --locked --release bench_scheduler_strict_vs_fair -- --ignored --nocapture
+    #[test]
+    #[ignore = "run explicitly on a controlled host; performance is not a CI pass gate"]
+    fn bench_scheduler_strict_vs_fair() {
+        use std::time::Instant;
+
+        const EACH_BAND: usize = 10_000;
+        const TOTAL: usize = EACH_BAND * 3;
+        const WARMUP_ROUNDS: usize = 1;
+        const MEASURED_ROUNDS: usize = 6;
+        let mut samples: [Vec<(u128, u128)>; 2] = [Vec::new(), Vec::new()];
+
+        for round in 0..WARMUP_ROUNDS + MEASURED_ROUNDS {
+            // Alternate execution order across measured samples to avoid
+            // systematically benchmarking strict mode on a cooler CPU.
+            let order = if round % 2 == 0 {
+                [false, true]
+            } else {
+                [true, false]
+            };
+            for fair in order {
+                let s = if fair {
+                    Scheduler::new_with_fair_priority(1, PriorityWeights::new(8, 4, 1))
+                        .expect("valid weights")
+                } else {
+                    Scheduler::new(1)
+                };
+
+                let mut enqueued_at = vec![Instant::now(); TOTAL];
+                // Identical interleaved arrival pattern and logical token IDs.
+                for i in 0..EACH_BAND {
+                    for (band, priority) in [
+                        ActorPriority::High,
+                        ActorPriority::Normal,
+                        ActorPriority::Low,
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        let id = i * 3 + band;
+                        enqueued_at[id] = Instant::now();
+                        s.enqueue_with_priority(id as u64, priority);
+                    }
+                }
+
+                let mut seen = vec![false; TOTAL];
+                let mut counts = [0usize; 3];
+                let mut high_wait_ns = Vec::with_capacity(EACH_BAND);
+                let started = Instant::now();
+                for _ in 0..TOTAL {
+                    let id = s.dequeue().expect("every enqueued token must be served") as usize;
+                    assert!(id < TOTAL, "out-of-range actor token");
+                    assert!(!seen[id], "duplicate actor token {id}");
+                    seen[id] = true;
+                    counts[id % 3] += 1;
+                    if id % 3 == 0 {
+                        high_wait_ns.push(enqueued_at[id].elapsed().as_nanos());
+                    }
+                }
+                let elapsed_ns = started.elapsed().as_nanos();
+                assert_eq!(counts, [EACH_BAND; 3]);
+                assert!(s.dequeue().is_none(), "unexpected extra actor token");
+
+                // p99 is enqueue-to-dequeue waiting time for this synthetic
+                // preloaded queue, not end-to-end actor latency.
+                high_wait_ns.sort_unstable();
+                let high_p99_ns = high_wait_ns[(EACH_BAND * 99).div_ceil(100) - 1];
+                if round >= WARMUP_ROUNDS {
+                    samples[usize::from(fair)].push((elapsed_ns, high_p99_ns));
+                    println!(
+                        concat!(
+                            "[scheduler-fair-bench] mode={} round={} operations={} ",
+                            "elapsed_ns={} high_queue_p99_ns={}"
+                        ),
+                        if fair { "fair_8_4_1" } else { "strict" },
+                        round - WARMUP_ROUNDS + 1,
+                        TOTAL,
+                        elapsed_ns,
+                        high_p99_ns,
+                    );
+                }
+            }
+        }
+
+        for (mode, rows) in ["strict", "fair_8_4_1"].iter().zip(samples.iter_mut()) {
+            assert_eq!(rows.len(), MEASURED_ROUNDS);
+            let mut durations: Vec<_> = rows.iter().map(|(ns, _)| *ns).collect();
+            let mut high_p99s: Vec<_> = rows.iter().map(|(_, ns)| *ns).collect();
+            durations.sort_unstable();
+            high_p99s.sort_unstable();
+            // Six measured rounds: use the midpoint of the two central
+            // samples, rather than silently reporting the upper-middle one.
+            let midpoint = durations.len() / 2;
+            let median_duration_ns = (durations[midpoint - 1] + durations[midpoint]) / 2;
+            let median_high_p99_ns = (high_p99s[midpoint - 1] + high_p99s[midpoint]) / 2;
+            println!(
+                concat!(
+                    "[scheduler-fair-summary] mode={} samples={} operations={} ",
+                    "median_elapsed_ns={} median_high_queue_p99_ns={}"
+                ),
+                mode,
+                rows.len(),
+                TOTAL,
+                median_duration_ns,
+                median_high_p99_ns,
+            );
+        }
     }
 
     #[test]

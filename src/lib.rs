@@ -90,6 +90,7 @@ pub mod registry;
 pub mod repl;
 pub mod resolver;
 pub mod runtime;
+pub mod scheduler_fairness;
 pub mod semantic_identity;
 pub mod semantic_schema;
 pub mod stdlib;
