@@ -37,6 +37,23 @@ In the REPL, try `:help` for commands, `:type <expr>` to inspect a type,
 
 ## 3. Hello World
 
+For ordinary application code, you can opt into small standard-library wrappers
+without changing Nulang's effect system:
+
+```nula
+import stdlib::prelude
+
+fn main() {
+    println("Hello, Nulang!")
+    println(int_to_string(string_length("Nulang")))
+}
+```
+
+The prelude is **explicitly imported**; it does not silently grant IO or
+other external authority. `println`, `string_length`, and
+`int_to_string` delegate to existing effect operations. The lower-level
+`perform` syntax is always available and is used in the examples below.
+
 `perform IO.print` writes to stdout. Use `+` for string concatenation and
 `Int.to_string` to convert numbers.
 
@@ -357,34 +374,30 @@ Spawn syntax: `spawn Actor { field = value }` (overrides state defaults).
 
 ## 11. Error Handling
 
-Use `catch` to provide a fallback when a variant-producing computation returns
-an error variant, and `fail` to exit early from a function:
+Use `Result` to represent operations that can fail, and `match` for
+explicit recovery. This is the preferred starting point:
 
 ```nula
-type Result[Ok, Err] = Ok(Ok) | Error(Err)
+type Result[T, E] = Ok(T) | Error(E)
 
-fn ok_val() -> Result[Int, String] { Ok(42) }
-fn err_val() -> Result[Int, String] { Error("fail") }
-
-fn early_return(x: Int) -> Int {
-    if x < 0 then fail 0 else x
+let safe_div = fn(a, b) {
+    if b == 0 then Error("division by zero") else Ok(a / b)
 }
 
-fn div(a: Int, b: Int) -> Int ! String {
-    if b == 0 then fail Error("div by zero") else Ok(a / b)
+let answer = match safe_div(84, 2) {
+    | Ok(value) => value
+    | Error(_) => 0
 }
-
-// catch: fallback for error variants
-ok_val() catch 0    // → 42    (success — returns the Ok payload)
-err_val() catch 0   // → 0     (error — returns the fallback)
-
-// fail: early exit from a function
-early_return(42)    // → 42
-early_return(-5)    // → 0
-
-// ?: unwrap the Ok variant
-div(10, 2)?         // → 5
 ```
+
+Nulang also supports `?` for compatible error propagation in functions that
+return an appropriate error type. See the error-handling specification for
+the type/effect boundary.
+
+**Compatibility note:** The older `catch` and `fail` expressions still
+parse, but are deprecated under RFC 0015. Avoid them in new examples;
+use `match`, `?`, and explicit error values instead. See
+`docs/MIGRATION_RFC_0015.md`.
 
 ## 12. The Package Manager
 

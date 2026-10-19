@@ -1,0 +1,23 @@
+// Nulang standard library — optional beginner-friendly prelude.
+//
+// Import: import stdlib::prelude
+//
+// Ordinary functions delegate to existing effect operations. Importing this
+// module changes no effect, ownership, or external-authority semantics.
+// Advanced code can continue using `perform` and `handle` directly.
+
+/// Print a string with the host's existing IO.print semantics.
+/// Calling this function still requires the IO effect.
+pub fn println(message: String) {
+    perform IO.print(message)
+}
+
+/// Return the length of a string using the existing String.length primitive.
+pub fn string_length(value: String) {
+    perform String.length(value)
+}
+
+/// Convert an integer to a string using the existing Int.to_string primitive.
+pub fn int_to_string(value: Int) {
+    perform Int.to_string(value)
+}
