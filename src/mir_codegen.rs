@@ -1629,8 +1629,8 @@ pub(crate) fn float_locals(func: &mir::Function) -> Vec<bool> {
 //
 // Everything here is semantics-preserving with respect to the bytecode VM.
 // Notable VM quirks the folding accounts for:
-//   - float Eq/Ne is NOT folded: the VM's ICmpEq/FCmpEq use epsilon
-//     equality (|a-b| < f64::EPSILON), not exact ==;
+//   - float Eq/Ne uses the VM's epsilon equality
+//     (|a-b| < f64::EPSILON), not exact ==;
 //   - identity/zero-propagation rules are skipped when the non-const
 //     operand is a float local: the VM's F* handlers coerce the int
 //     constant to a float, and IEEE semantics differ at ±0.0/NaN
@@ -1794,8 +1794,8 @@ fn fold_rvalue(
 }
 
 /// Constant-fold `Const op Const` per the VM's integer/float handler
-/// semantics. Returns None when no rule applies (mixed int/float, float
-/// Eq/Ne — the VM uses epsilon equality there — nil comparisons, ...).
+/// semantics. Returns None when no rule applies (mixed int/float,
+/// unsupported nil comparisons, ...).
 fn fold_binary_consts(bop: crate::ast::BinOp, a: &Constant, b: &Constant) -> Option<mir::RValue> {
     use crate::ast::BinOp;
     use mir::RValue;
@@ -1827,10 +1827,15 @@ fn fold_binary_consts(bop: crate::ast::BinOp, a: &Constant, b: &Constant) -> Opt
         (BinOp::Le, Int(x), Int(y)) => RValue::Const(Bool(x <= y)),
         (BinOp::Gt, Int(x), Int(y)) => RValue::Const(Bool(x > y)),
         (BinOp::Ge, Int(x), Int(y)) => RValue::Const(Bool(x >= y)),
-        // -- Float comparisons: Lt/Le/Gt/Ge are standard in both the
-        //    ICmp*/FCmp* handlers and the caller's Le/Ge expansion.
-        //    Eq/Ne are deliberately excluded (epsilon equality) —
-        //    the plan's contingency for a semantic mismatch. --
+        // -- Float comparisons: Eq/Ne follow the VM's absolute-epsilon
+        //    equality, including NaN/infinity behavior (NaN compares false).
+        //    Negation, not >=, is essential for NaN inequality. --
+        (BinOp::Eq, Float(x), Float(y)) => {
+            RValue::Const(Bool((*x - *y).abs() < f64::EPSILON))
+        }
+        (BinOp::Ne, Float(x), Float(y)) => {
+            RValue::Const(Bool(!((*x - *y).abs() < f64::EPSILON)))
+        }
         (BinOp::Lt, Float(x), Float(y)) => RValue::Const(Bool(x < y)),
         (BinOp::Le, Float(x), Float(y)) => RValue::Const(Bool(x <= y)),
         (BinOp::Gt, Float(x), Float(y)) => RValue::Const(Bool(x > y)),
@@ -3656,6 +3661,51 @@ mod optimize_tests {
             !has_opcode(&module, OpCode::IAdd),
             "constant addition must not emit IAdd"
         );
+    }
+
+    #[test]
+    fn test_fold_float_epsilon_equality_without_runtime_comparison() {
+        // The VM compares float equality using an absolute epsilon, not
+        // bitwise IEEE equality. Constant evaluation must use the same rule.
+        let source = "0.1 + 0.2 == 0.3";
+        assert_eq!(run_source(source).unwrap().as_bool(), Some(true));
+        assert!(
+            !has_opcode(&compile_source(source).unwrap(), OpCode::FCmpEq),
+            "constant float equality must not emit FCmpEq"
+        );
+
+        let source = "0.1 + 0.2 != 0.3";
+        assert_eq!(run_source(source).unwrap().as_bool(), Some(false));
+        assert!(
+            !has_opcode(&compile_source(source).unwrap(), OpCode::FCmpEq),
+            "constant float inequality must not emit FCmpEq"
+        );
+    }
+
+    #[test]
+    fn test_fold_float_epsilon_boundary_and_nonfinite_values() {
+        use crate::ast::BinOp;
+
+        let cases = [
+            (1.0, 1.0, true),
+            (0.1 + 0.2, 0.3, true),
+            (1.0, 1.0 + f64::EPSILON, false),
+            (0.0, -0.0, true),
+            (f64::INFINITY, f64::INFINITY, false),
+            (f64::NAN, f64::NAN, false),
+        ];
+        for (a, b, equal) in cases {
+            assert_eq!(
+                fold_binary_consts(BinOp::Eq, &Constant::Float(a), &Constant::Float(b)),
+                Some(mir::RValue::Const(Constant::Bool(equal))),
+                "folded float equality for {a:?} and {b:?}"
+            );
+            assert_eq!(
+                fold_binary_consts(BinOp::Ne, &Constant::Float(a), &Constant::Float(b)),
+                Some(mir::RValue::Const(Constant::Bool(!equal))),
+                "folded float inequality for {a:?} and {b:?}"
+            );
+        }
     }
 
     #[test]

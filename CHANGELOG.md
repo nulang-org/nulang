@@ -1,4 +1,8 @@
 # Nulang Changelog
+### MIR constant Float equality folding — 2026-10-19
+- **Compile-time Float `==` and `!=` expressions use the bytecode VM's absolute-epsilon comparison.** When both operands are constants, the MIR optimizer emits a Bool constant instead of a runtime Float comparison. The rule preserves NaN, infinity, signed-zero, and strict-epsilon-boundary behavior.
+- **Regression tests pin bytecode elimination and numerical edge cases.** No changes to user-facing syntax, runtime Float semantics, frozen formats, or actor/effect boundaries. Exact-head CI and performance validation remain required before promotion.
+
 ### Fabric on-demand mailbox scoring — 2026-10-18
 - **Fabric publish admission now reads mailbox pressure only for matching local subscribers**, instead of allocating and populating an all-actor mailbox snapshot on every publish.
 - **Ported the regression and exact-base matched-fixture A/B harness** from #1708 onto current main. Historical unmatched-publish microbenchmarks were favorable; new-head CI and measurements remain the promotion gate.
