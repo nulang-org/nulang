@@ -451,6 +451,98 @@ mod tests {
     }
 
     #[test]
+    fn named_declaration_kinds_participate_in_import_identity() {
+        let span = sp();
+        let zero = Expr::Literal(Literal::Int(0), span);
+        let declarations = vec![
+            Decl::LetBinding {
+                name: "settings".into(),
+                type_ann: None,
+                value: zero.clone(),
+                mutable: false,
+                span,
+            },
+            Decl::Signal {
+                name: "status".into(),
+                ty: crate::types::Type::int(),
+                init: zero.clone(),
+                span,
+            },
+            Decl::Given {
+                name: "request".into(),
+                ty: Some(crate::types::Type::int()),
+                value: zero,
+                span,
+            },
+            Decl::Workflow {
+                name: "checkout".into(),
+                input: None,
+                items: vec![],
+                compensate: None,
+                span,
+            },
+            Decl::Class {
+                name: "Serializable".into(),
+                type_params: vec![],
+                type_param_constraints: vec![],
+                super_classes: vec![],
+                methods: vec![],
+                span,
+            },
+        ];
+        let actual: Vec<_> = declarations.iter().map(decl_name).collect();
+        assert_eq!(
+            actual,
+            vec![
+                Some("settings"),
+                Some("status"),
+                Some("request"),
+                Some("checkout"),
+                Some("Serializable"),
+            ]
+        );
+    }
+
+    #[test]
+    fn imports_cannot_silently_shadow_a_local_value_binding() {
+        let err = resolve_fixture(
+            "let token = 1\nimport foreign\n",
+            &[("foreign", "let token = 2\n")],
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("import conflict"), "{err}");
+        assert!(format!("{err}").contains("token"), "{err}");
+    }
+
+    #[test]
+    fn independent_imported_value_bindings_with_same_name_conflict() {
+        let err = resolve_fixture(
+            "import first\nimport second\n",
+            &[("first", "let config = 1\n"), ("second", "let config = 2\n")],
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("import conflict"), "{err}");
+        assert!(format!("{err}").contains("config"), "{err}");
+    }
+
+    #[test]
+    fn repeated_value_binding_import_is_idempotent() {
+        let module = resolve_fixture(
+            "import shared\nimport shared\n",
+            &[("shared", "let config = 1\n")],
+        )
+        .unwrap();
+        assert_eq!(
+            module
+                .decls
+                .iter()
+                .filter(|decl| decl_name(decl) == Some("config"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn independent_opaque_types_with_same_name_must_conflict() {
         let err = resolve_fixture(
             "import first\nimport second\n",
