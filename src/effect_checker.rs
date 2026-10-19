@@ -19,10 +19,10 @@ type FxHashSet<T> = rustc_hash::FxHashSet<T>;
 
 /// Check whether every effect in `sub` is present in `sup`.
 ///
-/// For closed rows this is simple set inclusion.  For open rows we are
-/// conservative: an open row on the *sup* side may contain additional effects
-/// via its row variable, while an open row on the *sub* side is assumed to
-/// possibly contain any effect not explicitly listed.
+/// For closed rows this is simple set inclusion. For open rows the comparison
+/// is conservative: an open row can have further effects through its unresolved
+/// tail. In particular, an open `sub` cannot prove a closed `sup` contract,
+/// including the empty effect row used by pure functions.
 pub fn effect_row_subset(sub: &EffectRow, sup: &EffectRow) -> bool {
     match (sub, sup) {
         // Closed sub, closed sup: straightforward subset check.
@@ -34,13 +34,9 @@ pub fn effect_row_subset(sub: &EffectRow, sup: &EffectRow) -> bool {
         (EffectRow::Closed(sub_effs), EffectRow::Open(sup_effs, _)) => {
             sub_effs.iter().all(|e| sup_effs.contains(e))
         }
-        // Open sub, closed sup: the open row *might* contain effects beyond
-        // its concrete list, so it is only a subset if the concrete list
-        // itself is already a subset and the open row is empty except for the
-        // variable that could introduce new effects.
-        (EffectRow::Open(sub_effs, _), EffectRow::Closed(sup_effs)) => {
-            sub_effs.iter().all(|e| sup_effs.contains(e))
-        }
+        // Open sub, closed sup: unresolved tail effects may exceed any
+        // closed allowlist, even when all known effects are permitted.
+        (EffectRow::Open(_, _), EffectRow::Closed(_)) => false,
         // Open sub, open sup: both row variables could introduce arbitrary
         // effects.  We only require that the concrete effects of sub are
         // contained in the concrete effects of sup.
