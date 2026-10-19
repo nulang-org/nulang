@@ -1,7 +1,7 @@
 # Nulang Changelog
 ### Conservative closed-variant match coverage — 2026-10-19
 - **Type inference detects provably missing constructors and unreachable arms for statically known closed variants.** Guarded arms never establish complete coverage; an unguarded wildcard, variable, alias catch-all, or complete variant constructor pattern does.
-- **Ten focused unit regressions cover incomplete/complete patterns, guards, wildcards, aliases, unreachable cases, refutable nested payloads, and unchanged non-variant matching.** Full recursive pattern-matrix exhaustiveness and abstract scrutinee handling remain P0 follow-up work. Exact-head CI validation is required before promotion.
+- **Thirteen focused unit regressions cover incomplete/complete patterns, guards, wildcards, aliases, unreachable cases, refutable nested payloads, unchanged non-variant matching, unknown constructors, and payload-shape mismatches.** Full recursive pattern-matrix exhaustiveness and abstract scrutinee handling remain P0 follow-up work. Exact-head CI validation is required before promotion.
 
 ### Fabric on-demand mailbox scoring — 2026-10-18
 - **Fabric publish admission now reads mailbox pressure only for matching local subscribers**, instead of allocating and populating an all-actor mailbox snapshot on every publish.
