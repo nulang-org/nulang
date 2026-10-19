@@ -3158,12 +3158,16 @@ impl VM {
         if value.is_nil() {
             return Ok(value);
         }
-        let ptr = value.as_ptr().ok_or_else(|| NuError::VMError {
-            msg: "FFI C string return was not a pointer".to_string(),
-            span: Span::default(),
+        // SAFETY: FFICall passed the temporary allocation created by
+        // cstr_to_value; taking ownership makes every subsequent error path
+        // drop the CString instead of leaking it.
+        let owned_cstr = unsafe { crate::ffi::marshal::take_cstr_value(value) }.ok_or_else(|| {
+            NuError::VMError {
+                msg: "FFI C string return was not a pointer".to_string(),
+                span: Span::default(),
+            }
         })?;
-        // SAFETY: ptr is a valid null-terminated C string from cstr_to_value.
-        let bytes = unsafe { CStr::from_ptr(ptr as *const c_char).to_bytes() };
+        let bytes = owned_cstr.as_bytes();
         let len = bytes.len();
         let heap_ptr = self
             .actor_callbacks
@@ -3177,10 +3181,7 @@ impl VM {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), heap_ptr, len);
             *heap_ptr.add(len) = 0;
         }
-        // SAFETY: value was produced by cstr_to_value.
-        unsafe {
-            crate::ffi::marshal::free_cstr_value(value);
-        }
+        // owned_cstr is released here even if the actor allocation fails.
         Ok(unsafe {
             /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
             Value::ptr(heap_ptr)
