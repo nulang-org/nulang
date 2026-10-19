@@ -97,3 +97,36 @@ They do **not** implement monomorphization, prove an optimization, or justify a
 generic-language ABI change. Execute a paired base/candidate benchmark before
 changing compilation policy; keep both the cold compilation cost and the
 warmed execution cost visible.
+
+
+### Counterbalanced comparison gate
+
+The one-repetition JIT telemetry workflow is a smoke/contract run, not enough
+to quantify generic dispatch overhead or justify monomorphization. Run the
+counterbalanced benchmark after the paired fixtures from #1964 are available:
+
+```bash
+python3 -m unittest discover -s scripts/tests -p 'test_jit_generic_call_ab.py' -v
+python3 scripts/jit_generic_call_ab.py --rounds 8 --output jit-generic-call-ab.json
+```
+
+The comparator builds the release binary once and then executes that binary
+directly with the measured process pinned to one available logical CPU on
+Linux by default. Use `--cpu-mode host` only for an explicitly unpinned
+exploratory comparison or where affinity is unsupported. The JSON report
+records the CPU mode and selected CPU affinity. Each round executes both
+workloads and alternates which one runs first. Each individual benchmark
+process verifies interpreter/first-JIT/warm-JIT result
+parity before emitting JSONL; the analyzer rejects missing or malformed metrics
+and preserves every raw sample alongside median interpreter, first-run, warm-run
+and compilation durations. CI uploads the report as an artifact.
+
+The median of same-round **generic/concrete** warm-duration ratios is
+descriptive only. Both programs do the same work; neither program uses actual
+monomorphization. Each process constructs its own JIT and measures a short hot
+loop, so OS scheduling, CPU frequency, process startups, and JIT policy can
+affect small differences. The result does not establish statistical significance,
+a general compiler speedup, or the benefit of adding a new optimization.
+A proposed monomorphization patch must be measured separately against its
+exact base SHA on the same controlled host, including compilation/code-size
+cost and interpreter/backend semantic parity.
