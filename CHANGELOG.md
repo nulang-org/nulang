@@ -1,4 +1,6 @@
 # Nulang Changelog
+### Experimental structured `par` effect-scheduling metadata — 2026-10-19
+- **Compiler-owned safety metadata is available for future scoped execution.** Effects are classified separately from durable replay behavior; unknown calls and custom effects fail closed to sequential scheduling, while reference capability analysis remains an independent requirement. This does not enable parallel execution or alter runtime behavior.
 ### Web static-root containment — 2026-10-15
 - **Experimental Web static file serving refuses parent traversal and symlinks escaping configured roots.** Canonical candidate paths must remain inside their canonicalized static or output root, and normal in-root files remain serveable.
 - **A filesystem regression verifies parent and symlink escape rejection.** This is a clean current-main successor to draft #1676; it does not change SSE or claim protection from malicious concurrent mutation of a trusted static root.

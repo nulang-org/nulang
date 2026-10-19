@@ -87,6 +87,7 @@ fn actor_messaging_does_not_become_worker_parallel() {
         actor: Box::new(Expr::Var("worker".to_string(), sp())),
         behavior: "work".to_string(),
         args: vec![int(7)],
+        remote: false,
         span: sp(),
     };
     let summary = summarize_branch(0, &branch);
