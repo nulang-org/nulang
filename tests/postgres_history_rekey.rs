@@ -12,7 +12,16 @@ use nulang::runtime::{
 };
 
 fn db() -> Option<PostgresStore> {
-    let url = std::env::var("NU_TEST_POSTGRES_URL").ok()?;
+    let url = match std::env::var("NU_TEST_POSTGRES_URL") {
+        Ok(url) => url,
+        Err(_) => {
+            assert!(
+                std::env::var_os("NU_REQUIRE_POSTGRES_REKEY_TESTS").is_none(),
+                "PostgreSQL re-key integration gate requires NU_TEST_POSTGRES_URL"
+            );
+            return None;
+        }
+    };
     Some(PostgresStore::new(&url).expect("connect isolated PostgreSQL test instance"))
 }
 
