@@ -1,4 +1,8 @@
 # Nulang Changelog
+
+### Deterministic cluster restart fidelity — 2026-10-17
+- **Test-only real-runtime cluster simulation now preserves elapsed virtual time across node restarts.** The replacement runtime advances to the current simulation round before joining its peers; seeded regressions catch clock rewind after multi-round crashes.
+- **Restarted simulation transports retain bounded adjacent-packet reordering** when the test harness has enabled it. Production networking, runtime clocks and durability semantics are unchanged; exact-head Rust CI is required before promotion.
 ### Bounded Nulang Web development-server connections — 2026-10-16
 - **The experimental Web development listener caps active connections at 64**, including SSE, and returns `503` with `Retry-After: 1` when full.
 - **Worker capacity is returned by a scoped RAII lease** after normal completion, panic, or thread-spawn failure. One shared `Arc` route table replaces per-connection clones of compiled route modules.

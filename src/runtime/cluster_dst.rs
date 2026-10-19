@@ -191,11 +191,27 @@ impl DeterministicCluster {
         let bus = self.bus.clone();
         let mut rt = Runtime::new();
         rt.install_virtual_clock();
+        // A process restart does not rewind wall time. Bring the fresh
+        // virtual clock to this harness's current round BEFORE joining the
+        // cluster, so heartbeat/probe/deadline timestamps use the same
+        // simulated time horizon as the surviving nodes.
+        rt.advance_time(Duration::from_millis(
+            self.round.saturating_mul(ROUND_STEP.as_millis() as u64),
+        ));
         let transport =
             DeterministicNetworkTransport::bind_with_bus(addr, bus).expect("dst transport binds");
         transport.register_on_bus();
         rt.enable_distribution_with_transport(Box::new(transport))
             .expect("dst distribution enables");
+        // Recreating the transport must not silently disable fault injection
+        // for just this node after a crash/restart cycle.
+        if self.reorder {
+            rt.distributed
+                .transport
+                .as_mut()
+                .expect("dst transport")
+                .set_reorder(true);
+        }
         if let Some(cluster) = rt.distributed.cluster.as_mut() {
             cluster.set_rng(Box::new(DeterministicRng::new(self.rng.next())));
         }
@@ -387,6 +403,46 @@ mod tests {
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+    }
+
+    /// A restarted node must join at the current simulated time, not at the
+    /// virtual clock's zero point. Otherwise crash duration is effectively
+    /// erased for that node's failure detector, timers and deadlines.
+    #[test]
+    fn test_dst_cluster_restart_preserves_global_virtual_round() {
+        const BEFORE_CRASH: u64 = 7;
+        const WHILE_CRASHED: u64 = 13;
+
+        for seed in 0..8 {
+            let mut cluster = DeterministicCluster::new(&[addr(9161), addr(9162)], seed);
+            cluster.run_rounds(BEFORE_CRASH);
+            cluster.crash_node(1);
+            cluster.run_rounds(WHILE_CRASHED);
+            cluster.restart_node(1);
+
+            let expected = ROUND_STEP * (BEFORE_CRASH + WHILE_CRASHED) as u32;
+            for node in 0..2 {
+                assert_eq!(
+                    cluster.node(node).virtual_clock.as_ref().unwrap().elapsed(),
+                    expected,
+                    "seed {seed}: node {node} clock must equal global round {} after restart",
+                    cluster.round
+                );
+            }
+
+            cluster.step_round();
+            for node in 0..2 {
+                assert_eq!(
+                    cluster.node(node).virtual_clock.as_ref().unwrap().elapsed(),
+                    expected + ROUND_STEP,
+                    "seed {seed}: node {node} must advance without a clock discontinuity"
+                );
+            }
+            assert_eq!(
+                cluster.limit_hits, 0,
+                "seed {seed}: scheduler budget exhausted"
+            );
+        }
     }
 
     /// Spawn a counter actor with an `inc` behavior that adds its arg to a
