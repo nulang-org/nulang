@@ -35,7 +35,11 @@ it does not enumerate every actor behavior or nested expression.
 The MIR report lowers the checked AST through Nulang's existing HIR and MIR
 pipeline and lists compiler-owned functions and actor behaviors by name.
 For each it shows parameter count, MIR local-slot count, basic-block count,
-statement count and handler-table count. These are **compiler IR shapes**,
+statement count, handler-table count and sorted distinct nonzero source lines
+recorded in the MIR statement source map (`source_lines=-` when unmapped).
+The line list is partial statement-location metadata, not an exhaustive
+source map of every expression or a guarantee that generated code maps to a
+user declaration. These are **compiler IR shapes**,
 not bytecode instructions, verified optimizations, boxing, allocations, heap
 bytes or runtime measurements. Closure lifting and compiler-generated MIR
 functions may be included. MIR lowering can reject a program accepted by
