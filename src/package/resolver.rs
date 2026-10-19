@@ -445,6 +445,31 @@ impl Resolver {
                     span: Span::default(),
                 });
             }
+            // A matching Git HEAD does not guarantee a pristine checkout.
+            // Reject tracked changes and untracked sources before using the
+            // offline cache. Exclude generated .nula build/cache output.
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(&dest)
+                .args([
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=all",
+                    "--",
+                    ".",
+                    ":(exclude).nula",
+                ])
+                .output()
+                .map_err(|e| NuError::PackageError {
+                    msg: format!("cannot inspect offline git cache for '{}': {}", dep_name, e),
+                    span: Span::default(),
+                })?;
+            if !status.status.success() || !status.stdout.is_empty() {
+                return Err(NuError::PackageError {
+                    msg: format!("offline git dependency '{}' cache is dirty or unreadable", dep_name),
+                    span: Span::default(),
+                });
+            }
             let dir = std::fs::canonicalize(&dest).map_err(|e| NuError::PackageError {
                 msg: format!("offline git cache for '{}' cannot be resolved: {}", dep_name, e),
                 span: Span::default(),
