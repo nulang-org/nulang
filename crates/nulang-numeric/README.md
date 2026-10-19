@@ -50,6 +50,24 @@ buffer sizes run in eight paired rounds with alternating order and warmup.
 Treat ratios as *within-host diagnostic measurements*, not universal
 speedups; collect allocation and CPU evidence separately.
 
+Validate and summarize the generated CSV with the dependency-free Python
+analyzer (run from the repository root):
+
+```bash
+cd crates/nulang-numeric/tools
+python3 -m unittest discover -s tests -v
+cd ../../..
+python3 crates/nulang-numeric/tools/analyze.py numeric-views.csv > numeric-views-report.json
+```
+
+The analyzer enforces complete view/copy pairs for each round and checks
+checksum agreement before producing median timings, median **paired**
+view/copy latency ratios, and a deterministic 2,000-resample bootstrap
+95% interval. A ratio below 1 means the view path measured faster on
+these specific native-Rust operations. The CI workflow preserves raw CSV
+and the JSON analysis as a 14-day artifact; shared-runner results remain
+diagnostic only and do not authorize runtime integration.
+
 **Important:** This is not a Nulang source-level VM versus typed-buffer
 benchmark. It compares two Rust primitives and does not capture Nulang
 effect dispatch, compiler lowering, JIT, AOT, or WASM. Do not claim a Nulang
