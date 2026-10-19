@@ -42,7 +42,9 @@ mod object_store;
 mod orca_cycle;
 mod supervision;
 mod supervisor;
-pub use diagnostics::{DiagnosticEvent, DiagnosticSubscribeError, DiagnosticSubscription, RuntimeDiagnostics};
+pub use diagnostics::{
+    DiagnosticEvent, DiagnosticSubscribeError, DiagnosticSubscription, RuntimeDiagnostics,
+};
 pub use distributed_context::{
     DistributedContext, FabricAdvertisement, FabricAdvertisementSnapshot, FabricPublishReport,
 };
