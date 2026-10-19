@@ -33,6 +33,7 @@ Usage:
 import argparse
 import json
 import statistics
+import subprocess
 import sys
 from pathlib import Path
 
@@ -56,6 +57,79 @@ def median_absolute_deviation(samples: list[float], center: float) -> float:
     in the window doesn't blow out the spread estimate."""
     deviations = [abs(s - center) for s in samples]
     return statistics.median(deviations)
+
+
+def regression_manifest(
+    regressions: list[tuple[str, float, float, float, float]]
+) -> dict:
+    """Return the machine-readable payload consumed by paired confirmation."""
+    return {
+        "schema": 1,
+        "regressions": [
+            {
+                "benchmark": name,
+                "historical_median_ns": baseline,
+                "current_ns": current_ns,
+                "historical_delta": delta,
+                "threshold": threshold,
+            }
+            for name, baseline, current_ns, delta, threshold in regressions
+        ],
+    }
+
+
+def write_regression_manifest(
+    path: Path,
+    regressions: list[tuple[str, float, float, float, float]],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(regression_manifest(regressions), indent=2, sort_keys=True) + "\n")
+
+
+def git_commit_times() -> dict[str, int]:
+    """Return commit timestamps keyed by full SHA for the checked-out history.
+
+    Benchmark result filenames are the main-branch commit SHA that produced
+    them. Use Git history rather than filesystem mtimes: history JSON is
+    materialized with `git show` during CI, so its mtime describes copy order,
+    not benchmark chronology.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "log", "--format=%H %ct"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return {}
+
+    if proc.returncode != 0:
+        return {}
+
+    commit_times: dict[str, int] = {}
+    for line in proc.stdout.splitlines():
+        sha, separator, timestamp = line.partition(" ")
+        if not separator:
+            continue
+        try:
+            commit_times[sha] = int(timestamp)
+        except ValueError:
+            continue
+    return commit_times
+
+
+def history_order_key(path: Path, commit_times: dict[str, int]) -> tuple[int, int, str]:
+    """Sort benchmark files newest-first by producing commit timestamp.
+
+    Non-SHA or unavailable commits retain a deterministic mtime fallback for
+    local/offline use, but CI checks out full history so normal benchmark files
+    always take the Git-timestamp path.
+    """
+    timestamp = commit_times.get(path.stem)
+    if timestamp is not None:
+        return (1, timestamp, path.name)
+    return (0, path.stat().st_mtime_ns, path.name)
 
 
 def main() -> int:
@@ -89,23 +163,44 @@ def main() -> int:
         help="floor on the regression threshold as a fraction of the median, so a benchmark "
         "with unusually low historical spread isn't flagged for a trivial delta (default: 0.20)",
     )
+    parser.add_argument(
+        "--regressions-out",
+        type=Path,
+        help="optional JSON manifest of benchmarks that exceeded the historical gate",
+    )
     args = parser.parse_args()
 
     latest = load_results(args.latest)
     if not latest:
         print("No benchmarks in the latest result file; nothing to check.")
+        if args.regressions_out:
+            write_regression_manifest(args.regressions_out, [])
         return 0
 
     latest_resolved = args.latest.resolve()
+    commit_times = git_commit_times()
+    history_candidates = [
+        p
+        for p in args.history_dir.glob("*.json")
+        if p.resolve() != latest_resolved
+    ]
     history_files = sorted(
-        (
-            p
-            for p in args.history_dir.glob("*.json")
-            if p.resolve() != latest_resolved
-        ),
-        key=lambda p: p.stat().st_mtime,
+        history_candidates,
+        key=lambda p: history_order_key(p, commit_times),
         reverse=True,
     )[: args.window]
+
+    unresolved = [
+        path.name
+        for path in history_files
+        if path.stem not in commit_times
+    ]
+    if unresolved:
+        print(
+            "WARNING: Git timestamps unavailable for "
+            f"{len(unresolved)} selected history file(s); using filesystem mtime fallback: "
+            + ", ".join(unresolved)
+        )
 
     if len(history_files) < args.min_samples:
         print(
@@ -113,6 +208,8 @@ def main() -> int:
             f"(need >= {args.min_samples}); skipping regression gate -- not enough "
             "history to compare against yet."
         )
+        if args.regressions_out:
+            write_regression_manifest(args.regressions_out, [])
         return 0
 
     # benchmark -> list of historical mean_ns values, most recent window only.
@@ -142,6 +239,9 @@ def main() -> int:
         print(f"Skipped {len(skipped)} benchmark(s) with < {args.min_samples} historical samples:")
         for name, n in skipped:
             print(f"  - {name} ({n} prior sample(s))")
+
+    if args.regressions_out:
+        write_regression_manifest(args.regressions_out, regressions)
 
     if not regressions:
         print(

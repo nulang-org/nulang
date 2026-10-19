@@ -4,24 +4,30 @@
 - **Tier:** Experimental
 - **Created:** 2026-09-11
 - **Supersedes:** RFC 0004 (Draft) where it proposed that agent/workflow ergonomics must be removed rather than lowered to actors
+- **Partially superseded by:** RFC 0024 for the language-wide claim that actors are Nulang's only execution model
 
 ## Summary
 
-Nulang has one execution model: actors. Higher-level constructs such as `agent`,
-`workflow`, `entity`, `organization`, and virtual actors are compositions or
-specializations of actors, not independent runtime species.
+This RFC originally described actors as Nulang's single execution model. RFC 0024
+refines that claim: **the actor runtime has one canonical actor object model**, while
+the language has multiple orthogonal execution domains (local computation, scoped
+tasks, and actors). Higher-level actor-backed constructs should still avoid becoming
+independent runtime species.
 
-The canonical semantic model contains seven primitives:
+The canonical actor-runtime vocabulary contains eight primitives:
 
-1. **Actor** — identity plus computation.
+1. **Actor** — independently addressable isolated computation.
 2. **State** — local, durable, event-sourced, or CRDT-backed state.
 3. **Message** — `send`, `ask`, `receive`, and signals.
-4. **Effect** — interaction with storage, HTTP, inference, queues, and other resources.
-5. **Capability** — authority to perform effects or move references across boundaries.
-6. **Supervisor** — lifecycle, failure containment, restart policy, links, and monitors.
-7. **Time** — sleep, timer, deadline, and recurring schedule semantics.
+4. **Effect** — a requested interaction such as storage, HTTP, inference, or queues.
+5. **Reference capability** — aliasing, mutation, ownership, and sendability constraints.
+6. **Authority** — permission to cross an external host/security boundary.
+7. **Supervisor** — lifecycle, failure containment, restart policy, links, and monitors.
+8. **Time** — sleep, timer, deadline, and recurring schedule semantics.
 
-Everything else should lower to a composition of these primitives.
+Actor-backed higher-level forms should lower to compositions of these primitives.
+Local computation and scoped tasks are defined separately by RFC 0024 and do not
+need an actor identity merely to execute or run concurrently.
 
 ## Motivation
 
@@ -78,8 +84,10 @@ single serialized role enum once all consumers have migrated.
 
 ## Workflows
 
-A workflow is not a separate scheduler process. It is a durable actor whose
-behaviors execute journaled effects and whose state records progress.
+The current language/runtime implementation hosts a workflow as a durable actor whose
+behaviors execute journaled effects and whose state records progress. RFC 0024
+separates that hosting strategy from the semantic definition: a workflow is durable
+structured computation, and an actor-backed host is one valid executor.
 
 Conceptually:
 
@@ -92,8 +100,9 @@ workflow
   + optional compensation
 ```
 
-Workflow syntax remains because it is clearer for orchestration code, but it lowers
-to actor semantics.
+Workflow syntax remains because it is clearer for orchestration code. Current
+lowering remains actor-backed for compatibility; executor-neutral workflow semantics
+may also be hosted without an actor as long as history/replay behavior is identical.
 
 ## Agents
 

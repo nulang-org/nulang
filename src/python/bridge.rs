@@ -24,9 +24,9 @@ use std::sync::{Mutex, OnceLock};
 
 /// NaN tag for Python object references stored in Nulang `Value`s.
 ///
-/// This tag occupies the unused NaN slot `0x7FF6` so it does not collide
-/// with `TAG_STRING` (`0x7FFE`) or `TAG_CLOSURE` (`0x7FF7`) defined in
-/// `crate::vm::Value`. See `src/vm.rs` for the full NaN-boxing layout.
+/// This tag occupies the reserved high-16 tag value `0x7FF6` so it does not collide
+/// with `TAG_STRING` (`0x7FFE`) or `TAG_CLOSURE` (`0x7FF7`). See
+/// `src/value_layout.rs` for the canonical tagged-word layout.
 pub const TAG_PYTHON: u64 = 0x7FF6_0000_0000_0000;
 
 // ---------------------------------------------------------------------------

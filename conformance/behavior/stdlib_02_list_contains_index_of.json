@@ -1,1 +1,1 @@
-{"exit_code":0,"stdout":"contains3=1\ncontains9=0\ncontains_empty=0\nidx2=1\nidx_first=0\nidx_miss=-1","stderr":""}
+{"exit_code":0,"stdout":"contains3=1\ncontains9=0\ncontains_empty=0\nidx2=1\nidx_first=0\nidx_miss=None","stderr":""}

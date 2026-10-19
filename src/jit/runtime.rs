@@ -1,12 +1,13 @@
 //! Runtime helper functions callable from JIT-compiled code.
 
-use crate::bytecode::Constant;
 use crate::value_layout::{
     is_float_raw, sext48, tag_int, INT48_MAX, INT48_MIN, PAYLOAD_MASK, TAG_CLOSURE, TAG_INT,
     TAG_MASK, TAG_PTR, TAG_STRING,
 };
 use crate::vm::Value;
 use std::cell::{Cell, UnsafeCell};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 // is_float_raw is now imported from crate::value_layout (integer bitmask, no FPU).
 
 /// Coerce a raw Nulang value to its string representation: the string content
@@ -332,6 +333,39 @@ pub extern "C" fn nulang_fmul(a: u64, b: u64) -> u64 {
     Value::float(f64::from_bits(a) * f64::from_bits(b)).as_raw()
 }
 
+/// Float arithmetic that coerces a non-float (nil) operand to 0.0, matching
+/// the interpreter's `F*` opcode handlers (`as_float().unwrap_or(0.0)`).
+/// Used by the AOT backend for operations the bytecode compiler statically
+/// types as Float even when a value (e.g. a division-by-zero nil) is not a
+/// float at runtime.
+fn fval(raw: u64) -> f64 {
+    if is_float_raw(raw) {
+        f64::from_bits(raw)
+    } else {
+        0.0
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn nulang_fadd_nil0(a: u64, b: u64) -> u64 {
+    Value::float(fval(a) + fval(b)).as_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn nulang_fsub_nil0(a: u64, b: u64) -> u64 {
+    Value::float(fval(a) - fval(b)).as_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn nulang_fmul_nil0(a: u64, b: u64) -> u64 {
+    Value::float(fval(a) * fval(b)).as_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn nulang_ineg_nil0(a: u64) -> u64 {
+    Value::float(-fval(a)).as_raw()
+}
+
 #[no_mangle]
 pub extern "C" fn nulang_fdiv(a: u64, b: u64) -> u64 {
     let bv = f64::from_bits(b);
@@ -339,6 +373,15 @@ pub extern "C" fn nulang_fdiv(a: u64, b: u64) -> u64 {
         return Value::nil().as_raw();
     }
     Value::float(f64::from_bits(a) / bv).as_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn nulang_fmod(a: u64, b: u64) -> u64 {
+    let bv = f64::from_bits(b);
+    if bv == 0.0 {
+        return Value::nil().as_raw();
+    }
+    Value::float(f64::from_bits(a) % bv).as_raw()
 }
 
 #[no_mangle]
@@ -445,9 +488,22 @@ thread_local! {
 
 /// Record a runtime error for retrieval by the AOT driver (no-op semantics
 /// for the tiered JIT, which never inspects this slot).
+///
+/// First-write-wins: compiled code cannot unwind, so a helper records the
+/// error and yields its nil/replacement value, and later statements keep
+/// executing and may record *their* own errors. The interpreter aborts at
+/// the FIRST arithmetic/type error, so to stay in lockstep the AOT driver
+/// must surface that first error, not the last one recorded by downstream
+/// statements that ran on the error-replacement value. E.g. `--(1 + 2,)`:
+/// the inner neg fails on the tuple pointer ("got ptr"), yields nil, and the
+/// OUTER neg on nil would otherwise overwrite the slot with "got nil".
 pub fn aot_set_pending_error(msg: String) {
+    // First-write-wins: the interpreter aborts at the FIRST error and never
+    // runs later statements, so that first error is the observable one.
     AOT_PENDING_ERROR.with(|e| {
-        *e.borrow_mut() = Some(msg);
+        if e.borrow().is_none() {
+            *e.borrow_mut() = Some(msg);
+        }
     });
 }
 
@@ -469,69 +525,50 @@ pub fn clear_jit_callbacks() {
 }
 
 // ---------------------------------------------------------------------------
-// Constant-pool thread-local for JIT runtime helpers (string comparison)
+// JIT string resolution
 // ---------------------------------------------------------------------------
 
-/// Pointer-length pair for the current module's constant pool, stored as
-/// two usize values to avoid zero-initialization UB in the thread-local.
-#[derive(Clone, Copy)]
-struct ConstantsPtr(*const Constant, usize);
-
-impl ConstantsPtr {
-    const NULL: Self = ConstantsPtr(std::ptr::null(), 0);
-
-    /// # Safety
-    /// The slice must be valid for the duration of the JIT execution.
-    unsafe fn as_slice(self) -> &'static [Constant] {
-        if self.0.is_null() {
-            &[]
-        } else {
-            std::slice::from_raw_parts(self.0, self.1)
-        }
-    }
-}
-
 thread_local! {
-    static JIT_CONSTANTS: UnsafeCell<ConstantsPtr> = UnsafeCell::new(ConstantsPtr::NULL);
+    /// Immutable module context used by zero-copy JIT entries. Keeping this
+    /// separate from JIT_VM lets string-aware helpers resolve interned strings
+    /// without constructing an immutable reference to the parent VM while its
+    /// frame register array is mutably exposed to native code.
+    static JIT_STRING_MODULE: Cell<*const crate::bytecode::CodeModule> =
+        const { Cell::new(std::ptr::null()) };
 }
 
-/// Set the current module's constant pool for JIT runtime helpers.
+/// Install the active module for synchronous native string resolution.
 ///
 /// # Safety
-/// The slice must remain valid until `clear_jit_constants` is called.
-pub unsafe fn set_jit_constants(constants: &[Constant]) {
-    JIT_CONSTANTS.with(|cell| {
-        *cell.get() = ConstantsPtr(constants.as_ptr(), constants.len());
-    });
+/// `module` must remain valid and immutable until `clear_jit_string_module`.
+/// The VM installs this only for non-reentrant compiled regions, so native
+/// execution cannot mutate or reallocate `VM::modules` while the pointer is live.
+pub unsafe fn set_jit_string_module(module: *const crate::bytecode::CodeModule) {
+    JIT_STRING_MODULE.with(|cell| cell.set(module));
 }
 
-pub fn clear_jit_constants() {
-    JIT_CONSTANTS.with(|cell| unsafe {
-        *cell.get() = ConstantsPtr::NULL;
-    });
+pub fn clear_jit_string_module() {
+    JIT_STRING_MODULE.with(|cell| cell.set(std::ptr::null()));
 }
 
 /// Resolve a raw u64 value to its string content (for comparison).
-/// Returns None for non-string values or when the constant pool is unavailable.
+///
+/// Interned strings are resolved through either the direct-frame path's
+/// immutable active-module pointer or the detached path's VM + module index.
+/// No borrowed constant-pool slice is stored in thread-local state; the module
+/// pointer is installed only while non-reentrant native execution keeps
+/// `VM::modules` fixed in place.
 fn resolve_jit_string(raw: u64) -> Option<String> {
     if (raw & TAG_MASK) == TAG_STRING {
-        // Interned string: look up in the thread-local constant pool.
         let id = (raw & PAYLOAD_MASK) as u32;
-        JIT_CONSTANTS.with(|cell| unsafe {
-            let cp = (*cell.get()).as_slice();
-            match cp.get(id as usize) {
-                Some(Constant::String(s)) => Some(s.clone()),
-                _ => None,
-            }
-        })
+        resolve_active_vm_string(id)
     } else if (raw & TAG_MASK) == TAG_PTR {
         let ptr = (raw & PAYLOAD_MASK) as *mut u8;
         if ptr.is_null() {
             return None;
         }
         // SAFETY: ptr is a valid ActorHeap allocation with a header;
-        // `heap_string_payload` re-checks the type tag and bounds the scan
-        // for the NUL terminator by the recorded payload size.
+        // heap_string_payload re-checks the type tag and bounds the scan.
         unsafe { heap_string_payload(ptr) }
     } else {
         None
@@ -626,23 +663,123 @@ pub fn take_jit_branch_exit_pc() -> Option<usize> {
 // and the interpreter.
 // ---------------------------------------------------------------------------
 
-// The single-threaded VM currently executing a compiled region (set by
-// `VM::step` around each `tiered_execute_step_typed` call; the VM is
-// thread-confined, so a thread-local pointer is sound).
+// The single-threaded VM currently executing a compiled region. Native
+// helpers keep only the raw VM pointer and module index; no Rust reference to
+// module storage survives native entry.
+const NO_JIT_MODULE: usize = usize::MAX;
+
 thread_local! {
-    static JIT_VM: Cell<*mut crate::vm::VM> = Cell::new(std::ptr::null_mut());
+    static JIT_VM: Cell<*mut crate::vm::VM> = const { Cell::new(std::ptr::null_mut()) };
+    static JIT_MODULE_IDX: Cell<usize> = const { Cell::new(NO_JIT_MODULE) };
 }
 
-pub unsafe fn set_jit_vm(vm: *mut crate::vm::VM) {
+#[derive(Clone, Copy)]
+struct JitLeafCallEntry {
+    func_idx: usize,
+    ptr: *const u8,
+    return_reg: u8,
+    required_args: usize,
+}
+
+thread_local! {
+    static JIT_LEAF_CALLS: std::cell::RefCell<Vec<JitLeafCallEntry>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static JIT_LEAF_CONSTANTS: Cell<*const u64> = const { Cell::new(std::ptr::null()) };
+}
+
+#[cfg(test)]
+static JIT_LEAF_TABLE_INSTALLS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_jit_leaf_table_installs_for_test() {
+    JIT_LEAF_TABLE_INSTALLS.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn jit_leaf_table_installs_for_test() -> usize {
+    JIT_LEAF_TABLE_INSTALLS.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_jit_leaf_calls(calls: &[(usize, *const u8, u8, usize)], constants: *const u64) {
+    #[cfg(test)]
+    JIT_LEAF_TABLE_INSTALLS.fetch_add(1, Ordering::Relaxed);
+    JIT_LEAF_CALLS.with(|slot| {
+        let mut entries = slot.borrow_mut();
+        entries.clear();
+        entries.extend(
+            calls.iter().map(
+                |&(func_idx, ptr, return_reg, required_args)| JitLeafCallEntry {
+                    func_idx,
+                    ptr,
+                    return_reg,
+                    required_args,
+                },
+            ),
+        );
+    });
+    JIT_LEAF_CONSTANTS.with(|slot| slot.set(constants));
+}
+
+pub(crate) fn clear_jit_leaf_calls() {
+    JIT_LEAF_CALLS.with(|slot| slot.borrow_mut().clear());
+    JIT_LEAF_CONSTANTS.with(|slot| slot.set(std::ptr::null()));
+}
+
+fn jit_leaf_call(func_idx: usize) -> Option<JitLeafCallEntry> {
+    JIT_LEAF_CALLS.with(|slot| {
+        slot.borrow()
+            .iter()
+            .copied()
+            .find(|entry| entry.func_idx == func_idx)
+    })
+}
+
+pub unsafe fn set_jit_vm(vm: *mut crate::vm::VM, module_idx: usize) {
     JIT_VM.with(|cell| cell.set(vm));
+    JIT_MODULE_IDX.with(|cell| cell.set(module_idx));
 }
 
 pub fn clear_jit_vm() {
     JIT_VM.with(|cell| cell.set(std::ptr::null_mut()));
+    JIT_MODULE_IDX.with(|cell| cell.set(NO_JIT_MODULE));
 }
 
 fn get_jit_vm() -> *mut crate::vm::VM {
     JIT_VM.with(|cell| cell.get())
+}
+
+fn get_jit_module_idx() -> Option<usize> {
+    JIT_MODULE_IDX.with(|cell| {
+        let idx = cell.get();
+        (idx != NO_JIT_MODULE).then_some(idx)
+    })
+}
+
+fn resolve_active_vm_string(id: u32) -> Option<String> {
+    let module_ptr = JIT_STRING_MODULE.with(|cell| cell.get());
+    if !module_ptr.is_null() {
+        // SAFETY: the zero-copy VM path installs a pointer to the active
+        // CodeModule for exactly the synchronous native call. That path cannot
+        // re-enter the VM, so `VM::modules` cannot move while this pointer is
+        // live. The module is disjoint from the mutably-borrowed frame regs.
+        return unsafe {
+            (&*module_ptr)
+                .constants
+                .get(id as usize)
+                .and_then(|constant| match constant {
+                    crate::bytecode::Constant::String(value) => Some(value.clone()),
+                    _ => None,
+                })
+        };
+    }
+
+    let vm_ptr = get_jit_vm();
+    let module_idx = get_jit_module_idx()?;
+    if vm_ptr.is_null() {
+        return None;
+    }
+    // Detached/re-entrant regions retain the existing VM lookup path.
+    unsafe { (&*vm_ptr).constant_string(module_idx, id) }
 }
 
 // Runtime error raised while running a re-entrant callee (e.g. step-limit).
@@ -668,18 +805,20 @@ pub fn take_jit_pending_vm_error() -> Option<String> {
 /// callbacks / safepoint / branch markers.
 struct JitThreadState {
     vm: *mut crate::vm::VM,
-    constants: ConstantsPtr,
+    module_idx: usize,
     callbacks: CbPair,
     safepoint: *mut u64,
     yield_pc: u64,
     branch_exit_pc: u64,
     pending_error: Option<String>,
+    leaf_calls: Vec<JitLeafCallEntry>,
+    leaf_constants: *const u64,
 }
 
 fn save_jit_thread_state() -> JitThreadState {
-    let (vm, constants, callbacks) = (
+    let (vm, module_idx, callbacks) = (
         JIT_VM.with(|c| c.get()),
-        JIT_CONSTANTS.with(|c| unsafe { *c.get() }),
+        JIT_MODULE_IDX.with(|c| c.get()),
         JIT_CALLBACKS.with(|c| unsafe { *c.get() }),
     );
     let (safepoint, yield_pc, branch_exit_pc) = (
@@ -688,27 +827,33 @@ fn save_jit_thread_state() -> JitThreadState {
         JIT_BRANCH_EXIT_PC.with(|c| c.get()),
     );
     let pending_error = AOT_PENDING_ERROR.with(|e| e.borrow().clone());
+    let leaf_calls = JIT_LEAF_CALLS.with(|slot| slot.borrow().clone());
+    let leaf_constants = JIT_LEAF_CONSTANTS.with(|slot| slot.get());
     JitThreadState {
         vm,
-        constants,
+        module_idx,
         callbacks,
         safepoint,
         yield_pc,
         branch_exit_pc,
         pending_error,
+        leaf_calls,
+        leaf_constants,
     }
 }
 
 fn restore_jit_thread_state(s: JitThreadState) {
     JIT_VM.with(|c| c.set(s.vm));
+    JIT_MODULE_IDX.with(|c| c.set(s.module_idx));
     unsafe {
-        JIT_CONSTANTS.with(|c| *c.get() = s.constants);
         JIT_CALLBACKS.with(|c| *c.get() = s.callbacks);
     }
     JIT_SAFEPOINT_PTR.with(|c| c.set(s.safepoint));
     JIT_YIELD_PC.with(|c| c.set(s.yield_pc));
     JIT_BRANCH_EXIT_PC.with(|c| c.set(s.branch_exit_pc));
     AOT_PENDING_ERROR.with(|e| *e.borrow_mut() = s.pending_error);
+    JIT_LEAF_CALLS.with(|slot| *slot.borrow_mut() = s.leaf_calls);
+    JIT_LEAF_CONSTANTS.with(|slot| slot.set(s.leaf_constants));
 }
 
 /// Run a provably-non-suspending callee (function-table index `func_idx`) to
@@ -727,7 +872,7 @@ fn restore_jit_thread_state(s: JitThreadState) {
 /// The callee is `!may_suspend` by construction (the compiler gates emission
 /// on that analysis), so it never suspends mid-run.
 #[no_mangle]
-pub extern "C" fn nulang_jit_direct_call(
+pub unsafe extern "C" fn nulang_jit_direct_call(
     regs: *mut u64,
     func_idx: i64,
     argc: i64,
@@ -738,9 +883,59 @@ pub extern "C" fn nulang_jit_direct_call(
         set_jit_pending_vm_error("JIT direct call with no active VM".to_string());
         return 1;
     }
+    let func_idx = func_idx as usize;
+    let argc = argc.max(0) as usize;
+    let dst = dst.max(0) as usize;
+
+    if dst < 256 {
+        if let Some(leaf) = jit_leaf_call(func_idx) {
+            if argc >= leaf.required_args {
+                let mut callee_regs = std::mem::MaybeUninit::<[u64; 256]>::uninit();
+                let callee_ptr = callee_regs.as_mut_ptr() as *mut u64;
+                let copied = argc.min(256);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(regs, callee_ptr, copied);
+                }
+
+                // A nested leaf call is part of the enclosing native region's
+                // reduction. Do not consume a second safepoint budget or leak
+                // branch/yield markers from the callee back into the caller.
+                let saved_safepoint = JIT_SAFEPOINT_PTR.with(|slot| {
+                    let old = slot.get();
+                    slot.set(std::ptr::null_mut());
+                    old
+                });
+                let saved_yield = JIT_YIELD_PC.with(|slot| slot.replace(u64::MAX));
+                let saved_branch = JIT_BRANCH_EXIT_PC.with(|slot| slot.replace(u64::MAX));
+                let saved_aot_error = AOT_PENDING_ERROR.with(|slot| slot.borrow_mut().take());
+
+                let constants = JIT_LEAF_CONSTANTS.with(|slot| slot.get());
+                let func: extern "C" fn(*mut u64, *const u64) =
+                    unsafe { std::mem::transmute(leaf.ptr) };
+                func(callee_ptr, constants);
+
+                let leaf_error = AOT_PENDING_ERROR.with(|slot| slot.borrow_mut().take());
+                AOT_PENDING_ERROR.with(|slot| *slot.borrow_mut() = saved_aot_error);
+                JIT_SAFEPOINT_PTR.with(|slot| slot.set(saved_safepoint));
+                JIT_YIELD_PC.with(|slot| slot.set(saved_yield));
+                JIT_BRANCH_EXIT_PC.with(|slot| slot.set(saved_branch));
+
+                if let Some(msg) = leaf_error {
+                    set_jit_pending_vm_error(msg);
+                    return 1;
+                }
+
+                unsafe {
+                    *regs.add(dst) = *callee_ptr.add(leaf.return_reg as usize);
+                }
+                return 0;
+            }
+        }
+    }
+
     let vm = unsafe { &mut *vm_ptr };
     let saved = save_jit_thread_state();
-    let status = vm.jit_direct_call(regs, func_idx as usize, argc as usize, dst as usize);
+    let status = vm.jit_direct_call(regs, func_idx, argc, dst);
     restore_jit_thread_state(saved);
     status
 }
@@ -801,6 +996,73 @@ pub fn aot_clear_constants() {
     AOT_CONSTANTS.with(|cell| {
         *cell.borrow_mut() = None;
     });
+}
+
+/// Snapshot of the helper thread-local state that nested AOT actor dispatch
+/// temporarily replaces. The constant pool is moved out rather than cloned so
+/// preserving an outer native frame does not add a copy proportional to the
+/// module's constant count.
+pub(crate) struct AotHelperThreadState {
+    callbacks: CbPair,
+    constants: Option<Vec<crate::bytecode::Constant>>,
+}
+
+/// Save the active AOT callback and constant-pool context before a nested
+/// native actor entry overwrites it.
+pub(crate) fn save_aot_helper_thread_state() -> AotHelperThreadState {
+    let callbacks = JIT_CALLBACKS.with(|cell| unsafe { *cell.get() });
+    let constants = AOT_CONSTANTS.with(|cell| cell.borrow_mut().take());
+    AotHelperThreadState {
+        callbacks,
+        constants,
+    }
+}
+
+/// Restore the helper context saved by `save_aot_helper_thread_state`.
+///
+/// This intentionally does not restore the pending AOT error slot: an error
+/// raised by the nested native call belongs to the enclosing run and must
+/// remain observable by the outer driver.
+pub(crate) fn restore_aot_helper_thread_state(state: AotHelperThreadState) {
+    unsafe {
+        JIT_CALLBACKS.with(|cell| *cell.get() = state.callbacks);
+    }
+    AOT_CONSTANTS.with(|cell| *cell.borrow_mut() = state.constants);
+}
+
+#[cfg(test)]
+mod aot_helper_state_tests {
+    use super::*;
+
+    #[test]
+    fn nested_aot_helper_state_round_trip_restores_outer_context() {
+        JIT_CALLBACKS.with(|cell| unsafe { *cell.get() = CbPair(11, 22) });
+        AOT_CONSTANTS.with(|cell| {
+            *cell.borrow_mut() = Some(vec![crate::bytecode::Constant::String("outer".to_string())]);
+        });
+
+        let saved = save_aot_helper_thread_state();
+
+        JIT_CALLBACKS.with(|cell| unsafe { *cell.get() = CbPair(33, 44) });
+        AOT_CONSTANTS.with(|cell| {
+            *cell.borrow_mut() = Some(vec![crate::bytecode::Constant::String("inner".to_string())]);
+        });
+
+        restore_aot_helper_thread_state(saved);
+
+        JIT_CALLBACKS.with(|cell| unsafe {
+            let restored = *cell.get();
+            assert_eq!((restored.0, restored.1), (11, 22));
+            *cell.get() = CbPair::NULL;
+        });
+        AOT_CONSTANTS.with(|cell| {
+            let restored = cell.borrow_mut().take();
+            assert!(matches!(
+                restored.as_deref(),
+                Some([crate::bytecode::Constant::String(value)]) if value == "outer"
+            ));
+        });
+    }
 }
 
 /// Allocate via callbacks or fall back to standalone AOT heap.
@@ -1019,18 +1281,11 @@ pub fn resolve_string_coerce(raw: u64) -> Option<String> {
         return Some(val.as_bool().unwrap().to_string());
     }
     if (raw & TAG_MASK) == TAG_STRING {
-        // String constant from the module pool: content lives in the JIT or
-        // AOT constant pool, keyed by the payload index.
+        // String constant from the module pool: content lives in the active
+        // JIT VM or the standalone AOT constant pool.
         let id = (raw & PAYLOAD_MASK) as u32;
-        let from_jit = JIT_CONSTANTS.with(|cell| unsafe {
-            let cp = (*cell.get()).as_slice();
-            cp.get(id as usize).and_then(|c| match c {
-                crate::bytecode::Constant::String(s) => Some(s.clone()),
-                _ => None,
-            })
-        });
-        if from_jit.is_some() {
-            return from_jit;
+        if let Some(from_jit) = resolve_active_vm_string(id) {
+            return Some(from_jit);
         }
         return AOT_CONSTANTS.with(|cell| {
             let guard = cell.borrow();
@@ -1697,6 +1952,7 @@ macro_rules! define_aot_perform_async {
                         Value::nil().as_raw()
                     }
                 }
+                Some(crate::vm::PerformAsyncResult::ReadyValue(value)) => value.as_raw(),
                 // Ready(None), unarmed callbacks, or Pending (no native
                 // suspension) all degrade to nil.
                 _ => Value::nil().as_raw(),

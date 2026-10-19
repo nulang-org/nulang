@@ -1,0 +1,82 @@
+version: 1
+
+commands:
+  doctor: cargo --version && rustc --version && python3 --version
+
+verification:
+  fast:
+    command: cargo fmt --all -- --check && cargo clippy --locked --all-targets -- -D clippy::correctness && cargo check --locked --tests
+    timeout_seconds: 1200
+  changed:
+    command: bash scripts/ci-local.sh
+    timeout_seconds: 3600
+  full:
+    command: bash scripts/ci-local.sh --full
+    timeout_seconds: 7200
+  no_default_features:
+    command: cargo test --locked --no-default-features
+    timeout_seconds: 2400
+  wasm:
+    command: cargo test --locked --features wasm-backend
+    timeout_seconds: 3000
+  conformance:
+    command: python3 scripts/verify_implementation.py
+    timeout_seconds: 1200
+
+work:
+  isolation: worktree
+  max_parallel_cost: 4
+  require_clean_handoff: true
+
+review:
+  independent: true
+  exact_head: true
+
+risk:
+  - paths:
+      - devplane.yaml
+      - scripts/ci-local.sh
+      - .github/**
+      - .woodpecker/**
+      - .buildkite/**
+    level: critical
+    requires:
+      - full
+      - independent_review
+      - human_approval
+
+  - paths:
+      - src/format/**
+      - src/bytecode.rs
+      - src/value_layout.rs
+      - src/runtime/network.rs
+      - src/runtime/persistence.rs
+    level: high
+    requires:
+      - full
+      - conformance
+      - independent_review
+      - human_approval
+
+  - paths:
+      - src/runtime/**
+      - src/jit/**
+      - src/aot/**
+      - src/mir_wasm.rs
+      - src/wasm_runtime.rs
+      - src/typechecker.rs
+      - src/effect_checker.rs
+      - src/mir_lower.rs
+      - src/mir_codegen.rs
+    level: high
+    requires:
+      - full
+      - independent_review
+
+  - paths:
+      - Cargo.toml
+      - Cargo.lock
+    level: high
+    requires:
+      - full
+      - independent_review

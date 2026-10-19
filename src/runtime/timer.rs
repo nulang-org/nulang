@@ -266,16 +266,18 @@ impl TimerWheel {
         id
     }
 
-    /// Schedule a `TimerSleepWake` message to fire after `delay`, resuming
-    /// an actor suspended on `Timer.sleep`.
-    pub fn timer_sleep_wake(&self, delay: Duration, target_actor: u64) -> TimerId {
+    /// Schedule a `TimerSleepWake` message relative to `now`, resuming an
+    /// actor suspended on `Timer.sleep`.
+    ///
+    /// The caller supplies `now` so a `Runtime` with a virtual clock never
+    /// mixes its logical time with wall-clock `Instant::now()`.
+    pub fn timer_sleep_wake_at(&self, now: Instant, delay: Duration, target_actor: u64) -> TimerId {
         let id = TimerId(self.next_id.fetch_add(1, Ordering::SeqCst));
-        let fire_at = Instant::now() + delay;
         let entry = TimerEntry {
             id,
             target_actor,
             message: TimerMessage::TimerSleepWake,
-            fire_at,
+            fire_at: now + delay,
             cancelled: AtomicBool::new(false),
         };
         if let Ok(mut timers) = self.timers.write() {

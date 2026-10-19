@@ -42,6 +42,16 @@ pub(crate) fn migration_authority_tokens(
     Ok(manifest.canonical_token_set())
 }
 
+/// Allocate the fencing epoch owned by the migration target.
+///
+/// The source remains on `current` until it is reaped; sending `current + 1`
+/// means any stale source activation is rejected once the target publishes a
+/// durable commit. Overflow cannot preserve strict monotonicity, so migration
+/// fails closed instead of reusing the maximum epoch.
+fn next_migration_activation_epoch(current: u64) -> Option<u64> {
+    current.checked_add(1)
+}
+
 pub(crate) fn spawn_with_site_authority(
     rt: &mut Runtime,
     module: &crate::bytecode::CodeModule,
@@ -135,7 +145,9 @@ fn required_host_authority(
             }
             other("Net", "Listen", Some(port.to_string()))
         }
-        ("Process", Some("run")) => other("Process", "Run", Some(string_arg(0)?)),
+        ("Process", Some("run")) => AuthorityGrant::ProcessRun {
+            command: string_arg(0)?,
+        },
         ("System", Some("arg")) => {
             let index = regs
                 .first()
@@ -379,29 +391,22 @@ pub(crate) fn perform_web_builtin(
             let tag = resolve(constants, *regs.first()?);
             let attrs = read_array(callbacks, *regs.get(1)?);
             let children = read_array(callbacks, *regs.get(2)?);
-            let mut out = String::new();
-            out.push('<');
-            out.push_str(&tag);
-            for attr in &attrs {
-                let slots = read_array(callbacks, *attr);
-                if slots.len() >= 2 {
-                    let name = resolve(constants, slots[0]);
-                    let value = resolve(constants, slots[1]);
-                    out.push(' ');
-                    out.push_str(&name);
-                    out.push_str("=\"");
-                    out.push_str(&value);
-                    out.push('\"');
-                }
+            let attrs: Vec<(String, String)> = attrs
+                .iter()
+                .filter_map(|attr| {
+                    let slots = read_array(callbacks, *attr);
+                    (slots.len() >= 2)
+                        .then(|| (resolve(constants, slots[0]), resolve(constants, slots[1])))
+                })
+                .collect();
+            let children: Vec<String> = children
+                .iter()
+                .map(|child| resolve(constants, *child))
+                .collect();
+            match crate::web::html_safety::render_element(&tag, &attrs, &children) {
+                Some(html) => Some(callbacks.alloc_string(&html)),
+                None => Some(crate::vm::Value::nil()),
             }
-            out.push('>');
-            for child in &children {
-                out.push_str(&resolve(constants, *child));
-            }
-            out.push_str("</");
-            out.push_str(&tag);
-            out.push('>');
-            Some(callbacks.alloc_string(&out))
         }
         Some("text") => {
             let s = resolve(constants, *regs.first()?);
@@ -779,7 +784,15 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
             vm.constant_string(module_idx, string_id)?
         };
         let duration_ms = regs.get(1)?.as_int()? as u64;
-        rt.schedule_workflow_timer(actor_id, &name, duration_ms);
+        if let Err(error) = rt.schedule_workflow_timer(actor_id, &name, duration_ms) {
+            tracing::error!(
+                actor_id,
+                timer = %name,
+                %error,
+                "nulang-workflow: durable timer scheduling failed"
+            );
+            return None;
+        }
         Some(crate::vm::Value::unit())
     }
 
@@ -836,8 +849,7 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
                 if let Some(callback_name) = callback_name {
                     let rt = self.runtime.borrow_mut();
                     let actor_id = rt.current_actor.unwrap_or(0);
-                    let behavior_id = rt.behavior_id_for(actor_id, &callback_name).unwrap_or(0);
-                    if behavior_id > 0 {
+                    if let Some(behavior_id) = rt.behavior_id_for(actor_id, &callback_name) {
                         rt.timer_wheel.send_after(
                             std::time::Duration::from_millis(ms as u64),
                             actor_id,
@@ -1032,13 +1044,17 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
             Some(op) => format!("{}.{}", effect_name, op),
             None => effect_name.to_string(),
         };
-        // Check test handlers before real dispatch — allows tests to
-        // intercept effects without a `handle` block in source.
+        // Test-only interception is compiled out of production builds so
+        // privileged host effects cannot bypass the authority boundary.
+        #[cfg(test)]
         {
             let rt = self.runtime.borrow();
             if let Some(result) = rt.check_test_handler(&qualified, regs) {
                 return Some(result);
             }
+        }
+        {
+            let rt = self.runtime.borrow();
             if let Err(error) = authorize_actor_host_effect(
                 &rt,
                 rt.current_actor,
@@ -1116,8 +1132,12 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
                     return crate::vm::PerformAsyncResult::Ready(None);
                 }
                 if ms > 0 {
-                    rt.timer_wheel
-                        .timer_sleep_wake(std::time::Duration::from_millis(ms), actor_id);
+                    let now = rt.now();
+                    rt.timer_wheel.timer_sleep_wake_at(
+                        now,
+                        std::time::Duration::from_millis(ms),
+                        actor_id,
+                    );
                 }
                 crate::vm::PerformAsyncResult::Pending
             }
@@ -1586,7 +1606,17 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
             let string_id = regs.get(0)?.as_string_id()?;
             let name = vm.constant_string(module_idx, string_id)?;
             let duration_ms = regs.get(1)?.as_int()? as u64;
-            (*self.runtime).schedule_workflow_timer(self.actor_id, &name, duration_ms);
+            if let Err(error) =
+                (*self.runtime).schedule_workflow_timer(self.actor_id, &name, duration_ms)
+            {
+                tracing::error!(
+                    actor_id = self.actor_id,
+                    timer = %name,
+                    %error,
+                    "nulang-workflow: durable timer scheduling failed"
+                );
+                return None;
+            }
             Some(crate::vm::Value::unit())
         }
     }
@@ -1696,10 +1726,9 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
                         })
                     });
                     if let Some(callback_name) = callback_name {
-                        let behavior_id = (*self.runtime)
-                            .behavior_id_for(self.actor_id, &callback_name)
-                            .unwrap_or(0);
-                        if behavior_id > 0 {
+                        if let Some(behavior_id) =
+                            (*self.runtime).behavior_id_for(self.actor_id, &callback_name)
+                        {
                             (*self.runtime).timer_wheel.send_after(
                                 std::time::Duration::from_millis(ms as u64),
                                 self.actor_id,
@@ -1840,7 +1869,9 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
             None => effect_name.to_string(),
         };
         unsafe {
-            // Check test handlers before real dispatch.
+            // Test-only interception is compiled out of production builds so
+            // privileged host effects cannot bypass the authority boundary.
+            #[cfg(test)]
             if let Some(result) = (*self.runtime).check_test_handler(&qualified, regs) {
                 return Some(result);
             }
@@ -2068,8 +2099,12 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
                         return PerformAsyncResult::Ready(None);
                     }
                     if ms > 0 {
-                        rt.timer_wheel
-                            .timer_sleep_wake(std::time::Duration::from_millis(ms), self.actor_id);
+                        let now = rt.now();
+                        rt.timer_wheel.timer_sleep_wake_at(
+                            now,
+                            std::time::Duration::from_millis(ms),
+                            self.actor_id,
+                        );
                     }
                 }
                 PerformAsyncResult::Pending
@@ -2343,25 +2378,7 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
                         .unwrap_or(crate::runtime::persistence::StateModel::Local);
                     if model == crate::runtime::persistence::StateModel::Durable || model.is_crdt()
                     {
-                        let persisted = if name == "semantic_memory" || name == "procedural_memory"
-                        {
-                            crate::runtime::workflow::vm_value_to_string_in_actor(
-                                    value, actor,
-                                )
-                                .map(crate::runtime::persistence::PersistedValue::String)
-                                .unwrap_or_else(|| {
-                                    crate::runtime::persistence::PersistedValue::from_value_resolved(
-                                        value,
-                                        actor.bytecode_module.as_ref(),
-                                    )
-                                })
-                        } else {
-                            crate::runtime::persistence::PersistedValue::from_value_resolved(
-                                value,
-                                actor.bytecode_module.as_ref(),
-                            )
-                        };
-                        state.insert(name.clone(), persisted);
+                        state.insert(name.clone(), actor.persist_value(value));
                     }
                 }
 
@@ -2391,13 +2408,37 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
                         return;
                     }
                 };
+                let activation_epoch = match next_migration_activation_epoch(actor.activation_epoch)
+                {
+                    Some(epoch) => epoch,
+                    None => {
+                        tracing::warn!(
+                            actor_id,
+                            epoch = actor.activation_epoch,
+                            "nulang-migrate: refusing migration because activation epoch cannot advance"
+                        );
+                        return;
+                    }
+                };
+                let schema_name = actor
+                    .bytecode_module
+                    .as_ref()
+                    .and_then(|module| {
+                        crate::runtime::schema_identity::canonical_schema_name_for_runtime_actor(
+                            module,
+                            &actor.name,
+                        )
+                    })
+                    .map(str::to_owned);
                 let snapshot = crate::runtime::persistence::ActorSnapshot {
                     actor_id,
                     sequence: actor.sequence,
+                    activation_epoch,
                     state,
                     waiting_signal: actor.waiting_signal.clone(),
                     crdt_snapshot,
                     crdt_field_map,
+                    schema_name,
                     authority_tokens,
                 };
 
@@ -2415,7 +2456,7 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
 
                 // Get NBC-encoded bytecode module.
                 let module = match actor.bytecode_module.as_ref() {
-                    Some(m) => m.clone(),
+                    Some(m) => m.as_ref().clone(),
                     None => match rt.recovery_modules.get(&actor_id) {
                         Some((m, _, _)) => m.clone(),
                         None => {
@@ -2547,10 +2588,20 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
 
 #[cfg(test)]
 mod migration_authority_tests {
-    use super::migration_authority_tokens;
+    use super::{migration_authority_tokens, next_migration_activation_epoch};
     use crate::authority::AuthorityManifest;
     use crate::authority_runtime::RuntimeAuthorityError;
     use crate::runtime::Actor;
+
+    #[test]
+    fn explicit_migration_advances_the_fencing_epoch() {
+        assert_eq!(next_migration_activation_epoch(7), Some(8));
+    }
+
+    #[test]
+    fn explicit_migration_refuses_epoch_overflow() {
+        assert_eq!(next_migration_activation_epoch(u64::MAX), None);
+    }
 
     #[test]
     fn migration_sender_preserves_canonical_actor_authority() {
@@ -2663,6 +2714,14 @@ mod host_authority_tests {
             required_host_authority("Secret", Some("read"), &constants, &regs).unwrap(),
             Some(AuthorityGrant::SecretRead {
                 name: "PAYMENTS_KEY".into(),
+            })
+        );
+
+        let (constants, regs) = string_args(&["printf hello"]);
+        assert_eq!(
+            required_host_authority("Process", Some("run"), &constants, &regs).unwrap(),
+            Some(AuthorityGrant::ProcessRun {
+                command: "printf hello".into(),
             })
         );
     }
@@ -2930,6 +2989,53 @@ mod host_authority_tests {
         assert!(
             runtime.borrow().http_server.is_none(),
             "denied Http.serve must not bind a socket"
+        );
+    }
+
+    #[test]
+    fn actor_process_grant_does_not_enable_shell_execution_without_sandbox() {
+        use crate::vm::ActorVmCallbacks;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let unique = format!(
+            "nulang-process-boundary-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let marker = std::env::temp_dir().join(unique);
+        let command = format!("touch {}", marker.display());
+
+        let runtime = Rc::new(RefCell::new(Runtime::new()));
+        let actor_id = 800_007;
+        {
+            let mut rt = runtime.borrow_mut();
+            let mut actor = Actor::new(actor_id, "process-authority-boundary", 8);
+            let token = format!("Process::Run({command})");
+            let manifest = AuthorityManifest::from_tokens([token.as_str()]).unwrap();
+            actor.install_authority_manifest(&manifest);
+            rt.actors.insert(actor_id, actor);
+            rt.current_actor = Some(actor_id);
+        }
+
+        let mut module = crate::bytecode::CodeModule::new("process-authority-boundary");
+        module.add_constant(Constant::String(command));
+        let regs = [Value::string(0)];
+        let mut callbacks = super::RuntimeVmCallbacks::new(runtime);
+
+        let result =
+            callbacks.perform_builtin_effect_in_module("Process", Some("run"), &module, &regs);
+
+        assert!(
+            result.is_none(),
+            "actor-backed Process.run must remain undispatched until an isolated process sandbox exists"
+        );
+        assert!(
+            !marker.exists(),
+            "holding Process::Run authority must not by itself grant host shell execution"
         );
     }
 

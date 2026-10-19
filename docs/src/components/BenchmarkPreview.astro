@@ -1,0 +1,144 @@
+---
+const measurements = [
+  { name: 'Go · channels', rate: 6106795, color: 'go' },
+  { name: 'Erlang · BEAM', rate: 3371477, color: 'beam' },
+  { name: 'Nulang · actors', rate: 594970, color: 'nulang' },
+  { name: 'Rust · std channels', rate: 251192, color: 'rust' },
+];
+const maximum = Math.max(...measurements.map((row) => row.rate));
+const source = 'https://github.com/nulang-org/nulang/actions/runs/38193394276';
+---
+
+<section class="benchmark-preview" aria-labelledby="benchmark-preview-title">
+  <div class="preview-copy">
+    <span class="preview-kicker">Measured performance · 12 Oct 2026 UTC</span>
+    <h2 id="benchmark-preview-title">See the numbers, not a speed claim.</h2>
+    <p>
+      Same-host, single-CPU Savina-style message-passing baselines across Nulang,
+      Go, Erlang/BEAM, and Rust. These are measured runtime primitives, not
+      equivalent actor-framework implementations.
+    </p>
+    <a class="preview-link" href="/benchmarks/">
+      All four workloads, exact results, and methodology
+      <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M5 12h14" /><path d="m12 5 7 7-7 7" />
+      </svg>
+    </a>
+  </div>
+
+  <div class="preview-chart">
+    <div class="chart-header">
+      <div>
+        <strong>Ping-pong throughput</strong>
+        <span>20,000 round trips · logical messages/sec</span>
+      </div>
+      <span class="chart-unit">Higher is better</span>
+    </div>
+    <div class="chart-rows" role="list" aria-label="Ping-pong messages per second by runtime">
+      {measurements.map((row) => (
+        <div class="chart-row" role="listitem">
+          <span class="row-name">{row.name}</span>
+          <div class="bar-track" aria-hidden="true">
+            <div class={'bar-fill bar-' + row.color} style={'width: ' + (row.rate / maximum * 100).toFixed(2) + '%;'}></div>
+          </div>
+          <span class="row-value" aria-label={row.rate.toLocaleString('en-US') + ' messages per second'}>
+            {(row.rate / 1000000).toFixed(2)}M
+          </span>
+        </div>
+      ))}
+    </div>
+    <div class="chart-footer">
+      <span>3 measured samples · 1 warm-up · Ubuntu 24.04 · 1 logical CPU</span>
+      <a href={source} target="_blank" rel="noopener noreferrer">Source run ↗</a>
+    </div>
+    <p class="chart-warning">
+      Shared CI hardware is noisy. Rust here uses native threads and
+      <code>std::sync::mpsc</code>; no third-party actor frameworks have been measured.
+    </p>
+  </div>
+</section>
+
+<style>
+  .benchmark-preview {
+    display: grid;
+    grid-template-columns: minmax(0, 0.82fr) minmax(0, 1.18fr);
+    gap: clamp(1.5rem, 4vw, 3.5rem);
+    align-items: center;
+    padding: clamp(1.5rem, 3vw, 2.5rem) 0;
+    border-top: 1px solid var(--nu-border);
+    border-bottom: 1px solid var(--nu-border);
+  }
+  .preview-kicker {
+    display: block;
+    color: var(--nu-blue);
+    font-size: .73rem;
+    font-weight: 750;
+    text-transform: uppercase;
+    letter-spacing: .075em;
+    margin-bottom: .75rem;
+  }
+  .preview-copy h2 {
+    font-size: clamp(1.55rem, 2.6vw, 2.35rem);
+    line-height: 1.15;
+    letter-spacing: -.035em;
+    margin: 0 0 .85rem;
+    color: var(--nu-text);
+  }
+  .preview-copy p {
+    margin: 0;
+    font-size: .97rem;
+    line-height: 1.65;
+    color: var(--nu-text-secondary);
+  }
+  .preview-link {
+    display: inline-flex;
+    align-items: center;
+    gap: .55rem;
+    font-size: .9rem;
+    font-weight: 750;
+    margin-top: 1.35rem;
+    color: var(--nu-accent-high);
+  }
+  .preview-link svg { width: 1rem; height: 1rem; flex: none; }
+  .preview-chart {
+    padding: clamp(1.1rem, 2.5vw, 1.7rem);
+    border: 1px solid var(--nu-border);
+    border-radius: .9rem;
+    background: var(--nu-surface);
+    min-width: 0;
+  }
+  .chart-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: .75rem;
+  }
+  .chart-header strong { display: block; color: var(--nu-text); font-size: .96rem; }
+  .chart-header span { display: block; color: var(--nu-text-secondary); font-size: .76rem; }
+  .chart-header .chart-unit { text-align: right; white-space: nowrap; }
+  .chart-rows { display: grid; gap: .95rem; margin: 1.3rem 0 1.1rem; }
+  .chart-row { display: grid; grid-template-columns: 9.4rem minmax(0, 1fr) 4.1rem; align-items: center; gap: .7rem; }
+  .row-name { color: var(--nu-text); font-size: .78rem; font-weight: 650; }
+  .bar-track { width: 100%; height: .85rem; background: var(--nu-border-subtle); border-radius: .25rem; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: .25rem; min-width: 2px; background: var(--nu-blue); }
+  .bar-nulang { background: var(--nu-accent); }
+  .bar-beam { background: #0d9488; }
+  .bar-rust { background: #8b5cf6; }
+  .row-value { color: var(--nu-text); font-size: .86rem; font-weight: 700; text-align: right; font-variant-numeric: tabular-nums; }
+  .chart-footer { display: flex; justify-content: space-between; gap: 1rem; border-top: 1px solid var(--nu-border); padding-top: .9rem; }
+  .chart-footer span, .chart-footer a { font-size: .72rem; line-height: 1.45; }
+  .chart-footer span { color: var(--nu-text-secondary); }
+  .chart-footer a { color: var(--nu-accent-high); flex-shrink: 0; }
+  .chart-warning { color: var(--nu-text-secondary); font-size: .75rem; line-height: 1.55; margin: .8rem 0 0; }
+  .chart-warning code { color: inherit; font-size: .73rem; }
+  @media (max-width: 57rem) {
+    .benchmark-preview { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 36rem) {
+    .chart-row { grid-template-columns: 6.7rem minmax(0, 1fr) 3.6rem; gap: .45rem; }
+    .row-name { font-size: .68rem; }
+    .row-value { font-size: .76rem; }
+    .chart-unit { display: none !important; }
+    .chart-footer { flex-direction: column; gap: .3rem; }
+  }
+</style>

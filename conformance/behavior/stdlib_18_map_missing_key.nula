@@ -1,15 +1,15 @@
-// stdlib::map — get on missing key returns -1 (not nil).
-// The map::get implementation returns -1 for keys not found in the map,
-// regardless of the value type. This is because get() unwraps r.value
-// for matching keys, and falls through to `-1` for missing keys.
-// For string-valued maps, -1 is still returned (Int, not String).
+// stdlib::map — get on a missing key returns None.
+// The Option contract preserves the map value type and makes absence explicit.
 import stdlib::map
 
 fn main() {
+    let show = fn(opt: Option[String]) {
+        match opt {
+            Some(x) => x,
+            None => "None",
+        }
+    }
     let m = insert("a", "hello", insert("b", "world", []))
-    // Existing keys return their values.
-    perform IO.print(get("a", m))
-    // Missing key returns -1 (Int), not nil and not "".
-    let missing = get("z", m)
-    perform IO.print(perform Int.to_string(missing))
+    perform IO.print(show(get("a", m)))
+    perform IO.print(show(get("z", m)))
 }

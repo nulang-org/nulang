@@ -1,50 +1,42 @@
-//! Immutable shared object store for large `val` buffers.
+//! Immutable node-shared object store for large `val` buffers.
 //!
-//! This module provides a per-shard (per-Runtime) store for immutable byte
-//! buffers.  A buffer is inserted once and referenced by a lightweight
-//! `ObjectId`.  The runtime can pass these identifiers between actors in place
-//! of copying the buffer through mailboxes.
+//! A buffer is inserted once and referenced by a lightweight `ObjectId`.
+//! `ObjectStore` is cheap to clone: clones share one node-local backing map,
+//! allowing runtime shards in the same process to exchange `TAG_OBJECT`
+//! handles without copying the underlying bytes.
 //!
-//! # Scope
-//!
-//! The MVP store is **per-shard**: each `Runtime` owns its own `ObjectStore`,
-//! and a cross-shard message that carries an object reference serializes the
-//! bytes into the cross-shard channel so the target shard can insert a local
-//! copy.  This keeps the implementation simple and avoids cross-thread sharing
-//! and locking.  A future node-wide shared-memory pool can replace this without
-//! changing the `Value::object` representation or the public API.
+//! Cross-node transport remains explicit: wire encoding resolves an object to
+//! bytes, and the receiving node interns a new local object.
 //!
 //! # Lifecycle
 //!
-//! - `put` inserts a buffer with refcount `1`.
-//! - `clone_ref` increments the refcount when an actor receives a message that
-//!   holds the object id.
-//! - `drop_ref` decrements the refcount when an actor exits or overwrites a
-//!   register holding the object id.
-//! - When the refcount reaches zero the entry is removed and the bytes freed.
+//! - `put` inserts a buffer with refcount 1.
+//! - A receiving actor acquires at most one actor-lifetime hold per ObjectId.
+//! - `clone_ref` increments that hold count.
+//! - `drop_ref` decrements it and removes the object at zero.
 //!
-//! All operations run on the owning shard's scheduler thread; no interior
-//! mutability is required.
+//! Actor heaps and ORCA remain shard-confined. Shared objects are immutable and
+//! never contain actor-heap pointers.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 
 pub type ObjectId = u64;
 
-/// An immutable buffer stored in the object store.
+/// An immutable buffer stored outside actor heaps.
 #[derive(Debug)]
 pub struct ObjectEntry {
     pub id: ObjectId,
-    bytes: Box<[u8]>,
-    ref_count: usize,
+    bytes: Arc<[u8]>,
+    ref_count: AtomicUsize,
 }
 
 impl ObjectEntry {
-    /// Return a slice to the immutable bytes.
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
 
-    /// Return the byte length.
     pub fn len(&self) -> usize {
         self.bytes.len()
     }
@@ -53,83 +45,117 @@ impl ObjectEntry {
         self.bytes.is_empty()
     }
 
-    /// Return the current reference count.
     pub fn ref_count(&self) -> usize {
-        self.ref_count
+        self.ref_count.load(Ordering::Acquire)
     }
 }
 
-/// Per-shard object store.
-#[derive(Debug, Default)]
+#[derive(Debug)]
+struct ObjectStoreInner {
+    next_id: AtomicU64,
+    entries: RwLock<HashMap<ObjectId, Arc<ObjectEntry>>>,
+}
+
+/// Cloneable node-local store. Every clone addresses the same immutable
+/// objects and refcounts.
+#[derive(Debug, Clone)]
 pub struct ObjectStore {
-    next_id: ObjectId,
-    entries: std::collections::HashMap<ObjectId, ObjectEntry>,
+    inner: Arc<ObjectStoreInner>,
+}
+
+impl Default for ObjectStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ObjectStore {
-    /// Create an empty object store.
     pub fn new() -> Self {
-        ObjectStore {
-            next_id: 1,
-            entries: std::collections::HashMap::new(),
+        Self {
+            inner: Arc::new(ObjectStoreInner {
+                next_id: AtomicU64::new(1),
+                entries: RwLock::new(HashMap::new()),
+            }),
         }
     }
 
-    /// Store an immutable buffer and return its object id.  Refcount starts at 1.
-    pub fn put(&mut self, bytes: Box<[u8]>) -> ObjectId {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.entries.insert(
+    /// True when two handles share the same node-local store.
+    pub fn shares_storage_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Store an immutable buffer and return its object id. Refcount starts at 1.
+    pub fn put(&self, bytes: Box<[u8]>) -> ObjectId {
+        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
+        let entry = Arc::new(ObjectEntry {
             id,
-            ObjectEntry {
-                id,
-                bytes,
-                ref_count: 1,
-            },
-        );
+            bytes: Arc::from(bytes),
+            ref_count: AtomicUsize::new(1),
+        });
+        self.inner
+            .entries
+            .write()
+            .expect("object-store write lock poisoned")
+            .insert(id, entry);
         id
     }
 
-    /// Borrow an entry by id.
-    pub fn get(&self, id: ObjectId) -> Option<&ObjectEntry> {
-        self.entries.get(&id)
+    /// Return a shared immutable entry by id.
+    pub fn get(&self, id: ObjectId) -> Option<Arc<ObjectEntry>> {
+        self.inner
+            .entries
+            .read()
+            .expect("object-store read lock poisoned")
+            .get(&id)
+            .cloned()
     }
 
-    /// Increment the refcount for `id`.  Returns `true` if the id existed.
-    pub fn clone_ref(&mut self, id: ObjectId) -> bool {
-        if let Some(entry) = self.entries.get_mut(&id) {
-            entry.ref_count = entry.ref_count.saturating_add(1);
-            true
-        } else {
-            false
+    /// Increment the refcount for id. Returns true when the id exists.
+    pub fn clone_ref(&self, id: ObjectId) -> bool {
+        let entries = self
+            .inner
+            .entries
+            .read()
+            .expect("object-store read lock poisoned");
+        let Some(entry) = entries.get(&id) else {
+            return false;
+        };
+        entry.ref_count.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// Decrement the refcount for id, removing the entry at zero.
+    pub fn drop_ref(&self, id: ObjectId) -> bool {
+        let mut entries = self
+            .inner
+            .entries
+            .write()
+            .expect("object-store write lock poisoned");
+        let Some(entry) = entries.get(&id) else {
+            return false;
+        };
+
+        let previous = entry.ref_count.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "object-store refcount underflow");
+        if previous == 1 {
+            entries.remove(&id);
         }
+        true
     }
 
-    /// Decrement the refcount for `id`, removing the entry if it reaches zero.
-    /// Returns `true` if the id existed.
-    pub fn drop_ref(&mut self, id: ObjectId) -> bool {
-        if let Some(entry) = self.entries.get_mut(&id) {
-            entry.ref_count = entry.ref_count.saturating_sub(1);
-            if entry.ref_count == 0 {
-                self.entries.remove(&id);
-            }
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Number of stored objects.
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.inner
+            .entries
+            .read()
+            .expect("object-store read lock poisoned")
+            .len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.len() == 0
     }
 
-    /// Drop every refcount held by `ids`.  Convenience for actor exit cleanup.
-    pub fn drop_refs(&mut self, ids: &HashSet<ObjectId>) {
+    pub fn drop_refs(&self, ids: &HashSet<ObjectId>) {
         for &id in ids {
             self.drop_ref(id);
         }
@@ -142,9 +168,8 @@ mod tests {
 
     #[test]
     fn test_put_get() {
-        let mut store = ObjectStore::new();
-        let bytes: Box<[u8]> = vec![1, 2, 3, 4].into_boxed_slice();
-        let id = store.put(bytes);
+        let store = ObjectStore::new();
+        let id = store.put(vec![1, 2, 3, 4].into_boxed_slice());
         let entry = store.get(id).unwrap();
         assert_eq!(entry.as_bytes(), &[1, 2, 3, 4]);
         assert_eq!(entry.len(), 4);
@@ -152,8 +177,8 @@ mod tests {
 
     #[test]
     fn test_ref_count_lifecycle() {
-        let mut store = ObjectStore::new();
-        let id = store.put(Box::new([10, 20, 30]));
+        let store = ObjectStore::new();
+        let id = store.put(vec![10, 20, 30].into_boxed_slice());
         assert!(store.clone_ref(id));
         assert!(store.clone_ref(id));
         store.drop_ref(id);
@@ -164,25 +189,34 @@ mod tests {
     }
 
     #[test]
+    fn test_clones_share_entries() {
+        let store = ObjectStore::new();
+        let clone = store.clone();
+        assert!(store.shares_storage_with(&clone));
+
+        let id = store.put(vec![7, 8, 9].into_boxed_slice());
+        let from_store = store.get(id).unwrap();
+        let from_clone = clone.get(id).unwrap();
+        assert!(Arc::ptr_eq(&from_store, &from_clone));
+    }
+
+    #[test]
     fn test_drop_unknown_is_noop() {
-        let mut store = ObjectStore::new();
+        let store = ObjectStore::new();
         assert!(!store.drop_ref(123));
     }
 
     #[test]
     fn test_drop_refs_bulk() {
-        let mut store = ObjectStore::new();
-        let id1 = store.put(Box::new([1]));
-        let id2 = store.put(Box::new([2]));
+        let store = ObjectStore::new();
+        let id1 = store.put(vec![1].into_boxed_slice());
+        let id2 = store.put(vec![2].into_boxed_slice());
         store.clone_ref(id1);
         store.clone_ref(id2);
 
-        let mut held = HashSet::new();
-        held.insert(id1);
-        held.insert(id2);
+        let held = HashSet::from([id1, id2]);
         store.drop_refs(&held);
 
-        // original refs still alive
         assert!(store.get(id1).is_some());
         assert!(store.get(id2).is_some());
 
