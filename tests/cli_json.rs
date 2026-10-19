@@ -341,7 +341,11 @@ fn nula_test_filter_selects_functions_inside_a_file() {
     );
 
     let out = run_nula(&dir, &["test", "--json", "--filter", "test_success"]);
-    assert!(out.status.success(), "filtered test must pass: {:?}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "filtered test must pass: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("JSON-only report");
     let tests = v["tests"].as_array().expect("tests array");
     assert_eq!(tests.len(), 1, "must select a function even when the filename doesn't match");
@@ -372,7 +376,11 @@ fn nula_test_ignores_phantom_functions_in_comments_and_strings() {
     );
 
     let out = run_nula(&dir, &["test", "--json"]);
-    assert!(out.status.success(), "comments and literals are not tests: {:?}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "comments and literals are not tests: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("JSON-only report");
     let tests = v["tests"].as_array().expect("tests array");
     assert_eq!(tests.len(), 1, "only the actual function should be collected: {tests:?}");
