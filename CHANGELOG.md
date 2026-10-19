@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Cross-runtime benchmark evidence hardening — 2026-10-19
+- **Cross-runtime measurements now rotate runtime execution order per round** instead of always measuring Nulang first, limiting systematic host drift bias and recording the order in JSON artifacts.
+- **Benchmark records fail closed on duplicate, zero-duration, or zero-operation output**, and the comparison rejects differing per-workload operation or sample counts across runtimes. Deterministic Python regression tests run before expensive benchmark builds.
+- **No runtime performance improvement is claimed.** The Rust baseline still measures native threads and standard channels, not an optimized actor framework; rerun comparable exact-head benchmarks before updating numerical comparisons.
+
 ### Fabric on-demand mailbox scoring — 2026-10-18
 - **Fabric publish admission now reads mailbox pressure only for matching local subscribers**, instead of allocating and populating an all-actor mailbox snapshot on every publish.
 - **Ported the regression and exact-base matched-fixture A/B harness** from #1708 onto current main. Historical unmatched-publish microbenchmarks were favorable; new-head CI and measurements remain the promotion gate.
