@@ -366,7 +366,7 @@ pub struct Runtime {
     /// causal chains span actor, shard, and node boundaries.
     pub current_trace: Option<TraceContext>,
     /// Opt-in metadata diagnostics scoped to this runtime shard.
-    pub diagnostics: RuntimeDiagnostics,
+    diagnostics: RuntimeDiagnostics,
     // Fallback heap/GC for allocation performed OUTSIDE any actor's
     // behavior (e.g. `main()`'s own top-level bytecode: string
     // concatenation, `Int.to_string`, and similar). See
@@ -643,6 +643,20 @@ impl crate::backends::ForeignInterop for NoOpForeignInterop {
 }
 
 impl Runtime {
+    /// Subscribe to this runtime's metadata-only diagnostics without access to
+    /// the publisher or to another runtime's telemetry.
+    pub fn subscribe_diagnostics(
+        &self,
+        capacity: usize,
+    ) -> Result<DiagnosticSubscription, DiagnosticSubscribeError> {
+        self.diagnostics.subscribe(capacity)
+    }
+
+    /// Number of diagnostic deliveries discarded because observers were slow.
+    pub fn diagnostic_dropped_deliveries(&self) -> u64 {
+        self.diagnostics.dropped_deliveries()
+    }
+
     pub fn new() -> Self {
         Runtime {
             actors: HashMap::new(),
