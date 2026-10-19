@@ -1247,6 +1247,14 @@ mod tests {
     }
 
     #[test]
+    fn test_fmt_qualified_import_keeps_alias_and_is_idempotent() {
+        let src = "import stdlib::list as lists";
+        let formatted = format_source(src).expect("alias import format");
+        assert_eq!(formatted, "import stdlib::list as lists\\n");
+        assert_idempotent(src);
+    }
+
+    #[test]
     fn test_fmt_cap_ref_constructors() {
         // `&cap` must format with the capability keyword AND a space before
         // the operand: the old `op_sym_unary` printed "ref" for every Ref op
