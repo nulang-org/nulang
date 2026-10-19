@@ -1396,4 +1396,51 @@ fn main() {
         assert!(out.contains("emit Event(1)"), "got: {out}");
         assert_idempotent(src);
     }
+
+    #[test]
+    fn test_fmt_preserves_generic_function_parameters() {
+        let src = "fn identity[T](value: T) -> T = value";
+        let formatted = format_source(src).expect("generic function formats");
+        assert!(formatted.contains("fn identity[T](value: T) -> T"), "{formatted}");
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn test_fmt_preserves_default_parameter_values() {
+        let src = "fn answer(value: Int = 42) -> Int = value";
+        let formatted = format_source(src).expect("defaults format");
+        assert!(formatted.contains("value: Int = 42"), "{formatted}");
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn test_fmt_rejects_regular_comments_instead_of_deleting_them() {
+        let src = "fn main() { // this comment must not disappear\n 42\n}";
+        assert!(format_source(src).is_err());
+    }
+
+    #[test]
+    fn test_fmt_rejects_doc_comments_instead_of_deleting_them() {
+        let src = "/// public API docs\nfn answer() = 42";
+        assert!(format_source(src).is_err());
+    }
+
+    #[test]
+    fn test_fmt_does_not_confuse_url_literals_with_comments() {
+        let src = "fn url() = \"https://example.com/path\"";
+        let formatted = format_source(src).expect("URL in string literal is not a comment");
+        assert!(formatted.contains("https://example.com/path"), "{formatted}");
+    }
+
+    #[test]
+    fn test_fmt_rejects_function_visibility_loss() {
+        assert!(format_source("pub fn answer() = 42").is_err());
+    }
+
+    #[test]
+    fn test_fmt_rejects_actor_persistence_loss() {
+        let src = "persistent actor Counter { state count: Int = 0 }";
+        assert!(format_source(src).is_err());
+    }
+
 }
