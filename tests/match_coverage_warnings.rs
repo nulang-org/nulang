@@ -97,7 +97,7 @@ fn missing_closed_variant_constructor_has_witness() {
 #[test]
 fn payload_patterns_only_cover_a_constructor_when_irrefutable() {
     let ty = Type::Variant(vec![
-        ("Some".to_string(), Some(Box::new(Type::int()))),
+        ("Some".to_string(), Some(Type::int())),
         ("None".to_string(), None),
     ]);
     let warnings = check_coverage(
@@ -120,7 +120,7 @@ fn payload_patterns_only_cover_a_constructor_when_irrefutable() {
 #[test]
 fn irrefutable_payload_and_nullary_constructor_are_exhaustive() {
     let ty = Type::Variant(vec![
-        ("Some".to_string(), Some(Box::new(Type::int()))),
+        ("Some".to_string(), Some(Type::int())),
         ("None".to_string(), None),
     ]);
     let warnings = check_coverage(
