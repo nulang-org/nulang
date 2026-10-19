@@ -103,6 +103,7 @@ by `render_warning`/`format_warning` (src/diagnostic.rs) with a
 |---------|-------------------------------------------|
 | `W01xx` | Deprecations                              |
 | `W02xx` | Static pattern analysis                   |
+| `W03xx` | Ignored-result diagnostics                |
 
 | Code    | Meaning                                   | Replacement (RFC)        |
 |---------|-------------------------------------------|--------------------------|
@@ -110,8 +111,14 @@ by `render_warning`/`format_warning` (src/diagnostic.rs) with a
 | `W0102` | Deprecated `fail` expression              | `return Error(...)` under `T ! E` (RFC 0015) |
 | `W0201` | Provably non-exhaustive finite-domain `match` | Add arms for the reported missing witnesses |
 | `W0202` | Provably redundant/unreachable finite-domain match arm | Remove, move, or refine the reported arm(s) |
+| `W0301` | Discarded `Result` in a non-final block expression | Match, propagate with `?`, or explicitly bind the value |
 
 `W0201`/`W0202` are conservative semantic warnings: currently the analyzer proves coverage only for top-level declared variants and `Bool`, and guarded arms never count toward exhaustiveness. `--deny-warnings` enables strict enforcement without changing default runtime semantics.
+
+`W0301` is emitted only when a statically resolved two-constructor `Ok`/`Error`
+result is an intermediate expression in a block. A block's final result is
+considered returned, not discarded; other ADTs are unaffected. Like W0201/W0202,
+W0301 is non-fatal by default and rejected by `--deny-warnings`.
 
 See `docs/MIGRATION_RFC_0015.md` for the `catch`/`fail` migration guide.
 
