@@ -2851,11 +2851,11 @@ impl Runtime {
                         // SAFETY: as above; the single scheduler thread is
                         // the only mutator of any header.
                         unsafe {
-                        (*source_header).foreign_count = (*source_header)
-                            .foreign_count
-                            .checked_add(1)
-                            .expect("ORCA retired foreign reference count overflow");
-                    };
+                            (*source_header).foreign_count = (*source_header)
+                                .foreign_count
+                                .checked_add(1)
+                                .expect("ORCA retired foreign reference count overflow");
+                        };
                         self.coordinator.submit_op(ForeignRefOp {
                             target_actor: target_id,
                             owner_actor: owner_id,
