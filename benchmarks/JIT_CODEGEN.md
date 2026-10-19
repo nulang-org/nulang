@@ -74,3 +74,26 @@ copy-and-patch, or custom native backend can implement the same
 backends on the same commit, workload, build profile, hardware, and repetition
 count; report both compile time and execution time rather than a single blended
 number.
+
+## Generic-call specialization candidates
+
+The `concrete_identity_call_loop` and `generic_identity_call_loop` workloads
+execute the same 50,000-iteration integer accumulation. They differ only in the
+identity function's concrete versus generic signature. Each benchmark repetition
+checks its interpreter, first JIT run, and warm JIT run for equal results.
+
+Run the pair on the **same pinned CPU**, using the same commit, build profile,
+repetition count and warm-up policy:
+
+```bash
+cargo run --locked --release --no-default-features --features native-codegen \\
+  --bin nulang-jit-bench -- --workload concrete_identity_call_loop --format jsonl --repeat 8
+cargo run --locked --release --no-default-features --features native-codegen \\
+  --bin nulang-jit-bench -- --workload generic_identity_call_loop --format jsonl --repeat 8
+```
+
+These workloads are diagnostic baselines for potential generic specialization.
+They do **not** implement monomorphization, prove an optimization, or justify a
+generic-language ABI change. Execute a paired base/candidate benchmark before
+changing compilation policy; keep both the cold compilation cost and the
+warmed execution cost visible.
