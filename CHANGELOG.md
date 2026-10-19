@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Opt-in runtime-scope EXPLAIN ANALYZE diagnostics — 2026-10-19
+- **`Runtime::explain_analyze` measures an explicit closure on one runtime shard** and returns both the original result and a versioned, JSON-serializable profile containing wall time, scheduler counter deltas, pending mailbox messages, actor counts, DLQ depth, and ORCA live-actor counter snapshots.
+- **Mailbox pressure is deterministically ranked and bounded** to the 16 highest-pressure actors, with totals and omitted counts preserving the overall picture. A scheduler-counter reset inside the measured scope is called out rather than presenting a misleading unsigned delta.
+- **The report is explicitly aggregate and opt-in.** It does not claim per-actor CPU/wait duration, JIT compilation timing, effect I/O, or true allocation deltas; those require additional instrumentation and their own evidence.
+
 ### Fabric on-demand mailbox scoring — 2026-10-18
 - **Fabric publish admission now reads mailbox pressure only for matching local subscribers**, instead of allocating and populating an all-actor mailbox snapshot on every publish.
 - **Ported the regression and exact-base matched-fixture A/B harness** from #1708 onto current main. Historical unmatched-publish microbenchmarks were favorable; new-head CI and measurements remain the promotion gate.
