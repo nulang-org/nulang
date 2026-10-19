@@ -2654,6 +2654,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn offline_build_requires_lockfile_and_preserves_existing_bytes() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_offline_build_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = ChangeDir::new(&dir);
+        scaffold_package(&dir, "offline-app", "default").unwrap();
+        let missing = prepare_package_with_mode(true, true).unwrap_err();
+        assert!(missing.to_string().contains("Nulang.lock"), "{missing}");
+        prepare_package().unwrap();
+        let lock_path = dir.join(LOCKFILE_FILE);
+        let original = std::fs::read(&lock_path).unwrap();
+        prepare_package_with_mode(true, true).unwrap();
+        assert_eq!(std::fs::read(&lock_path).unwrap(), original);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn locked_build_requires_existing_lockfile() {
         let dir = std::env::temp_dir().join(format!(
             "nulang_locked_missing_{}",
