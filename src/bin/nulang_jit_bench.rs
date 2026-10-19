@@ -365,6 +365,25 @@ mod tests {
     }
 
     #[test]
+    fn generic_and_concrete_identity_calls_agree_in_reference_interpreter() {
+        let concrete = WORKLOADS
+            .iter()
+            .find(|workload| workload.name == "concrete_identity_call_loop")
+            .expect("concrete identity workload");
+        let generic = WORKLOADS
+            .iter()
+            .find(|workload| workload.name == "generic_identity_call_loop")
+            .expect("generic identity workload");
+
+        let (concrete_result, _) = run_interpreter(&compile(concrete.source));
+        let (generic_result, _) = run_interpreter(&compile(generic.source));
+        assert_eq!(
+            generic_result, concrete_result,
+            "generic and concrete fixtures must have identical semantics"
+        );
+    }
+
+    #[test]
     fn crossover_workloads_cover_current_threshold_window() {
         let names: Vec<&str> = WORKLOADS.iter().map(|workload| workload.name).collect();
         for required in [
