@@ -880,10 +880,12 @@ fn prepare_package_with_lock(locked: bool) -> NuResult<PathBuf> {
             });
         }
     } else {
-        resolved_lock.save(&root).map_err(|e| NuError::PackageError {
-            msg: format!("failed to write {}: {}", lock_path.display(), e),
-            span: Span::default(),
-        })?;
+        resolved_lock
+            .save(&root)
+            .map_err(|e| NuError::PackageError {
+                msg: format!("failed to write {}: {}", lock_path.display(), e),
+                span: Span::default(),
+            })?;
     }
 
     let entry = root.join(&manifest.package.entry);
@@ -2655,10 +2657,8 @@ mod tests {
 
     #[test]
     fn locked_build_requires_existing_lockfile() {
-        let dir = std::env::temp_dir().join(format!(
-            "nulang_locked_missing_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("nulang_locked_missing_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _guard = ChangeDir::new(&dir);
