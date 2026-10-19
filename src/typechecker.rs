@@ -3364,7 +3364,7 @@ impl TypeChecker {
             let ctx_sub = apply_subst_to_ctx(ctx, &subst);
             // Bind pattern variables to the context
             let pattern_ctx =
-                self.bind_pattern(&ctx_sub, pattern, &apply_subst(&scrut_ty, &subst))?;
+                self.bind_pattern(&ctx_sub, pattern, &apply_subst(&scrut_ty, &subst), span)?;
             // A guard runs with the pattern's bindings in scope and must be
             // a boolean; it does not contribute to the arm result type.
             if let Some(guard_expr) = guard {
@@ -3409,6 +3409,7 @@ impl TypeChecker {
         ctx: &TypeContext,
         pattern: &Pattern,
         scrut_ty: &Type,
+        span: Span,
     ) -> NuResult<TypeContext> {
         match pattern {
             Pattern::Wild => Ok(ctx.clone()),
@@ -3424,24 +3425,42 @@ impl TypeChecker {
                     Literal::Nil => Type::nil(),
                     Literal::Unit => Type::unit(),
                 };
-                let _ = mgu(scrut_ty, &lit_ty, Span::default())?;
+                let _ = mgu(scrut_ty, &lit_ty, span)?;
                 Ok(ctx.clone())
             }
             Pattern::Tuple(pats) => {
                 match scrut_ty {
-                    Type::Tuple(tys) if tys.len() == pats.len() => {
+                    Type::Tuple(tys) => {
+                        // A known tuple has an exact arity. Falling through to
+                        // fresh type variables used to accept too-short and
+                        // too-long patterns, letting MIR bind missing fields
+                        // to nil or silently ignore additional tuple values.
+                        if tys.len() != pats.len() {
+                            return Err(NuError::type_mismatch(
+                                format!("tuple pattern with {} element(s)", tys.len()),
+                                format!("tuple pattern with {} element(s)", pats.len()),
+                                span,
+                            ));
+                        }
                         let mut new_ctx = ctx.clone();
                         for (pat, ty) in pats.iter().zip(tys.iter()) {
-                            new_ctx = self.bind_pattern(&new_ctx, pat, ty)?;
+                            new_ctx = self.bind_pattern(&new_ctx, pat, ty, span)?;
                         }
                         Ok(new_ctx)
                     }
+                    Type::Primitive(_) => Err(NuError::type_mismatch(
+                        "tuple pattern".to_string(),
+                        format!("{}", scrut_ty),
+                        span,
+                    )),
                     _ => {
-                        // Create fresh type vars for tuple elements
+                        // For unresolved or abstract types we cannot prove
+                        // the shape here; retain the existing conservative
+                        // binding path until pattern constraints are unified.
                         let mut new_ctx = ctx.clone();
                         for pat in pats {
                             let elem_ty = Type::Var(TypeVar::fresh());
-                            new_ctx = self.bind_pattern(&new_ctx, pat, &elem_ty)?;
+                            new_ctx = self.bind_pattern(&new_ctx, pat, &elem_ty, span)?;
                         }
                         Ok(new_ctx)
                     }
@@ -3454,10 +3473,10 @@ impl TypeChecker {
                         fields.iter().map(|(n, t)| (n.clone(), t.clone())).collect();
                     for (field_name, pat) in pats {
                         if let Some(ty) = field_map.get(field_name) {
-                            new_ctx = self.bind_pattern(&new_ctx, pat, ty)?;
+                            new_ctx = self.bind_pattern(&new_ctx, pat, ty, span)?;
                         } else {
                             let fresh = Type::Var(TypeVar::fresh());
-                            new_ctx = self.bind_pattern(&new_ctx, pat, &fresh)?;
+                            new_ctx = self.bind_pattern(&new_ctx, pat, &fresh, span)?;
                         }
                     }
                     Ok(new_ctx)
@@ -3466,7 +3485,7 @@ impl TypeChecker {
                     let mut new_ctx = ctx.clone();
                     for (_, pat) in pats {
                         let fresh = Type::Var(TypeVar::fresh());
-                        new_ctx = self.bind_pattern(&new_ctx, pat, &fresh)?;
+                        new_ctx = self.bind_pattern(&new_ctx, pat, &fresh, span)?;
                     }
                     Ok(new_ctx)
                 }
@@ -3476,7 +3495,7 @@ impl TypeChecker {
                     let mut new_ctx = ctx.clone();
                     if let Some((_, Some(ty))) = variants.iter().find(|(n, _)| n == name) {
                         if let Some(p) = pat {
-                            new_ctx = self.bind_pattern(&new_ctx, p, ty)?;
+                            new_ctx = self.bind_pattern(&new_ctx, p, ty, span)?;
                         }
                     }
                     Ok(new_ctx)
@@ -3484,7 +3503,7 @@ impl TypeChecker {
                 _ => {
                     if let Some(p) = pat {
                         let fresh = Type::Var(TypeVar::fresh());
-                        self.bind_pattern(ctx, p, &fresh)
+                        self.bind_pattern(ctx, p, &fresh, span)
                     } else {
                         Ok(ctx.clone())
                     }
@@ -3493,7 +3512,7 @@ impl TypeChecker {
             Pattern::Alias(name, pat) => {
                 let mut new_ctx =
                     ctx.extend(name.clone(), scrut_ty.clone(), Capability::Ref, false);
-                new_ctx = self.bind_pattern(&new_ctx, pat, scrut_ty)?;
+                new_ctx = self.bind_pattern(&new_ctx, pat, scrut_ty, span)?;
                 Ok(new_ctx)
             }
         }
@@ -4877,6 +4896,139 @@ mod tests {
             span: sp(),
         };
         let (s, ty) = tc.infer_expr(&ctx, &expr).unwrap();
+        assert_eq!(apply_subst(&ty, &s), Type::int());
+    }
+
+    #[test]
+    fn test_match_rejects_tuple_pattern_with_missing_element() {
+        let mut tc = TypeChecker::new();
+        let expr = Expr::Match {
+            scrutinee: Box::new(tuple(vec![int_lit(1), bool_lit(true)])),
+            arms: vec![(Pattern::Tuple(vec![Pattern::Wild]), None, int_lit(0))],
+            span: sp(),
+        };
+        let result = tc.infer_expr(&TypeContext::new(), &expr);
+        assert!(
+            matches!(result, Err(NuError::TypeError { msg, .. }) if msg.contains("tuple pattern")),
+            "a one-element pattern must not accept a two-element tuple"
+        );
+    }
+
+    #[test]
+    fn test_match_rejects_tuple_pattern_with_extra_element() {
+        let mut tc = TypeChecker::new();
+        let expr = Expr::Match {
+            scrutinee: Box::new(tuple(vec![int_lit(1)])),
+            arms: vec![(
+                Pattern::Tuple(vec![Pattern::Wild, Pattern::Wild]),
+                None,
+                int_lit(0),
+            )],
+            span: sp(),
+        };
+        let result = tc.infer_expr(&TypeContext::new(), &expr);
+        assert!(
+            matches!(result, Err(NuError::TypeError { msg, .. }) if msg.contains("tuple pattern")),
+            "a two-element pattern must not accept a one-element tuple"
+        );
+    }
+
+    #[test]
+    fn test_match_rejects_tuple_pattern_on_known_non_tuple() {
+        let mut tc = TypeChecker::new();
+        let expr = Expr::Match {
+            scrutinee: Box::new(int_lit(42)),
+            arms: vec![(Pattern::Tuple(vec![Pattern::Wild]), None, int_lit(0))],
+            span: sp(),
+        };
+        let result = tc.infer_expr(&TypeContext::new(), &expr);
+        assert!(
+            matches!(result, Err(NuError::TypeError { msg, .. }) if msg.contains("tuple pattern")),
+            "a tuple pattern must not accept an Int"
+        );
+    }
+
+    #[test]
+    fn test_match_rejects_tuple_pattern_inside_variant_payload() {
+        let mut tc = TypeChecker::new();
+        let ctx = ctx_with(
+            "option",
+            Type::Variant(vec![
+                ("None".to_string(), None),
+                ("Some".to_string(), Some(Type::Tuple(vec![Type::int()]))),
+            ]),
+        );
+        let expr = Expr::Match {
+            scrutinee: Box::new(var("option")),
+            arms: vec![(
+                Pattern::Variant(
+                    "Some".to_string(),
+                    Some(Box::new(Pattern::Tuple(vec![Pattern::Wild, Pattern::Wild]))),
+                ),
+                None,
+                int_lit(0),
+            )],
+            span: sp(),
+        };
+        let result = tc.infer_expr(&ctx, &expr);
+        assert!(
+            matches!(result, Err(NuError::TypeError { msg, .. }) if msg.contains("tuple pattern")),
+            "nested variant payload patterns must check tuple arity"
+        );
+    }
+
+    #[test]
+    fn test_tuple_pattern_error_preserves_match_source_span() {
+        let mut tc = TypeChecker::new();
+        let match_span = Span::new(13, 49);
+        let expr = Expr::Match {
+            scrutinee: Box::new(tuple(vec![int_lit(1), int_lit(2)])),
+            arms: vec![(Pattern::Tuple(vec![Pattern::Wild]), None, int_lit(0))],
+            span: match_span,
+        };
+        match tc.infer_expr(&TypeContext::new(), &expr) {
+            Err(NuError::TypeError { span, .. }) => assert_eq!(span, match_span),
+            other => panic!("expected a spanned tuple-pattern error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_tuple_arity_error_exposes_structured_expected_and_found() {
+        let mut tc = TypeChecker::new();
+        let expr = Expr::Match {
+            scrutinee: Box::new(tuple(vec![int_lit(1), int_lit(2)])),
+            arms: vec![(Pattern::Tuple(vec![Pattern::Wild]), None, int_lit(0))],
+            span: sp(),
+        };
+        match tc.infer_expr(&TypeContext::new(), &expr) {
+            Err(NuError::TypeError {
+                expected_type: Some(expected),
+                found_type: Some(found),
+                ..
+            }) => {
+                assert!(expected.contains('2'), "unexpected type: {}", expected);
+                assert!(found.contains('1'), "unexpected type: {}", found);
+            }
+            other => panic!("expected a structured tuple mismatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_match_accepts_tuple_pattern_of_exact_arity() {
+        let mut tc = TypeChecker::new();
+        let expr = Expr::Match {
+            scrutinee: Box::new(tuple(vec![int_lit(1), bool_lit(true)])),
+            arms: vec![(
+                Pattern::Tuple(vec![
+                    Pattern::Var("first".to_string()),
+                    Pattern::Var("second".to_string()),
+                ]),
+                None,
+                var("first"),
+            )],
+            span: sp(),
+        };
+        let (s, ty) = tc.infer_expr(&TypeContext::new(), &expr).unwrap();
         assert_eq!(apply_subst(&ty, &s), Type::int());
     }
 

@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Known tuple-pattern shape safety — 2026-10-19
+- **Type inference rejects tuple-pattern arity mismatches when the scrutinee has a known tuple type**, including nested patterns in typed variant payloads. Matching a tuple pattern against a known primitive also fails instead of creating unconstrained element bindings.
+- **Seven regression tests cover both mismatch directions, a non-tuple primitive, nested variant payloads, a correctly sized tuple pattern, source-span propagation, and structured expected/found type details.** Runtime tuple matching for unresolved/abstract types and full variant exhaustiveness remain separate stabilization work.
+
 ### Fabric on-demand mailbox scoring — 2026-10-18
 - **Fabric publish admission now reads mailbox pressure only for matching local subscribers**, instead of allocating and populating an all-actor mailbox snapshot on every publish.
 - **Ported the regression and exact-base matched-fixture A/B harness** from #1708 onto current main. Historical unmatched-publish microbenchmarks were favorable; new-head CI and measurements remain the promotion gate.
