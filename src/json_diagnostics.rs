@@ -34,7 +34,7 @@
 
 use serde::Serialize;
 
-use crate::types::{current_source_text, source_map_file, NuError, Span};
+use crate::types::{current_source_text, source_map_file, NuError, NuWarning, Span};
 
 /// Current JSON diagnostics schema version.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -129,6 +129,18 @@ pub fn diagnostics_from_error(err: &NuError) -> Vec<JsonDiagnostic> {
             .collect(),
         NuError::Suspended(_) => Vec::new(),
         _ => vec![diagnostic_from_single(err)],
+    }
+}
+
+/// Convert a [`NuWarning`] into a machine-readable diagnostic.
+pub fn diagnostic_from_warning(warning: &NuWarning) -> JsonDiagnostic {
+    JsonDiagnostic {
+        code: Some(warning.code.to_string()),
+        severity: "warning".to_string(),
+        message: warning.msg.clone(),
+        span: json_span(warning.span),
+        notes: warning.help.iter().cloned().collect(),
+        suggestion: None,
     }
 }
 
@@ -253,6 +265,33 @@ mod tests {
         assert_eq!(v["command"], "check");
         assert_eq!(v["ok"], false);
         assert!(v["diagnostics"].is_array());
+        clear_source_map();
+    }
+
+    #[test]
+    fn test_warning_serializes_expected_shape() {
+        set_source_map_with_file("catch value 0\n", Some("test.nula"));
+        let warning = NuWarning::deprecated_catch(Span::new(0, 5));
+        let diagnostic = diagnostic_from_warning(&warning);
+
+        assert_eq!(diagnostic.code.as_deref(), Some("W0101"));
+        assert_eq!(diagnostic.severity, "warning");
+        assert_eq!(diagnostic.message, "use of deprecated `catch` expression");
+        let span = diagnostic.span.as_ref().expect("warning span");
+        assert_eq!(span.file, "test.nula");
+        assert_eq!(span.line, 1);
+        assert_eq!(span.col, 1);
+        assert_eq!(span.end_col, 6);
+        assert!(
+            diagnostic
+                .notes
+                .iter()
+                .any(|note| note.contains("RFC 0015")),
+            "warning help must be retained as JSON diagnostic context"
+        );
+
+        let report = JsonReport::new("check", Some("test.nula".to_string()), vec![diagnostic]);
+        assert!(report.ok, "warnings do not make the compiler report fail");
         clear_source_map();
     }
 
