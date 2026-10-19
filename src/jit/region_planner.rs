@@ -747,4 +747,38 @@ mod planner_tests {
         assert_eq!(plan.len, 0);
         assert!(plan.native_calls.is_empty());
     }
+
+    #[test]
+    fn test_graph_analysis_marks_self_and_mutual_recursion() {
+        // 0 <-> 1 is mutual recursion; 2 -> 2 is self-recursion.
+        let graph = vec![vec![1], vec![0], vec![2], vec![]];
+        let analysis = analyze_call_graph(&graph, &[false; 4]);
+        assert_eq!(analysis.recursive, vec![true, true, true, false]);
+        assert_eq!(analysis.may_suspend, vec![false; 4]);
+    }
+
+    #[test]
+    fn test_graph_analysis_handles_deep_acyclic_call_chain() {
+        // Recursive host-stack DFS would risk overflow; cubic closure scales
+        // poorly with generated modules containing thousands of functions.
+        const COUNT: usize = 2_048;
+        let mut graph = vec![Vec::new(); COUNT];
+        for (idx, callees) in graph.iter_mut().enumerate().take(COUNT - 1) {
+            callees.push(idx + 1);
+        }
+        let mut directly_unsafe = vec![false; COUNT];
+        directly_unsafe[COUNT - 1] = true;
+        let analysis = analyze_call_graph(&graph, &directly_unsafe);
+        assert!(analysis.may_suspend.iter().all(|&v| v));
+        assert!(analysis.recursive.iter().all(|&v| !v));
+    }
+
+    #[test]
+    fn test_graph_analysis_propagates_suspension_to_callers_only() {
+        // 0 -> 1 -> 2 (unsafe), 3 -> 1; 4 is unrelated.
+        let graph = vec![vec![1], vec![2], vec![], vec![1], vec![]];
+        let analysis = analyze_call_graph(&graph, &[false, false, true, false, false]);
+        assert_eq!(analysis.may_suspend, vec![true, true, true, true, false]);
+        assert_eq!(analysis.recursive, vec![false; 5]);
+    }
 }
