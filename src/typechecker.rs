@@ -3585,13 +3585,24 @@ impl TypeChecker {
             },
             Pattern::Variant(name, pat) => match scrut_ty {
                 Type::Variant(variants) => {
-                    let mut new_ctx = ctx.clone();
-                    if let Some((_, Some(ty))) = variants.iter().find(|(n, _)| n == name) {
-                        if let Some(p) = pat {
-                            new_ctx = self.bind_pattern(&new_ctx, p, ty)?;
-                        }
+                    let Some((_, payload)) = variants.iter().find(|(n, _)| n == name) else {
+                        return Err(NuError::type_error(
+                            format!("unknown variant constructor '{}' in match", name),
+                            Span::default(),
+                        ));
+                    };
+                    match (payload.as_ref(), pat.as_deref()) {
+                        (Some(ty), Some(inner)) => self.bind_pattern(ctx, inner, ty),
+                        (None, None) => Ok(ctx.clone()),
+                        (Some(_), None) => Err(NuError::type_error(
+                            format!("variant constructor '{}' requires a payload pattern", name),
+                            Span::default(),
+                        )),
+                        (None, Some(_)) => Err(NuError::type_error(
+                            format!("variant constructor '{}' has no payload", name),
+                            Span::default(),
+                        )),
                     }
-                    Ok(new_ctx)
                 }
                 _ => {
                     if let Some(p) = pat {
