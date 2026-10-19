@@ -288,7 +288,7 @@ fn select_import_decls(
     let available: HashSet<&str> = decls.iter().filter_map(decl_name).collect();
     if let Some(missing) = items.iter().find(|item| !available.contains(item.as_str())) {
         return Err(NuError::RuntimeError {
-            msg: format!("import '{}' does not export '{}'", import_path, missing),
+            msg: format!("import '{}' has no declaration named '{}'", import_path, missing),
             span: Span::default(),
         });
     }
