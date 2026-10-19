@@ -107,6 +107,7 @@ suite('Nulang extension', () => {
       assert.deepStrictEqual(task.execution.args, [file]);
       assert.strictEqual(task.execution.options?.cwd, workspace);
       assert.strictEqual(task.definition.command, 'Run');
+      assert.notStrictEqual(task.scope, vscode.TaskScope.Global, 'VS Code does not support global tasks');
     } finally {
       fs.rmSync(workspace, { recursive: true, force: true });
     }
