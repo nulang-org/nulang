@@ -276,14 +276,16 @@ test result: 2 passed; 0 failed
 
 Flags:
 
-- `--filter <substr>` — only run test files whose name contains the substring
+- `--filter <substr>` — select whole-file tests by filename or individual `test_*` cases by function/qualified name
 - `--verbose` / `-v` — print per-file results and failure details
 - `--watch` / `-w` — re-run when `src/` or `tests/` change
 - `--json` — machine-readable report on stdout
 
-If a test file defines `fn test_*` functions, each one is discovered and run
-as an independent test case (the file's `fn main`, if any, is stripped from
-the per-function wrappers); otherwise the whole file runs as a single test.
+If a test file defines top-level `fn test_*` functions, each one is discovered
+through the Nulang parser and runs as an independent test case (the file's
+`fn main`, if any, is stripped from the per-function wrappers); otherwise the
+whole file runs as a single test. Per-function results are reported as
+`tests/file.nula::test_name`, making identical function names unambiguous.
 
 ## WASM builds — `nula build-wasm`
 
