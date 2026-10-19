@@ -843,6 +843,37 @@ mod tests {
     }
 
     #[test]
+    fn decoded_snapshots_reject_ambiguous_per_node_action_events() {
+        let mut document = document();
+        let button = document
+            .nodes
+            .iter_mut()
+            .find(|node| node.id.as_str() == "task-1")
+            .expect("fixture must have a task node");
+        button.actions = vec![
+            ActionBinding {
+                event: "press".to_owned(),
+                action_id: ActionId::from("save"),
+                placement: ActionPlacement::Client,
+            },
+            ActionBinding {
+                event: "press".to_owned(),
+                action_id: ActionId::from("delete"),
+                placement: ActionPlacement::Client,
+            },
+        ];
+
+        // Serialization alone does not validate an envelope; decoding must
+        // fail closed when the document violates the shared host contract.
+        let encoded = serde_json::to_string(&RuntimeToHostMessage::snapshot(document)).unwrap();
+        let error = decode_runtime_message(&encoded).unwrap_err();
+        assert!(
+            error.to_string().contains("duplicate action event"),
+            "unexpected decoder error: {error}"
+        );
+    }
+
+    #[test]
     fn decoding_runtime_messages_rejects_invalid_snapshots_and_patches() {
         let mut invalid_document = document();
         invalid_document.root = NodeId::from("missing");
