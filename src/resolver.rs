@@ -210,7 +210,11 @@ fn resolve_path(base: &Path, import: &str) -> PathBuf {
         return resolve_module_path(module);
     }
 
-    let p = Path::new(import);
+    // Ordinary nested imports use namespace separators in source syntax,
+    // but on disk each namespace component is a directory. Keep stdlib and
+    // registry imports on their dedicated resolution paths above.
+    let normalized = import.replace("::", std::path::MAIN_SEPARATOR_STR);
+    let p = Path::new(&normalized);
     let resolved = if p.is_absolute() {
         p.to_path_buf()
     } else {
