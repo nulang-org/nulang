@@ -3257,7 +3257,10 @@ mod tests {
             span: s(),
         };
         let result = checker.check_effects(&ctx, &expr, &ctx.allowed_effects);
-        assert!(result.is_err(), "unresolved callee effects cannot satisfy ! {{}}");
+        assert!(
+            result.is_err(),
+            "unresolved callee effects cannot satisfy ! {{}}"
+        );
     }
 
     #[test]
