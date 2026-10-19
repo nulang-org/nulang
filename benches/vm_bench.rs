@@ -124,6 +124,29 @@ fn bench_array_indexing(c: &mut Criterion) {
     });
 }
 
+/// Track the cost of value-semantic array updates before introducing typed
+/// numeric buffers or zero-copy views. The full source is compiled outside
+/// the timed region, as in the other VM throughput benchmarks.
+fn bench_array_value_set(c: &mut Criterion) {
+    for size in [8, 128] {
+        let elements = (1..=size)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let source = format!(
+            "var arr = [{elements}]; var i = 0; while i < 200 {{ arr = perform Array.set(arr, i % {size}, i); i = i + 1; }}; arr[0]"
+        );
+        let module = compile(&source);
+        c.bench_function(format!("vm/array_value_set/{size}"), |b| {
+            b.iter_batched_ref(
+                || fresh_vm(&module),
+                |vm| black_box(vm.run().unwrap()),
+                BatchSize::SmallInput,
+            )
+        });
+    }
+}
+
 /// Baseline the `Perform` hot path before module-load name caching.
 /// The performed operation is stable for every loop iteration, so repeated
 /// parsing/allocation of `Float.sqrt` is pure dispatch overhead.
@@ -198,6 +221,7 @@ criterion_group!(
     bench_closure_capture,
     bench_record_access,
     bench_array_indexing,
+    bench_array_value_set,
     bench_perform_float_sqrt,
     bench_perform_int_to_float,
     bench_perform_array_length,
