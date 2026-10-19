@@ -137,7 +137,8 @@ fn bench_array_value_set(c: &mut Criterion) {
             "var arr = [{elements}]; var i = 0; while i < 200 {{ arr = perform Array.set(arr, i % {size}, i); i = i + 1; }}; arr[0]"
         );
         let module = compile(&source);
-        c.bench_function(format!("vm/array_value_set/{size}"), |b| {
+        let benchmark_name = format!("vm/array_value_set/{size}");
+        c.bench_function(&benchmark_name, |b| {
             b.iter_batched_ref(
                 || fresh_vm(&module),
                 |vm| black_box(vm.run().unwrap()),
