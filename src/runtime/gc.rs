@@ -1464,4 +1464,50 @@ mod tests {
             "object freed once the hold is released"
         );
     }
+
+    // Broken ref-count barriers must fail with a stable diagnostic in both
+    // debug and release builds; wrapping counts can silently prolong a heap
+    // object's lifetime or free it while a foreign reader still holds it.
+    #[test]
+    #[should_panic(expected = "ORCA local reference count underflow")]
+    fn test_drop_local_ref_rejects_zero_count() {
+        let mut heap = MockHeap::new();
+        let mut gc = OrcaGc::new(1);
+        let ptr = gc.alloc_object(&mut heap, 16, TypeTag::Raw).unwrap();
+        unsafe {
+            (*heap.header_ptr(ptr)).ref_count = 0;
+            gc.drop_local_ref(&mut heap, ptr);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "ORCA foreign reference count underflow")]
+    fn test_process_foreign_op_rejects_missing_credit() {
+        let mut heap = MockHeap::new();
+        let mut gc = OrcaGc::new(1);
+        let ptr = gc.alloc_object(&mut heap, 16, TypeTag::Raw).unwrap();
+        let header = unsafe { heap.header_ptr(ptr) };
+        gc.process_foreign_op(
+            &mut heap,
+            ForeignRefOp {
+                target_actor: 2,
+                owner_actor: 1,
+                object_header: header,
+                delta: -1,
+            },
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "ORCA local reference count overflow")]
+    fn test_local_ref_rejects_overflow() {
+        let mut heap = MockHeap::new();
+        let mut gc = OrcaGc::new(1);
+        let ptr = gc.alloc_object(&mut heap, 16, TypeTag::Raw).unwrap();
+        unsafe {
+            (*heap.header_ptr(ptr)).ref_count = u32::MAX;
+            gc.local_ref(&heap, ptr);
+        }
+    }
+
 }
