@@ -3308,6 +3308,34 @@ mod tests {
     }
 
     #[test]
+    fn test_check_effects_rejects_union_of_independent_open_tails() {
+        // A combined expression must not silently retain only the first
+        // unresolved tail and pass a contract that shares that same tail.
+        let allowed_tail = Region::fresh();
+        let mut checker = EffectChecker::new();
+        checker.fn_rows.insert(
+            "first".to_string(),
+            EffectRow::Open(vec![Effect::IO], allowed_tail),
+        );
+        checker.fn_rows.insert(
+            "second".to_string(),
+            EffectRow::Open(vec![Effect::FS], Region::fresh()),
+        );
+        let allowed = EffectRow::Open(vec![Effect::IO, Effect::FS], allowed_tail);
+        let ctx = EffectContext::with_allowed(allowed.clone());
+        let call = |name: &str| Expr::App {
+            func: Box::new(Expr::Var(name.to_string(), s())),
+            args: vec![],
+            span: s(),
+        };
+        let expr = Expr::Tuple(vec![call("first"), call("second")], s());
+        assert!(
+            checker.check_effects(&ctx, &expr, &allowed).is_err(),
+            "independent effect tails must remain unknown after expression union"
+        );
+    }
+
+    #[test]
     fn test_check_effects_accepts_shared_open_effect_tail() {
         // A shared row variable denotes the same unknown effects on both
         // sides; widening the known allowance remains safe.
