@@ -146,6 +146,22 @@ fn diagnostic_from_single(err: &NuError) -> JsonDiagnostic {
     }
 }
 
+/// Convert a non-fatal compiler warning into the same structured schema as
+/// errors, preserving its stable W-code, source span, and migration guidance.
+pub fn diagnostic_from_warning(warning: &crate::types::NuWarning) -> JsonDiagnostic {
+    JsonDiagnostic {
+        code: Some(warning.code.to_string()),
+        severity: "warning".to_string(),
+        message: warning.msg.clone(),
+        span: json_span(warning.span),
+        notes: Vec::new(),
+        suggestion: warning.help.as_ref().map(|help| JsonSuggestion {
+            message: help.clone(),
+            replacement: None,
+        }),
+    }
+}
+
 /// The core message without position prefixes or structured-field suffixes.
 fn json_message(err: &NuError) -> String {
     match err {
@@ -221,6 +237,22 @@ pub fn diagnostic_from_message(message: String) -> JsonDiagnostic {
 mod tests {
     use super::*;
     use crate::types::{clear_source_map, set_source_map_with_file};
+
+    #[test]
+    fn warning_diagnostic_serializes_stable_code_without_making_report_fail() {
+        set_source_map_with_file("fail 1\n", Some("warn.nula"));
+        let warning = crate::types::NuWarning::deprecated_fail(Span::new(0, 4));
+        let diagnostic = diagnostic_from_warning(&warning);
+        assert_eq!(diagnostic.code.as_deref(), Some("W0102"));
+        assert_eq!(diagnostic.severity, "warning");
+        assert_eq!(diagnostic.span.as_ref().unwrap().file, "warn.nula");
+        assert_eq!(diagnostic.span.as_ref().unwrap().col, 1);
+        assert!(diagnostic.suggestion.is_some());
+
+        let report = JsonReport::new("check", Some("warn.nula".into()), vec![diagnostic]);
+        assert!(report.ok, "warnings should not fail a JSON report");
+        clear_source_map();
+    }
 
     #[test]
     fn test_report_serializes_expected_shape() {
