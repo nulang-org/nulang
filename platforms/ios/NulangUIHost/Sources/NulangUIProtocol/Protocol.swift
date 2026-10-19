@@ -246,6 +246,7 @@ public enum NulangUIProtocolError: Error, Equatable, Sendable {
     case emptyIdentifier(String)
     case emptyNodeKind(String)
     case emptyActionEvent(String)
+    case duplicateActionEvent(node: String, event: String)
     case duplicateNode(String)
     case missingNode(String)
     case danglingChild(parent: String, child: String)
@@ -270,6 +271,8 @@ extension NulangUIProtocolError: LocalizedError {
             return "node \(node) has an empty kind"
         case .emptyActionEvent(let node):
             return "node \(node) has an empty action event"
+        case .duplicateActionEvent(let node, let event):
+            return "node \(node) has duplicate action event \(event)"
         case .duplicateNode(let node):
             return "duplicate node id \(node)"
         case .missingNode(let node):
@@ -348,10 +351,19 @@ public struct UiDocument: Codable, Equatable, Sendable {
             guard !node.kind.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw NulangUIProtocolError.emptyNodeKind(node.id)
             }
+            // Use the same per-node event identity rule as the Rust UI protocol.
+            // A native host must never choose between ambiguous handlers.
+            var actionEvents = Set<String>()
             for binding in node.actions {
                 try requireIdentifier("action_id", binding.actionId)
                 guard !binding.event.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                     throw NulangUIProtocolError.emptyActionEvent(node.id)
+                }
+                guard actionEvents.insert(binding.event).inserted else {
+                    throw NulangUIProtocolError.duplicateActionEvent(
+                        node: node.id,
+                        event: binding.event
+                    )
                 }
             }
             guard byId[node.id] == nil else {
