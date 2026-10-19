@@ -81,14 +81,21 @@ pub fn run(args: &[String]) -> NuResult<()> {
             if web {
                 cmd_build_web()
             } else {
-                let json = args[1..].iter().any(|a| a == "--json");
-                if args.len() > 1 && !json {
-                    return Err(NuError::PackageError {
-                        msg: format!("unknown flag '{}' for nula build", args[1]),
-                        span: Span::default(),
-                    });
+                let mut json = false;
+                let mut locked = false;
+                for flag in &args[1..] {
+                    match flag.as_str() {
+                        "--json" => json = true,
+                        "--locked" => locked = true,
+                        other => {
+                            return Err(NuError::PackageError {
+                                msg: format!("unknown flag '{}' for nula build", other),
+                                span: Span::default(),
+                            });
+                        }
+                    }
                 }
-                cmd_build(json)
+                cmd_build(json, locked)
             }
         }
         Some("build-wasm") => cmd_build_wasm(),
@@ -766,6 +773,12 @@ button {
 /// Resolve the package in the current directory, write `Nulang.lock`, and
 /// return the entry point path.
 fn prepare_package() -> NuResult<PathBuf> {
+    prepare_package_with_lock_mode(false)
+}
+
+/// In locked mode verify the resolved package closure without rewriting the lockfile.
+/// This is not an offline or sandboxed build: remote source resolution can still occur.
+fn prepare_package_with_lock_mode(locked: bool) -> NuResult<PathBuf> {
     let root = package_root()?;
     let manifest_path = root.join(MANIFEST_FILE);
     let manifest = Manifest::load(&root).map_err(|e| NuError::PackageError {
@@ -832,13 +845,54 @@ fn prepare_package() -> NuResult<PathBuf> {
     })?;
 
     let lock_path = root.join(LOCKFILE_FILE);
-    resolution
-        .to_lockfile()
-        .save(&root)
-        .map_err(|e| NuError::PackageError {
+    let resolved = resolution.to_lockfile();
+    if locked {
+        let existing = Lockfile::load(&root).map_err(|e| NuError::PackageError {
+            msg: format!(
+                "nula build --locked requires an existing {}: {}",
+                LOCKFILE_FILE, e
+            ),
+            span: Span::default(),
+        })?;
+        if existing.package != resolved.package {
+            return Err(NuError::PackageError {
+                msg: format!(
+                    "{} is out of date; run 'nulang nula build' to refresh it",
+                    LOCKFILE_FILE
+                ),
+                span: Span::default(),
+            });
+        }
+        // Legacy source hashes only cover direct .nula files. Check canonical
+        // source identities too, so changes to nested modules and manifests
+        // cannot silently reuse a locked local dependency.
+        let canonical = resolved.with_available_source_identities()?;
+        for package in &existing.package {
+            if !package.source.starts_with("path+") {
+                continue;
+            }
+            let previous = existing.package_identity(
+                &package.name, &package.version, &package.source
+            ).and_then(|entry| entry.parsed_source_id().transpose()).transpose()?;
+            let current = canonical.package_identity(
+                &package.name, &package.version, &package.source
+            ).and_then(|entry| entry.parsed_source_id().transpose()).transpose()?;
+            if previous.flatten().is_none() || previous != current {
+                return Err(NuError::PackageError {
+                    msg: format!(
+                        "{} is out of date: local dependency '{}' lacks a matching strong source identity",
+                        LOCKFILE_FILE, package.name
+                    ),
+                    span: Span::default(),
+                });
+            }
+        }
+    } else {
+        resolved.save(&root).map_err(|e| NuError::PackageError {
             msg: format!("failed to write {}: {}", lock_path.display(), e),
             span: Span::default(),
         })?;
+    }
 
     let entry = root.join(&manifest.package.entry);
     if !entry.exists() {
@@ -1064,7 +1118,7 @@ fn build_module_path() -> Option<String> {
 /// `nula build`: resolve dependencies, write the lockfile, type-check entry.
 /// `nula build`: resolve dependencies, write the lockfile, type-check and
 /// compile to a .nbc artifact in .nula/dist/.
-fn cmd_build(json: bool) -> NuResult<()> {
+fn cmd_build(json: bool, locked: bool) -> NuResult<()> {
     let root = package_root()?;
     let manifest_path = root.join(MANIFEST_FILE);
     let manifest = Manifest::load(&root).map_err(|e| NuError::PackageError {
@@ -1074,7 +1128,7 @@ fn cmd_build(json: bool) -> NuResult<()> {
     let name = manifest.package.name.clone();
     let version = manifest.package.version.clone();
 
-    let entry = prepare_package()?;
+    let entry = prepare_package_with_lock_mode(locked)?;
     let entry_str = entry.to_string_lossy().into_owned();
 
     if json {
