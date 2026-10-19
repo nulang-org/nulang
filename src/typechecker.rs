@@ -451,17 +451,11 @@ fn mgu(t1: &Type, t2: &Type, span: Span) -> NuResult<Substitution> {
     if t1 == t2 {
         return Ok(vec![]);
     }
-    // NTIR erases opaque nominal wrappers to their underlying type, so two
-    // ground types that differ only by opacity must not short-circuit here.
-    // Let the Type::Nominal cases below enforce the opacity contract.
-    if !matches!(t1, Type::Nominal { .. })
-        && !matches!(t2, Type::Nominal { .. })
-        && t1.is_ground()
-        && t2.is_ground()
-        && t1.to_ntir().hash() == t2.to_ntir().hash()
-    {
-        return Ok(vec![]);
-    }
+    // NTIR is a content-addressing representation, not an injective encoding
+    // of type equality: it erases function effect rows and opaque nominal
+    // wrappers, and represents arrays with tuple nodes. Matching NTIR hashes
+    // therefore cannot bypass the semantic cases below, even for ground types.
+    // Exact type equality has already been handled above.
 
     match (t1, t2) {
         // Identical primitives unify trivially
