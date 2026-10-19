@@ -806,6 +806,112 @@ mod scheduler_tests {
         assert!(Scheduler::new_with_fair_priority(1, PriorityWeights::new(0, 0, 0)).is_err());
     }
 
+    /// Manually executed, payload-free owner-dequeue benchmark. This measures
+    /// scheduler admission + draining, not actor behavior, JIT or wall-clock SLOs.
+    ///
+    /// Run explicitly on an otherwise idle host:
+    /// cargo test --locked --release bench_scheduler_strict_vs_fair -- --ignored --nocapture
+    #[test]
+    #[ignore = "run explicitly on a controlled host; performance is not a CI pass gate"]
+    fn bench_scheduler_strict_vs_fair() {
+        use std::time::Instant;
+
+        const EACH_BAND: usize = 10_000;
+        const TOTAL: usize = EACH_BAND * 3;
+        const WARMUP_ROUNDS: usize = 1;
+        const MEASURED_ROUNDS: usize = 6;
+        let mut samples: [Vec<(u128, u128)>; 2] = [Vec::new(), Vec::new()];
+
+        for round in 0..WARMUP_ROUNDS + MEASURED_ROUNDS {
+            // Alternate execution order across measured samples to avoid
+            // systematically benchmarking strict mode on a cooler CPU.
+            let order = if round % 2 == 0 {
+                [false, true]
+            } else {
+                [true, false]
+            };
+            for fair in order {
+                let s = if fair {
+                    Scheduler::new_with_fair_priority(1, PriorityWeights::new(8, 4, 1))
+                        .expect("valid weights")
+                } else {
+                    Scheduler::new(1)
+                };
+
+                let mut enqueued_at = vec![Instant::now(); TOTAL];
+                // Identical interleaved arrival pattern and logical token IDs.
+                for i in 0..EACH_BAND {
+                    for (band, priority) in [
+                        ActorPriority::High,
+                        ActorPriority::Normal,
+                        ActorPriority::Low,
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        let id = i * 3 + band;
+                        enqueued_at[id] = Instant::now();
+                        s.enqueue_with_priority(id as u64, priority);
+                    }
+                }
+
+                let mut seen = vec![false; TOTAL];
+                let mut counts = [0usize; 3];
+                let mut high_wait_ns = Vec::with_capacity(EACH_BAND);
+                let started = Instant::now();
+                for _ in 0..TOTAL {
+                    let id = s.dequeue().expect("every enqueued token must be served") as usize;
+                    assert!(id < TOTAL, "out-of-range actor token");
+                    assert!(!seen[id], "duplicate actor token {id}");
+                    seen[id] = true;
+                    counts[id % 3] += 1;
+                    if id % 3 == 0 {
+                        high_wait_ns.push(enqueued_at[id].elapsed().as_nanos());
+                    }
+                }
+                let elapsed_ns = started.elapsed().as_nanos();
+                assert_eq!(counts, [EACH_BAND; 3]);
+                assert!(s.dequeue().is_none(), "unexpected extra actor token");
+
+                // p99 is enqueue-to-dequeue waiting time for this synthetic
+                // preloaded queue, not end-to-end actor latency.
+                high_wait_ns.sort_unstable();
+                let high_p99_ns = high_wait_ns[(EACH_BAND * 99).div_ceil(100) - 1];
+                if round >= WARMUP_ROUNDS {
+                    samples[usize::from(fair)].push((elapsed_ns, high_p99_ns));
+                    println!(
+                        "[scheduler-fair-bench] mode={} round={} operations={} \
+                         elapsed_ns={} high_queue_p99_ns={}",
+                        if fair { "fair_8_4_1" } else { "strict" },
+                        round - WARMUP_ROUNDS + 1,
+                        TOTAL,
+                        elapsed_ns,
+                        high_p99_ns,
+                    );
+                }
+            }
+        }
+
+        for (mode, rows) in ["strict", "fair_8_4_1"].iter().zip(samples.iter_mut()) {
+            assert_eq!(rows.len(), MEASURED_ROUNDS);
+            let mut durations: Vec<_> = rows.iter().map(|(ns, _)| *ns).collect();
+            let mut high_p99s: Vec<_> = rows.iter().map(|(_, ns)| *ns).collect();
+            durations.sort_unstable();
+            high_p99s.sort_unstable();
+            let median_duration_ns = durations[durations.len() / 2];
+            let median_high_p99_ns = high_p99s[high_p99s.len() / 2];
+            println!(
+                "[scheduler-fair-summary] mode={} samples={} operations={} \
+                 median_elapsed_ns={} median_high_queue_p99_ns={}",
+                mode,
+                rows.len(),
+                TOTAL,
+                median_duration_ns,
+                median_high_p99_ns,
+            );
+        }
+    }
+
     #[test]
     fn test_run_one() {
         let s = Scheduler::new(2);
