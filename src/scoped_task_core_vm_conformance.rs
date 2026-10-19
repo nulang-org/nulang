@@ -48,6 +48,20 @@ impl CoreVmTaskHost {
         id
     }
 
+    fn submit_non_integer(&mut self) -> TaskId {
+        // Deliberately returns a bool, violating this test adapter's
+        // integer-only result contract. The reference executor must cancel
+        // admitted siblings and pending work when it observes that failure.
+        let mut module = CodeModule::new("scoped_test_non_integer");
+        module.constants.push(Constant::Bool(true));
+        module.emit(Instruction::new3(OpCode::ConstU, 0, 0, 0));
+        module.emit(Instruction::new0(OpCode::Halt));
+
+        let id = self.executor.try_submit().expect("within test queue capacity");
+        self.modules.insert(id, module);
+        id
+    }
+
     fn defer_once(&mut self, id: TaskId) {
         self.deferred_once = Some(id);
     }
