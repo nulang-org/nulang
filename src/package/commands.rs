@@ -7,7 +7,7 @@ use std::process::Command;
 
 use crate::package::lockfile::{Lockfile, LOCKFILE_FILE};
 use crate::package::manifest::{Dependency, DependencyDetail, Manifest, MANIFEST_FILE};
-use crate::package::resolver::resolve;
+use crate::package::resolver::{resolve, resolve_offline};
 use crate::types::{NuError, NuResult, Span};
 use crate::web::modules::{ModuleRegistry, ModuleSpec};
 
@@ -89,10 +89,12 @@ pub fn run(args: &[String]) -> NuResult<()> {
             } else {
                 let mut json = false;
                 let mut locked = false;
+                let mut offline = false;
                 for arg in args.iter().skip(1) {
                     match arg.as_str() {
                         "--json" => json = true,
                         "--locked" => locked = true,
+                        "--offline" => offline = true,
                         other => {
                             return Err(NuError::PackageError {
                                 msg: format!("unknown flag '{}' for nula build", other),
@@ -101,7 +103,7 @@ pub fn run(args: &[String]) -> NuResult<()> {
                         }
                     }
                 }
-                cmd_build_with_lock(json, locked)
+                cmd_build_with_mode(json, locked || offline, offline)
             }
         }
         Some("build-wasm") => cmd_build_wasm(),
@@ -301,7 +303,7 @@ fn print_usage() {
     println!("                Scaffold a new package directory");
     println!("                Templates: default, cli, lib, full");
     println!("  init          Scaffold a new package in the current directory");
-    println!("  build [--locked] [--json]  Build .nbc + behavior sidecar in .nula/dist/");
+    println!("  build [--locked|--offline] [--json]  Build .nbc + behavior sidecar");
     println!("  build-wasm    Build package to .wasm + .cwasm in .nula/dist/");
     println!("  test [--filter <substr>] [--verbose|-v] [--watch|-w]  Run .nula test files");
     println!("  run           Build and run the package entry point");
@@ -786,6 +788,10 @@ fn prepare_package() -> NuResult<PathBuf> {
 /// without changing that file. This mode is not offline: remote dependencies
 /// may still need to be fetched by the resolver.
 fn prepare_package_with_lock(locked: bool) -> NuResult<PathBuf> {
+    prepare_package_with_mode(locked, false)
+}
+
+fn prepare_package_with_mode(locked: bool, offline: bool) -> NuResult<PathBuf> {
     let root = package_root()?;
     let manifest_path = root.join(MANIFEST_FILE);
     let manifest = Manifest::load(&root).map_err(|e| NuError::PackageError {
@@ -857,7 +863,16 @@ fn prepare_package_with_lock(locked: bool) -> NuResult<PathBuf> {
     };
 
     eprintln!("  Resolving dependencies...");
-    let resolution = resolve(&root, &manifest).map_err(|e| NuError::PackageError {
+    let resolution = if offline {
+        resolve_offline(
+            &root,
+            &manifest,
+            existing_lock.as_ref().expect("offline mode requires --locked"),
+        )
+    } else {
+        resolve(&root, &manifest)
+    }
+    .map_err(|e| NuError::PackageError {
         msg: format!(
             "failed to resolve dependencies for package '{}': {}\n  help: check that all [dependencies] in {} are reachable",
             manifest.package.name,
@@ -1110,7 +1125,7 @@ fn build_module_path() -> Option<String> {
 /// `nula build`: resolve dependencies, write the lockfile, type-check entry.
 /// `nula build`: resolve dependencies, write the lockfile, type-check and
 /// compile to a .nbc artifact in .nula/dist/.
-fn cmd_build_with_lock(json: bool, locked: bool) -> NuResult<()> {
+fn cmd_build_with_mode(json: bool, locked: bool, offline: bool) -> NuResult<()> {
     let root = package_root()?;
     let manifest_path = root.join(MANIFEST_FILE);
     let manifest = Manifest::load(&root).map_err(|e| NuError::PackageError {
@@ -1120,7 +1135,7 @@ fn cmd_build_with_lock(json: bool, locked: bool) -> NuResult<()> {
     let name = manifest.package.name.clone();
     let version = manifest.package.version.clone();
 
-    let entry = prepare_package_with_lock(locked)?;
+    let entry = prepare_package_with_mode(locked, offline)?;
     let entry_str = entry.to_string_lossy().into_owned();
 
     if json {
