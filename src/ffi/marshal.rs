@@ -140,22 +140,43 @@ fn ptr_to_value_checked(p: *mut u8) -> Value {
     }
 }
 
+/// Copy a lifetime-checked borrowed C string into an owned Nulang FFI value.
+///
+/// The input borrow ends at this call: it is copied into a separate `CString`
+/// allocation, so the original C string may be released independently.
+/// The caller must free the returned pointer with `free_cstr_value` after the
+/// VM has copied it to actor-owned storage.
+///
+/// Address representability is checked *before* `CString::into_raw` transfers
+/// ownership. If a target cannot encode the allocated pointer, the CString is
+/// automatically dropped and `nil` is returned rather than leaking it.
+/// This is an internal host-side borrow boundary, not a source-language
+/// lifetime checker for arbitrary tagged `Value` pointers.
+pub fn borrowed_cstr_to_value(borrowed: &CStr) -> Value {
+    let owned = borrowed.to_owned();
+    let ptr = owned.as_ptr() as *mut u8;
+    if !crate::value_layout::ptr_fits_payload(ptr as u64) {
+        return Value::nil();
+    }
+    // SAFETY: the checked pointer is from the same owned CString allocation
+    // that we now transfer into the VM's explicitly managed FFI value.
+    unsafe { Value::ptr(owned.into_raw() as *mut u8) }
+}
+
 /// Marshal a C string return value into a Nulang pointer value.
 ///
-/// The string is copied into a `CString` and the pointer is leaked to the VM
-/// heap model. The caller is responsible for freeing the returned pointer with
-/// `free_cstr_value` once it is copied into the actor heap.
+/// The result owns an independent copy; native code retains ownership of `s`.
+/// Call `free_cstr_value` once the VM has copied the result into actor storage.
 ///
 /// # Safety
-/// `s` must be a valid, null-terminated C string.
+/// `s` must be null or point to a valid null-terminated C string for the
+/// duration of this call. Native pointer validity cannot be verified here.
 pub unsafe fn cstr_to_value(s: *const c_char) -> Value {
     if s.is_null() {
         return Value::nil();
     }
     // SAFETY: caller guarantees `s` is a valid, null-terminated C string.
-    let cstr = CStr::from_ptr(s);
-    let cstring = CString::new(cstr.to_bytes()).unwrap_or_else(|_| CString::default());
-    ptr_to_value_checked(cstring.into_raw() as *mut u8)
+    borrowed_cstr_to_value(CStr::from_ptr(s))
 }
 
 /// Free a pointer value previously created by `cstr_to_value`.
@@ -661,6 +682,8 @@ mod tests {
             unsafe { CStr::from_ptr(round_ptr).to_str().unwrap() },
             "hello ffi"
         );
+        // SAFETY: round is the owned copy created by cstr_to_value.
+        unsafe { free_cstr_value(round) };
     }
 
     #[test]
