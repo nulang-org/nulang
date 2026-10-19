@@ -964,6 +964,74 @@ mod tests {
     }
 
     #[test]
+    fn offline_resolution_reuses_exact_locked_git_commit_without_fetching_remote() {
+        let dir = fresh_dir("offline_git");
+        let remote = dir.join("remote");
+        let app = dir.join("app");
+        let pinned = git_remote(&remote, "util", "0.1.0", "fn main() { 1 }");
+        write_manifest(
+            &app,
+            "app",
+            "1.0.0",
+            &format!("util = {{ git = \"{}\", branch = \"main\" }}\n", remote.display()),
+        );
+        let manifest = Manifest::load(&app).unwrap();
+        let lock = resolve(&app, &manifest).unwrap().to_lockfile();
+        assert_eq!(lock.package[0].commit, pinned);
+
+        std::fs::write(remote.join("lib.nula"), "fn main() { 2 }").unwrap();
+        git_commit_all(&remote, "remote changed");
+        let offline = resolve_offline(&app, &manifest, &lock).unwrap().to_lockfile();
+        assert_eq!(offline.package, lock.package);
+        assert_eq!(
+            std::fs::read_to_string(app.join(".nula/git/util/lib.nula")).unwrap(),
+            "fn main() { 1 }"
+        );
+
+        std::fs::write(app.join(".nula/git/util.commit"), "incorrect\n").unwrap();
+        assert!(
+            resolve_offline(&app, &manifest, &lock).is_err(),
+            "tampered cache marker must fail closed, not fetch"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn offline_registry_resolution_requires_matching_cached_lock() {
+        let dir = fresh_dir("offline_registry");
+        let app = dir.join("app");
+        write_manifest(&app, "app", "1.0.0", "util = \"1.0.0\"\n");
+        let mut manifest = Manifest::load(&app).unwrap();
+        manifest.package.registry = Some("http://127.0.0.1:9".to_string());
+        let mut lock = Lockfile::new();
+        lock.package.push(LockedPackage {
+            name: "util".to_string(),
+            version: "1.0.0".to_string(),
+            source: "reg+http://127.0.0.1:9".to_string(),
+            content_hash: String::new(),
+            commit: String::new(),
+        });
+        let err = resolve_offline(&app, &manifest, &lock).unwrap_err();
+        assert!(err.to_string().contains("offline"), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn offline_local_path_resolution_requires_matching_lock() {
+        let dir = fresh_dir("offline_path");
+        let app = dir.join("app");
+        let util = dir.join("util");
+        write_manifest(&util, "util", "0.1.0", "");
+        std::fs::write(util.join("lib.nula"), "fn value() { 1 }").unwrap();
+        write_manifest(&app, "app", "1.0.0", "util = { path = \"../util\" }\n");
+        let manifest = Manifest::load(&app).unwrap();
+        let lock = resolve(&app, &manifest).unwrap().to_lockfile();
+        let actual = resolve_offline(&app, &manifest, &lock).unwrap().to_lockfile();
+        assert_eq!(actual.package, lock.package);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn test_git_dependency_refetches_when_remote_moves() {
         // An unpinned git dependency records the resolved commit in the
         // lockfile and re-fetches (re-clones) when the remote's default
