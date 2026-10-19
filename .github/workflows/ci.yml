@@ -108,6 +108,11 @@ jobs:
         # the default-feature test selection.
         run: cargo nextest run --locked
 
+      - name: Test universal UI protocol crate
+        # The root-package nextest invocation does not select workspace members.
+        # Validate the shared native/web UI ABI with its own integration tests.
+        run: cargo test --locked -p nulang-ui-protocol
+
       - name: Test doctests
         # nextest intentionally does not execute rustdoc tests.
         run: cargo test --locked --doc
