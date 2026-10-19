@@ -2578,9 +2578,19 @@ impl Parser {
                 self.current_span(),
             ));
         }
+        let alias = if self.consume_if(&TokenKind::As) {
+            Some(self.expect_ident("import alias")?)
+        } else {
+            None
+        };
         let items = Vec::new();
         self.skip_newlines_semicolons();
-        Ok(Decl::Import { path, items, span })
+        Ok(Decl::Import {
+            path,
+            items,
+            alias,
+            span,
+        })
     }
 
     /// Parse a module-level let binding: `let name [: Type] = value`
