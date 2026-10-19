@@ -108,6 +108,15 @@ class FirstRunSmokeTests(unittest.TestCase):
         self.assertIn("bytecode artifact", proc.stderr)
         self.assertNotIn("nula run", self.log.read_text())
 
+    def test_package_ci_executes_smoke_using_downloaded_release_cli(self):
+        workflow = (SCRIPT.parent.parent / ".github" / "workflows" / "ci.yml").read_text()
+        job = workflow.split("  nula-test:", 1)[1].split("  minimal-build:", 1)[0]
+        self.assertIn(
+            "python3 scripts/smoke_first_run.py --bin ./target/release/nulang",
+            job,
+            "first-run smoke must run against the tested release binary",
+        )
+
     def test_missing_binary_fails_before_any_command(self):
         self.fake.unlink()
         proc = self.invoke()
