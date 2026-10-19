@@ -6,6 +6,7 @@ Run only with a repeatable, non-destructive command whose side effects are safe.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import pathlib
@@ -59,6 +60,19 @@ def repo_sha(repo_root):
     return result.stdout.strip() if result.returncode == 0 else None
 
 
+def executable_identity(command):
+    """Fingerprint the executed file when resolvable, without following a shell."""
+    executable = command[0]
+    path = pathlib.Path(executable) if "/" in executable else pathlib.Path(shutil.which(executable) or "")
+    if not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as binary:
+        for chunk in iter(lambda: binary.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {"path": str(path.resolve()), "sha256": digest.hexdigest()}
+
+
 def collect(output, command, repetitions, warmups, repo_root):
     if sys.platform != "linux":
         raise RuntimeError("Linux perf is required; no non-Linux fallback is claimed")
@@ -73,6 +87,7 @@ def collect(output, command, repetitions, warmups, repo_root):
         "schema_version": 1,
         "source_sha": repo_sha(repo_root),
         "command": command,
+        "executable": executable_identity(command),
         "hardware": {
             "machine": platform.machine(),
             "cpu_model": cpu_model(),
