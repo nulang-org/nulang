@@ -31,3 +31,16 @@ jobs:
         run: cargo clippy --manifest-path crates/nulang-numeric/Cargo.toml --all-targets -- -D warnings
       - name: Release example compile
         run: cargo check --release --manifest-path crates/nulang-numeric/Cargo.toml --example compare_views
+      # Diagnostic timing only: shared-runner values are not performance
+      # certification and must never gate or claim a speedup.
+      - name: Generate paired Rust-side timing artifact
+        run: |
+          cargo run --release --manifest-path crates/nulang-numeric/Cargo.toml \
+            --example compare_views > numeric-views.csv
+          head -n 5 numeric-views.csv
+      - name: Upload timing samples
+        uses: actions/upload-artifact@v4
+        with:
+          name: numeric-views
+          path: numeric-views.csv
+          retention-days: 14
