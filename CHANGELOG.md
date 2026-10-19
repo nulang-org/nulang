@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Draft-aware CI and preserved test matrix — 2026-10-16
+- **Draft pull requests no longer consume pull-request runner capacity.** Every pull-request workflow keeps its validation but skips jobs until `ready_for_review`; per-ref concurrency cancels superseded runs without cancelling tagged releases.
+- **All required Rust test jobs use nextest plus explicit doctest runs.** Release, no-default-features, and WASM jobs retain their previous build, test, smoke, audit, documentation, package, and Lean validation; only test-process scheduling changes.
+- **A workflow contract test protects required contexts, draft reactivation, cancellation scope, and the nextest/doctest split.** External Woodpecker and Buildkite configuration is unchanged.
+
 ### Bounded Nulang Web development-server connections — 2026-10-16
 - **The experimental Web development listener caps active connections at 64**, including SSE, and returns `503` with `Retry-After: 1` when full.
 - **Worker capacity is returned by a scoped RAII lease** after normal completion, panic, or thread-spawn failure. One shared `Arc` route table replaces per-connection clones of compiled route modules.

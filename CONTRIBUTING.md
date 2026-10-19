@@ -25,6 +25,18 @@ NULANG_BIN=./target/release/nulang bash scripts/verify_doc_examples.sh  # doc sn
 
 Please make sure these pass before opening a PR. CI runs them all.
 
+## Continuous integration
+
+GitHub Actions runs the required Rust, release, optional-feature, formatting,
+Clippy, audit, documentation, package, and Lean checks. Test binaries run
+under `cargo nextest`; rustdoc tests remain explicit `cargo test --doc` steps
+because nextest does not execute doctests.
+
+Draft pull requests skip pull-request jobs so unfinished work does not consume
+runner capacity. Marking a draft ready for review emits the `ready_for_review`
+event and starts the same validation; tagged release jobs remain independent of
+pull-request cancellation.
+
 ## Commit style
 
 We use [Conventional Commits](https://www.conventionalcommits.org/):
