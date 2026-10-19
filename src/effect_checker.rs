@@ -3213,6 +3213,48 @@ mod tests {
     }
 
     #[test]
+    fn test_check_effects_rejects_unrelated_open_effect_tails() {
+        // Identical known effects do not prove that two independent row
+        // variables denote the same additional effects.
+        let mut checker = EffectChecker::new();
+        checker.fn_rows.insert(
+            "unknown_effects".to_string(),
+            EffectRow::Open(vec![Effect::IO], Region::fresh()),
+        );
+        let allowed = EffectRow::Open(vec![Effect::IO], Region::fresh());
+        let ctx = EffectContext::with_allowed(allowed.clone());
+        let call = Expr::App {
+            func: Box::new(Expr::Var("unknown_effects".to_string(), s())),
+            args: vec![],
+            span: s(),
+        };
+        assert!(
+            checker.check_effects(&ctx, &call, &allowed).is_err(),
+            "independent unresolved effect tails must not satisfy an effect contract"
+        );
+    }
+
+    #[test]
+    fn test_check_effects_accepts_shared_open_effect_tail() {
+        // A shared row variable denotes the same unknown effects on both
+        // sides; widening the known allowance remains safe.
+        let tail = Region::fresh();
+        let mut checker = EffectChecker::new();
+        checker.fn_rows.insert(
+            "shared_effects".to_string(),
+            EffectRow::Open(vec![Effect::IO], tail),
+        );
+        let allowed = EffectRow::Open(vec![Effect::IO, Effect::FS], tail);
+        let ctx = EffectContext::with_allowed(allowed.clone());
+        let call = Expr::App {
+            func: Box::new(Expr::Var("shared_effects".to_string(), s())),
+            args: vec![],
+            span: s(),
+        };
+        assert!(checker.check_effects(&ctx, &call, &allowed).is_ok());
+    }
+
+    #[test]
     fn test_check_effects_passes() {
         let mut checker = EffectChecker::new();
         let ctx = EffectContext::with_allowed(EffectRow::Closed(vec![Effect::IO, Effect::FS]));
