@@ -898,8 +898,13 @@ mod scheduler_tests {
             let mut high_p99s: Vec<_> = rows.iter().map(|(_, ns)| *ns).collect();
             durations.sort_unstable();
             high_p99s.sort_unstable();
-            let median_duration_ns = durations[durations.len() / 2];
-            let median_high_p99_ns = high_p99s[high_p99s.len() / 2];
+            // Six measured rounds: use the midpoint of the two central
+            // samples, rather than silently reporting the upper-middle one.
+            let midpoint = durations.len() / 2;
+            let median_duration_ns =
+                (durations[midpoint - 1] + durations[midpoint]) / 2;
+            let median_high_p99_ns =
+                (high_p99s[midpoint - 1] + high_p99s[midpoint]) / 2;
             println!(
                 "[scheduler-fair-summary] mode={} samples={} operations={} \
                  median_elapsed_ns={} median_high_queue_p99_ns={}",
