@@ -682,7 +682,11 @@ impl CycleDetector {
         let mut path: Vec<(u64, *mut OrcaHeader)> = Vec::new();
         if let Some(cycle) = self.dfs_find_cycle(suspect.actor_id, suspect.object_header, &mut path)
         {
-            // Cycle found! Send trial decrements.
+            // A graph edge alone is not proof of a live foreign count.
+            // Refuse trial deletion if any credit is absent or a node is pinned.
+            if !self.can_trial_decrement(&cycle) {
+                return;
+            }
             self.send_trial_decrements(&cycle);
 
             // Check if the cycle is garbage (all objects have zero count).
@@ -784,6 +788,38 @@ impl CycleDetector {
 
     // -- Trial decrement protocol ------------------------------------------
 
+    /// Verify every proposed decrement has a matching graph edge and a live
+    /// foreign credit. Pinned runtime sentinels must never be reclaimed.
+    ///
+    /// Graph membership is not a liveness proof: the coordinator may observe
+    /// in-flight registration/removal while foreign holds persist separately.
+    fn can_trial_decrement(&self, cycle: &[(u64, *mut OrcaHeader)]) -> bool {
+        if cycle.is_empty() {
+            return false;
+        }
+        for i in 0..cycle.len() {
+            let (from_actor, from_object) = cycle[i];
+            let (to_actor, to_object) = cycle[(i + 1) % cycle.len()];
+            let Some(node) = self.graph.get(&(from_actor, from_object as usize)) else {
+                return false;
+            };
+            if !node.foreign_refs.iter().any(|edge| {
+                edge.target_actor == to_actor
+                    && edge.target_object == to_object
+                    && edge.ref_count > 0
+            }) {
+                return false;
+            }
+            // SAFETY: cycle nodes originate from the live graph used by DFS.
+            // Every node's pointer is only valid while its owner heap is live.
+            let header = unsafe { &*to_object };
+            if header.sticky || header.foreign_count == 0 {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Send trial decrements along a detected cycle.
     ///
     /// For each edge in the cycle, this constructs a `ForeignRefOp` with
@@ -822,7 +858,10 @@ impl CycleDetector {
                 // SAFETY: The objects were verified alive during DFS, and the
                 // single scheduler thread is the only mutator of any header.
                 let target_header = &mut *to_object;
-                target_header.foreign_count -= 1;
+                target_header.foreign_count = target_header
+                    .foreign_count
+                    .checked_sub(1)
+                    .expect("ORCA trial foreign reference count underflow");
             }
         }
 
@@ -850,12 +889,12 @@ impl CycleDetector {
         for &(_actor, object) in cycle {
             // SAFETY: Object headers were validated during DFS and have not
             // been freed (trial decrements prevent concurrent reclamation).
-            let (local, foreign) = unsafe {
+            let (local, foreign, sticky) = unsafe {
                 let header = &*object;
-                (header.ref_count, header.foreign_count)
+                (header.ref_count, header.foreign_count, header.sticky)
             };
 
-            if local + foreign > 0 {
+            if sticky || local != 0 || foreign != 0 {
                 // At least one object still has references — the cycle is
                 // still reachable from outside.
                 return false;
