@@ -176,8 +176,7 @@ impl Fixture {
         }
 
         let hir = nulang::hir_lower::lower_module(&ast, &checker.inferred_decl_types);
-        let mut mir = nulang::mir_lower::lower_module(&hir)
-            .map_err(|e| format!("MIR: {e}"))?;
+        let mut mir = nulang::mir_lower::lower_module(&hir).map_err(|e| format!("MIR: {e}"))?;
         let bytecode = nulang::mir_codegen::compile_mir(&mut mir, "import-bench")
             .map_err(|e| format!("bytecode: {e}"))?;
         std::hint::black_box(&bytecode);
@@ -194,8 +193,10 @@ impl Drop for Fixture {
 
 fn run(config: &Config) -> Result<(), String> {
     let fixture = Fixture::create(config.modules, config.functions_per_module)?;
-    let cache_disabled =
-        env::var("NULANG_DISABLE_IMPORT_TOKEN_CACHE").ok().as_deref() == Some("1");
+    let cache_disabled = env::var("NULANG_DISABLE_IMPORT_TOKEN_CACHE")
+        .ok()
+        .as_deref()
+        == Some("1");
     for _ in 0..config.warmup {
         fixture.compile()?;
     }
@@ -267,9 +268,9 @@ mod tests {
 
     #[test]
     fn invalid_flags_fail_before_benchmarking() {
-        assert!(parse_args(["--repeat", "0"].map(str::to_string)).is_err());
-        assert!(parse_args(["--modules", "33"].map(str::to_string)).is_err());
-        assert!(parse_args(["--functions", "0"].map(str::to_string)).is_err());
-        assert!(parse_args(["--format", "xml"].map(str::to_string)).is_err());
+        assert!(parse_args(["--repeat", "0"].map(str::to_string).into_iter()).is_err());
+        assert!(parse_args(["--modules", "33"].map(str::to_string).into_iter()).is_err());
+        assert!(parse_args(["--functions", "0"].map(str::to_string).into_iter()).is_err());
+        assert!(parse_args(["--format", "xml"].map(str::to_string).into_iter()).is_err());
     }
 }
