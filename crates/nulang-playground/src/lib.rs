@@ -47,6 +47,8 @@ pub mod parallel_analysis;
 pub mod parallel_marker;
 #[path = "../../../src/stdlib.rs"]
 pub mod stdlib;
+#[path = "../../../src/match_coverage.rs"]
+pub mod match_coverage;
 #[path = "../../../src/typechecker.rs"]
 pub mod typechecker;
 #[path = "../../../src/tool_schema.rs"]
