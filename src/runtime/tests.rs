@@ -1105,6 +1105,59 @@ fn test_supervisor_restart_atomically_rekeys_sqlite_history() {
     assert!(rt.persistence.read_journal(child_id).is_empty());
 }
 
+#[test]
+fn test_supervisor_restart_restores_validated_authority_manifest() {
+    let mut rt = Runtime::new();
+    let supervisor_id = rt.create_supervisor("authority_sup", RestartStrategy::OneForOne);
+    let child_id = rt.spawn_persistent_actor(Box::new(Vec::new), HashMap::new());
+    let manifest = crate::authority::AuthorityManifest::from_tokens([
+        "Fs::Read(/srv/input)",
+        "Env::Read(REGION)",
+    ])
+    .unwrap();
+    rt.actors
+        .get_mut(&child_id)
+        .unwrap()
+        .install_authority_manifest(&manifest);
+    rt.checkpoint_actor(child_id);
+    rt.supervise_child(
+        supervisor_id,
+        ChildSpec::new("authority_child", RestartPolicy::Permanent),
+        child_id,
+    );
+    rt.exit_actor(child_id, ExitReason::Error("simulated crash".to_string()));
+
+    let new_id = rt.supervisors[&supervisor_id].children[0].1;
+    assert_ne!(new_id, child_id);
+    assert_eq!(
+        rt.actors[&new_id].authority_manifest().unwrap(),
+        manifest,
+        "supervised restart must preserve the validated authority boundary"
+    );
+}
+
+#[test]
+fn test_supervisor_restart_rejects_malformed_authority_snapshot() {
+    let mut rt = Runtime::new();
+    let supervisor_id = rt.create_supervisor("invalid_authority_sup", RestartStrategy::OneForOne);
+    let child_id = rt.spawn_persistent_actor(Box::new(Vec::new), HashMap::new());
+    let mut snapshot = rt.persistence.load_snapshot(child_id).unwrap();
+    snapshot.authority_tokens.insert("Secret::Read(".to_string());
+    rt.persistence.save_snapshot(snapshot).unwrap();
+    rt.supervise_child(
+        supervisor_id,
+        ChildSpec::new("invalid_authority", RestartPolicy::Permanent),
+        child_id,
+    );
+    rt.exit_actor(child_id, ExitReason::Error("simulated crash".to_string()));
+
+    assert!(rt.persistence.load_snapshot(child_id).is_some());
+    assert!(
+        !rt.actors.values().any(|actor| actor.parent == Some(supervisor_id)),
+        "a malformed authority manifest must reject the entire restart"
+    );
+}
+
 /// Supervisor restart of a persistent child must hydrate state from the
 /// persistence store, not from the captured RestartTemplate (which holds
 /// the *original* state from registration time).
