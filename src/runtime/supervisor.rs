@@ -366,12 +366,6 @@ impl Supervisor {
         new_actor.parent = Some(self.id);
         if let Some(module) = &template.bytecode_module {
             new_actor.bytecode_module = Some(Box::new(module.clone()));
-            runtime.register_recovery_module(
-                new_id,
-                module.clone(),
-                template.bytecode_offsets.clone(),
-                template.compensation_offsets.clone(),
-            );
         }
         let role = match new_actor.role() {
             Ok(role) => role,
@@ -386,6 +380,45 @@ impl Supervisor {
             }
         };
         let is_workflow = matches!(role, ActorRole::Workflow);
+
+        // A failed snapshot re-key must not publish a runnable actor or erase
+        // the last recoverable checkpoint. Save before touching the live actor
+        // registry; only retire the old durable record after the new one exists.
+        if let Some(mut snap) = snapshot {
+            snap.actor_id = new_id;
+            if let Err(error) = runtime.persistence.save_snapshot(snap) {
+                warn!(
+                    supervisor = %self.name,
+                    child = %spec.id,
+                    old_actor_id,
+                    new_actor_id = new_id,
+                    %error,
+                    "refusing durable child restart: snapshot re-key failed"
+                );
+                return None;
+            }
+            if let Err(error) = runtime.persistence.clear(old_actor_id) {
+                // Cleanup failure leaves an extra old checkpoint, but the new
+                // checkpoint is committed and the child can safely activate.
+                warn!(
+                    supervisor = %self.name,
+                    child = %spec.id,
+                    old_actor_id,
+                    new_actor_id = new_id,
+                    %error,
+                    "old checkpoint cleanup failed after snapshot re-key"
+                );
+            }
+        }
+
+        if let Some(module) = &template.bytecode_module {
+            runtime.register_recovery_module(
+                new_id,
+                module.clone(),
+                template.bytecode_offsets.clone(),
+                template.compensation_offsets.clone(),
+            );
+        }
         runtime.actors.insert(new_id, new_actor);
         // Register CRDT-backed fields with the CrdtManager.
         if let Some(ref mut mgr) = runtime.crdt_manager {
@@ -394,13 +427,6 @@ impl Supervisor {
         }
         if is_workflow {
             runtime.layout_workflow_behavior_table(new_id);
-        }
-
-        // Re-key the snapshot under the new actor id so future restarts find it.
-        if let Some(mut snap) = snapshot {
-            snap.actor_id = new_id;
-            let _ = runtime.persistence.save_snapshot(snap);
-            let _ = runtime.persistence.clear(old_actor_id);
         }
 
         // If the dead child was itself a supervisor, recreate its
