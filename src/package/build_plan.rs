@@ -10,7 +10,7 @@ use std::path::{Component, Path};
 
 use crate::package::identity::source_id_for_package_dir;
 use crate::package::lockfile::{Lockfile, LOCKFILE_FILE};
-use crate::package::manifest::Manifest;
+use crate::package::manifest::{Dependency, Manifest};
 use crate::types::{NuError, NuResult, Span};
 
 pub const BUILD_PLAN_SCHEMA: &str = "nulang.build-plan/v0alpha1";
@@ -53,15 +53,50 @@ pub fn inspect(root: &Path) -> NuResult<serde_json::Value> {
         ));
     };
 
-    // A stale lockfile must not silently masquerade as covering direct inputs.
-    for name in manifest.dependencies.keys() {
-        if !lockfile
+    // Match the manifest's exact direct dependency source as well as its name.
+    // A lockfile from an earlier package revision must never appear verified
+    // merely because the old and new sources both exist.
+    for (name, declared) in &manifest.dependencies {
+        let locked = lockfile
             .package
             .iter()
-            .any(|dependency| &dependency.name == name)
-        {
+            .find(|dependency| &dependency.name == name)
+            .ok_or_else(|| {
+                package_error(format!(
+                    "Nulang.lock does not contain direct dependency '{name}'; rebuild the lockfile"
+                ))
+            })?;
+        let matches_source = match declared {
+            Dependency::Detailed(detail) if detail.path.is_some() => {
+                let declared_path = root.join(detail.path.as_deref().unwrap());
+                let actual_path = declared_path.canonicalize().map_err(|error| {
+                    package_error(format!(
+                        "cannot verify direct dependency source '{name}': {error}"
+                    ))
+                })?;
+                locked
+                    .source
+                    .strip_prefix("path+")
+                    .and_then(|source| Path::new(source).canonicalize().ok())
+                    .is_some_and(|locked_path| locked_path == actual_path)
+            }
+            Dependency::Detailed(detail) if detail.git.is_some() => {
+                let revision = detail.rev.as_ref()
+                    .or(detail.branch.as_ref())
+                    .or(detail.tag.as_ref());
+                let requested = match revision {
+                    Some(revision) => format!("git+{}#{revision}", detail.git.as_deref().unwrap()),
+                    None => format!("git+{}", detail.git.as_deref().unwrap()),
+                };
+                locked.source == requested
+            }
+            // Version-only dependency resolution requires registry proof.
+            // This prototype has no verified registry input closure.
+            _ => false,
+        };
+        if !matches_source {
             return Err(package_error(format!(
-                "Nulang.lock does not contain direct dependency '{name}'; rebuild the lockfile"
+                "direct dependency source mismatch for '{name}'; refresh Nulang.lock before inspection"
             )));
         }
     }
@@ -331,7 +366,7 @@ mod tests {
         let new_path = root.join("replacement");
         make_package(
             &root,
-            "[dependencies]\\nutil = { path = \\"original\\" }\\n",
+            "[dependencies]\nutil = { path = \"original\" }\n",
         );
         make_package(&old_path, "");
         make_package(&new_path, "");
@@ -363,7 +398,7 @@ mod tests {
         let root = scratch("stale-direct-git");
         make_package(
             &root,
-            "[dependencies]\\nutil = { git = \\"https://example.org/old.git\\" }\\n",
+            "[dependencies]\nutil = { git = \"https://example.org/old.git\" }\n",
         );
         let mut lock = Lockfile::new();
         lock.package.push(locked_dependency(
