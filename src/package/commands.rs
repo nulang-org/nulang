@@ -862,6 +862,33 @@ fn prepare_package_with_mode(locked: bool, offline: bool) -> NuResult<PathBuf> {
         None
     };
 
+    if offline {
+        let lock = existing_lock.as_ref().expect("offline mode requires --locked");
+        for package in &lock.package {
+            if package.source.starts_with("path+") {
+                let identity = lock.package_identity(
+                    &package.name,
+                    &package.version,
+                    &package.source,
+                );
+                let source_id = identity
+                    .map(|id| id.parsed_source_id())
+                    .transpose()?
+                    .flatten();
+                if source_id.is_none() {
+                    return Err(NuError::PackageError {
+                        msg: format!(
+                            "offline path dependency '{}' lacks a strong source identity in Nulang.lock; run 'nulang nula build' to refresh it",
+                            package.name
+                        ),
+                        span: Span::default(),
+                    });
+                }
+            }
+        }
+        lock.verify_available_source_identities()?;
+    }
+
     eprintln!("  Resolving dependencies...");
     let resolution = if offline {
         resolve_offline(
