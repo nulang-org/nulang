@@ -3400,7 +3400,116 @@ impl TypeChecker {
             final_subst = compose_subst(&s, &final_subst);
         }
 
+        Self::check_closed_variant_match(
+            &apply_subst(&scrut_ty, &final_subst),
+            arms,
+            span,
+        )?;
         Ok((final_subst.clone(), apply_subst(&first_arm, &final_subst)))
+    }
+
+    /// Conservative coverage for a statically known, closed variant.
+    ///
+    /// Only unguarded, irrefutable constructor patterns establish full
+    /// coverage. Refutable payload patterns remain unknown rather than
+    /// generating false positives while full pattern-matrix analysis is
+    /// developed. Open/unknown types keep their runtime fallback.
+    fn check_closed_variant_match(
+        scrutinee_type: &Type,
+        arms: &[(Pattern, Option<Expr>, Expr)],
+        span: Span,
+    ) -> NuResult<()> {
+        let Type::Variant(variants) = scrutinee_type else {
+            return Ok(());
+        };
+        if variants.is_empty() {
+            return Ok(());
+        }
+
+        fn irrefutable(pat: &Pattern) -> bool {
+            match pat {
+                Pattern::Wild | Pattern::Var(_) => true,
+                Pattern::Alias(_, inner) => irrefutable(inner),
+                _ => false,
+            }
+        }
+
+        fn targets(pat: &Pattern, name: &str) -> bool {
+            match pat {
+                Pattern::Variant(tag, _) => tag == name,
+                Pattern::Alias(_, inner) => targets(inner, name),
+                _ => false,
+            }
+        }
+
+        fn covers(pat: &Pattern, name: &str, payload: &Option<Type>) -> bool {
+            if irrefutable(pat) {
+                return true;
+            }
+            match pat {
+                Pattern::Alias(_, inner) => covers(inner, name, payload),
+                Pattern::Variant(tag, bound) if tag == name => match (payload, bound) {
+                    (None, None) => true,
+                    (Some(_), Some(inner)) => irrefutable(inner),
+                    _ => false,
+                },
+                _ => false,
+            }
+        }
+
+        let mut covered = FxHashSet::default();
+        let mut uncertain = FxHashSet::default();
+
+        for (index, (pattern, guard, _)) in arms.iter().enumerate() {
+            // Every constructor was covered by earlier unguarded arms.
+            if variants.iter().all(|(name, _)| covered.contains(name)) {
+                return Err(NuError::type_error(
+                    format!("unreachable match arm {}: previous arms cover every variant", index + 1),
+                    span,
+                ));
+            }
+            // A prior unconditional arm for this constructor makes all later
+            // patterns for it unreachable, including guarded or refutable ones.
+            if variants.iter().any(|(name, _)| covered.contains(name) && targets(pattern, name)) {
+                return Err(NuError::type_error(
+                    format!("unreachable match arm {}: constructor is already covered", index + 1),
+                    span,
+                ));
+            }
+
+            if guard.is_some() {
+                continue;
+            }
+            for (name, payload) in variants {
+                if covers(pattern, name, payload) {
+                    covered.insert(name.clone());
+                } else if targets(pattern, name) {
+                    // A nested refutable payload may cover some, but not
+                    // necessarily all, values of this constructor. Keep the
+                    // verdict unknown until recursive matrix analysis exists.
+                    uncertain.insert(name.clone());
+                }
+            }
+        }
+
+        let missing: Vec<_> = variants
+            .iter()
+            .filter(|(name, _)| !covered.contains(name) && !uncertain.contains(name))
+            .map(|(name, _)| name.clone())
+            .collect();
+        if !missing.is_empty() {
+            return Err(NuError::TypeError {
+                msg: format!(
+                    "non-exhaustive match: missing variant constructor(s): {}",
+                    missing.join(", ")
+                ),
+                span,
+                expected_type: Some("all known variant constructors handled".to_string()),
+                found_type: Some(format!("missing: {}", missing.join(", "))),
+                similar_names: None,
+            });
+        }
+        Ok(())
     }
 
     /// Bind pattern variables into a new context.
