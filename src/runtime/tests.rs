@@ -8710,3 +8710,66 @@ fn confirmed_node_removal_forgets_crdt_receiver_knowledge() {
         "a peer that rejoins after confirmed removal must receive full state"
     );
 }
+
+
+/// A pending release against an exited actor's retired heap must never
+/// silently wrap its missing foreign-reference credit in release builds.
+#[test]
+#[should_panic(expected = "ORCA retired foreign reference count underflow")]
+fn retired_heap_rejects_missing_foreign_reference_credit() {
+    let mut rt = Runtime::new();
+    let owner = rt.spawn_actor(Box::new(|| vec![]));
+    let ptr = rt
+        .actors
+        .get_mut(&owner)
+        .expect("owner")
+        .heap
+        .alloc(16, TypeTag::Raw)
+        .expect("allocation");
+    let header = unsafe { ActorHeap::header_of(ptr) };
+
+    // The outstanding credit forces actor reaping to retire, rather than free,
+    // the owner's heap. Then inject an inconsistent counter on purpose.
+    unsafe { (*header).foreign_count = 1 };
+    rt.remove_actor_reaping(owner);
+    assert_eq!(rt.retired_heaps.len(), 1);
+    unsafe { (*header).foreign_count = 0 };
+
+    rt.coordinator.submit_op(crate::runtime::gc::ForeignRefOp {
+        target_actor: 999,
+        owner_actor: owner,
+        object_header: header,
+        delta: -1,
+    });
+    rt.process_gc_ops();
+}
+
+/// Releasing a receiver's hold on an already-exited owner is another
+/// independent retired-heap decrement path. It needs the same guard.
+#[test]
+#[should_panic(expected = "ORCA retired foreign reference count underflow")]
+fn retired_heap_rejects_double_release_of_receiver_hold() {
+    let mut rt = Runtime::new();
+    let owner = rt.spawn_actor(Box::new(|| vec![]));
+    let receiver = rt.spawn_actor(Box::new(|| vec![]));
+    let ptr = rt
+        .actors
+        .get_mut(&owner)
+        .expect("owner")
+        .heap
+        .alloc(16, TypeTag::Raw)
+        .expect("allocation");
+    let header = unsafe { ActorHeap::header_of(ptr) };
+
+    unsafe { (*header).foreign_count = 1 };
+    rt.actors
+        .get_mut(&receiver)
+        .expect("receiver")
+        .orca_gc
+        .record_held_ref(owner, header);
+    rt.remove_actor_reaping(owner);
+    assert_eq!(rt.retired_heaps.len(), 1);
+    unsafe { (*header).foreign_count = 0 };
+
+    rt.release_held_foreign_refs(receiver);
+}
