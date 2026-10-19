@@ -477,6 +477,46 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unknown_method_callback_during_migration() {
+        let ast = parse(
+            r#"
+            fn call_member(holder) { holder.run() }
+            fn noisy() { perform IO.print("side effect") }
+            entity Account {
+                version: 2
+                state balance: Int = 0
+                events | Changed(value: Int)
+                migration from 1 to 2 {
+                    state => { call_member({ run: noisy }) }
+                }
+            }
+            "#,
+        );
+        let err = check_module(&ast.decls).unwrap_err().to_string();
+        assert!(err.contains("unresolved callable expression"));
+    }
+
+    #[test]
+    fn rejects_unknown_pipe_target_during_migration() {
+        let ast = parse(
+            r#"
+            fn call_member(holder) { 1 |> holder.run }
+            fn noisy(x: Int) { perform IO.print("side effect"); x }
+            entity Account {
+                version: 2
+                state balance: Int = 0
+                events | Changed(value: Int)
+                migration from 1 to 2 {
+                    state => { call_member({ run: noisy }) }
+                }
+            }
+            "#,
+        );
+        let err = check_module(&ast.decls).unwrap_err().to_string();
+        assert!(err.contains("unresolved callable expression"));
+    }
+
+    #[test]
     fn permits_replay_stream_emit() {
         let ast = parse(
             r#"
