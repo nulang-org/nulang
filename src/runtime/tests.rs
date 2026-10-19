@@ -1044,6 +1044,67 @@ fn test_supervisor_restart_refuses_history_with_old_actor_self_reference() {
     );
 }
 
+#[test]
+fn test_supervisor_restart_refuses_missing_persistent_checkpoint() {
+    let mut rt = Runtime::new();
+    let supervisor_id = rt.create_supervisor("missing_sup", RestartStrategy::OneForOne);
+    let mut models = HashMap::new();
+    models.insert("count".to_string(), StateModel::Durable);
+    let child_id = rt.spawn_persistent_actor(
+        Box::new(|| vec![("count".to_string(), Value::int(7))]),
+        models,
+    );
+    rt.supervise_child(
+        supervisor_id,
+        ChildSpec::new("counter", RestartPolicy::Permanent),
+        child_id,
+    );
+    rt.persistence.clear(child_id).unwrap();
+    rt.exit_actor(child_id, ExitReason::Error("simulated crash".to_string()));
+
+    assert!(
+        !rt.actors.values().any(|actor| actor.parent == Some(supervisor_id)),
+        "missing durable history must not silently reset an actor to its defaults"
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn test_supervisor_restart_atomically_rekeys_sqlite_history() {
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(LibsqlStore::in_memory().unwrap());
+    let supervisor_id = rt.create_supervisor("sqlite_sup", RestartStrategy::OneForOne);
+    let mut models = HashMap::new();
+    models.insert("count".to_string(), StateModel::Durable);
+    let child_id = rt.spawn_persistent_actor(
+        Box::new(|| vec![("count".to_string(), Value::int(1))]),
+        models,
+    );
+    rt.persistence
+        .append_journal(
+            child_id,
+            JournalEntry {
+                sequence: 1,
+                behavior_id: 5,
+                payload: vec![PersistedValue::Int(7)],
+            },
+        )
+        .unwrap();
+    rt.supervise_child(
+        supervisor_id,
+        ChildSpec::new("counter", RestartPolicy::Permanent),
+        child_id,
+    );
+    rt.exit_actor(child_id, ExitReason::Error("simulated crash".to_string()));
+
+    let restarted = rt.supervisors[&supervisor_id].children[0].1;
+    assert_ne!(restarted, child_id);
+    assert!(rt.persistence.load_snapshot(restarted).is_some());
+    assert_eq!(rt.persistence.read_journal(restarted).len(), 1);
+    assert!(rt.persistence.load_snapshot(child_id).is_none());
+    assert!(rt.persistence.read_journal(child_id).is_empty());
+}
+
 /// Supervisor restart of a persistent child must hydrate state from the
 /// persistence store, not from the captured RestartTemplate (which holds
 /// the *original* state from registration time).
