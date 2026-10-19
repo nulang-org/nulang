@@ -1,7 +1,7 @@
 //! Nulang production benchmarks — criterion harness entry point.
 //!
 //! Run with: `cargo bench`
-//! Individual group: `cargo bench --bench bench_main -- vm_throughput`
+//! Individual group: `cargo bench --bench bench_main -- numeric_kernel`
 
 mod actor_bench;
 #[cfg(feature = "native-codegen")]
@@ -12,6 +12,7 @@ mod gc_bench;
 mod interp_bench;
 #[cfg(feature = "native-codegen")]
 mod jit_bench;
+mod numeric_bench;
 mod persist_bench;
 mod scheduler_bench;
 mod vm_bench;
@@ -26,6 +27,7 @@ criterion_main!(
     cache_bench::benches,
     aot_bench::benches,
     jit_bench::benches,
+    numeric_bench::benches,
     gc_bench::benches,
     dist_bench::benches,
     persist_bench::benches,
@@ -38,6 +40,7 @@ criterion_main!(
     interp_bench::benches,
     actor_bench::benches,
     cache_bench::benches,
+    numeric_bench::benches,
     gc_bench::benches,
     dist_bench::benches,
     persist_bench::benches,
