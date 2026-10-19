@@ -1,4 +1,9 @@
 # Nulang Changelog
+
+### Qualified import syntax preparation (experimental) — 2026-10-19
+- **The parser preserves `import module as alias` in the AST, and the formatter retains it.** This is syntax preparation only; actual qualified symbol references are not yet supported.
+- **Resolver and direct typechecker paths reject aliased imports with a diagnostic** rather than silently flattening their exports and changing binding identities.
+- Added parser, formatter, resolver and frontend regressions for aliases; executable Rust/Cargo validation and exact-head CI remain mandatory before promotion.
 ### Fabric on-demand mailbox scoring — 2026-10-18
 - **Fabric publish admission now reads mailbox pressure only for matching local subscribers**, instead of allocating and populating an all-actor mailbox snapshot on every publish.
 - **Ported the regression and exact-base matched-fixture A/B harness** from #1708 onto current main. Historical unmatched-publish microbenchmarks were favorable; new-head CI and measurements remain the promotion gate.
