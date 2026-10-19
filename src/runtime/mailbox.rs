@@ -767,7 +767,11 @@ mod tests {
         system.priority = MessagePriority::System;
         mb.push_local(system).unwrap();
         mb.push_local(make_msg(10, 100)).unwrap();
-        assert_eq!(mb.len(), 2, "supervisor signal does not consume normal credit");
+        assert_eq!(
+            mb.len(),
+            2,
+            "supervisor signal does not consume normal credit"
+        );
         assert!(mb.push(make_msg(11, 101)).is_err());
         assert!(mb.push_local(make_msg(11, 101)).is_err());
 
