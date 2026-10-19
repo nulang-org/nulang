@@ -206,7 +206,7 @@ fn test_spawn_send_step_sequence() {
 #[test]
 fn actor_dispatch_diagnostics_report_trace_without_message_payload() {
     let mut rt = Runtime::new();
-    let subscription = rt.diagnostics.subscribe(2).expect("diagnostic subscription");
+    let subscription = rt.subscribe_diagnostics(2).expect("diagnostic subscription");
     let actor_id = rt.spawn_actor(Box::new(|| vec![]));
     rt.actors
         .get_mut(&actor_id)
