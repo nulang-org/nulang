@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Cross-runtime CI diagnostics and Go 1.27 comparison — 2026-10-19
+- **Cross-runtime benchmarking now prints captured command errors and partial timeout logs**, with a validated per-execution deadline (300 seconds by default) for warm-up and measured subprocesses; optional version probes stay quiet.
+- **The benchmark comparison CI now installs Go 1.27.x**, records the detected toolchain and measurement deadline in JSON output, and runs focused subprocess regression tests before expensive builds. No new performance claim is made; rerun exact-head measurements before comparing against historical Go 1.25 results.
+
 ### Fabric on-demand mailbox scoring — 2026-10-18
 - **Fabric publish admission now reads mailbox pressure only for matching local subscribers**, instead of allocating and populating an all-actor mailbox snapshot on every publish.
 - **Ported the regression and exact-base matched-fixture A/B harness** from #1708 onto current main. Historical unmatched-publish microbenchmarks were favorable; new-head CI and measurements remain the promotion gate.
