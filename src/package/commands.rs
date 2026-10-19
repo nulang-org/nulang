@@ -2703,7 +2703,8 @@ mod tests {
         std::fs::create_dir_all(&util).unwrap();
         scaffold_package(&app, "locked-app", "default").unwrap();
         scaffold_package(&util, "util", "lib").unwrap();
-        std::fs::write(util.join("util.nula"), "fn value() -> Int { 1 }\n").unwrap();
+        // The legacy content_hash does not cover nested src/ modules.
+        std::fs::write(util.join("src/lib.nula"), "fn value() -> Int { 1 }\n").unwrap();
 
         let _guard = ChangeDir::new(&app);
         let mut manifest = Manifest::load(&app).unwrap();
@@ -2716,7 +2717,7 @@ mod tests {
         prepare_package().unwrap();
         let lock_path = app.join(LOCKFILE_FILE);
         let original = std::fs::read(&lock_path).unwrap();
-        std::fs::write(util.join("util.nula"), "fn value() -> Int { 2 }\n").unwrap();
+        std::fs::write(util.join("src/lib.nula"), "fn value() -> Int { 2 }\n").unwrap();
 
         let err = prepare_package_with_lock_mode(true).expect_err("changed dependency must fail");
         assert!(err.to_string().contains("Nulang.lock is out of date"));
