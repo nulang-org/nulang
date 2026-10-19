@@ -379,12 +379,20 @@ impl Mailbox {
     }
 
     /// Push a message from the scheduler thread.
+    ///
+    /// Supervisor/system traffic must enter the same priority band as
+    /// concurrent system sends. Placing it in the normal local FIFO would
+    /// let older application traffic delay supervisor control signals.
     pub fn push_local(&mut self, msg: Message) -> Result<(), Message> {
         let system = msg.priority == MessagePriority::System;
         if !self.reserve_slot(system) {
             return Err(msg);
         }
-        self.local_queue.push_back(msg);
+        if system {
+            self.system_queue.push(msg);
+        } else {
+            self.local_queue.push_back(msg);
+        }
         Ok(())
     }
 
