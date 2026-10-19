@@ -43,11 +43,7 @@ fn test_python_builtin_call_resolves_unicode_argument_by_content() {
         Constant::String("len".to_string()),
         Constant::String("olá 🐍".to_string()),
     ];
-    let imported = rt.perform_python_builtin(
-        Some("import"),
-        &constants,
-        &[Value::string(0)],
-    );
+    let imported = rt.perform_python_builtin(Some("import"), &constants, &[Value::string(0)]);
     assert!(matches!(imported, Some(value) if value.is_unit()));
 
     let result = rt.perform_python_builtin(
@@ -67,11 +63,7 @@ fn test_python_builtin_string_result_can_be_passed_to_next_python_call() {
         Constant::String("str".to_string()),
         Constant::String("len".to_string()),
     ];
-    let imported = rt.perform_python_builtin(
-        Some("import"),
-        &constants,
-        &[Value::string(0)],
-    );
+    let imported = rt.perform_python_builtin(Some("import"), &constants, &[Value::string(0)]);
     assert!(matches!(imported, Some(value) if value.is_unit()));
 
     let py_string = rt
