@@ -2677,6 +2677,21 @@ mod tests {
     }
 
     #[test]
+    fn test_build_wasm_locked_flag_dispatches_before_compiler_invocation() {
+        let dir = std::env::temp_dir().join(format!("nula_wasm_locked_cli_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = ChangeDir::new(&dir);
+        scaffold_package(&dir, "wasm-app", "default").unwrap();
+
+        let args = vec!["build-wasm".to_string(), "--locked".to_string()];
+        let err = run(&args).expect_err("missing lock must fail before invoking wasm compiler");
+        assert!(err.to_string().contains("requires an existing Nulang.lock"));
+        assert!(!dir.join(LOCKFILE_FILE).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_build_rejects_unknown_flag_even_with_json_enabled() {
         let args = vec!["build".to_string(), "--json".to_string(), "--surprise".to_string()];
         let err = run(&args).expect_err("unknown flags must not be bypassed by --json");
