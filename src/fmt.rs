@@ -245,7 +245,7 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             if items.is_empty() {
                 out.push_str(&format!("{}import {}\n", sp, path));
             } else {
-                out.push_str(&format!("{}import {}.{{{}}}\n", sp, path, items.join(", ")));
+                out.push_str(&format!("{}import {} {{ {} }}\n", sp, path, items.join(", ")));
             }
         }
         Decl::Extern { library, funcs, .. } => {
