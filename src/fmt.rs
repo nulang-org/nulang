@@ -241,12 +241,18 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             }
             out.push_str(&format!("{}}}\n", sp));
         }
-        Decl::Import { path, items, .. } => {
+        Decl::Import {
+            path, items, alias, ..
+        } => {
             if items.is_empty() {
-                out.push_str(&format!("{}import {}\n", sp, path));
+                out.push_str(&format!("{}import {}", sp, path));
             } else {
-                out.push_str(&format!("{}import {}.{{{}}}\n", sp, path, items.join(", ")));
+                out.push_str(&format!("{}import {}.{{{}}}", sp, path, items.join(", ")));
             }
+            if let Some(alias) = alias {
+                out.push_str(&format!(" as {}", alias));
+            }
+            out.push('\n');
         }
         Decl::Extern { library, funcs, .. } => {
             out.push_str(&format!("{}extern \"{}\" {{\n", sp, library));
@@ -1250,7 +1256,7 @@ mod tests {
     fn test_fmt_qualified_import_keeps_alias_and_is_idempotent() {
         let src = "import stdlib::list as lists";
         let formatted = format_source(src).expect("alias import format");
-        assert_eq!(formatted, "import stdlib::list as lists\\n");
+        assert_eq!(formatted, "import stdlib::list as lists\n");
         assert_idempotent(src);
     }
 
