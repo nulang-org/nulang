@@ -1087,6 +1087,8 @@ mod tests {
         );
         let manifest = Manifest::load(&app).unwrap();
         let lock = resolve(&app, &manifest).unwrap().to_lockfile();
+        lock.save(&app).unwrap();
+        let lock = Lockfile::load(&app).unwrap();
         assert_eq!(lock.package[0].commit, pinned);
 
         std::fs::write(remote.join("lib.nula"), "fn main() { 2 }").unwrap();
@@ -1135,6 +1137,37 @@ mod tests {
     }
 
     #[test]
+    fn offline_registry_cache_requires_strong_source_identity_and_rejects_tampering() {
+        let dir = fresh_dir("offline_registry_digest");
+        let app = dir.join("app");
+        write_manifest(&app, "app", "1.0.0", "util = \"1.0.0\"\n");
+        let mut manifest = Manifest::load(&app).unwrap();
+        manifest.package.registry = Some("http://127.0.0.1:9".into());
+
+        let cached = app.join(".nula/registry/util-1.0.0");
+        write_manifest(&cached, "util", "1.0.0", "");
+        std::fs::write(cached.join("lib.nula"), "fn value() { 1 }").unwrap();
+        let mut lock = Lockfile::new();
+        lock.package.push(LockedPackage {
+            name: "util".into(),
+            version: "1.0.0".into(),
+            source: "reg+http://127.0.0.1:9".into(),
+            content_hash: String::new(),
+            commit: String::new(),
+        });
+        let missing = resolve_offline(&app, &manifest, &lock).unwrap_err();
+        assert!(missing.to_string().contains("identity"), "{missing}");
+
+        lock.save(&app).unwrap();
+        let lock = Lockfile::load(&app).unwrap();
+        resolve_offline(&app, &manifest, &lock).unwrap();
+        std::fs::write(cached.join("lib.nula"), "fn value() { 2 }").unwrap();
+        let tampered = resolve_offline(&app, &manifest, &lock).unwrap_err();
+        assert!(tampered.to_string().contains("identity"), "{tampered}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn offline_local_path_resolution_requires_matching_lock() {
         let dir = fresh_dir("offline_path");
         let app = dir.join("app");
@@ -1144,6 +1177,8 @@ mod tests {
         write_manifest(&app, "app", "1.0.0", "util = { path = \"../util\" }\n");
         let manifest = Manifest::load(&app).unwrap();
         let lock = resolve(&app, &manifest).unwrap().to_lockfile();
+        lock.save(&app).unwrap();
+        let lock = Lockfile::load(&app).unwrap();
         let actual = resolve_offline(&app, &manifest, &lock).unwrap().to_lockfile();
         assert_eq!(actual.package, lock.package);
         let _ = std::fs::remove_dir_all(dir);
