@@ -291,7 +291,10 @@ impl OrcaGc {
             "local_ref called on object not owned by this actor"
         );
 
-        header.ref_count = header.ref_count.checked_add(1).expect("ORCA local reference count overflow");
+        header.ref_count = header
+            .ref_count
+            .checked_add(1)
+            .expect("ORCA local reference count overflow");
         self.stats.local_refs_created += 1;
     }
 
@@ -318,7 +321,10 @@ impl OrcaGc {
             "drop_local_ref called on object not owned by this actor"
         );
 
-        header.ref_count = header.ref_count.checked_sub(1).expect("ORCA local reference count underflow");
+        header.ref_count = header
+            .ref_count
+            .checked_sub(1)
+            .expect("ORCA local reference count underflow");
 
         self.stats.local_refs_dropped += 1;
 
@@ -368,7 +374,10 @@ impl OrcaGc {
         );
 
         // Mark the reference as in-flight.
-        header.foreign_count = header.foreign_count.checked_add(1).expect("ORCA foreign reference count overflow");
+        header.foreign_count = header
+            .foreign_count
+            .checked_add(1)
+            .expect("ORCA foreign reference count overflow");
         self.stats.foreign_refs_sent += 1;
 
         ForeignRefOp {
@@ -398,8 +407,14 @@ impl OrcaGc {
         );
 
         // In-flight reference has arrived.
-        let next_foreign = header.foreign_count.checked_sub(1).expect("ORCA foreign reference count underflow");
-        let next_local = header.ref_count.checked_add(1).expect("ORCA local reference count overflow");
+        let next_foreign = header
+            .foreign_count
+            .checked_sub(1)
+            .expect("ORCA foreign reference count underflow");
+        let next_local = header
+            .ref_count
+            .checked_add(1)
+            .expect("ORCA local reference count overflow");
         header.foreign_count = next_foreign;
         // Transfer the in-flight credit atomically into a local reference.
         header.ref_count = next_local;
@@ -428,7 +443,10 @@ impl OrcaGc {
             "inc_foreign_hold called on object not owned by this actor"
         );
 
-        header.foreign_count = header.foreign_count.checked_add(1).expect("ORCA foreign reference count overflow");
+        header.foreign_count = header
+            .foreign_count
+            .checked_add(1)
+            .expect("ORCA foreign reference count overflow");
         self.stats.foreign_refs_received += 1;
     }
 
@@ -469,10 +487,16 @@ impl OrcaGc {
         let header = unsafe { &mut *op.object_header };
 
         let prev_foreign = if op.delta >= 0 {
-            header.foreign_count = header.foreign_count.checked_add(op.delta as u32).expect("ORCA foreign reference count overflow");
+            header.foreign_count = header
+                .foreign_count
+                .checked_add(op.delta as u32)
+                .expect("ORCA foreign reference count overflow");
             header.foreign_count
         } else {
-            header.foreign_count = header.foreign_count.checked_sub(op.delta.unsigned_abs()).expect("ORCA foreign reference count underflow");
+            header.foreign_count = header
+                .foreign_count
+                .checked_sub(op.delta.unsigned_abs())
+                .expect("ORCA foreign reference count underflow");
             header.foreign_count
         };
 
