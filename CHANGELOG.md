@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Scheduler-local system message priority — 2026-10-19
+- **Locally enqueued supervisor/system signals use the system-priority mailbox lane** rather than the ordinary scheduler-local FIFO, so earlier normal application messages cannot delay supervisor control traffic during ordinary receives.
+- **Three mailbox regressions** check local system preemption, system FIFO, and consistent snapshot/receive ordering. Normal local sends retain the low-overhead local queue; no mailbox capacity or durability contracts are changed.
+
 ### Fabric on-demand mailbox scoring — 2026-10-18
 - **Fabric publish admission now reads mailbox pressure only for matching local subscribers**, instead of allocating and populating an all-actor mailbox snapshot on every publish.
 - **Ported the regression and exact-base matched-fixture A/B harness** from #1708 onto current main. Historical unmatched-publish microbenchmarks were favorable; new-head CI and measurements remain the promotion gate.
