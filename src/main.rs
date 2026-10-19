@@ -4,7 +4,7 @@
 //!   nulang [OPTIONS] <FILE>
 //!   nulang --repl
 //!   nulang --eval <CODE>
-//!   nulang --check <FILE> [--inspect-types] [--inspect-effects]
+//!   nulang --check <FILE> [--inspect-types] [--inspect-effects] [--inspect-mir]
 //!   nulang --lsp
 //!   nulang --dap [FILE]
 //!   nulang agent <init|run|chat|goals|graph>
@@ -17,6 +17,7 @@
 //!   -c, --check <FILE>       Type-check a file (don't run)
 //!   --inspect-types          Print inferred declaration types with --check
 //!   --inspect-effects        Print inferred function effect rows with --check
+//!   --inspect-mir            Print MIR structural counts with --check
 //!   --doc                    Generate Markdown API docs (docs/api.md)
 //!   --emit-stdlib-docs <dir> Generate per-effect stdlib docs into <dir>
 //!   --lsp                    Start Language Server (stdio)
@@ -446,6 +447,7 @@ fn main() {
             "--all-errors" => opts.all_errors = true,
             "--inspect-types" => opts.inspect_types = true,
             "--inspect-effects" => opts.inspect_effects = true,
+            "--inspect-mir" => opts.inspect_mir = true,
             "--json" => opts.json = true,
             "--deny-warnings" => opts.deny_warnings = true,
             "--metrics-port" => {
@@ -538,6 +540,7 @@ fn main() {
                     "--check",
                     "--inspect-types",
                     "--inspect-effects",
+                    "--inspect-mir",
                     "--lsp",
                     "--dap",
                     "--doc",
@@ -590,17 +593,17 @@ fn main() {
     // Type inspection is a read-only companion to --check. Keep the existing
     // --json diagnostics schema unchanged until introspection has its own
     // versioned machine-readable contract.
-    if (opts.inspect_types || opts.inspect_effects) && opts.check_file.is_none() {
-        eprintln!("Error: --inspect-types/--inspect-effects requires --check <FILE>");
+    if (opts.inspect_types || opts.inspect_effects || opts.inspect_mir) && opts.check_file.is_none() {
+        eprintln!("Error: --inspect-types/--inspect-effects/--inspect-mir requires --check <FILE>");
         std::process::exit(1);
     }
-    if (opts.inspect_types || opts.inspect_effects) && opts.json {
-        eprintln!("Error: --inspect-types/--inspect-effects cannot be combined with --json");
+    if (opts.inspect_types || opts.inspect_effects || opts.inspect_mir) && opts.json {
+        eprintln!("Error: --inspect-types/--inspect-effects/--inspect-mir cannot be combined with --json");
         std::process::exit(1);
     }
     // Reject all alternative execution/compilation modes before their
     // dispatch paths. An inspection request must never evaluate user code.
-    if (opts.inspect_types || opts.inspect_effects)
+    if (opts.inspect_types || opts.inspect_effects || opts.inspect_mir)
         && (opts.eval_code.is_some()
             || opts.watch.is_some()
             || opts.init.is_some()
@@ -847,7 +850,7 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        if opts.inspect_types || opts.inspect_effects {
+        if opts.inspect_types || opts.inspect_effects || opts.inspect_mir {
             match run_frontend_with_effects(
                 &source,
                 Some(&path),
@@ -855,12 +858,30 @@ fn main() {
                 &opts.with_capabilities,
                 opts.deny_warnings,
             ) {
-                Ok((_, checker, effects)) => {
+                Ok((ast, checker, effects)) => {
+                    // Build the MIR report before printing any inspection output.
+                    // A lowering error must not leave a misleading partial report.
+                    let mir_report = if opts.inspect_mir {
+                        let hir =
+                            nulang::hir_lower::lower_module(&ast, &checker.inferred_decl_types);
+                        match nulang::mir_lower::lower_module(&hir) {
+                            Ok(mir) => Some(format_mir_structure(&mir)),
+                            Err(e) => {
+                                print_error(&e, use_color);
+                                std::process::exit(exit_code(&e));
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     if opts.inspect_types {
                         print!("{}", format_inferred_decl_types(&checker));
                     }
                     if opts.inspect_effects {
                         print!("{}", format_inferred_function_effects(&effects));
+                    }
+                    if let Some(report) = mir_report {
+                        print!("{}", report);
                     }
                     return;
                 }
@@ -1091,6 +1112,7 @@ struct Options {
     verbose: bool,
     inspect_types: bool,
     inspect_effects: bool,
+    inspect_mir: bool,
     backend: String,
     out_file: Option<String>,
     /// Compile the input to a `.nbc` artifact and write it, don't run.
@@ -1156,6 +1178,7 @@ impl Default for Options {
             verbose: false,
             inspect_types: false,
             inspect_effects: false,
+            inspect_mir: false,
             backend: "bytecode".to_string(),
             out_file: None,
             emit_nbc: false,
@@ -1205,6 +1228,7 @@ fn print_help() {
     println!(
         "  --inspect-effects Print inferred function effect rows with --check (no execution)"
     );
+    println!("  --inspect-mir     Print MIR structural counts with --check (no execution)");
     println!("  --doc            Generate Markdown API docs (docs/api.md)");
     println!("  --emit-stdlib-docs <dir>  Generate per-effect stdlib Markdown docs into <dir>");
     println!("  --lsp            Start Language Server (stdio)");
@@ -2790,6 +2814,58 @@ fn format_inferred_function_effects(checker: &EffectChecker) -> String {
 /// Sorted output makes it easy to diff type changes between compiler revisions.
 /// This reports top-level inferred types, not allocation behavior or JIT
 /// specialization decisions.
+/// Count slots, basic blocks and statements in compiler-owned pre-codegen
+/// MIR. Slots are not heap allocations; these figures are diagnostic structure
+/// only and do not predict optimized instructions, memory use or runtime cost.
+fn format_mir_structure(module: &nulang::mir::Module) -> String {
+    let mut rows: Vec<(&str, &nulang::mir::Function)> = module
+        .functions
+        .iter()
+        .map(|function| ("function", function))
+        .chain(
+            module
+                .behaviors
+                .iter()
+                .map(|behavior| ("behavior", behavior)),
+        )
+        .collect();
+    rows.sort_unstable_by(|(kind_a, func_a), (kind_b, func_b)| {
+        func_a.name.cmp(&func_b.name).then_with(|| kind_a.cmp(kind_b))
+    });
+    let mut output = String::from("=== MIR Structure (pre-codegen) ===\n");
+    for (kind, function) in rows {
+        let statements: usize = function.blocks.iter().map(|b| b.stmts.len()).sum();
+        // The MIR source map records statement positions, not necessarily
+        // every expression. Ignore synthetic line zero and avoid attributing
+        // locations to generated/unmapped statements.
+        let mut lines: Vec<u32> = function
+            .line_table
+            .iter()
+            .map(|(_, line)| *line)
+            .filter(|line| *line != 0)
+            .collect();
+        lines.sort_unstable();
+        lines.dedup();
+        let source_lines = if lines.is_empty() {
+            "-".to_string()
+        } else {
+            lines.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
+        };
+        output.push_str(&format!(
+            "{} {}: params={} locals={} blocks={} statements={} handlers={} source_lines={}\n",
+            kind,
+            function.name,
+            function.params.len(),
+            function.locals.len(),
+            function.blocks.len(),
+            statements,
+            function.handler_tables.len(),
+            source_lines,
+        ));
+    }
+    output
+}
+
 fn format_inferred_decl_types(checker: &TypeChecker) -> String {
     let mut declarations: Vec<_> = checker.inferred_decl_types.iter().collect();
     declarations.sort_unstable_by(|(name_a, _), (name_b, _)| name_a.cmp(name_b));
