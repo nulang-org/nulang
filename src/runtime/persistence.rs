@@ -1162,25 +1162,28 @@ impl PersistenceStore for MemoryStore {
             ));
         }
 
+        let journal_has_self_ref = self
+            .journals
+            .get(&from)
+            .map(|entries| serialized_history_contains_self_ref(entries, from))
+            .transpose()?
+            .unwrap_or(false);
+        let workflow_has_self_ref = self
+            .workflow_events
+            .get(&from)
+            .map(|events| serialized_history_contains_self_ref(events, from))
+            .transpose()?
+            .unwrap_or(false);
+        let events_have_self_ref = self
+            .events
+            .get(&from)
+            .map(|events| serialized_history_contains_self_ref(events, from))
+            .transpose()?
+            .unwrap_or(false);
         let has_embedded_self_ref = serialized_history_contains_self_ref(source, from)?
-            || self
-                .journals
-                .get(&from)
-                .is_some_and(|entries| {
-                    serialized_history_contains_self_ref(entries, from).unwrap_or(true)
-                })
-            || self
-                .workflow_events
-                .get(&from)
-                .is_some_and(|events| {
-                    serialized_history_contains_self_ref(events, from).unwrap_or(true)
-                })
-            || self
-                .events
-                .get(&from)
-                .is_some_and(|events| {
-                    serialized_history_contains_self_ref(events, from).unwrap_or(true)
-                });
+            || journal_has_self_ref
+            || workflow_has_self_ref
+            || events_have_self_ref;
         if has_embedded_self_ref {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -2396,7 +2399,7 @@ impl PersistenceStore for LibsqlStore {
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
                 {
                     for idx in 0..columns.len() {
-                        let json: String = row.get(idx as i32).map_err(|e| {
+                        let json: String = row.get(idx).map_err(|e| {
                             io::Error::new(io::ErrorKind::InvalidData, e.to_string())
                         })?;
                         if json_history_contains_self_ref(&json, from)? {
