@@ -102,6 +102,25 @@ class ExactHeadReleaseProofTests(unittest.TestCase):
                 with self.assertRaises(proof.ProofError):
                     proof.validate_exact_head_ci(valid_run(), jobs, SHA)
 
+    def test_run_and_jobs_cannot_share_missing_identity_fields(self):
+        for run_field, job_field in (("id", "run_id"), ("run_attempt", "run_attempt")):
+            with self.subTest(run_field=run_field):
+                run = valid_run()
+                del run[run_field]
+                jobs = valid_jobs()
+                for job in jobs:
+                    del job[job_field]
+                with self.assertRaises(proof.ProofError):
+                    proof.validate_exact_head_ci(run, jobs, SHA)
+
+    def test_job_identity_rejects_bool_and_float_coercion(self):
+        for field, value in (("run_id", 1234.0), ("run_attempt", True)):
+            with self.subTest(field=field):
+                jobs = valid_jobs()
+                jobs[0] = {**jobs[0], field: value}
+                with self.assertRaises(proof.ProofError):
+                    proof.validate_exact_head_ci(valid_run(), jobs, SHA)
+
     def test_workflow_success_must_be_terminal(self):
         for run in (
             valid_run(status="in_progress", conclusion=None),
