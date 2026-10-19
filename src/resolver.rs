@@ -2,9 +2,9 @@ use crate::ast::{AstModule, Decl};
 use crate::lexer::{Lexer, Token};
 use crate::parser::Parser;
 use crate::types::{NuError, NuResult, Span};
-use std::cell::RefCell;
 #[cfg(test)]
 use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -155,8 +155,8 @@ pub fn resolve_imports(
             msg: format!("cannot read '{}': {}", import_path, e),
             span: Span::default(),
         })?;
-        let tokens = lex_import_tokens(&resolved_canonical, &source)
-            .map_err(|e| NuError::RuntimeError {
+        let tokens =
+            lex_import_tokens(&resolved_canonical, &source).map_err(|e| NuError::RuntimeError {
                 msg: format!("lex error in '{}': {}", import_path, e),
                 span: Span::default(),
             })?;
@@ -556,15 +556,17 @@ mod tests {
         TOKEN_CACHE.with(|cache| cache.borrow_mut().clear());
         TOKEN_CACHE_HITS.with(|hits| hits.set(0));
 
-        let first = lex_import_tokens(&path, "fn alpha() -> Int { 1 }")
-            .expect("lex first version");
-        let again = lex_import_tokens(&path, "fn alpha() -> Int { 1 }")
-            .expect("lex unchanged version");
-        assert_eq!(first, again, "cache must return exactly the original token stream");
+        let first = lex_import_tokens(&path, "fn alpha() -> Int { 1 }").expect("lex first version");
+        let again =
+            lex_import_tokens(&path, "fn alpha() -> Int { 1 }").expect("lex unchanged version");
+        assert_eq!(
+            first, again,
+            "cache must return exactly the original token stream"
+        );
         TOKEN_CACHE_HITS.with(|hits| assert_eq!(hits.get(), 1));
 
-        let changed = lex_import_tokens(&path, "fn beta() -> Int { 2 }")
-            .expect("lex edited version");
+        let changed =
+            lex_import_tokens(&path, "fn beta() -> Int { 2 }").expect("lex edited version");
         assert_ne!(first, changed, "edited source must not use stale tokens");
         TOKEN_CACHE_HITS.with(|hits| assert_eq!(hits.get(), 1));
 
@@ -615,8 +617,11 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir(&dir).expect("create fixture directory");
-        std::fs::write(dir.join("parent.nula"), "import dep\nfn parent() -> Int { 1 }\n")
-            .expect("write unchanged parent");
+        std::fs::write(
+            dir.join("parent.nula"),
+            "import dep\nfn parent() -> Int { 1 }\n",
+        )
+        .expect("write unchanged parent");
         let dep = dir.join("dep.nula");
         let compile = || {
             let mut module = AstModule {
@@ -647,7 +652,10 @@ mod tests {
         assert!(second.contains("second"));
         assert!(!second.contains("first"));
         TOKEN_CACHE_HITS.with(|hits| {
-            assert!(hits.get() >= 1, "unchanged parent should reuse lexed tokens")
+            assert!(
+                hits.get() >= 1,
+                "unchanged parent should reuse lexed tokens"
+            )
         });
     }
 
