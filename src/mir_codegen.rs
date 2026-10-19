@@ -3659,6 +3659,51 @@ mod optimize_tests {
     }
 
     #[test]
+    fn test_fold_float_epsilon_equality_without_runtime_comparison() {
+        // The VM compares float equality using an absolute epsilon, not
+        // bitwise IEEE equality. Constant evaluation must use the same rule.
+        let source = "0.1 + 0.2 == 0.3";
+        assert_eq!(run_source(source).unwrap().as_bool(), Some(true));
+        assert!(
+            !has_opcode(&compile_source(source).unwrap(), OpCode::FCmpEq),
+            "constant float equality must not emit FCmpEq"
+        );
+
+        let source = "0.1 + 0.2 != 0.3";
+        assert_eq!(run_source(source).unwrap().as_bool(), Some(false));
+        assert!(
+            !has_opcode(&compile_source(source).unwrap(), OpCode::FCmpEq),
+            "constant float inequality must not emit FCmpEq"
+        );
+    }
+
+    #[test]
+    fn test_fold_float_epsilon_boundary_and_nonfinite_values() {
+        use crate::ast::BinOp;
+
+        let cases = [
+            (1.0, 1.0, true),
+            (0.1 + 0.2, 0.3, true),
+            (1.0, 1.0 + f64::EPSILON, false),
+            (0.0, -0.0, true),
+            (f64::INFINITY, f64::INFINITY, false),
+            (f64::NAN, f64::NAN, false),
+        ];
+        for (a, b, equal) in cases {
+            assert_eq!(
+                fold_binary_consts(BinOp::Eq, &Constant::Float(a), &Constant::Float(b)),
+                Some(mir::RValue::Const(Constant::Bool(equal))),
+                "folded float equality for {a:?} and {b:?}"
+            );
+            assert_eq!(
+                fold_binary_consts(BinOp::Ne, &Constant::Float(a), &Constant::Float(b)),
+                Some(mir::RValue::Const(Constant::Bool(!equal))),
+                "folded float inequality for {a:?} and {b:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_fold_const_mul_add() {
         // `1 + 2 * 3` folds to 7; neither opcode survives.
         let value = run_source("1 + 2 * 3").unwrap();
