@@ -5132,6 +5132,56 @@ mod tests {
     }
 
     #[test]
+    fn closed_variant_rejects_unknown_constructor() {
+        let mut tc = TypeChecker::new();
+        let expr = option_match(vec![
+            (Pattern::Variant("Missing".to_string(), None), None, int_lit(1)),
+            (some_wild(), None, int_lit(2)),
+            (none(), None, int_lit(3)),
+        ]);
+        let result = tc.infer_expr(&option_ctx(), &expr);
+        assert!(
+            matches!(result, Err(NuError::TypeError { msg, .. }) if msg.contains("Missing")),
+            "an unknown constructor must fail even if other arms cover the type"
+        );
+    }
+
+    #[test]
+    fn closed_variant_rejects_missing_payload_pattern() {
+        let mut tc = TypeChecker::new();
+        let expr = option_match(vec![
+            (Pattern::Variant("Some".to_string(), None), None, int_lit(1)),
+            (none(), None, int_lit(0)),
+        ]);
+        let result = tc.infer_expr(&option_ctx(), &expr);
+        assert!(
+            matches!(result, Err(NuError::TypeError { msg, .. }) if msg.contains("Some")),
+            "a payload constructor requires a payload pattern"
+        );
+    }
+
+    #[test]
+    fn closed_variant_rejects_payload_on_nullary_constructor() {
+        let mut tc = TypeChecker::new();
+        let expr = option_match(vec![
+            (
+                Pattern::Variant(
+                    "None".to_string(),
+                    Some(Box::new(Pattern::Var("unexpected".to_string()))),
+                ),
+                None,
+                int_lit(0),
+            ),
+            (some_wild(), None, int_lit(1)),
+        ]);
+        let result = tc.infer_expr(&option_ctx(), &expr);
+        assert!(
+            matches!(result, Err(NuError::TypeError { msg, .. }) if msg.contains("None")),
+            "a nullary constructor cannot bind a payload"
+        );
+    }
+
+    #[test]
     fn closed_variant_nonvariant_match_unchanged() {
         let mut tc = TypeChecker::new();
         let expr = Expr::Match {
