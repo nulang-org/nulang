@@ -997,10 +997,7 @@ fn test_supervisor_rekey_write_failure_retains_checkpoint_and_aborts_restart() {
         .load_snapshot(child_id)
         .expect("failed re-key must not delete the last durable checkpoint");
     assert_eq!(preserved.sequence, 7);
-    assert_eq!(
-        preserved.state.get("count"),
-        Some(&PersistedValue::Int(42))
-    );
+    assert_eq!(preserved.state.get("count"), Some(&PersistedValue::Int(42)));
     assert!(
         !rt.actors.values().any(|actor| actor.parent == Some(supervisor_id)),
         "a replacement must not become runnable when its checkpoint failed"
