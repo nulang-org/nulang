@@ -1076,6 +1076,8 @@ pub struct TypeChecker {
     pub collect_errors: bool,
     /// Errors collected when `collect_errors` is set (empty otherwise).
     pub collected_errors: Vec<crate::types::NuError>,
+    /// Non-fatal semantic warnings such as conservative finite match coverage.
+    pub warnings: Vec<crate::types::NuWarning>,
 }
 
 /// Pre-computed class and instance tables extracted from an AST module.
@@ -1157,6 +1159,7 @@ impl TypeChecker {
             rigid_vars: FxHashSet::default(),
             collect_errors: false,
             collected_errors: Vec::new(),
+            warnings: Vec::new(),
         }
     }
 
@@ -3400,6 +3403,14 @@ impl TypeChecker {
             final_subst = compose_subst(&s, &final_subst);
         }
 
+        // Reuse the inferred, fully substituted type so diagnostics match the
+        // compiler's actual accepted meaning, not a syntax-only guess.
+        let resolved_scrutinee = apply_subst(&scrut_ty, &final_subst);
+        self.warnings.extend(crate::match_coverage::check_coverage(
+            &resolved_scrutinee,
+            arms,
+            span,
+        ));
         Ok((final_subst.clone(), apply_subst(&first_arm, &final_subst)))
     }
 
