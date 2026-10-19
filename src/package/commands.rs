@@ -873,11 +873,11 @@ fn prepare_package_with_lock_mode(locked: bool) -> NuResult<PathBuf> {
             }
             let previous = existing.package_identity(
                 &package.name, &package.version, &package.source
-            ).and_then(|entry| entry.parsed_source_id().transpose()).transpose()?;
+            ).map(|entry| entry.parsed_source_id()).transpose()?.flatten();
             let current = canonical.package_identity(
                 &package.name, &package.version, &package.source
-            ).and_then(|entry| entry.parsed_source_id().transpose()).transpose()?;
-            if previous.flatten().is_none() || previous != current {
+            ).map(|entry| entry.parsed_source_id()).transpose()?.flatten();
+            if previous.is_none() || previous != current {
                 return Err(NuError::PackageError {
                     msg: format!(
                         "{} is out of date: local dependency '{}' lacks a matching strong source identity",
