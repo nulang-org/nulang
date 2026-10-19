@@ -517,6 +517,7 @@ pub fn inject_client_runtime_script(html: &str) -> String {
     if !html.contains("data-signal=")
         && !html.contains("data-action=")
         && !html.contains("data-nulang-bind=")
+        && !html.contains("data-nulang-bind-")
     {
         return html.to_string();
     }
