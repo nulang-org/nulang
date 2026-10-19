@@ -60,6 +60,8 @@ native-codegen = [
 mobile-runtime = []
 # Enables the standalone Savina-style actor benchmark runner without pulling optional subsystems.
 savina-bench = []
+# Opt-in Criterion numeric workloads; keep the default CI benchmark duration unchanged.
+numeric-bench = []
 python = ["dep:pyo3"]
 sqlite = ["dep:libsql", "dep:tokio"]
 lsp = ["dep:tower-lsp", "dep:tokio", "dep:futures", "dep:tower-service"]
