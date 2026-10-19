@@ -4995,6 +4995,27 @@ mod tests {
     }
 
     #[test]
+    fn test_tuple_arity_error_exposes_structured_expected_and_found() {
+        let mut tc = TypeChecker::new();
+        let expr = Expr::Match {
+            scrutinee: Box::new(tuple(vec![int_lit(1), int_lit(2)])),
+            arms: vec![(Pattern::Tuple(vec![Pattern::Wild]), None, int_lit(0))],
+            span: sp(),
+        };
+        match tc.infer_expr(&TypeContext::new(), &expr) {
+            Err(NuError::TypeError {
+                expected_type: Some(expected),
+                found_type: Some(found),
+                ..
+            }) => {
+                assert!(expected.contains('2'), "unexpected type: {}", expected);
+                assert!(found.contains('1'), "unexpected type: {}", found);
+            }
+            other => panic!("expected a structured tuple mismatch, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_match_accepts_tuple_pattern_of_exact_arity() {
         let mut tc = TypeChecker::new();
         let expr = Expr::Match {
