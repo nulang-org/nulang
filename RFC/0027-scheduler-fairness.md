@@ -1,12 +1,12 @@
 # RFC 0027: Weighted-Fair Actor Priority Scheduling
 
-- **Status:** Draft — policy primitive implemented
+- **Status:** Draft — experimental, opt-in scheduler integration; no production default change
 - **Tier:** Experimental
 - **Created:** 2026-09-16
 
 ## Summary
 
-Nulang's current actor scheduler probes priority bands in strict order on every dequeue:
+Nulang's production actor scheduler probes priority bands in strict order on every dequeue:
 
 ```text
 High -> Normal -> Low
@@ -14,7 +14,7 @@ High -> Normal -> Low
 
 That is simple and minimizes High-priority latency, but a continuously non-empty High queue can starve Normal and Low work indefinitely.
 
-This RFC introduces a deterministic weighted service policy. The default cycle is:
+This RFC introduces a deterministic weighted service policy. The *proposed fair configuration*, which is not Nulang's runtime default, is:
 
 ```text
 High:   8 preferred turns
@@ -64,7 +64,7 @@ This is a service-opportunity bound, not a wall-clock latency bound. Actor turn 
 
 ## System-message priority is separate
 
-Mailbox `System` messages already bypass application mailbox capacity and are processed ahead of normal mailbox traffic. This RFC concerns **actor scheduling priority** (`High`, `Normal`, `Low`), not supervisor/system-message ordering inside an actor mailbox.
+Mailbox `System` messages bypass bounded admission, and the priority-lane contract requires system traffic ahead of ordinary application traffic. Separate mailbox credit-accounting corrections are under review; this proposal does not change their behavior. This RFC concerns **actor scheduling priority** (`High`, `Normal`, `Low`), not supervisor/system-message ordering inside an actor mailbox.
 
 Therefore weighted actor scheduling does not weaken supervision signal priority.
 
@@ -80,19 +80,20 @@ Normal and Low remain fallback bands when High is empty, but receive no preferre
 
 This allows benchmark/regression comparisons and an opt-out for workloads that explicitly require strict actor priority.
 
-## Integration plan
+## Integration plan and current scope
 
-1. Keep `FairPriorityPolicy` independent of Chase-Lev queues and benchmark it first.
-2. Add one policy instance per scheduler owner/worker or shard.
-3. Replace hard-coded `[High, Normal, Low]` probe arrays in `next_task`, `next_owner_task`, and `steal_one` with the policy's per-turn order.
-4. Ensure one logical dequeue attempt advances the wheel once; retries inside a queue steal operation must not advance policy state.
-5. Add saturated-queue tests showing Normal and Low make progress while High remains dominant.
-6. Add benchmarks for throughput, p50/p99 High latency, queue residence time, steal behavior, and cache effects.
-7. Expose fairness weights and per-band service counters through actor/scheduler introspection.
+1. The policy primitive is independent of Chase-Lev queues and has deterministic tests.
+2. `Scheduler::new(worker_count)` **remains strict priority**. An embedding Rust caller can select the opt-in `Scheduler::new_with_fair_priority(worker_count, weights)` constructor, which validates nonzero weights.
+3. `next_task`, `dequeue` (owner path), and `steal_one` obtain a single atomic turn ticket per attempt. Each turn uses the pure policy lookup. A retry inside a queue's steal operation does not consume another ticket.
+4. Scheduler-level saturated-queue tests exercise the owner, generic worker, and steal paths. These are compile-time tests awaiting exact-head CI, **not yet passing performance evidence**.
+5. **Before making any runtime default change:** measure throughput, High-priority p50/p99 latency, queue residence time, multi-worker contention/steal behavior, and scheduling overhead on the exact head. Use same-runner strict-vs-fair comparison and test both large and small actor turns.
+6. Expose fairness weights and per-band service counters through introspection only if the policy is adopted.
+
+The global atomic turn ticket coordinates logical attempts on a shared scheduler, not per-actor execution completion. Under concurrency, a reserved preferred slot is an opportunity, not a guarantee of dispatch timing or a wall-clock bound.
 
 ## Operational defaults
 
-The proposed initial default is `8:4:1`. It is intentionally conservative and should be treated as benchmark-tunable rather than language semantics.
+The proposed fair-mode starting weights are `8:4:1`; the deployed default remains **strict High-first** pending performance and semantics validation. The proposed weights are benchmark-tunable, not language semantics.
 
 The language should not expose these exact weights as source-level semantics. They are runtime scheduling policy.
 
