@@ -834,7 +834,11 @@ fn main() {
                 } else {
                     nulang::json_diagnostics::diagnostics_from_error(&e)
                 };
-                diags.extend(check_warnings.iter().map(nulang::json_diagnostics::diagnostic_from_warning));
+                diags.extend(
+                    check_warnings
+                        .iter()
+                        .map(nulang::json_diagnostics::diagnostic_from_warning),
+                );
                 let report =
                     nulang::json_diagnostics::JsonReport::new("check", Some(path.clone()), diags);
                 print!("{}", report.to_json_string());
