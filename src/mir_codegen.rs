@@ -1629,8 +1629,8 @@ pub(crate) fn float_locals(func: &mir::Function) -> Vec<bool> {
 //
 // Everything here is semantics-preserving with respect to the bytecode VM.
 // Notable VM quirks the folding accounts for:
-//   - float Eq/Ne is NOT folded: the VM's ICmpEq/FCmpEq use epsilon
-//     equality (|a-b| < f64::EPSILON), not exact ==;
+//   - float Eq/Ne uses the VM's epsilon equality
+//     (|a-b| < f64::EPSILON), not exact ==;
 //   - identity/zero-propagation rules are skipped when the non-const
 //     operand is a float local: the VM's F* handlers coerce the int
 //     constant to a float, and IEEE semantics differ at ±0.0/NaN
@@ -1794,8 +1794,8 @@ fn fold_rvalue(
 }
 
 /// Constant-fold `Const op Const` per the VM's integer/float handler
-/// semantics. Returns None when no rule applies (mixed int/float, float
-/// Eq/Ne — the VM uses epsilon equality there — nil comparisons, ...).
+/// semantics. Returns None when no rule applies (mixed int/float,
+/// unsupported nil comparisons, ...).
 fn fold_binary_consts(bop: crate::ast::BinOp, a: &Constant, b: &Constant) -> Option<mir::RValue> {
     use crate::ast::BinOp;
     use mir::RValue;
@@ -1827,10 +1827,15 @@ fn fold_binary_consts(bop: crate::ast::BinOp, a: &Constant, b: &Constant) -> Opt
         (BinOp::Le, Int(x), Int(y)) => RValue::Const(Bool(x <= y)),
         (BinOp::Gt, Int(x), Int(y)) => RValue::Const(Bool(x > y)),
         (BinOp::Ge, Int(x), Int(y)) => RValue::Const(Bool(x >= y)),
-        // -- Float comparisons: Lt/Le/Gt/Ge are standard in both the
-        //    ICmp*/FCmp* handlers and the caller's Le/Ge expansion.
-        //    Eq/Ne are deliberately excluded (epsilon equality) —
-        //    the plan's contingency for a semantic mismatch. --
+        // -- Float comparisons: Eq/Ne follow the VM's absolute-epsilon
+        //    equality, including NaN/infinity behavior (NaN compares false).
+        //    Negation, not >=, is essential for NaN inequality. --
+        (BinOp::Eq, Float(x), Float(y)) => {
+            RValue::Const(Bool((*x - *y).abs() < f64::EPSILON))
+        }
+        (BinOp::Ne, Float(x), Float(y)) => {
+            RValue::Const(Bool(!((*x - *y).abs() < f64::EPSILON)))
+        }
         (BinOp::Lt, Float(x), Float(y)) => RValue::Const(Bool(x < y)),
         (BinOp::Le, Float(x), Float(y)) => RValue::Const(Bool(x <= y)),
         (BinOp::Gt, Float(x), Float(y)) => RValue::Const(Bool(x > y)),
