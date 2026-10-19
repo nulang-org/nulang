@@ -35,7 +35,11 @@ fn assert_output(output: Output, expected: &str) {
         output.status.success(),
         "Nulang source-to-actor Python smoke failed: stdout={stdout:?}; stderr={stderr:?}"
     );
-    assert_eq!(stdout.trim(), expected, "unexpected Nulang stdout; stderr={stderr}");
+    assert_eq!(
+        stdout.trim(),
+        expected,
+        "unexpected Nulang stdout; stderr={stderr}"
+    );
 }
 
 #[test]
