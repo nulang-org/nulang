@@ -1674,4 +1674,48 @@ mod tests {
             runtime2.free_object(obj_b2);
         }
     }
+
+    /// A pinned object cannot be collected even when only a cyclic foreign
+    /// edge accounts for its ordinary reference counts.
+    #[test]
+    fn test_pinned_cycle_never_reclaimed() {
+        let mut detector = CycleDetector::new();
+        let mut runtime = MockRuntime::new();
+        let pinned = runtime.create_object(1, 0, 1);
+        let other = runtime.create_object(2, 0, 1);
+        unsafe { (*pinned).sticky = true };
+        detector.register_foreign_ref(1, pinned, 2, other);
+        detector.register_foreign_ref(2, other, 1, pinned);
+
+        detector.detect_cycles(&mut runtime);
+        assert_eq!(detector.stats(), (0, 0));
+        unsafe {
+            assert_eq!((*pinned).foreign_count, 1);
+            assert_eq!((*other).foreign_count, 1);
+            runtime.free_object(pinned);
+            runtime.free_object(other);
+        }
+    }
+
+    /// Graph entries do not themselves prove a matching foreign reference
+    /// credit exists: never trial-decrement a zero counter in release builds.
+    #[test]
+    fn test_inconsistent_cycle_edge_cannot_underflow_credit() {
+        let mut detector = CycleDetector::new();
+        let mut runtime = MockRuntime::new();
+        let a = runtime.create_object(1, 1, 0);
+        let b = runtime.create_object(2, 1, 0);
+        detector.register_foreign_ref(1, a, 2, b);
+        detector.register_foreign_ref(2, b, 1, a);
+
+        detector.detect_cycles(&mut runtime);
+        assert_eq!(detector.stats(), (0, 0));
+        unsafe {
+            assert_eq!((*a).foreign_count, 0);
+            assert_eq!((*b).foreign_count, 0);
+            runtime.free_object(a);
+            runtime.free_object(b);
+        }
+    }
+
 }
