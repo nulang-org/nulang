@@ -86,9 +86,9 @@ Run the pair on the **same pinned CPU**, using the same commit, build profile,
 repetition count and warm-up policy:
 
 ```bash
-cargo run --locked --release --no-default-features --features native-codegen \\
+cargo run --locked --release --no-default-features --features native-codegen \
   --bin nulang-jit-bench -- --workload concrete_identity_call_loop --format jsonl --repeat 8
-cargo run --locked --release --no-default-features --features native-codegen \\
+cargo run --locked --release --no-default-features --features native-codegen \
   --bin nulang-jit-bench -- --workload generic_identity_call_loop --format jsonl --repeat 8
 ```
 
