@@ -156,127 +156,21 @@ impl TimerWheel {
         }
     }
 
-    /// Schedule a message to be sent to an actor after a delay.
-    ///
-    /// Returns the `TimerId` which can be used to cancel the timer.
-    pub fn send_after(
+    /// Schedule a timer at the supplied logical instant. Production callers
+    /// can use wall time; Runtime callers pass Runtime::now() so deterministic
+    /// execution never mixes the virtual clock with Instant::now().
+    fn schedule_message_at(
         &self,
+        now: Instant,
         delay: Duration,
         target_actor: u64,
-        behavior_id: u16,
-        payload: Vec<Value>,
-    ) -> TimerId {
-        self.send_after_with_context(delay, target_actor, behavior_id, payload, String::new())
-    }
-
-    /// Schedule a message to be sent to an actor after a delay, carrying an
-    /// opaque context string through to the fire handler.
-    ///
-    /// Returns the `TimerId` which can be used to cancel the timer.
-    pub fn send_after_with_context(
-        &self,
-        delay: Duration,
-        target_actor: u64,
-        behavior_id: u16,
-        payload: Vec<Value>,
-        context: String,
+        message: TimerMessage,
     ) -> TimerId {
         let id = TimerId(self.next_id.fetch_add(1, Ordering::SeqCst));
-        let fire_at = Instant::now() + delay;
-
         let entry = TimerEntry {
             id,
             target_actor,
-            message: TimerMessage::SendWithContext {
-                behavior_id,
-                payload,
-                context,
-            },
-            fire_at,
-            cancelled: AtomicBool::new(false),
-        };
-
-        if let Ok(mut timers) = self.timers.write() {
-            timers.push(entry);
-        }
-
-        id
-    }
-
-    /// Schedule an actor exit after a delay.
-    pub fn exit_after(&self, delay: Duration, target_actor: u64, reason: String) -> TimerId {
-        let id = TimerId(self.next_id.fetch_add(1, Ordering::SeqCst));
-        let fire_at = Instant::now() + delay;
-
-        let entry = TimerEntry {
-            id,
-            target_actor,
-            message: TimerMessage::Exit { reason },
-            fire_at,
-            cancelled: AtomicBool::new(false),
-        };
-
-        if let Ok(mut timers) = self.timers.write() {
-            timers.push(entry);
-        }
-
-        id
-    }
-
-    /// Schedule an unconditional kill after a delay.
-    pub fn kill_after(&self, delay: Duration, target_actor: u64) -> TimerId {
-        let id = TimerId(self.next_id.fetch_add(1, Ordering::SeqCst));
-        let fire_at = Instant::now() + delay;
-
-        let entry = TimerEntry {
-            id,
-            target_actor,
-            message: TimerMessage::Kill,
-            fire_at,
-            cancelled: AtomicBool::new(false),
-        };
-
-        if let Ok(mut timers) = self.timers.write() {
-            timers.push(entry);
-        }
-
-        id
-    }
-
-    /// Schedule a receive-wait timeout for an actor suspended in a timed
-    /// selective receive. On fire the runtime marks the actor's wait as
-    /// timed out and resumes it; the re-executed `ReceiveWait` then resolves
-    /// with the no-match sentinel.
-    pub fn receive_wait_timeout(&self, delay: Duration, target_actor: u64) -> TimerId {
-        let id = TimerId(self.next_id.fetch_add(1, Ordering::SeqCst));
-        let fire_at = Instant::now() + delay;
-
-        let entry = TimerEntry {
-            id,
-            target_actor,
-            message: TimerMessage::ReceiveWaitTimeout,
-            fire_at,
-            cancelled: AtomicBool::new(false),
-        };
-
-        if let Ok(mut timers) = self.timers.write() {
-            timers.push(entry);
-        }
-
-        id
-    }
-
-    /// Schedule a `TimerSleepWake` message relative to `now`, resuming an
-    /// actor suspended on `Timer.sleep`.
-    ///
-    /// The caller supplies `now` so a `Runtime` with a virtual clock never
-    /// mixes its logical time with wall-clock `Instant::now()`.
-    pub fn timer_sleep_wake_at(&self, now: Instant, delay: Duration, target_actor: u64) -> TimerId {
-        let id = TimerId(self.next_id.fetch_add(1, Ordering::SeqCst));
-        let entry = TimerEntry {
-            id,
-            target_actor,
-            message: TimerMessage::TimerSleepWake,
+            message,
             fire_at: now + delay,
             cancelled: AtomicBool::new(false),
         };
@@ -286,25 +180,140 @@ impl TimerWheel {
         id
     }
 
-    /// Schedule an LLM retry for an actor after a delay. On fire the
-    /// runtime re-builds and re-dispatches the in-flight request.
-    pub fn schedule_llm_retry(&self, delay: Duration, target_actor: u64) -> TimerId {
-        let id = TimerId(self.next_id.fetch_add(1, Ordering::SeqCst));
-        let fire_at = Instant::now() + delay;
+    /// Schedule a message to be sent to an actor after a delay.
+    ///
+    /// Returns the TimerId which can be used to cancel the timer.
+    pub fn send_after(
+        &self,
+        delay: Duration,
+        target_actor: u64,
+        behavior_id: u16,
+        payload: Vec<Value>,
+    ) -> TimerId {
+        self.send_after_at(Instant::now(), delay, target_actor, behavior_id, payload)
+    }
 
-        let entry = TimerEntry {
-            id,
+    /// Schedule an actor message relative to a specified logical instant.
+    pub fn send_after_at(
+        &self,
+        now: Instant,
+        delay: Duration,
+        target_actor: u64,
+        behavior_id: u16,
+        payload: Vec<Value>,
+    ) -> TimerId {
+        self.send_after_with_context_at(
+            now,
+            delay,
             target_actor,
-            message: TimerMessage::LlmRetry,
-            fire_at,
-            cancelled: AtomicBool::new(false),
-        };
+            behavior_id,
+            payload,
+            String::new(),
+        )
+    }
 
-        if let Ok(mut timers) = self.timers.write() {
-            timers.push(entry);
-        }
+    /// Schedule a message to be sent to an actor after a delay, carrying an
+    /// opaque context string through to the fire handler.
+    pub fn send_after_with_context(
+        &self,
+        delay: Duration,
+        target_actor: u64,
+        behavior_id: u16,
+        payload: Vec<Value>,
+        context: String,
+    ) -> TimerId {
+        self.send_after_with_context_at(
+            Instant::now(),
+            delay,
+            target_actor,
+            behavior_id,
+            payload,
+            context,
+        )
+    }
 
-        id
+    /// Schedule a contextual actor message at the supplied logical instant.
+    pub fn send_after_with_context_at(
+        &self,
+        now: Instant,
+        delay: Duration,
+        target_actor: u64,
+        behavior_id: u16,
+        payload: Vec<Value>,
+        context: String,
+    ) -> TimerId {
+        self.schedule_message_at(
+            now,
+            delay,
+            target_actor,
+            TimerMessage::SendWithContext {
+                behavior_id,
+                payload,
+                context,
+            },
+        )
+    }
+
+    /// Schedule an actor exit after a delay.
+    pub fn exit_after(&self, delay: Duration, target_actor: u64, reason: String) -> TimerId {
+        self.exit_after_at(Instant::now(), delay, target_actor, reason)
+    }
+
+    /// Schedule an actor exit at the supplied logical instant.
+    pub fn exit_after_at(
+        &self,
+        now: Instant,
+        delay: Duration,
+        target_actor: u64,
+        reason: String,
+    ) -> TimerId {
+        self.schedule_message_at(now, delay, target_actor, TimerMessage::Exit { reason })
+    }
+
+    /// Schedule an unconditional kill after a delay.
+    pub fn kill_after(&self, delay: Duration, target_actor: u64) -> TimerId {
+        self.kill_after_at(Instant::now(), delay, target_actor)
+    }
+
+    /// Schedule an unconditional kill at the supplied logical instant.
+    pub fn kill_after_at(&self, now: Instant, delay: Duration, target_actor: u64) -> TimerId {
+        self.schedule_message_at(now, delay, target_actor, TimerMessage::Kill)
+    }
+
+    /// Schedule a receive-wait timeout for an actor suspended in a timed
+    /// selective receive. The runtime marks the wait timed out on fire.
+    pub fn receive_wait_timeout(&self, delay: Duration, target_actor: u64) -> TimerId {
+        self.receive_wait_timeout_at(Instant::now(), delay, target_actor)
+    }
+
+    /// Schedule a receive-wait timeout relative to the runtime's logical time.
+    pub fn receive_wait_timeout_at(
+        &self,
+        now: Instant,
+        delay: Duration,
+        target_actor: u64,
+    ) -> TimerId {
+        self.schedule_message_at(now, delay, target_actor, TimerMessage::ReceiveWaitTimeout)
+    }
+
+    /// Schedule a Timer.sleep wake using the runtime's logical clock.
+    pub fn timer_sleep_wake_at(&self, now: Instant, delay: Duration, target_actor: u64) -> TimerId {
+        self.schedule_message_at(now, delay, target_actor, TimerMessage::TimerSleepWake)
+    }
+
+    /// Schedule an LLM retry after a delay.
+    pub fn schedule_llm_retry(&self, delay: Duration, target_actor: u64) -> TimerId {
+        self.schedule_llm_retry_at(Instant::now(), delay, target_actor)
+    }
+
+    /// Schedule an LLM retry relative to the runtime's logical time.
+    pub fn schedule_llm_retry_at(
+        &self,
+        now: Instant,
+        delay: Duration,
+        target_actor: u64,
+    ) -> TimerId {
+        self.schedule_message_at(now, delay, target_actor, TimerMessage::LlmRetry)
     }
 
     /// Cancel a timer by its id.
@@ -328,25 +337,26 @@ impl TimerWheel {
         false
     }
 
-    /// Get the remaining time for a timer.
-    ///
-    /// Returns `None` if the timer is not found or has already fired.
+    /// Get remaining time using the wall clock for standalone TimerWheel use.
+    /// Runtime callers with virtual time should use remaining_at().
     pub fn remaining(&self, timer_id: TimerId) -> Option<Duration> {
+        self.remaining_at(timer_id, Instant::now())
+    }
+
+    /// Get remaining time relative to an explicit logical instant.
+    ///
+    /// Returns None if the timer is not found, cancelled, or has fired and
+    /// already been removed. An expired but uncollected timer returns zero.
+    pub fn remaining_at(&self, timer_id: TimerId, now: Instant) -> Option<Duration> {
         let timers = match self.timers.read() {
             Ok(t) => t,
             Err(_) => return None,
         };
-
         for entry in timers.iter() {
             if entry.id == timer_id && !entry.cancelled.load(Ordering::SeqCst) {
-                let now = Instant::now();
-                if entry.fire_at > now {
-                    return Some(entry.fire_at - now);
-                }
-                return Some(Duration::ZERO);
+                return Some(entry.fire_at.saturating_duration_since(now));
             }
         }
-
         None
     }
 
