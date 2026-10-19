@@ -1823,7 +1823,8 @@ impl NulangLanguageServer {
         };
 
         // Parse
-        let ast = match Parser::new(tokens).parse_module() {
+        let mut parser = Parser::new(tokens);
+        let ast = match parser.parse_module() {
             Ok(a) => a,
             Err(e) => {
                 diagnostics.extend(nu_error_to_diagnostic(e));
@@ -1836,6 +1837,15 @@ impl NulangLanguageServer {
                 };
             }
         };
+
+        // Parser warnings (including RFC 0015 deprecations) must not vanish
+        // in the editor; preserve the same codes the CLI already emits.
+        diagnostics.extend(
+            parser
+                .take_warnings()
+                .iter()
+                .map(|warning| warning_to_lsp_diagnostic(warning, source)),
+        );
 
         // Type check — collect all errors so we surface every problem,
         // not just the first. Downstream effect/capability checks still
@@ -2346,6 +2356,46 @@ impl NulangLanguageServer {
         }
         doc_lines.reverse();
         Some(doc_lines.join("\n"))
+    }
+}
+
+/// Map a parser warning to LSP's UTF-16 coordinates, using the current
+/// document's source rather than a thread-local source map.
+fn warning_to_lsp_diagnostic(warning: &crate::types::NuWarning, source: &str) -> Diagnostic {
+    fn position_at(source: &str, byte_offset: u32) -> Position {
+        let mut offset = (byte_offset as usize).min(source.len());
+        while !source.is_char_boundary(offset) {
+            offset -= 1;
+        }
+        let prefix = &source[..offset];
+        let line = prefix.as_bytes().iter().filter(|&&byte| byte == b'\n').count();
+        let column = prefix
+            .rsplit('\n')
+            .next()
+            .unwrap_or("")
+            .encode_utf16()
+            .count();
+        Position::new(line as u32, column as u32)
+    }
+
+    let message = match &warning.help {
+        Some(help) => format!("{}\nHelp: {}", warning.msg, help),
+        None => warning.msg.clone(),
+    };
+
+    Diagnostic {
+        range: Range::new(
+            position_at(source, warning.span.start),
+            position_at(source, warning.span.end),
+        ),
+        severity: Some(DiagnosticSeverity::WARNING),
+        code: Some(NumberOrString::String(warning.code.to_string())),
+        code_description: None,
+        source: Some("nulang".to_string()),
+        message,
+        related_information: None,
+        tags: None,
+        data: None,
     }
 }
 
