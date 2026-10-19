@@ -4,6 +4,101 @@
 //! synchronously on isolated VM instances. This is not parallel par lowering,
 //! a cooperative VM instruction scheduler, or a production worker runtime.
 
+use std::collections::HashMap;
+
+use crate::bytecode::{CodeModule, Constant, Instruction, OpCode};
+use crate::core_vm::CoreVM;
+use crate::scoped_task_reference::{ReferenceExecutor, TaskPoll, TickStats};
+use crate::scoped_tasks::{CancellationCause, TaskId, TaskOutcome};
+use crate::value_layout;
+
+/// Test-only adapter: runs each admitted pure bytecode task to completion
+/// in an isolated CoreVM, on the caller's thread. It cannot preempt the VM.
+struct CoreVmTaskHost {
+    executor: ReferenceExecutor<i64, String>,
+    modules: HashMap<TaskId, CodeModule>,
+    deferred_once: Option<TaskId>,
+    executed: Vec<TaskId>,
+}
+
+impl CoreVmTaskHost {
+    fn new(max_in_flight: usize, max_pending: usize) -> Self {
+        Self {
+            executor: ReferenceExecutor::new(max_in_flight, max_pending)
+                .expect("positive test limits"),
+            modules: HashMap::new(),
+            deferred_once: None,
+            executed: Vec::new(),
+        }
+    }
+
+    fn submit_add(&mut self, left: i64, right: i64) -> TaskId {
+        // Deliberately use a small, known-pure CoreVM instruction sequence.
+        // No actor state, effect handlers, callbacks, or FFI cross this seam.
+        let mut module = CodeModule::new("scoped_test_add");
+        module.constants.push(Constant::Int(left));
+        module.constants.push(Constant::Int(right));
+        module.emit(Instruction::new3(OpCode::ConstU, 0, 0, 0));
+        module.emit(Instruction::new3(OpCode::ConstU, 0, 1, 1));
+        module.emit(Instruction::new3(OpCode::IAdd, 0, 1, 0));
+        module.emit(Instruction::new0(OpCode::Halt));
+
+        let id = self.executor.try_submit().expect("within test queue capacity");
+        self.modules.insert(id, module);
+        id
+    }
+
+    fn defer_once(&mut self, id: TaskId) {
+        self.deferred_once = Some(id);
+    }
+
+    fn tick(&mut self) -> TickStats {
+        let modules = &self.modules;
+        let deferred_once = &mut self.deferred_once;
+        let executed = &mut self.executed;
+        self.executor.tick(|id, token| {
+            // Cancellation can prevent execution only before starting a
+            // non-preemptible CoreVM call, not interrupt one already running.
+            if token.is_cancelled() {
+                return TaskPoll::Cancelled;
+            }
+            if *deferred_once == Some(id) {
+                *deferred_once = None;
+                return TaskPoll::Pending;
+            }
+
+            let module = modules.get(&id).expect("every admitted task has bytecode");
+            let mut vm = CoreVM::new();
+            let result = vm
+                .load_module_from_code(module)
+                .and_then(|idx| vm.run(idx, module.entry_point.unwrap_or(0)))
+                .and_then(|value| {
+                    if value_layout::is_int_raw(value) {
+                        Ok(value_layout::as_int_raw(value))
+                    } else {
+                        Err("expected an integer CoreVM result".to_string())
+                    }
+                });
+            executed.push(id);
+            TaskPoll::Ready(result)
+        })
+    }
+
+    fn cancel(&mut self, reason: CancellationCause) {
+        self.executor.cancel(reason);
+    }
+
+    fn executed(&self) -> &[TaskId] {
+        &self.executed
+    }
+
+    fn into_outcomes(self) -> Vec<TaskOutcome<i64, String>> {
+        self.executor
+            .into_outcomes()
+            .expect("all test tasks reached a terminal outcome")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
