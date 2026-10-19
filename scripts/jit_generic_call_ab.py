@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import subprocess
 from pathlib import Path
@@ -59,13 +60,68 @@ def parse_single_record(stdout: str, workload: str) -> dict:
     return validate_record(record, workload)
 
 
-def run_benchmark(workload: str) -> dict:
+def find_benchmark_executable(stdout: str) -> Path:
+    """Use Cargo's build messages, never assume a hard-coded target dir."""
+    executable = None
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if (event.get("reason") == "compiler-artifact"
+                and event.get("target", {}).get("name") == "nulang-jit-bench"):
+            if event.get("executable"):
+                executable = Path(event["executable"])
+    if executable is None:
+        raise ValueError("Cargo build emitted no nulang-jit-bench executable")
+    return executable
+
+
+def build_benchmark() -> Path:
+    """Compile once without CPU pinning; avoid Cargo invocations between pairs."""
     command = [
-        "cargo", "run", "--locked", "--release", "--no-default-features",
-        "--features", "native-codegen", "--bin", "nulang-jit-bench", "--",
-        "--workload", workload, "--format", "jsonl", "--repeat", "1",
+        "cargo", "build", "--locked", "--release", "--no-default-features",
+        "--features", "native-codegen", "--bin", "nulang-jit-bench",
+        "--message-format=json",
     ]
     process = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, check=False)
+    if process.returncode != 0:
+        raise RuntimeError(
+            f"benchmark build failed with exit {process.returncode}:\n{process.stderr[-4000:]}"
+        )
+    executable = find_benchmark_executable(process.stdout)
+    if not executable.is_file():
+        raise RuntimeError(f"Cargo-reported benchmark executable missing: {executable}")
+    return executable
+
+
+def select_affinity(mode: str, available: set[int]) -> set[int] | None:
+    if mode == "host":
+        return None
+    if mode != "single":
+        raise ValueError(f"unknown CPU mode: {mode}")
+    if not available:
+        raise ValueError("empty CPU affinity set")
+    return {min(available)}
+
+
+def measurement_affinity(mode: str) -> set[int] | None:
+    if mode == "host":
+        return None
+    if not hasattr(os, "sched_getaffinity") or not hasattr(os, "sched_setaffinity"):
+        raise ValueError("single CPU mode requires Linux CPU affinity support")
+    return select_affinity(mode, os.sched_getaffinity(0))
+
+
+def run_benchmark(workload: str, executable: Path, affinity: set[int] | None) -> dict:
+    command = [str(executable), "--workload", workload, "--format", "jsonl", "--repeat", "1"]
+    # Apply pinning only to the measured process, not the parallel Cargo build.
+    pin = None if affinity is None else lambda: os.sched_setaffinity(0, affinity)
+    process = subprocess.run(
+        command, cwd=ROOT, capture_output=True, text=True, check=False, preexec_fn=pin
+    )
     if process.returncode != 0:
         raise RuntimeError(
             f"benchmark {workload} failed with exit {process.returncode}:\n"
@@ -127,10 +183,17 @@ def measure_pairs(rounds: int, runner: Callable[[str], dict]) -> tuple[dict, lis
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rounds", type=int, default=8)
+    parser.add_argument("--cpu-mode", choices=("single", "host"), default="single")
     parser.add_argument("--output", type=Path, default=Path("jit-generic-call-ab.json"))
     args = parser.parse_args()
     try:
-        summary, samples = measure_pairs(args.rounds, run_benchmark)
+        affinity = measurement_affinity(args.cpu_mode)
+        executable = build_benchmark()
+        summary, samples = measure_pairs(
+            args.rounds, lambda workload: run_benchmark(workload, executable, affinity)
+        )
+        summary["cpu_mode"] = args.cpu_mode
+        summary["measured_cpu_affinity"] = sorted(affinity) if affinity is not None else None
     except (ValueError, RuntimeError, OSError) as exc:
         parser.error(str(exc))
     report = {"summary": summary, "samples": samples}
