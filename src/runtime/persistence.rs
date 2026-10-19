@@ -2191,6 +2191,155 @@ impl PersistenceStore for LibsqlStore {
         })
     }
 
+    fn rekey_actor_history(&mut self, from: u64, to: u64) -> io::Result<()> {
+        if from == to {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "actor history relocation requires distinct actor IDs",
+            ));
+        }
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let tx = conn
+                .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+            // Check the source inside the same write transaction as the move.
+            // JSON "null" is the representation for absent optional CRDT data.
+            {
+                let mut rows = tx
+                    .query(
+                        "SELECT crdt_snapshot, crdt_field_map FROM snapshots WHERE actor_id = ?1",
+                        libsql::params![from as i64],
+                    )
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                let row = rows
+                    .next()
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotFound, "actor snapshot to relocate not found")
+                    })?;
+                let crdt_snapshot: Option<String> = row
+                    .get(0)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                let crdt_field_map: Option<String> = row
+                    .get(1)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                if crdt_snapshot.as_deref().is_some_and(|s| s != "null")
+                    || crdt_field_map.as_deref().is_some_and(|s| s != "null")
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "CRDT state cannot be re-keyed without explicit identity migration",
+                    ));
+                }
+            }
+
+            // Atomic transition receipts and outbox records are keyed by their
+            // original actor identity. Do not relabel them as another actor.
+            for table in [
+                "durable_tails",
+                "durable_transitions",
+                "durable_workflow_events",
+                "durable_domain_events",
+                "durable_effect_records",
+                "durable_outbox",
+            ] {
+                let sql = format!("SELECT 1 FROM {table} WHERE actor_id = ?1 LIMIT 1");
+                let mut rows = tx
+                    .query(&sql, libsql::params![from as i64])
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                if rows
+                    .next()
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+                    .is_some()
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "actor-scoped atomic transition history cannot be re-keyed",
+                    ));
+                }
+            }
+
+            // Even legacy workflow events may carry a stable activation or
+            // replay identity. Inspect them before moving any rows.
+            {
+                let mut rows = tx
+                    .query(
+                        "SELECT event FROM workflow_events WHERE actor_id = ?1",
+                        libsql::params![from as i64],
+                    )
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                while let Some(row) = rows
+                    .next()
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+                {
+                    let json: String = row
+                        .get(0)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    let event: WorkflowEvent = serde_json::from_str(&json)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    if event.activation_id().is_some() || event.replay_id().is_some() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "workflow activation or replay identity cannot be re-keyed",
+                        ));
+                    }
+                }
+            }
+
+            // Reject *any* destination record before moving the first row.
+            for table in [
+                "snapshots",
+                "journal",
+                "workflow_events",
+                "events",
+                "durable_tails",
+                "durable_transitions",
+                "durable_workflow_events",
+                "durable_domain_events",
+                "durable_effect_records",
+                "durable_outbox",
+            ] {
+                let sql = format!("SELECT 1 FROM {table} WHERE actor_id = ?1 LIMIT 1");
+                let mut rows = tx
+                    .query(&sql, libsql::params![to as i64])
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                if rows
+                    .next()
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+                    .is_some()
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "destination actor already has durable history",
+                    ));
+                }
+            }
+
+            // These are four updates in *one* database transaction. On any
+            // SQL error the transaction rolls back with source data intact.
+            for table in ["snapshots", "journal", "workflow_events", "events"] {
+                let sql = format!("UPDATE {table} SET actor_id = ?1 WHERE actor_id = ?2");
+                tx.execute(&sql, libsql::params![to as i64, from as i64])
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            }
+            tx.commit()
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+        })
+    }
+
     fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()> {
         let state_json = serde_json::to_string(&snapshot.state)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
