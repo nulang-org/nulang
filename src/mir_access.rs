@@ -65,7 +65,7 @@ pub fn may_overlap(a: &AccessPath, b: &AccessPath) -> bool {
             (Projection::Field(x), Projection::Field(y)) if x != y => return false,
             (Projection::Tuple(x), Projection::Tuple(y)) if x != y => return false,
             (Projection::Index(Some(x)), Projection::Index(Some(y))) if x != y => {
-                return false
+                return false;
             }
             _ => {}
         }
@@ -147,7 +147,7 @@ pub fn summarize_function(function: &Function) -> Vec<AccessSite> {
                     site.defines.push(*dst);
                 }
                 Stmt::StoreFieldNamed { obj, field, src } => {
-                    site.modifies.push(AccessPath::new(*obj).field(field));
+                    site.modifies.push(AccessPath::new(*obj).field(field.as_str()));
                     site.read(*src);
                 }
                 Stmt::ArrayStore { arr, idx, src } => {
