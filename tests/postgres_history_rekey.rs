@@ -252,3 +252,66 @@ fn test_postgres_rekey_refuses_workflow_replay_identity() {
     assert!(store.read_workflow_events(to).is_empty());
     store.clear(from).unwrap();
 }
+
+
+#[test]
+fn test_postgres_rekey_survives_abrupt_child_process_exit() {
+    if std::env::var_os("NU_POSTGRES_REKEY_CHILD").is_some() {
+        let from: u64 = std::env::var("NU_POSTGRES_REKEY_FROM")
+            .expect("child from ID")
+            .parse()
+            .expect("valid child from ID");
+        let to: u64 = std::env::var("NU_POSTGRES_REKEY_TO")
+            .expect("child to ID")
+            .parse()
+            .expect("valid child to ID");
+        let mut store = db().expect("PostgreSQL test DB in child");
+        store
+            .rekey_actor_history(from, to)
+            .expect("child relocation commits before abrupt exit");
+
+        // Terminate without Rust destructors or closing the client normally.
+        // This verifies committed history after process loss, not an
+        // interruption in the middle of the transaction.
+        #[cfg(unix)]
+        unsafe {
+            libc::_exit(87);
+        }
+        #[cfg(not(unix))]
+        std::process::exit(87);
+    }
+
+    let Some(mut store) = db() else {
+        return;
+    };
+    let (from, to) = ids();
+    seed(&mut store, from);
+    drop(store);
+
+    let executable = std::env::current_exe().expect("integration test executable");
+    let status = std::process::Command::new(executable)
+        .args([
+            "--exact",
+            "test_postgres_rekey_survives_abrupt_child_process_exit",
+            "--nocapture",
+        ])
+        .env("NU_POSTGRES_REKEY_CHILD", "1")
+        .env("NU_POSTGRES_REKEY_FROM", from.to_string())
+        .env("NU_POSTGRES_REKEY_TO", to.to_string())
+        .status()
+        .expect("run relocation in isolated child process");
+    assert_eq!(
+        status.code(),
+        Some(87),
+        "child must commit relocation and exit without normal cleanup"
+    );
+
+    let mut reopened = db().expect("reopen after child process loss");
+    assert!(reopened.load_snapshot(from).is_none());
+    let snapshot = reopened.load_snapshot(to).expect("relocated checkpoint");
+    assert_eq!(snapshot.state["count"], PersistedValue::Int(42));
+    assert_eq!(reopened.read_journal(to).len(), 1);
+    assert_eq!(reopened.read_workflow_events(to).len(), 1);
+    assert_eq!(reopened.read_events(to).len(), 1);
+    reopened.clear(to).unwrap();
+}
