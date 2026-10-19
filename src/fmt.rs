@@ -1539,4 +1539,18 @@ fn main() {
         assert!(format_source(src).is_err());
     }
 
+    #[test]
+    fn test_fmt_rejects_public_and_opaque_type_metadata_loss() {
+        assert!(format_source("pub type PublicName = Int").is_err());
+        assert!(format_source("opaque type TokenId = Int").is_err());
+        assert!(format_source("pub type Point = { x: Int, y: Int }").is_err());
+        assert!(format_source("pub type Choice = Left | Right").is_err());
+    }
+
+    #[test]
+    fn test_fmt_rejects_generic_type_variables_without_source_names() {
+        assert!(format_source("type Pair[T] = { first: T, second: T }").is_err());
+        assert!(format_source("type Maybe[T] = None | Some(T)").is_err());
+    }
+
 }
