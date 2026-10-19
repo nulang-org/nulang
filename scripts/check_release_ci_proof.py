@@ -65,6 +65,16 @@ def validate_exact_head_ci(run, jobs, sha):
     if not jobs:
         raise ProofError("CI workflow recorded zero jobs; no validation was executed")
 
+    # Bind every job to this specific attempt, not merely its workflow name.
+    # Missing or mismatched provenance is not executable release evidence.
+    for job in jobs:
+        if (job.get("run_id") != run.get("id")
+                or job.get("head_sha") != sha
+                or job.get("run_attempt") != run.get("run_attempt")):
+            raise ProofError(
+                f"CI job {job.get('name')!r} does not match exact run, commit SHA, and attempt"
+            )
+
     by_name = {}
     for job in jobs:
         name = job.get("name")
