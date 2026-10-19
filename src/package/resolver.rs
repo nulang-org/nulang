@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::package::identity::source_id_for_package_dir;
 use crate::package::lockfile::{LockedPackage, Lockfile};
 use crate::package::manifest::{Dependency, DependencyDetail, Manifest, MANIFEST_FILE};
 use crate::types::{NuError, NuResult, Span};
@@ -183,7 +184,51 @@ pub fn resolve_offline(
     manifest: &Manifest,
     lock: &Lockfile,
 ) -> NuResult<Resolution> {
-    resolve_with_offline_lock(root_dir, manifest, Some(lock))
+    let resolution = resolve_with_offline_lock(root_dir, manifest, Some(lock))?;
+    // A matching registry version, Git HEAD, or legacy shallow content hash
+    // does not prove the cached source bytes. Require canonical source IDs.
+    for package in resolution.dependencies() {
+        let source = package.source.lockfile_source();
+        let expected = lock
+            .package_identity(&package.name, &package.version, &source)
+            .map(|identity| identity.parsed_source_id())
+            .transpose()?
+            .flatten()
+            .ok_or_else(|| NuError::PackageError {
+                msg: format!(
+                    "offline dependency '{}' has no strong source identity in Nulang.lock",
+                    package.name
+                ),
+                span: Span::default(),
+            })?;
+        let dir = match &package.source {
+            PackageSource::Path(dir) => dir.clone(),
+            PackageSource::Git { .. } => root_dir
+                .join(".nula")
+                .join("git")
+                .join(&package.name),
+            PackageSource::Registry(_) => root_dir
+                .join(".nula")
+                .join("registry")
+                .join(format!("{}-{}", package.name, package.version)),
+            PackageSource::Root => continue,
+        };
+        let actual =
+            source_id_for_package_dir(&dir).map_err(|e| NuError::PackageError {
+                msg: format!("cannot verify offline source identity for '{}': {}", package.name, e),
+                span: Span::default(),
+            })?;
+        if actual != expected {
+            return Err(NuError::PackageError {
+                msg: format!(
+                    "offline source identity mismatch for '{}' (cached content differs from Nulang.lock)",
+                    package.name
+                ),
+                span: Span::default(),
+            });
+        }
+    }
+    Ok(resolution)
 }
 
 fn resolve_with_offline_lock(
