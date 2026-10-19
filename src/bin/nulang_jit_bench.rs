@@ -71,6 +71,17 @@ const WORKLOADS: &[Workload] = &[
         name: "call_loop",
         source: "fn add(x: Int, y: Int) -> Int { x + y }; var sum = 0; var i = 0; while i < 50000 { sum = add(sum, i); i = i + 1; }; sum",
     },
+    // Same loop and identity call, with concrete versus erased generic
+    // signatures. A specialization change must prove its benefit on identical
+    // work and retain interpreter parity for both variants.
+    Workload {
+        name: "concrete_identity_call_loop",
+        source: "fn identity(x: Int) -> Int { x }; var sum = 0; var i = 0; while i < 50000 { sum = identity(sum + i); i = i + 1; }; sum",
+    },
+    Workload {
+        name: "generic_identity_call_loop",
+        source: "fn identity[T](x: T) -> T { x }; var sum = 0; var i = 0; while i < 50000 { sum = identity(sum + i); i = i + 1; }; sum",
+    },
     Workload {
         name: "branch_loop",
         source: "var sum = 0; var i = 0; while i < 100000 { if i < 50000 then { sum = sum + i } else { sum = sum - 1 }; i = i + 1; }; sum",
