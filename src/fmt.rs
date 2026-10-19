@@ -1396,4 +1396,12 @@ fn main() {
         assert!(out.contains("emit Event(1)"), "got: {out}");
         assert_idempotent(src);
     }
+    #[test]
+    fn test_fmt_selective_import_roundtrip() {
+        let source = "import stdlib::math { abs, factorial }";
+        let formatted = format_source(source).expect("selective import must format");
+        assert!(formatted.contains("import stdlib::math { abs, factorial }"), "{formatted}");
+        assert_eq!(format_source(&formatted).unwrap(), formatted);
+    }
+
 }
