@@ -110,8 +110,13 @@ python3 -m unittest discover -s scripts/tests -p 'test_jit_generic_call_ab.py' -
 python3 scripts/jit_generic_call_ab.py --rounds 8 --output jit-generic-call-ab.json
 ```
 
-Each round executes both workloads and alternates which one runs first. Each
-individual benchmark process verifies interpreter/first-JIT/warm-JIT result
+The comparator builds the release binary once and then executes that binary
+directly with the measured process pinned to one available logical CPU on
+Linux by default. Use `--cpu-mode host` only for an explicitly unpinned
+exploratory comparison or where affinity is unsupported. The JSON report
+records the CPU mode and selected CPU affinity. Each round executes both
+workloads and alternates which one runs first. Each individual benchmark
+process verifies interpreter/first-JIT/warm-JIT result
 parity before emitting JSONL; the analyzer rejects missing or malformed metrics
 and preserves every raw sample alongside median interpreter, first-run, warm-run
 and compilation durations. CI uploads the report as an artifact.
