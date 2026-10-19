@@ -19,6 +19,7 @@ function mount(values, readyState = 'complete') {
     querySelectorAll(selector) {
       if (selector === '[data-signal]') return elements;
       if (selector === '[data-action]') return [];
+      if (selector === '[data-nulang-attrs]') return [];
       throw new Error('unexpected selector: ' + selector);
     },
     addEventListener(name, listener) { listeners.set(name, listener); },

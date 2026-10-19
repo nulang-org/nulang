@@ -51,6 +51,11 @@ jobs:
       - name: Smoke test Nulang Web action events
         run: node scripts/tests/web_action_events.mjs
 
+      - name: Smoke test Web signal and attribute bindings
+        run: |
+          node scripts/tests/web_signal_name_safety.mjs
+          node scripts/tests/web_dom_attribute_bindings.mjs
+
       - name: Install docs dependencies
         run: |
           cd docs

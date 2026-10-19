@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Experimental Web typed reactive attributes — 2026-10-18
+- **The experimental Web signal compiler now records typed text and safe attribute binding parts.** Direct signal reads can update inert `title`, `alt`, `placeholder`, `class`, `aria-*`, and non-reserved `data-*` attributes in the browser, while URL/event/style attributes remain excluded. Existing text hydration and action placement are preserved.
+- **Rust and JavaScript regressions cover compiler metadata, binding annotations, safe browser updates, and prototype-like signal names.** The change adds no new language-core syntax.
+
 ### Bounded Nulang Web development-server connections — 2026-10-16
 - **The experimental Web development listener caps active connections at 64**, including SSE, and returns `503` with `Retry-After: 1` when full.
 - **Worker capacity is returned by a scoped RAII lease** after normal completion, panic, or thread-spawn failure. One shared `Arc` route table replaces per-connection clones of compiled route modules.
