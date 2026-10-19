@@ -3,15 +3,15 @@
 //! Produces deterministic, namespace-qualified metadata for tooling and future
 //! typed derivation. No source-level reflection syntax, runtime introspection,
 //! schema-format changes, or compile-time evaluator is introduced here.
-//! HIR currently uses conservative return types for some behaviors, so this
-//! interface intentionally exposes parameter types, effect rows and capabilities,
-//! but does not advertise behavior return types as verified protocol contracts.
+//! HIR can substitute placeholder types and empty effects for unannotated
+//! behaviors. Their names, parameter names and explicit capabilities are exposed,
+//! but not falsely advertised as fully verified type/effect contracts.
 
 use std::collections::BTreeSet;
 
 use crate::ast::StateModel;
 use crate::hir;
-use crate::types::{Capability, EffectRow, Type};
+use crate::types::{Capability, Type};
 
 /// One immutable snapshot of an actor's compiler-visible public structure.
 #[derive(Debug, Clone, PartialEq)]
@@ -34,9 +34,8 @@ pub struct StateFieldReflection {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BehaviorReflection {
     pub name: String,
-    /// Parameter declaration order is semantically meaningful and preserved.
-    pub params: Vec<(String, Type)>,
-    pub effects: EffectRow,
+    /// Names and declaration order only: HIR may use placeholder parameter types.
+    pub parameter_names: Vec<String>,
     pub capability: Capability,
 }
 
@@ -151,8 +150,11 @@ fn collect_actors(
                     .iter()
                     .map(|behavior| BehaviorReflection {
                         name: behavior.name.clone(),
-                        params: behavior.params.clone(),
-                        effects: behavior.effect.clone(),
+                        parameter_names: behavior
+                            .params
+                            .iter()
+                            .map(|(name, _)| name.clone())
+                            .collect(),
                         capability: behavior.cap,
                     })
                     .collect();
@@ -187,7 +189,7 @@ fn collect_actors(
 mod tests {
     use super::*;
     use crate::ast::{EventDecl, Literal};
-    use crate::types::{PrimitiveType, Span};
+    use crate::types::{EffectRow, PrimitiveType, Span};
 
     fn int_ty() -> Type {
         Type::Primitive(PrimitiveType::Int)
@@ -318,9 +320,9 @@ mod tests {
         );
         assert_eq!(
             actors[0].behaviors[1]
-                .params
+                .parameter_names
                 .iter()
-                .map(|x| x.0.as_str())
+                .map(String::as_str)
                 .collect::<Vec<_>>(),
             ["first", "second"]
         );
