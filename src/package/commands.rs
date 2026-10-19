@@ -98,7 +98,21 @@ pub fn run(args: &[String]) -> NuResult<()> {
                 cmd_build(json, locked)
             }
         }
-        Some("build-wasm") => cmd_build_wasm(),
+        Some("build-wasm") => {
+            let mut locked = false;
+            for flag in &args[1..] {
+                match flag.as_str() {
+                    "--locked" => locked = true,
+                    other => {
+                        return Err(NuError::PackageError {
+                            msg: format!("unknown flag '{}' for nula build-wasm", other),
+                            span: Span::default(),
+                        });
+                    }
+                }
+            }
+            cmd_build_wasm(locked)
+        },
         Some("test") => {
             let mut filter: Option<&str> = None;
             let mut verbose = false;
@@ -1292,7 +1306,7 @@ fn nulang_exe_output(args: &[&str]) -> NuResult<std::process::Output> {
 
 /// `nula build-wasm`: compile package to .wasm + AOT .cwasm.
 /// `nula build-wasm`: compile package to .wasm + AOT .cwasm in .nula/dist/.
-fn cmd_build_wasm() -> NuResult<()> {
+fn cmd_build_wasm(locked: bool) -> NuResult<()> {
     let root = package_root()?;
     let manifest_path = root.join(MANIFEST_FILE);
     let manifest = Manifest::load(&root).map_err(|e| NuError::PackageError {
@@ -1301,7 +1315,7 @@ fn cmd_build_wasm() -> NuResult<()> {
     })?;
     let name = manifest.package.name.clone();
 
-    let entry = prepare_package()?;
+    let entry = prepare_package_with_lock_mode(locked)?;
     let entry_str = entry.to_string_lossy().into_owned();
 
     let dist_dir = root.join(".nula").join("dist");
