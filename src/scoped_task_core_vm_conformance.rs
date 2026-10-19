@@ -137,6 +137,50 @@ mod tests {
     }
 
     #[test]
+    fn parent_cancellation_before_admission_prevents_any_core_vm_execution() {
+        let mut host = CoreVmTaskHost::new(2, 2);
+        host.submit_add(3, 4);
+        host.submit_add(5, 6);
+
+        host.cancel(CancellationCause::Parent);
+
+        let stats = host.tick();
+        assert_eq!(stats.admitted, 0);
+        assert_eq!(stats.polled, 0);
+        assert!(host.executed().is_empty());
+        assert_eq!(
+            host.into_outcomes(),
+            vec![TaskOutcome::Cancelled, TaskOutcome::Cancelled]
+        );
+    }
+
+    #[test]
+    fn invalid_bytecode_result_cancels_active_sibling_and_queued_task() {
+        let mut host = CoreVmTaskHost::new(2, 3);
+        let invalid = host.submit_non_integer();
+        host.submit_add(10, 1);
+        host.submit_add(20, 2);
+
+        let stats = host.tick();
+        assert_eq!(stats.admitted, 2);
+        assert_eq!(stats.polled, 2);
+        assert_eq!(stats.completed, 2);
+        // Only the first task reached its CoreVM execution point. The error
+        // cancelled its admitted sibling before the sibling entered a VM.
+        assert_eq!(host.executed(), &[invalid]);
+        assert_eq!(
+            host.into_outcomes(),
+            vec![
+                TaskOutcome::Completed(Err(
+                    "expected an integer CoreVM result".to_string()
+                )),
+                TaskOutcome::Cancelled,
+                TaskOutcome::Cancelled,
+            ]
+        );
+    }
+
+    #[test]
     fn parent_cancellation_prevents_queued_and_deferred_bytecode_from_running() {
         let mut host = CoreVmTaskHost::new(1, 2);
         let first = host.submit_add(100, 1);
