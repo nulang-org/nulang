@@ -19,6 +19,23 @@ let filtered = list::filter(numbers, is_positive)
 
 The `import ... as ...` declarations above now parse as AST and round-trip through the formatter, but are **deliberately rejected during semantic resolution**. The `alias::function` expression still requires future parser/name-lookup work. Existing `import stdlib::list` remains a legacy unqualified import for Nulang 1.x. Do not silently change its meaning without a versioned migration.
 
+## Resolver symbol-index foundation
+
+The experimental resolver helper `QualifiedImportIndex` now records each
+module alias against its canonical source path. `index_qualified_imports`
+can inspect direct aliased imports in a parsed source file without flattening
+exports into the importing module. Only declarations marked explicitly
+`public` are currently discoverable (functions, type aliases, record types,
+and variant types), and same-name overloads retain their separate entries.
+Missing aliases, private names, and conflicting alias origins fail closed.
+
+**This index is not yet consumed by the production typechecker, HIR/MIR,
+bytecode, WASM, native backends, or LSP.** The ordinary compile path still
+rejects alias imports. Support for nested reexports, visibility on other
+declaration types, constructors, and type-directed overload lookup belongs
+in subsequent changes. Filesystem paths are resolver metadata only and
+must not be written into runtime type identifiers or serialized artifacts.
+
 ## Required semantic invariants
 
 1. **Lexical namespaces, not string-prefix collisions.** Bind `list` to a resolved module identity in the resolver. Qualifying a reference must select that module's exported declaration, not an arbitrary declaration whose textual name begins with `list::`.
@@ -34,7 +51,7 @@ The `import ... as ...` declarations above now parse as AST and round-trip throu
 ## Proposed implementation order
 
 1. Provenance completeness for already-existing import forms (this branch).
-2. Stable resolver-owned `ModuleBinding` / `ResolvedSymbol` model, with explicit source origin, export visibility, and local name.
+2. Stable resolver-owned `ModuleBinding` / `ResolvedSymbol` model, with explicit source origin, export visibility, and local name (**direct-import lookup prototype complete, production resolution and reexports outstanding**).
 3. AST/parser and formatter retention of `import path as alias` with a fail-closed semantic error (**syntax groundwork completed**); then implement `alias::name` as a distinct unresolved reference form, including unknown-alias tests.
 4. Typechecker and effects/capability lookup using resolved symbols. Verify polymorphic constructors and opaque types cannot be confused across modules.
 5. HIR/MIR and all backends operate on canonical resolved symbols rather than alias-formatted text. Add cross-backend behavior fixtures.
