@@ -136,6 +136,28 @@ fn memory_store_rekey_refuses_atomic_transition_identity_rewrite() {
 }
 
 #[test]
+fn memory_store_rekey_rejects_identity_bound_workflow_events() {
+    let mut store = MemoryStore::new();
+    seed_legacy_history(&mut store, 100);
+    store
+        .append_workflow_event(
+            100,
+            WorkflowEvent::StepCompleted {
+                sequence: 4,
+                activation: Some(nulang::runtime::WorkflowActivationId::new(100, 3)),
+                step_name: "done".to_string(),
+            },
+        )
+        .unwrap();
+
+    let err = store.rekey_actor_history(100, 101).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Unsupported);
+    assert!(store.load_snapshot(100).is_some());
+    assert_eq!(store.read_workflow_events(100).len(), 2);
+    assert!(store.load_snapshot(101).is_none());
+}
+
+#[test]
 fn memory_store_rekey_missing_source_or_same_identity_does_not_mutate() {
     let mut store = MemoryStore::new();
     assert_eq!(
