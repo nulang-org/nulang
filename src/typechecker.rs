@@ -1076,9 +1076,8 @@ pub struct TypeChecker {
     pub collect_errors: bool,
     /// Errors collected when `collect_errors` is set (empty otherwise).
     pub collected_errors: Vec<crate::types::NuError>,
-    /// Non-fatal semantic diagnostics collected during type inference.
-    /// Pattern coverage belongs here because it depends on the inferred scrutinee type.
-    pub warnings: Vec<NuWarning>,
+    /// Non-fatal semantic warnings such as conservative finite match coverage.
+    pub warnings: Vec<crate::types::NuWarning>,
 }
 
 /// Pre-computed class and instance tables extracted from an AST module.
@@ -1162,11 +1161,6 @@ impl TypeChecker {
             collected_errors: Vec::new(),
             warnings: Vec::new(),
         }
-    }
-
-    /// Consume and return non-fatal semantic warnings collected by type checking.
-    pub fn take_warnings(&mut self) -> Vec<NuWarning> {
-        std::mem::take(&mut self.warnings)
     }
 
     /// Type-check an entire module, returning the type of the last declaration.
@@ -3409,21 +3403,14 @@ impl TypeChecker {
             final_subst = compose_subst(&s, &final_subst);
         }
 
-        // Coverage analysis runs only after ordinary pattern/guard/body typing
-        // succeeds and uses the fully substituted scrutinee type. Guarded arms
-        // cannot close a coverage hole because their predicate may be false.
-        let coverage_ty = apply_subst(&scrut_ty, &final_subst);
-        let coverage_arms: Vec<(Pattern, bool)> = arms
-            .iter()
-            .map(|(pattern, guard, _)| (pattern.clone(), guard.is_some()))
-            .collect();
-        self.warnings
-            .extend(crate::pattern_coverage::warnings_for_match(
-                &coverage_ty,
-                &coverage_arms,
-                span,
-            ));
-
+        // Reuse the inferred, fully substituted type so diagnostics match the
+        // compiler's actual accepted meaning, not a syntax-only guess.
+        let resolved_scrutinee = apply_subst(&scrut_ty, &final_subst);
+        self.warnings.extend(crate::match_coverage::check_coverage(
+            &resolved_scrutinee,
+            arms,
+            span,
+        ));
         Ok((final_subst.clone(), apply_subst(&first_arm, &final_subst)))
     }
 

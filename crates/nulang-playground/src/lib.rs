@@ -41,14 +41,14 @@ pub mod effect_checker;
 pub mod prelude_source;
 #[path = "../../../src/parser.rs"]
 pub mod parser;
-#[path = "../../../src/pattern_coverage.rs"]
-pub mod pattern_coverage;
 #[path = "../../../src/parallel_analysis.rs"]
 pub mod parallel_analysis;
 #[path = "../../../src/parallel_marker.rs"]
 pub mod parallel_marker;
 #[path = "../../../src/stdlib.rs"]
 pub mod stdlib;
+#[path = "../../../src/match_coverage.rs"]
+pub mod match_coverage;
 #[path = "../../../src/typechecker.rs"]
 pub mod typechecker;
 #[path = "../../../src/tool_schema.rs"]

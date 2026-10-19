@@ -102,23 +102,28 @@ by `render_warning`/`format_warning` (src/diagnostic.rs) with a
 | Range   | Category                                  |
 |---------|-------------------------------------------|
 | `W01xx` | Deprecations                              |
-| `W02xx` | Static pattern analysis                   |
-| `W03xx` | Ignored-result diagnostics                |
+| `W02xx` | Conservative pattern match coverage     |
+| `W03xx` | Ignored Result warnings                  |
 
 | Code    | Meaning                                   | Replacement (RFC)        |
 |---------|-------------------------------------------|--------------------------|
 | `W0101` | Deprecated `catch` expression (all forms) | `match` on `Ok`/`Error`, `?` under `T ! E` (RFC 0015) |
 | `W0102` | Deprecated `fail` expression              | `return Error(...)` under `T ! E` (RFC 0015) |
-| `W0201` | Provably non-exhaustive finite-domain `match` | Add arms for the reported missing witnesses |
-| `W0202` | Provably redundant/unreachable finite-domain match arm | Remove, move, or refine the reported arm(s) |
-| `W0301` | Discarded `Result` in a non-final block expression | Match, propagate with `?`, or explicitly bind the value |
 
-`W0201`/`W0202` are conservative semantic warnings: currently the analyzer proves coverage only for top-level declared variants and `Bool`, and guarded arms never count toward exhaustiveness. `--deny-warnings` enables strict enforcement without changing default runtime semantics.
+| `W0201` | Provably non-exhaustive finite-domain `match` | Add an unguarded case or wildcard |
+| `W0202` | Provably unreachable `match` arm | Remove redundant arm or narrow an earlier pattern |
+| `W0301` | Discarded `Result` in an intermediate block expression | Handle with `match`, propagate via `?`, or explicitly bind |
 
-`W0301` is emitted only when a statically resolved two-constructor `Ok`/`Error`
-result is an intermediate expression in a block. A block's final result is
-considered returned, not discarded; other ADTs are unaffected. Like W0201/W0202,
-W0301 is non-fatal by default and rejected by `--deny-warnings`.
+In 1.x these are compatibility-preserving warnings, not errors by default.
+The existing `--deny-warnings` flag rejects both codes. Coverage currently
+handles Boolean types and closed variant constructors, counting payload arms
+only when their payload patterns are irrefutable. Guarded arms never establish
+coverage; open/infinite domains are intentionally not classified. Until patterns
+carry individual source spans, W0202 points to the enclosing match expression.
+
+`W0301` warns when a statically resolved two-constructor `Ok`/`Error` variant
+is used as a discarded intermediate block expression. Final expressions are
+returned rather than discarded. `--deny-warnings` opts into strict rejection.
 
 See `docs/MIGRATION_RFC_0015.md` for the `catch`/`fail` migration guide.
 

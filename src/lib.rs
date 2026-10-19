@@ -61,6 +61,7 @@ pub mod iso_arena;
 pub mod jit;
 pub mod json_diagnostics;
 pub mod lexer;
+pub mod match_coverage;
 #[cfg(feature = "lsp")]
 pub mod lsp;
 pub mod migration_purity;
@@ -80,7 +81,6 @@ pub mod package;
 pub mod parallel_analysis;
 pub mod parallel_marker;
 pub mod parser;
-pub mod pattern_coverage;
 pub mod prelude_source;
 pub mod primitives;
 pub mod protocol;

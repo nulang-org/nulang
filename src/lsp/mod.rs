@@ -1843,7 +1843,7 @@ impl NulangLanguageServer {
         let mut tc = TypeChecker::new();
         tc.collect_errors = true;
         let _ = tc.check_module(&ast);
-        for warning in tc.take_warnings() {
+        for warning in &tc.warnings {
             diagnostics.push(nu_warning_to_diagnostic(warning));
         }
         for err in tc.collected_errors {
@@ -2352,13 +2352,14 @@ impl NulangLanguageServer {
     }
 }
 
-/// Convert a compiler warning into an LSP diagnostic while preserving its
-/// stable warning code and source span.
-fn nu_warning_to_diagnostic(warning: crate::types::NuWarning) -> Diagnostic {
+/// Convert a compiler warning into the same stable LSP diagnostic surfaced by
+/// the CLI. Pattern arms do not yet have their own spans, so W0202 points to
+/// the enclosing match until the AST carries arm-level locations.
+fn nu_warning_to_diagnostic(warning: &crate::types::NuWarning) -> Diagnostic {
     let span = warning.span;
-    let message = match warning.help {
-        Some(help) => format!("{}\nhelp: {}", warning.msg, help),
-        None => warning.msg,
+    let message = match &warning.help {
+        Some(help) => format!("{}\\nhelp: {}", warning.msg, help),
+        None => warning.msg.clone(),
     };
     Diagnostic {
         range: Range::new(
@@ -3958,6 +3959,33 @@ mod lsp_tests {
         let engine = InlayHintEngine::new("fun foo) bar(");
         let hints = engine.generate_inlay_hints(None, None, None);
         assert!(hints.is_empty());
+    }
+
+    #[test]
+    fn test_diagnostics_reports_non_exhaustive_bool_as_warning() {
+        let source = "fn choose(value: Bool) -> Int { match value { | true => 1 } }";
+        let diagnostics = NulangLanguageServer::compute_diagnostics(source).diagnostics;
+        assert!(
+            diagnostics.iter().any(|d| {
+                d.severity == Some(DiagnosticSeverity::WARNING)
+                    && d.code == Some(NumberOrString::String("W0201".to_string()))
+                    && d.message.contains("false")
+            }),
+            "missing W0201 LSP warning: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn test_diagnostics_reports_redundant_match_arm_as_warning() {
+        let source = "fn choose(value: Bool) -> Int { match value { | _ => 1 | false => 2 } }";
+        let diagnostics = NulangLanguageServer::compute_diagnostics(source).diagnostics;
+        assert!(
+            diagnostics.iter().any(|d| {
+                d.severity == Some(DiagnosticSeverity::WARNING)
+                    && d.code == Some(NumberOrString::String("W0202".to_string()))
+            }),
+            "missing W0202 LSP warning: {diagnostics:?}"
+        );
     }
 
     #[test]
