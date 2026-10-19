@@ -3214,6 +3214,135 @@ impl PostgresStore {
 
 #[cfg(feature = "postgres")]
 impl PersistenceStore for PostgresStore {
+
+    fn rekey_actor_history(&mut self, from: u64, to: u64) -> io::Result<()> {
+        if from == to {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "actor history relocation requires distinct actor IDs",
+            ));
+        }
+        let from_id = from as i64;
+        let to_id = to as i64;
+        let mut conn = self.conn.lock().unwrap();
+        let mut tx = conn
+            .transaction()
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+
+        // Serialize legacy writes while inspecting and moving these rows.
+        // Row locks alone cannot prevent a concurrent writer from inserting
+        // a new source or destination journal entry after our preflight.
+        tx.batch_execute(
+            "LOCK TABLE snapshots, journal, workflow_events, events
+             IN SHARE ROW EXCLUSIVE MODE",
+        )
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+
+        let source = tx
+            .query_opt(
+                "SELECT state, crdt_snapshot, crdt_field_map
+                 FROM snapshots WHERE actor_id = $1 FOR UPDATE",
+                &[&from_id],
+            )
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "actor snapshot to relocate not found")
+            })?;
+
+        let state_json: String = source
+            .try_get(0)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        let crdt_json: Option<String> = source
+            .try_get(1)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        let field_map_json: Option<String> = source
+            .try_get(2)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        if crdt_json.as_deref().is_some_and(|value| value != "null")
+            || field_map_json.as_deref().is_some_and(|value| value != "null")
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "CRDT state requires stable actor identity and cannot be re-keyed",
+            ));
+        }
+        if json_history_contains_self_ref(&state_json, from)? {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "actor snapshot contains an old actor self reference",
+            ));
+        }
+
+        // PostgreSQL's legacy backend does not write atomic durable tails,
+        // but explicitly fail on any future identity-bound table. Do not
+        // invent those tables as a side effect of migration: backend schema
+        // evolution must define how digest/receipt identity is represented.
+        for (table, columns) in [
+            ("journal", &["payload"][..]),
+            ("workflow_events", &["event"][..]),
+            ("events", &["args", "value"][..]),
+        ] {
+            let sql = format!(
+                "SELECT {} FROM {table} WHERE actor_id = $1",
+                columns.join(", ")
+            );
+            for row in tx
+                .query(&sql, &[&from_id])
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?
+            {
+                for index in 0..columns.len() {
+                    let json: String = row.try_get(index).map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                    })?;
+                    if json_history_contains_self_ref(&json, from)? {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "actor recovery journal contains an old actor self reference",
+                        ));
+                    }
+                    if table == "workflow_events" {
+                        let event: WorkflowEvent = serde_json::from_str(&json).map_err(|error| {
+                            io::Error::new(io::ErrorKind::InvalidData, error)
+                        })?;
+                        if event.activation_id().is_some() || event.replay_id().is_some() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::Unsupported,
+                                "workflow activation/replay identities cannot be re-keyed",
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Prevent merging unrelated histories. SHARE ROW EXCLUSIVE locks
+        // guarantee all four destination checks remain valid until commit.
+        for table in ["snapshots", "journal", "workflow_events", "events"] {
+            let sql = format!("SELECT 1 FROM {table} WHERE actor_id = $1 LIMIT 1");
+            if tx
+                .query_opt(&sql, &[&to_id])
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?
+                .is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "destination actor already has durable history",
+                ));
+            }
+        }
+
+        for table in ["snapshots", "journal", "workflow_events", "events"] {
+            let sql = format!("UPDATE {table} SET actor_id = $1 WHERE actor_id = $2");
+            tx.execute(&sql, &[&to_id, &from_id])
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+        }
+
+        // Commit is the sole publication boundary. Any pre-commit error
+        // rolls back every update, leaving the old actor history in place.
+        tx.commit()
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))
+    }
+
     fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()> {
         let state_json = serde_json::to_string(&snapshot.state)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
