@@ -2950,6 +2950,23 @@ mod tests {
     }
 
     #[test]
+    fn test_effect_row_subset_open_tail_cannot_satisfy_pure_contract() {
+        // An unresolved row variable could include IO or other effects even
+        // though its known effect list is empty.
+        let unknown = EffectRow::Open(vec![], Region::fresh());
+        assert!(!effect_row_subset(&unknown, &EffectRow::empty()));
+    }
+
+    #[test]
+    fn test_effect_row_subset_open_tail_cannot_satisfy_closed_allowlist() {
+        // Matching all known effects is insufficient when the tail can
+        // contain additional effects absent from the closed contract.
+        let unknown = EffectRow::Open(vec![Effect::IO], Region::fresh());
+        let allowed = EffectRow::Closed(vec![Effect::IO, Effect::FS]);
+        assert!(!effect_row_subset(&unknown, &allowed));
+    }
+
+    #[test]
     fn test_effect_row_union() {
         let a = EffectRow::Closed(vec![Effect::IO]);
         let b = EffectRow::Closed(vec![Effect::FS]);
