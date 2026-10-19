@@ -325,6 +325,68 @@ mod tests {
     }
 
     #[test]
+    fn changed_direct_path_source_rejects_stale_lockfile() {
+        let root = scratch("stale-direct-path");
+        let old_path = root.join("original");
+        let new_path = root.join("replacement");
+        make_package(
+            &root,
+            "[dependencies]\\nutil = { path = \\"original\\" }\\n",
+        );
+        make_package(&old_path, "");
+        make_package(&new_path, "");
+        let mut lock = Lockfile::new();
+        lock.package.push(locked_dependency(
+            "util",
+            format!("path+{}", old_path.display()),
+            "",
+        ));
+        lock.save(&root).unwrap();
+
+        // Both directories are individually valid. The lock is nevertheless
+        // stale when the declared direct source changes without a new pin.
+        assert!(inspect(&root).is_ok());
+        let manifest = std::fs::read_to_string(root.join("Nulang.toml")).unwrap();
+        std::fs::write(
+            root.join("Nulang.toml"),
+            manifest.replace("original", "replacement"),
+        ).unwrap();
+        assert!(inspect(&root)
+            .expect_err("direct source change must reject stale lockfile")
+            .to_string()
+            .contains("direct dependency source mismatch"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn changed_direct_git_repository_rejects_stale_pin() {
+        let root = scratch("stale-direct-git");
+        make_package(
+            &root,
+            "[dependencies]\\nutil = { git = \\"https://example.org/old.git\\" }\\n",
+        );
+        let mut lock = Lockfile::new();
+        lock.package.push(locked_dependency(
+            "util",
+            "git+https://example.org/old.git".into(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ));
+        lock.save(&root).unwrap();
+
+        assert!(inspect(&root).is_ok());
+        let manifest = std::fs::read_to_string(root.join("Nulang.toml")).unwrap();
+        std::fs::write(
+            root.join("Nulang.toml"),
+            manifest.replace("old.git", "new.git"),
+        ).unwrap();
+        assert!(inspect(&root)
+            .expect_err("direct Git origin change must reject stale lockfile")
+            .to_string()
+            .contains("direct dependency source mismatch"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn root_inputs_change_source_id_without_producing_an_artifact() {
         let root = scratch("root-change");
         make_package(&root, "");
