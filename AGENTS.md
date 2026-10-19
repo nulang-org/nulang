@@ -7,6 +7,12 @@
 
 **Nulang** is a typed programming language for concurrent, durable, and distributed software, written in Rust (edition 2021, Cargo workspace with a primary `nulang` crate and a `nulang-ai` support crate). Actors are the addressable-isolation model rather than the ontology for all computation. Nulang combines Erlang-style fault-tolerant actors with a Rust/Pony-inspired type system (Hindley-Milner inference + reference capabilities + row-polymorphic algebraic effects), a register-based bytecode VM, a Cranelift JIT, a WASM backend (MIR→WASM via `wasm-encoder`) with a Wasmtime host runtime, BEAM/OTP primitives, CRDTs, location-transparent distribution, multi-backend persistence (memory/JSON/libSQL, with optional RocksDB/PostgreSQL), PyO3 Python interop, a C-compatible FFI layer, a v0.9 AI runtime (pure types in `crates/nulang-ai/`, `Runtime` glue in `src/runtime/`), and a format-stability layer (`src/format/` — frozen `.nbc` bytecode artifacts, NUL0 wire protocol versioning, migration registry). Status: Alpha; 1558 tests pass in the core crate (`cargo test`), 1596 with `--features wasm-backend`; the `nulang-ai` crate ships 58 additional tests (`cargo test -p nulang-ai`). License: Apache-2.0.
 
+## Semantic code intelligence (Rust and Nulang)
+
+The compiler implementation is Rust: use `rust-analyzer` references/rename plus `cargo metadata --locked --no-deps --format-version 1` for crate topology. Source files written in Nulang use the **native Nulang LSP** (`nulang --lsp`, including definition, references and rename). Neither GitNexus nor a generic Tree-sitter graph is required for these operations.
+
+An optional local MCP code graph (`codebase-memory-mcp`) is configured for Codex to help discover call chains and navigate multi-crate runtime/AI components. See [`docs/CODE_INTELLIGENCE.md`](./docs/CODE_INTELLIGENCE.md). Cross-language/dynamic calls, actor messages and durable workflow semantics are **not certified** by a static graph. Verify potential impact against source, compiler tests, conformance tests and actual runtime scenarios. Never treat no callers found as proof of no consumers.
+
 ## Architecture & Data Flow
 
 The compiler pipeline shares one frontend across the bytecode, native/AOT, and WASM execution backends:
