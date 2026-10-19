@@ -1738,14 +1738,10 @@ fn cmd_test(filter: Option<&str>, verbose: bool, json: bool) -> NuResult<()> {
     }
 
     let mut tests: Vec<TestCase> = Vec::new();
-    static TEST_RUN_SEQUENCE: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
+    static TEST_RUN_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let run_id = TEST_RUN_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let temp_dir = std::env::temp_dir().join(format!(
-        "nula_test_{}_{}",
-        std::process::id(),
-        run_id
-    ));
+    let temp_dir =
+        std::env::temp_dir().join(format!("nula_test_{}_{}", std::process::id(), run_id));
     std::fs::create_dir_all(&temp_dir).map_err(|error| NuError::PackageError {
         msg: format!("could not create test-wrapper directory: {error}"),
         span: Span::default(),
@@ -1993,9 +1989,10 @@ fn strip_main_function(source: &str) -> String {
         return source.to_string();
     };
 
-    let Some(fn_index) = tokens.iter().position(|token| {
-        matches!(token.kind, TokenKind::Fn) && token.span.start == fn_start
-    }) else {
+    let Some(fn_index) = tokens
+        .iter()
+        .position(|token| matches!(token.kind, TokenKind::Fn) && token.span.start == fn_start)
+    else {
         return source.to_string();
     };
 
@@ -2713,7 +2710,10 @@ mod tests {
             fn test_needs_argument(value: Int) { value }
             fn test_zero_args() { 1 }
         "#;
-        assert_eq!(discover_test_functions(source), vec!["test_zero_args".to_string()]);
+        assert_eq!(
+            discover_test_functions(source),
+            vec!["test_zero_args".to_string()]
+        );
     }
 
     #[test]
