@@ -28,8 +28,14 @@ python3 scripts/cross_runtime_bench.py --runs 5 --warmup 1 \
 
 The runner compiles each external fixture once, performs warm-up runs, then
 records exact nanosecond timings from each runtime and reports the median for
-every workload. The JSON also records OS/CPU counts, git SHA, toolchain
-versions, and the CPU topology used for measurement.
+every workload. The runner rotates which runtime executes first in each round,
+so a complete cycle gives every runtime every execution position. It also
+rejects duplicate or non-positive timing records and refuses to compare
+runtimes if message counts or measured round counts differ. The JSON records
+execution order for every warm-up and measured round, along with OS/CPU counts,
+git SHA, toolchain versions, and the CPU topology used for measurement.
+Rotation reduces fixed-order bias but does not eliminate noisy-host effects
+or the semantic differences between the standard runtime primitives.
 
 ## CPU-topology rule
 

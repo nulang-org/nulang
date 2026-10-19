@@ -80,9 +80,17 @@ def parse_records(output: str, expected_runtime: str) -> dict[str, dict[str, int
         name = match.group("benchmark")
         if name not in BENCHMARKS:
             continue
+        if name in records:
+            raise RuntimeError(f"{expected_runtime}: duplicate record for {name}")
+        messages = int(match.group("messages"))
+        elapsed_ns = int(match.group("elapsed_ns"))
+        if messages <= 0 or elapsed_ns <= 0:
+            raise RuntimeError(
+                f"{expected_runtime}/{name}: messages and elapsed_ns must be positive"
+            )
         records[name] = {
-            "messages": int(match.group("messages")),
-            "elapsed_ns": int(match.group("elapsed_ns")),
+            "messages": messages,
+            "elapsed_ns": elapsed_ns,
         }
 
     missing = [name for name in BENCHMARKS if name not in records]
@@ -204,6 +212,46 @@ def measurement_affinity(cpu_mode: str) -> set[int] | None:
     return {allowed[0]}
 
 
+def round_order(selected: list[str], round_index: int) -> list[str]:
+    """Rotate runners so each receives every execution position per full cycle.
+
+    Do not shuffle at random: a deterministic order makes performance reports
+    reproducible and avoids giving Nulang the first slot on every round.
+    """
+    if not selected:
+        return []
+    start = round_index % len(selected)
+    return selected[start:] + selected[:start]
+
+
+def validate_comparable_workloads(
+    samples: dict[str, dict[str, list[dict[str, int]]]]
+) -> None:
+    """Reject measurements that cannot legitimately share a comparison table."""
+    if not samples:
+        raise RuntimeError("no runtime measurements provided")
+
+    workloads = set().union(*(set(rows) for rows in samples.values()))
+    for name in sorted(workloads):
+        operation_counts: dict[str, int] = {}
+        sample_counts: dict[str, int] = {}
+        for runtime, results in samples.items():
+            rows = results.get(name, [])
+            if not rows:
+                raise RuntimeError(f"{name}: missing samples for {runtime}")
+            sample_counts[runtime] = len(rows)
+            counts = {row["messages"] for row in rows}
+            if len(counts) != 1 or next(iter(counts)) <= 0:
+                raise RuntimeError(f"{name}: invalid or inconsistent message count for {runtime}")
+            if any(row["elapsed_ns"] <= 0 for row in rows):
+                raise RuntimeError(f"{name}: elapsed_ns must be positive for {runtime}")
+            operation_counts[runtime] = next(iter(counts))
+        if len(set(sample_counts.values())) != 1:
+            raise RuntimeError(f"{name}: sample count differs across runtimes: {sample_counts}")
+        if len(set(operation_counts.values())) != 1:
+            raise RuntimeError(f"{name}: message count differs across runtimes: {operation_counts}")
+
+
 def git_sha() -> str | None:
     return maybe_version(["git", "rev-parse", "HEAD"])
 
@@ -323,6 +371,10 @@ def main() -> int:
     unknown = sorted(set(selected) - {"nulang", "rust", "go", "erlang"})
     if unknown:
         parser.error(f"unknown runtimes: {', '.join(unknown)}")
+    if not selected:
+        parser.error("--runtimes must include at least one runtime")
+    if len(selected) != len(set(selected)):
+        parser.error("--runtimes contains duplicate entries")
 
     cpu_affinity = measurement_affinity(args.cpu_mode)
     if cpu_affinity is not None:
@@ -346,11 +398,14 @@ def main() -> int:
     # Cycle across runtimes per sample rather than exhausting one runtime at a
     # time. This reduces simple thermal/load drift bias within a host run.
     total_rounds = args.warmup + args.runs
+    execution_orders: list[dict[str, object]] = []
     for round_idx in range(total_rounds):
         measured = round_idx >= args.warmup
         phase = "sample" if measured else "warmup"
         index = round_idx - args.warmup + 1 if measured else round_idx + 1
-        for runtime in selected:
+        order = round_order(selected, round_idx)
+        execution_orders.append({"phase": phase, "round": index, "runtimes": order})
+        for runtime in order:
             print(f"[{phase} {index}] {runtime}", flush=True)
             output = command_output(
                 commands[runtime],
@@ -361,6 +416,7 @@ def main() -> int:
                 for name, row in records.items():
                     samples[runtime][name].append(row)
 
+    validate_comparable_workloads(samples)
     summary = summarize(samples)
     print_table(summary)
 
@@ -371,6 +427,7 @@ def main() -> int:
         "measured_runs": args.runs,
         "environment": environment_metadata(args.cpu_mode, cpu_affinity),
         "samples": samples,
+        "execution_orders": execution_orders,
         "summary": summary,
     }
 
