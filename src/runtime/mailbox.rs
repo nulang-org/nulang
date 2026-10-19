@@ -713,6 +713,72 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_local_system_signal_preempts_earlier_local_normal_message() {
+        let mut mb = Mailbox::new(2);
+        mb.push_local(make_msg(1, 10)).expect("first normal message");
+
+        let system = Message {
+            behavior_id: 2,
+            payload: MessagePayload::from_slice(&[Value::int(77)]),
+            sender: 20,
+            priority: MessagePriority::System,
+            trace_id: None,
+        };
+        mb.push_local(system).expect("system signal must bypass admission");
+
+        assert_eq!(mb.len(), 2);
+        let first = mb.pop().expect("supervisor signal must be dispatched");
+        assert_eq!(first.priority, MessagePriority::System);
+        assert_eq!(first.behavior_id, 2);
+        assert_eq!(mb.pop().expect("normal backlog preserved").behavior_id, 1);
+        assert!(mb.is_empty());
+    }
+
+    #[test]
+    fn scheduler_local_system_signals_preserve_system_fifo() {
+        let mut mb = Mailbox::new(0);
+        mb.push_local(make_msg(1, 10)).unwrap();
+        for sender in [20, 21] {
+            mb.push_local(Message {
+                behavior_id: 2,
+                payload: MessagePayload::from_slice(&[]),
+                sender,
+                priority: MessagePriority::System,
+                trace_id: None,
+            })
+            .unwrap();
+        }
+
+        assert_eq!(mb.pop().unwrap().sender, 20);
+        assert_eq!(mb.pop().unwrap().sender, 21);
+        assert_eq!(mb.pop().unwrap().sender, 10);
+        assert!(mb.is_empty());
+    }
+
+    #[test]
+    fn local_system_priority_is_consistent_between_snapshot_and_pop() {
+        let mut mb = Mailbox::new(0);
+        mb.push_local(make_msg(1, 10)).unwrap();
+        mb.push_local(Message {
+            behavior_id: 2,
+            payload: MessagePayload::from_slice(&[]),
+            sender: 20,
+            priority: MessagePriority::System,
+            trace_id: None,
+        })
+        .unwrap();
+
+        let snapshot = mb.drain();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot[0].priority, MessagePriority::System);
+        assert_eq!(snapshot[1].priority, MessagePriority::Normal);
+        assert_eq!(mb.len(), 2, "snapshot must not consume messages");
+
+        assert_eq!(mb.pop().unwrap().priority, MessagePriority::System);
+        assert_eq!(mb.pop().unwrap().priority, MessagePriority::Normal);
+    }
+
+    #[test]
     fn test_len_and_is_empty() {
         let mut mb = Mailbox::new(4);
         assert!(mb.is_empty());
