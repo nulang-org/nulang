@@ -956,6 +956,34 @@ mod tests {
     }
 }
 
+
+impl Actor {
+    /// Observe Values kept by actor-owned state, event records, registered
+    /// query handlers, and a suspended workflow's execution frames.
+    ///
+    /// This deliberately does not scan mailboxes, native/runtime roots,
+    /// active shared-VM frames or in-flight deliveries. It must NOT be
+    /// interpreted as a complete root set for reclaiming local cycles.
+    /// The caller must check heap provenance before treating a Value as a
+    /// pointer into this actor's heap.
+    pub fn visit_stored_values(&self, visit: &mut impl FnMut(Value)) {
+        for &value in self.state_data.values() {
+            visit(value);
+        }
+        for (_, payload) in &self.event_log {
+            for &value in payload {
+                visit(value);
+            }
+        }
+        for &value in self.query_handlers.values() {
+            visit(value);
+        }
+        if let Some(suspended) = &self.suspended_execution {
+            suspended.vm_state.visit_execution_values(visit);
+        }
+    }
+}
+
 impl Drop for Actor {
     fn drop(&mut self) {
         let Some(store) = self.held_object_store.take() else {
