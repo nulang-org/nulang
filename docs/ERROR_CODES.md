@@ -103,6 +103,7 @@ by `render_warning`/`format_warning` (src/diagnostic.rs) with a
 |---------|-------------------------------------------|
 | `W01xx` | Deprecations                              |
 | `W02xx` | Conservative pattern match coverage     |
+| `W03xx` | Ignored Result warnings                  |
 
 | Code    | Meaning                                   | Replacement (RFC)        |
 |---------|-------------------------------------------|--------------------------|
@@ -111,6 +112,7 @@ by `render_warning`/`format_warning` (src/diagnostic.rs) with a
 
 | `W0201` | Provably non-exhaustive finite-domain `match` | Add an unguarded case or wildcard |
 | `W0202` | Provably unreachable `match` arm | Remove redundant arm or narrow an earlier pattern |
+| `W0301` | Discarded `Result` in an intermediate block expression | Handle with `match`, propagate via `?`, or explicitly bind |
 
 In 1.x these are compatibility-preserving warnings, not errors by default.
 The existing `--deny-warnings` flag rejects both codes. Coverage currently
@@ -118,6 +120,10 @@ handles Boolean types and closed variant constructors, counting payload arms
 only when their payload patterns are irrefutable. Guarded arms never establish
 coverage; open/infinite domains are intentionally not classified. Until patterns
 carry individual source spans, W0202 points to the enclosing match expression.
+
+`W0301` warns when a statically resolved two-constructor `Ok`/`Error` variant
+is used as a discarded intermediate block expression. Final expressions are
+returned rather than discarded. `--deny-warnings` opts into strict rejection.
 
 See `docs/MIGRATION_RFC_0015.md` for the `catch`/`fail` migration guide.
 

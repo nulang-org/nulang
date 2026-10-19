@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Warn on discarded typed Results — 2026-10-19
+- **Intermediate block expressions that produce a `Result` now emit `W0301` when their value is discarded.** Returning the `Result`, or an ordinary non-Result expression, does not trigger the warning. The existing `--deny-warnings` option enables strict enforcement; 1.x default behavior is unchanged.
+- **Added focused typechecker regression cases** for ignored Results, returned values, ordinary expressions, and unrelated variants. This feature builds upon the warning infrastructure in the stacked pattern-coverage PR.
+
 ### Fabric on-demand mailbox scoring — 2026-10-18
 - **Fabric publish admission now reads mailbox pressure only for matching local subscribers**, instead of allocating and populating an all-actor mailbox snapshot on every publish.
 - **Ported the regression and exact-base matched-fixture A/B harness** from #1708 onto current main. Historical unmatched-publish microbenchmarks were favorable; new-head CI and measurements remain the promotion gate.
