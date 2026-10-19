@@ -128,16 +128,25 @@ impl<'a> MigrationPurityChecker<'a> {
                     self.walk(scope, arg, bound)?;
                 }
                 if let Expr::Var(name, _) = func.as_ref() {
-                    if !bound.iter().any(|b| b == name) {
-                        if self.externs.contains(name) {
-                            return Err(self.forbidden(
-                                scope,
-                                &format!("external/FFI call '{name}'"),
-                                *span,
-                            ));
-                        }
-                        self.expand_function(scope, name)?;
+                    // Bound values may be function parameters or local aliases.
+                    // Their target is not statically known here: allowing the
+                    // call lets an effectful helper be passed as a callback and
+                    // executed during deterministic migration replay.
+                    if bound.iter().any(|b| b == name) {
+                        return Err(self.forbidden(
+                            scope,
+                            &format!("indirect call through '{name}'"),
+                            *span,
+                        ));
                     }
+                    if self.externs.contains(name) {
+                        return Err(self.forbidden(
+                            scope,
+                            &format!("external/FFI call '{name}'"),
+                            *span,
+                        ));
+                    }
+                    self.expand_function(scope, name)?;
                 }
                 Ok(())
             }
