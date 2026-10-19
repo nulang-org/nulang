@@ -897,8 +897,6 @@ fn test_restarted_child_restores_behavior_and_state() {
     assert_eq!(count, Some(Value::int(5)));
 }
 
-
-\
 /// Fault-injecting store: the dead actor's original snapshot is readable, but
 /// an attempted re-key to a replacement actor ID fails. The runtime must never
 /// clear the only checkpoint or publish a replacement without durable state.
