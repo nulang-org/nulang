@@ -1,0 +1,86 @@
+// Experimental numeric package contract: Float matrix values and shape checks.
+// Run with `nula test` from packages/numeric.
+// These tests are introduced before the implementation as the contract.
+
+import lib
+import stdlib::test
+
+fn main() {
+    assert(valid_shape([1.0, 2.0, 3.0, 4.0], 2, 2), "valid 2x2 shape");
+    assert(valid_shape([], 0, 4), "zero-row matrix accepts empty data");
+    assert(!valid_shape([1.0, 2.0], 2, 2), "reject short buffers");
+    assert(!valid_shape([], -1, 0), "reject negative dimensions");
+    assert(!valid_shape([1.0], 0, 1), "zero-row matrix cannot contain values");
+
+    assert(sum_values([1.5, -2.0, 3.25]) == 2.75, "sum Float values");
+    assert(sum_values([]) == 0.0, "sum empty array");
+
+    match dot([1.0, 2.0, 3.0], [4.0, -5.0, 6.0]) {
+        Some(value) => assert(value == 12.0, "dot product"),
+        None => fail_with("dot equal-length vectors should succeed"),
+    };
+    match dot([1.0], []) {
+        None => unit,
+        Some(_) => fail_with("dot must reject mismatched vector lengths"),
+    };
+    match dot([], []) {
+        Some(value) => assert(value == 0.0, "zero-length dot product"),
+        None => fail_with("empty equal-length vectors should succeed"),
+    };
+
+    match from_flat([1.0, 2.0, 3.0, 4.0], 2, 2) {
+        Some(a) => {
+            assert_eq(a.rows, 2);
+            assert_eq(a.cols, 2);
+            match at(a, 1, 0) {
+                Some(value) => assert(value == 3.0, "row-major indexing"),
+                None => fail_with("in-range lookup should succeed"),
+            };
+            match at(a, 2, 0) {
+                None => unit,
+                Some(_) => fail_with("out-of-range lookup must fail"),
+            };
+            match from_flat([5.0, 6.0, 7.0, 8.0], 2, 2) {
+                Some(b) => {
+                    match matmul(a, b) {
+                        Some(product) => {
+                            assert_eq(product.rows, 2);
+                            assert_eq(product.cols, 2);
+                            assert(product.data[0] == 19.0, "matmul [0,0]");
+                            assert(product.data[1] == 22.0, "matmul [0,1]");
+                            assert(product.data[2] == 43.0, "matmul [1,0]");
+                            assert(product.data[3] == 50.0, "matmul [1,1]");
+                        },
+                        None => fail_with("compatible 2x2 matrices should multiply"),
+                    }
+                },
+                None => fail_with("second 2x2 matrix should construct"),
+            }
+        },
+        None => fail_with("first 2x2 matrix should construct"),
+    };
+
+    match from_flat([1.0, 2.0], 2, 2) {
+        None => unit,
+        Some(_) => fail_with("invalid matrix must not construct"),
+    };
+    let invalid = { rows: 2, cols: 2, data: [1.0] };
+    match at(invalid, 0, 0) {
+        None => unit,
+        Some(_) => fail_with("forged invalid matrix must fail closed"),
+    };
+    match matmul(invalid, invalid) {
+        None => unit,
+        Some(_) => fail_with("forged invalid matrices must not multiply"),
+    };
+
+    match from_flat([], 0, 0) {
+        Some(empty) => {
+            match matmul(empty, empty) {
+                Some(product) => assert_eq(perform Array.length(product.data), 0),
+                None => fail_with("0x0 multiplication should yield a 0x0 matrix"),
+            }
+        },
+        None => fail_with("0x0 matrix should be representable"),
+    };
+}
