@@ -179,15 +179,31 @@ pub unsafe fn cstr_to_value(s: *const c_char) -> Value {
     borrowed_cstr_to_value(CStr::from_ptr(s))
 }
 
+/// Take ownership of a temporary C string produced by an FFI conversion.
+///
+/// The resulting `CString` automatically releases its allocation when
+/// dropped, including on early-return and error paths. The source `Value`
+/// must never be used to reclaim that allocation again.
+///
+/// # Safety
+/// For a non-nil value, its pointer must come from `cstr_to_value` or
+/// `borrowed_cstr_to_value` and must not already have been reclaimed.
+/// This consumes the allocation's ownership, not merely a pointer borrow.
+pub unsafe fn take_cstr_value(v: Value) -> Option<CString> {
+    let ptr = v.as_ptr()?;
+    // SAFETY: caller guarantees this pointer uniquely owns a CString::into_raw
+    // allocation created by the FFI conversion and not previously reclaimed.
+    Some(unsafe { CString::from_raw(ptr as *mut c_char) })
+}
+
 /// Free a pointer value previously created by `cstr_to_value`.
 ///
 /// # Safety
-/// `v` must be a pointer value whose payload was returned by `CString::into_raw`.
+/// `v` must hold a currently owned FFI CString pointer (or be nil). It must
+/// not be freed twice or used after this call.
 pub unsafe fn free_cstr_value(v: Value) {
-    if let Some(ptr) = v.as_ptr() {
-        // SAFETY: ptr came from CString::into_raw in cstr_to_value.
-        let _ = CString::from_raw(ptr as *mut c_char);
-    }
+    // SAFETY: caller supplies a unique FFI CString allocation or nil.
+    let _ = unsafe { take_cstr_value(v) };
 }
 
 /// Marshal a C void pointer return value into a Nulang pointer value.
