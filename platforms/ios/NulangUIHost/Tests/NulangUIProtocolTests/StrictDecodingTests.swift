@@ -34,10 +34,10 @@ final class StrictDecodingTests: XCTestCase {
 
     func testNodeRejectsExplicitNullCollections() {
         for field in ["properties", "children", "actions"] {
-            let json = "{\"id\":\"title\",\"kind\":\"text\",\"\\(field)\":null}"
+            let json = "{\"id\":\"title\",\"kind\":\"text\",\"\(field)\":null}"
             XCTAssertThrowsError(
                 try JSONDecoder().decode(UiNode.self, from: Data(json.utf8)),
-                "explicit null for \\(field) must not decode as a missing collection"
+                "explicit null for \(field) must not decode as a missing collection"
             )
         }
     }
