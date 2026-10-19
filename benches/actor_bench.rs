@@ -174,6 +174,44 @@ fn bench_message_drain(c: &mut Criterion) {
     group.finish();
 }
 
+/// Cross-shard channel admission cost for small inline and larger shared
+/// payloads. Creation, behavior registration, and target-side processing
+/// are excluded from the timed region. This measures sends only, not
+/// end-to-end cross-shard message delivery or throughput.
+fn bench_cross_shard_enqueue(c: &mut Criterion) {
+    let mut group = c.benchmark_group("actor/cross_shard_enqueue_by_id");
+    group.throughput(Throughput::Elements(MESSAGE_BATCH as u64));
+
+    for len in [0usize, 1, 4, 5, 16] {
+        let args: Vec<Value> = (0..len).map(|i| Value::int(i as i64)).collect();
+        group.bench_with_input(BenchmarkId::from_parameter(len), &args, |b, args| {
+            b.iter_batched_ref(
+                || {
+                    let mut shards = Runtime::new_sharded(2);
+                    let mut target = shards[1].spawn_actor(Box::new(|| vec![]));
+                    while target % 2 != 1 {
+                        target = shards[1].spawn_actor(Box::new(|| vec![]));
+                    }
+                    shards[1]
+                        .actors
+                        .get_mut(&target)
+                        .unwrap()
+                        .register_behavior("handle", noop_handler);
+                    (shards, target)
+                },
+                |(shards, target)| {
+                    for _ in 0..MESSAGE_BATCH {
+                        shards[0].send_message_by_id(*target, 0, black_box(args));
+                    }
+                    black_box(shards);
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
 fn selective_receive_mailbox(depth: usize, hit_behavior: u16) -> Mailbox {
     let mut mailbox = Mailbox::new(0);
     for _ in 0..depth.saturating_sub(1) {
@@ -267,5 +305,6 @@ criterion_group!(
     bench_spawn_send_receive,
     bench_message_enqueue,
     bench_message_drain,
+    bench_cross_shard_enqueue,
     bench_selective_receive
 );

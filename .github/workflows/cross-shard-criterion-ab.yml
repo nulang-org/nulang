@@ -1,0 +1,56 @@
+name: Cross-shard Criterion exact-base A/B
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/cross-shard-criterion-ab.yml'
+      - 'scripts/cross_shard_criterion_ab.py'
+      - 'scripts/tests/test_cross_shard_criterion_ab.py'
+      - 'scripts/confirm_bench_regression.py'
+      - 'benches/actor_bench.rs'
+      - 'src/runtime/**'
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Exact base commit SHA or ref for paired comparison
+        required: true
+      runs:
+        description: Even number of paired measured rounds
+        required: false
+        default: '4'
+
+concurrency:
+  group: cross-shard-criterion-ab-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    name: Paired shard enqueue Criterion
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test paired comparator
+        run: python3 -m unittest scripts/tests/test_cross_shard_criterion_ab.py
+
+      - name: Exact-base matched-fixture Criterion A/B
+        env:
+          BASE_REF: "${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || inputs.base_ref }}"
+          RUNS: "${{ github.event_name == 'pull_request' && '4' || inputs.runs }}"
+        run: |
+          python3 scripts/cross_shard_criterion_ab.py \
+            --base-ref "$BASE_REF" \
+            --runs "$RUNS" \
+            --warmup 1 \
+            --cpu-mode single
+
+      # The log contains compact paired results. No stored artifact is needed.

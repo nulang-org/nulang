@@ -317,7 +317,7 @@ enum CrossShardMsg {
     DeliverMessage {
         target_id: u64,
         behavior_id: u16,
-        payload: Vec<Value>,
+        payload: MessagePayload,
         sender: u64,
         trace_id: Option<String>,
         grain_id: Option<GrainId>,
@@ -329,7 +329,7 @@ enum CrossShardMsg {
     DeliverNamedMessage {
         target_id: u64,
         behavior_name: String,
-        payload: Vec<Value>,
+        payload: MessagePayload,
         sender: u64,
         trace_id: Option<String>,
         object_holds: ObjectRefLease,
@@ -1471,7 +1471,7 @@ impl Runtime {
         &mut self,
         target_id: u64,
         behavior_id: u16,
-        payload: Vec<Value>,
+        payload: MessagePayload,
         sender: u64,
         trace_id: Option<String>,
         grain_id: Option<GrainId>,
@@ -1507,7 +1507,7 @@ impl Runtime {
 
         let msg = Message {
             behavior_id,
-            payload: MessagePayload::from_vec(payload),
+            payload,
             sender,
             priority: MessagePriority::Normal,
             trace_id: trace_id.clone(),
@@ -1812,12 +1812,7 @@ impl Runtime {
             let target_shard = (target_id % self.shard_count as u64) as u16;
             if target_shard != self.shard_idx {
                 let out_trace = self.current_trace.as_ref().map(|t| t.to_traceparent());
-                let _ = self.send_cross_shard_named_message(
-                    target_id,
-                    behavior,
-                    args.to_vec(),
-                    out_trace,
-                );
+                let _ = self.send_cross_shard_named_message(target_id, behavior, args, out_trace);
                 return;
             }
         }
@@ -2369,12 +2364,12 @@ impl Runtime {
         &mut self,
         target_id: u64,
         behavior_id: u16,
-        args: Vec<Value>,
+        payload: MessagePayload,
         out_trace: Option<String>,
         grain_id: Option<GrainId>,
     ) -> MessageAdmission {
         let target_shard = (target_id % self.shard_count as u64) as u16;
-        for arg in &args {
+        for arg in payload.as_slice() {
             if arg.is_ptr() || arg.is_actor_ref() || arg.is_closure() {
                 tracing::warn!(
                     "nulang-shard: dropping cross-shard message to actor {}: \
@@ -2384,7 +2379,8 @@ impl Runtime {
                 return MessageAdmission::Rejected;
             }
         }
-        let Some(object_holds) = ObjectRefLease::acquire(&self.object_store, &args) else {
+        let Some(object_holds) = ObjectRefLease::acquire(&self.object_store, payload.as_slice())
+        else {
             warn!(
                 "nulang-shard: rejecting cross-shard message to actor {}: object ref not found",
                 target_id
@@ -2395,7 +2391,7 @@ impl Runtime {
         let result = tx[target_shard as usize].try_send(CrossShardMsg::DeliverMessage {
             target_id,
             behavior_id,
-            payload: args,
+            payload,
             sender: self.current_actor.unwrap_or(0),
             trace_id: out_trace,
             grain_id,
@@ -2430,11 +2426,11 @@ impl Runtime {
         &mut self,
         target_id: u64,
         behavior_name: &str,
-        args: Vec<Value>,
+        args: &[Value],
         out_trace: Option<String>,
     ) -> MessageAdmission {
         let target_shard = (target_id % self.shard_count as u64) as u16;
-        for arg in &args {
+        for arg in args {
             if arg.is_ptr() || arg.is_actor_ref() || arg.is_closure() {
                 warn!(
                     "nulang-shard: dropping named cross-shard message to actor {}: \
@@ -2445,7 +2441,7 @@ impl Runtime {
             }
         }
 
-        let Some(object_holds) = ObjectRefLease::acquire(&self.object_store, &args) else {
+        let Some(object_holds) = ObjectRefLease::acquire(&self.object_store, args) else {
             warn!(
                 "nulang-shard: rejecting named cross-shard message to actor {}: object ref not found",
                 target_id
@@ -2456,7 +2452,7 @@ impl Runtime {
         let result = tx[target_shard as usize].try_send(CrossShardMsg::DeliverNamedMessage {
             target_id,
             behavior_name: behavior_name.to_string(),
-            payload: args,
+            payload: MessagePayload::from_slice(args),
             sender: self.current_actor.unwrap_or(0),
             trace_id: out_trace,
             object_holds,
@@ -2500,7 +2496,7 @@ impl Runtime {
                 return self.send_cross_shard_message(
                     target_id,
                     behavior_id,
-                    args.to_vec(),
+                    MessagePayload::from_slice(args),
                     out_trace,
                     None,
                 );
@@ -2546,7 +2542,7 @@ impl Runtime {
                 self.send_cross_shard_message(
                     stable_id,
                     behavior_id,
-                    args,
+                    MessagePayload::from_vec(args),
                     out_trace,
                     Some(grain_id.clone()),
                 );
@@ -2685,7 +2681,7 @@ impl Runtime {
                 self.send_cross_shard_message(
                     target_id,
                     behavior_id,
-                    args.to_vec(),
+                    MessagePayload::from_slice(args),
                     out_trace.clone(),
                     None,
                 );
