@@ -57,7 +57,8 @@ fn noalloc_forbidden_opcode(opcode: OpCode) -> Option<&'static str> {
         | IToF | FToI | FPow | ICmpEq | ICmpLt | ICmpGt | ICmpLe | ICmpGe | FCmpEq | FCmpLt
         | FCmpGt | Not | And | Or | Jmp | JmpT | JmpF | Switch | Call | TailCall | Ret
         | RetVal | Closure | CapLoad | FreeVar | ClosureCall | FieldL | FieldS | ArrLoad
-        | ArrStore | ArrLen | TupleL | RecL | RecS | IsTag | Unpack | Drop | SelfOp | NodeId => None,
+        | ArrStore | ArrLen | TupleL | RecL | RecS | IsTag | Unpack | Drop | SelfOp
+        | NodeId => None,
     }
 }
 
