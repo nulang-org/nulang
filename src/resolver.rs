@@ -14,6 +14,218 @@ struct SourcedDecl {
     origin: PathBuf,
 }
 
+/// A qualified symbol's lexical category; no runtime or artifact encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QualifiedSymbolKind {
+    Function,
+    Type,
+}
+
+/// Source-level identity of one exported declaration. The canonical source
+/// path is resolver metadata only: do not embed it in serialized type IDs,
+/// compiled NBC artifacts, or distributed actor protocols.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QualifiedSymbol {
+    pub origin: PathBuf,
+    pub name: String,
+    pub kind: QualifiedSymbolKind,
+}
+
+/// A single module's visible exports. Keep overloaded declarations as a list,
+/// rather than silently choosing the last definition with a given name.
+#[derive(Clone, Debug)]
+struct IndexedModule {
+    origin: PathBuf,
+    exports: BTreeMap<String, Vec<QualifiedSymbol>>,
+}
+
+/// Lexically scoped alias lookup foundation for future qualified imports.
+///
+/// This index deliberately does *not* lower or execute aliases. The existing
+/// frontend still rejects imported aliases until all compiler passes use
+/// resolved symbols consistently. Only explicitly public declarations are
+/// indexed. Reexports and constructors require a later export-model pass.
+#[derive(Debug, Default)]
+pub struct QualifiedImportIndex {
+    aliases: BTreeMap<String, IndexedModule>,
+}
+
+impl QualifiedImportIndex {
+    /// Register an already-parsed module under a local alias.
+    ///
+    /// Repeat registration of the same canonical source is idempotent;
+    /// attempting to reuse an alias for another source fails closed.
+    pub fn bind(
+        &mut self,
+        alias: &str,
+        source_file: &Path,
+        module: &AstModule,
+        span: Span,
+    ) -> NuResult<()> {
+        if alias.is_empty() {
+            return Err(NuError::parse_error(
+                "empty qualified module alias".to_string(),
+                span,
+            ));
+        }
+        let origin = source_file.canonicalize().map_err(|error| {
+            NuError::parse_error(
+                format!(
+                    "cannot resolve canonical module source '{}': {}",
+                    source_file.display(),
+                    error
+                ),
+                span,
+            )
+        })?;
+        if let Some(existing) = self.aliases.get(alias) {
+            if existing.origin == origin {
+                return Ok(());
+            }
+            return Err(NuError::parse_error(
+                format!(
+                    "module alias conflict: '{}' already refers to a different module",
+                    alias
+                ),
+                span,
+            ));
+        }
+        let mut exports: BTreeMap<String, Vec<QualifiedSymbol>> = BTreeMap::new();
+        for decl in &module.decls {
+            let Some((name, kind)) = exported_decl(decl) else {
+                continue;
+            };
+            exports
+                .entry(name.to_string())
+                .or_default()
+                .push(QualifiedSymbol {
+                    origin: origin.clone(),
+                    name: name.to_string(),
+                    kind,
+                });
+        }
+        self.aliases
+            .insert(alias.to_string(), IndexedModule { origin, exports });
+        Ok(())
+    }
+
+    /// Resolve a public symbol without falling back to unrelated unqualified
+    /// bindings. Overloads are preserved for subsequent type-directed lookup.
+    pub fn resolve(
+        &self,
+        alias: &str,
+        symbol: &str,
+        span: Span,
+    ) -> NuResult<&[QualifiedSymbol]> {
+        let module = self.aliases.get(alias).ok_or_else(|| {
+            NuError::parse_error(format!("unknown module alias '{}'", alias), span)
+        })?;
+        module
+            .exports
+            .get(symbol)
+            .map(Vec::as_slice)
+            .ok_or_else(|| {
+                NuError::parse_error(
+                    format!("'{}' is not exported by module alias '{}'", symbol, alias),
+                    span,
+                )
+            })
+    }
+}
+
+/// Conservative export discovery: declarations without explicit visibility
+/// are not accidentally made public by import aliases.
+fn exported_decl(decl: &Decl) -> Option<(&str, QualifiedSymbolKind)> {
+    match decl {
+        Decl::Function {
+            name,
+            public: true,
+            ..
+        } => Some((name, QualifiedSymbolKind::Function)),
+        Decl::TypeAlias {
+            name,
+            public: true,
+            ..
+        }
+        | Decl::RecordType {
+            name,
+            public: true,
+            ..
+        }
+        | Decl::VariantType {
+            name,
+            public: true,
+            ..
+        } => Some((name, QualifiedSymbolKind::Type)),
+        _ => None,
+    }
+}
+
+/// Build a resolver-only index of direct aliased imports. This is a
+/// preparatory semantic pass: the compiler still rejects alias imports until
+/// the full type/HIR/backend pipeline consumes resolved symbols.
+///
+/// This pass does not recursively reexport dependencies or flatten imported
+/// declarations into the requesting module. Missing or private exports
+/// remain inaccessible; callers cannot fall back to unrelated local names.
+pub fn index_qualified_imports(
+    module: &AstModule,
+    current_file: &Path,
+) -> NuResult<QualifiedImportIndex> {
+    let base = current_file
+        .canonicalize()
+        .unwrap_or_else(|_| current_file.to_path_buf());
+    let dir = base.parent().unwrap_or(&base);
+    let mut index = QualifiedImportIndex::default();
+
+    for declaration in &module.decls {
+        let Decl::Import {
+            path,
+            alias: Some(alias),
+            items,
+            span,
+        } = declaration
+        else {
+            continue;
+        };
+        if module.decls.iter().any(|decl| {
+            !matches!(decl, Decl::Import { .. }) && decl_name(decl) == Some(alias.as_str())
+        }) {
+            return Err(NuError::parse_error(
+                format!("module alias shadows local declaration: '{}'", alias),
+                *span,
+            ));
+        }
+        if !items.is_empty() {
+            return Err(NuError::parse_error(
+                "qualified imports with a selective item list are not supported".to_string(),
+                *span,
+            ));
+        }
+        let path = resolve_path(dir, path);
+        let source = std::fs::read_to_string(&path).map_err(|error| {
+            NuError::parse_error(
+                format!("cannot read qualified module '{}': {}", path.display(), error),
+                *span,
+            )
+        })?;
+        let tokens = Lexer::new(&source).lex().map_err(|error| {
+            NuError::parse_error(
+                format!("lex error in qualified module '{}': {}", path.display(), error),
+                *span,
+            )
+        })?;
+        let imported = Parser::new(tokens).parse_module().map_err(|error| {
+            NuError::parse_error(
+                format!("parse error in qualified module '{}': {}", path.display(), error),
+                *span,
+            )
+        })?;
+        index.bind(alias, &path, &imported, *span)?;
+    }
+    Ok(index)
+}
+
 thread_local! {
     /// Cache *complete* resolved modules, with the original file for each
     /// declaration. Selective imports are filtered at the use site, not cached
@@ -568,6 +780,169 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("qualified imports"), "{msg}");
         assert!(!msg.contains("cannot read"), "{msg}");
+    }
+
+    fn public_fn(name: &str) -> Decl {
+        let mut decl = fn_decl(name);
+        if let Decl::Function { public, .. } = &mut decl {
+            *public = true;
+        }
+        decl
+    }
+
+    fn temp_module_path(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_SYMBOL_FIXTURE: AtomicU64 = AtomicU64::new(0);
+        let n = NEXT_SYMBOL_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "nulang_symbol_index_{}_{}_{}.nula",
+            std::process::id(),
+            n,
+            label
+        ));
+        std::fs::write(&path, "").expect("create test module");
+        path
+    }
+
+    #[test]
+    fn qualified_symbols_from_separate_modules_remain_distinct() {
+        let left = temp_module_path("left");
+        let right = temp_module_path("right");
+        let ast = AstModule {
+            name: "test".into(),
+            decls: vec![public_fn("run")],
+        };
+        let mut bindings = QualifiedImportIndex::default();
+        bindings.bind("one", &left, &ast, sp()).expect("bind first");
+        bindings.bind("two", &right, &ast, sp()).expect("bind second");
+        let first = bindings.resolve("one", "run", sp()).expect("first exported");
+        let second = bindings.resolve("two", "run", sp()).expect("second exported");
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_ne!(first[0].origin, second[0].origin);
+        assert_eq!(first[0].kind, QualifiedSymbolKind::Function);
+        std::fs::remove_file(left).unwrap();
+        std::fs::remove_file(right).unwrap();
+    }
+
+    #[test]
+    fn qualified_index_does_not_export_private_declarations() {
+        let path = temp_module_path("visibility");
+        let ast = AstModule {
+            name: "test".into(),
+            decls: vec![fn_decl("private"), public_fn("exposed")],
+        };
+        let mut bindings = QualifiedImportIndex::default();
+        bindings.bind("mod", &path, &ast, sp()).expect("bind");
+        assert!(bindings.resolve("mod", "exposed", sp()).is_ok());
+        let err = bindings.resolve("mod", "private", sp()).unwrap_err();
+        assert!(format!("{err}").contains("not exported"), "{err}");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn qualified_index_rejects_unknown_alias_or_missing_export() {
+        let path = temp_module_path("unknown");
+        let ast = AstModule {
+            name: "test".into(),
+            decls: vec![public_fn("known")],
+        };
+        let mut bindings = QualifiedImportIndex::default();
+        bindings.bind("mod", &path, &ast, sp()).expect("bind");
+        let unknown = bindings.resolve("elsewhere", "known", sp()).unwrap_err();
+        let missing = bindings.resolve("mod", "missing", sp()).unwrap_err();
+        assert!(format!("{unknown}").contains("unknown module alias"));
+        assert!(format!("{missing}").contains("not exported"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn duplicate_alias_same_source_is_idempotent_but_different_source_fails() {
+        let first = temp_module_path("first");
+        let second = temp_module_path("second");
+        let ast = AstModule {
+            name: "test".into(),
+            decls: vec![public_fn("go")],
+        };
+        let mut bindings = QualifiedImportIndex::default();
+        bindings.bind("lib", &first, &ast, sp()).unwrap();
+        bindings.bind("lib", &first, &ast, sp()).unwrap();
+        assert_eq!(bindings.resolve("lib", "go", sp()).unwrap().len(), 1);
+        let err = bindings.bind("lib", &second, &ast, sp()).unwrap_err();
+        assert!(format!("{err}").contains("module alias conflict"), "{err}");
+        std::fs::remove_file(first).unwrap();
+        std::fs::remove_file(second).unwrap();
+    }
+
+    #[test]
+    fn public_opaque_types_keep_canonical_source_origin() {
+        let path = temp_module_path("opaque");
+        let mut bindings = QualifiedImportIndex::default();
+        let ast = AstModule {
+            name: "test".into(),
+            decls: vec![Decl::TypeAlias {
+                name: "Token".into(),
+                type_params: vec![],
+                body: crate::types::Type::int(),
+                opaque: true,
+                public: true,
+                span: sp(),
+            }],
+        };
+        bindings.bind("ids", &path, &ast, sp()).unwrap();
+        let symbols = bindings.resolve("ids", "Token", sp()).unwrap();
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].kind, QualifiedSymbolKind::Type);
+        assert_eq!(symbols[0].origin, path.canonicalize().unwrap());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn source_import_index_discovers_public_symbols_without_flattening() {
+        let temp = temp_module_path("root");
+        let sibling = temp.with_file_name(format!(
+            "nulang_qualified_source_{}_{}.nula",
+            std::process::id(),
+            temp.file_stem().unwrap().to_string_lossy()
+        ));
+        std::fs::write(
+            &sibling,
+            "pub fn accessible() -> Int { 7 }\nfn internal() -> Int { 8 }\n",
+        )
+        .unwrap();
+        let source = format!(
+            "import {} as utilities\n",
+            sibling.file_stem().unwrap().to_string_lossy()
+        );
+        let tokens = Lexer::new(&source).lex().unwrap();
+        let module = Parser::new(tokens).parse_module().unwrap();
+        let index = index_qualified_imports(&module, &temp).expect("read qualified module");
+        assert!(index.resolve("utilities", "accessible", sp()).is_ok());
+        assert!(index.resolve("utilities", "internal", sp()).is_err());
+        // Indexing must not modify or flatten the program's import AST.
+        assert!(matches!(&module.decls[0], Decl::Import { alias: Some(a), .. } if a == "utilities"));
+        std::fs::remove_file(temp).unwrap();
+        std::fs::remove_file(sibling).unwrap();
+    }
+
+    #[test]
+    fn source_import_index_rejects_alias_shadowing_local_names() {
+        let path = temp_module_path("alias_collision");
+        let module = AstModule {
+            name: "test".into(),
+            decls: vec![
+                public_fn("utilities"),
+                Decl::Import {
+                    path: "missing".into(),
+                    items: vec![],
+                    alias: Some("utilities".into()),
+                    span: sp(),
+                },
+            ],
+        };
+        let err = index_qualified_imports(&module, &path).unwrap_err();
+        assert!(format!("{err}").contains("alias shadows local declaration"), "{err}");
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
