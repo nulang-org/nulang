@@ -390,4 +390,33 @@ mod tests {
         );
         std::env::remove_var("NULANG_MODULE_PATH");
     }
+    #[test]
+    fn test_resolve_cached_import_applies_each_selection() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("nulang-import-test-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("helpers.nula");
+        std::fs::write(&source, "fn alpha() = 1\nfn beta() = 2\n").unwrap();
+        let mut module = AstModule {
+            name: "test".into(),
+            decls: vec![
+                Decl::Import { path: "helpers".into(), items: vec!["alpha".into()], span: sp() },
+                Decl::Import { path: "helpers".into(), items: vec!["beta".into()], span: sp() },
+            ],
+        };
+        let result = resolve_imports(&mut module, &dir.join("main.nula"), &mut HashSet::new());
+        let _ = std::fs::remove_dir_all(&dir);
+        result.expect("both names should be imported after a cache hit");
+        assert_eq!(module.decls.iter().filter(|d| decl_name(d) == Some("alpha")).count(), 1);
+        assert_eq!(module.decls.iter().filter(|d| decl_name(d) == Some("beta")).count(), 1);
+    }
+
+    #[test]
+    fn test_resolve_selective_import_rejects_unknown_name() {
+        let decls = vec![fn_decl("alpha")];
+        let result = select_import_decls(decls, &["missing".into()], "helpers");
+        assert!(result.is_err(), "unknown import names must not be ignored");
+    }
+
 }
