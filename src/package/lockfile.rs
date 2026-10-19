@@ -241,6 +241,47 @@ impl Lockfile {
         Ok(())
     }
 
+    /// Populate strong source IDs for cached registry and Git packages.
+    /// The key remains the original source/version/commit lock pin; this
+    /// additive identity commits to the actual local source tree as well.
+    fn populate_cached_source_identities(&mut self, root: &Path) -> NuResult<()> {
+        for package in self.package.clone() {
+            let cached = if package.source.starts_with("git+") {
+                root.join(".nula").join("git").join(&package.name)
+            } else if package.source.starts_with("reg+") {
+                root.join(".nula")
+                    .join("registry")
+                    .join(format!("{}-{}", package.name, package.version))
+            } else {
+                continue;
+            };
+            if !cached.join("Nulang.toml").exists() {
+                continue;
+            }
+            let source_id =
+                source_id_for_package_dir(&cached).map_err(|error| NuError::PackageError {
+                    msg: format!(
+                        "cannot compute cached source identity for '{}' {}: {}",
+                        package.name, package.version, error
+                    ),
+                    span: Span::default(),
+                })?;
+            let semantic_id = self
+                .package_identity(&package.name, &package.version, &package.source)
+                .map(LockedPackageIdentity::parsed_semantic_id)
+                .transpose()?
+                .flatten();
+            self.set_package_identity(
+                &package.name,
+                &package.version,
+                &package.source,
+                Some(source_id),
+                semantic_id,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Return a clone enriched with every source identity that can be computed
     /// from currently available path dependencies.
     pub fn with_available_source_identities(&self) -> NuResult<Self> {
@@ -321,7 +362,8 @@ impl Lockfile {
     /// retain their existing values.
     pub fn save(&self, dir: &Path) -> NuResult<()> {
         let path = dir.join(LOCKFILE_FILE);
-        let enriched = self.with_available_source_identities()?;
+        let mut enriched = self.with_available_source_identities()?;
+        enriched.populate_cached_source_identities(dir)?;
         std::fs::write(&path, enriched.to_toml()?).map_err(|e| NuError::PackageError {
             msg: format!("cannot write {}: {}", path.display(), e),
             span: Span::default(),
