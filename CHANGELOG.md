@@ -1,4 +1,9 @@
 # Nulang Changelog
+
+### Experimental Web response header/cookie safety — 2026-10-17
+- The HTTP/1.1 response writer now rejects invalid header names/values and caller-supplied `Content-Length` / `Transfer-Encoding`, emitting a fixed 500 rather than serializing unsafe framing or CR/LF.
+- `Web.set_cookie` and `Web.clear_cookie` fail closed on malformed cookie names or values; the effect interface still returns `Unit` rather than a typed validation error. Focused wire-response and cookie regression tests cover unsafe input and unaffected valid cookies.
+
 ### Bounded Nulang Web development-server connections — 2026-10-16
 - **The experimental Web development listener caps active connections at 64**, including SSE, and returns `503` with `Retry-After: 1` when full.
 - **Worker capacity is returned by a scoped RAII lease** after normal completion, panic, or thread-spawn failure. One shared `Arc` route table replaces per-connection clones of compiled route modules.
