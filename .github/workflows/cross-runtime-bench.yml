@@ -25,6 +25,7 @@ on:
       - 'benchmarks/cross_runtime/**'
       - 'benchmarks/README.md'
       - 'scripts/cross_runtime_bench.py'
+      - 'scripts/tests/test_cross_runtime_command.py'
       - 'src/benchmarks.rs'
       - 'src/bin/nulang_savina.rs'
       - 'benchmarks/SAVINA.md'
@@ -42,6 +43,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Test cross-runtime subprocess and Go baseline contracts
+        run: python3 -m unittest scripts/tests/test_cross_runtime_command.py
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -51,7 +55,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v7
         with:
-          go-version: '1.25.x'
+          go-version: '1.27.x'
 
       - name: Install Erlang
         run: |
