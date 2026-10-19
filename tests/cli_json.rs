@@ -467,3 +467,25 @@ fn nula_test_expression_bodied_main_does_not_consume_test_functions() {
     assert_eq!(cases[0]["status"], "ok");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+
+#[test]
+fn nula_test_filter_without_a_value_is_an_error() {
+    let dir = temp_dir("missing_filter");
+    scaffold_package(
+        &dir,
+        "fn main() = 1\n",
+        &[("checks.nula", "fn main() = 1\n")],
+    );
+    let out = run_nula(&dir, &["test", "--filter"]);
+    assert!(
+        !out.status.success(),
+        "a missing --filter argument cannot silently run the entire suite"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("requires a value"),
+        "expected a useful error: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
