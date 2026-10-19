@@ -1108,6 +1108,10 @@ impl PersistenceStore for MemoryStore {
             || source.crdt_field_map.is_some()
             || self.durable_tails.contains_key(&from)
             || self.committed_transitions.contains_key(&from)
+            || self
+                .workflow_events
+                .get(&from)
+                .is_some_and(|events| events.iter().any(|event| event.activation_id().is_some()))
         {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
