@@ -21,6 +21,27 @@ final class StrictDecodingTests: XCTestCase {
         XCTAssertThrowsError(try JSONDecoder().decode(WireValue.self, from: invalid))
     }
 
+    func testRevisionRejectsNegativeZeroAndNegativeValues() {
+        for json in ["\"-0\"", "\"-1\""] {
+            XCTAssertThrowsError(try JSONDecoder().decode(Revision.self, from: Data(json.utf8)))
+        }
+    }
+
+    func testRevisionAllowsPositiveSignLikeRustUnsignedParsing() throws {
+        let revision = try JSONDecoder().decode(Revision.self, from: Data("\"+42\"".utf8))
+        XCTAssertEqual(revision, Revision(42))
+    }
+
+    func testNodeRejectsExplicitNullCollections() {
+        for field in ["properties", "children", "actions"] {
+            let json = "{\"id\":\"title\",\"kind\":\"text\",\"\(field)\":null}"
+            XCTAssertThrowsError(
+                try JSONDecoder().decode(UiNode.self, from: Data(json.utf8)),
+                "explicit null for \(field) must not decode as a missing collection"
+            )
+        }
+    }
+
     func testNodeOmittedCollectionsDecodeToEmpty() throws {
         let json = Data("{\"id\":\"title\",\"kind\":\"text\"}".utf8)
         let node = try JSONDecoder().decode(UiNode.self, from: json)

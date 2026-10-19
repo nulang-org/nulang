@@ -13,7 +13,9 @@ public struct Revision: Codable, Hashable, Comparable, Sendable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
         let text = try container.decode(String.self)
-        guard let value = UInt64(text) else {
+        // Rust's u64 parser allows a leading + but rejects every minus sign,
+        // including -0 (which Swift's UInt64 initializer otherwise accepts).
+        guard !text.hasPrefix("-"), let value = UInt64(text) else {
             throw DecodingError.dataCorruptedError(
                 in: container,
                 debugDescription: "revision must be a decimal UInt64 string"
@@ -235,9 +237,23 @@ public struct UiNode: Codable, Equatable, Sendable, Identifiable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(String.self, forKey: .id)
         kind = try container.decode(String.self, forKey: .kind)
-        properties = try container.decodeIfPresent([String: WireValue].self, forKey: .properties) ?? [:]
-        children = try container.decodeIfPresent([String].self, forKey: .children) ?? []
-        actions = try container.decodeIfPresent([ActionBinding].self, forKey: .actions) ?? []
+        // Match #[serde(default)] in nulang-ui-protocol: omitted collections
+        // default to empty, but explicit JSON null is invalid.
+        if container.contains(.properties) {
+            properties = try container.decode([String: WireValue].self, forKey: .properties)
+        } else {
+            properties = [:]
+        }
+        if container.contains(.children) {
+            children = try container.decode([String].self, forKey: .children)
+        } else {
+            children = []
+        }
+        if container.contains(.actions) {
+            actions = try container.decode([ActionBinding].self, forKey: .actions)
+        } else {
+            actions = []
+        }
     }
 }
 
