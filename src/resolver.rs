@@ -432,6 +432,44 @@ mod tests {
     }
 
     #[test]
+    fn test_selective_import_rejects_omitted_function_dependency() {
+        let mut parser = Parser::new(
+            Lexer::new("fn abs(x: Int) = if x < 0 then -x else x\nfn gcd(a: Int, b: Int) = abs(a)")
+                .lex()
+                .expect("valid source"),
+        );
+        let decls = parser.parse_module().expect("parse test module").decls;
+        let result = select_import_decls(decls, &["gcd".into()], "math");
+        assert!(result.is_err(), "selecting gcd must not silently discard abs");
+    }
+
+    #[test]
+    fn test_selective_import_accepts_standalone_function() {
+        let mut parser = Parser::new(
+            Lexer::new("fn abs(x: Int) = if x < 0 then -x else x\nfn gcd(a: Int, b: Int) = abs(a)")
+                .lex()
+                .expect("valid source"),
+        );
+        let decls = parser.parse_module().expect("parse test module").decls;
+        let selected = select_import_decls(decls, &["abs".into()], "math")
+            .expect("independent function should be selectable");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(decl_name(&selected[0]), Some("abs"));
+    }
+
+    #[test]
+    fn test_selective_import_rejects_omitted_module_type() {
+        let mut parser = Parser::new(
+            Lexer::new("type Id = Int\nfn use_id(id: Id) -> Id = id")
+                .lex()
+                .expect("valid source"),
+        );
+        let decls = parser.parse_module().expect("parse test module").decls;
+        let result = select_import_decls(decls, &["use_id".into()], "types");
+        assert!(result.is_err(), "type dependencies must not silently disappear");
+    }
+
+    #[test]
     fn test_resolve_selective_import_rejects_unknown_name() {
         let decls = vec![fn_decl("alpha")];
         let result = select_import_decls(decls, &["missing".into()], "helpers");
