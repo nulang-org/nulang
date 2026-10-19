@@ -4979,6 +4979,21 @@ mod tests {
     }
 
     #[test]
+    fn test_tuple_pattern_error_preserves_match_source_span() {
+        let mut tc = TypeChecker::new();
+        let match_span = Span::new(13, 49);
+        let expr = Expr::Match {
+            scrutinee: Box::new(tuple(vec![int_lit(1), int_lit(2)])),
+            arms: vec![(Pattern::Tuple(vec![Pattern::Wild]), None, int_lit(0))],
+            span: match_span,
+        };
+        match tc.infer_expr(&TypeContext::new(), &expr) {
+            Err(NuError::TypeError { span, .. }) => assert_eq!(span, match_span),
+            other => panic!("expected a spanned tuple-pattern error, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_match_accepts_tuple_pattern_of_exact_arity() {
         let mut tc = TypeChecker::new();
         let expr = Expr::Match {
