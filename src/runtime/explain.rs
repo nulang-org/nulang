@@ -189,13 +189,19 @@ impl Runtime {
     ///
     /// `reset_scheduler_stats` must not be called inside `operation`; if
     /// it is, `scheduler_counter_reset` flags incomplete deltas.
-    pub fn explain_analyze<R>(&mut self, operation: impl FnOnce(&mut Runtime) -> R) -> (R, RuntimeExplainReport) {
+    pub fn explain_analyze<R>(
+        &mut self,
+        operation: impl FnOnce(&mut Runtime) -> R,
+    ) -> (R, RuntimeExplainReport) {
         let before = self.metrics_snapshot();
         let start = Instant::now();
         let value = operation(self);
         let elapsed = start.elapsed();
         let after = self.metrics_snapshot();
-        (value, RuntimeExplainReport::between(before, after, elapsed))
+        (
+            value,
+            RuntimeExplainReport::between(before, after, elapsed),
+        )
     }
 }
 
