@@ -121,3 +121,15 @@ fn requires_check_and_rejects_json_and_execution_modes() {
     assert!(!String::from_utf8_lossy(&eval.stdout).contains("INSPECTION_EXECUTED"));
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn source_line_metadata_is_deterministic_across_runs() {
+    let (dir, file) = source("source_lines", "fn z() -> Int = 2\nfn a() -> Int = 1\n");
+    let first = run(&["--inspect-mir", "--check"], Some(&file));
+    let second = run(&["--inspect-mir", "--check"], Some(&file));
+    assert!(first.status.success(), "{}", String::from_utf8_lossy(&first.stderr));
+    assert!(second.status.success(), "{}", String::from_utf8_lossy(&second.stderr));
+    assert_eq!(first.stdout, second.stdout, "same input should produce stable IR metadata");
+    assert!(String::from_utf8_lossy(&first.stdout).contains("source_lines="));
+    std::fs::remove_dir_all(dir).unwrap();
+}
