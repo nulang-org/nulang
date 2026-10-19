@@ -3436,12 +3436,9 @@ impl TypeChecker {
                         // too-long patterns, letting MIR bind missing fields
                         // to nil or silently ignore additional tuple values.
                         if tys.len() != pats.len() {
-                            return Err(NuError::type_error(
-                                format!(
-                                    "tuple pattern has {} element(s), but the tuple has {}",
-                                    pats.len(),
-                                    tys.len()
-                                ),
+                            return Err(NuError::type_mismatch(
+                                format!("tuple pattern with {} element(s)", tys.len()),
+                                format!("tuple pattern with {} element(s)", pats.len()),
                                 span,
                             ));
                         }
@@ -3451,8 +3448,9 @@ impl TypeChecker {
                         }
                         Ok(new_ctx)
                     }
-                    Type::Primitive(_) => Err(NuError::type_error(
-                        format!("tuple pattern requires a tuple, found {}", scrut_ty),
+                    Type::Primitive(_) => Err(NuError::type_mismatch(
+                        "tuple pattern".to_string(),
+                        format!("{}", scrut_ty),
                         span,
                     )),
                     _ => {
