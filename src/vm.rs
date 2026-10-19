@@ -8983,6 +8983,72 @@ mod vm_tests {
 }
 
 
+
+/// Visit values retained by live frames and algebraic-effect snapshots.
+///
+/// This is deliberately a *value* visitor rather than a collector root set:
+/// callers must independently validate pointer provenance and account for
+/// actor state, mailboxes, in-flight messages, JIT/native roots, and foreign
+/// holds before deciding anything is unreachable. No reclamation occurs here.
+fn visit_execution_frame_values(frame: &Frame, visit: &mut impl FnMut(Value)) {
+    for &value in &frame.regs {
+        visit(value);
+    }
+    for &value in &frame.spilled {
+        visit(value);
+    }
+    if let Some(value) = frame.closure_env {
+        visit(value);
+    }
+}
+
+/// Iterative traversal avoids host-stack recursion on deeply nested, possibly
+/// untrusted continuation snapshots. Scan all retained frames (not just the
+/// active frame): stale slots can produce false positives, never false negatives.
+fn visit_execution_values(
+    frames: &[Frame],
+    handlers: &[HandlerFrame],
+    visit: &mut impl FnMut(Value),
+) {
+    for frame in frames {
+        visit_execution_frame_values(frame, visit);
+    }
+
+    let mut pending: Vec<&HandlerFrame> = handlers.iter().collect();
+    while let Some(handler) = pending.pop() {
+        if let Some(single_shot) = &handler.single_shot_state {
+            for &value in &single_shot.regs {
+                visit(value);
+            }
+        }
+        if let Some(continuation) = &handler.captured_continuation {
+            for frame in &continuation.frames {
+                visit_execution_frame_values(frame, visit);
+            }
+            pending.extend(continuation.handler_stack_snapshot.iter());
+        }
+    }
+}
+
+impl VM {
+    /// Observe Values held in the VM's active/cached frames and effect handler
+    /// snapshots, including spills and closure environments.
+    ///
+    /// Read-only diagnostic building block for ORCA root accounting; this is
+    /// NOT a complete, safe-to-collect heap-root visitor.
+    pub fn visit_execution_values(&self, visit: &mut impl FnMut(Value)) {
+        visit_execution_values(&self.frames, &self.handler_stack, visit);
+    }
+}
+
+impl SuspendedVmState {
+    /// Observe Values held by a suspended workflow continuation, without
+    /// resuming it or mutating reference counts.
+    pub fn visit_execution_values(&self, visit: &mut impl FnMut(Value)) {
+        visit_execution_values(&self.frames, &self.handler_stack, visit);
+    }
+}
+
 #[cfg(test)]
 mod orca_execution_root_visitor_tests {
     use super::*;
