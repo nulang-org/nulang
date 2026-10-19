@@ -164,6 +164,8 @@ pub enum AliasSendStatus {
 }
 
 static ACTOR_ALIAS_COUNTER: AtomicU64 = AtomicU64::new(1);
+/// Safety bound for live reply addresses held by a single actor.
+const MAX_LOCAL_ALIASES_PER_ACTOR: usize = 4096;
 
 /// Generate a fresh, globally unique actor ID.
 pub fn fresh_actor_id() -> u64 {
@@ -3854,6 +3856,13 @@ impl Runtime {
             .actors
             .get(&owner)
             .is_some_and(|actor| actor.state != ActorState::Terminated)
+        {
+            return None;
+        }
+        if self
+            .local_aliases_by_owner
+            .get(&owner)
+            .is_some_and(|aliases| aliases.len() >= MAX_LOCAL_ALIASES_PER_ACTOR)
         {
             return None;
         }
