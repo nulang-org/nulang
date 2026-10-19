@@ -1081,6 +1081,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wasm_ffi_rejects_return_types_with_host_pointer_provenance() {
+        use crate::ffi::marshal::CType;
+        for kind in [CType::CStr, CType::VoidPtr] {
+            assert!(
+                wasm_ffi_return_supported(kind).is_err(),
+                "WASM guest cannot safely receive a host pointer from {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wasm_ffi_keeps_scalar_return_types_supported() {
+        use crate::ffi::marshal::CType;
+        for kind in [CType::I64, CType::F64, CType::Bool, CType::Unit, CType::Value] {
+            assert!(
+                wasm_ffi_return_supported(kind).is_ok(),
+                "{kind:?} has no inherent pointer result"
+            );
+        }
+    }
+
+    #[test]
     fn guest_non_pointer_value_rejects_host_pointer_tag() {
         let err = guest_non_pointer_value(value_layout::TAG_PTR | 0x1234).unwrap_err();
         assert!(err.contains("host heap provenance"));
