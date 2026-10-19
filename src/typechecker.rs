@@ -3523,6 +3523,20 @@ impl TypeChecker {
         }
     }
 
+    /// Identify only the canonical two-constructor Result shape. Inferred
+    /// Result[T, E] is represented as a structural variant; other variants
+    /// (including Option) must not produce ignored-error warnings.
+    fn is_result_type(ty: &Type) -> bool {
+        match ty {
+            Type::Variant(variants) if variants.len() == 2 => {
+                variants.iter().any(|(name, _)| name == "Ok")
+                    && variants.iter().any(|(name, _)| name == "Error")
+            }
+            Type::App { constructor, .. } => Self::is_result_type(constructor),
+            _ => false,
+        }
+    }
+
     fn infer_block(
         &mut self,
         ctx: &TypeContext,
@@ -3535,10 +3549,25 @@ impl TypeChecker {
 
         let mut subst = vec![];
         let mut last_ty = Type::unit();
-        for expr in exprs {
+        for (index, expr) in exprs.iter().enumerate() {
             let ctx_sub = apply_subst_to_ctx(ctx, &subst);
             let (s, ty) = self.infer_expr(&ctx_sub, expr)?;
             subst = compose_subst(&s, &subst);
+
+            // Only intermediate expressions are discarded. The last
+            // expression's Result belongs to the enclosing expression/caller.
+            // Check after substitution so inference does not guess from syntax.
+            if index + 1 < exprs.len() && Self::is_result_type(&apply_subst(&ty, &subst)) {
+                self.warnings.push(NuWarning {
+                    code: "W0301",
+                    msg: "discarded Result value: a possible Error is not handled".to_string(),
+                    span: expr.span(),
+                    help: Some(
+                        "Handle it with match or propagate it with ?, or bind it explicitly                          if ignoring the result is intentional"
+                            .to_string(),
+                    ),
+                });
+            }
             last_ty = ty;
         }
         Ok((subst.clone(), apply_subst(&last_ty, &subst)))
