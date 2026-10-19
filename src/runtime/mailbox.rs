@@ -512,6 +512,68 @@ impl Mailbox {
         self.len() == 0
     }
 
+    /// Remove pending reference-bearing monitor DOWN messages for one watcher.
+    ///
+    /// Called only by the owning Runtime shard. DOWN delivery for local
+    /// MonitorRef registrations uses the ordinary System message lane, so all
+    /// arrivals are staged before filtering. This preserves the remaining
+    /// messages' relative order and updates the logical capacity count.
+    ///
+    /// Flushing while selective receive is considering a candidate would
+    /// invalidate a VM-held match index or payload. Fail without mutation in
+    /// that case; the caller may retry after the receive transaction ends.
+    pub(crate) fn flush_monitor_down(
+        &mut self,
+        watcher: u64,
+        reference: u64,
+    ) -> Result<usize, &'static str> {
+        let has_pending_match = self.active_match.is_some()
+            || self.system_skip_buffer.iter().any(|(_, tried)| *tried)
+            || self.local_skip_buffer.iter().any(|(_, tried)| *tried)
+            || self.skip_buffer.iter().any(|(_, tried)| *tried);
+        if has_pending_match {
+            return Err("monitor DOWN flush requires an idle selective receive");
+        }
+
+        // Use the existing receive staging machinery rather than destructively
+        // rebuilding a SegQueue: it preserves staged-before-new-arrival FIFO.
+        self.ensure_receive_indexes();
+        self.stage_arrivals();
+
+        let is_down = |message: &Message| {
+            message.behavior_id == 0
+                && message.priority == MessagePriority::System
+                && message.payload.len() == 4
+                && message.payload[1].as_int() == Some(watcher as i64)
+                && message.payload[3].as_int() == Some(reference as i64)
+        };
+
+        let mut removed = 0;
+        self.system_skip_buffer.retain(|(message, _)| {
+            let discard = is_down(message);
+            removed += usize::from(discard);
+            !discard
+        });
+        self.local_skip_buffer.retain(|(message, _)| {
+            let discard = is_down(message);
+            removed += usize::from(discard);
+            !discard
+        });
+        self.skip_buffer.retain(|(message, _)| {
+            let discard = is_down(message);
+            removed += usize::from(discard);
+            !discard
+        });
+
+        for _ in 0..removed {
+            self.release_slot();
+        }
+        if removed != 0 {
+            self.invalidate_receive_indexes();
+        }
+        Ok(removed)
+    }
+
     /// Snapshot the mailbox without changing logical ownership/counting.
     pub fn drain(&mut self) -> Vec<Message> {
         let mut snapshot = Vec::with_capacity(self.len());
