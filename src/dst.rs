@@ -11,6 +11,7 @@
 //!   sim.run_until_quiescence();
 //!   assert!(!sim.has_deadlock());
 
+pub mod isolation;
 pub mod shrink;
 
 use std::collections::{HashMap, VecDeque};
