@@ -261,9 +261,7 @@ fn compute_module_call_analysis(module: &CodeModule) -> ModuleCallAnalysis {
             }
 
             match instr.opcode {
-                OpCode::Const0 | OpCode::Const1 | OpCode::Const2
-                    if instr.op1 == FUNC_VALUE_REG =>
-                {
+                OpCode::Const0 | OpCode::Const1 | OpCode::Const2 if instr.op1 == FUNC_VALUE_REG => {
                     staged_target = Some(match instr.opcode {
                         OpCode::Const0 => 0,
                         OpCode::Const1 => 1,
@@ -863,12 +861,7 @@ mod planner_tests {
         assert_eq!(analysis.may_suspend, vec![true]);
         assert_eq!(analysis.recursive, vec![false]);
         assert_eq!(
-            native_direct_call(
-                &module,
-                1,
-                Some(&analysis.may_suspend),
-                Some(&analysis.recursive)
-            ),
+            native_direct_call(&module, 1, Some(&analysis.may_suspend), Some(&analysis.recursive)),
             None,
             "an invalid function index must never enter the native-call helper"
         );
