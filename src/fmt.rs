@@ -196,8 +196,13 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             name,
             type_params,
             variants,
+            public,
             ..
         } => {
+            if *public || !type_params.is_empty() {
+                *had_unhandled = true;
+                return;
+            }
             out.push_str(&format!("{}type {}", sp, name));
             if !type_params.is_empty() {
                 out.push_str(&format!("[{}]", type_params.join(", ")));
@@ -218,8 +223,14 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             name,
             type_params,
             body,
+            opaque,
+            public,
             ..
         } => {
+            if *public || *opaque || !type_params.is_empty() {
+                *had_unhandled = true;
+                return;
+            }
             out.push_str(&format!("{}type {}", sp, name));
             if !type_params.is_empty() {
                 out.push_str(&format!("[{}]", type_params.join(", ")));
@@ -700,9 +711,14 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             name,
             type_params,
             fields,
+            derives,
             public,
             ..
         } => {
+            if *public || !type_params.is_empty() || !derives.is_empty() {
+                *had_unhandled = true;
+                return;
+            }
             out.push_str(&format!("{}type {}", sp, name));
             if !type_params.is_empty() {
                 out.push_str(&format!("[{}]", type_params.join(", ")));
