@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import platform
 import re
@@ -36,8 +37,10 @@ def command_output(
     *,
     cwd: Path = ROOT,
     cpu_affinity: set[int] | None = None,
+    timeout_seconds: float | None = None,
+    diagnostics_on_failure: bool = True,
 ) -> str:
-    """Run one command, optionally constraining the child to specific CPUs."""
+    """Run a command and retain captured errors for exact-head CI debugging."""
 
     preexec_fn = None
     if cpu_affinity is not None:
@@ -52,21 +55,37 @@ def command_output(
 
         preexec_fn = pin_child
 
-    proc = subprocess.run(
-        command,
-        cwd=cwd,
-        check=True,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        preexec_fn=preexec_fn,
-    )
+    try:
+        proc = subprocess.run(
+            command,
+            cwd=cwd,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            preexec_fn=preexec_fn,
+            timeout=timeout_seconds,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        if diagnostics_on_failure:
+            output = exc.output
+            if isinstance(output, bytes):
+                output = output.decode(errors="replace")
+            if output:
+                print(output, file=sys.stderr, end="" if output.endswith("\n") else "\n")
+            if isinstance(exc, subprocess.TimeoutExpired):
+                print(
+                    f"benchmark command timed out after {exc.timeout}s: "
+                    f"{' '.join(command)}",
+                    file=sys.stderr,
+                )
+        raise
     return proc.stdout
 
 
 def maybe_version(command: list[str]) -> str | None:
     try:
-        return command_output(command).strip()
+        return command_output(command, diagnostics_on_failure=False).strip()
     except (FileNotFoundError, subprocess.CalledProcessError):
         return None
 
@@ -313,11 +332,19 @@ def main() -> int:
             "the host scheduler unconstrained and is diagnostic only"
         ),
     )
+    parser.add_argument(
+        "--measurement-timeout",
+        type=float,
+        default=300.0,
+        help="seconds allowed per warm-up or measured runtime process (default: 300)",
+    )
     parser.add_argument("--output", type=Path, help="write full JSON report here")
     args = parser.parse_args()
 
     if args.runs < 1 or args.warmup < 0:
         parser.error("--runs must be >= 1 and --warmup must be >= 0")
+    if not math.isfinite(args.measurement_timeout) or args.measurement_timeout <= 0:
+        parser.error("--measurement-timeout must be finite and > 0")
 
     selected = [item.strip() for item in args.runtimes.split(",") if item.strip()]
     unknown = sorted(set(selected) - {"nulang", "rust", "go", "erlang"})
@@ -355,6 +382,7 @@ def main() -> int:
             output = command_output(
                 commands[runtime],
                 cpu_affinity=cpu_affinity,
+                timeout_seconds=args.measurement_timeout,
             )
             records = parse_records(output, runtime)
             if measured:
@@ -369,6 +397,7 @@ def main() -> int:
         "methodology": "standard-runtime Savina-style messaging baselines",
         "warmup_runs": args.warmup,
         "measured_runs": args.runs,
+        "measurement_timeout_seconds": args.measurement_timeout,
         "environment": environment_metadata(args.cpu_mode, cpu_affinity),
         "samples": samples,
         "summary": summary,
