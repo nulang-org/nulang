@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { createNulangTask, selectNulangBinary } from '../../extension';
+import { createNulangTask, createStandaloneNulangTerminalOptions, selectNulangBinary } from '../../extension';
 
 const GOOD_SOURCE = `fn add(a: Int, b: Int) -> Int {
   a + b
@@ -111,6 +111,16 @@ suite('Nulang extension', () => {
     } finally {
       fs.rmSync(workspace, { recursive: true, force: true });
     }
+  });
+
+  test('single-file mode preserves literal process args without task support', () => {
+    const filename = "/tmp/it's $literal; project.nula";
+    const options = createStandaloneNulangTerminalOptions(
+      'Run', [], filename, '/toolchain with spaces/nulang'
+    );
+    assert.strictEqual(options.shellPath, '/toolchain with spaces/nulang');
+    assert.deepStrictEqual(options.shellArgs, [filename]);
+    assert.strictEqual(options.cwd, undefined, 'empty workspaces cannot set arbitrary terminal cwd');
   });
 
   test('Type Check task uses standalone file directory without a manifest', () => {
