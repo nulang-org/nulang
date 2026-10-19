@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Experimental Web HTTP redirects — 2026-10-17
+- **Web route redirects now emit actual HTTP status and Location metadata** rather than sending a 200 meta-refresh document: GET/HEAD use 302, and mutations use 303 to support POST/redirect/GET. Redirects contain no hydration HTML.
+- **The initial HTTP redirect contract accepts only safe same-origin absolute paths.** Invalid, external, protocol-relative, or header-injection locations receive 400 without a Location header. Standalone rendering retains its legacy HTML return value; HTTP exposure remains experimental and must pass exact-head CI and integration validation.
+
 ### Bounded Nulang Web development-server connections — 2026-10-16
 - **The experimental Web development listener caps active connections at 64**, including SSE, and returns `503` with `Retry-After: 1` when full.
 - **Worker capacity is returned by a scoped RAII lease** after normal completion, panic, or thread-spawn failure. One shared `Arc` route table replaces per-connection clones of compiled route modules.

@@ -419,9 +419,12 @@ pub(crate) fn perform_web_builtin(
         Some("route") => Some(crate::vm::Value::unit()),
         Some("redirect") => {
             let url = resolve(constants, *regs.first()?);
+            // During HTTP dispatch this is response metadata; the Html
+            // return is retained for standalone/CLI compatibility.
+            crate::runtime::http_server::set_response_redirect(&url);
             let out = format!(
                 "<html><head><meta http-equiv=\"refresh\" content=\"0;url={}\"></head></html>",
-                url
+                html_escape(&url)
             );
             Some(callbacks.alloc_string(&out))
         }

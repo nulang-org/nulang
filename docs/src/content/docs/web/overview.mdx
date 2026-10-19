@@ -114,7 +114,7 @@ The `stdlib::web::types` module defines `Html` as an **opaque type** — a compi
 The `stdlib::web::html` module adds ergonomic helpers: `el`, `txt`, `attr`, `body`, `head`, `title`, `document`. It re-exports `text`, `raw`, and `redirect` from `stdlib::web::host`.
 
 :::note
-`Web.redirect` produces an HTML page with a `<meta http-equiv="refresh">` and is sent with status 200 — not an HTTP 3xx. Browsers follow it; API clients will not.
+When a route is served through the experimental Web HTTP host, `Web.redirect("/path")` emits a real HTTP redirect: `302 Found` for GET/HEAD and `303 See Other` for POST and other mutations. The response carries a `Location` header and no injected hydration HTML. Only same-origin absolute paths are accepted in this initial HTTP contract; unsafe or external locations return `400`. Outside a request context (such as standalone CLI rendering), the historical HTML meta-refresh value is retained for compatibility.
 :::
 
 ### Reading the Request

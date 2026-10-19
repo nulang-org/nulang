@@ -362,6 +362,7 @@ impl HttpServerState {
             204 => "No Content",
             301 => "Moved Permanently",
             302 => "Found",
+            303 => "See Other",
             304 => "Not Modified",
             400 => "Bad Request",
             401 => "Unauthorized",
@@ -520,6 +521,13 @@ pub struct RequestContext {
 thread_local! {
     static CURRENT_REQUEST: RefCell<Option<RequestContext>> = const { RefCell::new(None) };
     static RESPONSE_COOKIES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    static RESPONSE_REDIRECT: RefCell<Option<RedirectTarget>> = const { RefCell::new(None) };
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RedirectTarget {
+    LocalPath(String),
+    Invalid,
 }
 
 /// Set the request context for the current thread, run `f`, then clear it.
@@ -529,9 +537,38 @@ where
 {
     CURRENT_REQUEST.with(|c| *c.borrow_mut() = Some(ctx));
     RESPONSE_COOKIES.with(|c| c.borrow_mut().clear());
+    RESPONSE_REDIRECT.with(|c| *c.borrow_mut() = None);
     let result = f();
     CURRENT_REQUEST.with(|c| *c.borrow_mut() = None);
     result
+}
+
+/// Record an HTTP redirect for the current request without encoding protocol
+/// control information into the rendered Html string. Outside an HTTP request,
+/// the legacy Web.redirect value is still available to CLI callers.
+pub fn set_response_redirect(location: &str) {
+    if !CURRENT_REQUEST.with(|current| current.borrow().is_some()) {
+        return;
+    }
+    // Restrict this initial HTTP API to same-origin absolute paths. In
+    // particular, reject protocol-relative URLs, backslashes, control bytes,
+    // unencoded spaces, and oversized values before writing Location.
+    let valid = location.starts_with('/')
+        && !location.starts_with("//")
+        && location.len() <= 2048
+        && location
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != b'\\');
+    let target = if valid {
+        RedirectTarget::LocalPath(location.to_string())
+    } else {
+        RedirectTarget::Invalid
+    };
+    RESPONSE_REDIRECT.with(|redirect| *redirect.borrow_mut() = Some(target));
+}
+
+fn take_response_redirect() -> Option<RedirectTarget> {
+    RESPONSE_REDIRECT.with(|redirect| redirect.borrow_mut().take())
 }
 
 /// Add a `Set-Cookie` header for the current response.
@@ -1056,11 +1093,7 @@ impl WebDevServer {
                         Err(error) => Err(error),
                     });
                 match rendered {
-                    Ok(Some(html)) => HttpResponse {
-                        status: 200,
-                        headers: vec![("Content-Type".into(), "text/html; charset=utf-8".into())],
-                        body: inject_client_runtime_script(&html).into_bytes(),
-                    },
+                    Ok(Some(html)) => Self::html_route_response(&request, &html),
                     Ok(None) => HttpResponse {
                         status: 500,
                         headers: vec![("Content-Type".into(), "text/plain".into())],
@@ -1095,6 +1128,36 @@ impl WebDevServer {
             m.apply(&request, &mut response);
         }
         HttpServerState::write_response(&mut stream, &response);
+    }
+
+    /// Turn a completed route into a wire response. Redirect metadata is
+    /// request-scoped, never inferred by parsing an Html string, and consumed
+    /// before the browser hydration script is injected.
+    fn html_route_response(request: &HttpRequest, html: &str) -> HttpResponse {
+        match take_response_redirect() {
+            Some(RedirectTarget::LocalPath(location)) => HttpResponse {
+                status: if matches!(request.method, HttpMethod::Get | HttpMethod::Head) {
+                    302
+                } else {
+                    303
+                },
+                headers: vec![
+                    ("Location".into(), location),
+                    ("Cache-Control".into(), "no-store".into()),
+                ],
+                body: Vec::new(),
+            },
+            Some(RedirectTarget::Invalid) => HttpResponse {
+                status: 400,
+                headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
+                body: b"Invalid redirect location".to_vec(),
+            },
+            None => HttpResponse {
+                status: 200,
+                headers: vec![("Content-Type".into(), "text/html; charset=utf-8".into())],
+                body: inject_client_runtime_script(html).into_bytes(),
+            },
+        }
     }
 
     fn serve_sse(room: &str, stream: &mut TcpStream, shutdown: Arc<AtomicBool>) {
@@ -1483,6 +1546,103 @@ mod tests {
         assert!(String::from_utf8(response.body)
             .unwrap()
             .contains("Invalid UI action envelope"));
+    }
+
+    // Web.redirect must affect the HTTP status, not just render a meta-refresh.
+    #[test]
+    fn web_post_redirect_uses_303_location_without_rendering_html() {
+        let request = HttpRequest {
+            method: HttpMethod::Post,
+            path: "/projects/42/deploy".into(),
+            headers: vec![],
+            body: vec![],
+        };
+        with_request_context(
+            RequestContext {
+                request: request.clone(),
+                params: HashMap::new(),
+            },
+            || set_response_redirect("/projects/42"),
+        );
+
+        let response = WebDevServer::html_route_response(&request, "<p>never render</p>");
+        assert_eq!(
+            response.status, 303,
+            "POST redirects must use PRG semantics"
+        );
+        assert!(
+            response.body.is_empty(),
+            "redirect must not inject client HTML"
+        );
+        assert!(response
+            .headers
+            .iter()
+            .any(|(name, value)| { name == "Location" && value == "/projects/42" }));
+    }
+
+    #[test]
+    fn web_get_redirect_uses_302_and_unmodified_pages_still_render() {
+        let request = HttpRequest {
+            method: HttpMethod::Get,
+            path: "/projects/42".into(),
+            headers: vec![],
+            body: vec![],
+        };
+        with_request_context(
+            RequestContext {
+                request: request.clone(),
+                params: HashMap::new(),
+            },
+            || set_response_redirect("/login"),
+        );
+        let redirect = WebDevServer::html_route_response(&request, "unused");
+        assert_eq!(redirect.status, 302);
+        assert!(redirect
+            .headers
+            .iter()
+            .any(|(name, value)| name == "Location" && value == "/login"));
+
+        with_request_context(
+            RequestContext {
+                request: request.clone(),
+                params: HashMap::new(),
+            },
+            || {},
+        );
+        let page = WebDevServer::html_route_response(&request, "<h1>normal</h1>");
+        assert_eq!(
+            page.status, 200,
+            "redirect state must not leak to later requests"
+        );
+        assert!(String::from_utf8_lossy(&page.body).contains("<h1>normal</h1>"));
+    }
+
+    #[test]
+    fn web_redirect_rejects_external_or_header_injection_targets() {
+        let request = HttpRequest {
+            method: HttpMethod::Post,
+            path: "/submit".into(),
+            headers: vec![],
+            body: vec![],
+        };
+        for location in [
+            "//evil.example",
+            "/\\evil.example",
+            "/ok\r\nX-Injected: yes",
+            "javascript:alert(1)",
+            "",
+        ] {
+            with_request_context(
+                RequestContext {
+                    request: request.clone(),
+                    params: HashMap::new(),
+                },
+                || set_response_redirect(location),
+            );
+            let response = WebDevServer::html_route_response(&request, "unused");
+            assert_eq!(response.status, 400, "unsafe redirect: {location:?}");
+            assert!(!response.headers.iter().any(|(name, _)| name == "Location"));
+        }
     }
 
     #[test]
