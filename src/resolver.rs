@@ -14,6 +14,153 @@ struct SourcedDecl {
     origin: PathBuf,
 }
 
+/// A qualified symbol's lexical category; no runtime or artifact encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QualifiedSymbolKind {
+    Function,
+    Type,
+}
+
+/// Source-level identity of one exported declaration. The canonical source
+/// path is resolver metadata only: do not embed it in serialized type IDs,
+/// compiled NBC artifacts, or distributed actor protocols.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QualifiedSymbol {
+    pub origin: PathBuf,
+    pub name: String,
+    pub kind: QualifiedSymbolKind,
+}
+
+/// A single module's visible exports. Keep overloaded declarations as a list,
+/// rather than silently choosing the last definition with a given name.
+#[derive(Clone, Debug)]
+struct IndexedModule {
+    origin: PathBuf,
+    exports: BTreeMap<String, Vec<QualifiedSymbol>>,
+}
+
+/// Lexically scoped alias lookup foundation for future qualified imports.
+///
+/// This index deliberately does *not* lower or execute aliases. The existing
+/// frontend still rejects imported aliases until all compiler passes use
+/// resolved symbols consistently. Only explicitly public declarations are
+/// indexed. Reexports and constructors require a later export-model pass.
+#[derive(Default)]
+pub struct QualifiedImportIndex {
+    aliases: BTreeMap<String, IndexedModule>,
+}
+
+impl QualifiedImportIndex {
+    /// Register an already-parsed module under a local alias.
+    ///
+    /// Repeat registration of the same canonical source is idempotent;
+    /// attempting to reuse an alias for another source fails closed.
+    pub fn bind(
+        &mut self,
+        alias: &str,
+        source_file: &Path,
+        module: &AstModule,
+        span: Span,
+    ) -> NuResult<()> {
+        if alias.is_empty() {
+            return Err(NuError::parse_error(
+                "empty qualified module alias".to_string(),
+                span,
+            ));
+        }
+        let origin = source_file.canonicalize().map_err(|error| {
+            NuError::parse_error(
+                format!(
+                    "cannot resolve canonical module source '{}': {}",
+                    source_file.display(),
+                    error
+                ),
+                span,
+            )
+        })?;
+        if let Some(existing) = self.aliases.get(alias) {
+            if existing.origin == origin {
+                return Ok(());
+            }
+            return Err(NuError::parse_error(
+                format!(
+                    "module alias conflict: '{}' already refers to a different module",
+                    alias
+                ),
+                span,
+            ));
+        }
+        let mut exports: BTreeMap<String, Vec<QualifiedSymbol>> = BTreeMap::new();
+        for decl in &module.decls {
+            let Some((name, kind)) = exported_decl(decl) else {
+                continue;
+            };
+            exports
+                .entry(name.to_string())
+                .or_default()
+                .push(QualifiedSymbol {
+                    origin: origin.clone(),
+                    name: name.to_string(),
+                    kind,
+                });
+        }
+        self.aliases
+            .insert(alias.to_string(), IndexedModule { origin, exports });
+        Ok(())
+    }
+
+    /// Resolve a public symbol without falling back to unrelated unqualified
+    /// bindings. Overloads are preserved for subsequent type-directed lookup.
+    pub fn resolve(
+        &self,
+        alias: &str,
+        symbol: &str,
+        span: Span,
+    ) -> NuResult<&[QualifiedSymbol]> {
+        let module = self.aliases.get(alias).ok_or_else(|| {
+            NuError::parse_error(format!("unknown module alias '{}'", alias), span)
+        })?;
+        module
+            .exports
+            .get(symbol)
+            .map(Vec::as_slice)
+            .ok_or_else(|| {
+                NuError::parse_error(
+                    format!("'{}' is not exported by module alias '{}'", symbol, alias),
+                    span,
+                )
+            })
+    }
+}
+
+/// Conservative export discovery: declarations without explicit visibility
+/// are not accidentally made public by import aliases.
+fn exported_decl(decl: &Decl) -> Option<(&str, QualifiedSymbolKind)> {
+    match decl {
+        Decl::Function {
+            name,
+            public: true,
+            ..
+        } => Some((name, QualifiedSymbolKind::Function)),
+        Decl::TypeAlias {
+            name,
+            public: true,
+            ..
+        }
+        | Decl::RecordType {
+            name,
+            public: true,
+            ..
+        }
+        | Decl::VariantType {
+            name,
+            public: true,
+            ..
+        } => Some((name, QualifiedSymbolKind::Type)),
+        _ => None,
+    }
+}
+
 thread_local! {
     /// Cache *complete* resolved modules, with the original file for each
     /// declaration. Selective imports are filtered at the use site, not cached
