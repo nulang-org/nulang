@@ -278,3 +278,86 @@ fn libsql_rekey_refuses_committed_atomic_transition_records() {
     assert!(store.load_snapshot(100).is_some());
     assert!(store.load_snapshot(101).is_none());
 }
+
+
+#[test]
+fn memory_store_rekey_refuses_self_reference_in_snapshot() {
+    let mut store = MemoryStore::new();
+    seed_legacy_history(&mut store, 100);
+    let mut source = store.load_snapshot(100).unwrap();
+    source
+        .state
+        .insert("self_ref".to_string(), PersistedValue::Actor(100));
+    store.save_snapshot(source).unwrap();
+
+    let err = store.rekey_actor_history(100, 101).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Unsupported);
+    assert_eq!(
+        store.load_snapshot(100).unwrap().state["self_ref"],
+        PersistedValue::Actor(100)
+    );
+    assert!(store.load_snapshot(101).is_none());
+}
+
+#[test]
+fn memory_store_rekey_refuses_self_reference_in_message_journal() {
+    let mut store = MemoryStore::new();
+    seed_legacy_history(&mut store, 100);
+    store
+        .append_journal(
+            100,
+            JournalEntry {
+                sequence: 4,
+                behavior_id: 6,
+                payload: vec![PersistedValue::Actor(100)],
+            },
+        )
+        .unwrap();
+
+    let err = store.rekey_actor_history(100, 101).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Unsupported);
+    assert_eq!(store.read_journal(100).len(), 2);
+    assert!(store.read_journal(101).is_empty());
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn libsql_rekey_refuses_self_reference_in_snapshot() {
+    let mut store = nulang::runtime::LibsqlStore::in_memory().unwrap();
+    seed_legacy_history(&mut store, 100);
+    let mut source = store.load_snapshot(100).unwrap();
+    source
+        .state
+        .insert("self_ref".to_string(), PersistedValue::Actor(100));
+    store.save_snapshot(source).unwrap();
+
+    let err = store.rekey_actor_history(100, 101).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Unsupported);
+    assert_eq!(
+        store.load_snapshot(100).unwrap().state["self_ref"],
+        PersistedValue::Actor(100)
+    );
+    assert!(store.load_snapshot(101).is_none());
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn libsql_rekey_refuses_self_reference_in_message_journal() {
+    let mut store = nulang::runtime::LibsqlStore::in_memory().unwrap();
+    seed_legacy_history(&mut store, 100);
+    store
+        .append_journal(
+            100,
+            JournalEntry {
+                sequence: 4,
+                behavior_id: 6,
+                payload: vec![PersistedValue::Actor(100)],
+            },
+        )
+        .unwrap();
+
+    let err = store.rekey_actor_history(100, 101).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Unsupported);
+    assert_eq!(store.read_journal(100).len(), 2);
+    assert!(store.read_journal(101).is_empty());
+}
