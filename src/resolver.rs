@@ -390,4 +390,46 @@ mod tests {
         );
         std::env::remove_var("NULANG_MODULE_PATH");
     }
+
+    #[test]
+    fn repeated_selective_imports_of_same_module_keep_each_requested_name() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "nulang-resolver-import-selection-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(
+            dir.join("library.nula"),
+            "fn alpha() { 1 }\nfn beta() { 2 }\n",
+        )
+        .unwrap();
+
+        let mut module = AstModule {
+            name: "main".into(),
+            decls: vec![
+                Decl::Import {
+                    path: "library".into(),
+                    items: vec!["alpha".into()],
+                    span: sp(),
+                },
+                Decl::Import {
+                    path: "library".into(),
+                    items: vec!["beta".into()],
+                    span: sp(),
+                },
+            ],
+        };
+        let result = resolve_imports(&mut module, &dir.join("main.nula"), &mut HashSet::new());
+        std::fs::remove_dir_all(&dir).unwrap();
+        result.unwrap();
+        let names: HashSet<_> = module.decls.iter().filter_map(decl_name).collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains("alpha"));
+        assert!(names.contains("beta"));
+    }
+
 }
