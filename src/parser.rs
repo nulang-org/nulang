@@ -7222,6 +7222,47 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_qualified_import_alias_preserves_source_path() {
+        let ast = parse("import stdlib::list as lists").unwrap();
+        assert_eq!(ast.decls.len(), 1);
+        match &ast.decls[0] {
+            Decl::Import { path, alias, items, .. } => {
+                assert_eq!(path, "stdlib::list");
+                assert_eq!(alias.as_deref(), Some("lists"));
+                assert!(items.is_empty());
+            }
+            other => panic!("expected qualified import, found {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_scoped_package_import_alias() {
+        let ast = parse("import @nulang/auth as auth").unwrap();
+        match &ast.decls[0] {
+            Decl::Import { path, alias, .. } => {
+                assert_eq!(path, "@nulang/auth");
+                assert_eq!(alias.as_deref(), Some("auth"));
+            }
+            other => panic!("expected qualified import, found {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_missing_import_alias_reports_error() {
+        let err = parse("import stdlib::list as").unwrap_err();
+        assert!(format!("{err}").contains("import alias"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_unqualified_import_has_no_alias() {
+        let ast = parse("import math").unwrap();
+        match &ast.decls[0] {
+            Decl::Import { alias, .. } => assert!(alias.is_none()),
+            other => panic!("expected import, found {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_parse_entity_decl() {
         let source = r#"entity Counter {
             state count = 0
