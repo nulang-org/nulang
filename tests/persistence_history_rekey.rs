@@ -18,7 +18,7 @@ fn snapshot(actor_id: u64) -> ActorSnapshot {
     }
 }
 
-fn seed_legacy_history(store: &mut MemoryStore, actor_id: u64) {
+fn seed_legacy_history(store: &mut impl PersistenceStore, actor_id: u64) {
     store.save_snapshot(snapshot(actor_id)).unwrap();
     store
         .append_journal(
@@ -196,4 +196,85 @@ fn memory_store_rekey_missing_source_or_same_identity_does_not_mutate() {
     );
     assert!(store.load_snapshot(100).is_some());
     assert_eq!(store.read_journal(100).len(), 1);
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn libsql_rekeys_legacy_recovery_history_in_one_transaction() {
+    let mut store = nulang::runtime::LibsqlStore::in_memory().unwrap();
+    seed_legacy_history(&mut store, 100);
+    store.rekey_actor_history(100, 101).unwrap();
+
+    assert!(store.load_snapshot(100).is_none());
+    assert!(store.read_journal(100).is_empty());
+    assert!(store.read_workflow_events(100).is_empty());
+    assert!(store.read_events(100).is_empty());
+    assert_eq!(store.load_snapshot(101).unwrap().actor_id, 101);
+    assert_eq!(store.load_snapshot(101).unwrap().state["counter"], PersistedValue::Int(42));
+    assert_eq!(store.read_journal(101)[0].behavior_id, 5);
+    assert_eq!(store.read_workflow_events(101).len(), 1);
+    assert_eq!(store.read_events(101)[0].value, PersistedValue::Int(42));
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn libsql_rekey_rejects_destination_collision_without_partial_move() {
+    let mut store = nulang::runtime::LibsqlStore::in_memory().unwrap();
+    seed_legacy_history(&mut store, 100);
+    store.save_snapshot(snapshot(101)).unwrap();
+
+    let err = store.rekey_actor_history(100, 101).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+    assert_eq!(store.load_snapshot(100).unwrap().state["counter"], PersistedValue::Int(42));
+    assert_eq!(store.read_workflow_events(100).len(), 1);
+    assert_eq!(store.read_events(100).len(), 1);
+    assert_eq!(store.load_snapshot(101).unwrap().actor_id, 101);
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn libsql_rekey_refuses_identity_bound_workflow_records() {
+    let mut store = nulang::runtime::LibsqlStore::in_memory().unwrap();
+    seed_legacy_history(&mut store, 100);
+    store.append_workflow_event(
+        100,
+        WorkflowEvent::StepCompleted {
+            sequence: 4,
+            activation: Some(nulang::runtime::WorkflowActivationId::new(100, 3)),
+            step_name: "step".to_string(),
+        },
+    ).unwrap();
+
+    let err = store.rekey_actor_history(100, 101).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Unsupported);
+    assert!(store.load_snapshot(100).is_some());
+    assert!(store.load_snapshot(101).is_none());
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn libsql_rekey_refuses_committed_atomic_transition_records() {
+    let mut store = nulang::runtime::LibsqlStore::in_memory().unwrap();
+    store.commit_transition(DurableTransition {
+        version: DURABLE_TRANSITION_VERSION,
+        actor_id: 100,
+        activation_epoch: 1,
+        sequence: 1,
+        expected_previous_sequence: 0,
+        command: None,
+        snapshot: Some(ActorSnapshot {
+            actor_id: 100,
+            sequence: 1,
+            ..ActorSnapshot::default()
+        }),
+        workflow_events: vec![],
+        domain_events: vec![],
+        durable_effects: vec![],
+        outbox: vec![],
+    }).unwrap();
+
+    let err = store.rekey_actor_history(100, 101).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Unsupported);
+    assert!(store.load_snapshot(100).is_some());
+    assert!(store.load_snapshot(101).is_none());
 }
