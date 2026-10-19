@@ -5193,6 +5193,57 @@ mod tests {
     }
 
     #[test]
+    fn closed_variant_source_reports_missing_constructor() {
+        let source = r#"
+type Color = Red | Green | Blue
+fn classify(c: Color) -> Int {
+    match c {
+        Red => 1,
+        Green => 2
+    }
+}
+"#;
+        let result = check_src(source);
+        assert!(
+            matches!(result, Err(NuError::TypeError { msg, .. }) if msg.contains("Blue")),
+            "source-level typechecking must report missing Blue"
+        );
+    }
+
+    #[test]
+    fn closed_variant_source_accepts_all_constructors() {
+        let source = r#"
+type Color = Red | Green | Blue
+fn classify(c: Color) -> Int {
+    match c {
+        Red => 1,
+        Green => 2,
+        Blue => 3
+    }
+}
+"#;
+        assert!(check_src(source).is_ok());
+    }
+
+    #[test]
+    fn closed_variant_source_rejects_impossible_constructor() {
+        let source = r#"
+type Color = Red | Green
+fn classify(c: Color) -> Int {
+    match c {
+        Red => 1,
+        Green => 2,
+        Blue => 3
+    }
+}
+"#;
+        assert!(
+            matches!(check_src(source), Err(NuError::TypeError { msg, .. }) if msg.contains("Blue")),
+            "unknown constructor Blue must fail from source compilation"
+        );
+    }
+
+    #[test]
     fn closed_variant_nonvariant_match_unchanged() {
         let mut tc = TypeChecker::new();
         let expr = Expr::Match {
