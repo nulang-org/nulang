@@ -103,12 +103,53 @@ fn payload_patterns_only_cover_a_constructor_when_irrefutable() {
     let warnings = check_coverage(
         &ty,
         &[
-            arm(Pattern::Variant("Some".into(), Some(Box::new(Pattern::Lit(Literal::Int(1))))), false),
+            arm(
+                Pattern::Variant(
+                    "Some".into(),
+                    Some(Box::new(Pattern::Lit(Literal::Int(1)))),
+                ),
+                false,
+            ),
             arm(Pattern::Variant("None".into(), None), false),
         ],
         Span::default(),
     );
     assert!(warnings.iter().any(|w| w.code == "W0201" && w.msg.contains("Some")));
+}
+
+#[test]
+fn irrefutable_payload_and_nullary_constructor_are_exhaustive() {
+    let ty = Type::Variant(vec![
+        ("Some".to_string(), Some(Box::new(Type::int()))),
+        ("None".to_string(), None),
+    ]);
+    let warnings = check_coverage(
+        &ty,
+        &[
+            arm(
+                Pattern::Variant("Some".into(), Some(Box::new(Pattern::Var("x".into())))),
+                false,
+            ),
+            arm(Pattern::Variant("None".into(), None), false),
+        ],
+        Span::default(),
+    );
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn duplicate_constructor_after_unguarded_arm_is_redundant() {
+    let warnings = check_coverage(
+        &closed_color_type(),
+        &[
+            arm(Pattern::Variant("Red".into(), None), false),
+            arm(Pattern::Variant("Red".into(), None), true),
+            arm(Pattern::Wild, false),
+        ],
+        Span::default(),
+    );
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].code, "W0202");
 }
 
 #[test]
