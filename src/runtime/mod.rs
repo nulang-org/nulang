@@ -73,6 +73,7 @@ mod metrics;
 mod persistence;
 mod process_groups;
 mod registry;
+mod reply_requests;
 pub mod resp;
 pub mod resp_cache;
 mod spawn;
@@ -125,6 +126,8 @@ pub use orca_cycle::*;
 pub use persistence::*;
 pub use process_groups::*;
 pub use registry::*;
+pub use reply_requests::{LocalReplyStatus, LocalReplyTicket, LocalRequestRef};
+use reply_requests::LocalReplyRegistry;
 pub use resp_cache::*;
 pub use scheduler::*;
 pub use supervisor::*;
@@ -380,6 +383,8 @@ pub struct Runtime {
     local_aliases: HashMap<ActorAlias, u64>,
     /// Reverse ownership index keeps actor-exit cleanup O(aliases of actor).
     local_aliases_by_owner: HashMap<u64, HashSet<ActorAlias>>,
+    /// Bounded-by-alias-cap, one-shot replies with local deadlines.
+    local_reply_requests: LocalReplyRegistry,
     pub scheduler: Scheduler,
     pub next_run_slot: Option<u64>,
     pub actor_pool: Vec<Actor>,
@@ -671,6 +676,7 @@ impl Runtime {
             supervisors: HashMap::new(),
             local_aliases: HashMap::new(),
             local_aliases_by_owner: HashMap::new(),
+            local_reply_requests: LocalReplyRegistry::default(),
             scheduler: Scheduler::new(4),
             next_run_slot: None,
             actor_pool: Vec::new(),
@@ -3947,6 +3953,7 @@ impl Runtime {
     /// `retired_heaps` instead of being dropped, so in-flight ops and
     /// receiver holds held elsewhere never dangle.
     pub(crate) fn remove_actor_reaping(&mut self, actor_id: u64) {
+        self.retire_local_reply_requests_of_owner(actor_id);
         self.retire_local_aliases(actor_id);
         self.release_held_foreign_refs(actor_id);
         if let Some(mut actor) = self.actors.remove(&actor_id) {
