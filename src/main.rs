@@ -862,10 +862,8 @@ fn main() {
                     // Build the MIR report before printing any inspection output.
                     // A lowering error must not leave a misleading partial report.
                     let mir_report = if opts.inspect_mir {
-                        let hir = nulang::hir_lower::lower_module(
-                            &ast,
-                            &checker.inferred_decl_types,
-                        );
+                        let hir =
+                            nulang::hir_lower::lower_module(&ast, &checker.inferred_decl_types);
                         match nulang::mir_lower::lower_module(&hir) {
                             Ok(mir) => Some(format_mir_structure(&mir)),
                             Err(e) => {
@@ -2837,8 +2835,24 @@ fn format_mir_structure(module: &nulang::mir::Module) -> String {
     let mut output = String::from("=== MIR Structure (pre-codegen) ===\n");
     for (kind, function) in rows {
         let statements: usize = function.blocks.iter().map(|b| b.stmts.len()).sum();
+        // The MIR source map records statement positions, not necessarily
+        // every expression. Ignore synthetic line zero and avoid attributing
+        // locations to generated/unmapped statements.
+        let mut lines: Vec<u32> = function
+            .line_table
+            .iter()
+            .map(|(_, line)| *line)
+            .filter(|line| *line != 0)
+            .collect();
+        lines.sort_unstable();
+        lines.dedup();
+        let source_lines = if lines.is_empty() {
+            "-".to_string()
+        } else {
+            lines.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
+        };
         output.push_str(&format!(
-            "{} {}: params={} locals={} blocks={} statements={} handlers={}\n",
+            "{} {}: params={} locals={} blocks={} statements={} handlers={} source_lines={}\n",
             kind,
             function.name,
             function.params.len(),
@@ -2846,6 +2860,7 @@ fn format_mir_structure(module: &nulang::mir::Module) -> String {
             function.blocks.len(),
             statements,
             function.handler_tables.len(),
+            source_lines,
         ));
     }
     output
