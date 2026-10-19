@@ -6437,6 +6437,40 @@ mod vm_tests {
     }
 
     #[test]
+    fn test_assert_message_preserved_with_source_line() {
+        let mut module = CodeModule::new("assert_with_message");
+        let effect_idx = module.add_string_constant("Test.assert");
+        let message_idx = module.add_string_constant("balance must be positive");
+        module.line_table.push((0, 27));
+        let mut vm = VM::new_without_jit();
+        vm.load_module(module);
+        let mut frame = Frame::new(None, 0);
+        frame.pc = 1;
+        frame.regs[0] = Value::bool(false);
+        frame.regs[1] = Value::string(message_idx as u32);
+        vm.frames.push(frame);
+        vm.current_frame_idx = Some(0);
+
+        let instr = Instruction::new3(
+            OpCode::Perform,
+            ((effect_idx >> 8) & 0xff) as u8,
+            (effect_idx & 0xff) as u8,
+            2,
+        );
+        let error = vm.step_perform(instr, 0, 0).expect_err("assert must fail");
+        match error {
+            NuError::RuntimeError { msg, .. } => {
+                assert!(
+                    msg.contains("assertion failed: balance must be positive"),
+                    "{msg}"
+                );
+                assert!(msg.contains("source line 27"), "{msg}");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
     fn test_assert_without_line_table_does_not_invent_source_location() {
         let mut module = CodeModule::new("assert_no_line");
         let effect_idx = module.add_string_constant("Test.assert_true");
