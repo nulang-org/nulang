@@ -159,9 +159,41 @@ impl CoreVM {
     }
 
     pub fn run(&mut self, module_idx: usize, entry_pc: usize) -> Result<Value, String> {
-        self.run_inner(module_idx, entry_pc)
+        // Preserve the unrestricted legacy path. The compiler specializes out
+        // the limits branch for this invocation.
+        self.run_inner(module_idx, entry_pc, None::<(u64, fn() -> bool)>)
     }
-    fn run_inner(&mut self, module_idx: usize, entry_pc: usize) -> Result<Value, String> {
+
+    /// Execute with a hard instruction budget and cooperative cancellation.
+    ///
+    /// The callback is sampled *before each bytecode instruction*. An
+    /// instruction already in progress is not preempted, and this method does
+    /// not prove that a module is effect-free or safe to share across actors.
+    /// Exhausting the budget or requesting cancellation returns an error;
+    /// callers should discard the partially executed VM after either error.
+    /// Zero fuel executes no instructions; the Halt instruction costs one.
+    pub fn run_with_limits<F>(
+        &mut self,
+        module_idx: usize,
+        entry_pc: usize,
+        instruction_budget: u64,
+        cancellation_requested: F,
+    ) -> Result<Value, String>
+    where
+        F: FnMut() -> bool,
+    {
+        self.run_inner(module_idx, entry_pc, Some((instruction_budget, cancellation_requested)))
+    }
+
+    fn run_inner<F>(
+        &mut self,
+        module_idx: usize,
+        entry_pc: usize,
+        mut limits: Option<(u64, F)>,
+    ) -> Result<Value, String>
+    where
+        F: FnMut() -> bool,
+    {
         let frame = Frame::new(None, module_idx);
         self.frames.push(frame);
         let frame_idx = self.frames.len() - 1;
@@ -171,6 +203,15 @@ impl CoreVM {
         loop {
             if self.halted || self.frames.is_empty() {
                 break;
+            }
+            if let Some((remaining, cancellation_requested)) = limits.as_mut() {
+                if cancellation_requested() {
+                    return Err("CoreVM execution cancelled".to_string());
+                }
+                if *remaining == 0 {
+                    return Err("CoreVM instruction budget exhausted".to_string());
+                }
+                *remaining -= 1;
             }
             // Always use the topmost frame for PC/instr fetch
             let top = self.frames.len() - 1;
