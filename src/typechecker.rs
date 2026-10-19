@@ -3400,7 +3400,119 @@ impl TypeChecker {
             final_subst = compose_subst(&s, &final_subst);
         }
 
+        Self::check_closed_variant_match(
+            &apply_subst(&scrut_ty, &final_subst),
+            arms,
+            span,
+        )?;
         Ok((final_subst.clone(), apply_subst(&first_arm, &final_subst)))
+    }
+
+    /// Conservative coverage for a statically known, closed variant.
+    ///
+    /// Only unguarded, irrefutable constructor patterns establish full
+    /// coverage. Refutable payload patterns remain unknown rather than
+    /// generating false positives while full pattern-matrix analysis is
+    /// developed. Open/unknown types keep their runtime fallback.
+    fn check_closed_variant_match(
+        scrutinee_type: &Type,
+        arms: &[(Pattern, Option<Expr>, Expr)],
+        span: Span,
+    ) -> NuResult<()> {
+        let Type::Variant(variants) = scrutinee_type else {
+            return Ok(());
+        };
+        if variants.is_empty() {
+            return Ok(());
+        }
+
+        fn irrefutable(pat: &Pattern) -> bool {
+            match pat {
+                Pattern::Wild | Pattern::Var(_) => true,
+                Pattern::Alias(_, inner) => irrefutable(inner),
+                _ => false,
+            }
+        }
+
+        fn targets(pat: &Pattern, name: &str) -> bool {
+            match pat {
+                Pattern::Variant(tag, _) => tag == name,
+                Pattern::Alias(_, inner) => targets(inner, name),
+                _ => false,
+            }
+        }
+
+        fn covers(pat: &Pattern, name: &str, payload: &Option<Type>) -> bool {
+            if irrefutable(pat) {
+                return true;
+            }
+            match pat {
+                Pattern::Alias(_, inner) => covers(inner, name, payload),
+                Pattern::Variant(tag, bound) if tag == name => match (payload, bound) {
+                    (None, None) => true,
+                    (Some(_), Some(inner)) => irrefutable(inner),
+                    _ => false,
+                },
+                _ => false,
+            }
+        }
+
+        let mut covered = FxHashSet::default();
+        let mut uncertain = FxHashSet::default();
+
+        for (index, (pattern, guard, _)) in arms.iter().enumerate() {
+            // Every constructor was covered by earlier unguarded arms.
+            if variants.iter().all(|(name, _)| covered.contains(name)) {
+                return Err(NuError::type_error(
+                    format!(
+                        "unreachable match arm {}: previous arms cover every variant",
+                        index + 1
+                    ),
+                    span,
+                ));
+            }
+            // A prior unconditional arm for this constructor makes all later
+            // patterns for it unreachable, including guarded or refutable ones.
+            if variants.iter().any(|(name, _)| covered.contains(name) && targets(pattern, name)) {
+                return Err(NuError::type_error(
+                    format!("unreachable match arm {}: constructor is already covered", index + 1),
+                    span,
+                ));
+            }
+
+            if guard.is_some() {
+                continue;
+            }
+            for (name, payload) in variants {
+                if covers(pattern, name, payload) {
+                    covered.insert(name.clone());
+                } else if targets(pattern, name) {
+                    // A nested refutable payload may cover some, but not
+                    // necessarily all, values of this constructor. Keep the
+                    // verdict unknown until recursive matrix analysis exists.
+                    uncertain.insert(name.clone());
+                }
+            }
+        }
+
+        let missing: Vec<_> = variants
+            .iter()
+            .filter(|(name, _)| !covered.contains(name) && !uncertain.contains(name))
+            .map(|(name, _)| name.clone())
+            .collect();
+        if !missing.is_empty() {
+            return Err(NuError::TypeError {
+                msg: format!(
+                    "non-exhaustive match: missing variant constructor(s): {}",
+                    missing.join(", ")
+                ),
+                span,
+                expected_type: Some("all known variant constructors handled".to_string()),
+                found_type: Some(format!("missing: {}", missing.join(", "))),
+                similar_names: None,
+            });
+        }
+        Ok(())
     }
 
     /// Bind pattern variables into a new context.
@@ -3473,13 +3585,24 @@ impl TypeChecker {
             },
             Pattern::Variant(name, pat) => match scrut_ty {
                 Type::Variant(variants) => {
-                    let mut new_ctx = ctx.clone();
-                    if let Some((_, Some(ty))) = variants.iter().find(|(n, _)| n == name) {
-                        if let Some(p) = pat {
-                            new_ctx = self.bind_pattern(&new_ctx, p, ty)?;
-                        }
+                    let Some((_, payload)) = variants.iter().find(|(n, _)| n == name) else {
+                        return Err(NuError::type_error(
+                            format!("unknown variant constructor '{}' in match", name),
+                            Span::default(),
+                        ));
+                    };
+                    match (payload.as_ref(), pat.as_deref()) {
+                        (Some(ty), Some(inner)) => self.bind_pattern(ctx, inner, ty),
+                        (None, None) => Ok(ctx.clone()),
+                        (Some(_), None) => Err(NuError::type_error(
+                            format!("variant constructor '{}' requires a payload pattern", name),
+                            Span::default(),
+                        )),
+                        (None, Some(_)) => Err(NuError::type_error(
+                            format!("variant constructor '{}' has no payload", name),
+                            Span::default(),
+                        )),
                     }
-                    Ok(new_ctx)
                 }
                 _ => {
                     if let Some(p) = pat {
@@ -4878,6 +5001,257 @@ mod tests {
         };
         let (s, ty) = tc.infer_expr(&ctx, &expr).unwrap();
         assert_eq!(apply_subst(&ty, &s), Type::int());
+    }
+
+    // Conservative closed-variant match coverage (Elm-inspired P0 stabilization).
+    fn option_ctx() -> TypeContext {
+        ctx_with(
+            "input",
+            Type::Variant(vec![
+                ("Some".to_string(), Some(Type::int())),
+                ("None".to_string(), None),
+            ]),
+        )
+    }
+
+    fn option_match(arms: Vec<(Pattern, Option<Expr>, Expr)>) -> Expr {
+        Expr::Match {
+            scrutinee: Box::new(var("input")),
+            arms,
+            span: sp(),
+        }
+    }
+
+    fn some_wild() -> Pattern {
+        Pattern::Variant("Some".to_string(), Some(Box::new(Pattern::Wild)))
+    }
+
+    fn none() -> Pattern {
+        Pattern::Variant("None".to_string(), None)
+    }
+
+    #[test]
+    fn closed_variant_match_rejects_missing_constructor() {
+        let mut tc = TypeChecker::new();
+        let expr = option_match(vec![(some_wild(), None, int_lit(1))]);
+        let err = tc.infer_expr(&option_ctx(), &expr).unwrap_err();
+        assert!(
+            matches!(err, NuError::TypeError { msg, .. } if msg.contains("None") && msg.contains("non-exhaustive")),
+            "missing None must be diagnosed at compile time"
+        );
+    }
+
+    #[test]
+    fn closed_variant_match_accepts_every_constructor() {
+        let mut tc = TypeChecker::new();
+        let expr = option_match(vec![
+            (some_wild(), None, int_lit(1)),
+            (none(), None, int_lit(0)),
+        ]);
+        assert!(tc.infer_expr(&option_ctx(), &expr).is_ok());
+    }
+
+    #[test]
+    fn closed_variant_guard_does_not_imply_exhaustiveness() {
+        let mut ctx = option_ctx();
+        ctx.bind("allow".to_string(), Type::bool(), Capability::Ref, false);
+        let mut tc = TypeChecker::new();
+        let expr = option_match(vec![
+            (some_wild(), None, int_lit(1)),
+            (none(), Some(var("allow")), int_lit(0)),
+        ]);
+        let err = tc.infer_expr(&ctx, &expr).unwrap_err();
+        assert!(matches!(err, NuError::TypeError { msg, .. } if msg.contains("None")));
+    }
+
+    #[test]
+    fn closed_variant_wildcard_fallback_is_exhaustive() {
+        let mut tc = TypeChecker::new();
+        let expr = option_match(vec![
+            (some_wild(), None, int_lit(1)),
+            (Pattern::Wild, None, int_lit(0)),
+        ]);
+        assert!(tc.infer_expr(&option_ctx(), &expr).is_ok());
+    }
+
+    #[test]
+    fn closed_variant_rejects_arm_after_unconditional_catchall() {
+        let mut tc = TypeChecker::new();
+        let expr = option_match(vec![
+            (Pattern::Wild, None, int_lit(0)),
+            (none(), None, int_lit(1)),
+        ]);
+        let err = tc.infer_expr(&option_ctx(), &expr).unwrap_err();
+        assert!(matches!(err, NuError::TypeError { msg, .. } if msg.contains("unreachable")));
+    }
+
+    #[test]
+    fn closed_variant_rejects_duplicate_irrefutable_constructor() {
+        let mut tc = TypeChecker::new();
+        let expr = option_match(vec![
+            (some_wild(), None, int_lit(1)),
+            (some_wild(), None, int_lit(2)),
+            (none(), None, int_lit(0)),
+        ]);
+        let err = tc.infer_expr(&option_ctx(), &expr).unwrap_err();
+        assert!(matches!(err, NuError::TypeError { msg, .. } if msg.contains("unreachable")));
+    }
+
+    #[test]
+    fn closed_variant_guarded_constructor_can_be_followed_by_fallback() {
+        let mut ctx = option_ctx();
+        ctx.bind("allow".to_string(), Type::bool(), Capability::Ref, false);
+        let mut tc = TypeChecker::new();
+        let expr = option_match(vec![
+            (some_wild(), Some(var("allow")), int_lit(1)),
+            (some_wild(), None, int_lit(2)),
+            (none(), None, int_lit(0)),
+        ]);
+        assert!(tc.infer_expr(&ctx, &expr).is_ok());
+    }
+
+    #[test]
+    fn closed_variant_alias_catchall_is_exhaustive() {
+        let mut tc = TypeChecker::new();
+        let expr = option_match(vec![(
+            Pattern::Alias("whole".to_string(), Box::new(Pattern::Wild)),
+            None,
+            int_lit(0),
+        )]);
+        assert!(tc.infer_expr(&option_ctx(), &expr).is_ok());
+    }
+
+    #[test]
+    fn closed_variant_refutable_nested_payload_does_not_claim_full_coverage() {
+        let mut tc = TypeChecker::new();
+        let expr = option_match(vec![
+            (
+                Pattern::Variant(
+                    "Some".to_string(),
+                    Some(Box::new(Pattern::Lit(Literal::Int(1)))),
+                ),
+                None,
+                int_lit(1),
+            ),
+            (none(), None, int_lit(0)),
+        ]);
+        // The first arm only matches Some(1): it cannot prove all Some values
+        // are handled. The conservative analyzer defers nested pattern coverage
+        // rather than claiming this match is exhaustive or rejecting valid nested
+        // enumerations based on incomplete reasoning.
+        assert!(tc.infer_expr(&option_ctx(), &expr).is_ok());
+    }
+
+    #[test]
+    fn closed_variant_rejects_unknown_constructor() {
+        let mut tc = TypeChecker::new();
+        let expr = option_match(vec![
+            (Pattern::Variant("Missing".to_string(), None), None, int_lit(1)),
+            (some_wild(), None, int_lit(2)),
+            (none(), None, int_lit(3)),
+        ]);
+        let result = tc.infer_expr(&option_ctx(), &expr);
+        assert!(
+            matches!(result, Err(NuError::TypeError { msg, .. }) if msg.contains("Missing")),
+            "an unknown constructor must fail even if other arms cover the type"
+        );
+    }
+
+    #[test]
+    fn closed_variant_rejects_missing_payload_pattern() {
+        let mut tc = TypeChecker::new();
+        let expr = option_match(vec![
+            (Pattern::Variant("Some".to_string(), None), None, int_lit(1)),
+            (none(), None, int_lit(0)),
+        ]);
+        let result = tc.infer_expr(&option_ctx(), &expr);
+        assert!(
+            matches!(result, Err(NuError::TypeError { msg, .. }) if msg.contains("Some")),
+            "a payload constructor requires a payload pattern"
+        );
+    }
+
+    #[test]
+    fn closed_variant_rejects_payload_on_nullary_constructor() {
+        let mut tc = TypeChecker::new();
+        let expr = option_match(vec![
+            (
+                Pattern::Variant(
+                    "None".to_string(),
+                    Some(Box::new(Pattern::Var("unexpected".to_string()))),
+                ),
+                None,
+                int_lit(0),
+            ),
+            (some_wild(), None, int_lit(1)),
+        ]);
+        let result = tc.infer_expr(&option_ctx(), &expr);
+        assert!(
+            matches!(result, Err(NuError::TypeError { msg, .. }) if msg.contains("None")),
+            "a nullary constructor cannot bind a payload"
+        );
+    }
+
+    #[test]
+    fn closed_variant_source_reports_missing_constructor() {
+        let source = r#"
+type Color = Red | Green | Blue
+fn classify(c: Color) -> Int {
+    match c {
+        Red => 1,
+        Green => 2
+    }
+}
+"#;
+        let result = check_src(source);
+        assert!(
+            matches!(result, Err(NuError::TypeError { msg, .. }) if msg.contains("Blue")),
+            "source-level typechecking must report missing Blue"
+        );
+    }
+
+    #[test]
+    fn closed_variant_source_accepts_all_constructors() {
+        let source = r#"
+type Color = Red | Green | Blue
+fn classify(c: Color) -> Int {
+    match c {
+        Red => 1,
+        Green => 2,
+        Blue => 3
+    }
+}
+"#;
+        assert!(check_src(source).is_ok());
+    }
+
+    #[test]
+    fn closed_variant_source_rejects_impossible_constructor() {
+        let source = r#"
+type Color = Red | Green
+fn classify(c: Color) -> Int {
+    match c {
+        Red => 1,
+        Green => 2,
+        Blue => 3
+    }
+}
+"#;
+        assert!(
+            matches!(check_src(source), Err(NuError::TypeError { msg, .. }) if msg.contains("Blue")),
+            "unknown constructor Blue must fail from source compilation"
+        );
+    }
+
+    #[test]
+    fn closed_variant_nonvariant_match_unchanged() {
+        let mut tc = TypeChecker::new();
+        let expr = Expr::Match {
+            scrutinee: Box::new(int_lit(1)),
+            arms: vec![(Pattern::Lit(Literal::Int(1)), None, int_lit(10))],
+            span: sp(),
+        };
+        assert!(tc.infer_expr(&TypeContext::new(), &expr).is_ok());
     }
 
     // -----------------------------------------------------------------------
