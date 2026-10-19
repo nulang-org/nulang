@@ -86,3 +86,23 @@ fn inspection_requires_check_and_cannot_mix_with_json_diagnostics() {
     assert!(String::from_utf8_lossy(&mixed.stderr).contains("--json"));
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn inspection_rejects_conflicting_execution_mode_before_running_user_code() {
+    let (dir, file) = temp_source("no_execution", "fn main() = 1\n");
+    let output = run(
+        &[
+            "--inspect-types",
+            "--check",
+            "--eval",
+            r#"perform IO.print("EXECUTED_UNEXPECTEDLY")"#,
+        ],
+        Some(&file),
+    );
+    assert!(!output.status.success(), "inspection must reject --eval");
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("EXECUTED_UNEXPECTEDLY"),
+        "inspection must never execute conflicting evaluation mode"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
