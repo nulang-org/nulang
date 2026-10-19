@@ -137,8 +137,9 @@ is testable from the start.
 
 - **Per-function style** — if a file defines functions whose names start
   with `test_`, each one is discovered and run as a separate test case.
-  The runner strips the file's `fn main` and wraps each test function in
-  its own temporary `main`, so the functions must take no arguments:
+  The runner renames the file's `fn main` (without executing it) and wraps
+  each test function in its own temporary `main`. The source's original `main`
+  is still typechecked, and test functions must take no arguments:
 
   ```nulang
   // tests/test_strings.nula — two test cases: test_greet_world, test_greet_empty.
