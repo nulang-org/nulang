@@ -2,8 +2,8 @@
 //!
 //! Each worker owns three local queues (High, Normal, Low). Keeping local
 //! queues split by priority lets the scheduler batch-transfer work out of the
-//! shared injectors without weakening the runtime's strict High > Normal > Low
-//! scheduling semantics. Within a priority, workers prefer local work, then
+//! shared injectors while preserving strict High > Normal > Low by default.
+//! Explicit weighted-fair schedulers instead vary which priority band is tried first. Within a priority, workers prefer local work, then
 //! batch from the global injector, then steal from peers.
 //!
 //! The live runtime currently has one owning scheduler thread per shard. Its
@@ -16,7 +16,7 @@
 //! - lock-free local push/pop on the owning worker
 //! - batched global-to-local transfers to reduce shared-injector contention
 //! - lock-free peer stealing for true multi-worker callers
-//! - strict priority across both global and worker-local queues
+//! - strict priority by default, opt-in weighted service ordering
 //! - no useless peer scans on the current single-owner runtime path
 //! - backoff and sleep for idle workers
 //!
@@ -24,6 +24,7 @@
 //! crossbeam::deque.
 
 use super::actor::ActorPriority;
+use crate::scheduler_fairness::{FairPriorityPolicy, InvalidPriorityWeights, PriorityWeights};
 use crossbeam::deque::{Injector, Steal, Stealer, Worker};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread;
@@ -134,7 +135,7 @@ impl SchedulerStatsInternal {
     }
 }
 
-/// A strict-priority work-stealing scheduler with Chase-Lev deques.
+/// A priority-aware work-stealing scheduler with Chase-Lev deques.
 ///
 /// Each worker has one local deque per actor priority. A single local queue
 /// would allow previously batched Low/Normal work to run in front of newly
@@ -156,6 +157,10 @@ pub struct Scheduler {
     stealers_low: Vec<Stealer<u64>>,
 
     worker_count: usize,
+    /// None preserves strict High > Normal > Low scheduling by default.
+    fair_priority: Option<FairPriorityPolicy>,
+    /// One logical arbitration ticket per dequeue attempt when fairness is opted in.
+    fair_cursor: AtomicU64,
     processed_count: AtomicUsize,
     stats: SchedulerStatsInternal,
 }
@@ -189,6 +194,8 @@ impl Scheduler {
             stealers,
             stealers_low,
             worker_count,
+            fair_priority: None,
+            fair_cursor: AtomicU64::new(0),
             processed_count: AtomicUsize::new(0),
             stats: SchedulerStatsInternal {
                 tasks_from_local_queue: AtomicU64::new(0),
@@ -198,6 +205,35 @@ impl Scheduler {
                 steal_successes: AtomicU64::new(0),
                 empty_polls: AtomicU64::new(0),
             },
+        }
+    }
+
+    /// Construct an explicitly weighted scheduler without changing the strict
+    /// production default. Caller-supplied weights must contain a nonzero band.
+    pub fn new_with_fair_priority(
+        worker_count: usize,
+        weights: PriorityWeights,
+    ) -> Result<Self, InvalidPriorityWeights> {
+        let policy = FairPriorityPolicy::new(weights)?;
+        let mut scheduler = Self::new(worker_count);
+        scheduler.fair_priority = Some(policy);
+        Ok(scheduler)
+    }
+
+    /// Choose one priority order per logical dequeue attempt. Retries inside
+    /// one queue probe must not consume additional fairness turns.
+    #[inline]
+    fn priority_order(&self) -> [ActorPriority; 3] {
+        match &self.fair_priority {
+            Some(policy) => {
+                let ticket = self.fair_cursor.fetch_add(1, Ordering::Relaxed);
+                policy.turn_at(ticket).order
+            }
+            None => [
+                ActorPriority::High,
+                ActorPriority::Normal,
+                ActorPriority::Low,
+            ],
         }
     }
 
@@ -367,11 +403,7 @@ impl Scheduler {
     pub fn next_task(&self, worker_idx: usize) -> Option<u64> {
         let mut steal_attempts = 0u64;
 
-        for priority in [
-            ActorPriority::High,
-            ActorPriority::Normal,
-            ActorPriority::Low,
-        ] {
+        for priority in self.priority_order() {
             if let Some(task) = self.pop_local(worker_idx, priority) {
                 self.record_steal_attempts(steal_attempts);
                 return Some(task);
@@ -403,11 +435,7 @@ impl Scheduler {
     /// peer scans here removes three empty High-band probes from the common
     /// Normal-priority path while retaining batch transfer and strict priority.
     fn next_owner_task(&self, worker_idx: usize) -> Option<u64> {
-        for priority in [
-            ActorPriority::High,
-            ActorPriority::Normal,
-            ActorPriority::Low,
-        ] {
+        for priority in self.priority_order() {
             if let Some(task) = self.pop_local(worker_idx, priority) {
                 return Some(task);
             }
@@ -437,11 +465,7 @@ impl Scheduler {
     pub fn steal_one(&self) -> Option<u64> {
         let mut steal_attempts = 0u64;
 
-        for priority in [
-            ActorPriority::High,
-            ActorPriority::Normal,
-            ActorPriority::Low,
-        ] {
+        for priority in self.priority_order() {
             if let Some(task) = self.steal_global_for(priority) {
                 self.record_steal_attempts(steal_attempts);
                 return Some(task);
