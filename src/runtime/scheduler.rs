@@ -880,8 +880,10 @@ mod scheduler_tests {
                 if round >= WARMUP_ROUNDS {
                     samples[usize::from(fair)].push((elapsed_ns, high_p99_ns));
                     println!(
-                        "[scheduler-fair-bench] mode={} round={} operations={} \
-                         elapsed_ns={} high_queue_p99_ns={}",
+                        concat!(
+                            "[scheduler-fair-bench] mode={} round={} operations={} ",
+                            "elapsed_ns={} high_queue_p99_ns={}"
+                        ),
                         if fair { "fair_8_4_1" } else { "strict" },
                         round - WARMUP_ROUNDS + 1,
                         TOTAL,
@@ -901,13 +903,13 @@ mod scheduler_tests {
             // Six measured rounds: use the midpoint of the two central
             // samples, rather than silently reporting the upper-middle one.
             let midpoint = durations.len() / 2;
-            let median_duration_ns =
-                (durations[midpoint - 1] + durations[midpoint]) / 2;
-            let median_high_p99_ns =
-                (high_p99s[midpoint - 1] + high_p99s[midpoint]) / 2;
+            let median_duration_ns = (durations[midpoint - 1] + durations[midpoint]) / 2;
+            let median_high_p99_ns = (high_p99s[midpoint - 1] + high_p99s[midpoint]) / 2;
             println!(
-                "[scheduler-fair-summary] mode={} samples={} operations={} \
-                 median_elapsed_ns={} median_high_queue_p99_ns={}",
+                concat!(
+                    "[scheduler-fair-summary] mode={} samples={} operations={} ",
+                    "median_elapsed_ns={} median_high_queue_p99_ns={}"
+                ),
                 mode,
                 rows.len(),
                 TOTAL,
