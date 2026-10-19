@@ -833,6 +833,54 @@ mod tests {
     }
 
     #[test]
+    fn source_import_index_discovers_public_symbols_without_flattening() {
+        let temp = temp_module_path("root");
+        let sibling = temp.with_file_name(format!(
+            "nulang_qualified_source_{}_{}.nula",
+            std::process::id(),
+            temp.file_stem().unwrap().to_string_lossy()
+        ));
+        std::fs::write(
+            &sibling,
+            "pub fn accessible() -> Int { 7 }\nfn internal() -> Int { 8 }\n",
+        )
+        .unwrap();
+        let source = format!(
+            "import {} as utilities\n",
+            sibling.file_stem().unwrap().to_string_lossy()
+        );
+        let tokens = Lexer::new(&source).lex().unwrap();
+        let module = Parser::new(tokens).parse_module().unwrap();
+        let index = index_qualified_imports(&module, &temp).expect("read qualified module");
+        assert!(index.resolve("utilities", "accessible", sp()).is_ok());
+        assert!(index.resolve("utilities", "internal", sp()).is_err());
+        // Indexing must not modify or flatten the program's import AST.
+        assert!(matches!(&module.decls[0], Decl::Import { alias: Some(a), .. } if a == "utilities"));
+        std::fs::remove_file(temp).unwrap();
+        std::fs::remove_file(sibling).unwrap();
+    }
+
+    #[test]
+    fn source_import_index_rejects_alias_shadowing_local_names() {
+        let path = temp_module_path("alias_collision");
+        let module = AstModule {
+            name: "test".into(),
+            decls: vec![
+                public_fn("utilities"),
+                Decl::Import {
+                    path: "missing".into(),
+                    items: vec![],
+                    alias: Some("utilities".into()),
+                    span: sp(),
+                },
+            ],
+        };
+        let err = index_qualified_imports(&module, &path).unwrap_err();
+        assert!(format!("{err}").contains("alias shadows local declaration"), "{err}");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn independent_opaque_types_with_same_name_must_conflict() {
         let err = resolve_fixture(
             "import first\nimport second\n",
