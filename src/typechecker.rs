@@ -4880,6 +4880,156 @@ mod tests {
         assert_eq!(apply_subst(&ty, &s), Type::int());
     }
 
+    // Conservative closed-variant match coverage (Elm-inspired P0 stabilization).
+    fn option_ctx() -> TypeContext {
+        ctx_with(
+            "input",
+            Type::Variant(vec![
+                ("Some".to_string(), Some(Type::int())),
+                ("None".to_string(), None),
+            ]),
+        )
+    }
+
+    fn option_match(arms: Vec<(Pattern, Option<Expr>, Expr)>) -> Expr {
+        Expr::Match {
+            scrutinee: Box::new(var("input")),
+            arms,
+            span: sp(),
+        }
+    }
+
+    fn some_wild() -> Pattern {
+        Pattern::Variant("Some".to_string(), Some(Box::new(Pattern::Wild)))
+    }
+
+    fn none() -> Pattern {
+        Pattern::Variant("None".to_string(), None)
+    }
+
+    #[test]
+    fn closed_variant_match_rejects_missing_constructor() {
+        let mut tc = TypeChecker::new();
+        let expr = option_match(vec![(some_wild(), None, int_lit(1))]);
+        let err = tc.infer_expr(&option_ctx(), &expr).unwrap_err();
+        assert!(
+            matches!(err, NuError::TypeError { msg, .. } if msg.contains("None") && msg.contains("non-exhaustive")),
+            "missing None must be diagnosed at compile time"
+        );
+    }
+
+    #[test]
+    fn closed_variant_match_accepts_every_constructor() {
+        let mut tc = TypeChecker::new();
+        let expr = option_match(vec![
+            (some_wild(), None, int_lit(1)),
+            (none(), None, int_lit(0)),
+        ]);
+        assert!(tc.infer_expr(&option_ctx(), &expr).is_ok());
+    }
+
+    #[test]
+    fn closed_variant_guard_does_not_imply_exhaustiveness() {
+        let mut ctx = option_ctx();
+        ctx.bind("allow".to_string(), Type::bool(), Capability::Ref, false);
+        let mut tc = TypeChecker::new();
+        let expr = option_match(vec![
+            (some_wild(), None, int_lit(1)),
+            (none(), Some(var("allow")), int_lit(0)),
+        ]);
+        let err = tc.infer_expr(&ctx, &expr).unwrap_err();
+        assert!(matches!(err, NuError::TypeError { msg, .. } if msg.contains("None")));
+    }
+
+    #[test]
+    fn closed_variant_wildcard_fallback_is_exhaustive() {
+        let mut tc = TypeChecker::new();
+        let expr = option_match(vec![
+            (some_wild(), None, int_lit(1)),
+            (Pattern::Wild, None, int_lit(0)),
+        ]);
+        assert!(tc.infer_expr(&option_ctx(), &expr).is_ok());
+    }
+
+    #[test]
+    fn closed_variant_rejects_arm_after_unconditional_catchall() {
+        let mut tc = TypeChecker::new();
+        let expr = option_match(vec![
+            (Pattern::Wild, None, int_lit(0)),
+            (none(), None, int_lit(1)),
+        ]);
+        let err = tc.infer_expr(&option_ctx(), &expr).unwrap_err();
+        assert!(matches!(err, NuError::TypeError { msg, .. } if msg.contains("unreachable")));
+    }
+
+    #[test]
+    fn closed_variant_rejects_duplicate_irrefutable_constructor() {
+        let mut tc = TypeChecker::new();
+        let expr = option_match(vec![
+            (some_wild(), None, int_lit(1)),
+            (some_wild(), None, int_lit(2)),
+            (none(), None, int_lit(0)),
+        ]);
+        let err = tc.infer_expr(&option_ctx(), &expr).unwrap_err();
+        assert!(matches!(err, NuError::TypeError { msg, .. } if msg.contains("unreachable")));
+    }
+
+    #[test]
+    fn closed_variant_guarded_constructor_can_be_followed_by_fallback() {
+        let mut ctx = option_ctx();
+        ctx.bind("allow".to_string(), Type::bool(), Capability::Ref, false);
+        let mut tc = TypeChecker::new();
+        let expr = option_match(vec![
+            (some_wild(), Some(var("allow")), int_lit(1)),
+            (some_wild(), None, int_lit(2)),
+            (none(), None, int_lit(0)),
+        ]);
+        assert!(tc.infer_expr(&ctx, &expr).is_ok());
+    }
+
+    #[test]
+    fn closed_variant_alias_catchall_is_exhaustive() {
+        let mut tc = TypeChecker::new();
+        let expr = option_match(vec![(
+            Pattern::Alias("whole".to_string(), Box::new(Pattern::Wild)),
+            None,
+            int_lit(0),
+        )]);
+        assert!(tc.infer_expr(&option_ctx(), &expr).is_ok());
+    }
+
+    #[test]
+    fn closed_variant_refutable_nested_payload_does_not_claim_full_coverage() {
+        let mut tc = TypeChecker::new();
+        let expr = option_match(vec![
+            (
+                Pattern::Variant(
+                    "Some".to_string(),
+                    Some(Box::new(Pattern::Lit(Literal::Int(1)))),
+                ),
+                None,
+                int_lit(1),
+            ),
+            (none(), None, int_lit(0)),
+        ]);
+        // The first arm only matches Some(1): it cannot prove all Some values
+        // are handled. The conservative analyzer defers nested pattern coverage
+        // rather than claiming this match is exhaustive or rejecting valid nested
+        // enumerations based on incomplete reasoning.
+        assert!(tc.infer_expr(&option_ctx(), &expr).is_ok());
+    }
+
+    #[test]
+    fn closed_variant_nonvariant_match_unchanged() {
+        let mut tc = TypeChecker::new();
+        let expr = Expr::Match {
+            scrutinee: Box::new(int_lit(1)),
+            arms: vec![(Pattern::Lit(Literal::Int(1)), None, int_lit(10))],
+            span: sp(),
+        };
+        assert!(tc.infer_expr(&TypeContext::new(), &expr).is_ok());
+    }
+
     // -----------------------------------------------------------------------
     // Test: Pipe operator
     // -----------------------------------------------------------------------
