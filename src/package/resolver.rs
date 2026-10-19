@@ -173,12 +173,31 @@ impl Resolution {
 
 /// Resolve the full dependency graph of `manifest`, rooted at `root_dir`.
 pub fn resolve(root_dir: &Path, manifest: &Manifest) -> NuResult<Resolution> {
+    resolve_with_offline_lock(root_dir, manifest, None)
+}
+
+/// Resolve strictly from local paths or cached git/registry dependency pins.
+/// This never calls git fetch/clone or any registry client.
+pub fn resolve_offline(
+    root_dir: &Path,
+    manifest: &Manifest,
+    lock: &Lockfile,
+) -> NuResult<Resolution> {
+    resolve_with_offline_lock(root_dir, manifest, Some(lock))
+}
+
+fn resolve_with_offline_lock(
+    root_dir: &Path,
+    manifest: &Manifest,
+    offline_lock: Option<&Lockfile>,
+) -> NuResult<Resolution> {
     let root_dir = std::fs::canonicalize(root_dir).map_err(|e| NuError::PackageError {
         msg: format!("cannot resolve {}: {}", root_dir.display(), e),
         span: Span::default(),
     })?;
     let registry = manifest.package.registry.clone();
     let mut resolver = Resolver::new(root_dir.clone(), registry);
+    resolver.offline_lock = offline_lock.cloned();
     resolver.resolve_package(&root_dir, manifest, PackageSource::Root)?;
     Ok(Resolution {
         packages: resolver.order,
@@ -239,6 +258,8 @@ struct Resolver {
     root_dir: PathBuf,
     /// Default registry URL (from root manifest's `[package] registry`).
     default_registry: Option<String>,
+    /// Non-empty only in offline mode; contains exact source/version/commit pins.
+    offline_lock: Option<Lockfile>,
     /// Canonical package dir -> name, to deduplicate shared dependencies.
     by_dir: BTreeMap<PathBuf, String>,
     /// Name -> source, to detect conflicting sources for one package.
@@ -254,6 +275,7 @@ impl Resolver {
         Resolver {
             root_dir,
             default_registry,
+            offline_lock: None,
             by_dir: BTreeMap::new(),
             by_name: BTreeMap::new(),
             in_progress: Vec::new(),
@@ -389,6 +411,46 @@ impl Resolver {
     fn fetch_git(&self, dep_name: &str, detail: &DependencyDetail) -> NuResult<(PathBuf, String)> {
         let url = detail.git.as_ref().expect("checked by caller");
         let cache = self.root_dir.join(".nula").join("git");
+        if let Some(lock) = &self.offline_lock {
+            let revision = detail
+                .rev
+                .as_ref()
+                .or(detail.branch.as_ref())
+                .or(detail.tag.as_ref());
+            let source = match revision {
+                Some(rev) => format!("git+{}#{}", url, rev),
+                None => format!("git+{}", url),
+            };
+            let pin = lock.package.iter().find(|p| p.name == dep_name && p.source == source)
+                .ok_or_else(|| NuError::PackageError {
+                    msg: format!("offline dependency '{}' has no matching git lockfile pin", dep_name),
+                    span: Span::default(),
+                })?;
+            let dest = cache.join(dep_name);
+            if pin.commit.is_empty() || !dest.join(MANIFEST_FILE).exists() {
+                return Err(NuError::PackageError {
+                    msg: format!("offline git dependency '{}' is not cached at its locked commit", dep_name),
+                    span: Span::default(),
+                });
+            }
+            let marker = std::fs::read_to_string(cache.join(format!("{}.commit", dep_name)))
+                .map_err(|e| NuError::PackageError {
+                    msg: format!("offline git dependency '{}' has no cache marker: {}", dep_name, e),
+                    span: Span::default(),
+                })?;
+            let head = git_rev_parse(&dest, "HEAD")?;
+            if marker.trim() != pin.commit || head != pin.commit {
+                return Err(NuError::PackageError {
+                    msg: format!("offline git dependency '{}' cache revision differs from Nulang.lock", dep_name),
+                    span: Span::default(),
+                });
+            }
+            let dir = std::fs::canonicalize(&dest).map_err(|e| NuError::PackageError {
+                msg: format!("offline git cache for '{}' cannot be resolved: {}", dep_name, e),
+                span: Span::default(),
+            })?;
+            return Ok((dir, pin.commit.clone()));
+        }
         std::fs::create_dir_all(&cache).map_err(|e| NuError::PackageError {
             msg: format!("cannot create {}: {}", cache.display(), e),
             span: Span::default(),
@@ -539,6 +601,29 @@ impl Resolver {
         requirement: &str,
         registry_url: &str,
     ) -> NuResult<(PathBuf, String)> {
+        if let Some(lock) = &self.offline_lock {
+            let source = format!("reg+{}", registry_url);
+            let pin = lock.package.iter()
+                .find(|p| p.name == dep_name && p.source == source
+                    && version_satisfies(requirement, &p.version).unwrap_or(false))
+                .ok_or_else(|| NuError::PackageError {
+                    msg: format!("offline dependency '{}' has no compatible registry lockfile pin", dep_name),
+                    span: Span::default(),
+                })?;
+            let dest = self.root_dir.join(".nula").join("registry")
+                .join(format!("{}-{}", dep_name, pin.version));
+            if !dest.join(MANIFEST_FILE).exists() {
+                return Err(NuError::PackageError {
+                    msg: format!("offline registry dependency '{}' version {} is not cached", dep_name, pin.version),
+                    span: Span::default(),
+                });
+            }
+            let dir = std::fs::canonicalize(&dest).map_err(|e| NuError::PackageError {
+                msg: format!("offline registry cache for '{}' cannot be resolved: {}", dep_name, e),
+                span: Span::default(),
+            })?;
+            return Ok((dir, pin.version.clone()));
+        }
         let client = crate::registry::RegistryClient::new(registry_url.to_string(), None);
         let versions = client
             .list_versions(dep_name)
