@@ -1,8 +1,8 @@
-type Color = Red | Green | Blue
-fn name(c: Color) -> String {
+// Unknown Int values are not statically exhaustive; preserve runtime fallback.
+fn name(c: Int) -> String {
     match c {
-        | Red => "red"
-        | Green => "green"
+        | 0 => "zero"
+        | 1 => "one"
     }
 }
-perform IO.print(name(Blue))
+perform IO.print(name(2))

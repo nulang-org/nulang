@@ -22,14 +22,15 @@ workflow SagaTransaction {
   }
 
   step ship_goods {
-    let m: Maybe[Int] = None in
+    // An incomplete Int match deliberately escapes finite-type static coverage,
+    // exercising the runtime failure/compensation path.
+    let m: Int = 0 in
     match m {
-      | Some(x) => perform IO.print("unreachable")
+      | 1 => perform IO.print("unreachable")
     }
   }
 }
 
-type Maybe[V] = Some(V) | None
 
 actor Dummy {
   behavior noop() { 0 }
