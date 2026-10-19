@@ -705,6 +705,68 @@ mod scheduler_tests {
     }
 
     #[test]
+    fn fair_owner_dequeue_services_low_and_normal_under_saturated_high() {
+        let s = Scheduler::new_with_fair_priority(1, PriorityWeights::new(8, 4, 1))
+            .expect("valid fairness weights");
+        for i in 0..64u64 {
+            s.enqueue_with_priority(1000 + i, ActorPriority::High);
+            s.enqueue_with_priority(2000 + i, ActorPriority::Normal);
+            s.enqueue_with_priority(3000 + i, ActorPriority::Low);
+        }
+
+        let ids: Vec<_> = (0..13).map(|_| s.dequeue().expect("queued actor")).collect();
+        assert_eq!(ids.iter().filter(|&&id| (1000..2000).contains(&id)).count(), 8);
+        assert_eq!(ids.iter().filter(|&&id| (2000..3000).contains(&id)).count(), 4);
+        assert_eq!(ids.iter().filter(|&&id| (3000..4000).contains(&id)).count(), 1);
+    }
+
+    #[test]
+    fn fair_generic_worker_and_steal_path_include_low_under_high_load() {
+        for steal in [false, true] {
+            let s = Scheduler::new_with_fair_priority(1, PriorityWeights::new(2, 1, 1))
+                .expect("valid fairness weights");
+            for i in 0..12u64 {
+                s.enqueue_with_priority(100 + i, ActorPriority::High);
+                s.enqueue_with_priority(200 + i, ActorPriority::Normal);
+                s.enqueue_with_priority(300 + i, ActorPriority::Low);
+            }
+            let ids: Vec<_> = (0..4)
+                .map(|_| {
+                    if steal {
+                        s.steal_one().expect("pending actor")
+                    } else {
+                        s.next_task(0).expect("pending actor")
+                    }
+                })
+                .collect();
+            assert_eq!(ids.iter().filter(|&&id| (100..200).contains(&id)).count(), 2);
+            assert_eq!(ids.iter().filter(|&&id| (200..300).contains(&id)).count(), 1);
+            assert_eq!(ids.iter().filter(|&&id| (300..400).contains(&id)).count(), 1);
+        }
+    }
+
+    #[test]
+    fn default_scheduler_remains_strictly_high_first() {
+        let s = Scheduler::new(1);
+        for i in 0..32 {
+            s.enqueue_with_priority(i, ActorPriority::Low);
+            s.enqueue_with_priority(100 + i, ActorPriority::High);
+        }
+        for _ in 0..32 {
+            assert!(
+                s.dequeue().is_some_and(|id| id >= 100),
+                "default must preserve existing strict actor priority"
+            );
+        }
+        assert!(s.dequeue().is_some_and(|id| id < 100));
+    }
+
+    #[test]
+    fn fairness_opt_in_rejects_zero_weights() {
+        assert!(Scheduler::new_with_fair_priority(1, PriorityWeights::new(0, 0, 0)).is_err());
+    }
+
+    #[test]
     fn test_run_one() {
         let s = Scheduler::new(2);
         let processed = Arc::new(AtomicU64::new(0));
