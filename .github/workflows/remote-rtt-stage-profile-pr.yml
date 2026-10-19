@@ -1,0 +1,33 @@
+name: Remote RTT stage profile
+
+on:
+  pull_request:
+    paths:
+      - 'tests/remote_rtt_stage_profile.rs'
+      - 'tests/remote_rtt_stage_profile_contract.rs'
+      - '.github/workflows/remote-rtt-stage-profile-pr.yml'
+      - 'src/runtime/**'
+
+permissions:
+  contents: read
+
+jobs:
+  profile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Contract
+        run: >-
+          cargo test --locked --no-default-features
+          --test remote_rtt_stage_profile_contract
+      - name: Release stage budget
+        run: >-
+          cargo test --locked --release
+          --no-default-features
+          --features tcp
+          --test remote_rtt_stage_profile
+          bench_ab_remote_rtt_stage_budget
+          -- --ignored --nocapture --test-threads=1

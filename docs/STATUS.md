@@ -1,5 +1,7 @@
 # Nulang RFC 0003 — Infrastructure Phase Completion Report
 
+> **Historical snapshot:** this report records the repository state on 2026-08-09. It is not a current release-health dashboard. Use the required CI checks on the exact commit being tagged, together with `docs/RELEASE_CHECKLIST.md`, for current release readiness.
+
 **Date:** 2026-08-09
 **Commits:** 4 pushed to origin/main
 **Tests:** 1679 passing (+12 new), 1 pre-existing AOT failure

@@ -1067,6 +1067,27 @@ mod tests {
             hosts[0].1, 51,
             "re-spawned actor must restore the LAST durable snapshot (not the first)"
         );
+        let respawned = cluster.node(hosts[0].0);
+        let actor = respawned
+            .actors
+            .get(&counter)
+            .expect("the unique survivor must host the re-spawned actor");
+        assert_eq!(
+            actor.activation_epoch, 2,
+            "failover must advance the live actor fencing epoch before it can run"
+        );
+        let snapshot = respawned
+            .persistence
+            .load_snapshot(counter)
+            .expect("failover must persist the bumped epoch locally");
+        assert_eq!(
+            snapshot.activation_epoch, 2,
+            "a crash immediately after takeover must recover the new fencing epoch"
+        );
+        assert!(
+            respawned.respawn_opted.contains(&counter),
+            "the re-spawned actor must remain opted into node-loss recovery"
+        );
     }
 
     /// D7c goodbye path (RFC 0014 §1 path 1): a self-downing node must
@@ -1098,8 +1119,14 @@ mod tests {
         cluster.node_mut(0).checkpoint_actor(counter);
         cluster.run_rounds(20);
 
-        // The self-down path: checkpoint + terminate, then the goodbye.
-        cluster.node_mut(0).goodbye_self();
+        // The self-down path: capture the manifest, checkpoint + terminate,
+        // then the caller can send the goodbye after the actors are gone.
+        let goodbye_manifest = cluster.node_mut(0).goodbye_self();
+        assert_eq!(
+            goodbye_manifest,
+            vec![(counter, 1)],
+            "goodbye must preserve the live actor's canonical epoch after reaping"
+        );
 
         // The goodbye declaration is now true: the local copy is gone.
         assert!(
@@ -1127,7 +1154,16 @@ mod tests {
         cluster.run_rounds(20);
 
         let counter = spawn_respawnable_counter(&mut cluster.node_mut(0));
-        assert_eq!(cluster.node(0).respawn_opted.get(&counter), Some(&1));
+        assert!(cluster.node(0).respawn_opted.contains(&counter));
+        assert_eq!(
+            cluster
+                .node(0)
+                .actors
+                .get(&counter)
+                .unwrap()
+                .activation_epoch,
+            1
+        );
         let other_node = cluster.id(1);
 
         // Simulate a re-joined node learning that a survivor re-spawned the
@@ -1151,7 +1187,7 @@ mod tests {
             "self-demote must reap the superseded local copy"
         );
         assert!(
-            !cluster.node(0).respawn_opted.contains_key(&counter),
+            !cluster.node(0).respawn_opted.contains(&counter),
             "self-demote must forget the superseded opt-in"
         );
         // The forwarding entry must point at the replacement node, not self.

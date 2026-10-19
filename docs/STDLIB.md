@@ -82,27 +82,27 @@ let r = sqrt(25.0)       // ~5.0
 
 List/array operations over native arrays. Functions fall into two categories:
 
-- **Int-only** (annotated `[Int]`): `length`, `sum`, `contains`, `index_of`,
-  `find`, `any`, `all`, `fold`, `max_of`, `min_of`, `sort`, `append`, `zip`,
-  `enumerate`. Passing a non-Int array produces a type error.
+- **Int-only** (annotated `[Int]`): `sum`, `fold`, `max_of`, `min_of`,
+  `sort`, `append`, `zip`, `enumerate`, and `uniq`.
 
-- **Polymorphic** (no element-type annotation): `map`, `filter`, `reverse`,
-  `take`, `drop`, `range`. These accept and return arrays of any element type
-  (strings, records, tuples, etc.).
+- **Polymorphic** (no element-type annotation): `length`, `contains`, `index_of`,
+  `find`, `any`, `all`, `map`, `filter`, `reverse`, `take`, `drop`,
+  and `range`. These accept arrays of any compatible element type.
 
 ### Traversal functions
 
 | Function | Signature | Description |
 |---|---|---|
-| `length` | `fn length(xs: [Int]) -> Int` | Number of elements in the array. |
+| `length` | `fn length(xs) -> Int` | Number of elements in the array. |
 | `sum` | `fn sum(xs: [Int]) -> Int` | Sum of all elements. |
-| `contains` | `fn contains(x: Int, xs: [Int]) -> Bool` | True if `x` appears in `xs`. |
-| `index_of` | `fn index_of(x: Int, xs: [Int]) -> Int` | First index of `x` in `xs`, or `-1` if not found. |
-| `any` | `fn any(pred, xs: [Int]) -> Bool` | True if any element satisfies the predicate. |
-| `all` | `fn all(pred, xs: [Int]) -> Bool` | True if all elements satisfy the predicate. |
+| `contains` | `fn contains(x, xs) -> Bool` | True if `x` appears in `xs`. |
+| `index_of` | `fn index_of(x, xs) -> Option[Int]` | First index of `x`, or `None` if not found. |
+| `find` | `fn find(pred, xs) -> Option[T]` | First matching element, or `None`. |
+| `any` | `fn any(pred, xs) -> Bool` | True if any element satisfies the predicate. |
+| `all` | `fn all(pred, xs) -> Bool` | True if all elements satisfy the predicate. |
 | `fold` | `fn fold(f, init: Int, xs: [Int]) -> Int` | Left fold: `fold(f, init, [a,b,c])` = `f(f(f(init, a), b), c)`. |
-| `max_of` | `fn max_of(xs: [Int]) -> Int` | Maximum element. Crashes for empty array. |
-| `min_of` | `fn min_of(xs: [Int]) -> Int` | Minimum element. Crashes for empty array. |
+| `max_of` | `fn max_of(xs: [Int]) -> Option[Int]` | Maximum element, or `None` for an empty array. |
+| `min_of` | `fn min_of(xs: [Int]) -> Option[Int]` | Minimum element, or `None` for an empty array. |
 
 ### Array-producing functions
 
@@ -125,7 +125,7 @@ let xs = [1, 2, 3, 4, 5]
 // Traversals
 let s = sum(xs)                // 15
 let c = contains(3, xs)        // true
-let i = index_of(4, xs)        // 3
+let i = index_of(4, xs)        // Some(3)
 let y = any(fn(x) { x > 3 }, xs)   // true
 let z = fold(fn(a, b) { a + b }, 0, xs)  // 15
 
@@ -147,8 +147,7 @@ import stdlib::list
 let excited = map(fn(s) { s + "!" }, ["a", "b", "c"])  // ["a!", "b!", "c!"]
 let short   = filter(fn(s) { perform String.length(s) <= 4 }, ["hi", "hello", "hey"])  // ["hi", "hey"]
 
-// ⚠ Passing strings to Int-only functions is a type error:
-// length(["x", "y", "z"])  // ERROR: Type mismatch, expected Int, found String
+// Int-only numerical/ordering operations still reject incompatible element types.
 ```
 
 ---
@@ -289,8 +288,7 @@ let r = remove(c, 1)             // [2]
 
 ## Module: map
 
-Integer-to-integer map operations. Maps are arrays of `{key: Int, value: Int}`
-records. Key lookup is O(n). `get` returns `-1` for missing keys.
+Map operations over arrays of `{key, value}` records. Keys and values are inferred from use. Key lookup is O(n), and `get` returns `Option[value]` so absence is explicit.
 
 > **Caveat**: `map` and `set` both export `empty`, `size`, `remove`, and
 > `is_empty`. Importing both in the same file causes name collisions — import
@@ -300,7 +298,7 @@ records. Key lookup is O(n). `get` returns `-1` for missing keys.
 |---|---|---|
 | `empty` | `fn empty()` | An empty map. |
 | `insert` | `fn insert(k, v, m)` | Insert or update a key-value pair. Returns a new map. |
-| `get` | `fn get(k, m)` | Look up a key. Returns the value, or `-1` if not found. |
+| `get` | `fn get(k, m) -> Option[V]` | Look up a key. Returns `Some(value)` or `None`. |
 | `contains_key` | `fn contains_key(k, m)` | True when the key is present. |
 | `remove` | `fn remove(k, m)` | Remove a key. Returns a new map. |
 | `size` | `fn size(m)` | Number of key-value pairs. |
@@ -317,8 +315,8 @@ let m = empty()                    // []
 let a = insert(1, 100, m)           // [{key: 1, value: 100}]
 let b = insert(2, 200, a)           // [{key: 1, value: 100}, {key: 2, value: 200}]
 let c = insert(1, 999, b)           // [{key: 1, value: 999}, {key: 2, value: 200}]
-let v = get(1, c)                   // 999
-let miss = get(3, c)                // -1
+let v = get(1, c)                   // Some(999)
+let miss = get(3, c)                // None
 let ok = contains_key(2, c)         // true
 let kk = keys(c)                     // [1, 2]
 let vv = values(c)                   // [999, 200]

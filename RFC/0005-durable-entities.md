@@ -1,15 +1,17 @@
 # RFC 0005: Durable Entities
 
-- **Status:** Draft
+- **Status:** Historical draft — not accepted; universal-entity framing superseded by RFC 0024
 - **Tier:** Stable
 - **Author:** AI assistant review
 - **Created:** 2026-07-21
 - **Resolved:** (pending)
 - **Language-version at effect:** 2.0 (planned)
 - **Supersedes:** none
-- **Superseded by:** none
+- **Superseded by:** RFC 0024 (execution-model architecture)
 
 ## Summary
+
+> **Historical note (2026-09-25):** This draft predates RFC 0024 and must not be read as making `entity` the universal unit of computation. The current model keeps local computation, scoped tasks, actors, workflows, durability, identity, placement, effects, reference capabilities, and external authority orthogonal. `entity` remains a useful durable-state abstraction, but it does not subsume ordinary computation or durable workflows. Consult `SPEC2.md`, `docs/IMPLEMENTATION_STATUS.md`, and accepted RFCs for current semantics.
 
 Introduce `entity` as a Stable language keyword for long-lived, durable, stateful computational identities. An `entity` is a `persistent actor` with stronger defaults and additional operations: event sourcing as the primary state model, stable identity across restarts, and migration-aware state evolution. The existing `actor` and `persistent actor` keywords remain Stable; `entity` is the recommended surface for software that must survive forever.
 

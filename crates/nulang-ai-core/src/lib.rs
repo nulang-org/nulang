@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use uuid::Uuid;
 
+pub mod orchestration;
+pub use orchestration::{ProgressEvent, ProgressLedger};
+
 mod duration_secs {
     use serde::{Deserialize, Deserializer, Serializer};
     use std::time::Duration;

@@ -135,13 +135,15 @@ Given `TypeMetadata` (register → `KnownType::{Int, Float, Bool, Unknown}`), th
 
 The SIMD compiler emits 128-bit vectors — `I64x2`/`F64x2` (2-wide) and `I32x4`/`F32x4` (4-wide) — as a scalar prefix loop, a SIMD body, and a scalar epilogue (`SimdWidth::Width8`/`I16x8` is reserved, not implemented). Compilation requires a compile-time trip-count hint and host support (`is_simd_supported()`: SSE2 on x86_64, always true on aarch64); otherwise it falls back to the typed scalar compiler. On a SIMD compile error the session falls back to the plain scalar `compile_region`.
 
-### Testing
+### Testing and measurement
 
-71 `#[test]`s under `src/jit/` (35 in `tests.rs`, 3 in `compiler.rs`, 15 in `simd_analyzer.rs`, 10 in `simd_compiler.rs`, 8 in `typed_compiler.rs`) plus 2 VM-level regression tests in `src/vm.rs` (`test_jit_hot_loop_matches_interpreter`, `test_jit_hot_loop_with_early_exit_branch`) and a typed-path test in `src/integration_tests.rs` (`test_jit_typed_guard_stripping_hot_function`) that assert JIT-compiled hot loops produce exactly the interpreter's result. There is **no performance benchmark harness** anywhere in the repository — all speedup numbers in this document are estimates.
+The test-count snapshot that originally appeared here is no longer maintained. The current repository has JIT/VM semantic regressions plus a real performance harness: Criterion groups under `benches/`, rolling main-branch history under `automation/benchmark-history`, exact-base same-host A/B measurements, Savina-style cross-runtime workloads, and the compiler-only JIT telemetry described in `benchmarks/JIT_CODEGEN.md`.
 
-### Not implemented (do not claim)
+Treat `benchmarks/README.md` and current benchmark artifacts as the source of truth for measured performance. Proposal-era speedup figures elsewhere in this document remain estimates unless they are explicitly tied to a matching benchmark result.
 
-No whole-function or ahead-of-time compilation; no inlining; no deoptimization or on-stack replacement beyond re-entering the interpreter at region boundaries; no JIT support for actor, effect, FFI, or Python opcodes; no control flow across region boundaries; no 8/16-bit SIMD widths; no recorded benchmark numbers.
+### Historical implementation caveat
+
+The negative implementation inventory that previously followed this section was a 2026-07-11 snapshot and became stale as AOT, richer JIT control flow, actor/runtime work, and benchmark infrastructure landed. Do not use this historical proposal document to infer that a feature is absent; verify the current source tree and benchmark contracts instead.
 
 ---
 

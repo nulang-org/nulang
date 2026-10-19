@@ -11,7 +11,12 @@ state isolation with message-passing — no locks, no shared mutable state.
 
 ## 2. Install & Run
 
-Build from source:
+For the fastest start, download a checksummed pre-built archive from
+[GitHub Releases](https://github.com/nulang-org/nulang/releases). The tagged
+release matrix currently publishes Linux x86_64/aarch64, macOS aarch64, and
+Windows x86_64 binaries.
+
+To build from source instead (Rust 1.95.0 is pinned by `rust-toolchain.toml`):
 
 ```bash
 git clone https://github.com/nulang-org/nulang.git && cd nulang
@@ -81,7 +86,7 @@ Comparisons: `==`, `!=`, `<`, `>`. Booleans: `true`, `false`, `and`, `or`, `not`
 
 ### Strings
 
-Single-quoted strings and string concatenation:
+Double-quoted strings and string concatenation:
 
 ```nula
 let greeting = "Hello"
