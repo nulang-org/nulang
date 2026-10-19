@@ -570,6 +570,121 @@ mod tests {
         assert!(!msg.contains("cannot read"), "{msg}");
     }
 
+    fn public_fn(name: &str) -> Decl {
+        let mut decl = fn_decl(name);
+        if let Decl::Function { public, .. } = &mut decl {
+            *public = true;
+        }
+        decl
+    }
+
+    fn temp_module_path(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_SYMBOL_FIXTURE: AtomicU64 = AtomicU64::new(0);
+        let n = NEXT_SYMBOL_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "nulang_symbol_index_{}_{}_{}.nula",
+            std::process::id(),
+            n,
+            label
+        ));
+        std::fs::write(&path, "").expect("create test module");
+        path
+    }
+
+    #[test]
+    fn qualified_symbols_from_separate_modules_remain_distinct() {
+        let left = temp_module_path("left");
+        let right = temp_module_path("right");
+        let ast = AstModule {
+            name: "test".into(),
+            decls: vec![public_fn("run")],
+        };
+        let mut bindings = QualifiedImportIndex::default();
+        bindings.bind("one", &left, &ast, sp()).expect("bind first");
+        bindings.bind("two", &right, &ast, sp()).expect("bind second");
+        let first = bindings.resolve("one", "run", sp()).expect("first exported");
+        let second = bindings.resolve("two", "run", sp()).expect("second exported");
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_ne!(first[0].origin, second[0].origin);
+        assert_eq!(first[0].kind, QualifiedSymbolKind::Function);
+        std::fs::remove_file(left).unwrap();
+        std::fs::remove_file(right).unwrap();
+    }
+
+    #[test]
+    fn qualified_index_does_not_export_private_declarations() {
+        let path = temp_module_path("visibility");
+        let ast = AstModule {
+            name: "test".into(),
+            decls: vec![fn_decl("private"), public_fn("exposed")],
+        };
+        let mut bindings = QualifiedImportIndex::default();
+        bindings.bind("mod", &path, &ast, sp()).expect("bind");
+        assert!(bindings.resolve("mod", "exposed", sp()).is_ok());
+        let err = bindings.resolve("mod", "private", sp()).unwrap_err();
+        assert!(format!("{err}").contains("not exported"), "{err}");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn qualified_index_rejects_unknown_alias_or_missing_export() {
+        let path = temp_module_path("unknown");
+        let ast = AstModule {
+            name: "test".into(),
+            decls: vec![public_fn("known")],
+        };
+        let mut bindings = QualifiedImportIndex::default();
+        bindings.bind("mod", &path, &ast, sp()).expect("bind");
+        let unknown = bindings.resolve("elsewhere", "known", sp()).unwrap_err();
+        let missing = bindings.resolve("mod", "missing", sp()).unwrap_err();
+        assert!(format!("{unknown}").contains("unknown module alias"));
+        assert!(format!("{missing}").contains("not exported"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn duplicate_alias_same_source_is_idempotent_but_different_source_fails() {
+        let first = temp_module_path("first");
+        let second = temp_module_path("second");
+        let ast = AstModule {
+            name: "test".into(),
+            decls: vec![public_fn("go")],
+        };
+        let mut bindings = QualifiedImportIndex::default();
+        bindings.bind("lib", &first, &ast, sp()).unwrap();
+        bindings.bind("lib", &first, &ast, sp()).unwrap();
+        assert_eq!(bindings.resolve("lib", "go", sp()).unwrap().len(), 1);
+        let err = bindings.bind("lib", &second, &ast, sp()).unwrap_err();
+        assert!(format!("{err}").contains("module alias conflict"), "{err}");
+        std::fs::remove_file(first).unwrap();
+        std::fs::remove_file(second).unwrap();
+    }
+
+    #[test]
+    fn public_opaque_types_keep_canonical_source_origin() {
+        let path = temp_module_path("opaque");
+        let mut bindings = QualifiedImportIndex::default();
+        let ast = AstModule {
+            name: "test".into(),
+            decls: vec![Decl::TypeAlias {
+                name: "Token".into(),
+                type_params: vec![],
+                body: crate::types::Type::int(),
+                opaque: true,
+                public: true,
+                span: sp(),
+            }],
+        };
+        bindings.bind("ids", &path, &ast, sp()).unwrap();
+        let symbols = bindings.resolve("ids", "Token", sp()).unwrap();
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].kind, QualifiedSymbolKind::Type);
+        assert_eq!(symbols[0].origin, path.canonicalize().unwrap());
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn independent_opaque_types_with_same_name_must_conflict() {
         let err = resolve_fixture(
