@@ -973,7 +973,17 @@ impl EffectChecker {
         allowed: &EffectRow,
     ) -> NuResult<()> {
         let inferred = self.infer_effects(ctx, expr)?;
-        if !effect_row_subset(&inferred, allowed) {
+        // Known-effect inclusion is sufficient for the inference fixpoint,
+        // but it cannot prove a checked contract between *independent*
+        // unresolved row variables. Until Region substitution/unification is
+        // implemented, only the same tail variable can satisfy an open
+        // effect contract without losing information.
+        let unrelated_open_tails = matches!(
+            (&inferred, allowed),
+            (EffectRow::Open(_, inferred_tail), EffectRow::Open(_, allowed_tail))
+                if inferred_tail != allowed_tail
+        );
+        if unrelated_open_tails || !effect_row_subset(&inferred, allowed) {
             // Identify which effects are not allowed for a better error message.
             let offending: Vec<String> = inferred
                 .effects()
