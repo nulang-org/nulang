@@ -1692,6 +1692,8 @@ match tree {
 
 Pattern guards (`| pat if cond => ...`) are implemented — the guard is a boolean expression evaluated with the pattern's bindings in scope after the pattern matches, and an arm whose guard fails falls through to the next arm (a guarded last arm whose guard fails raises the non-exhaustive-match error) — while list-cons patterns are planned for a future version. Nested variant, tuple, and record patterns all match structurally: sub-patterns are tested recursively against the payload, element, or field value, so `Some(Some(x))` rejects both `Some(None)` and `None`, and the `Node((l, v, r))` form above binds `l`, `v`, and `r`. One caveat remains: tuple patterns do not check arity — a pattern tests only the positions it names, so `(a, b)` also matches a longer tuple (extra elements are ignored) and a position beyond the scrutinee's length binds nil.
 
+**Conservative closed-variant coverage (experimental):** For matches whose scrutinee has a statically known `Type::Variant`, type inference rejects definitely missing constructors and arms shadowed by prior unguarded, irrefutable constructor or catch-all patterns. A guarded arm cannot establish coverage, even if its condition looks always true. Refutable nested payload patterns are treated as *unknown* rather than as complete coverage, so this analysis does not yet prove every possible pattern matrix exhaustive; unknown or abstract scrutinee types retain the existing runtime fallback. This check is intentionally narrower than Elm-style full pattern matrix checking and remains subject to P0 conformance validation.
+
 ## 6.8 Lambda Expressions
 
 Lambda expressions create anonymous functions with the `fn` keyword. An optional `->` may separate the parameter list from the body:
