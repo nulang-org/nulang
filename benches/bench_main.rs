@@ -1,7 +1,7 @@
 //! Nulang production benchmarks — criterion harness entry point.
 //!
 //! Run with: `cargo bench`
-//! Individual group: `cargo bench --bench bench_main -- numeric_kernel`
+//! Individual group: `cargo bench --features numeric-bench --bench bench_main -- numeric_kernel`
 
 mod actor_bench;
 #[cfg(feature = "native-codegen")]
