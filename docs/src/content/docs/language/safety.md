@@ -30,7 +30,7 @@ Nulang's capability system (inspired by Pony) prevents data races and use-after-
 
 - **Hindley-Milner inference** (Algorithm W): full type inference with polymorphism. The compiler infers types globally — you write annotations only for public APIs.
 - **No `any` / `dynamic`**: every expression has a known type. There are no implicit coercions or runtime type checks.
-- **Pattern matching**: variants, tuples, records, nested patterns, and guards are type-checked, but compile-time exhaustiveness analysis is not complete yet. A non-exhaustive `match` can still reach the runtime `non-exhaustive match` error path. Compile-time exhaustiveness is tracked as P0 correctness work in issue #332.
+- **Pattern matching**: variants, tuples, records, nested patterns, and guards are type-checked. A conservative compiler check detects definitely missing constructors and unreachable branches when the scrutinee has a known closed variant type; guarded branches do not establish coverage. Refutable nested payload patterns, unresolved types, and runtime tuple shape behavior still require broader exhaustiveness work in issue #332.
 - **No null**: `nil` is an explicit tagged value with its own type (`Nil`). You cannot dereference nil — the type system tracks where `nil` may flow.
 - **Row polymorphism**: records are structurally typed. A function accepting `{ x: Int, y: Int }` works with any record containing those fields (and any others) — no type-level casting needed.
 
