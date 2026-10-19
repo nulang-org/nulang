@@ -3,8 +3,9 @@
 //! running database means no external side effects and no false success claim.
 #![cfg(feature = "postgres")]
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::io::ErrorKind;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use nulang::runtime::{
     ActorSnapshot, EventEntry, JournalEntry, PersistedValue, PersistenceStore, PostgresStore,
     WorkflowEvent,
@@ -16,8 +17,13 @@ fn db() -> Option<PostgresStore> {
 }
 
 fn ids() -> (u64, u64) {
-    static NEXT: AtomicU64 = AtomicU64::new(900_000_001);
-    let from = NEXT.fetch_add(2, Ordering::Relaxed);
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_micros() as u64;
+    // Avoid colliding with rows from earlier test processes on a reused DB.
+    let from = stamp * 4 + NEXT.fetch_add(2, Ordering::Relaxed);
     (from, from + 1)
 }
 
@@ -67,7 +73,9 @@ fn seed(store: &mut PostgresStore, actor_id: u64) {
 
 #[test]
 fn test_postgres_rekey_moves_legacy_history_and_survives_reopen() {
-    let Some(mut store) = db() else { return };
+    let Some(mut store) = db() else {
+        return;
+    };
     let (from, to) = ids();
     seed(&mut store, from);
     store.rekey_actor_history(from, to).unwrap();
@@ -89,7 +97,9 @@ fn test_postgres_rekey_moves_legacy_history_and_survives_reopen() {
 
 #[test]
 fn test_postgres_rekey_refuses_destination_collision_without_partial_mutation() {
-    let Some(mut store) = db() else { return };
+    let Some(mut store) = db() else {
+        return;
+    };
     let (from, to) = ids();
     seed(&mut store, from);
     store
@@ -104,7 +114,10 @@ fn test_postgres_rekey_refuses_destination_collision_without_partial_mutation() 
         .unwrap();
     let error = store.rekey_actor_history(from, to).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::AlreadyExists);
-    assert_eq!(store.load_snapshot(from).unwrap().state["count"], PersistedValue::Int(42));
+    assert_eq!(
+        store.load_snapshot(from).unwrap().state["count"],
+        PersistedValue::Int(42)
+    );
     assert_eq!(store.read_journal(from).len(), 1);
     assert_eq!(store.read_events(from).len(), 1);
     assert_eq!(store.read_journal(to)[0].behavior_id, 9);
@@ -114,7 +127,9 @@ fn test_postgres_rekey_refuses_destination_collision_without_partial_mutation() 
 
 #[test]
 fn test_postgres_rekey_refuses_identity_bound_workflow_history() {
-    let Some(mut store) = db() else { return };
+    let Some(mut store) = db() else {
+        return;
+    };
     let (from, to) = ids();
     seed(&mut store, from);
     store
@@ -136,7 +151,9 @@ fn test_postgres_rekey_refuses_identity_bound_workflow_history() {
 
 #[test]
 fn test_postgres_rekey_refuses_embedded_actor_self_reference() {
-    let Some(mut store) = db() else { return };
+    let Some(mut store) = db() else {
+        return;
+    };
     let (from, to) = ids();
     seed(&mut store, from);
     store
@@ -158,7 +175,9 @@ fn test_postgres_rekey_refuses_embedded_actor_self_reference() {
 
 #[test]
 fn test_postgres_rekey_rejects_missing_source_and_same_identity() {
-    let Some(mut store) = db() else { return };
+    let Some(mut store) = db() else {
+        return;
+    };
     let (from, to) = ids();
     assert_eq!(
         store.rekey_actor_history(from, to).unwrap_err().kind(),
@@ -170,5 +189,57 @@ fn test_postgres_rekey_rejects_missing_source_and_same_identity() {
         ErrorKind::InvalidInput
     );
     assert!(store.load_snapshot(from).is_some());
+    store.clear(from).unwrap();
+}
+
+#[test]
+fn test_postgres_rekey_refuses_actor_self_reference_in_snapshot() {
+    let Some(mut store) = db() else {
+        return;
+    };
+    let (from, to) = ids();
+    seed(&mut store, from);
+    let mut snapshot = store.load_snapshot(from).unwrap();
+    snapshot
+        .state
+        .insert("self_ref".to_string(), PersistedValue::Actor(from));
+    store.save_snapshot(snapshot).unwrap();
+
+    let error = store.rekey_actor_history(from, to).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert_eq!(
+        store.load_snapshot(from).unwrap().state["self_ref"],
+        PersistedValue::Actor(from)
+    );
+    assert!(store.load_snapshot(to).is_none());
+    store.clear(from).unwrap();
+}
+
+#[test]
+fn test_postgres_rekey_refuses_workflow_replay_identity() {
+    let Some(mut store) = db() else {
+        return;
+    };
+    let (from, to) = ids();
+    seed(&mut store, from);
+    store
+        .append_workflow_event(
+            from,
+            WorkflowEvent::TimerSet {
+                sequence: 4,
+                replay_id: Some(nulang::runtime::WorkflowReplayEventId::new(
+                    nulang::runtime::WorkflowActivationId::new(from, 3),
+                    0,
+                )),
+                name: "timeout".to_string(),
+                duration_ms: 100,
+            },
+        )
+        .unwrap();
+
+    let error = store.rekey_actor_history(from, to).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert!(store.load_snapshot(from).is_some());
+    assert!(store.read_workflow_events(to).is_empty());
     store.clear(from).unwrap();
 }
