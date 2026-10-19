@@ -55,9 +55,10 @@ export function createNulangTask(
   const execution = new vscode.ProcessExecution(binary, [...args, file], {
     cwd: packageDirectory(file),
   });
+  const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(file));
   const task = new vscode.Task(
-    { type: 'nulang', command },
-    vscode.TaskScope.Global,
+    { type: 'nulang', command, file: path.resolve(file) },
+    folder ?? vscode.TaskScope.Workspace,
     `Nulang: ${command}`,
     'nulang',
     execution
@@ -69,6 +70,22 @@ export function createNulangTask(
   return task;
 }
 
+/**
+ * VS Code tasks require an open workspace. In a single-file window, launch the
+ * binary as the terminal process with a separate argv array instead of
+ * interpolating arguments into a shell command. No cwd override: recent VS Code
+ * versions block custom terminal cwd outside userHome in empty workspaces.
+ */
+export function createStandaloneNulangTerminalOptions(
+  command: string, args: string[], file: string, binary: string
+): vscode.TerminalOptions {
+  return {
+    name: `Nulang: ${command}`,
+    shellPath: binary,
+    shellArgs: [...args, file],
+  };
+}
+
 /** Run the active .nula file in a managed task with visible terminal output. */
 async function runNulang(command: string, args: string[]): Promise<void> {
   const editor = vscode.window.activeTextEditor;
@@ -77,7 +94,16 @@ async function runNulang(command: string, args: string[]): Promise<void> {
     return;
   }
   const file = editor.document.fileName;
-  const task = createNulangTask(command, args, file, nulangBinary(editor.document.uri));
+  const binary = nulangBinary(editor.document.uri);
+  if (!vscode.workspace.workspaceFolders?.length) {
+    // Task support is unavailable in single-file VS Code windows.
+    const terminal = vscode.window.createTerminal(
+      createStandaloneNulangTerminalOptions(command, args, file, binary)
+    );
+    terminal.show();
+    return;
+  }
+  const task = createNulangTask(command, args, file, binary);
   try {
     await vscode.tasks.executeTask(task);
   } catch (error) {
