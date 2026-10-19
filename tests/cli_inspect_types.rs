@@ -22,12 +22,20 @@ fn temp_source(tag: &str, contents: &str) -> (PathBuf, PathBuf) {
 
 fn run(args: &[&str], file: Option<&Path>) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_nulang"));
-    command.args(args).env(
+    command.env(
         "NULANG_STDLIB",
         Path::new(env!("CARGO_MANIFEST_DIR")).join("src/stdlib"),
     );
+    // --check consumes the immediately following argument. Keep inspection
+    // flags independent of the file position in test invocations.
     if let Some(path) = file {
-        command.arg(path);
+        if let Some(index) = args.iter().position(|arg| *arg == "--check") {
+            command.args(&args[..=index]).arg(path).args(&args[index + 1..]);
+        } else {
+            command.args(args).arg(path);
+        }
+    } else {
+        command.args(args);
     }
     command.output().expect("execute nulang")
 }
@@ -49,7 +57,10 @@ fn inspect_types_reports_inferred_declarations_in_name_order_without_running() {
     let a = stdout.find("a: Int -> Int").expect("inferred type for a");
     let z = stdout.find("z: Int -> Int").expect("inferred type for z");
     assert!(a < z, "declarations must be sorted by name: {stdout}");
-    assert!(!stdout.contains("Type check passed."), "report replaces success message");
+    assert!(
+        !stdout.contains("Type check passed."),
+        "report replaces success message"
+    );
     std::fs::remove_dir_all(dir).unwrap();
 }
 
