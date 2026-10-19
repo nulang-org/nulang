@@ -3238,10 +3238,16 @@ mod tests {
             args: vec![],
             span: s(),
         };
-        assert!(
-            checker.check_effects(&ctx, &call, &allowed).is_err(),
-            "independent unresolved effect tails must not satisfy an effect contract"
-        );
+        let error = checker.check_effects(&ctx, &call, &allowed).unwrap_err();
+        match error {
+            NuError::EffectError { msg, .. } => {
+                assert!(
+                    msg.contains("unrelated unresolved effect tails"),
+                    "diagnostic should explain the unsafe row variables: {msg}"
+                );
+            }
+            other => panic!("expected effect-contract error, got {other:?}"),
+        }
     }
 
     #[test]
