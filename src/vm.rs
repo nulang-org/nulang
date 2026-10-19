@@ -1944,7 +1944,17 @@ impl Value {
         Value { raw: TAG_NIL }
     }
 
-    /// Create an integer value.
+    /// Try to construct an inline integer, returning None rather than
+    /// truncating a signed 64-bit value outside the v1 48-bit payload.
+    ///
+    /// Wide Int64 values will use a separate owned representation until
+    /// the remaining VM/backends/persistence migration is complete.
+    pub fn try_int(n: i64) -> Option<Self> {
+        crate::value_layout::try_tag_int(n).map(|raw| Self { raw })
+    }
+
+    /// Create an integer value with historical v1 48-bit masking semantics.
+    /// New full-width APIs must use try_int or a future wide-value allocator.
     pub fn int(n: i64) -> Self {
         // Store directly in the 48-bit payload.
         let payload = (n as u64) & PAYLOAD_MASK;

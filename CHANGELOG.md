@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Checked Int64 semantic kernel (staging only) — 2026-10-17
+- **Incubating numeric foundation:** Added a pure full-width signed `i64` checked arithmetic kernel with explicit overflow, division-by-zero and negative-exponent errors; negative exponent and `0**0` semantics are documented.
+- **Tagged representation boundary:** Added `value_layout::try_tag_int` and `Value::try_int` to reject integers outside the immediate 48-bit signed payload. The opaque `Int64Storage` staging type preserves wider `i64` values losslessly.
+- **No user-language migration yet:** Existing v1 `Value::int`, VM/JIT/AOT/WASM numeric opcodes, bytecode, wire and persistence encodings are unchanged; current source-level `Int` is still 48-bit. See `docs/INT64_MIGRATION.md` for required ownership, backend parity, and format gates.
+
 ### Bounded Nulang Web development-server connections — 2026-10-16
 - **The experimental Web development listener caps active connections at 64**, including SSE, and returns `503` with `Retry-After: 1` when full.
 - **Worker capacity is returned by a scoped RAII lease** after normal completion, panic, or thread-spawn failure. One shared `Arc` route table replaces per-connection clones of compiled route modules.
