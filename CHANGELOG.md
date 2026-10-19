@@ -1,8 +1,8 @@
+# Nulang Changelog
+
 ### Warn on discarded typed Results — 2026-10-19
 - **Intermediate block expressions that produce a `Result` now emit `W0301` when their value is discarded.** Returning the `Result`, or an ordinary non-Result expression, does not trigger the warning. The existing `--deny-warnings` option enables strict enforcement; 1.x default behavior is unchanged.
 - **Added focused typechecker regression cases** for ignored Results, returned values, ordinary expressions, and unrelated variants. This feature builds upon the warning infrastructure in the stacked pattern-coverage PR.
-
-# Nulang Changelog
 
 ### Public CLI release portability — 2026-10-11
 - **Public release archives use the `release-cli` feature profile without a Python shared-library ABI dependency.** The ordinary full/default source build retains opt-in Python interoperability; release packaging checks the resulting Linux and macOS binary for Python dependencies.
