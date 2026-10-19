@@ -259,17 +259,16 @@ fn decl_name(decl: &Decl) -> Option<&str> {
         | Decl::EffectDecl { name, .. }
         | Decl::Module { name, .. }
         | Decl::Agent { name, .. }
-        | Decl::Database { name, .. } => Some(name.as_str()),
-        Decl::NamedHandler { name, .. } => Some(name.as_str()),
-        Decl::CrdtDecl { name, .. } => Some(name.as_str()),
-        Decl::Extern { .. }
-        | Decl::Workflow { .. }
-        | Decl::Import { .. }
-        | Decl::Class { .. }
-        | Decl::LetBinding { .. }
-        | Decl::Signal { .. }
-        | Decl::Impl { .. }
-        | Decl::Given { .. } => None,
+        | Decl::Database { name, .. }
+        | Decl::NamedHandler { name, .. }
+        | Decl::CrdtDecl { name, .. }
+        | Decl::Workflow { name, .. }
+        | Decl::Class { name, .. }
+        | Decl::LetBinding { name, .. }
+        | Decl::Signal { name, .. }
+        | Decl::Given { name, .. } => Some(name.as_str()),
+        // Extern blocks and instance impls do not declare a single symbol.
+        Decl::Extern { .. } | Decl::Import { .. } | Decl::Impl { .. } => None,
     }
 }
 
