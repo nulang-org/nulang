@@ -2655,7 +2655,10 @@ mod tests {
 
     #[test]
     fn locked_build_requires_existing_lockfile() {
-        let dir = std::env::temp_dir().join(format!("nulang_locked_missing_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_locked_missing_{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _guard = ChangeDir::new(&dir);
@@ -2672,7 +2675,8 @@ mod tests {
         );
         manifest.save(&dir).unwrap();
 
-        let err = prepare_package_with_lock(true).expect_err("locked build must require Nulang.lock");
+        let err =
+            prepare_package_with_lock(true).expect_err("locked build must require Nulang.lock");
         assert!(err.to_string().contains("Nulang.lock"), "{err}");
         assert!(!dir.join(LOCKFILE_FILE).exists());
         let _ = std::fs::remove_dir_all(&dir);
