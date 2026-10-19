@@ -48,6 +48,9 @@ jobs:
       - name: Smoke test browser playground
         run: node playground/web/test/smoke.mjs
 
+      - name: Smoke test Nulang Web action events
+        run: node scripts/tests/web_action_events.mjs
+
       - name: Install docs dependencies
         run: |
           cd docs
@@ -105,12 +108,10 @@ jobs:
         # the default-feature test selection.
         run: cargo nextest run --locked
 
-      - name: Test renderer-neutral UI protocol crate
-        # The workspace root has a [package] and no default-members, so the
-        # preceding nextest command selects only the root nulang package.
-        # Explicitly exercise protocol validators and wire-format regressions.
+      - name: Test universal UI protocol crate
+        # The root-package nextest invocation does not select workspace members.
+        # Validate the shared native/web UI ABI with its own integration tests.
         run: cargo test --locked -p nulang-ui-protocol
-
 
       - name: Test doctests
         # nextest intentionally does not execute rustdoc tests.
