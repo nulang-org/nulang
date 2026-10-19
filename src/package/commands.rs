@@ -2685,6 +2685,23 @@ mod tests {
         let original = std::fs::read(&lock_path).unwrap();
         prepare_package_with_mode(true, true).unwrap();
         assert_eq!(std::fs::read(&lock_path).unwrap(), original);
+
+        let util = dir.join("util");
+        scaffold_package(&util, "util", "lib").unwrap();
+        let mut manifest = Manifest::load(&dir).unwrap();
+        manifest.dependencies.insert(
+            "util".into(),
+            Dependency::Detailed(DependencyDetail {
+                path: Some("util".into()),
+                ..Default::default()
+            }),
+        );
+        manifest.save(&dir).unwrap();
+        prepare_package().unwrap();
+        prepare_package_with_mode(true, true).unwrap();
+        std::fs::write(util.join("src/lib.nula"), "fn replaced() { 22 }").unwrap();
+        let changed = prepare_package_with_mode(true, true).unwrap_err();
+        assert!(changed.to_string().contains("identity"), "{changed}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
