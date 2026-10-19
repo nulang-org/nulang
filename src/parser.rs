@@ -4134,9 +4134,7 @@ impl Parser {
                 // Python's built-in `import` effect is a reserved language
                 // keyword, but an explicitly granted `Python::import` must
                 // still be expressible. Do not permit it in other namespaces.
-                let operation = if namespace == "Python"
-                    && self.match_token(&TokenKind::Import)
-                {
+                let operation = if namespace == "Python" && self.match_token(&TokenKind::Import) {
                     self.advance();
                     "import".to_string()
                 } else {
@@ -6952,7 +6950,9 @@ mod tests {
         let expr = parse_expr("perform Python.import(\"math\")")
             .expect("effect operation named import must parse");
         match expr {
-            Expr::Perform { effect, op, args, .. } => {
+            Expr::Perform {
+                effect, op, args, ..
+            } => {
                 assert_eq!(effect, "Python");
                 assert_eq!(op, "import");
                 assert_eq!(args.len(), 1);
@@ -6963,10 +6963,9 @@ mod tests {
 
     #[test]
     fn test_spawn_accepts_keyword_named_python_import_authority() {
-        let expr = parse_expr(
-            "spawn Worker {} with [Python::import, Python::call, Python::get_attr]",
-        )
-        .expect("Python::import must be legal in a literal authority grant");
+        let expr =
+            parse_expr("spawn Worker {} with [Python::import, Python::call, Python::get_attr]")
+                .expect("Python::import must be legal in a literal authority grant");
         match expr {
             Expr::Spawn { capabilities, .. } => {
                 assert_eq!(
