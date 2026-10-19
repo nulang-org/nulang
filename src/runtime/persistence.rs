@@ -816,6 +816,22 @@ pub trait PersistenceStore: Send + Sync {
     /// Remove all data for an actor.
     fn clear(&mut self, actor_id: u64) -> io::Result<()>;
 
+    /// Atomically relocate legacy recovery history from one process-local
+    /// actor ID to a fresh one. This includes the snapshot, message journal,
+    /// workflow history, and domain events as one indivisible operation.
+    ///
+    /// A backend MUST return Unsupported unless it can guarantee that the
+    /// source remains intact on every failed migration. Atomic transitions
+    /// and effect receipts embed actor identity: do not silently change their
+    /// IDs or hashes. Callers must treat Unsupported as a hard failure and
+    /// must not emulate this through save_snapshot followed by clear.
+    fn rekey_actor_history(&mut self, _from: u64, _to: u64) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic actor history relocation is not supported by this backend",
+        ))
+    }
+
     /// Execute an arbitrary SQL query against the store.
     /// Returns rows as JSON arrays of column values. Default: not supported.
     fn query(&self, _sql: &str, _params: &[Value]) -> io::Result<Vec<String>> {
@@ -1071,6 +1087,62 @@ impl PersistenceStore for MemoryStore {
             .max(wf_event_seq)
             .max(event_seq)
             .max(transition_seq)
+    }
+
+    fn rekey_actor_history(&mut self, from: u64, to: u64) -> io::Result<()> {
+        if from == to {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "actor history relocation requires distinct actor IDs",
+            ));
+        }
+        let source = self.snapshots.get(&from).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "actor snapshot to relocate not found")
+        })?;
+
+        // CRDT identities and atomic transition digests have their own
+        // actor-scoped identity contracts. Copying them to a fresh actor ID
+        // would make their old receipts/fingerprints appear valid for a new
+        // activation. Refuse until those records have a defined migration.
+        if source.crdt_snapshot.is_some()
+            || source.crdt_field_map.is_some()
+            || self.durable_tails.contains_key(&from)
+            || self.committed_transitions.contains_key(&from)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "actor-scoped CRDT or atomic transition history cannot be re-keyed",
+            ));
+        }
+
+        // Validate *all* destination record categories before mutating any
+        // entry. After these checks, in-memory map moves cannot fail.
+        if self.snapshots.contains_key(&to)
+            || self.journals.contains_key(&to)
+            || self.workflow_events.contains_key(&to)
+            || self.events.contains_key(&to)
+            || self.durable_tails.contains_key(&to)
+            || self.committed_transitions.contains_key(&to)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "destination actor already has durable history",
+            ));
+        }
+
+        let mut snapshot = self.snapshots.remove(&from).expect("validated source");
+        snapshot.actor_id = to;
+        self.snapshots.insert(to, snapshot);
+        if let Some(entries) = self.journals.remove(&from) {
+            self.journals.insert(to, entries);
+        }
+        if let Some(events) = self.workflow_events.remove(&from) {
+            self.workflow_events.insert(to, events);
+        }
+        if let Some(events) = self.events.remove(&from) {
+            self.events.insert(to, events);
+        }
+        Ok(())
     }
 
     fn clear(&mut self, actor_id: u64) -> io::Result<()> {
