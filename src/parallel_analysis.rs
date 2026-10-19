@@ -486,11 +486,7 @@ fn summarize_assignment_target(
 /// Collect effects and captures from computed indices on a self-rooted path.
 /// FieldAccess on self is summarized as one state read, so normal recursion
 /// would otherwise skip indices nested under that field access.
-fn summarize_state_indices(
-    expr: &Expr,
-    bound: &HashSet<String>,
-    out: &mut ParallelBranchSummary,
-) {
+fn summarize_state_indices(expr: &Expr, bound: &HashSet<String>, out: &mut ParallelBranchSummary) {
     match expr {
         Expr::Index { arr, idx, .. } => {
             summarize_state_indices(arr, bound, out);
@@ -510,9 +506,7 @@ fn state_target_path(expr: &Expr) -> String {
             format!("{}.{}", state_target_path(expr), field)
         }
         Expr::Index { arr, .. } => format!("{}[*]", state_target_path(arr)),
-        Expr::CapAnnotate { expr, .. } | Expr::TypeAnnotate { expr, .. } => {
-            state_target_path(expr)
-        }
+        Expr::CapAnnotate { expr, .. } | Expr::TypeAnnotate { expr, .. } => state_target_path(expr),
         _ => "self".to_string(),
     }
 }
@@ -660,6 +654,54 @@ mod tests {
                     span: sp(),
                 }),
                 value: Box::new(int(1)),
+                span: sp(),
+            },
+            int(2),
+        ];
+        let err = validate_parallel_branches(&branches, sp()).unwrap_err();
+        assert!(err.to_string().contains("mutates actor state"));
+    }
+
+    #[test]
+    fn annotated_indexed_actor_state_mutation_is_rejected() {
+        let target = Expr::CapAnnotate {
+            expr: Box::new(Expr::Index {
+                arr: Box::new(Expr::FieldAccess {
+                    expr: Box::new(Expr::SelfRef(sp())),
+                    field: "items".to_string(),
+                    span: sp(),
+                }),
+                idx: Box::new(int(0)),
+                span: sp(),
+            }),
+            cap: crate::types::Capability::Iso,
+            span: sp(),
+        };
+        let branches = vec![
+            Expr::Assign {
+                target: Box::new(target),
+                value: Box::new(int(1)),
+                span: sp(),
+            },
+            int(2),
+        ];
+        let err = validate_parallel_branches(&branches, sp()).unwrap_err();
+        assert!(err.to_string().contains("mutates actor state"));
+    }
+
+    #[test]
+    fn consuming_indexed_actor_state_is_rejected() {
+        let branches = vec![
+            Expr::Consume {
+                expr: Box::new(Expr::Index {
+                    arr: Box::new(Expr::FieldAccess {
+                        expr: Box::new(Expr::SelfRef(sp())),
+                        field: "items".to_string(),
+                        span: sp(),
+                    }),
+                    idx: Box::new(int(0)),
+                    span: sp(),
+                }),
                 span: sp(),
             },
             int(2),
