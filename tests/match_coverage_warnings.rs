@@ -218,3 +218,31 @@ fn pick(c: Color) -> Int {
     assert!(!strict.status.success(), "strict checker must reject match coverage warning");
     assert!(String::from_utf8_lossy(&strict.stderr).contains("W0201"));
 }
+
+#[test]
+fn cli_json_check_includes_semantic_warning_and_ok_true() {
+    use std::process::Command;
+    let source = "fn choose(flag: Bool) -> Int { match flag { | true => 1 } }";
+    let path = std::env::temp_dir().join(format!(
+        "nulang_match_json_{}_{}.nula",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(&path, source).expect("write test source");
+    let out = Command::new(env!("CARGO_BIN_EXE_nulang"))
+        .args(["--check", "--json"])
+        .arg(&path)
+        .output()
+        .expect("run JSON checker");
+    let _ = std::fs::remove_file(&path);
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("valid JSON stdout");
+    assert_eq!(report["ok"], true);
+    assert!(report["diagnostics"].as_array().unwrap().iter().any(|diag| {
+        diag["code"] == "W0201" && diag["severity"] == "warning"
+    }), "report: {report}");
+}
