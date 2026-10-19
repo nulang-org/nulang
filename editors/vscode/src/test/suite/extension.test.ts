@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { createNulangTask } from '../../extension';
+import { createNulangTask, selectNulangBinary } from '../../extension';
 
 const GOOD_SOURCE = `fn add(a: Int, b: Int) -> Int {
   a + b
@@ -82,6 +82,14 @@ suite('Nulang extension', () => {
       .map((c) => (typeof c === 'string' ? c : c.value))
       .join('\n');
     assert.ok(contents.includes('add'), `hover should mention add: ${contents}`);
+  });
+
+  test('binary selection respects folder, workspace, global, then environment precedence', () => {
+    assert.strictEqual(selectNulangBinary('/folder/tool', '/workspace/tool', '/global/tool', '/env/tool'), '/folder/tool');
+    assert.strictEqual(selectNulangBinary(undefined, ' /workspace/tool ', '/global/tool', '/env/tool'), '/workspace/tool');
+    assert.strictEqual(selectNulangBinary(undefined, undefined, '/global/tool', '/env/tool'), '/global/tool');
+    assert.strictEqual(selectNulangBinary(undefined, undefined, undefined, ' /env/tool '), '/env/tool');
+    assert.strictEqual(selectNulangBinary(undefined, undefined, undefined, undefined), 'nulang');
   });
 
   test('Run task passes shell-metacharacter paths literally and uses package root', () => {
