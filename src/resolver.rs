@@ -53,7 +53,9 @@ pub fn resolve_imports(
         // If the file has already been fully resolved in this compilation,
         // reuse its cached declarations.
         if let Some(cached) = IMPORT_CACHE.with(|c| c.borrow().get(&resolved_canonical).cloned()) {
-            merge_imported_decls(module, cached, import_path, true)?;
+            // Cache the *full* source module, not a previous importer's selection.
+            let selected = select_import_decls(cached, items, import_path)?;
+            merge_imported_decls(module, selected, import_path, true)?;
             continue;
         }
 
@@ -85,17 +87,15 @@ pub fn resolve_imports(
 
         resolve_imports(&mut imported, &resolved_canonical, stack)?;
 
-        let imported_decls = if items.is_empty() {
-            imported.decls
-        } else {
-            filter_decls(imported.decls, items)
-        };
-
+        // Store unfiltered exports. Multiple imports of the same module may
+        // request disjoint subsets, including on a cache hit.
+        let all_decls = imported.decls;
         IMPORT_CACHE.with(|c| {
             c.borrow_mut()
-                .insert(resolved_canonical, imported_decls.clone())
+                .insert(resolved_canonical, all_decls.clone())
         });
-        merge_imported_decls(module, imported_decls, import_path, false)?;
+        let selected = select_import_decls(all_decls, items, import_path)?;
+        merge_imported_decls(module, selected, import_path, false)?;
     }
     module.decls.retain(|d| !matches!(d, Decl::Import { .. }));
     stack.remove(&canonical_file);
@@ -274,6 +274,25 @@ fn decl_name(decl: &Decl) -> Option<&str> {
         | Decl::Impl { .. }
         | Decl::Given { .. } => None,
     }
+}
+
+/// Fail rather than silently omitting misspelled names from a selective import.
+fn select_import_decls(
+    decls: Vec<Decl>,
+    items: &[String],
+    import_path: &str,
+) -> NuResult<Vec<Decl>> {
+    if items.is_empty() {
+        return Ok(decls);
+    }
+    let available: HashSet<&str> = decls.iter().filter_map(decl_name).collect();
+    if let Some(missing) = items.iter().find(|item| !available.contains(item.as_str())) {
+        return Err(NuError::RuntimeError {
+            msg: format!("import '{}' does not export '{}'", import_path, missing),
+            span: Span::default(),
+        });
+    }
+    Ok(filter_decls(decls, items))
 }
 
 fn filter_decls(decls: Vec<Decl>, items: &[String]) -> Vec<Decl> {
