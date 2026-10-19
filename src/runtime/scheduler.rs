@@ -3,8 +3,9 @@
 //! Each worker owns three local queues (High, Normal, Low). Keeping local
 //! queues split by priority lets the scheduler batch-transfer work out of the
 //! shared injectors while preserving strict High > Normal > Low by default.
-//! Explicit weighted-fair schedulers instead vary which priority band is tried first. Within a priority, workers prefer local work, then
-//! batch from the global injector, then steal from peers.
+//! Explicit weighted-fair schedulers instead vary which priority band is tried
+//! first. Within a priority, workers prefer local work, then batch from the
+//! global injector, then steal from peers.
 //!
 //! The live runtime currently has one owning scheduler thread per shard. Its
 //! [`Scheduler::dequeue`] path therefore uses worker slot 0 as a locality
@@ -137,11 +138,10 @@ impl SchedulerStatsInternal {
 
 /// A priority-aware work-stealing scheduler with Chase-Lev deques.
 ///
-/// Each worker has one local deque per actor priority. A single local queue
-/// would allow previously batched Low/Normal work to run in front of newly
-/// arrived High work. Splitting local queues preserves the same priority
-/// contract as the global injectors while still allowing batch transfer and
-/// cache-local dispatch.
+/// Each worker has one local deque per actor priority. Splitting local queues
+/// retains each band's FIFO/admission behavior even when an explicitly
+/// weighted scheduler occasionally prefers Normal or Low over High.
+/// `Scheduler::new` remains strictly High-first by default.
 #[repr(align(64))]
 pub struct Scheduler {
     global_high: Injector<u64>,
@@ -390,7 +390,7 @@ impl Scheduler {
         (None, attempts)
     }
 
-    /// Pop the next actor for a worker while preserving strict priority.
+    /// Pop the next actor for a worker, using the configured priority order.
     ///
     /// For each priority band in High → Normal → Low order:
     /// 1. consume worker-local work,
@@ -427,7 +427,7 @@ impl Scheduler {
         None
     }
 
-    /// Pop work for a scheduler thread that owns one worker-local slot.
+    /// Pop work for the scheduler owner's local slot.
     ///
     /// The current runtime has exactly one owning scheduler thread per shard.
     /// It therefore has no useful peers to steal from even though the
@@ -460,8 +460,8 @@ impl Scheduler {
 
     /// Steal one task from any source without owning a local worker slot.
     ///
-    /// Priority is strict: all High global/local sources are inspected before
-    /// Normal, and all Normal sources before Low.
+    /// The default is strict High-first; weighted-fair instances vary their
+    /// preferred priority per turn without changing queue ordering within a band.
     pub fn steal_one(&self) -> Option<u64> {
         let mut steal_attempts = 0u64;
 
