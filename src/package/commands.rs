@@ -2652,6 +2652,17 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let _guard = ChangeDir::new(&dir);
         scaffold_package(&dir, "locked-missing", "default").unwrap();
+        // Even an unresolvable dependency must not be visited before a
+        // missing lockfile is rejected (important for remote dependencies).
+        let mut manifest = Manifest::load(&dir).unwrap();
+        manifest.dependencies.insert(
+            "missing".to_string(),
+            Dependency::Detailed(DependencyDetail {
+                path: Some("nonexistent".to_string()),
+                ..Default::default()
+            }),
+        );
+        manifest.save(&dir).unwrap();
 
         let err = prepare_package_with_lock(true).expect_err("locked build must require Nulang.lock");
         assert!(err.to_string().contains("Nulang.lock"), "{err}");
