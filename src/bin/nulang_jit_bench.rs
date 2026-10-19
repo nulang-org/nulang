@@ -336,6 +336,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn generic_and_concrete_identity_calls_have_matched_workloads() {
+        let concrete = WORKLOADS
+            .iter()
+            .find(|workload| workload.name == "concrete_identity_call_loop")
+            .expect("missing concrete call baseline");
+        let generic = WORKLOADS
+            .iter()
+            .find(|workload| workload.name == "generic_identity_call_loop")
+            .expect("missing generic call comparison");
+        assert!(concrete.source.contains("fn identity(x: Int) -> Int"));
+        assert!(generic.source.contains("fn identity[T](x: T) -> T"));
+        for workload in [concrete, generic] {
+            assert!(workload.source.contains("while i < 50000"));
+            assert!(workload.source.contains("sum = identity(sum + i)"));
+        }
+    }
+
+    #[test]
     fn crossover_workloads_cover_current_threshold_window() {
         let names: Vec<&str> = WORKLOADS.iter().map(|workload| workload.name).collect();
         for required in [
