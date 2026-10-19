@@ -328,8 +328,14 @@ pub(crate) fn process_network(rt: &mut Runtime) {
                     let net_node_id = NodeId(node.0);
                     transport.disconnect(net_node_id);
                 }
+                rt.fabric_remove_remote_node(NodeId(node.0));
             }
             ClusterAction::SendGossip { targets } => {
+                // Fabric snapshots are authoritative only when complete.
+                // An oversized local routing set therefore omits the Fabric
+                // extension for this round instead of advertising a partial
+                // replacement that would delete live remote routes.
+                let fabric = rt.fabric_advertisements(GOSSIP_PAYLOAD_MAX_ENTRIES).ok();
                 if let (Some(transport), Some(cluster)) =
                     (&mut rt.distributed.transport, &rt.distributed.cluster)
                 {
@@ -339,8 +345,12 @@ pub(crate) fn process_network(rt: &mut Runtime) {
                     } else {
                         Vec::new()
                     };
-                    if !members.is_empty() || !directory.is_empty() {
-                        let packet = Packet::Gossip { members, directory };
+                    if !members.is_empty() || !directory.is_empty() || fabric.is_some() {
+                        let packet = Packet::Gossip {
+                            members,
+                            directory,
+                            fabric,
+                        };
                         for (to, addr) in targets {
                             transport.send(NodeId(to.0), addr, packet.clone());
                         }
@@ -375,8 +385,8 @@ pub(crate) fn process_network(rt: &mut Runtime) {
                      leaving the cluster",
                     node
                 );
-                rt.goodbye_self();
-                let goodbye = build_node_goodbye(rt);
+                let durable = rt.goodbye_self();
+                let goodbye = build_node_goodbye(rt, durable);
                 if let Some(transport) = &mut rt.distributed.transport {
                     if let Some((packet, targets)) = goodbye {
                         for (to, addr) in targets {
@@ -388,6 +398,37 @@ pub(crate) fn process_network(rt: &mut Runtime) {
             }
         }
     }
+
+    // Confirmed removals can be observed while packet processing temporarily
+    // owns ClusterState outside Runtime. Drain them only now, after the
+    // runtime-owned transport/cluster state has been restored.
+    let removed_nodes = std::mem::take(&mut rt.distributed.fabric_stream_removed_nodes_pending);
+    for removed in removed_nodes {
+        if let Err(error) = rt.fabric_stream_failover_confirmed_removed(removed) {
+            tracing::warn!(
+                removed = removed.0,
+                "nulang-fabric-stream: confirmed-removal failover orchestration failed: {}",
+                error
+            );
+        }
+    }
+    rt.fabric_stream_tick_auto_failover();
+
+    // Retry pending durable stream replication only after packet processing
+    // and cluster actions have restored the runtime-owned distribution state.
+    rt.fabric_stream_tick_retries();
+}
+
+/// Forget receiver-specific CRDT knowledge for a peer whose prior
+/// process state can no longer be trusted.
+///
+/// Packet-to-batch correlations are peer-scoped too: retaining one after the
+/// frontier is reset could let a late ACK from the old process advance the new
+/// receiver's knowledge incorrectly.
+pub(crate) fn forget_crdt_peer_state(rt: &mut Runtime, node: NodeId) {
+    rt.crdt_peer_frontiers.forget_peer(node.0);
+    rt.pending_crdt_sync_acks
+        .retain(|_, (peer_id, _)| *peer_id != node.0);
 }
 
 /// React to a peer node being declared `Failed` by the failure detector:
@@ -403,6 +444,11 @@ pub(crate) fn process_network(rt: &mut Runtime) {
 /// requires the confirmed-gone gate of [`handle_node_removed`], so a merely
 /// partitioned node is never raced by a re-spawn of its own actors.
 pub(crate) fn handle_node_failed(rt: &mut Runtime, node: NodeId) {
+    // Stop selecting subscribers on an unroutable node immediately. This
+    // also forgets the remote snapshot generation, allowing a genuinely
+    // healed/restarted peer to repopulate the directory from its next gossip.
+    rt.fabric_remove_remote_node(node);
+
     // (1) Invalidate cached remote actors on the failed node.
     if let Some(resolver) = rt.distributed.resolver.as_mut() {
         resolver.invalidate_node(node);
@@ -425,12 +471,30 @@ pub(crate) fn handle_node_failed(rt: &mut Runtime, node: NodeId) {
     }
 }
 
+/// Allocate the fencing epoch owned by a node-loss takeover.
+///
+/// Epoch zero is invalid and ownership epochs are strictly monotonic. If the
+/// previous owner has exhausted the u64 space, there is no safe successor and
+/// the takeover must fail closed rather than reuse the maximum epoch.
+fn next_failover_activation_epoch(current: u64) -> Option<u64> {
+    current.checked_add(1)
+}
+
 /// React to a peer node being confirmed gone (RFC 0014 §1): deliver the
 /// `Failed`-path cleanup, then re-spawn that node's re-spawn-opted durable
 /// actors from their shadow replicas — but only on the node that actually
 /// holds the replica (the deterministic shadow), so exactly one survivor
 /// re-spawns each actor and no two live copies can exist.
 pub(crate) fn handle_node_removed(rt: &mut Runtime, node: NodeId) {
+    forget_crdt_peer_state(rt, node);
+
+    // Fabric ownership transitions are deferred until process_network restores
+    // runtime-owned cluster/transport state. HashSet semantics deduplicate
+    // graceful-goodbye and failure-detector confirmation of the same node.
+    rt.distributed
+        .fabric_stream_removed_nodes_pending
+        .insert(node);
+
     handle_node_failed(rt, node);
 
     // Which actors lived on the removed node, and am I their shadow?
@@ -451,19 +515,53 @@ pub(crate) fn handle_node_removed(rt: &mut Runtime, node: NodeId) {
             // Some other survivor holds the replica; it will re-spawn.
             continue;
         }
+        let Some(new_epoch) = next_failover_activation_epoch(entry.epoch) else {
+            tracing::warn!(
+                actor_id = entry.actor_id,
+                epoch = entry.epoch,
+                "nulang-respawn: refusing takeover because activation epoch cannot advance"
+            );
+            continue;
+        };
         if let Some(replica) = rt.shadow_replicas.remove(&entry.actor_id) {
             let ok =
                 rt.receive_migrated_actor(entry.actor_id, replica.nbc_bytes, replica.snapshot_json);
             if ok {
-                // Bump the activation epoch and re-announce so a
-                // resurrected old node self-demotes its stale copy (§5).
-                let new_epoch = rt
-                    .distributed
-                    .cluster
-                    .as_mut()
-                    .map(|c| c.bump_directory_epoch(entry.actor_id, local))
-                    .unwrap_or(entry.epoch.saturating_add(1));
-                rt.respawn_opted.insert(entry.actor_id, new_epoch);
+                // Advance the canonical live actor epoch before it can execute
+                // on the survivor. Persist that bump locally before announcing
+                // ownership, so a crash immediately after takeover cannot
+                // resurrect the stale epoch.
+                let Some(actor) = rt.actors.get_mut(&entry.actor_id) else {
+                    continue;
+                };
+                actor.activation_epoch = new_epoch;
+                rt.respawn_opted.insert(entry.actor_id);
+                if let Err(error) =
+                    crate::runtime::workflow::try_checkpoint_actor(rt, entry.actor_id)
+                {
+                    rt.respawn_opted.remove(&entry.actor_id);
+                    crate::runtime::exit::reap_living_actor(
+                        rt,
+                        entry.actor_id,
+                        crate::types::ExitReason::Error(format!(
+                            "activation epoch persistence failed: {error}"
+                        )),
+                    );
+                    tracing::warn!(
+                        actor_id = entry.actor_id,
+                        epoch = new_epoch,
+                        %error,
+                        "nulang-respawn: refusing takeover because the bumped activation epoch was not durable"
+                    );
+                    continue;
+                }
+                if let Some(cluster) = rt.distributed.cluster.as_mut() {
+                    cluster.announce_directory(crate::runtime::cluster::DurableDirectoryEntry {
+                        actor_id: entry.actor_id,
+                        node_id: local,
+                        epoch: new_epoch,
+                    });
+                }
                 // Forward in-flight messages sent to the old location to
                 // the re-spawned actor (same TTL mechanism as migration).
                 rt.migrated_actors
@@ -482,13 +580,11 @@ pub(crate) fn handle_node_removed(rt: &mut Runtime, node: NodeId) {
 /// the local node's re-spawn-opted durable actors as `(actor_id, epoch)`
 /// pairs. Returned targets + packet are sent by the caller (which owns the
 /// mutable transport borrow).
-fn build_node_goodbye(rt: &Runtime) -> Option<(Packet, Vec<(NodeId, SocketAddr)>)> {
+fn build_node_goodbye(
+    rt: &Runtime,
+    durable: Vec<(u64, u64)>,
+) -> Option<(Packet, Vec<(NodeId, SocketAddr)>)> {
     let local = rt.distributed.node_id?;
-    let durable: Vec<(u64, u64)> = rt
-        .respawn_opted
-        .iter()
-        .map(|(&actor_id, &epoch)| (actor_id, epoch))
-        .collect();
     let cluster = rt.distributed.cluster.as_ref()?;
     let targets: Vec<(NodeId, SocketAddr)> = cluster
         .healthy_members()
@@ -538,4 +634,19 @@ pub(crate) fn sync_crdts(rt: &mut Runtime) {
 /// True when the given 1-based sync round should ship full state.
 pub(crate) fn crdt_sync_is_full_round(round: u64) -> bool {
     round % crate::runtime::CRDT_FULL_SYNC_INTERVAL == 1
+}
+
+#[cfg(test)]
+mod activation_epoch_tests {
+    use super::next_failover_activation_epoch;
+
+    #[test]
+    fn failover_advances_the_fencing_epoch() {
+        assert_eq!(next_failover_activation_epoch(9), Some(10));
+    }
+
+    #[test]
+    fn failover_refuses_epoch_overflow() {
+        assert_eq!(next_failover_activation_epoch(u64::MAX), None);
+    }
 }

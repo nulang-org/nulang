@@ -62,7 +62,7 @@
 | ID | Threat | Mitigation | Status |
 |---|---|---|---|
 | V1 | **JIT code injection** | JIT compilation is from MIR bytecode, not arbitrary machine code. `compile_region` stops at `Ret`. | Implemented. |
-| V2 | **Type confusion in JIT** | `typed_compiler` strips NaN-tag guards only when `TypeMetadata` proves register types. Falls back to scalar compilation on ambiguity. | Implemented. |
+| V2 | **Type confusion in JIT** | `typed_compiler` strips tagged-value guards only when `TypeMetadata` proves register types. Falls back to scalar compilation on ambiguity. | Implemented. |
 | V3 | **Division-by-zero in JIT** | `IDiv`/`IMod` always emit runtime-helper calls (`nulang_idiv`/`nulang_imod`), never raw `sdiv`. | Implemented. |
 | V4 | **SIMD out-of-bounds access** | SIMD lowering only processes `ArrayLen`-bounded loops. Scalar epilogue handles remainder. | Implemented. |
 
@@ -90,7 +90,7 @@ An attacker gains access to a single node and sends a crafted `ActorMessage` to 
 
 - **Payload**: heap pointers, closures, and actor refs are rejected at send time (`packet_payload_wire_safe`). Only ints, floats, bools, unit, and strings cross the wire.
 - **String injection**: strings travel by content (interned on receipt), so they cannot carry executable code unless the target behavior executes them.
-- **Behavior name spoofing**: behavior names are resolved on the target node via `Runtime::behavior_id_for`. Unknown names fall back to id 0, which is typically a no-op handler.
+- **Behavior name spoofing**: behavior names are resolved on the target node. Actors with a declared native/bytecode behavior surface reject unknown names; an unknown name cannot alias a real behavior id 0 handler. Metadata-free low-level Rust-embedder actors may admit raw mailbox traffic through inert id 0, but those actors have no handler at that id and therefore cannot execute attacker-selected code. If a sender includes a content hash for code fetch/hot-reload, the fetched artifact must still resolve and verify the requested name before delivery.
 
 ### Scenario B: Compromised native library
 An attacker replaces a `.so` file that a Nulang program loads via FFI.

@@ -500,13 +500,18 @@ fn host_arith_fi(a: u64, b: u64, fop: fn(f64, f64) -> f64, iop: fn(i64, i64) -> 
     }
 }
 
-fn host_add(_caller: Caller<'_, HostState>, a: i64, b: i64) -> Result<i64, Error> {
-    Ok(host_arith_fi(
-        a as u64,
-        b as u64,
-        |x, y| x + y,
-        |x, y| x + y,
-    ))
+fn host_add(caller: Caller<'_, HostState>, a: i64, b: i64) -> Result<i64, Error> {
+    let a_raw = a as u64;
+    let b_raw = b as u64;
+    // Match VM::IAdd's dynamic string fallback. MIR can retain Binary(Add)
+    // when a string arrives through a runtime-typed path such as ArrayLoad,
+    // so WASM must not assume every Binary(Add) is numeric.
+    if (a_raw & value_layout::TAG_MASK) == value_layout::TAG_STRING
+        || (b_raw & value_layout::TAG_MASK) == value_layout::TAG_STRING
+    {
+        return host_str_concat(caller, a, b);
+    }
+    Ok(host_arith_fi(a_raw, b_raw, |x, y| x + y, |x, y| x + y))
 }
 fn host_sub(_caller: Caller<'_, HostState>, a: i64, b: i64) -> Result<i64, Error> {
     Ok(host_arith_fi(
@@ -576,8 +581,16 @@ fn host_neg(_caller: Caller<'_, HostState>, a: i64) -> Result<i64, Error> {
     } else {
         // Match the interpreter's INeg (and the JIT helper `nulang_ineg`):
         // ints negate with a 48-bit overflow check at INT48_MIN; anything
-        // else is a type error. A guest pointer remains valid guest-local
-        // state, but it cannot be reconstructed as a host pointer Value.
+        // else is a type error. A guest TAG_PTR is a linear-memory offset,
+        // not a process-local host pointer, so format that type error from
+        // the raw guest bits instead of reconstructing a host `Value`.
+        if value_layout::is_ptr_raw(a) {
+            let repr = format!("#Value({a:x})");
+            return Err(Error::msg(format!(
+                "type error: arithmetic `neg` requires numeric operands, got {repr} and {repr}"
+            )));
+        }
+
         let v = guest_non_pointer_value(a).map_err(Error::msg)?;
         match v.as_int() {
             Some(x) if x != crate::value_layout::INT48_MIN => Ok(value_layout::tag_int(-x) as i64),

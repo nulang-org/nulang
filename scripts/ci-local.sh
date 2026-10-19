@@ -33,33 +33,33 @@ run() {
 }
 
 # Fastest failures first.
-run cargo fmt --check
-run cargo clippy --all-targets -- -D clippy::correctness
-run cargo check --tests
+run cargo fmt --all -- --check
+run cargo clippy --locked --all-targets -- -D clippy::correctness
+run cargo check --locked --tests
 
 # Default feature matrix.
-run cargo build --all-targets
-run cargo test
+run cargo build --locked --all-targets
+run cargo test --locked
 run python3 scripts/verify_implementation.py
 
 # Minimal feature matrix. This is intentionally run without adding any Python
 # system dependency here; CI uses the same property to prove optional features
 # are genuinely optional.
-run cargo build --all-targets --no-default-features
-run cargo test --no-default-features
-run cargo check --tests --no-default-features
-run cargo clippy --all-targets --no-default-features -- -D clippy::correctness
+run cargo build --locked --all-targets --no-default-features
+run cargo test --locked --no-default-features
+run cargo check --locked --tests --no-default-features
+run cargo clippy --locked --all-targets --no-default-features -- -D clippy::correctness
 
 # WASM/all-features paths catch backend-specific semantic drift.
-run cargo build --all-targets --features wasm-backend
-run cargo test --features wasm-backend
-run cargo clippy --all-targets --all-features -- -D clippy::correctness
-run cargo check --all-features
+run cargo build --locked --all-targets --features wasm-backend
+run cargo test --locked --features wasm-backend
+run cargo clippy --locked --all-targets --all-features -- -D clippy::correctness
+run cargo check --locked --all-features
 
 if [[ "$FULL" -eq 1 ]]; then
-  run cargo build --release
-  run cargo test --release
-  run cargo doc --no-deps
+  run cargo build --locked --release
+  run cargo test --locked --release
+  run cargo doc --locked --no-deps
 
   if command -v cargo-audit >/dev/null 2>&1; then
     run cargo audit
@@ -70,7 +70,7 @@ if [[ "$FULL" -eq 1 ]]; then
   fi
 
   # Build the binary into the location used by the documentation verifier.
-  run env CARGO_TARGET_DIR=./target cargo build --release --bin nulang
+  run env CARGO_TARGET_DIR=./target cargo build --locked --release --bin nulang
   run env NULANG_BIN=./target/release/nulang bash scripts/verify_doc_examples.sh
 
   if command -v lake >/dev/null 2>&1; then

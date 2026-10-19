@@ -6,24 +6,24 @@ instructions/state live.
 
 ## Phase 0 — Repo readiness (T-7 to T-3 days)
 
-- [ ] **Merge or explicitly defer pending PRs.** Currently open:
-  PR #46 `fix(vm): checked 48-bit arithmetic, NaN canonicalization, and
-  type-error traps` (branch `fix/vm-correctness-v2`, **draft**). Either land
-  it or mark it post-launch — do not launch with a draft VM-correctness PR
-  hanging, because HN *will* find it. Numerous stale `next/*` and
-  `arch-critique-*` branches exist; prune or leave, but decide.
-- [ ] **Green CI on main**, including `cargo test` (~1,680 tests; note the
-  known pre-existing AOT failure documented in `docs/STATUS.md` — fix it or
-  be ready to answer for it).
+- [ ] **Merge or explicitly defer pending PRs.** Correctness, durability,
+  security, and CI/release fixes targeting `main` must be merged or explicitly
+  deferred with a documented reason before launch. Performance and experimental
+  feature stacks may remain open only when they are not required for the
+  supported release surface.
+- [ ] **Green CI on the exact `main` commit to be tagged.** Treat every
+  blocking build/test/lint/audit/docs/formal job as a release gate. Do not use
+  historical counts or `docs/STATUS.md` as evidence that current `main` is
+  green; that file is a dated infrastructure snapshot.
 - [ ] **Run RELEASE_CHECKLIST.md + docs/RELEASING.md and cut the first
   release** (suggest `v0.1.0`): bump `Cargo.toml` version + `VERSION` in
   `src/main.rs`, add CHANGELOG entry, `git tag v0.1.0 && git push origin
   v0.1.0`, watch the Release workflow, verify all 8 artifacts (4 tarballs +
   4 checksums), and smoke-test one tarball per docs/RELEASING.md §4. Until
   this lands, the README install section points at a promise.
-- [ ] **README sanity pass against reality** — README says "1550+ tests"
-  while `docs/STATUS.md` reports 1679; update the number. Verify every
-  README link resolves.
+- [ ] **README sanity pass against reality** — verify feature/status claims
+  against the tagged commit and current CI, avoid brittle exact test-count claims,
+  and verify every README link resolves.
 - [ ] **Merge this launch kit** (`docs/launch/`) to main.
 - [ ] **Demo is executed and current** — `docs/launch/demo-script.md` was run
   against a real build and its observed output is recorded; the

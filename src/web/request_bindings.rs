@@ -304,7 +304,7 @@ pub fn parse_urlencoded(input: &[u8]) -> HashMap<String, String> {
             continue;
         }
         let (key, value) = part.split_once('=').unwrap_or((part, ""));
-        out.insert(percent_decode(key), percent_decode(value));
+        out.insert(percent_decode_form(key), percent_decode_form(value));
     }
     out
 }
@@ -314,16 +314,16 @@ pub fn parse_cookie_header(header: &str) -> HashMap<String, String> {
         .split(';')
         .filter_map(|part| {
             let (key, value) = part.trim().split_once('=')?;
-            Some((key.trim().to_string(), percent_decode(value.trim())))
+            Some((key.trim().to_string(), percent_decode_form(value.trim())))
         })
         .collect()
 }
 
-fn percent_decode(input: &str) -> String {
+pub(crate) fn percent_decode_form(input: &str) -> String {
     percent_decode_impl(input, true)
 }
 
-/// Path-segment decoding: identical to [`percent_decode`] except `+` is a
+/// Path-segment decoding: identical to [`percent_decode_form`] except `+` is a
 /// literal plus, not a space (RFC 3986; `+`-means-space is a query/form
 /// convention only).
 pub(crate) fn percent_decode_path(input: &str) -> String {
@@ -516,13 +516,13 @@ mod tests {
     #[test]
     fn percent_decode_preserves_non_ascii_utf8() {
         // Raw and percent-encoded UTF-8 must survive decoding intact.
-        assert_eq!(percent_decode("café"), "café");
-        assert_eq!(percent_decode("caf%C3%A9"), "café");
-        assert_eq!(percent_decode("Jos%C3%A9+M%C3%BCller"), "José Müller");
-        assert_eq!(percent_decode("100%E2%82%AC"), "100€");
+        assert_eq!(percent_decode_form("café"), "café");
+        assert_eq!(percent_decode_form("caf%C3%A9"), "café");
+        assert_eq!(percent_decode_form("Jos%C3%A9+M%C3%BCller"), "José Müller");
+        assert_eq!(percent_decode_form("100%E2%82%AC"), "100€");
         // Malformed sequences pass through rather than corrupting neighbors.
-        assert_eq!(percent_decode("100%ZZ"), "100%ZZ");
-        assert_eq!(percent_decode("truncated%4"), "truncated%4");
+        assert_eq!(percent_decode_form("100%ZZ"), "100%ZZ");
+        assert_eq!(percent_decode_form("truncated%4"), "truncated%4");
     }
 
     #[test]

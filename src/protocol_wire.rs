@@ -8,7 +8,6 @@
 use crate::protocol::{ProtocolActorRef, ProtocolId, ProtocolIdParseError, ProtocolMismatch};
 use std::error::Error;
 use std::fmt;
-use std::str::FromStr;
 
 pub const PROTOCOL_WIRE_MAGIC: [u8; 4] = *b"NUPR";
 pub const PROTOCOL_WIRE_VERSION: u16 = 1;
@@ -47,7 +46,11 @@ pub fn decode_protocol_actor_ref(bytes: &[u8]) -> Result<ProtocolActorRef, Proto
 
     let node_id = u64::from_be_bytes(bytes[6..14].try_into().expect("validated fixed length"));
     let actor_id = u64::from_be_bytes(bytes[14..22].try_into().expect("validated fixed length"));
-    let protocol_id = protocol_id_from_bytes(&bytes[22..54])?;
+    let protocol_id = ProtocolId::from_bytes(
+        bytes[22..54]
+            .try_into()
+            .expect("validated fixed protocol-id length"),
+    );
 
     Ok(ProtocolActorRef::new(node_id, actor_id, protocol_id))
 }
@@ -65,16 +68,6 @@ pub fn decode_protocol_actor_ref_for(
         .require_protocol(expected)
         .map_err(ProtocolWireError::ProtocolMismatch)?;
     Ok(reference)
-}
-
-fn protocol_id_from_bytes(bytes: &[u8]) -> Result<ProtocolId, ProtocolWireError> {
-    let mut encoded = String::with_capacity(64);
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for byte in bytes {
-        encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    ProtocolId::from_str(&encoded).map_err(ProtocolWireError::InvalidProtocolId)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

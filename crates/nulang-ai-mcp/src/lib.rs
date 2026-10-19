@@ -1,5 +1,10 @@
 //! MCP (Model Context Protocol) JSON-RPC host — OSS stub.
 
+pub mod dev_plane;
+pub mod forge;
+pub mod forge_tools;
+pub mod gitea;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

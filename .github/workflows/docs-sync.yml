@@ -2,9 +2,9 @@ name: Docs Sync
 
 # Regenerate derived docs (stdlib reference + API reference) whenever the
 # compiler, standard library, examples, docs source, or this workflow change
-# on the main branch. The updated docs are committed back to main, the Astro
-# site is built to verify the result, and DeepWiki is pinged to encourage
-# re-indexing. Cloudflare Pages then redeploys https://nulang.org from main.
+# on the main branch. The generated outputs are proposed through a dedicated
+# pull request so protected-main rules remain authoritative. The Astro site is
+# built before the PR is opened, and DeepWiki is pinged to encourage re-indexing.
 
 on:
   workflow_dispatch:
@@ -16,6 +16,9 @@ on:
       - 'examples/**'
       - 'scripts/**'
       - 'docs/**'
+      - '!docs/public/playground/**'
+      - 'playground/web/**'
+      - 'crates/nulang-playground/**'
       - '.github/workflows/docs-sync.yml'
 
 concurrency:
@@ -27,13 +30,14 @@ jobs:
     name: Regenerate and sync docs
     runs-on: ubuntu-latest
     permissions:
-      contents: write       # Required for auto-committing doc changes
+      contents: write
+      pull-requests: write
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.DOCS_SYNC_TOKEN || github.token }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v7
@@ -47,7 +51,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y python3-dev
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.95.0'
+          targets: wasm32-unknown-unknown
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -55,25 +62,54 @@ jobs:
       - name: Generate docs
         run: node scripts/generate-docs.js
 
+      - name: Build browser playground
+        run: |
+          playground/web/build.sh
+          cd docs
+          node scripts/sync-playground.mjs
+
       - name: Build Astro site
         run: |
           cd docs
           pnpm install --frozen-lockfile
           pnpm run build
-        # Deployment is handled by the Cloudflare Pages Git integration,
-        # which triggers on every push to main. This step validates the build
-        # before any generated docs are committed.
+        # Deployment remains handled by the Cloudflare Pages Git integration.
+        # This step validates the exact generated site before assets are
+        # proposed to protected main through the generated-assets PR.
 
-      - name: Commit and push changes
+      - name: Open or update generated-assets PR
+        env:
+          # Optional PAT/GitHub-App token avoids the approval gate GitHub
+          # applies to PR workflows created by GITHUB_TOKEN. Without it, the
+          # generated-assets PR is still created safely but a maintainer must
+          # approve its workflow runs in the PR UI.
+          GH_TOKEN: ${{ secrets.DOCS_SYNC_TOKEN || github.token }}
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add docs/src/content/docs/stdlib/ docs/api.md
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/src/content/docs/stdlib/ docs/api.md docs/public/playground/
+
           if git diff --staged --quiet; then
-            echo "No changes to commit."
+            echo "Generated docs and playground assets are already current."
+            exit 0
+          fi
+
+          sync_branch="automation/docs-sync"
+          git checkout -B "$sync_branch"
+          git commit -m "docs: auto-sync generated site assets"
+          git push --force origin "HEAD:$sync_branch"
+
+          pr_number="$(gh pr list --head "$sync_branch" --base main --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$pr_number" ]; then
+            gh pr edit "$pr_number" \
+              --title "docs: sync generated site assets" \
+              --body "Automated refresh of generated standard-library/API docs and the browser-playground bundle from the current main branch."
           else
-            git commit -m "docs: auto-sync stdlib reference [skip ci]"
-            git push
+            gh pr create \
+              --base main \
+              --head "$sync_branch" \
+              --title "docs: sync generated site assets" \
+              --body "Automated refresh of generated standard-library/API docs and the browser-playground bundle from the current main branch."
           fi
 
       - name: Ping DeepWiki to refresh index
