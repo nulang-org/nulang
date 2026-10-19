@@ -99,6 +99,7 @@ pub enum DurableAsyncDispatchError {
         actual: u64,
     },
     ActorNotLive,
+    ActorNotPersistent,
     ActorEpochMismatch {
         expected: u64,
         actual: u64,
@@ -122,6 +123,7 @@ impl fmt::Display for DurableAsyncDispatchError {
                 "durable effect actor mismatch: expected {expected}, got {actual}"
             ),
             Self::ActorNotLive => write!(f, "terminated actor cannot dispatch durable effect"),
+            Self::ActorNotPersistent => write!(f, "transient actor cannot dispatch durable effect"),
             Self::ActorEpochMismatch { expected, actual } => write!(
                 f,
                 "durable effect activation epoch mismatch: expected {expected}, got {actual}"
@@ -215,8 +217,8 @@ impl<'a> DurableEffectCoordinator<'a> {
     /// The provider MUST honor the supplied stable idempotency key. A provider
     /// timeout or error leaves Prepared intact for a future deduplicated retry.
     ///
-    /// Require a live actor with the exact ID, activation epoch and typed
-    /// authority for the compiler's effect operation BEFORE journaling, replay,
+    /// Require a live persistent actor with the exact ID, activation epoch and
+    /// typed authority for the compiler's effect operation BEFORE journaling, replay,
     /// or provider dispatch. For now this bridge intentionally permits only an
     /// unparameterized Other(Namespace::Operation) grant matching the compiled
     /// Namespace.operation site. Resource-scoped grants need a separate adapter
@@ -248,6 +250,9 @@ impl<'a> DurableEffectCoordinator<'a> {
         }
         if actor.state == ActorState::Terminated {
             return Err(DurableAsyncDispatchError::ActorNotLive);
+        }
+        if !actor.persistent {
+            return Err(DurableAsyncDispatchError::ActorNotPersistent);
         }
         if actor.activation_epoch != self.activation_epoch {
             return Err(DurableAsyncDispatchError::ActorEpochMismatch {
