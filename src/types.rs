@@ -2469,7 +2469,6 @@ mod tests {
         }
     }
 
-
     // -----------------------------------------------------------------
     // Structured error diagnostics (PLAN.md Phase 1 bullet 7): verify
     // the NuError constructor helpers actually populate their
