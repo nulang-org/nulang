@@ -6,7 +6,7 @@
 //! changing any files.
 
 use std::collections::BTreeSet;
-use std::path::{Path, Component};
+use std::path::{Component, Path};
 
 use crate::package::identity::source_id_for_package_dir;
 use crate::package::lockfile::{Lockfile, LOCKFILE_FILE};
@@ -29,7 +29,9 @@ fn package_error(message: impl Into<String>) -> NuError {
 pub fn inspect(root: &Path) -> NuResult<serde_json::Value> {
     let manifest = Manifest::load(root)?;
     let entry = Path::new(&manifest.package.entry);
-    if entry.components().any(|part| !matches!(part, Component::Normal(_) | Component::CurDir))
+    if entry
+        .components()
+        .any(|part| !matches!(part, Component::Normal(_) | Component::CurDir))
         || entry.extension().and_then(|ext| ext.to_str()) != Some("nula")
         || !root.join(entry).is_file()
     {
@@ -53,7 +55,11 @@ pub fn inspect(root: &Path) -> NuResult<serde_json::Value> {
 
     // A stale lockfile must not silently masquerade as covering direct inputs.
     for name in manifest.dependencies.keys() {
-        if !lockfile.package.iter().any(|dependency| &dependency.name == name) {
+        if !lockfile
+            .package
+            .iter()
+            .any(|dependency| &dependency.name == name)
+        {
             return Err(package_error(format!(
                 "Nulang.lock does not contain direct dependency '{name}'; rebuild the lockfile"
             )));
@@ -61,7 +67,8 @@ pub fn inspect(root: &Path) -> NuResult<serde_json::Value> {
     }
 
     let mut packages = lockfile.package.iter().collect::<Vec<_>>();
-    packages.sort_by(|a, b| (&a.name, &a.version, &a.source).cmp(&(&b.name, &b.version, &b.source)));
+    packages
+        .sort_by(|a, b| (&a.name, &a.version, &a.source).cmp(&(&b.name, &b.version, &b.source)));
     let mut seen = BTreeSet::new();
     let mut dependencies = Vec::with_capacity(packages.len());
 
@@ -72,27 +79,28 @@ pub fn inspect(root: &Path) -> NuResult<serde_json::Value> {
                 package.name, package.version, package.source
             )));
         }
-        let metadata = lockfile.package_identity(
-            &package.name,
-            &package.version,
-            &package.source,
-        );
+        let metadata = lockfile.package_identity(&package.name, &package.version, &package.source);
         let (source_id, verification) = if let Some(path) = package.source.strip_prefix("path+") {
             let expected = metadata
-                .ok_or_else(|| package_error(format!(
-                    "missing SourceId for locked path dependency '{}'",
-                    package.name
-                )))?
+                .ok_or_else(|| {
+                    package_error(format!(
+                        "missing SourceId for locked path dependency '{}'",
+                        package.name
+                    ))
+                })?
                 .parsed_source_id()?
-                .ok_or_else(|| package_error(format!(
-                    "missing SourceId for locked path dependency '{}'",
-                    package.name
-                )))?;
-            let actual = source_id_for_package_dir(Path::new(path))
-                .map_err(|error| package_error(format!(
+                .ok_or_else(|| {
+                    package_error(format!(
+                        "missing SourceId for locked path dependency '{}'",
+                        package.name
+                    ))
+                })?;
+            let actual = source_id_for_package_dir(Path::new(path)).map_err(|error| {
+                package_error(format!(
                     "cannot verify locked path dependency '{}': {error}",
                     package.name
-                )))?;
+                ))
+            })?;
             if expected != actual {
                 return Err(package_error(format!(
                     "source identity mismatch for locked dependency '{}': expected {expected}, got {actual}",
@@ -176,9 +184,7 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(
             root.join("Nulang.toml"),
-            format!(
-                "[package]\nname = \"test-pkg\"\nversion = \"0.1.0\"\n\n{dependencies}"
-            ),
+            format!("[package]\nname = \"test-pkg\"\nversion = \"0.1.0\"\n\n{dependencies}"),
         )
         .unwrap();
         std::fs::write(root.join("src/main.nula"), "fn main() { 42 }").unwrap();
@@ -225,9 +231,15 @@ mod tests {
         lock.save(&root).unwrap();
 
         let first = inspect(&root).unwrap();
-        assert_eq!(first["dependencies"][0]["verification"], "local-source-verified");
+        assert_eq!(
+            first["dependencies"][0]["verification"],
+            "local-source-verified"
+        );
         std::fs::write(dependency.join("src/main.nula"), "fn main() { 43 }").unwrap();
-        assert!(inspect(&root).unwrap_err().to_string().contains("source identity mismatch"));
+        assert!(inspect(&root)
+            .unwrap_err()
+            .to_string()
+            .contains("source identity mismatch"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -238,11 +250,18 @@ mod tests {
         make_package(&root, "[dependencies]\nutil = { path = \"util\" }\n");
         make_package(&dependency, "");
         let mut lock = Lockfile::new();
-        lock.package.push(locked_dependency("util", format!("path+{}", dependency.display()), ""));
+        lock.package.push(locked_dependency(
+            "util",
+            format!("path+{}", dependency.display()),
+            "",
+        ));
         lock.save(&root).unwrap();
         std::fs::remove_dir_all(&dependency).unwrap();
 
-        assert!(inspect(&root).unwrap_err().to_string().contains("cannot verify locked path"));
+        assert!(inspect(&root)
+            .unwrap_err()
+            .to_string()
+            .contains("cannot verify locked path"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -250,14 +269,20 @@ mod tests {
     fn dependency_requires_existing_lockfile() {
         let root = scratch("unlocked");
         make_package(&root, "[dependencies]\nutil = { path = \"util\" }\n");
-        assert!(inspect(&root).unwrap_err().to_string().contains("Nulang.lock is required"));
+        assert!(inspect(&root)
+            .unwrap_err()
+            .to_string()
+            .contains("Nulang.lock is required"));
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn git_pin_is_not_misrepresented_as_verified_content() {
         let root = scratch("git");
-        make_package(&root, "[dependencies]\nutil = { git = \"https://example.org/util.git\" }\n");
+        make_package(
+            &root,
+            "[dependencies]\nutil = { git = \"https://example.org/util.git\" }\n",
+        );
         let mut lock = Lockfile::new();
         lock.package.push(locked_dependency(
             "util",
@@ -266,8 +291,14 @@ mod tests {
         ));
         lock.save(&root).unwrap();
         let plan = inspect(&root).unwrap();
-        assert_eq!(plan["dependencies"][0]["verification"], "commit-pinned-content-unverified");
-        assert_eq!(plan["dependencies"][0]["source_id"], serde_json::Value::Null);
+        assert_eq!(
+            plan["dependencies"][0]["verification"],
+            "commit-pinned-content-unverified"
+        );
+        assert_eq!(
+            plan["dependencies"][0]["source_id"],
+            serde_json::Value::Null
+        );
         assert_eq!(plan["cloud_admissible"], false);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -275,11 +306,21 @@ mod tests {
     #[test]
     fn unpinned_git_dependency_fails_closed() {
         let root = scratch("unpinned");
-        make_package(&root, "[dependencies]\nutil = { git = \"https://example.org/util.git\" }\n");
+        make_package(
+            &root,
+            "[dependencies]\nutil = { git = \"https://example.org/util.git\" }\n",
+        );
         let mut lock = Lockfile::new();
-        lock.package.push(locked_dependency("util", "git+https://example.org/util.git".into(), ""));
+        lock.package.push(locked_dependency(
+            "util",
+            "git+https://example.org/util.git".into(),
+            "",
+        ));
         lock.save(&root).unwrap();
-        assert!(inspect(&root).unwrap_err().to_string().contains("complete commit pin"));
+        assert!(inspect(&root)
+            .unwrap_err()
+            .to_string()
+            .contains("complete commit pin"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -290,7 +331,10 @@ mod tests {
         let before = inspect(&root).unwrap();
         std::fs::write(root.join("src/main.nula"), "fn main() { 43 }").unwrap();
         let after = inspect(&root).unwrap();
-        assert_ne!(before["package"]["source_id"], after["package"]["source_id"]);
+        assert_ne!(
+            before["package"]["source_id"],
+            after["package"]["source_id"]
+        );
         assert_eq!(after["artifact"]["artifact_id"], serde_json::Value::Null);
         let _ = std::fs::remove_dir_all(root);
     }
