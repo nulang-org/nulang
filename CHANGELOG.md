@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Web static-build route placement enforcement — 2026-10-17
+- **`nula build --web` now executes and writes HTML only for routes classified `static` by its compiler-contract-backed deployment IR.** Server/edge/client routes remain in the manifest but are not prerendered during the build.
+- **Signal analysis and deployment IR generation precede prerendering**, so build output uses the same placement decision exported to Nulang Cloud. This does not yet strengthen the existing placement inference heuristic or purge output left by earlier builds; exact-head integration tests and CI are required before promotion.
+
 ### Bounded Nulang Web development-server connections — 2026-10-16
 - **The experimental Web development listener caps active connections at 64**, including SSE, and returns `503` with `Retry-After: 1` when full.
 - **Worker capacity is returned by a scoped RAII lease** after normal completion, panic, or thread-spawn failure. One shared `Arc` route table replaces per-connection clones of compiled route modules.

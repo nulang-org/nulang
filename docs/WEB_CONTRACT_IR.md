@@ -237,6 +237,10 @@ the binding plan is equivalent to:
 ]
 ```
 
+## Static-build execution boundary
+
+`nula build --web` generates the deployment IR from the same validated route contracts used for runtime dispatch **before** prerendering. Only routes classified `static` are executed to generate HTML artifacts; routes classified `server`, `edge`, or `client` remain manifest entries and must be dispatched by an appropriate host. This prevents the build step from executing known non-static route handlers, but does not itself prove that implicit `static` inference is sound or remove stale output from older builds.
+
 ## Architectural direction
 
 The Web Contract IR is intended to be the stable seam between language semantics and transports:

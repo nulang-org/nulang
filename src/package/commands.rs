@@ -1415,8 +1415,33 @@ fn cmd_build_web() -> NuResult<()> {
         span: Span::default(),
     })?;
 
-    eprintln!("  Rendering {} route(s)...", routes.len());
-    for route in &routes {
+    // Resolve deployment placement from the validated contract set before
+    // executing any route handler. A server/edge/client route must not run as
+    // a static build step or generate a misleading prerendered document.
+    let signals_path = output_dir.join("app.signals.json");
+    nulang_exe(&[
+        "--emit-signals",
+        &signals_path.to_string_lossy(),
+        &entry_str,
+    ])?;
+    let ir = crate::web::ir::generate_deployment_ir(
+        &routes,
+        Some(&signals_path),
+        &src_root,
+        &manifest.budgets,
+        &validated_contracts,
+    );
+    let static_count = ir
+        .routes
+        .iter()
+        .filter(|route| route.placement == "static")
+        .count();
+    eprintln!("  Rendering {} static route(s)...", static_count);
+    // DeploymentIr is generated in registration order from this exact list.
+    for (route, ir_route) in routes.iter().zip(&ir.routes) {
+        if ir_route.placement != "static" {
+            continue;
+        }
         let html = render_route_handler(&route.handler_module, route.handler_func_idx, None)
             .ok_or_else(|| NuError::PackageError {
                 msg: format!("failed to render route {:?} {}", route.method, route.path),
@@ -1443,22 +1468,6 @@ fn cmd_build_web() -> NuResult<()> {
         copy_dir_contents(&static_dir, &output_dir)?;
     }
 
-    // Emit compile-time signal graph if the entry uses `signal` declarations.
-    let signals_path = output_dir.join("app.signals.json");
-    nulang_exe(&[
-        "--emit-signals",
-        &signals_path.to_string_lossy(),
-        &entry_str,
-    ])?;
-
-    // Generate deployment IR consumed by adapters and Nulang Cloud.
-    let ir = crate::web::ir::generate_deployment_ir(
-        &routes,
-        Some(&signals_path),
-        &src_root,
-        &manifest.budgets,
-        &validated_contracts,
-    );
     let ir_path = output_dir.join("nulang-app.ir.json");
     let ir_json = ir.to_json();
     std::fs::write(&ir_path, ir_json).map_err(|e| NuError::PackageError {
@@ -3114,6 +3123,78 @@ app "counter" {
         assert!(js.contains("window.nulang"), "nulang global missing");
         assert!(js.contains("hydrate"), "hydrate missing");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn web_build_only_prerenders_routes_marked_static_in_deployment_ir() {
+        let dir =
+            std::env::temp_dir().join(format!("nulang_build_web_placement_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        scaffold_package(&dir, "placement-app", "web").expect("scaffold should succeed");
+        std::fs::write(
+            dir.join("src/main.nula"),
+            r#"import stdlib::web::html
+import stdlib::web::types
+
+@placement(static)
+fn home() -> Html {
+    text("Public home")
+}
+
+@placement(server)
+fn dashboard() -> Html {
+    text("Server-only dashboard")
+}
+
+fn submit() -> Html {
+    text("Mutation result")
+}
+
+app "placement" {
+    route "GET" "/" -> home
+    route "GET" "/dashboard" -> dashboard
+    route "POST" "/submit" -> submit
+}
+"#,
+        )
+        .unwrap();
+
+        let _guard = ChangeDir::new(&dir);
+        cmd_build_web().expect("hybrid web build should succeed");
+
+        let home = std::fs::read_to_string(dir.join("dist/index.html"))
+            .expect("static home should be prerendered");
+        assert!(home.contains("Public home"));
+        assert!(
+            !dir.join("dist/dashboard/index.html").exists(),
+            "server routes must never be emitted as static HTML"
+        );
+        assert!(
+            !dir.join("dist/submit/index.html").exists(),
+            "POST mutations must never be emitted as static HTML"
+        );
+
+        let manifest = std::fs::read_to_string(dir.join("dist/nulang-app.ir.json"))
+            .expect("web deployment IR should be emitted");
+        let ir: crate::web::ir::DeploymentIr =
+            serde_json::from_str(&manifest).expect("valid deployment IR");
+        assert!(ir.routes.iter().any(|route| {
+            route.path == "/"
+                && route.placement == "static"
+                && route.artifact.as_deref() == Some("index.html")
+        }));
+        assert!(ir.routes.iter().any(|route| {
+            route.path == "/dashboard" && route.placement == "server" && route.artifact.is_none()
+        }));
+        assert!(ir.routes.iter().any(|route| {
+            route.method == "POST"
+                && route.path == "/submit"
+                && route.placement == "server"
+                && route.artifact.is_none()
+        }));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
