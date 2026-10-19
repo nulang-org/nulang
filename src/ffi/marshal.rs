@@ -696,6 +696,11 @@ mod tests {
     }
 
     #[cfg(feature = "ffi")]
+    extern "C" fn accept_opaque_value(_bits: u64) -> i64 {
+        1
+    }
+
+    #[cfg(feature = "ffi")]
     extern "C" fn make_greeting() -> *const c_char {
         let s = std::ffi::CString::new("hello ffi").unwrap();
         s.into_raw()
@@ -756,6 +761,21 @@ mod tests {
         );
         let err = unsafe { call_native(&func, &[]) }.unwrap_err();
         assert!(err.contains("pointer-tagged"));
+    }
+
+    #[test]
+    #[cfg(feature = "ffi")]
+    fn test_call_native_value_rejects_borrowed_pointer_argument() {
+        let func = make_func(
+            accept_opaque_value as *const c_void,
+            Signature::new(vec![CType::Value], CType::I64),
+        );
+        let mut byte = 7u8;
+        // SAFETY: byte remains allocated for the entire call, but CType::Value
+        // has no provenance or lifetime contract for exposing its pointer.
+        let pointer_value = unsafe { Value::ptr(&mut byte as *mut u8) };
+        let err = unsafe { call_native(&func, &[pointer_value]) }.unwrap_err();
+        assert!(err.contains("pointer-tagged"), "{err}");
     }
 
     #[test]
