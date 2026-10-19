@@ -81,7 +81,9 @@ pub fn inspect(root: &Path) -> NuResult<serde_json::Value> {
                     .is_some_and(|locked_path| locked_path == actual_path)
             }
             Dependency::Detailed(detail) if detail.git.is_some() => {
-                let revision = detail.rev.as_ref()
+                let revision = detail
+                    .rev
+                    .as_ref()
                     .or(detail.branch.as_ref())
                     .or(detail.tag.as_ref());
                 let requested = match revision {
@@ -364,10 +366,7 @@ mod tests {
         let root = scratch("stale-direct-path");
         let old_path = root.join("original");
         let new_path = root.join("replacement");
-        make_package(
-            &root,
-            "[dependencies]\nutil = { path = \"original\" }\n",
-        );
+        make_package(&root, "[dependencies]\nutil = { path = \"original\" }\n");
         make_package(&old_path, "");
         make_package(&new_path, "");
         let mut lock = Lockfile::new();
@@ -385,7 +384,8 @@ mod tests {
         std::fs::write(
             root.join("Nulang.toml"),
             manifest.replace("original", "replacement"),
-        ).unwrap();
+        )
+        .unwrap();
         assert!(inspect(&root)
             .expect_err("direct source change must reject stale lockfile")
             .to_string()
@@ -413,7 +413,8 @@ mod tests {
         std::fs::write(
             root.join("Nulang.toml"),
             manifest.replace("old.git", "new.git"),
-        ).unwrap();
+        )
+        .unwrap();
         assert!(inspect(&root)
             .expect_err("direct Git origin change must reject stale lockfile")
             .to_string()
