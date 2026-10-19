@@ -531,6 +531,30 @@ mod tests {
     }
 
     #[test]
+    fn rejects_ambiguous_same_named_helpers_across_modules() {
+        let ast = parse(
+            r#"
+            module Alpha {
+                fn helper() { perform IO.print("unsafe") }
+                entity Account {
+                    version: 2
+                    state balance: Int = 0
+                    events | Changed(value: Int)
+                    migration from 1 to 2 {
+                        state => { helper() }
+                    }
+                }
+            }
+            module Beta {
+                fn helper() { 1 }
+            }
+            "#,
+        );
+        let err = check_module(&ast.decls).unwrap_err().to_string();
+        assert!(err.contains("ambiguous migration helper 'helper'"));
+    }
+
+    #[test]
     fn permits_replay_stream_emit() {
         let ast = parse(
             r#"
