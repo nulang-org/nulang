@@ -3226,6 +3226,22 @@ mod tests {
     }
 
     #[test]
+    fn test_array_perform_is_not_silently_reclassified_as_pure() {
+        // Array.length currently uses effect dispatch; an enclosing handler
+        // may intercept it, so it is not yet an unconditional pure intrinsic.
+        let mut checker = EffectChecker::new();
+        let ctx = EffectContext::empty();
+        let expr = Expr::Perform {
+            effect: "Array".to_string(),
+            op: "length".to_string(),
+            args: vec![Expr::Array(vec![], s())],
+            span: s(),
+        };
+        let row = checker.infer_effects(&ctx, &expr).unwrap();
+        assert!(row.contains(&Effect::Array));
+    }
+
+    #[test]
     fn test_check_effects_rejects_open_callee_from_pure_function() {
         // A callee with an unresolved effect tail cannot be assumed pure.
         // This checks the actual call-site gate, not only row comparison.
