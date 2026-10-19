@@ -1,4 +1,9 @@
 # Nulang Changelog
+
+### Per-import filtering correctness for resolver cache — 2026-10-13
+- **In-process import resolution now caches complete unfiltered declaration sets and applies each import's selection independently.** A second import of the same file can no longer lose symbols because the first import requested a different subset; the existing per-top-level cache reset remains unchanged to prevent stale results between compilations.
+- **Regression fixtures cover repeated selective imports and modified files across top-level compilation calls.** This is a correctness prerequisite for any persistent incremental semantic cache, not an implementation of cross-build caching.
+
 ### Fabric on-demand mailbox scoring — 2026-10-18
 - **Fabric publish admission now reads mailbox pressure only for matching local subscribers**, instead of allocating and populating an all-actor mailbox snapshot on every publish.
 - **Ported the regression and exact-base matched-fixture A/B harness** from #1708 onto current main. Historical unmatched-publish microbenchmarks were favorable; new-head CI and measurements remain the promotion gate.
