@@ -42,14 +42,22 @@ fn noalloc_forbidden_opcode(opcode: OpCode) -> Option<&'static str> {
         SPrint | SRead | FOpen | FRead | FWrite | FClose | Print => {
             Some("I/O boundary is not allocation-provable")
         }
-        DbgPrint | DbgStack | MetaType | MetaCap => {
+        DbgBreak | DbgPrint | DbgStack | MetaType | MetaCap => {
             Some("debug/meta operation may materialize runtime data")
         }
         // Spilled locals use frame-side dynamic storage. Treat this as an
         // allocation risk rather than silently weakening @noalloc for very
         // large functions.
         SpillLoad | SpillStore => Some("register spill requires dynamic frame storage"),
-        _ => None,
+        // Exhaustive allowlist: adding an opcode requires reviewing its VM
+        // allocation behavior before it can be accepted under @noalloc.
+        Nop | Halt | Const0 | Const1 | Const2 | ConstM1 | ConstU | ConstL | Load | Store
+        | Move | Pop | Dup | Swap | IAdd | ISub | IMul | IDiv | IMod | INeg | IInc | IDec
+        | IPow | Xor | Shl | Shr | BitAnd | BitOr | FAdd | FSub | FMul | FDiv | FNeg | FMod
+        | IToF | FToI | FPow | ICmpEq | ICmpLt | ICmpGt | ICmpLe | ICmpGe | FCmpEq | FCmpLt
+        | FCmpGt | Not | And | Or | Jmp | JmpT | JmpF | Switch | Call | TailCall | Ret
+        | RetVal | Closure | CapLoad | FreeVar | ClosureCall | FieldL | FieldS | ArrLoad
+        | ArrStore | ArrLen | TupleL | RecL | RecS | IsTag | Unpack | Drop | SelfOp | NodeId => None,
     }
 }
 
@@ -262,6 +270,13 @@ pub fn validate_noalloc_contracts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proven_numeric_and_register_ops_remain_allocation_free() {
+        assert_eq!(noalloc_forbidden_opcode(OpCode::IAdd), None);
+        assert_eq!(noalloc_forbidden_opcode(OpCode::RetVal), None);
+        assert_eq!(noalloc_forbidden_opcode(OpCode::Closure), None);
+    }
 
     #[test]
     fn debugger_breakpoint_is_not_proven_allocation_free() {
