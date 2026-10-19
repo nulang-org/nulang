@@ -2608,6 +2608,70 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_locked_build_requires_existing_lockfile_without_creating_it() {
+        let dir = std::env::temp_dir().join(format!("nula_locked_missing_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = ChangeDir::new(&dir);
+        scaffold_package(&dir, "locked-app", "default").unwrap();
+
+        let err = prepare_package_with_lock_mode(true).expect_err("missing lockfile must fail");
+        assert!(err.to_string().contains("requires an existing Nulang.lock"));
+        assert!(!dir.join(LOCKFILE_FILE).exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_locked_build_preserves_existing_lockfile_bytes() {
+        let dir = std::env::temp_dir().join(format!("nula_locked_unchanged_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = ChangeDir::new(&dir);
+        scaffold_package(&dir, "locked-app", "default").unwrap();
+
+        prepare_package().unwrap();
+        let lock_path = dir.join(LOCKFILE_FILE);
+        let original = std::fs::read(&lock_path).unwrap();
+        prepare_package_with_lock_mode(true).expect("unchanged lockfile must be accepted");
+        assert_eq!(std::fs::read(&lock_path).unwrap(), original);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_locked_build_rejects_dependency_changes_without_rewriting_lockfile() {
+        let dir = std::env::temp_dir().join(format!("nula_locked_drift_{}", std::process::id()));
+        let app = dir.join("app");
+        let util = dir.join("util");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::create_dir_all(&util).unwrap();
+        scaffold_package(&app, "locked-app", "default").unwrap();
+        scaffold_package(&util, "util", "lib").unwrap();
+        std::fs::write(util.join("util.nula"), "fn value() -> Int { 1 }\n").unwrap();
+
+        let _guard = ChangeDir::new(&app);
+        let mut manifest = Manifest::load(&app).unwrap();
+        manifest.dependencies.insert("util".to_string(), Dependency::Detailed(DependencyDetail {
+            path: Some("../util".to_string()),
+            ..Default::default()
+        }));
+        manifest.save(&app).unwrap();
+
+        prepare_package().unwrap();
+        let lock_path = app.join(LOCKFILE_FILE);
+        let original = std::fs::read(&lock_path).unwrap();
+        std::fs::write(util.join("util.nula"), "fn value() -> Int { 2 }\n").unwrap();
+
+        let err = prepare_package_with_lock_mode(true).expect_err("changed dependency must fail");
+        assert!(err.to_string().contains("Nulang.lock is out of date"));
+        assert_eq!(std::fs::read(&lock_path).unwrap(), original);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_manifest_language_pin() {
         let dir = std::env::temp_dir().join(format!("nulang_lang_pin_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
