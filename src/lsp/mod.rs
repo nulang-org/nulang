@@ -2358,7 +2358,7 @@ impl NulangLanguageServer {
 fn nu_warning_to_diagnostic(warning: &crate::types::NuWarning) -> Diagnostic {
     let span = warning.span;
     let message = match &warning.help {
-        Some(help) => format!("{}\\nhelp: {}", warning.msg, help),
+        Some(help) => format!("{}\nhelp: {}", warning.msg, help),
         None => warning.msg.clone(),
     };
     Diagnostic {
