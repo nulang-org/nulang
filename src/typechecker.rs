@@ -3364,7 +3364,7 @@ impl TypeChecker {
             let ctx_sub = apply_subst_to_ctx(ctx, &subst);
             // Bind pattern variables to the context
             let pattern_ctx =
-                self.bind_pattern(&ctx_sub, pattern, &apply_subst(&scrut_ty, &subst))?;
+                self.bind_pattern(&ctx_sub, pattern, &apply_subst(&scrut_ty, &subst), span)?;
             // A guard runs with the pattern's bindings in scope and must be
             // a boolean; it does not contribute to the arm result type.
             if let Some(guard_expr) = guard {
@@ -3409,6 +3409,7 @@ impl TypeChecker {
         ctx: &TypeContext,
         pattern: &Pattern,
         scrut_ty: &Type,
+        span: Span,
     ) -> NuResult<TypeContext> {
         match pattern {
             Pattern::Wild => Ok(ctx.clone()),
@@ -3424,7 +3425,7 @@ impl TypeChecker {
                     Literal::Nil => Type::nil(),
                     Literal::Unit => Type::unit(),
                 };
-                let _ = mgu(scrut_ty, &lit_ty, Span::default())?;
+                let _ = mgu(scrut_ty, &lit_ty, span)?;
                 Ok(ctx.clone())
             }
             Pattern::Tuple(pats) => {
@@ -3441,18 +3442,18 @@ impl TypeChecker {
                                     pats.len(),
                                     tys.len()
                                 ),
-                                Span::default(),
+                                span,
                             ));
                         }
                         let mut new_ctx = ctx.clone();
                         for (pat, ty) in pats.iter().zip(tys.iter()) {
-                            new_ctx = self.bind_pattern(&new_ctx, pat, ty)?;
+                            new_ctx = self.bind_pattern(&new_ctx, pat, ty, span)?;
                         }
                         Ok(new_ctx)
                     }
                     Type::Primitive(_) => Err(NuError::type_error(
                         format!("tuple pattern requires a tuple, found {}", scrut_ty),
-                        Span::default(),
+                        span,
                     )),
                     _ => {
                         // For unresolved or abstract types we cannot prove
@@ -3461,7 +3462,7 @@ impl TypeChecker {
                         let mut new_ctx = ctx.clone();
                         for pat in pats {
                             let elem_ty = Type::Var(TypeVar::fresh());
-                            new_ctx = self.bind_pattern(&new_ctx, pat, &elem_ty)?;
+                            new_ctx = self.bind_pattern(&new_ctx, pat, &elem_ty, span)?;
                         }
                         Ok(new_ctx)
                     }
@@ -3474,10 +3475,10 @@ impl TypeChecker {
                         fields.iter().map(|(n, t)| (n.clone(), t.clone())).collect();
                     for (field_name, pat) in pats {
                         if let Some(ty) = field_map.get(field_name) {
-                            new_ctx = self.bind_pattern(&new_ctx, pat, ty)?;
+                            new_ctx = self.bind_pattern(&new_ctx, pat, ty, span)?;
                         } else {
                             let fresh = Type::Var(TypeVar::fresh());
-                            new_ctx = self.bind_pattern(&new_ctx, pat, &fresh)?;
+                            new_ctx = self.bind_pattern(&new_ctx, pat, &fresh, span)?;
                         }
                     }
                     Ok(new_ctx)
@@ -3486,7 +3487,7 @@ impl TypeChecker {
                     let mut new_ctx = ctx.clone();
                     for (_, pat) in pats {
                         let fresh = Type::Var(TypeVar::fresh());
-                        new_ctx = self.bind_pattern(&new_ctx, pat, &fresh)?;
+                        new_ctx = self.bind_pattern(&new_ctx, pat, &fresh, span)?;
                     }
                     Ok(new_ctx)
                 }
@@ -3496,7 +3497,7 @@ impl TypeChecker {
                     let mut new_ctx = ctx.clone();
                     if let Some((_, Some(ty))) = variants.iter().find(|(n, _)| n == name) {
                         if let Some(p) = pat {
-                            new_ctx = self.bind_pattern(&new_ctx, p, ty)?;
+                            new_ctx = self.bind_pattern(&new_ctx, p, ty, span)?;
                         }
                     }
                     Ok(new_ctx)
@@ -3504,7 +3505,7 @@ impl TypeChecker {
                 _ => {
                     if let Some(p) = pat {
                         let fresh = Type::Var(TypeVar::fresh());
-                        self.bind_pattern(ctx, p, &fresh)
+                        self.bind_pattern(ctx, p, &fresh, span)
                     } else {
                         Ok(ctx.clone())
                     }
@@ -3513,7 +3514,7 @@ impl TypeChecker {
             Pattern::Alias(name, pat) => {
                 let mut new_ctx =
                     ctx.extend(name.clone(), scrut_ty.clone(), Capability::Ref, false);
-                new_ctx = self.bind_pattern(&new_ctx, pat, scrut_ty)?;
+                new_ctx = self.bind_pattern(&new_ctx, pat, scrut_ty, span)?;
                 Ok(new_ctx)
             }
         }
