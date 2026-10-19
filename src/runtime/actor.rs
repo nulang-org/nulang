@@ -965,3 +965,40 @@ impl Drop for Actor {
         store.drop_refs(&held);
     }
 }
+
+
+#[cfg(test)]
+mod orca_actor_stored_root_visitor_tests {
+    use super::*;
+
+    #[test]
+    fn stored_actor_root_visitor_covers_state_events_queries_and_suspension() {
+        let mut actor = Actor::new(1, "root-observer", 0);
+        actor.state_data.insert("field".to_string(), Value::int(31));
+        actor.event_log.push(("event".to_string(), vec![Value::int(32)]));
+        actor.query_handlers.insert("query".to_string(), Value::int(33));
+
+        let mut frame = crate::vm::Frame::new(None, 0);
+        frame.regs[9] = Value::int(34);
+        actor.suspended_execution = Some(SuspendedExecution {
+            vm_state: crate::vm::SuspendedVmState {
+                frames: vec![frame],
+                current_frame_idx: Some(0),
+                handler_stack: Vec::new(),
+                step_count: 0,
+            },
+            behavior_idx: 0,
+            activation: None,
+            step_name: "suspended".to_string(),
+        });
+
+        let mut observed = Vec::new();
+        actor.visit_stored_values(&mut |value| {
+            if let Some(value) = value.as_int() {
+                observed.push(value);
+            }
+        });
+        observed.sort_unstable();
+        assert_eq!(observed, vec![31, 32, 33, 34]);
+    }
+}
