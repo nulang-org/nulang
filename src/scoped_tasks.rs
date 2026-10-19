@@ -36,7 +36,6 @@ impl CancellationToken {
     }
 }
 
-
 /// Stable identity within a single parent scope, in submission order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TaskId(pub usize);
@@ -300,7 +299,10 @@ mod tests {
         assert_eq!(scope.admit_next(), Some(b));
         scope.complete(b, Err("failed")).unwrap();
 
-        assert_eq!(scope.cancellation(), Some(&CancellationCause::ChildFailed(b)));
+        assert_eq!(
+            scope.cancellation(),
+            Some(&CancellationCause::ChildFailed(b))
+        );
         assert_eq!(scope.pending(), 0);
         assert_eq!(scope.in_flight(), 1);
         assert_eq!(scope.admit_next(), None);
@@ -334,10 +336,7 @@ mod tests {
         scope.complete(running, Ok(())).unwrap();
         assert_eq!(
             scope.into_outcomes().unwrap(),
-            vec![
-                TaskOutcome::Completed(Ok(())),
-                TaskOutcome::Cancelled,
-            ]
+            vec![TaskOutcome::Completed(Ok(())), TaskOutcome::Cancelled,]
         );
     }
 
