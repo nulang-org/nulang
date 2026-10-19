@@ -243,8 +243,10 @@ fn compose_subst(s2: &Substitution, s1: &Substitution) -> Substitution {
 // ---------------------------------------------------------------------------
 
 /// Check if two effect rows are compatible (can be unified).
-/// For closed rows, they must have exactly the same effects.
-/// For open rows, we check that the fixed effects are compatible.
+/// Closed rows must have exactly the same effects. For an open row and a
+/// closed row, the open row's known effects must be present in the closed
+/// row; its unresolved tail could account for the remaining closed effects.
+/// This is a compatibility predicate, not full row-variable unification.
 fn effect_row_compatible(e1: &EffectRow, e2: &EffectRow) -> bool {
     match (e1, e2) {
         (EffectRow::Closed(a), EffectRow::Closed(b)) => {
@@ -255,7 +257,7 @@ fn effect_row_compatible(e1: &EffectRow, e2: &EffectRow) -> bool {
             a_sorted == b_sorted
         }
         (EffectRow::Open(a, _), EffectRow::Closed(b))
-        | (EffectRow::Closed(b), EffectRow::Open(a, _)) => b.iter().all(|e| a.contains(e)),
+        | (EffectRow::Closed(b), EffectRow::Open(a, _)) => a.iter().all(|e| b.contains(e)),
         (EffectRow::Open(a, _), EffectRow::Open(b, _)) => {
             // Both sides must agree on fixed effects; row variables are
             // assumed compatible (full row unification requires Region
