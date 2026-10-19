@@ -60,7 +60,8 @@ fn checked_range(range: Range<usize>, available: usize) -> Result<Range<usize>, 
 }
 
 impl<T: Numeric> NumericBuffer<T> {
-    /// Own `values` without introducing a second element-wise copy.
+    /// Convert `values` to immutable shared storage. This may copy data
+    /// during construction; slicing an existing buffer is the zero-copy path.
     pub fn new(values: Vec<T>) -> Self {
         Self {
             storage: values.into(),
