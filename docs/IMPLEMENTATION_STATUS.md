@@ -131,7 +131,9 @@ Important boundaries:
   transactional `LibsqlStore` (under the `sqlite` feature). Supervised
   persistent restarts use this relocation contract and refuse to restart on
   unsupported backends or missing snapshots, rather than dropping journals.
-  Identity-bound atomic transitions, CRDT state, embedded old self-references,
+  Recovered authority tokens are validated as a complete manifest before
+  activation; malformed manifests prevent restart. Identity-bound atomic
+  transitions, CRDT state, embedded old self-references,
   and workflow activation/replay receipts are deliberately not re-keyed.
   MemoryStore is ephemeral; this does not yet establish end-to-end
   process-crash recovery or stable logical actor identity;
