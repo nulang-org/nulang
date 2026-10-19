@@ -595,6 +595,27 @@ fn main() {
         eprintln!("Error: --inspect-types cannot be combined with --json");
         std::process::exit(1);
     }
+    // Reject all alternative execution/compilation modes before their
+    // dispatch paths. An inspection request must never evaluate user code.
+    if opts.inspect_types
+        && (opts.eval_code.is_some()
+            || opts.watch.is_some()
+            || opts.init.is_some()
+            || opts.repl
+            || opts.lsp
+            || opts.dap
+            || opts.doc
+            || opts.explain.is_some()
+            || opts.emit_nbc
+            || opts.emit_stdlib_docs.is_some()
+            || opts.emit_signals.is_some()
+            || opts.rewrite_signals.is_some()
+            || opts.bench_count.is_some()
+            || !positional.is_empty())
+    {
+        eprintln!("Error: --inspect-types cannot be combined with another command mode");
+        std::process::exit(1);
+    }
 
     // Resolve color mode once after all args are parsed.
     let use_color = color_enabled(&opts);
