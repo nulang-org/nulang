@@ -91,6 +91,31 @@ This allows benchmark/regression comparisons and an opt-out for workloads that e
 
 The global atomic turn ticket coordinates logical attempts on a shared scheduler, not per-actor execution completion. Under concurrency, a reserved preferred slot is an opportunity, not a guarantee of dispatch timing or a wall-clock bound.
 
+## Controlled strict-vs-fair scheduler probe
+
+An opt-in, ignored Rust test supplies an identical 30,000-token fixture
+(10,000 High, Normal and Low tokens) to strict and explicitly fair scheduler
+instances. It measures the scheduler owner's dequeue loop, alternating the
+execution order across six measured rounds after one warm-up:
+
+```bash
+cargo test --locked --release bench_scheduler_strict_vs_fair -- --ignored --nocapture
+```
+
+Each round fails if there are duplicate, missing or extra task tokens and emits
+`[scheduler-fair-bench]` machine-readable lines containing the mode,
+operation count, loop elapsed time and High-priority p99 queue waiting time.
+The `[scheduler-fair-summary]` line reports sample medians. Benchmarking
+requires the same host, CPU affinity, toolchain and exact source revision.
+
+**Limits:** This is a synthetic, preloaded, single-owner, payload-free test.
+The High p99 is **enqueue-to-dequeue queue delay**, including fixture enqueue
+time; it is not actor-handler p99, asynchronous wakeup p99 or full end-to-end
+latency. Per-iteration bookkeeping also contributes to measured throughput.
+This microbenchmark is not a production-default adoption gate by itself.
+Follow with mixed live-actor workloads, sustained producer pressure, and
+multi-worker contention before deciding whether to enable the policy.
+
 ## Operational defaults
 
 The proposed fair-mode starting weights are `8:4:1`; the deployed default remains **strict High-first** pending performance and semantics validation. The proposed weights are benchmark-tunable, not language semantics.
