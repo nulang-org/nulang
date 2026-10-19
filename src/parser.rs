@@ -9030,7 +9030,7 @@ mod tests {
         assert!(matches!(
             &ast.decls[0],
             Decl::Import { path, items, .. }
-                if path == "stdlib::math" && items == &["abs", "factorial"]
+                if path == "stdlib::math" && items == &vec!["abs".to_string(), "factorial".to_string()]
         ));
     }
 
