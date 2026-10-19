@@ -1073,6 +1073,14 @@ mod tests {
             "fn main() { 1 }"
         );
 
+        let cached_source = app.join(".nula/git/util/lib.nula");
+        std::fs::write(&cached_source, "fn main() { 777 }").unwrap();
+        assert!(
+            resolve_offline(&app, &manifest, &lock).is_err(),
+            "dirty cached source must never compile as the pinned commit"
+        );
+        std::fs::write(&cached_source, "fn main() { 1 }").unwrap();
+
         std::fs::write(app.join(".nula/git/util.commit"), "incorrect\n").unwrap();
         assert!(
             resolve_offline(&app, &manifest, &lock).is_err(),
