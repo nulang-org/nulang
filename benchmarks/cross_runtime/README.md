@@ -22,14 +22,23 @@ Run all installed runtimes on the same host:
 
 ```bash
 python3 scripts/cross_runtime_bench.py --runs 5 --warmup 1 \
-  --cpu-mode single \
+  --cpu-mode single --measurement-timeout 300 \
   --output /tmp/nulang-cross-runtime.json
 ```
 
 The runner compiles each external fixture once, performs warm-up runs, then
 records exact nanosecond timings from each runtime and reports the median for
 every workload. The JSON also records OS/CPU counts, git SHA, toolchain
-versions, and the CPU topology used for measurement.
+versions, and the CPU topology used for measurement. Each warm-up/measured
+runtime process has a configurable deadline (300 seconds by default), so a
+hung actor workload fails the comparison instead of consuming the entire CI
+job. Failed commands print captured output (including partial output on
+timeouts) to aid exact-revision debugging. Build steps remain outside this
+measurement deadline and under the CI job timeout.
+
+The GitHub workflow uses the Go 1.27 toolchain as its current comparison
+baseline. The emitted JSON records the exact Go version for every run; results
+from older compiler/runtime versions should not be presented as equivalent.
 
 ## CPU-topology rule
 
