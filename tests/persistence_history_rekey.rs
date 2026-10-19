@@ -158,6 +158,31 @@ fn memory_store_rekey_rejects_identity_bound_workflow_events() {
 }
 
 #[test]
+fn memory_store_rekey_rejects_replay_site_identity() {
+    let mut store = MemoryStore::new();
+    seed_legacy_history(&mut store, 100);
+    store
+        .append_workflow_event(
+            100,
+            WorkflowEvent::TimerSet {
+                sequence: 4,
+                replay_id: Some(nulang::runtime::WorkflowReplayEventId {
+                    activation: nulang::runtime::WorkflowActivationId::new(100, 3),
+                    ordinal: 0,
+                }),
+                name: "timeout".to_string(),
+                duration_ms: 100,
+            },
+        )
+        .unwrap();
+
+    let err = store.rekey_actor_history(100, 101).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Unsupported);
+    assert_eq!(store.read_workflow_events(100).len(), 2);
+    assert!(store.read_workflow_events(101).is_empty());
+}
+
+#[test]
 fn memory_store_rekey_missing_source_or_same_identity_does_not_mutate() {
     let mut store = MemoryStore::new();
     assert_eq!(
