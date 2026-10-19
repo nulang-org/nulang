@@ -1,0 +1,33 @@
+name: Performance envelope validation
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/performance-envelope-validation.yml'
+      - 'scripts/performance_envelope.py'
+      - 'scripts/tests/test_performance_envelope.py'
+      - 'examples/actor_allocation_profile.rs'
+      - 'benchmarks/perf_envelope_numeric.nula'
+      - 'benchmarks/PERFORMANCE_ENVELOPE.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify Python parsing, error boundaries and child peak RSS
+        run: python3 -m unittest discover -s scripts/tests -p 'test_performance_envelope.py' -v
+      - name: Verify ORCA allocation example compiles
+        run: cargo check --locked --no-default-features --features native-codegen --example actor_allocation_profile
+      - name: Check synthetic fixture compilation
+        run: |
+          cargo run --locked --no-default-features --features native-codegen --bin nulang -- \
+            --emit-nbc --out /tmp/perf_envelope.nbc benchmarks/perf_envelope_numeric.nula
+          test -s /tmp/perf_envelope.nbc
