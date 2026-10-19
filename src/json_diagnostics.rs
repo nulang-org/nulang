@@ -34,7 +34,7 @@
 
 use serde::Serialize;
 
-use crate::types::{current_source_text, source_map_file, NuError, Span};
+use crate::types::{current_source_text, source_map_file, NuError, NuWarning, Span};
 
 /// Current JSON diagnostics schema version.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -115,6 +115,21 @@ pub struct JsonTestResult {
     pub status: String,
     pub duration_ms: u64,
     pub diagnostics: Vec<JsonDiagnostic>,
+}
+
+/// Convert a non-fatal compiler warning into the existing JSON schema.
+pub fn diagnostic_from_warning(warning: &NuWarning) -> JsonDiagnostic {
+    JsonDiagnostic {
+        code: Some(warning.code.to_string()),
+        severity: "warning".to_string(),
+        message: warning.msg.clone(),
+        span: json_span(warning.span),
+        notes: Vec::new(),
+        suggestion: warning.help.as_ref().map(|help| JsonSuggestion {
+            message: help.clone(),
+            replacement: None,
+        }),
+    }
 }
 
 /// Convert an [`NuError`] into a flat list of JSON diagnostics.
