@@ -91,8 +91,9 @@ export function activate(context: vscode.ExtensionContext): void {
   // `--stdio` to the args (a node-server convention), which nulang rejects.
   // Undefined transport still uses stdio pipes, without the extra flag.
   const uri = vscode.window.activeTextEditor?.document.uri;
+  const lspCommand = nulangBinary(uri);
   const serverOptions: ServerOptions = {
-    command: nulangBinary(uri),
+    command: lspCommand,
     args: ['--lsp'],
   };
 
@@ -104,7 +105,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   client = new LanguageClient('nulang', 'Nulang Language Server', serverOptions, clientOptions);
   client.start().catch((err) => {
-    console.error(`[nulang] language server failed to start (binary: ${serverOptions.command}):`, err);
+    console.error(`[nulang] language server failed to start (binary: ${lspCommand}):`, err);
   });
 
   context.subscriptions.push(
