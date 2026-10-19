@@ -59,7 +59,10 @@ fn different_events_and_different_nodes_are_independent() {
     root.children = vec![NodeId::from("save"), NodeId::from("cancel")];
 
     let mut save = UiNode::new("save", "button");
-    save.actions = vec![binding("activate", "save"), binding("focus", "record_focus")];
+    save.actions = vec![
+        binding("activate", "save"),
+        binding("focus", "record_focus"),
+    ];
 
     let mut cancel = UiNode::new("cancel", "button");
     cancel.actions.push(binding("activate", "cancel"));
