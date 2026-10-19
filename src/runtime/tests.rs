@@ -22,6 +22,135 @@ fn declare_test_behavior(rt: &mut Runtime, actor_id: u64, name: &str) {
 }
 
 #[test]
+fn local_request_reply_is_one_shot_and_payload_carries_correlation() {
+    let mut rt = Runtime::new();
+    let owner = rt.spawn_actor(Box::new(Vec::new));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let first = rt.begin_local_reply_request(owner, deadline).expect("first request");
+    let second = rt.begin_local_reply_request(owner, deadline).expect("second request");
+    assert_ne!(first.reference(), second.reference());
+    assert_ne!(first.alias(), second.alias());
+
+    assert_eq!(
+        rt.send_local_reply(first, 7, &[Value::int(42)]),
+        LocalReplyStatus::Accepted
+    );
+    assert_eq!(
+        rt.send_local_reply(first, 7, &[Value::int(99)]),
+        LocalReplyStatus::Inactive
+    );
+    assert_eq!(
+        rt.send_local_reply(second, 7, &[Value::int(33)]),
+        LocalReplyStatus::Accepted
+    );
+
+    let mailbox = &mut rt.actors.get_mut(&owner).unwrap().mailbox;
+    let first_message = mailbox.pop().expect("first accepted reply");
+    let second_message = mailbox.pop().expect("second accepted reply");
+    assert_eq!(first_message.behavior_id, 7);
+    assert_eq!(first_message.payload.len(), 2);
+    assert_eq!(first_message.payload[0].as_int(), Some(first.reference().as_int()));
+    assert_eq!(first_message.payload[1].as_int(), Some(42));
+    assert_eq!(second_message.payload[0].as_int(), Some(second.reference().as_int()));
+    assert_eq!(second_message.payload[1].as_int(), Some(33));
+    assert!(mailbox.pop().is_none(), "second reply to first ticket dropped");
+    assert_eq!(rt.local_reply_request_count(), 0);
+}
+
+#[test]
+fn local_request_reply_cancellation_is_owner_checked() {
+    let mut rt = Runtime::new();
+    let owner = rt.spawn_actor(Box::new(Vec::new));
+    let stranger = rt.spawn_actor(Box::new(Vec::new));
+    let ticket = rt
+        .begin_local_reply_request(owner, Instant::now() + Duration::from_secs(60))
+        .expect("ticket");
+    assert!(!rt.cancel_local_reply_request(stranger, ticket.reference()));
+    assert!(rt.cancel_local_reply_request(owner, ticket.reference()));
+    assert!(!rt.cancel_local_reply_request(owner, ticket.reference()));
+    assert_eq!(rt.send_local_reply(ticket, 0, &[]), LocalReplyStatus::Inactive);
+    assert!(rt.actors.get(&owner).unwrap().mailbox.is_empty());
+}
+
+#[test]
+fn local_request_reply_expiry_is_deterministic_and_retires_alias() {
+    let mut rt = Runtime::new();
+    let owner = rt.spawn_actor(Box::new(Vec::new));
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(30);
+    let ticket = rt.begin_local_reply_request(owner, deadline).unwrap();
+
+    assert_eq!(
+        rt.send_local_reply_at(ticket, 0, &[Value::int(7)], deadline),
+        LocalReplyStatus::Expired
+    );
+    assert_eq!(rt.send_local_reply(ticket, 0, &[]), LocalReplyStatus::Inactive);
+    assert_eq!(rt.send_to_local_alias(ticket.alias(), 0, &[]), AliasSendStatus::Inactive);
+    assert_eq!(rt.local_reply_request_count(), 0);
+    assert!(rt.actors.get(&owner).unwrap().mailbox.is_empty());
+}
+
+#[test]
+fn local_request_reply_backpressure_does_not_consume_ticket() {
+    let mut rt = Runtime::new();
+    let owner = rt.spawn_actor(Box::new(Vec::new));
+    rt.actors.get_mut(&owner).unwrap().mailbox = Mailbox::new(1);
+    rt.send_message_by_id(owner, 0, &[Value::int(1)]);
+    let ticket = rt
+        .begin_local_reply_request(owner, Instant::now() + Duration::from_secs(60))
+        .unwrap();
+    assert_eq!(
+        rt.send_local_reply(ticket, 7, &[Value::int(2)]),
+        LocalReplyStatus::Backpressured
+    );
+    assert_eq!(rt.local_reply_request_count(), 1);
+    assert_eq!(rt.actors.get_mut(&owner).unwrap().mailbox.pop().unwrap().payload[0].as_int(), Some(1));
+    assert_eq!(
+        rt.send_local_reply(ticket, 7, &[Value::int(3)]),
+        LocalReplyStatus::Accepted
+    );
+    assert_eq!(rt.local_reply_request_count(), 0);
+    assert_eq!(
+        rt.actors.get_mut(&owner).unwrap().mailbox.pop().unwrap().payload[1].as_int(),
+        Some(3)
+    );
+}
+
+#[test]
+fn local_request_reply_rejects_ticket_with_crossed_reference_and_alias() {
+    let mut rt = Runtime::new();
+    let owner = rt.spawn_actor(Box::new(Vec::new));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let first = rt.begin_local_reply_request(owner, deadline).unwrap();
+    let second = rt.begin_local_reply_request(owner, deadline).unwrap();
+    let mismatched = LocalReplyTicket {
+        reference: first.reference(),
+        alias: second.alias(),
+    };
+    assert_eq!(rt.send_local_reply(mismatched, 7, &[]), LocalReplyStatus::Inactive);
+    assert_eq!(rt.local_reply_request_count(), 2);
+    assert_eq!(rt.send_local_reply(first, 7, &[]), LocalReplyStatus::Accepted);
+    assert_eq!(rt.send_local_reply(second, 7, &[]), LocalReplyStatus::Accepted);
+}
+
+#[test]
+fn local_request_reply_sweep_and_actor_exit_release_pending_aliases() {
+    let mut rt = Runtime::new();
+    let first_owner = rt.spawn_actor(Box::new(Vec::new));
+    let second_owner = rt.spawn_actor(Box::new(Vec::new));
+    let start = Instant::now();
+    let expired = rt.begin_local_reply_request(first_owner, start + Duration::from_secs(1)).unwrap();
+    let live = rt.begin_local_reply_request(second_owner, start + Duration::from_secs(90)).unwrap();
+    assert_eq!(rt.expire_local_reply_requests(start + Duration::from_secs(2)), 1);
+    assert_eq!(rt.send_local_reply(expired, 0, &[]), LocalReplyStatus::Inactive);
+    assert_eq!(rt.local_reply_request_count(), 1);
+    rt.exit_actor(second_owner, ExitReason::Normal);
+    assert_eq!(rt.local_reply_request_count(), 0);
+    assert_eq!(rt.send_local_reply(live, 0, &[]), LocalReplyStatus::Inactive);
+    assert_eq!(rt.send_to_local_alias(live.alias(), 0, &[]), AliasSendStatus::Inactive);
+}
+
+#[test]
 fn local_reply_alias_deactivation_rejects_late_replies_without_affecting_other_aliases() {
     let mut runtime = Runtime::new();
     let receiver = runtime.spawn_actor(Box::new(Vec::new));
