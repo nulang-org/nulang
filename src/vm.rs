@@ -8981,3 +8981,83 @@ mod vm_tests {
         }
     }
 }
+
+
+#[cfg(test)]
+mod orca_execution_root_visitor_tests {
+    use super::*;
+
+    #[test]
+    fn active_vm_root_visitor_includes_spills_closure_and_nested_effect_handlers() {
+        let mut vm = VM::new();
+        let mut frame = Frame::new(None, 0);
+        frame.regs[4] = Value::int(11);
+        frame.spilled.push(Value::int(12));
+        frame.closure_env = Some(Value::int(13));
+        vm.frames.push(frame);
+        vm.current_frame_idx = Some(0);
+
+        let mut captured = Frame::new(None, 0);
+        captured.regs[5] = Value::int(14);
+        let mut nested = HandlerFrame::new(0, 0, 0, 0);
+        let mut single_shot_regs = [Value::nil(); 256];
+        single_shot_regs[6] = Value::int(15);
+        nested.single_shot_state = Some(SingleShotState {
+            resume_pc: 0,
+            resume_dst: 0,
+            step_count: 0,
+            regs: single_shot_regs,
+        });
+        let mut handler = HandlerFrame::new(0, 0, 0, 0);
+        handler.captured_continuation = Some(Continuation {
+            frames: vec![captured],
+            current_frame_idx: 0,
+            resume_pc: 0,
+            resume_dst: 0,
+            step_count: 0,
+            handler_stack_snapshot: vec![nested],
+        });
+        vm.handler_stack.push(handler);
+
+        let mut observed = Vec::new();
+        vm.visit_execution_values(&mut |value| {
+            if let Some(value) = value.as_int() {
+                observed.push(value);
+            }
+        });
+        observed.sort_unstable();
+        assert_eq!(observed, vec![11, 12, 13, 14, 15]);
+    }
+
+    #[test]
+    fn suspended_vm_root_visitor_includes_register_spills_and_single_shot_state() {
+        let mut frame = Frame::new(None, 0);
+        frame.regs[3] = Value::int(21);
+        frame.spilled.push(Value::int(22));
+        frame.closure_env = Some(Value::int(23));
+        let mut regs = [Value::nil(); 256];
+        regs[0] = Value::int(24);
+        let mut handler = HandlerFrame::new(0, 0, 0, 0);
+        handler.single_shot_state = Some(SingleShotState {
+            resume_pc: 0,
+            resume_dst: 0,
+            step_count: 0,
+            regs,
+        });
+        let suspended = SuspendedVmState {
+            frames: vec![frame],
+            current_frame_idx: Some(0),
+            handler_stack: vec![handler],
+            step_count: 0,
+        };
+
+        let mut observed = Vec::new();
+        suspended.visit_execution_values(&mut |value| {
+            if let Some(value) = value.as_int() {
+                observed.push(value);
+            }
+        });
+        observed.sort_unstable();
+        assert_eq!(observed, vec![21, 22, 23, 24]);
+    }
+}
