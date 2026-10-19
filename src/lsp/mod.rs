@@ -3928,6 +3928,33 @@ mod lsp_tests {
     }
 
     #[test]
+    fn test_deprecated_catch_warning_is_published_to_lsp() {
+        let source = "fn main() = catch Ok(1) 0";
+        let diagnostics = NulangLanguageServer::compute_diagnostics(source).diagnostics;
+        let warning = diagnostics
+            .iter()
+            .find(|d| matches!(&d.code, Some(NumberOrString::String(code)) if code == "W0101"))
+            .expect("the existing parser warning must reach the language server");
+        assert_eq!(warning.severity, Some(DiagnosticSeverity::WARNING));
+        assert!(warning.message.contains("deprecated `catch`"));
+        assert_eq!(warning.range.start, Position::new(0, 12));
+    }
+
+    #[test]
+    fn test_warning_span_is_utf16_accurate_after_non_bmp_text() {
+        let source = "let symbol = \"😀\"; catch Ok(1) 0";
+        let start = source.find("catch").unwrap();
+        let warning = crate::types::NuWarning::deprecated_catch(
+            crate::types::Span::new(start as u32, (start + 5) as u32),
+        );
+        let diagnostic = warning_to_lsp_diagnostic(&warning, source);
+        let utf16_col = source[..start].encode_utf16().count() as u32;
+        assert_eq!(diagnostic.range.start, Position::new(0, utf16_col));
+        assert_eq!(diagnostic.range.end, Position::new(0, utf16_col + 5));
+        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
+    }
+
+    #[test]
     fn test_diagnostics_frontend_returns_parsed_ast() {
         let source = "fn main() -> Int { 42 }";
         let result = NulangLanguageServer::compute_diagnostics(source);
