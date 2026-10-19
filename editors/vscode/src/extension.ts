@@ -5,24 +5,28 @@ import { LanguageClient, LanguageClientOptions, ServerOptions } from 'vscode-lan
 
 let client: LanguageClient | undefined;
 
-/**
- * Respect VS Code configuration precedence for the active file. An explicit
- * workspace-folder setting overrides workspace/global settings; NULANG_PATH
- * remains the fallback when nothing was explicitly configured.
- */
+/** Choose an explicitly configured binary before consulting the environment. */
+export function selectNulangBinary(
+  folderValue?: string, workspaceValue?: string, globalValue?: string, envValue?: string
+): string {
+  for (const value of [folderValue, workspaceValue, globalValue, envValue]) {
+    if (value?.trim()) {
+      return value.trim();
+    }
+  }
+  return 'nulang';
+}
+
+/** VS Code settings are scoped to the active source file. */
 function nulangBinary(uri?: vscode.Uri): string {
   const config = vscode.workspace.getConfiguration('nulang', uri);
   const inspected = config.inspect<string>('path');
-  const explicit =
-    inspected?.workspaceFolderValue ?? inspected?.workspaceValue ?? inspected?.globalValue;
-  if (explicit && explicit.trim() !== '') {
-    return explicit.trim();
-  }
-  const envPath = process.env.NULANG_PATH;
-  if (envPath && envPath.trim() !== '') {
-    return envPath.trim();
-  }
-  return 'nulang';
+  return selectNulangBinary(
+    inspected?.workspaceFolderValue,
+    inspected?.workspaceValue,
+    inspected?.globalValue,
+    process.env.NULANG_PATH
+  );
 }
 
 /** Prefer the nearest Nulang.toml; standalone files run from their own folder. */
