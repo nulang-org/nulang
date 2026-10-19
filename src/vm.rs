@@ -8982,8 +8982,6 @@ mod vm_tests {
     }
 }
 
-
-
 /// Visit values retained by live frames and algebraic-effect snapshots.
 ///
 /// This is deliberately a *value* visitor rather than a collector root set:
