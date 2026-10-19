@@ -2,7 +2,9 @@
 //!
 //! Parses a `.nula` file and pretty-prints it with canonical formatting.
 
-use crate::ast::{BinOp, Decl, Expr, Literal, Pattern};
+use crate::ast::{BinOp, Decl, Expr, Literal, Pattern, StateModel};
+use crate::lexer::{Token, TokenKind};
+use crate::types::Capability;
 use crate::authority::AuthorityGrant;
 use crate::types::Type;
 use std::path::Path;
@@ -15,6 +17,9 @@ use crate::types::{NuError, NuResult, Span};
 pub fn format_source(source: &str) -> Result<String, String> {
     let mut lexer = crate::lexer::Lexer::new(source);
     let tokens = lexer.lex().map_err(|e| e.to_string())?;
+    if contains_comments_not_represented_by_ast(source, &tokens) {
+        return Err("cannot safely format source comments yet; file was not modified".to_string());
+    }
     let mut parser = crate::parser::Parser::new(tokens);
     let ast = parser.parse_module().map_err(|e| e.to_string())?;
 
@@ -29,12 +34,38 @@ pub fn format_source(source: &str) -> Result<String, String> {
         fmt_decl(&mut out, decl, 0, &mut had_unhandled);
     }
     if had_unhandled {
-        return Err("file contains constructs not yet supported by the formatter (e.g. workflow, agent, let-binding, class, impl). The file was not modified.".to_string());
+        return Err("file contains syntax or metadata the formatter cannot safely preserve; file was not modified".to_string());
     }
     if !out.ends_with('\n') {
         out.push('\n');
     }
     Ok(out)
+}
+
+/// Whether the lexer omitted comments between tokens. A string containing `//`
+/// is a single token, so its contents are never mistaken for a comment.
+/// Doc comments are lexed explicitly but are also not printed by the formatter.
+fn contains_comments_not_represented_by_ast(source: &str, tokens: &[Token]) -> bool {
+    let mut previous_end = 0_usize;
+    for token in tokens {
+        if matches!(&token.kind, TokenKind::DocComment(_)) {
+            return true;
+        }
+        let start = token.span.start as usize;
+        let end = token.span.end as usize;
+        if start > previous_end {
+            let Some(gap) = source.get(previous_end..start) else {
+                return true;
+            };
+            if gap.contains("//") || gap.contains("/*") {
+                return true;
+            }
+        }
+        previous_end = previous_end.max(end);
+    }
+    source
+        .get(previous_end..)
+        .is_none_or(|gap| gap.contains("//") || gap.contains("/*"))
 }
 
 /// Recursively format all `.nula` files under `dir`.
@@ -104,22 +135,53 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
     match decl {
         Decl::Function {
             name,
+            type_params,
+            type_param_constraints,
             params,
+            default_values,
+            using_params,
             ret_type,
-            body,
+            error_type,
             effect,
+            cap,
+            requires,
+            ensures,
+            annotations,
+            public,
+            body,
             ..
         } => {
-            out.push_str(&format!("{}fn {}(", sp, name));
+            // Never emit only part of a declaration. These fields affect
+            // dispatch, contracts, visibility, effects or authority.
+            if !type_param_constraints.is_empty()
+                || !using_params.is_empty()
+                || error_type.is_some()
+                || cap.is_some()
+                || !requires.is_empty()
+                || !ensures.is_empty()
+                || !annotations.is_empty()
+                || *public
+                || params.iter().any(|p| p.cap.is_some())
+            {
+                *had_unhandled = true;
+                return;
+            }
+            out.push_str(&format!("{}fn {}", sp, name));
+            if !type_params.is_empty() {
+                out.push_str(&format!("[{}]", type_params.join(", ")));
+            }
+            out.push('(');
             for (i, p) in params.iter().enumerate() {
-                let pn = &p.name;
-                let pty = &p.ty;
                 if i > 0 {
                     out.push_str(", ");
                 }
-                out.push_str(pn);
-                if let Some(t) = pty {
+                out.push_str(&p.name);
+                if let Some(t) = &p.ty {
                     out.push_str(&format!(": {}", fmt_type(t)));
+                }
+                if let Some(Some(default)) = default_values.get(i) {
+                    out.push_str(" = ");
+                    fmt_expr(out, default, indent, had_unhandled);
                 }
             }
             out.push(')');
@@ -169,10 +231,47 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
         }
         Decl::Actor {
             name,
+            type_params,
+            persistent,
             behaviors,
             state_fields,
+            init,
+            backend,
+            initializer,
+            version,
+            events,
+            apply_handlers,
+            migrations,
+            is_organization,
+            virtual_,
+            key_params,
+            implements,
             ..
         } => {
+            if !type_params.is_empty()
+                || *persistent
+                || !init.is_empty()
+                || backend.is_some()
+                || initializer.is_some()
+                || *version != 1
+                || !events.is_empty()
+                || !apply_handlers.is_empty()
+                || !migrations.is_empty()
+                || *is_organization
+                || *virtual_
+                || !key_params.is_empty()
+                || implements.is_some()
+                || state_fields.iter().any(|(_, model, _, _)| *model != StateModel::Local)
+                || behaviors.iter().any(|b| {
+                    b.effect.is_some()
+                        || b.cap != Capability::Ref
+                        || b.ret_type.is_some()
+                        || b.params.iter().any(|p| p.cap.is_some())
+                })
+            {
+                *had_unhandled = true;
+                return;
+            }
             out.push_str(&format!("{}actor {} {{\n", sp, name));
             for (fnm, _, fty, fdef) in state_fields {
                 out.push_str(&format!("{}    state {}: {}", sp, fnm, fmt_type(fty)));
