@@ -16,7 +16,7 @@ python3 scripts/cpu_counter_profile.py --output target/cpu-profile-jit-1 --repea
 python3 -m unittest discover -s scripts/tests -p 'test_cpu_counter_profile.py'
 ```
 
-The profiler writes `manifest.json` with repo HEAD, CPU model, kernel, process affinity, perf version, command, run exit codes, and available counters. Raw perf reports, stdout, and stderr are saved per run. Output directories must not exist already. A missing `cycles` or `instructions` counter fails closed and preserves captured evidence; optional unavailable counters appear as `null`.
+The profiler writes `manifest.json` with repo HEAD, executable SHA-256 when resolvable, CPU model, kernel, process affinity, perf version, command, run exit codes, and available counters. Raw perf reports, stdout, and stderr are saved per run. Output directories must not exist already. A missing `cycles` or `instructions` counter fails closed and preserves captured evidence; optional unavailable counters appear as `null`.
 
 Counter totals cover the **whole benchmark process**, including its initialization and potentially more than one benchmark case. For instruction-specific conclusions, use an isolated executable/workload and correlate with a disassembly or profiler sample. Branch and cache event counts are hardware-specific; raw totals must be normalized to equal work. The profiler intentionally avoids automatic CI gates and publication.
 
