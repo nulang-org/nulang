@@ -5533,6 +5533,49 @@ mod tests {
     }
 
     #[test]
+    fn test_given_annotation_rejects_mismatched_initializer() {
+        // Contextual values are ordinary typed values, not an escape hatch
+        // around the annotation checks performed for top-level let bindings.
+        let error = check_src("given retries: Int = \"not an int\"")
+            .expect_err("given must reject an initializer of the wrong type");
+        let message = error.to_string();
+        assert!(message.contains("Int") && message.contains("String"), "{message}");
+
+        assert!(
+            check_src("given enabled: Bool = 42").is_err(),
+            "given must check primitive annotations independently of names"
+        );
+    }
+
+    #[test]
+    fn test_given_mismatch_does_not_register_contextual_binding() {
+        let mut tc = TypeChecker::new();
+        let declaration = Decl::Given {
+            name: "config".to_string(),
+            ty: Some(Type::int()),
+            value: string_lit("invalid"),
+            span: sp(),
+        };
+        assert!(tc.infer_decl(&TypeContext::new(), &declaration).is_err());
+        assert!(
+            !tc.given_bindings.contains_key("config"),
+            "a rejected given must not leak into contextual resolution"
+        );
+    }
+
+    #[test]
+    fn test_given_annotation_accepts_valid_and_inferred_initializers() {
+        assert!(
+            check_src("given retries: Int = 3").is_ok(),
+            "a compatible contextual annotation must be accepted"
+        );
+        assert!(
+            check_src("given enabled = true").is_ok(),
+            "unannotated given values must retain type inference"
+        );
+    }
+
+    #[test]
     fn test_apply_subst_to_ctx_updates_bindings() {
         let v = TypeVar(9001);
         let ctx = ctx_with("x", Type::Var(v));
