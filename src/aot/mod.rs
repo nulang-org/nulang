@@ -1230,9 +1230,7 @@ impl crate::vm::ActorVmCallbacks for AotActorCallbacks {
         unsafe {
             let header = &*crate::runtime::heap::ActorHeap::header_of(ptr);
             if header.type_tag == HeapTypeTag::Array {
-                let payload = header
-                    .size
-                    .saturating_sub(crate::runtime::heap::ActorHeap::HEADER_SIZE);
+                let payload = header.padded_payload_size();
                 Some(payload / std::mem::size_of::<crate::vm::Value>())
             } else {
                 None
@@ -1380,9 +1378,7 @@ impl crate::vm::ActorVmCallbacks for AotRuntimeCallbacks {
             let _actor = (*self.runtime).actors.get(&self.actor_id)?;
             let header = &*crate::runtime::heap::ActorHeap::header_of(ptr);
             if header.type_tag == HeapTypeTag::Array {
-                let payload_size = header
-                    .size
-                    .saturating_sub(crate::runtime::heap::ActorHeap::HEADER_SIZE);
+                let payload_size = header.padded_payload_size();
                 Some(payload_size / std::mem::size_of::<crate::vm::Value>())
             } else {
                 None
@@ -1630,9 +1626,7 @@ impl crate::vm::ActorVmCallbacks for AotTopLevelCallbacks {
             let _rt = &*self.runtime;
             let header = &*crate::runtime::heap::ActorHeap::header_of(ptr);
             if header.type_tag == HeapTypeTag::Array {
-                let payload_size = header
-                    .size
-                    .saturating_sub(crate::runtime::heap::ActorHeap::HEADER_SIZE);
+                let payload_size = header.padded_payload_size();
                 Some(payload_size / std::mem::size_of::<crate::vm::Value>())
             } else {
                 None
