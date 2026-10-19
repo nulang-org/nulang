@@ -897,6 +897,111 @@ fn test_restarted_child_restores_behavior_and_state() {
     assert_eq!(count, Some(Value::int(5)));
 }
 
+
+\
+/// Fault-injecting store: the dead actor's original snapshot is readable, but
+/// an attempted re-key to a replacement actor ID fails. The runtime must never
+/// clear the only checkpoint or publish a replacement without durable state.
+struct RejectSupervisorSnapshotRekeyStore {
+    inner: MemoryStore,
+    original_id: u64,
+}
+
+impl PersistenceStore for RejectSupervisorSnapshotRekeyStore {
+    fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> std::io::Result<()> {
+        if snapshot.actor_id != self.original_id {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected snapshot re-key failure",
+            ));
+        }
+        self.inner.save_snapshot(snapshot)
+    }
+
+    fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+        self.inner.load_snapshot(actor_id)
+    }
+
+    fn append_journal(&mut self, actor_id: u64, entry: JournalEntry) -> std::io::Result<()> {
+        self.inner.append_journal(actor_id, entry)
+    }
+
+    fn read_journal(&self, actor_id: u64) -> Vec<JournalEntry> {
+        self.inner.read_journal(actor_id)
+    }
+
+    fn append_workflow_event(
+        &mut self,
+        actor_id: u64,
+        event: WorkflowEvent,
+    ) -> std::io::Result<()> {
+        self.inner.append_workflow_event(actor_id, event)
+    }
+
+    fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
+        self.inner.read_workflow_events(actor_id)
+    }
+
+    fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> std::io::Result<()> {
+        self.inner.append_event(actor_id, entry)
+    }
+
+    fn read_events(&self, actor_id: u64) -> Vec<EventEntry> {
+        self.inner.read_events(actor_id)
+    }
+
+    fn latest_sequence(&self, actor_id: u64) -> u64 {
+        self.inner.latest_sequence(actor_id)
+    }
+
+    fn clear(&mut self, actor_id: u64) -> std::io::Result<()> {
+        self.inner.clear(actor_id)
+    }
+}
+
+#[test]
+fn test_supervisor_rekey_write_failure_retains_checkpoint_and_aborts_restart() {
+    let mut rt = Runtime::new();
+    let supervisor_id = rt.create_supervisor("rekey_sup", RestartStrategy::OneForOne);
+    let mut models = HashMap::new();
+    models.insert("count".to_string(), StateModel::Durable);
+    let child_id = rt.spawn_persistent_actor(
+        Box::new(|| vec![("count".to_string(), Value::int(0))]),
+        models,
+    );
+
+    let snapshot = ActorSnapshot {
+        actor_id: child_id,
+        sequence: 7,
+        state: [("count".to_string(), PersistedValue::Int(42))]
+            .into_iter()
+            .collect(),
+        ..ActorSnapshot::default()
+    };
+    let mut inner = MemoryStore::new();
+    inner.save_snapshot(snapshot).expect("seed checkpoint");
+    rt.persistence = Box::new(RejectSupervisorSnapshotRekeyStore {
+        inner,
+        original_id: child_id,
+    });
+
+    rt.supervise_child(
+        supervisor_id,
+        ChildSpec::new("counter", RestartPolicy::Permanent),
+        child_id,
+    );
+    rt.exit_actor(child_id, ExitReason::Error("simulated crash".to_string()));
+
+    let preserved = rt.persistence.load_snapshot(child_id)
+        .expect("failed re-key must not delete the last durable checkpoint");
+    assert_eq!(preserved.sequence, 7);
+    assert_eq!(preserved.state.get("count"), Some(&PersistedValue::Int(42)));
+    assert!(
+        !rt.actors.values().any(|actor| actor.parent == Some(supervisor_id)),
+        "a replacement must not become runnable when its checkpoint failed"
+    );
+}
+
 /// Supervisor restart of a persistent child must hydrate state from the
 /// persistence store, not from the captured RestartTemplate (which holds
 /// the *original* state from registration time).
