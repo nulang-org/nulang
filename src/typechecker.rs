@@ -3563,7 +3563,7 @@ impl TypeChecker {
                     msg: "discarded Result value: a possible Error is not handled".to_string(),
                     span: expr.span(),
                     help: Some(
-                        "Handle it with match or propagate it with ?, or bind it explicitly                          if ignoring the result is intentional"
+                        "Handle the Result with match, propagate it with ?, or bind it explicitly if discarding is intentional"
                             .to_string(),
                     ),
                 });
