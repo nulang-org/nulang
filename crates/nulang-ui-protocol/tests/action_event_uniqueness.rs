@@ -20,15 +20,12 @@ fn binding(event: &str, action_id: &str) -> ActionBinding {
 #[test]
 fn duplicate_event_on_one_node_is_rejected() {
     let mut button = UiNode::new("submit", "button");
-    button.actions = vec![
-        binding("activate", "save"),
-        binding("activate", "delete"),
-    ];
+    button.actions = vec![binding("activate", "save"), binding("activate", "delete")];
     let document = UiDocument::new("form", Revision(1), "submit", vec![button]);
 
-    let error = document.validate().expect_err(
-        "two handlers for one node event must fail before entering any renderer",
-    );
+    let error = document
+        .validate()
+        .expect_err("two handlers for one node event must fail before entering any renderer");
     assert!(
         error.to_string().contains("duplicate action event"),
         "unexpected validation error: {error}"
@@ -48,10 +45,7 @@ fn patch_cannot_install_ambiguous_actions_or_mutate_the_document() {
         Revision(2),
         vec![PatchOperation::ReplaceActions {
             node_id: NodeId::from("submit"),
-            actions: vec![
-                binding("activate", "save"),
-                binding("activate", "delete"),
-            ],
+            actions: vec![binding("activate", "save"), binding("activate", "delete")],
         }],
     );
 
@@ -65,19 +59,11 @@ fn different_events_and_different_nodes_are_independent() {
     root.children = vec![NodeId::from("save"), NodeId::from("cancel")];
 
     let mut save = UiNode::new("save", "button");
-    save.actions = vec![
-        binding("activate", "save"),
-        binding("focus", "record_focus"),
-    ];
+    save.actions = vec![binding("activate", "save"), binding("focus", "record_focus")];
 
     let mut cancel = UiNode::new("cancel", "button");
     cancel.actions.push(binding("activate", "cancel"));
 
-    let document = UiDocument::new(
-        "form",
-        Revision(1),
-        "root",
-        vec![root, save, cancel],
-    );
+    let document = UiDocument::new("form", Revision(1), "root", vec![root, save, cancel]);
     document.validate().unwrap();
 }
