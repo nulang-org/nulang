@@ -93,8 +93,8 @@ Preparing package...
   Resolving dependencies...
 running 3 tests
 test tests/test_math.nula ... ok
-test test_greet_world ... ok
-test test_greet_empty ... ok
+test tests/test_strings.nula::test_greet_world ... ok
+test tests/test_strings.nula::test_greet_empty ... ok
 
 test result: 3 passed; 0 failed
 ```
@@ -103,7 +103,7 @@ On failure the runner prints the test name, the error, and a non-zero exit
 code:
 
 ```text
-test test_something_is_wrong ... FAILED
+test tests/test_strings.nula::test_something_is_wrong ... FAILED
 Error: Runtime error at 1:1: assertion failed: expected 5, got 4
 
 test result: 3 passed; 1 failed
@@ -157,18 +157,21 @@ is testable from the start.
   }
   ```
 
-:::caution
-Discovery is a simple textual scan for `fn test_`. A comment containing
-that literal (e.g. `` `fn test_*` ``) is picked up as a test name too, and
-the resulting wrapper fails to compile. Avoid writing `fn test_` in test
-file comments.
-:::
+Discovery uses the language parser and only collects top-level function
+declarations, so comments, string literals, and nested lambdas do not register
+as test cases. Cases use qualified names like
+`tests/test_strings.nula::test_greet_world` in both human and JSON output.
+Function-level filters are supported:
+
+```bash
+nulang nula test --filter test_greet_world
+```
 
 ### Flags
 
 | Flag | Effect |
 |------|--------|
-| `--filter <substr>` | Run only test files whose file name contains `<substr>` |
+| `--filter <substr>` | Match filenames, `test_*` function names, or qualified test names |
 | `--verbose`, `-v` | List discovered test functions per file (`--- file ---` / `discovered: ...`) |
 | `--watch`, `-w` | Re-run tests when `.nula` files under `src/` or `tests/` change (mtime polling) |
 | `--json` | Emit a machine-readable JSON report (test name, status, duration, diagnostics) instead of text lines |
