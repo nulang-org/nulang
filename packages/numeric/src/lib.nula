@@ -1,0 +1,101 @@
+// Experimental numerical package for Nulang-native Float arrays.
+//
+// This is a logical row-major Matrix over Nulang's existing [Float] values,
+// not a new packed tensor ABI or a BLAS/SIMD accelerated buffer. Each public
+// matrix operation validates the shape because Matrix is a structural record.
+
+/// Row-major Float matrix. Public records can be constructed directly,
+/// so consumers should use from_flat; all operations validate shape.
+pub type Matrix = {
+    rows: Int,
+    cols: Int,
+    data: [Float],
+}
+
+/// Check that rows/cols are non-negative and describe exactly the data length.
+/// Divide before multiplying to prevent integer overflow on invalid shapes.
+pub fn valid_shape(data: [Float], rows: Int, cols: Int) -> Bool {
+    if rows < 0 || cols < 0 then { false }
+    else {
+        let n = perform Array.length(data);
+        if rows == 0 || cols == 0 then { n == 0 }
+        else if rows > n / cols then { false }
+        else { rows * cols == n }
+    }
+}
+
+/// Construct a matrix only when the dimensions match its flattened values.
+/// Zero-sized dimensions are supported when data is empty.
+pub fn from_flat(data: [Float], rows: Int, cols: Int) -> Option[Matrix] {
+    if valid_shape(data, rows, cols) then {
+        Some({rows: rows, cols: cols, data: data})
+    } else {
+        None
+    }
+}
+
+/// Reduce a Float array. Accumulation is left-to-right, not reassociated:
+/// floating-point results follow this order rather than a parallel tree.
+pub fn sum_values(values: [Float]) -> Float {
+    var result = 0.0;
+    for x in values {
+        result = result + x
+    };
+    result
+}
+
+/// Compute a dot product, returning None for mismatched vector lengths.
+/// Empty vectors have a well-defined zero dot product.
+pub fn dot(a: [Float], b: [Float]) -> Option[Float] {
+    let n = perform Array.length(a);
+    if n != perform Array.length(b) then { None }
+    else {
+        var total = 0.0;
+        var i = 0;
+        while i < n {
+            total = total + a[i] * b[i];
+            i = i + 1
+        };
+        Some(total)
+    }
+}
+
+/// Return the row-major element, or None for invalid shape or coordinates.
+pub fn at(m: Matrix, row: Int, col: Int) -> Option[Float] {
+    if !valid_shape(m.data, m.rows, m.cols) ||
+       row < 0 || col < 0 || row >= m.rows || col >= m.cols then {
+        None
+    } else {
+        Some(m.data[row * m.cols + col])
+    }
+}
+
+/// Reference O(rows * inner * cols) matrix multiplication.
+/// This allocates using Array.push and is a correctness baseline, not a fast
+/// numerical kernel. Shape errors are represented as None, never truncated.
+pub fn matmul(a: Matrix, b: Matrix) -> Option[Matrix] {
+    if !valid_shape(a.data, a.rows, a.cols) ||
+       !valid_shape(b.data, b.rows, b.cols) ||
+       a.cols != b.rows then {
+        None
+    } else {
+        var result = [];
+        var row = 0;
+        while row < a.rows {
+            var col = 0;
+            while col < b.cols {
+                var total = 0.0;
+                var inner = 0;
+                while inner < a.cols {
+                    total = total + a.data[row * a.cols + inner] *
+                                    b.data[inner * b.cols + col];
+                    inner = inner + 1
+                };
+                result = perform Array.push(result, total);
+                col = col + 1
+            };
+            row = row + 1
+        };
+        Some({rows: a.rows, cols: b.cols, data: result})
+    }
+}
