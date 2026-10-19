@@ -21,6 +21,18 @@ Language support for [Nulang](https://github.com/nulang-org/nulang) in Visual St
   - **Type Check** — type/effect/capability check only (`nulang --check`)
   - **Restart Language Server** — restart the LSP client
 
+## Running and checking files
+
+The **Compile**, **Run**, and **Type Check** commands start managed VS Code
+process tasks rather than interpolating filenames into shell commands.
+This preserves filenames and configured executable paths containing spaces
+or shell metacharacters. Tasks run from the nearest parent directory with a
+`Nulang.toml` manifest; standalone files run from their own directory.
+
+Save modified source files before running a command: these tasks execute the
+file on disk. They use the same CLI options as the corresponding terminal
+commands, with output shown in the VS Code task terminal.
+
 ## Requirements
 
 The `nulang` binary must be on your `PATH`, or point the `NULANG_PATH`
