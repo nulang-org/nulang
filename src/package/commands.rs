@@ -885,12 +885,16 @@ fn prepare_package_with_lock_mode(locked: bool) -> NuResult<PathBuf> {
             if !package.source.starts_with("path+") {
                 continue;
             }
-            let previous = existing.package_identity(
-                &package.name, &package.version, &package.source
-            ).map(|entry| entry.parsed_source_id()).transpose()?.flatten();
-            let current = canonical.package_identity(
-                &package.name, &package.version, &package.source
-            ).map(|entry| entry.parsed_source_id()).transpose()?.flatten();
+            let previous = existing
+                .package_identity(&package.name, &package.version, &package.source)
+                .map(|entry| entry.parsed_source_id())
+                .transpose()?
+                .flatten();
+            let current = canonical
+                .package_identity(&package.name, &package.version, &package.source)
+                .map(|entry| entry.parsed_source_id())
+                .transpose()?
+                .flatten();
             if previous.is_none() || previous != current {
                 return Err(NuError::PackageError {
                     msg: format!(
@@ -2683,7 +2687,11 @@ mod tests {
         let _guard = ChangeDir::new(&dir);
         scaffold_package(&dir, "locked-app", "default").unwrap();
 
-        let args = vec!["build".to_string(), "--locked".to_string(), "--json".to_string()];
+        let args = vec![
+            "build".to_string(),
+            "--locked".to_string(),
+            "--json".to_string(),
+        ];
         let err = run(&args).expect_err("missing lock must fail before compiler invocation");
         assert!(err.to_string().contains("requires an existing Nulang.lock"));
 
@@ -2707,7 +2715,11 @@ mod tests {
 
     #[test]
     fn test_build_rejects_unknown_flag_even_with_json_enabled() {
-        let args = vec!["build".to_string(), "--json".to_string(), "--surprise".to_string()];
+        let args = vec![
+            "build".to_string(),
+            "--json".to_string(),
+            "--surprise".to_string(),
+        ];
         let err = run(&args).expect_err("unknown flags must not be bypassed by --json");
         assert!(err.to_string().contains("unknown flag '--surprise'"));
     }
@@ -2729,7 +2741,8 @@ mod tests {
 
     #[test]
     fn test_locked_build_preserves_existing_lockfile_bytes() {
-        let dir = std::env::temp_dir().join(format!("nula_locked_unchanged_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("nula_locked_unchanged_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _guard = ChangeDir::new(&dir);
@@ -2759,10 +2772,13 @@ mod tests {
 
         let _guard = ChangeDir::new(&app);
         let mut manifest = Manifest::load(&app).unwrap();
-        manifest.dependencies.insert("util".to_string(), Dependency::Detailed(DependencyDetail {
-            path: Some("../util".to_string()),
-            ..Default::default()
-        }));
+        manifest.dependencies.insert(
+            "util".to_string(),
+            Dependency::Detailed(DependencyDetail {
+                path: Some("../util".to_string()),
+                ..Default::default()
+            }),
+        );
         manifest.save(&app).unwrap();
 
         prepare_package().unwrap();
