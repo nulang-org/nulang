@@ -3226,6 +3226,25 @@ mod tests {
     }
 
     #[test]
+    fn test_check_effects_rejects_open_callee_from_pure_function() {
+        // A callee with an unresolved effect tail cannot be assumed pure.
+        // This checks the actual call-site gate, not only row comparison.
+        let mut checker = EffectChecker::new();
+        checker.fn_rows.insert(
+            "maybe_effectful".to_string(),
+            EffectRow::Open(vec![], Region::fresh()),
+        );
+        let ctx = EffectContext::with_allowed(EffectRow::empty());
+        let expr = Expr::App {
+            func: Box::new(Expr::Var("maybe_effectful".to_string(), s())),
+            args: vec![],
+            span: s(),
+        };
+        let result = checker.check_effects(&ctx, &expr, &ctx.allowed_effects);
+        assert!(result.is_err(), "unresolved callee effects cannot satisfy ! {{}}");
+    }
+
+    #[test]
     fn test_check_effects_passes() {
         let mut checker = EffectChecker::new();
         let ctx = EffectContext::with_allowed(EffectRow::Closed(vec![Effect::IO, Effect::FS]));
