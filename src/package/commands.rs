@@ -2662,6 +2662,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_build_locked_flag_dispatches_before_compilation() {
+        let dir = std::env::temp_dir().join(format!("nula_locked_cli_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = ChangeDir::new(&dir);
+        scaffold_package(&dir, "locked-app", "default").unwrap();
+
+        let args = vec!["build".to_string(), "--locked".to_string(), "--json".to_string()];
+        let err = run(&args).expect_err("missing lock must fail before compiler invocation");
+        assert!(err.to_string().contains("requires an existing Nulang.lock"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_build_rejects_unknown_flag_even_with_json_enabled() {
+        let args = vec!["build".to_string(), "--json".to_string(), "--surprise".to_string()];
+        let err = run(&args).expect_err("unknown flags must not be bypassed by --json");
+        assert!(err.to_string().contains("unknown flag '--surprise'"));
+    }
+
+    #[test]
     fn test_locked_build_requires_existing_lockfile_without_creating_it() {
         let dir = std::env::temp_dir().join(format!("nula_locked_missing_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
