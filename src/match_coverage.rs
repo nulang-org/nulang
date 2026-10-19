@@ -17,8 +17,6 @@ fn finite_domain(ty: &Type) -> Option<FiniteDomain<'_>> {
     match ty {
         Type::Primitive(PrimitiveType::Bool) => Some(FiniteDomain::Bool),
         Type::Variant(variants) if !variants.is_empty() => Some(FiniteDomain::Variant(variants)),
-        Type::Nominal { underlying, .. } => finite_domain(underlying),
-        Type::Reference { inner, .. } => finite_domain(inner),
         _ => None,
     }
 }
