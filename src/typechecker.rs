@@ -3464,7 +3464,10 @@ impl TypeChecker {
             // Every constructor was covered by earlier unguarded arms.
             if variants.iter().all(|(name, _)| covered.contains(name)) {
                 return Err(NuError::type_error(
-                    format!("unreachable match arm {}: previous arms cover every variant", index + 1),
+                    format!(
+                        "unreachable match arm {}: previous arms cover every variant",
+                        index + 1
+                    ),
                     span,
                 ));
             }
