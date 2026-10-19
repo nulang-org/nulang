@@ -8711,7 +8711,6 @@ fn confirmed_node_removal_forgets_crdt_receiver_knowledge() {
     );
 }
 
-
 /// A pending release against an exited actor's retired heap must never
 /// silently wrap its missing foreign-reference credit in release builds.
 #[test]
