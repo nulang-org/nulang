@@ -6378,6 +6378,60 @@ mod vm_tests {
         assert_eq!(vm.frames[0].pc, 1, "ReadyValue must not rewind the PC");
     }
 
+    #[test]
+    fn test_assert_eq_failure_includes_compiler_debug_source_line() {
+        let mut module = CodeModule::new("assert_line");
+        let effect_idx = module.add_string_constant("Test.assert_eq");
+        module.line_table.push((0, 12));
+        let mut vm = VM::new_without_jit();
+        vm.load_module(module);
+        let mut frame = Frame::new(None, 0);
+        frame.pc = 1; // step() advances beyond Perform before step_perform().
+        frame.regs[0] = Value::int(41);
+        frame.regs[1] = Value::int(42);
+        vm.frames.push(frame);
+        vm.current_frame_idx = Some(0);
+
+        let instr = Instruction::new3(
+            OpCode::Perform,
+            ((effect_idx >> 8) & 0xff) as u8,
+            (effect_idx & 0xff) as u8,
+            2,
+        );
+        let error = vm.step_perform(instr, 0, 0).expect_err("assert must fail");
+        match error {
+            NuError::RuntimeError { msg, .. } => {
+                assert!(msg.contains("expected 42, got 41"), "{msg}");
+                assert!(msg.contains("source line 12"), "{msg}");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_assert_without_line_table_does_not_invent_source_location() {
+        let mut module = CodeModule::new("assert_no_line");
+        let effect_idx = module.add_string_constant("Test.assert_true");
+        let mut vm = VM::new_without_jit();
+        vm.load_module(module);
+        let mut frame = Frame::new(None, 0);
+        frame.pc = 1;
+        frame.regs[0] = Value::bool(false);
+        vm.frames.push(frame);
+        vm.current_frame_idx = Some(0);
+        let instr = Instruction::new3(
+            OpCode::Perform,
+            ((effect_idx >> 8) & 0xff) as u8,
+            (effect_idx & 0xff) as u8,
+            2,
+        );
+        let error = vm.step_perform(instr, 0, 0).expect_err("assert must fail");
+        match error {
+            NuError::RuntimeError { msg, .. } => assert_eq!(msg, "assertion failed"),
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
     /// A NULL C string return (nil from cstr_to_value) must pass through
     /// instead of erroring on the missing pointer.
     #[test]
