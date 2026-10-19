@@ -102,9 +102,17 @@ pub fn run(args: &[String]) -> NuResult<()> {
                 match args[i].as_str() {
                     "--filter" => {
                         i += 1;
-                        if i < args.len() {
-                            filter = Some(args[i].as_str());
+                        let value = args.get(i).ok_or_else(|| NuError::PackageError {
+                            msg: "--filter requires a value".to_string(),
+                            span: Span::default(),
+                        })?;
+                        if value.starts_with("--") {
+                            return Err(NuError::PackageError {
+                                msg: "--filter requires a value".to_string(),
+                                span: Span::default(),
+                            });
                         }
+                        filter = Some(value.as_str());
                     }
                     "--verbose" | "-v" => verbose = true,
                     "--watch" | "-w" => watch = true,
@@ -1788,8 +1796,8 @@ fn cmd_test(filter: Option<&str>, verbose: bool, json: bool) -> NuResult<()> {
                 println!("--- {} ---", relative.display());
                 println!("  discovered: {}", test_fns.join(", "));
             }
-            // Strip fn main() for per-function wrappers.
-            let stripped = strip_main_function(&content);
+            // Rename the original main so the wrapper owns the entry point.
+            let stripped = rename_main_for_test(&content);
             for fn_name in &test_fns {
                 let display = format!("{}::{}", relative.display(), fn_name);
                 if !filter.is_none_or(|needle| {
@@ -1967,7 +1975,7 @@ fn discover_test_functions(source: &str) -> Vec<String> {
 /// consume later functions when main had an expression body. Keeping the
 /// original body under an inert name avoids guessing where it ends. It is
 /// still typechecked, but never invoked by the generated test entry point.
-fn strip_main_function(source: &str) -> String {
+fn rename_main_for_test(source: &str) -> String {
     let tokens = match crate::lexer::Lexer::new(source).lex() {
         Ok(tokens) => tokens,
         Err(_) => return source.to_string(),
