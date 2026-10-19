@@ -629,6 +629,45 @@ fn canonicalize_json(value: &mut serde_json::Value) {
     }
 }
 
+/// Detect serialized actor references that still point at a retired
+/// incarnation. A history move must not silently strand self references.
+/// PersistedValue uses the tagged representation {"tag":"Actor","value":id};
+/// recurse because snapshots, messages, workflow records and events nest it.
+fn contains_actor_self_ref(value: &serde_json::Value, source_id: u64) -> bool {
+    match value {
+        serde_json::Value::Object(fields) => {
+            if fields.get("tag").and_then(serde_json::Value::as_str) == Some("Actor")
+                && fields.get("value").and_then(serde_json::Value::as_u64)
+                    == Some(source_id)
+            {
+                return true;
+            }
+            fields
+                .values()
+                .any(|value| contains_actor_self_ref(value, source_id))
+        }
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|value| contains_actor_self_ref(value, source_id)),
+        _ => false,
+    }
+}
+
+fn serialized_history_contains_self_ref<T: serde::Serialize>(
+    history: &T,
+    source_id: u64,
+) -> io::Result<bool> {
+    let value = serde_json::to_value(history)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(contains_actor_self_ref(&value, source_id))
+}
+
+fn json_history_contains_self_ref(json: &str, source_id: u64) -> io::Result<bool> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(contains_actor_self_ref(&value, source_id))
+}
+
 /// Persistence backend trait. Implementations may be in-memory or disk-backed.
 pub trait PersistenceStore: Send + Sync {
     /// Atomically commit one logical durable transition.
@@ -1120,6 +1159,32 @@ impl PersistenceStore for MemoryStore {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "actor-scoped CRDT or atomic transition history cannot be re-keyed",
+            ));
+        }
+
+        let has_embedded_self_ref = serialized_history_contains_self_ref(source, from)?
+            || self
+                .journals
+                .get(&from)
+                .is_some_and(|entries| {
+                    serialized_history_contains_self_ref(entries, from).unwrap_or(true)
+                })
+            || self
+                .workflow_events
+                .get(&from)
+                .is_some_and(|events| {
+                    serialized_history_contains_self_ref(events, from).unwrap_or(true)
+                })
+            || self
+                .events
+                .get(&from)
+                .is_some_and(|events| {
+                    serialized_history_contains_self_ref(events, from).unwrap_or(true)
+                });
+        if has_embedded_self_ref {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "legacy recovery history contains references to its old actor ID",
             ));
         }
 
@@ -2210,7 +2275,7 @@ impl PersistenceStore for LibsqlStore {
             {
                 let mut rows = tx
                     .query(
-                        "SELECT crdt_snapshot, crdt_field_map FROM snapshots WHERE actor_id = ?1",
+                        "SELECT crdt_snapshot, crdt_field_map, state FROM snapshots WHERE actor_id = ?1",
                         libsql::params![from as i64],
                     )
                     .await
@@ -2234,6 +2299,15 @@ impl PersistenceStore for LibsqlStore {
                     return Err(io::Error::new(
                         io::ErrorKind::Unsupported,
                         "CRDT state cannot be re-keyed without explicit identity migration",
+                    ));
+                }
+                let state_json: String = row
+                    .get(2)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                if json_history_contains_self_ref(&state_json, from)? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "actor snapshot still contains an old self reference",
                     ));
                 }
             }
@@ -2286,11 +2360,51 @@ impl PersistenceStore for LibsqlStore {
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                     let event: WorkflowEvent = serde_json::from_str(&json)
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    if json_history_contains_self_ref(&json, from)? {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "workflow history contains an old actor self reference",
+                        ));
+                    }
                     if event.activation_id().is_some() || event.replay_id().is_some() {
                         return Err(io::Error::new(
                             io::ErrorKind::Unsupported,
                             "workflow activation or replay identity cannot be re-keyed",
                         ));
+                    }
+                }
+            }
+
+            // Look for embedded self references in the remaining legacy
+            // journals. Checking inside the write transaction prevents a
+            // concurrent writer from inserting an unchecked record.
+            for (table, columns) in [
+                ("journal", &["payload"][..]),
+                ("events", &["args", "value"][..]),
+            ] {
+                let sql = format!(
+                    "SELECT {} FROM {table} WHERE actor_id = ?1",
+                    columns.join(", ")
+                );
+                let mut rows = tx
+                    .query(&sql, libsql::params![from as i64])
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                while let Some(row) = rows
+                    .next()
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+                {
+                    for idx in 0..columns.len() {
+                        let json: String = row.get(idx as i32).map_err(|e| {
+                            io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                        })?;
+                        if json_history_contains_self_ref(&json, from)? {
+                            return Err(io::Error::new(
+                                io::ErrorKind::Unsupported,
+                                "legacy journal contains an old actor self reference",
+                            ));
+                        }
                     }
                 }
             }
