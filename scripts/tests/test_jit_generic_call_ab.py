@@ -1,6 +1,7 @@
 import json
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -16,6 +17,32 @@ def record(workload, warm_ns, *, first_ns=110, interp_ns=220):
 
 
 class GenericCallAbTests(unittest.TestCase):
+    def test_select_affinity_pins_only_measured_binary(self):
+        self.assertEqual(ab.select_affinity("single", {7, 3, 9}), {3})
+        self.assertIsNone(ab.select_affinity("host", {3, 9}))
+        with self.assertRaisesRegex(ValueError, "empty"):
+            ab.select_affinity("single", set())
+
+    def test_find_compiler_artifact_from_cargo_json(self):
+        other = {"reason": "compiler-artifact", "target": {"name": "other"},
+                 "executable": "/tmp/other"}
+        wanted = {"reason": "compiler-artifact", "target": {"name": "nulang-jit-bench"},
+                  "executable": "/tmp/target/release/nulang-jit-bench"}
+        output = "\n".join([json.dumps(other), json.dumps(wanted), json.dumps({"reason": "build-finished"})])
+        self.assertEqual(ab.find_benchmark_executable(output), Path(wanted["executable"]))
+        with self.assertRaisesRegex(ValueError, "executable"):
+            ab.find_benchmark_executable(json.dumps(other))
+
+    def test_run_benchmark_executes_binary_directly(self):
+        payload = json.dumps(record(ab.CONCRETE, 100)) + "\n"
+        completed = mock.Mock(returncode=0, stdout=payload, stderr="")
+        with mock.patch.object(ab.subprocess, "run", return_value=completed) as execute:
+            result = ab.run_benchmark(ab.CONCRETE, Path("/tmp/nulang-jit-bench"), None)
+        self.assertEqual(result["warm_run_ns"], 100)
+        args = execute.call_args.args[0]
+        self.assertEqual(args[0], "/tmp/nulang-jit-bench")
+        self.assertNotIn("cargo", args)
+
     def test_counterbalanced_order_and_per_round_pairing(self):
         calls = []
 
