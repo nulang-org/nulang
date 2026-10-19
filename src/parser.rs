@@ -2578,7 +2578,38 @@ impl Parser {
                 self.current_span(),
             ));
         }
-        let items = Vec::new();
+        // Explicit selective import: import stdlib::math { abs, factorial }
+        // Unlike a full import, it does not inject unrelated names into scope.
+        let mut items = Vec::new();
+        if self.consume_if(&TokenKind::LBrace) {
+            self.skip_newlines();
+            if self.match_token(&TokenKind::RBrace) {
+                return Err(NuError::parse_error(
+                    "selective import must list at least one name".to_string(),
+                    self.current_span(),
+                ));
+            }
+            loop {
+                let item = self.expect_ident("imported name")?;
+                if items.contains(&item) {
+                    return Err(NuError::parse_error(
+                        format!("duplicate imported name '{item}'"),
+                        self.current_span(),
+                    ));
+                }
+                items.push(item);
+                self.skip_newlines();
+                if self.consume_if(&TokenKind::Comma) {
+                    self.skip_newlines();
+                    if self.match_token(&TokenKind::RBrace) {
+                        break; // trailing comma
+                    }
+                } else {
+                    break;
+                }
+            }
+            self.expect(TokenKind::RBrace)?;
+        }
         self.skip_newlines_semicolons();
         Ok(Decl::Import { path, items, span })
     }
