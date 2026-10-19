@@ -102,6 +102,21 @@ jobs:
       - name: Build
         run: cargo build --locked --all-targets
 
+      # Exercise the actual Nulang source-level stdlib and the exact-output
+      # conformance fixture; Rust-only tests cannot prove either contract.
+      - name: Literal text conformance (bytecode)
+        shell: bash
+        run: |
+          set -euo pipefail
+          target_dir="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+          nulang_bin="$target_dir/debug/nulang"
+          "$nulang_bin" src/stdlib/string_test.nula
+          actual="$("$nulang_bin" conformance/behavior/stdlib_16_literal_text.nula)"
+          if [[ "$actual" != "literal text ok" ]]; then
+            printf 'Unexpected literal-text conformance stdout: %q\\n' "$actual" >&2
+            exit 1
+          fi
+
       - name: Test
         # nextest isolates individual tests in their own processes and schedules
         # test binaries concurrently, reducing wall-clock time without changing
