@@ -1173,6 +1173,8 @@ impl TypeChecker {
 
     /// Type-check an entire module, returning the type of the last declaration.
     pub fn check_module(&mut self, module: &AstModule) -> NuResult<Type> {
+        // A reusable typechecker must not retain diagnostics from an earlier module.
+        self.warnings.clear();
         // Enrich statically known actor sends/asks with protocol constraints
         // before ordinary Algorithm-W inference. Dynamic actor references
         // remain permissive for compatibility; explicit ActorRef<P> values
