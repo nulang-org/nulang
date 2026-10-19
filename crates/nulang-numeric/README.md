@@ -30,6 +30,32 @@ The crate declares its own empty workspace and has no dependencies, so it
 does not alter the root `Cargo.lock` or core compiler build. A dedicated CI
 workflow checks it when these files change.
 
+## Paired native-Rust performance experiment
+
+Build and execute the opt-in benchmark on a single, otherwise idle host:
+
+```bash
+cargo run --release --manifest-path crates/nulang-numeric/Cargo.toml \
+  --example compare_views > numeric-views.csv
+```
+
+On Linux, optionally pin it to one logical core with `taskset -c 2`
+(adjust the CPU index for the host). The output is CSV with one row per
+mode, size, and round: `size,range_len,iterations,round,mode,elapsed_ns,checksum`.
+
+Each workload sums the same middle-half subrange of a numeric buffer. The
+`view` mode creates an owned read-only `Arc` view, whereas `copy` creates
+a fresh `Vec` for that subrange; both assert the same checksum. Three
+buffer sizes run in eight paired rounds with alternating order and warmup.
+Treat ratios as *within-host diagnostic measurements*, not universal
+speedups; collect allocation and CPU evidence separately.
+
+**Important:** This is not a Nulang source-level VM versus typed-buffer
+benchmark. It compares two Rust primitives and does not capture Nulang
+effect dispatch, compiler lowering, JIT, AOT, or WASM. Do not claim a Nulang
+performance gain until a Nulang-level implementation and equivalent
+same-runner A/B harness exist.
+
 ## Admission into Nulang
 
 Do not add Nulang syntax, VM values, or numeric sendability as part of this
