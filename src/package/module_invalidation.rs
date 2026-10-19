@@ -174,9 +174,7 @@ fn validate_graph(snapshot: &ModuleSnapshot) -> Result<(), String> {
         visited += 1;
         if let Some(dependents) = reverse.get(&name) {
             for dependent in dependents {
-                let degree = indegrees
-                    .get_mut(dependent)
-                    .expect("validated module");
+                let degree = indegrees.get_mut(dependent).expect("validated module");
                 *degree -= 1;
                 if *degree == 0 {
                     ready.insert(dependent.clone());
@@ -242,11 +240,7 @@ mod tests {
     fn import_edge_change_invalidates_module_and_its_dependents() {
         let before = fixture(b"compiler=1,target=wasm");
         let mut after = before.clone();
-        after.insert(
-            "api",
-            b"fn api() { core() }",
-            ["core", "unrelated"],
-        );
+        after.insert("api", b"fn api() { core() }", ["core", "unrelated"]);
         assert_eq!(
             invalidated_modules(&before, &after),
             Invalidation::Dirty {
