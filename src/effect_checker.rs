@@ -138,7 +138,7 @@ pub fn flatten_decls(decls: &[Decl]) -> Vec<&Decl> {
 /// Collect the free (unbound) variable names in an expression.
 /// `bound` accumulates the set of locally-bound names (parameters, let
 /// bindings, etc.) and should not be included in the result.
-fn free_vars(expr: &Expr, bound: &mut Vec<String>, acc: &mut Vec<String>) {
+pub(crate) fn free_vars(expr: &Expr, bound: &mut Vec<String>, acc: &mut Vec<String>) {
     match expr {
         Expr::Literal(_, _) => {}
         Expr::FString(parts, _) => {
