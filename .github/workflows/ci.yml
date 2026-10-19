@@ -202,6 +202,9 @@ jobs:
       - name: Smoke test (eval)
         run: ./target/release/nulang --eval 'perform IO.print("hello")'
 
+      - name: First-run developer smoke (isolated)
+        run: python3 scripts/smoke_first_run.py --bin ./target/release/nulang
+
       - name: Scaffold test package
         run: ./target/release/nulang nula new test-pkg
 
