@@ -4930,6 +4930,35 @@ mod tests {
     }
 
     #[test]
+    fn test_match_rejects_tuple_pattern_inside_variant_payload() {
+        let mut tc = TypeChecker::new();
+        let ctx = ctx_with(
+            "option",
+            Type::Variant(vec![
+                ("None".to_string(), None),
+                ("Some".to_string(), Some(Type::Tuple(vec![Type::int()]))),
+            ]),
+        );
+        let expr = Expr::Match {
+            scrutinee: Box::new(var("option")),
+            arms: vec![(
+                Pattern::Variant(
+                    "Some".to_string(),
+                    Some(Box::new(Pattern::Tuple(vec![Pattern::Wild, Pattern::Wild]))),
+                ),
+                None,
+                int_lit(0),
+            )],
+            span: sp(),
+        };
+        let result = tc.infer_expr(&ctx, &expr);
+        assert!(
+            matches!(result, Err(NuError::TypeError { msg, .. }) if msg.contains("tuple pattern")),
+            "nested variant payload patterns must check tuple arity"
+        );
+    }
+
+    #[test]
     fn test_match_accepts_tuple_pattern_of_exact_arity() {
         let mut tc = TypeChecker::new();
         let expr = Expr::Match {
