@@ -39,24 +39,27 @@ impl RegionPlan {
 /// Keeping this separate from `JitSession` makes region semantics reusable
 /// by alternative native backends (MIR, a custom emitter, or a future JIT)
 /// without coupling them to Cranelift state.
+#[derive(Debug)]
+struct ModuleCallAnalysis {
+    may_suspend: Vec<bool>,
+    recursive: Vec<bool>,
+}
+
 #[derive(Default)]
 pub(crate) struct RegionPlanner {
-    may_suspend: FxHashMap<usize, Vec<bool>>,
-    recursive: FxHashMap<usize, Vec<bool>>,
+    /// One lazily computed direct-call graph analysis per loaded module.
+    /// Both suspension and recursion gates consume the same result.
+    module_analysis: FxHashMap<usize, ModuleCallAnalysis>,
 }
 
 impl RegionPlanner {
     pub(crate) fn plan(&mut self, module_idx: usize, pc: usize, module: &CodeModule) -> RegionPlan {
-        if !self.may_suspend.contains_key(&module_idx) {
-            self.may_suspend
-                .insert(module_idx, compute_may_suspend(module));
-        }
-        if !self.recursive.contains_key(&module_idx) {
-            self.recursive.insert(module_idx, compute_recursive(module));
-        }
-
-        let may_suspend = self.may_suspend.get(&module_idx).map(Vec::as_slice);
-        let recursive = self.recursive.get(&module_idx).map(Vec::as_slice);
+        let analysis = self
+            .module_analysis
+            .entry(module_idx)
+            .or_insert_with(|| compute_module_call_analysis(module));
+        let may_suspend = Some(analysis.may_suspend.as_slice());
+        let recursive = Some(analysis.recursive.as_slice());
         let (len, native_calls) = find_compilable_region_with_calls(
             pc,
             &module.instructions,
@@ -211,120 +214,181 @@ fn is_non_suspending_op(op: crate::bytecode::OpCode) -> bool {
     )
 }
 
-/// Compute the transitive "may suspend" vector for a module (indexed by
-/// function-table index). A function may suspend if its body contains a
-/// suspending opcode (or any opcode outside the pure whitelist), or an
-/// indirect call (unknown target), or a direct call to a may-suspend
-/// function. Fixed point over the direct-call graph recovered by
-/// `direct_call_target`.
-#[allow(dead_code)]
-pub(crate) fn compute_may_suspend(module: &crate::bytecode::CodeModule) -> Vec<bool> {
-    use crate::bytecode::OpCode;
-    let n = module.function_table.len();
-    let mut result = vec![false; n];
-    // Directly unsafe: contains a non-whitelisted opcode (effect/actor/
-    // foreign/suspending) or an indirect call (Call/ClosureCall whose target
-    // is not a statically-recovered direct callee).
-    for i in 0..n {
-        let start = module.function_table[i];
-        let end = if i + 1 < n {
-            module.function_table[i + 1]
-        } else {
-            module.instructions.len()
-        };
-        for pc in start..end {
-            let op = module.instructions[pc].opcode;
-            if matches!(op, OpCode::Call | OpCode::ClosureCall) {
-                if direct_call_target(module, pc, start).is_none() {
-                    result[i] = true; // indirect call: unknown target
-                }
-                // direct call: leave for the fixed-point propagation
-            } else if !is_non_suspending_op(op) {
-                result[i] = true;
-                break;
-            }
+/// Scan function bytecode once to recover the same nearest-staged-function
+/// hints used by `direct_call_target`. The native-call helper still guards
+/// the live callee register at runtime; this analysis does not prove a call
+/// target invariant across arbitrary control flow.
+///
+/// A missing, malformed or out-of-range target is conservatively unsafe.
+/// Constructing the adjacency lists costs O(instructions + direct call edges).
+fn compute_module_call_analysis(module: &CodeModule) -> ModuleCallAnalysis {
+    use crate::bytecode::{Constant, OpCode};
+
+    const FUNC_VALUE_REG: u8 = 254;
+    let function_count = module.function_table.len();
+    let mut graph = vec![Vec::new(); function_count];
+    let mut directly_unsafe = vec![false; function_count];
+
+    for function_idx in 0..function_count {
+        let start = module.function_table[function_idx];
+        let end = module
+            .function_table
+            .get(function_idx + 1)
+            .copied()
+            .unwrap_or(module.instructions.len());
+
+        if start > end || end > module.instructions.len() {
+            directly_unsafe[function_idx] = true;
+            continue;
         }
-    }
-    // Propagate through the direct-call graph until stable.
-    loop {
-        let mut changed = false;
-        for i in 0..n {
-            if result[i] {
-                continue;
-            }
-            let start = module.function_table[i];
-            let end = if i + 1 < n {
-                module.function_table[i + 1]
-            } else {
-                module.instructions.len()
-            };
-            for pc in start..end {
-                if matches!(
-                    module.instructions[pc].opcode,
-                    OpCode::Call | OpCode::ClosureCall
-                ) {
-                    if let Some(callee) = direct_call_target(module, pc, start) {
-                        if callee < n && result[callee] {
-                            result[i] = true;
-                            changed = true;
-                            break;
-                        }
+
+        // Tracks the nearest recognized definition of the function-value
+        // staging register, matching direct_call_target's backward lookup.
+        let mut staged_target: Option<usize> = None;
+        for instr in &module.instructions[start..end] {
+            match instr.opcode {
+                OpCode::Call | OpCode::ClosureCall => {
+                    if let Some(callee) = staged_target.filter(|&idx| idx < function_count) {
+                        graph[function_idx].push(callee);
+                    } else {
+                        directly_unsafe[function_idx] = true;
                     }
                 }
+                op if !is_non_suspending_op(op) => {
+                    directly_unsafe[function_idx] = true;
+                }
+                _ => {}
+            }
+
+            match instr.opcode {
+                OpCode::Const0 | OpCode::Const1 | OpCode::Const2
+                    if instr.op1 == FUNC_VALUE_REG =>
+                {
+                    staged_target = Some(match instr.opcode {
+                        OpCode::Const0 => 0,
+                        OpCode::Const1 => 1,
+                        _ => 2,
+                    });
+                }
+                OpCode::ConstM1 if instr.op1 == FUNC_VALUE_REG => {
+                    staged_target = None;
+                }
+                OpCode::ConstU if instr.op3 == FUNC_VALUE_REG => {
+                    staged_target = match module.constants.get(instr.imm16() as usize) {
+                        Some(Constant::Int(value)) if *value >= 0 => Some(*value as usize),
+                        _ => None,
+                    };
+                }
+                OpCode::Move if instr.op2 == FUNC_VALUE_REG => {
+                    staged_target = None;
+                }
+                _ => {}
             }
         }
-        if !changed {
-            break;
-        }
     }
-    result
+
+    analyze_call_graph(&graph, &directly_unsafe)
 }
 
-/// Per function: can it transitively reach itself via direct calls (i.e. is
-/// it part of a direct-call recursion cycle)? A recursive function must NOT
-/// be run through the re-entrant direct-call helper: each helper invocation
-/// consumes native stack (compiled region -> helper -> interpreter step ->
-/// nested region -> ...), so unbounded recursion would overflow the stack.
-/// The interpreter handles recursion on heap-allocated frames; a recursive
-/// callee stays there. Computed via transitive closure over the direct-call
-/// graph (n is small — one per function).
-pub(crate) fn compute_recursive(module: &crate::bytecode::CodeModule) -> Vec<bool> {
-    use crate::bytecode::OpCode;
-    let n = module.function_table.len();
-    let mut reach = vec![vec![false; n]; n];
-    for i in 0..n {
-        let start = module.function_table[i];
-        let end = if i + 1 < n {
-            module.function_table[i + 1]
+/// Compute suspension reachability and recursion in O(functions + edges).
+/// Iterative traversal avoids consuming the Rust call stack for very large
+/// generated modules. Only SCC members, not their external callers, are
+/// classified as recursive.
+fn analyze_call_graph(graph: &[Vec<usize>], directly_unsafe: &[bool]) -> ModuleCallAnalysis {
+    let count = graph.len();
+    debug_assert_eq!(directly_unsafe.len(), count);
+    let mut reverse = vec![Vec::new(); count];
+    for (caller, callees) in graph.iter().enumerate() {
+        for &callee in callees {
+            reverse[callee].push(caller);
+        }
+    }
+
+    let mut may_suspend = directly_unsafe.to_vec();
+    let mut pending = Vec::with_capacity(count);
+    for (idx, &unsafe_call) in directly_unsafe.iter().enumerate() {
+        if unsafe_call {
+            pending.push(idx);
+        }
+    }
+    while let Some(callee) = pending.pop() {
+        for &caller in &reverse[callee] {
+            if !may_suspend[caller] {
+                may_suspend[caller] = true;
+                pending.push(caller);
+            }
+        }
+    }
+
+    // First Kosaraju pass: iterative depth-first postorder.
+    let mut seen = vec![false; count];
+    let mut postorder = Vec::with_capacity(count);
+    for root in 0..count {
+        if seen[root] {
+            continue;
+        }
+        seen[root] = true;
+        let mut stack = vec![(root, 0usize)];
+        while let Some((node, next_edge)) = stack.pop() {
+            if next_edge == graph[node].len() {
+                postorder.push(node);
+                continue;
+            }
+            stack.push((node, next_edge + 1));
+            let callee = graph[node][next_edge];
+            if !seen[callee] {
+                seen[callee] = true;
+                stack.push((callee, 0));
+            }
+        }
+    }
+
+    // Second pass: traverse reverse edges to discover SCC members.
+    let mut assigned = vec![false; count];
+    let mut recursive = vec![false; count];
+    for &root in postorder.iter().rev() {
+        if assigned[root] {
+            continue;
+        }
+        let mut members = Vec::new();
+        let mut stack = vec![root];
+        assigned[root] = true;
+        while let Some(node) = stack.pop() {
+            members.push(node);
+            for &caller in &reverse[node] {
+                if !assigned[caller] {
+                    assigned[caller] = true;
+                    stack.push(caller);
+                }
+            }
+        }
+
+        if members.len() > 1 {
+            for member in members {
+                recursive[member] = true;
+            }
         } else {
-            module.instructions.len()
-        };
-        for pc in start..end {
-            if matches!(
-                module.instructions[pc].opcode,
-                OpCode::Call | OpCode::ClosureCall
-            ) {
-                if let Some(callee) = direct_call_target(module, pc, start) {
-                    if callee < n {
-                        reach[i][callee] = true;
-                    }
-                }
-            }
+            let node = members[0];
+            recursive[node] = graph[node].contains(&node);
         }
     }
-    // Floyd-Warshall transitive closure.
-    for k in 0..n {
-        for i in 0..n {
-            if reach[i][k] {
-                for j in 0..n {
-                    if reach[k][j] {
-                        reach[i][j] = true;
-                    }
-                }
-            }
-        }
+
+    ModuleCallAnalysis {
+        may_suspend,
+        recursive,
     }
-    (0..n).map(|i| reach[i][i]).collect()
+}
+
+/// Keep the existing test-only contract while the runtime shares one cached
+/// analysis result instead of doing independent bytecode scans.
+#[cfg(test)]
+pub(crate) fn compute_may_suspend(module: &CodeModule) -> Vec<bool> {
+    compute_module_call_analysis(module).may_suspend
+}
+
+#[cfg(test)]
+pub(crate) fn compute_recursive(module: &CodeModule) -> Vec<bool> {
+    compute_module_call_analysis(module).recursive
 }
 
 /// Return true when a compiled region contains a branch back to an earlier
