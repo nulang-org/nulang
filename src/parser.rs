@@ -8993,4 +8993,20 @@ mod tests {
         let result = parse_expr("par");
         assert!(result.is_err(), "bare 'par' must be a parse error");
     }
+    #[test]
+    fn test_parse_selective_imports() {
+        let ast = parse("import stdlib::math { abs, factorial, }").expect("selective import");
+        assert!(matches!(
+            &ast.decls[0],
+            Decl::Import { path, items, .. }
+                if path == "stdlib::math" && items == &["abs", "factorial"]
+        ));
+    }
+
+    #[test]
+    fn test_parse_selective_import_rejects_empty_or_duplicate_names() {
+        assert!(parse("import stdlib::math {}").is_err());
+        assert!(parse("import stdlib::math { abs, abs }").is_err());
+    }
+
 }
