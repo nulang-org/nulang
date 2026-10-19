@@ -99,26 +99,30 @@ impl FairPriorityPolicy {
         self.cursor = 0;
     }
 
-    /// Produce the priority order for one dequeue attempt and advance the
-    /// deterministic service wheel.
-    pub fn next_turn(&mut self) -> PriorityTurn {
-        let total = self.weights.total();
-        debug_assert!(total > 0);
-
-        let slot = self.cursor;
-        self.cursor = (self.cursor + 1) % total;
-
-        let preferred = if slot < self.weights.high as u32 {
+    /// Inspect one absolute turn without mutating shared policy state.
+    ///
+    /// Scheduler dequeue methods use an atomic ticket and this pure function
+    /// because `next_task`, `dequeue`, and `steal_one` accept `&self`.
+    pub fn turn_at(&self, turn: u64) -> PriorityTurn {
+        let slot = (turn % u64::from(self.weights.total())) as u32;
+        let preferred = if slot < u32::from(self.weights.high) {
             ActorPriority::High
-        } else if slot < self.weights.high as u32 + self.weights.normal as u32 {
+        } else if slot < u32::from(self.weights.high) + u32::from(self.weights.normal) {
             ActorPriority::Normal
         } else {
             ActorPriority::Low
         };
-
         PriorityTurn {
             order: fallback_order(preferred),
         }
+    }
+
+    /// Produce the priority order for one dequeue attempt and advance the
+    /// deterministic service wheel.
+    pub fn next_turn(&mut self) -> PriorityTurn {
+        let turn = self.turn_at(u64::from(self.cursor));
+        self.cursor = (self.cursor + 1) % self.weights.total();
+        turn
     }
 }
 
@@ -232,6 +236,19 @@ mod tests {
                 ]
             );
         }
+    }
+
+    #[test]
+    fn absolute_turn_lookup_matches_stateful_cycle_without_consuming_it() {
+        let mut policy = FairPriorityPolicy::new(PriorityWeights::new(2, 1, 1)).unwrap();
+        let original = policy.turn_at(3);
+        assert_eq!(original.preferred(), ActorPriority::Low);
+        assert_eq!(policy.turn_at(4), policy.turn_at(0));
+        assert_eq!(policy.turn_at(u64::MAX), policy.turn_at(u64::MAX % 4));
+        assert_eq!(policy.next_turn().preferred(), ActorPriority::High);
+        assert_eq!(policy.next_turn().preferred(), ActorPriority::High);
+        assert_eq!(policy.next_turn().preferred(), ActorPriority::Normal);
+        assert_eq!(policy.next_turn(), original);
     }
 
     #[test]
