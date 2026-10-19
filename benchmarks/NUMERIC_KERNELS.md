@@ -13,7 +13,7 @@ matrix library, GPU backend, or claim of SIMD speedup.
 Lengths: 128 and 4096 in Criterion. `tests/numeric_kernels.rs` also covers
 zero and singleton lengths, negative elements, and interpreter/JIT result parity.
 
-These benchmarks use the **real Nulang frontend and VM**. Compilation occurs
+These benchmarks are opt-in through the `numeric-bench` feature so standard benchmark CI does not incur additional samples. They use the **real Nulang frontend and VM**. Compilation occurs
 before timing. However, `Array.new` executes inside the timed program, so
 measurements include array allocation, VM dispatch, indexing, arithmetic,
 reductions, and (in cold-JIT mode) potential compilation. They do **not**
@@ -32,8 +32,8 @@ cargo test --locked --no-default-features --features native-codegen --test numer
 Then run controlled Criterion baselines on the **same machine**:
 
 ```sh
-cargo bench --locked --no-default-features --bench bench_main -- numeric_kernel
-cargo bench --locked --no-default-features --features native-codegen --bench bench_main -- numeric_kernel
+cargo bench --locked --no-default-features --features numeric-bench --bench bench_main -- numeric_kernel
+cargo bench --locked --no-default-features --features native-codegen,numeric-bench --bench bench_main -- numeric_kernel
 ```
 
 Measurements are reported as elapsed time and elements/second. Keep interpreter,
