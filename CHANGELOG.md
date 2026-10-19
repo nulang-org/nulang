@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Mailbox supervisor capacity isolation — 2026-10-18
+- **System and supervisor signals no longer consume bounded normal/bulk mailbox credits.** Normal-message admission and logical queue depth are tracked independently; selective-receive commit and reset release the appropriate counts.
+- **Current-main successor of #1703**, preserving its exact mailbox implementation and conformance tests. Full exact-head validation is required before promotion.
+
 ### Bounded Nulang Web development-server connections — 2026-10-16
 - **The experimental Web development listener caps active connections at 64**, including SSE, and returns `503` with `Retry-After: 1` when full.
 - **Worker capacity is returned by a scoped RAII lease** after normal completion, panic, or thread-spawn failure. One shared `Arc` route table replaces per-connection clones of compiled route modules.
