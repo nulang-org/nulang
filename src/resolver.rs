@@ -45,7 +45,7 @@ struct IndexedModule {
 /// frontend still rejects imported aliases until all compiler passes use
 /// resolved symbols consistently. Only explicitly public declarations are
 /// indexed. Reexports and constructors require a later export-model pass.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct QualifiedImportIndex {
     aliases: BTreeMap<String, IndexedModule>,
 }
@@ -159,6 +159,71 @@ fn exported_decl(decl: &Decl) -> Option<(&str, QualifiedSymbolKind)> {
         } => Some((name, QualifiedSymbolKind::Type)),
         _ => None,
     }
+}
+
+/// Build a resolver-only index of direct aliased imports. This is a
+/// preparatory semantic pass: the compiler still rejects alias imports until
+/// the full type/HIR/backend pipeline consumes resolved symbols.
+///
+/// This pass does not recursively reexport dependencies or flatten imported
+/// declarations into the requesting module. Missing or private exports
+/// remain inaccessible; callers cannot fall back to unrelated local names.
+pub fn index_qualified_imports(
+    module: &AstModule,
+    current_file: &Path,
+) -> NuResult<QualifiedImportIndex> {
+    let base = current_file
+        .canonicalize()
+        .unwrap_or_else(|_| current_file.to_path_buf());
+    let dir = base.parent().unwrap_or(&base);
+    let mut index = QualifiedImportIndex::default();
+
+    for declaration in &module.decls {
+        let Decl::Import {
+            path,
+            alias: Some(alias),
+            items,
+            span,
+        } = declaration
+        else {
+            continue;
+        };
+        if module.decls.iter().any(|decl| {
+            !matches!(decl, Decl::Import { .. }) && decl_name(decl) == Some(alias.as_str())
+        }) {
+            return Err(NuError::parse_error(
+                format!("module alias shadows local declaration: '{}'", alias),
+                *span,
+            ));
+        }
+        if !items.is_empty() {
+            return Err(NuError::parse_error(
+                "qualified imports with a selective item list are not supported".to_string(),
+                *span,
+            ));
+        }
+        let path = resolve_path(dir, path);
+        let source = std::fs::read_to_string(&path).map_err(|error| {
+            NuError::parse_error(
+                format!("cannot read qualified module '{}': {}", path.display(), error),
+                *span,
+            )
+        })?;
+        let tokens = Lexer::new(&source).lex().map_err(|error| {
+            NuError::parse_error(
+                format!("lex error in qualified module '{}': {}", path.display(), error),
+                *span,
+            )
+        })?;
+        let imported = Parser::new(tokens).parse_module().map_err(|error| {
+            NuError::parse_error(
+                format!("parse error in qualified module '{}': {}", path.display(), error),
+                *span,
+            )
+        })?;
+        index.bind(alias, &path, &imported, *span)?;
+    }
+    Ok(index)
 }
 
 thread_local! {
