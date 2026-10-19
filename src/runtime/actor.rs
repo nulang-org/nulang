@@ -1029,4 +1029,20 @@ mod orca_actor_stored_root_visitor_tests {
         observed.sort_unstable();
         assert_eq!(observed, vec![31, 32, 33, 34]);
     }
+
+    #[test]
+    fn stored_actor_root_visitor_preserves_actor_heap_pointer_identity() {
+        let mut actor = Actor::new(1, "heap-root-observer", 0);
+        let heap_pointer = actor.allocate_string("still reachable");
+        let expected = heap_pointer.as_ptr().expect("actor heap allocation");
+        actor.state_data.insert("heap_pointer".to_string(), heap_pointer);
+
+        let mut found = false;
+        actor.visit_stored_values(&mut |value| {
+            if value.as_ptr() == Some(expected) {
+                found = true;
+            }
+        });
+        assert!(found, "visitor must retain the exact live heap pointer");
+    }
 }
