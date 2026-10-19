@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Iterative JIT module call-graph analysis — 2026-10-19
+- **JIT region planning now caches one module-level direct-call graph** and computes suspension reachability and recursive strongly connected components through iterative linear-time graph traversal, replacing repeated function-bytecode scans and cubic Floyd–Warshall closure.
+- **Native direct-call eligibility rejects out-of-range staged function indices** rather than treating missing safety metadata as non-suspending. Tests cover self/mutual recursion, a 2,048-function chain, suspension propagation, and invalid callees.
+- **Performance and exact-head validation are pending**: no speedup claim until checked on a Rust-enabled host, and no bytecode, wire, or actor-runtime semantics were intentionally changed.
+
 ### Fabric on-demand mailbox scoring — 2026-10-18
 - **Fabric publish admission now reads mailbox pressure only for matching local subscribers**, instead of allocating and populating an all-actor mailbox snapshot on every publish.
 - **Ported the regression and exact-base matched-fixture A/B harness** from #1708 onto current main. Historical unmatched-publish microbenchmarks were favorable; new-head CI and measurements remain the promotion gate.
