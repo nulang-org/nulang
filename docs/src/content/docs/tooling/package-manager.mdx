@@ -190,11 +190,16 @@ cache marker. Registry dependencies must already exist in
 without rewriting the lockfile. `--offline` can be combined with
 `--locked` and `--json`.
 
-**Integrity scope:** an offline build is not automatically hermetic.
-Cached registry packages currently lack a mandatory cryptographic
-source-content pin in the legacy lockfile format, and external toolchain
-and environment identities are not established by this flag. Prefer
-trusted, protected caches and verify final Cloud artifacts independently.
+**Integrity scope:** normal lockfile saves attach canonical source
+identities to available path, Git-cache, and registry-cache packages.
+Offline builds require these identities and reject any mismatch in
+canonical manifest and `.nula` source bytes. Older lockfiles missing
+identity sidecars must be refreshed with a regular `nulang nula build`.
+
+Offline builds are still **not hermetic or provenance-attested**: the
+compiler version, host environment, upstream package publisher, and final
+Cloud artifacts require independent verification. A matching SourceId
+proves content equality with the recorded lock, not package authorship.
 
 
 The `source` prefix records where the package came from: `path+<dir>` for
