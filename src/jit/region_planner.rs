@@ -845,4 +845,26 @@ mod planner_tests {
         assert_eq!(analysis.may_suspend, vec![true, true, true, true, false]);
         assert_eq!(analysis.recursive, vec![false; 5]);
     }
+
+    #[test]
+    fn test_rejects_out_of_range_direct_callee() {
+        let mut module = CodeModule::new("invalid_direct_target");
+        module.function_table.push(0);
+        module.emit(Instruction::new1(OpCode::Const2, 254));
+        module.emit(Instruction::new0(OpCode::Call));
+
+        let analysis = compute_module_call_analysis(&module);
+        assert_eq!(analysis.may_suspend, vec![true]);
+        assert_eq!(analysis.recursive, vec![false]);
+        assert_eq!(
+            native_direct_call(
+                &module,
+                1,
+                Some(&analysis.may_suspend),
+                Some(&analysis.recursive)
+            ),
+            None,
+            "an invalid function index must never enter the native-call helper"
+        );
+    }
 }
