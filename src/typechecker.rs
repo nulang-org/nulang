@@ -4880,6 +4880,74 @@ mod tests {
         assert_eq!(apply_subst(&ty, &s), Type::int());
     }
 
+    #[test]
+    fn test_match_rejects_tuple_pattern_with_missing_element() {
+        let mut tc = TypeChecker::new();
+        let expr = Expr::Match {
+            scrutinee: Box::new(tuple(vec![int_lit(1), bool_lit(true)])),
+            arms: vec![(Pattern::Tuple(vec![Pattern::Wild]), None, int_lit(0))],
+            span: sp(),
+        };
+        let result = tc.infer_expr(&TypeContext::new(), &expr);
+        assert!(
+            matches!(result, Err(NuError::TypeError { msg, .. }) if msg.contains("tuple pattern")),
+            "a one-element pattern must not accept a two-element tuple"
+        );
+    }
+
+    #[test]
+    fn test_match_rejects_tuple_pattern_with_extra_element() {
+        let mut tc = TypeChecker::new();
+        let expr = Expr::Match {
+            scrutinee: Box::new(tuple(vec![int_lit(1)])),
+            arms: vec![(
+                Pattern::Tuple(vec![Pattern::Wild, Pattern::Wild]),
+                None,
+                int_lit(0),
+            )],
+            span: sp(),
+        };
+        let result = tc.infer_expr(&TypeContext::new(), &expr);
+        assert!(
+            matches!(result, Err(NuError::TypeError { msg, .. }) if msg.contains("tuple pattern")),
+            "a two-element pattern must not accept a one-element tuple"
+        );
+    }
+
+    #[test]
+    fn test_match_rejects_tuple_pattern_on_known_non_tuple() {
+        let mut tc = TypeChecker::new();
+        let expr = Expr::Match {
+            scrutinee: Box::new(int_lit(42)),
+            arms: vec![(Pattern::Tuple(vec![Pattern::Wild]), None, int_lit(0))],
+            span: sp(),
+        };
+        let result = tc.infer_expr(&TypeContext::new(), &expr);
+        assert!(
+            matches!(result, Err(NuError::TypeError { msg, .. }) if msg.contains("tuple pattern")),
+            "a tuple pattern must not accept an Int"
+        );
+    }
+
+    #[test]
+    fn test_match_accepts_tuple_pattern_of_exact_arity() {
+        let mut tc = TypeChecker::new();
+        let expr = Expr::Match {
+            scrutinee: Box::new(tuple(vec![int_lit(1), bool_lit(true)])),
+            arms: vec![(
+                Pattern::Tuple(vec![
+                    Pattern::Var("first".to_string()),
+                    Pattern::Var("second".to_string()),
+                ]),
+                None,
+                var("first"),
+            )],
+            span: sp(),
+        };
+        let (s, ty) = tc.infer_expr(&TypeContext::new(), &expr).unwrap();
+        assert_eq!(apply_subst(&ty, &s), Type::int());
+    }
+
     // -----------------------------------------------------------------------
     // Test: Pipe operator
     // -----------------------------------------------------------------------
