@@ -1111,7 +1111,11 @@ impl PersistenceStore for MemoryStore {
             || self
                 .workflow_events
                 .get(&from)
-                .is_some_and(|events| events.iter().any(|event| event.activation_id().is_some()))
+                .is_some_and(|events| {
+                    events.iter().any(|event| {
+                        event.activation_id().is_some() || event.replay_id().is_some()
+                    })
+                })
         {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
