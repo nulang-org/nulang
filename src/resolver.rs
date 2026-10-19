@@ -292,6 +292,79 @@ fn select_import_decls(
             span: Span::default(),
         });
     }
+    // Import resolution currently flattens declarations into the caller. It
+    // cannot keep a private dependency closure: silently omitting a sibling
+    // helper or a type would create a broken program. Until module namespaces
+    // exist, allow only selections that are demonstrably self-contained.
+    let selected: HashSet<&str> = items.iter().map(String::as_str).collect();
+    let module_names: HashSet<&str> = decls.iter().filter_map(decl_name).collect();
+
+    // Type references may occur in signatures, constructors, and patterns;
+    // this pass does not yet track them all. Reject partial type namespaces
+    // rather than allowing a type-correctness bug to escape.
+    if let Some(name) = decls.iter().find_map(|decl| {
+        if matches!(decl, Decl::TypeAlias { .. } | Decl::RecordType { .. } | Decl::VariantType { .. })
+            && decl_name(decl).is_some_and(|n| !selected.contains(n))
+        {
+            decl_name(decl)
+        } else {
+            None
+        }
+    }) {
+        return Err(NuError::RuntimeError {
+            msg: format!(
+                "selective import from '{}' would omit type '{}'; import the complete module until namespace dependencies are supported",
+                import_path, name
+            ),
+            span: Span::default(),
+        });
+    }
+
+    for decl in &decls {
+        let Some(name) = decl_name(decl) else {
+            // Other declarations (including module-level lets, instances,
+            // effects and module declarations) may provide necessary state
+            // or authority. Restrict selection to independent function/type
+            // modules until their linkage is modeled explicitly.
+            return Err(NuError::RuntimeError {
+                msg: format!(
+                    "selective import from '{}' cannot safely omit non-function declarations; import the complete module",
+                    import_path
+                ),
+                span: Span::default(),
+            });
+        };
+        if !selected.contains(name) {
+            continue;
+        }
+        if let Decl::Function {
+            body, params, using_params, default_values, requires, ensures, ..
+        } = decl
+        {
+            let mut bound: Vec<String> = params.iter().chain(using_params.iter())
+                .map(|p| p.name.clone()).collect();
+            let mut referenced = Vec::new();
+            crate::effect_checker::free_vars(body, &mut bound, &mut referenced);
+            for default in default_values.iter().flatten() {
+                crate::effect_checker::free_vars(default, &mut bound, &mut referenced);
+            }
+            for contract in requires.iter().chain(ensures.iter()) {
+                crate::effect_checker::free_vars(contract, &mut bound, &mut referenced);
+            }
+            if let Some(missing) = referenced.iter().find(|candidate| {
+                module_names.contains(candidate.as_str())
+                    && !selected.contains(candidate.as_str())
+            }) {
+                return Err(NuError::RuntimeError {
+                    msg: format!(
+                        "selective import of '{}' from '{}' omits required module declaration '{}'; import it too or import the whole module",
+                        name, import_path, missing
+                    ),
+                    span: Span::default(),
+                });
+            }
+        }
+    }
     Ok(filter_decls(decls, items))
 }
 
