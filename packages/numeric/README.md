@@ -10,10 +10,10 @@ Neither Nulang's language semantics nor its default runtime dependencies change.
 From `packages/numeric`:
 
 ```sh
-nula test
+nulang nula test
 ```
 
-If built from this repository, use the `nula` command from your Nulang
+If built from this repository, use the `nulang nula` subcommand from your Nulang
 installation. This package is not automatically promoted to the official
 registry; add from a local checkout until publication is authorized.
 
@@ -57,7 +57,7 @@ fn main() {
   do not use this reference algorithm for high-throughput matrix workloads.
 - Arithmetic follows Nulang's current Float semantics and operation order;
   no parallel reassociation or numerically stable summation is promised.
-- Tests must pass via `nula test` on an actual compiler/runtime before
+- Tests must pass via `nulang nula test` on an actual compiler/runtime before
   moving this feature out of draft. The earlier numerical Criterion baselines
   must be certified separately, without inferring SIMD from a warm JIT run.
 
