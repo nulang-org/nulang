@@ -524,4 +524,84 @@ mod tests {
         clock.advance(Duration::from_millis(200));
         assert!(clock.elapsed() >= Duration::from_millis(300));
     }
+
+    #[test]
+    fn test_virtual_time_controls_send_receive_and_retry_deadlines() {
+        let mut clock = VirtualClock::new();
+        clock.advance(Duration::from_secs(30));
+        let start = clock.now();
+        let wheel = TimerWheel::new();
+
+        let send = wheel.send_after_at(start, Duration::from_millis(50), 42, 1, vec![]);
+        let receive = wheel.receive_wait_timeout_at(start, Duration::from_millis(75), 43);
+        let retry = wheel.schedule_llm_retry_at(start, Duration::from_millis(100), 44);
+        assert_eq!(wheel.next_deadline(), Some(start + Duration::from_millis(50)));
+        assert_eq!(wheel.remaining_at(send, start), Some(Duration::from_millis(50)));
+
+        clock.advance(Duration::from_millis(49));
+        assert!(wheel.tick(clock.now()).is_empty());
+        clock.advance(Duration::from_millis(1));
+        assert_eq!(
+            wheel.tick(clock.now()),
+            vec![(
+                42,
+                TimerMessage::SendWithContext {
+                    behavior_id: 1,
+                    payload: vec![],
+                    context: String::new(),
+                },
+            )]
+        );
+        assert_eq!(wheel.remaining_at(send, clock.now()), None);
+        assert_eq!(
+            wheel.remaining_at(receive, clock.now()),
+            Some(Duration::from_millis(25))
+        );
+
+        clock.advance(Duration::from_millis(25));
+        assert_eq!(wheel.tick(clock.now()), vec![(43, TimerMessage::ReceiveWaitTimeout)]);
+        clock.advance(Duration::from_millis(25));
+        assert_eq!(wheel.tick(clock.now()), vec![(44, TimerMessage::LlmRetry)]);
+        assert!(wheel.is_empty());
+        assert_eq!(wheel.remaining_at(retry, clock.now()), None);
+    }
+
+    #[test]
+    fn test_virtual_time_controls_context_and_exit_kill_deadlines() {
+        let mut clock = VirtualClock::new();
+        clock.advance(Duration::from_secs(30));
+        let start = clock.now();
+        let wheel = TimerWheel::new();
+
+        wheel.send_after_with_context_at(
+            start,
+            Duration::from_millis(10),
+            42,
+            2,
+            vec![],
+            "timer-id".to_owned(),
+        );
+        wheel.exit_after_at(start, Duration::from_millis(20), 43, "bye".to_owned());
+        wheel.kill_after_at(start, Duration::from_millis(30), 44);
+
+        clock.advance(Duration::from_millis(10));
+        assert_eq!(
+            wheel.tick(clock.now()),
+            vec![(
+                42,
+                TimerMessage::SendWithContext {
+                    behavior_id: 2,
+                    payload: vec![],
+                    context: "timer-id".to_owned(),
+                },
+            )]
+        );
+        clock.advance(Duration::from_millis(10));
+        assert_eq!(
+            wheel.tick(clock.now()),
+            vec![(43, TimerMessage::Exit { reason: "bye".to_owned() })]
+        );
+        clock.advance(Duration::from_millis(10));
+        assert_eq!(wheel.tick(clock.now()), vec![(44, TimerMessage::Kill)]);
+    }
 }
