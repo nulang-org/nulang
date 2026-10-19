@@ -4282,6 +4282,39 @@ impl Default for TypeChecker {
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_effect_row_compatible_open_requires_known_effects_in_closed_row() {
+        let open = EffectRow::Open(vec![Effect::IO], Region::fresh());
+        let pure = EffectRow::empty();
+        assert!(!effect_row_compatible(&open, &pure));
+        assert!(!effect_row_compatible(&pure, &open));
+    }
+
+    #[test]
+    fn test_effect_row_compatible_open_may_instantiate_tail_from_closed_row() {
+        let open = EffectRow::Open(vec![Effect::IO], Region::fresh());
+        let closed = EffectRow::Closed(vec![Effect::IO, Effect::FS]);
+        assert!(effect_row_compatible(&open, &closed));
+        assert!(effect_row_compatible(&closed, &open));
+    }
+
+    #[test]
+    fn test_mgu_rejects_function_with_unaccounted_known_effect() {
+        let open_fn = Type::Function {
+            param: Box::new(Type::int()),
+            ret: Box::new(Type::int()),
+            effect: EffectRow::Open(vec![Effect::IO], Region::fresh()),
+            cap: Capability::Ref,
+        };
+        let pure_fn = Type::Function {
+            param: Box::new(Type::int()),
+            ret: Box::new(Type::int()),
+            effect: EffectRow::empty(),
+            cap: Capability::Ref,
+        };
+        assert!(mgu(&open_fn, &pure_fn, sp()).is_err());
+    }
+
     // Helper to create a span
     fn sp() -> Span {
         Span::new(0, 0)
