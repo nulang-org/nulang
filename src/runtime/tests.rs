@@ -94,6 +94,37 @@ fn local_reply_alias_retires_on_actor_exit_and_rejects_dead_owners() {
 }
 
 #[test]
+fn local_reply_aliases_are_not_valid_in_other_runtime_instances() {
+    let mut first_runtime = Runtime::new();
+    let mut second_runtime = Runtime::new();
+    let owner_a = first_runtime.spawn_actor(Box::new(Vec::new));
+    let owner_b = second_runtime.spawn_actor(Box::new(Vec::new));
+    let alias_a = first_runtime.create_local_alias(owner_a).unwrap();
+    let alias_b = second_runtime.create_local_alias(owner_b).unwrap();
+
+    assert_ne!(alias_a, alias_b, "tokens must not collide between runtimes");
+    assert_eq!(
+        second_runtime.send_to_local_alias(alias_a, 0, &[Value::int(1)]),
+        AliasSendStatus::Inactive
+    );
+    assert_eq!(second_runtime.actors.get(&owner_b).unwrap().mailbox.len(), 0);
+}
+
+#[test]
+fn local_reply_alias_registry_caps_outstanding_aliases_per_actor() {
+    let mut runtime = Runtime::new();
+    let owner = runtime.spawn_actor(Box::new(Vec::new));
+    let mut aliases = Vec::new();
+    for _ in 0..MAX_LOCAL_ALIASES_PER_ACTOR {
+        aliases.push(runtime.create_local_alias(owner).expect("under alias cap"));
+    }
+    assert!(runtime.create_local_alias(owner).is_none(), "cap rejects more aliases");
+    let old = aliases.pop().unwrap();
+    assert!(runtime.deactivate_local_alias(owner, old));
+    assert!(runtime.create_local_alias(owner).is_some(), "released slot is reusable");
+}
+
+#[test]
 fn local_reply_alias_reports_backpressure_and_remains_active_for_retry() {
     let mut runtime = Runtime::new();
     let receiver = runtime.spawn_actor(Box::new(Vec::new));
