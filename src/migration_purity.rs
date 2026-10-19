@@ -18,6 +18,7 @@ struct FunctionInfo<'a> {
 
 struct MigrationPurityChecker<'a> {
     functions: HashMap<String, FunctionInfo<'a>>,
+    ambiguous_functions: HashSet<String>,
     externs: HashSet<String>,
     visiting: Vec<String>,
 }
@@ -26,6 +27,7 @@ impl<'a> MigrationPurityChecker<'a> {
     fn new(decls: &'a [Decl]) -> Self {
         let mut checker = Self {
             functions: HashMap::new(),
+            ambiguous_functions: HashSet::new(),
             externs: HashSet::new(),
             visiting: Vec::new(),
         };
@@ -40,6 +42,11 @@ impl<'a> MigrationPurityChecker<'a> {
                 Decl::Function {
                     name, params, body, ..
                 } => {
+                    // Unqualified lookup cannot safely identify which module
+                    // helper executes when names collide.
+                    if self.functions.contains_key(name) {
+                        self.ambiguous_functions.insert(name.clone());
+                    }
                     self.functions.insert(
                         name.clone(),
                         FunctionInfo {
@@ -91,7 +98,14 @@ impl<'a> MigrationPurityChecker<'a> {
         )
     }
 
-    fn expand_function(&mut self, scope: &str, name: &str) -> NuResult<()> {
+    fn expand_function(&mut self, scope: &str, name: &str, span: Span) -> NuResult<()> {
+        if self.ambiguous_functions.contains(name) {
+            return Err(self.forbidden(
+                scope,
+                &format!("ambiguous migration helper '{name}'"),
+                span,
+            ));
+        }
         if self.visiting.iter().any(|n| n == name) {
             return Ok(());
         }
@@ -145,7 +159,7 @@ impl<'a> MigrationPurityChecker<'a> {
                                 *span,
                             ));
                         }
-                        self.expand_function(scope, name)?;
+                        self.expand_function(scope, name, *span)?;
                     }
                     Expr::Lambda { .. } => {
                         // The inline lambda body was recursively checked above.
@@ -274,7 +288,7 @@ impl<'a> MigrationPurityChecker<'a> {
                                 *span,
                             ));
                         }
-                        self.expand_function(scope, name)?;
+                        self.expand_function(scope, name, *span)?;
                     }
                     Expr::Lambda { .. } => {
                         // The inline lambda body was recursively checked above.
