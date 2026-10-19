@@ -992,7 +992,13 @@ impl EffectChecker {
                 .map(|e| format!("{}", e))
                 .collect();
             let span = expr_span(expr);
-            let msg = if offending.is_empty() {
+            let msg = if unrelated_open_tails {
+                format!(
+                    "unrelated unresolved effect tails: effects {} cannot be proven within allowed effects {}; resolve the row variables before checking this contract",
+                    format_row(&inferred),
+                    format_row(allowed)
+                )
+            } else if offending.is_empty() {
                 format!(
                     "effects {} are not a subset of allowed effects {}",
                     format_row(&inferred),
