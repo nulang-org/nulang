@@ -674,7 +674,10 @@ impl ForeignInterop for DefaultForeignInterop {
         let mut py_args = Vec::with_capacity(request.args.len());
         for value in &request.args {
             let id = crate::python::owned_foreign_to_python_object_id(value)?;
-            if !matches!(value, crate::runtime::OwnedForeignValue::OpaqueHandle { .. }) {
+            if !matches!(
+                value,
+                crate::runtime::OwnedForeignValue::OpaqueHandle { .. }
+            ) {
                 temporary.track(id);
             }
             py_args.push(id);
@@ -682,7 +685,10 @@ impl ForeignInterop for DefaultForeignInterop {
         let result_id = self.bridge.call(func_id, py_args)?;
         temporary.track(result_id);
         let result = crate::python::python_object_id_to_owned_foreign(result_id)?;
-        if matches!(result, crate::runtime::OwnedForeignValue::OpaqueHandle { .. }) {
+        if matches!(
+            result,
+            crate::runtime::OwnedForeignValue::OpaqueHandle { .. }
+        ) {
             temporary.keep(result_id);
         }
         Ok(result)
@@ -896,7 +902,11 @@ mod tests {
                 vec![],
             ))
             .expect("Python list call failed");
-        let crate::runtime::OwnedForeignValue::OpaqueHandle { backend: "python", id } = result else {
+        let crate::runtime::OwnedForeignValue::OpaqueHandle {
+            backend: "python",
+            id,
+        } = result
+        else {
             panic!("list() must return an opaque Python object");
         };
         let reused = fi
@@ -918,7 +928,9 @@ mod tests {
     fn test_python_attribute_string_survives_temporary_registry_cleanup() {
         let mut fi = DefaultForeignInterop::new().expect("Python backend init failed");
         fi.import("builtins").expect("builtins import failed");
-        let value = fi.get_attr("builtins", "__name__").expect("attribute lookup failed");
+        let value = fi
+            .get_attr("builtins", "__name__")
+            .expect("attribute lookup failed");
         let id = value.as_raw() & crate::value_layout::PAYLOAD_MASK;
         assert_eq!(
             value.as_raw() & crate::value_layout::TAG_MASK,
@@ -943,15 +955,14 @@ mod tests {
     fn test_direct_value_wrapper_registers_a_distinct_temporary_handle() {
         // The legacy conversion always registers a new object ID, including
         // when its input is an already registered Python-tagged VM value.
-        let original = pyo3::Python::attach(|py| {
-            crate::python::register_object(py.None())
-        });
-        let vm_value = unsafe {
-            Value::from_raw(crate::python::TAG_PYTHON | original.0)
-        };
+        let original = pyo3::Python::attach(|py| crate::python::register_object(py.None()));
+        let vm_value = unsafe { Value::from_raw(crate::python::TAG_PYTHON | original.0) };
         let wrapper = crate::python::value_to_python_object_id(vm_value)
             .expect("wrap an already registered object");
-        assert_ne!(wrapper, original, "conversion should create a temporary registry slot");
+        assert_ne!(
+            wrapper, original,
+            "conversion should create a temporary registry slot"
+        );
         {
             let mut temporary = TemporaryPythonHandles::default();
             temporary.track(wrapper);
@@ -973,7 +984,9 @@ mod tests {
             "str",
             vec![crate::runtime::OwnedForeignValue::String(text.clone())],
         );
-        let result = fi.call_owned(&request).expect("owned Python string call failed");
+        let result = fi
+            .call_owned(&request)
+            .expect("owned Python string call failed");
         assert_eq!(result, crate::runtime::OwnedForeignValue::String(text));
     }
 
@@ -995,7 +1008,9 @@ mod tests {
     fn test_foreign_interop_get_attr_reads_non_callable_constant() {
         let mut fi = DefaultForeignInterop::new().expect("Python backend initialization failed");
         fi.import("math").expect("math module import failed");
-        let result = fi.get_attr("math", "pi").expect("math.pi is a non-callable attribute");
+        let result = fi
+            .get_attr("math", "pi")
+            .expect("math.pi is a non-callable attribute");
         let value = result.as_float().expect("expected Python float");
         assert!((value - std::f64::consts::PI).abs() < f64::EPSILON);
     }
