@@ -101,5 +101,11 @@ fn sampling_does_not_run_or_drain_pending_actor_work_by_itself() {
     assert_eq!(report.scheduler.tasks_processed, 0);
     assert_eq!(report.mailbox_messages_before, 1);
     assert_eq!(report.mailbox_messages_after, 1);
-    assert_eq!(runtime.metrics_snapshot().actors_mailboxes.iter().find(|m| m.actor_id == actor).unwrap().depth, 1);
+    let snapshot = runtime.metrics_snapshot();
+    let pending = snapshot
+        .actors_mailboxes
+        .iter()
+        .find(|mailbox| mailbox.actor_id == actor)
+        .expect("actor must remain resident");
+    assert_eq!(pending.depth, 1);
 }
