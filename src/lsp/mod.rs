@@ -3991,6 +3991,32 @@ mod lsp_tests {
     }
 
     #[test]
+    fn test_postfix_catch_warning_highlights_catch_keyword() {
+        let source = "fn main() { Ok(1) catch 0 }";
+        let diagnostics = NulangLanguageServer::compute_diagnostics(source).diagnostics;
+        let warning = diagnostics
+            .iter()
+            .find(|d| matches!(&d.code, Some(NumberOrString::String(code)) if code == "W0101"))
+            .expect("postfix catch should emit W0101");
+        let column = source.find("catch").unwrap() as u32;
+        assert_eq!(warning.range.start, Position::new(0, column));
+        assert_eq!(warning.range.end, Position::new(0, column + 5));
+    }
+
+    #[test]
+    fn test_fail_warning_is_published_to_lsp() {
+        let source = "fn main() { fail Error(\"oops\") }";
+        let diagnostics = NulangLanguageServer::compute_diagnostics(source).diagnostics;
+        assert!(
+            diagnostics.iter().any(|d| {
+                matches!(&d.code, Some(NumberOrString::String(code)) if code == "W0102")
+                    && d.severity == Some(DiagnosticSeverity::WARNING)
+            }),
+            "deprecated fail must produce a coded editor warning: {diagnostics:?}"
+        );
+    }
+
+    #[test]
     fn test_warning_span_is_utf16_accurate_after_non_bmp_text() {
         let source = "let symbol = \"😀\"; catch Ok(1) 0";
         let start = source.find("catch").unwrap();
