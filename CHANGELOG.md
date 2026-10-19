@@ -1,5 +1,10 @@
 # Nulang Changelog
 
+### Qualified module symbol indexing (experimental) — 2026-10-19
+- **Direct aliased modules can be indexed by canonical source path without flattening exports.** Explicitly public functions/types are visible; private symbols, unknown names, and alias-origin conflicts fail closed, with overloads retained.
+- Seven resolver tests cover source identities, visibility, missing symbols, duplicate aliases, opaque provenance, source-file indexing, and local name shadowing.
+- **Qualified imports remain non-executable** until canonical symbol binding is wired through the typechecker and code generation; exact-head CI remains outstanding.
+
 ### Qualified import syntax preparation (experimental) — 2026-10-19
 - **The parser preserves `import module as alias` in the AST, and the formatter retains it.** This is syntax preparation only; actual qualified symbol references are not yet supported.
 - **Resolver and direct typechecker paths reject aliased imports with a diagnostic** rather than silently flattening their exports and changing binding identities.
