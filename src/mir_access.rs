@@ -178,7 +178,7 @@ pub fn summarize_function(function: &Function) -> Vec<AccessSite> {
         match &block.terminator {
             Terminator::Return(Some(value)) | Terminator::Resume(value) => {
                 site.read(*value);
-                if matches!(block.terminator, Terminator::Resume(_)) {
+                if matches!(&block.terminator, Terminator::Resume(_)) {
                     site.boundaries.push(Boundary::Handler);
                 }
             }
