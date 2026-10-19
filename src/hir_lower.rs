@@ -1223,14 +1223,31 @@ fn lower_let_chain(first_body: &Expr, body: &mut hir::Body) -> hir::Operand {
     }
 }
 
-/// Emit all active deferred expressions from all scopes in LIFO order.
-/// Snapshots the defer stack to avoid RefCell double-borrow when deferred
-/// expressions themselves contain blocks/if/match (which re-enter the stack).
+/// Capture a value before lowering scope-exit cleanup. A variable operand
+/// alone still refers to mutable storage; keeping it live through a deferred
+/// assignment would incorrectly change the value returned by `return` or
+/// `break`.
+fn capture_exit_value(value: hir::Operand, span: Span, body: &mut hir::Body) -> hir::Operand {
+    let ty = value.ty();
+    let name = fresh_temp_name();
+    body.push(hir::Stmt::Let {
+        name: name.clone(),
+        ty: ty.clone(),
+        value: hir::RValue::Use(value),
+        span,
+    });
+    hir::Operand::Var(name, ty)
+}
+
+/// Emit ordinary (non-error-only) defers in LIFO order on a successful return.
+/// Snapshots avoid RefCell double-borrow when deferred expressions re-enter lowering.
 fn emit_all_defers(body: &mut hir::Body) {
     let snapshot = DEFER_SCOPES.with(|s| s.borrow().clone());
     for scope in snapshot.iter().rev() {
-        for (expr, _error_only) in scope.iter().rev() {
-            let _ = lower_expr(expr, body);
+        for (expr, error_only) in scope.iter().rev() {
+            if !error_only {
+                let _ = lower_expr(expr, body);
+            }
         }
     }
 }
@@ -1242,8 +1259,10 @@ fn emit_defers_for_break(body: &mut hir::Body) {
     });
     for scope_idx in (boundary..snapshot.len()).rev() {
         if let Some(scope) = snapshot.get(scope_idx) {
-            for (expr, _error_only) in scope.iter().rev() {
-                let _ = lower_expr(expr, body);
+            for (expr, error_only) in scope.iter().rev() {
+                if !error_only {
+                    let _ = lower_expr(expr, body);
+                }
             }
         }
     }
@@ -1659,7 +1678,7 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
             });
             hir::Operand::Var(temp, ty)
         }
-        Expr::Block { exprs, span: _ } => {
+        Expr::Block { exprs, span } => {
             push_defer_scope();
             let mut last = hir::Operand::Unit;
             for e in exprs {
@@ -1677,11 +1696,21 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
             }
             if !body.is_terminated() {
                 let scope = pop_defer_scope();
-                for (expr, _error_only) in scope.into_iter().rev() {
+                // A block result is evaluated before scope-exit cleanup. A
+                // variable operand still refers to mutable storage, so
+                // snapshot it before a deferred assignment can modify it.
+                if scope.iter().any(|(_, error_only)| !error_only)
+                    && matches!(last, hir::Operand::Var(..))
+                {
+                    last = capture_exit_value(last, *span, body);
+                }
+                for (expr, error_only) in scope.into_iter().rev() {
                     if body.is_terminated() {
                         break;
                     }
-                    let _ = lower_expr(&expr, body);
+                    if !error_only {
+                        let _ = lower_expr(&expr, body);
+                    }
                 }
             } else {
                 let _ = pop_defer_scope();
@@ -1718,11 +1747,13 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
             }
             if !body.is_terminated() {
                 let scope = pop_defer_scope();
-                for (expr, _error_only) in scope.into_iter().rev() {
+                for (expr, error_only) in scope.into_iter().rev() {
                     if body.is_terminated() {
                         break;
                     }
-                    let _ = lower_expr(&expr, body);
+                    if !error_only {
+                        let _ = lower_expr(&expr, body);
+                    }
                 }
                 body.push(hir::Stmt::ParallelMarker {
                     marker: crate::parallel_marker::ParallelRegionMarker::End,
@@ -2218,16 +2249,19 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
             };
             lower_expr(&app, body)
         }
-        Expr::Return(val, _span) => {
-            // Emit all active defers before return (all scopes, LIFO).
-            emit_all_defers(body);
+        Expr::Return(val, span) => {
+            // Evaluate and freeze the return operand before deferred expressions
+            // can mutate variables referenced by the operand.
             let op = val.as_ref().map(|e| lower_expr(e, body));
+            let op = op.map(|value| capture_exit_value(value, *span, body));
+            emit_all_defers(body);
             body.set_terminator(hir::Terminator::FnReturn(op));
             hir::Operand::Unit
         }
-        Expr::Break(val, _span) => {
-            emit_defers_for_break(body);
+        Expr::Break(val, span) => {
             let op = val.as_ref().map(|e| lower_expr(e, body));
+            let op = op.map(|value| capture_exit_value(value, *span, body));
+            emit_defers_for_break(body);
             body.set_terminator(hir::Terminator::Break(op));
             hir::Operand::Unit
         }
@@ -2726,6 +2760,244 @@ where
 mod tests {
     use super::*;
     use crate::ast::{Param, Pattern};
+
+
+    #[test]
+    fn test_nested_defer_scopes_run_inner_first_in_lifo_order() {
+        let span = Span::default();
+        let cleanup = |name: &str| Expr::Defer {
+            expr: Box::new(Expr::Panic(name.to_string(), span)),
+            error_only: false,
+            span,
+        };
+        let expr = Expr::Block {
+            exprs: vec![
+                cleanup("outer"),
+                Expr::Block {
+                    exprs: vec![
+                        cleanup("inner-first"),
+                        cleanup("inner-last"),
+                        Expr::Literal(Literal::Unit, span),
+                    ],
+                    span,
+                },
+                Expr::Literal(Literal::Int(1), span),
+            ],
+            span,
+        };
+        let body = with_fresh_defer_stack(|| lower_body(&expr));
+        let cleanup_order: Vec<_> = body.stmts.iter().filter_map(|stmt| match stmt {
+            hir::Stmt::Let {
+                value: hir::RValue::Panic(message),
+                ..
+            } => Some(message.as_str()),
+            _ => None,
+        }).collect();
+        assert_eq!(cleanup_order, ["inner-last", "inner-first", "outer"]);
+    }
+
+    #[test]
+    fn test_errdefer_skipped_on_normal_scope_exit() {
+        let span = Span::default();
+        let expr = Expr::Block {
+            exprs: vec![
+                Expr::Defer {
+                    expr: Box::new(Expr::Panic("error-only".to_string(), span)),
+                    error_only: true,
+                    span,
+                },
+                Expr::Defer {
+                    expr: Box::new(Expr::Panic("ordinary-cleanup".to_string(), span)),
+                    error_only: false,
+                    span,
+                },
+                Expr::Literal(Literal::Int(42), span),
+            ],
+            span,
+        };
+        let body = with_fresh_defer_stack(|| lower_body(&expr));
+        let panics: Vec<_> = body
+            .stmts
+            .iter()
+            .filter_map(|stmt| match stmt {
+                hir::Stmt::Let {
+                    value: hir::RValue::Panic(message),
+                    ..
+                } => Some(message.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(panics, ["ordinary-cleanup"]);
+    }
+
+    #[test]
+    fn test_block_value_is_captured_before_deferred_cleanup() {
+        let span = Span::default();
+        let expr = Expr::Block {
+            exprs: vec![
+                Expr::Defer {
+                    expr: Box::new(Expr::Panic("cleanup".to_string(), span)),
+                    error_only: false,
+                    span,
+                },
+                Expr::Var("x".to_string(), span),
+            ],
+            span,
+        };
+        let body = with_fresh_defer_stack(|| lower_body(&expr));
+        let result = match &body.terminator {
+            hir::Terminator::Yield(hir::Operand::Var(name, _)) => name,
+            other => panic!("expected block to yield a captured value, got {other:?}"),
+        };
+        let capture_pos = body
+            .stmts
+            .iter()
+            .position(|stmt| matches!(
+                stmt,
+                hir::Stmt::Let {
+                    name,
+                    value: hir::RValue::Use(hir::Operand::Var(source, _)),
+                    ..
+                } if name == result && source == "x"
+            ))
+            .expect("block value must be copied before deferred cleanup");
+        let cleanup_pos = body
+            .stmts
+            .iter()
+            .position(|stmt| matches!(
+                stmt,
+                hir::Stmt::Let {
+                    value: hir::RValue::Panic(message),
+                    ..
+                } if message == "cleanup"
+            ))
+            .expect("deferred cleanup missing");
+        assert!(capture_pos < cleanup_pos, "block value captured too late");
+    }
+
+    #[test]
+    fn test_return_evaluates_and_captures_value_before_defer() {
+        let span = Span::default();
+        let expr = Expr::Block {
+            exprs: vec![
+                Expr::Defer {
+                    expr: Box::new(Expr::Panic("cleanup".to_string(), span)),
+                    error_only: false,
+                    span,
+                },
+                Expr::Defer {
+                    expr: Box::new(Expr::Panic("error-only".to_string(), span)),
+                    error_only: true,
+                    span,
+                },
+                Expr::Return(Some(Box::new(Expr::Var("x".to_string(), span))), span),
+            ],
+            span,
+        };
+        let body = with_fresh_defer_stack(|| lower_body(&expr));
+        let (returned, _) = match &body.terminator {
+            hir::Terminator::FnReturn(Some(hir::Operand::Var(name, ty))) => {
+                (name.as_str(), ty)
+            }
+            other => panic!("expected variable-valued return, got {other:?}"),
+        };
+        let capture_pos = body
+            .stmts
+            .iter()
+            .position(|stmt| {
+                matches!(
+                    stmt,
+                    hir::Stmt::Let {
+                        name,
+                        value: hir::RValue::Use(hir::Operand::Var(source, _)),
+                        ..
+                    } if name == returned && source == "x"
+                )
+            })
+            .expect("return value must be captured before cleanup");
+        let cleanup_pos = body
+            .stmts
+            .iter()
+            .position(|stmt| matches!(
+                stmt,
+                hir::Stmt::Let {
+                    value: hir::RValue::Panic(message),
+                    ..
+                } if message == "cleanup"
+            ))
+            .expect("ordinary defer must run before return");
+        assert!(capture_pos < cleanup_pos, "return value evaluated after cleanup");
+        assert!(
+            !body.stmts.iter().any(|stmt| matches!(
+                stmt,
+                hir::Stmt::Let {
+                    value: hir::RValue::Panic(message),
+                    ..
+                } if message == "error-only"
+            )),
+            "errdefer must not execute on an ordinary return"
+        );
+    }
+
+    #[test]
+    fn test_break_evaluates_and_captures_value_before_defer() {
+        let span = Span::default();
+        let expr = Expr::Block {
+            exprs: vec![
+                Expr::Defer {
+                    expr: Box::new(Expr::Panic("cleanup".to_string(), span)),
+                    error_only: false,
+                    span,
+                },
+                Expr::Defer {
+                    expr: Box::new(Expr::Panic("error-only".to_string(), span)),
+                    error_only: true,
+                    span,
+                },
+                Expr::Break(Some(Box::new(Expr::Var("x".to_string(), span))), span),
+            ],
+            span,
+        };
+        let body = with_fresh_defer_stack(|| lower_body(&expr));
+        let returned = match &body.terminator {
+            hir::Terminator::Break(Some(hir::Operand::Var(name, _))) => name,
+            other => panic!("expected value-valued break, got {other:?}"),
+        };
+        let capture_pos = body
+            .stmts
+            .iter()
+            .position(|stmt| matches!(
+                stmt,
+                hir::Stmt::Let {
+                    name,
+                    value: hir::RValue::Use(hir::Operand::Var(source, _)),
+                    ..
+                } if name == returned && source == "x"
+            ))
+            .expect("break value must be captured before cleanup");
+        let cleanup_pos = body
+            .stmts
+            .iter()
+            .position(|stmt| matches!(
+                stmt,
+                hir::Stmt::Let {
+                    value: hir::RValue::Panic(message),
+                    ..
+                } if message == "cleanup"
+            ))
+            .expect("ordinary defer must run before break");
+        assert!(capture_pos < cleanup_pos, "break value evaluated after cleanup");
+        assert!(
+            !body.stmts.iter().any(|stmt| matches!(
+                stmt,
+                hir::Stmt::Let {
+                    value: hir::RValue::Panic(message),
+                    ..
+                } if message == "error-only"
+            )),
+            "errdefer must not execute on an ordinary break"
+        );
+    }
 
     #[test]
     fn test_lower_literal() {
