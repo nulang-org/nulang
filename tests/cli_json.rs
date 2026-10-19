@@ -412,3 +412,58 @@ fn nula_test_same_named_functions_in_distinct_files_do_not_overwrite_wrappers() 
     assert_eq!(tests[1]["status"], "failed");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+
+#[test]
+fn nula_test_main_entrypoint_is_not_confused_by_a_string_literal() {
+    let dir = temp_dir("main_name_literal");
+    scaffold_package(
+        &dir,
+        "fn main() = 1\n",
+        &[(
+            "checks.nula",
+            "fn helper() = \"fn main() {}\"\nfn main() { perform Test.assert(false, \"original main should not run\") }\nfn test_real() { perform Test.assert(true, \"actual case\") }\n",
+        )],
+    );
+
+    let out = run_nula(&dir, &["test", "--json"]);
+    assert!(
+        out.status.success(),
+        "the original main must not collide with test wrapper: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("valid test JSON");
+    let cases = report["tests"].as_array().expect("test results");
+    assert_eq!(cases.len(), 1);
+    assert_eq!(cases[0]["name"], "tests/checks.nula::test_real");
+    assert_eq!(cases[0]["status"], "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn nula_test_expression_bodied_main_does_not_consume_test_functions() {
+    let dir = temp_dir("expression_main");
+    scaffold_package(
+        &dir,
+        "fn main() = 1\n",
+        &[(
+            "checks.nula",
+            "fn main() = 42\nfn test_real() { perform Test.assert(true, \"actual case\") }\n",
+        )],
+    );
+
+    let out = run_nula(&dir, &["test", "--json"]);
+    assert!(
+        out.status.success(),
+        "an expression-bodied main cannot corrupt subsequent functions: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("valid test JSON");
+    let cases = report["tests"].as_array().expect("test results");
+    assert_eq!(cases.len(), 1);
+    assert_eq!(cases[0]["name"], "tests/checks.nula::test_real");
+    assert_eq!(cases[0]["status"], "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
