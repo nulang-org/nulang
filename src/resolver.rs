@@ -53,7 +53,7 @@ pub fn resolve_imports(
         // If the file has already been fully resolved in this compilation,
         // reuse its cached declarations.
         if let Some(cached) = IMPORT_CACHE.with(|c| c.borrow().get(&resolved_canonical).cloned()) {
-            merge_imported_decls(module, cached, import_path, true)?;
+            merge_imported_decls(module, filter_decls(cached, items), import_path, true)?;
             continue;
         }
 
@@ -85,17 +85,19 @@ pub fn resolve_imports(
 
         resolve_imports(&mut imported, &resolved_canonical, stack)?;
 
-        let imported_decls = if items.is_empty() {
-            imported.decls
-        } else {
-            filter_decls(imported.decls, items)
-        };
-
+        // Cache the full resolved module, not this import's requested subset.
+        // Other imports of the same file may select different declarations.
+        let all_decls = imported.decls;
         IMPORT_CACHE.with(|c| {
             c.borrow_mut()
-                .insert(resolved_canonical, imported_decls.clone())
+                .insert(resolved_canonical, all_decls.clone())
         });
-        merge_imported_decls(module, imported_decls, import_path, false)?;
+        merge_imported_decls(
+            module,
+            filter_decls(all_decls, items),
+            import_path,
+            false,
+        )?;
     }
     module.decls.retain(|d| !matches!(d, Decl::Import { .. }));
     stack.remove(&canonical_file);
