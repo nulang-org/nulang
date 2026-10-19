@@ -1,0 +1,25 @@
+// Correlated monitor references are independent of legacy target monitors.
+// A source-level actor can create a reference, cancel it by identity, and
+// request a pending-DOWN flush without using the Rust Runtime API.
+actor Watcher {
+    behavior watch(target) { perform Actor.monitor_ref(target) }
+    behavior cancel(reference) { perform Actor.demonitor_ref(reference) }
+    behavior flush(reference) { perform Actor.demonitor_ref_flush(reference) }
+}
+
+actor Subject {
+    behavior ping() { 1 }
+}
+
+fn main() {
+    let watcher = spawn Watcher {}
+    let subject = spawn Subject {}
+    let reference = ask watcher watch(subject)
+    let canceled = ask watcher cancel(reference)
+    let discarded = ask watcher flush(reference)
+    if canceled then {
+        perform IO.print("canceled")
+    } else {
+        perform IO.print("unexpected")
+    }
+}
