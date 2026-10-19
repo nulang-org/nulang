@@ -14,6 +14,8 @@ on:
       - 'src/jit/**'
       - 'src/vm.rs'
       - 'src/bin/nulang_jit_bench.rs'
+      - 'scripts/jit_generic_call_ab.py'
+      - 'scripts/tests/test_jit_generic_call_ab.py'
       - 'benchmarks/JIT_CODEGEN.md'
       - 'Cargo.toml'
 
@@ -51,6 +53,19 @@ jobs:
             --features native-codegen \
             --bin nulang-jit-bench -- \
             --format jsonl --repeat "$REPEAT" | tee jit-codegen-results.jsonl
+
+      - name: Test paired generic-call comparator
+        run: python3 -m unittest discover -s scripts/tests -p 'test_jit_generic_call_ab.py' -v
+
+      - name: Measure paired generic-call baseline
+        run: python3 scripts/jit_generic_call_ab.py --rounds 8 --output jit-generic-call-ab.json
+
+      - name: Upload paired generic-call baseline
+        uses: actions/upload-artifact@v7
+        with:
+          name: jit-generic-call-ab-${{ github.sha }}
+          path: jit-generic-call-ab.json
+          if-no-files-found: error
 
       - name: Upload JIT telemetry
         uses: actions/upload-artifact@v7
