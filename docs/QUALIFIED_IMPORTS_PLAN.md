@@ -1,6 +1,6 @@
 # Qualified imports: implementation contract (draft)
 
-Status: **design and provenance preflight only**. Qualified import syntax is **not implemented** in this branch. It must not be described as a supported Nulang feature until the compiler, resolver, editor tooling, and backends pass the gates below.
+Status: **experimental syntax AST/formatter support, not executable qualified imports**. The parser records `import path as alias` and the formatter preserves it, but the resolver and direct typechecker deliberately reject aliased imports until module-qualified symbol lookup exists end-to-end. No qualified-import program is supported yet.
 
 ## Why this work precedes aliases
 
@@ -17,7 +17,7 @@ import stdlib::set as set
 let filtered = list::filter(numbers, is_positive)
 ```
 
-The syntax above is **illustrative and not yet accepted**. Existing `import stdlib::list` remains a legacy unqualified import for Nulang 1.x. Do not silently change its meaning without a versioned migration.
+The `import ... as ...` declarations above now parse as AST and round-trip through the formatter, but are **deliberately rejected during semantic resolution**. The `alias::function` expression still requires future parser/name-lookup work. Existing `import stdlib::list` remains a legacy unqualified import for Nulang 1.x. Do not silently change its meaning without a versioned migration.
 
 ## Required semantic invariants
 
@@ -35,7 +35,7 @@ The syntax above is **illustrative and not yet accepted**. Existing `import stdl
 
 1. Provenance completeness for already-existing import forms (this branch).
 2. Stable resolver-owned `ModuleBinding` / `ResolvedSymbol` model, with explicit source origin, export visibility, and local name.
-3. Parser and AST representation for `import path as alias` and `alias::name`, with negative parsing and unknown-alias tests.
+3. AST/parser and formatter retention of `import path as alias` with a fail-closed semantic error (**syntax groundwork completed**); then implement `alias::name` as a distinct unresolved reference form, including unknown-alias tests.
 4. Typechecker and effects/capability lookup using resolved symbols. Verify polymorphic constructors and opaque types cannot be confused across modules.
 5. HIR/MIR and all backends operate on canonical resolved symbols rather than alias-formatted text. Add cross-backend behavior fixtures.
 6. Formatter, LSP, JSON diagnostics, and migration examples, with full CI and conformance.
