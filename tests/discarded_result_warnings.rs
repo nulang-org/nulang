@@ -82,3 +82,27 @@ fn nested_blocks_report_only_the_result_actually_discarded() {
     assert_eq!(tc.warnings.len(), 1, "{:?}", tc.warnings);
     assert_eq!(tc.warnings[0].code, "W0301");
 }
+
+#[test]
+fn parsed_program_warns_on_ignored_result_without_rejecting_the_program() {
+    use nulang::lexer::Lexer;
+    use nulang::parser::Parser;
+
+    let source = r#"
+        type Outcome = Ok(Int) | Error(String)
+        fn ignored() -> Int {
+            Ok(1)
+            42
+        }
+    "#;
+    let tokens = Lexer::new(source).lex().expect("lex");
+    let mut parser = Parser::new(tokens);
+    let module = parser.parse_module().expect("parse");
+    let mut tc = TypeChecker::new();
+    tc.check_module(&module).expect("warning must not fail typechecking");
+    assert!(
+        tc.warnings.iter().any(|w| w.code == "W0301"),
+        "expected W0301 from the real compiler frontend: {:?}",
+        tc.warnings
+    );
+}
