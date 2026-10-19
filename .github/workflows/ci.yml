@@ -233,6 +233,11 @@ jobs:
       - name: Build
         run: cargo build --locked --all-targets --no-default-features
 
+      # Isolate bounded-scope/VM contract regressions from unrelated
+      # distributed-cluster integration failures in the full suite.
+      - name: Focused scoped-task contract
+        run: cargo test --locked --no-default-features scoped_task
+
       - name: Test
         run: cargo test --locked --no-default-features
 
