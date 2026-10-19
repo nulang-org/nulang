@@ -1,0 +1,52 @@
+name: Criterion confirmation smoke
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/confirm_bench_regression.py'
+      - 'scripts/tests/test_confirm_bench_regression.py'
+      - '.github/workflows/criterion-confirmation-smoke.yml'
+  workflow_dispatch:
+
+jobs:
+  criterion-confirmation-smoke:
+    name: Real Criterion ID smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3-dev
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Verify confirmation contracts
+        run: python3 -m unittest scripts.tests.test_confirm_bench_regression
+      - name: Run one real Criterion JIT benchmark
+        run: cargo bench --locked --bench bench_main -- '^jit/function_call_loop_interp$' --noplot --color never
+      - name: Verify metadata mapping and emitted estimate
+        run: |
+          python3 - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+          from scripts.confirm_bench_regression import (
+              benchmark_ids_for_reports,
+              criterion_directory,
+              criterion_filter,
+          )
+          key = "jit_function_call_loop_interp"
+          expected_id = "jit/function_call_loop_interp"
+          criterion_dir = criterion_directory(Path.cwd())
+          resolved = benchmark_ids_for_reports(criterion_dir, [key])
+          assert resolved[key] == expected_id, resolved
+          assert re.fullmatch(criterion_filter(list(resolved.values())), expected_id)
+          estimate = criterion_dir / key / "new" / "estimates.json"
+          assert estimate.is_file(), f"Criterion did not emit {estimate}"
+          mean_ns = json.loads(estimate.read_text())["mean"]["point_estimate"]
+          assert mean_ns > 0, mean_ns
+          print(f"Criterion full ID {expected_id} emitted {key}: {mean_ns} ns")
+          PY

@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Criterion paired-confirmation ID mapping — 2026-10-18
+- **Resolve historical report-directory keys through Criterion `benchmark.json` metadata**, rather than using sanitized keys as anchored runtime filters. The JIT interpreter alert in main run `39152376887` selected zero benchmarks because `jit_function_call_loop_interp` differs from `jit/function_call_loop_interp`.
+- **Preserve historical result keys and regression thresholds.** Add focused mapping/collection regression tests plus a path-scoped real-Criterion pull-request smoke job. Passing the smoke proves the selection/estimate contract, not that the October 18 performance alert was or was not a real regression.
+
 ### Bounded Nulang Web development-server connections — 2026-10-16
 - **The experimental Web development listener caps active connections at 64**, including SSE, and returns `503` with `Retry-After: 1` when full.
 - **Worker capacity is returned by a scoped RAII lease** after normal completion, panic, or thread-spawn failure. One shared `Arc` route table replaces per-connection clones of compiled route modules.
