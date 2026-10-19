@@ -550,6 +550,12 @@ pub(crate) fn native_direct_call(
         return None;
     }
     let idx = direct_call_target(module, pc, func_start_for(module, pc))?;
+    // A staged integer that does not resolve to a real function is not a
+    // callable target. Fail closed instead of treating missing safety entries
+    // as proof that it cannot suspend or recurse.
+    if idx >= module.function_table.len() {
+        return None;
+    }
     // A suspending callee must not be run re-entrantly from a compiled
     // region: it could suspend mid-run and be re-entered from its call start,
     // double-executing pre-suspend side effects. Stay on the interpreter.
