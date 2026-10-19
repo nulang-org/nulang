@@ -2608,6 +2608,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn locked_build_requires_existing_lockfile() {
+        let dir = std::env::temp_dir().join(format!("nulang_locked_missing_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = ChangeDir::new(&dir);
+        scaffold_package(&dir, "locked-missing", "default").unwrap();
+
+        let err = prepare_package_with_lock(true).expect_err("locked build must require Nulang.lock");
+        assert!(err.to_string().contains("Nulang.lock"), "{err}");
+        assert!(!dir.join(LOCKFILE_FILE).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn locked_build_preserves_lockfile_and_rejects_dependency_drift() {
+        let dir = std::env::temp_dir().join(format!("nulang_locked_drift_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = ChangeDir::new(&dir);
+        scaffold_package(&dir, "locked-drift", "default").unwrap();
+        prepare_package().unwrap();
+
+        let lock_path = dir.join(LOCKFILE_FILE);
+        let original = std::fs::read_to_string(&lock_path).unwrap();
+        let marked = format!("{original}\n# preserved by --locked\n");
+        std::fs::write(&lock_path, &marked).unwrap();
+        prepare_package_with_lock(true).expect("matching lock must work");
+        assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), marked);
+
+        let dependency_dir = dir.join("extra");
+        scaffold_package(&dependency_dir, "extra", "lib").unwrap();
+        let mut manifest = Manifest::load(&dir).unwrap();
+        manifest.dependencies.insert(
+            "extra".to_string(),
+            Dependency::Detailed(DependencyDetail {
+                path: Some("extra".to_string()),
+                ..Default::default()
+            }),
+        );
+        manifest.save(&dir).unwrap();
+
+        let err = prepare_package_with_lock(true).expect_err("drift must fail closed");
+        assert!(err.to_string().contains("lockfile"), "{err}");
+        assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), marked);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_manifest_language_pin() {
         let dir = std::env::temp_dir().join(format!("nulang_lang_pin_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
