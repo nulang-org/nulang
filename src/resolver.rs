@@ -542,6 +542,16 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_import_alias_fails_closed_before_loading_module() {
+        // A parser accepting the syntax must not accidentally resolve this
+        // as an ordinary unqualified import before namespace binding exists.
+        let err = resolve_fixture("import foreign as source\\n", &[]).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("qualified imports"), "{msg}");
+        assert!(!msg.contains("cannot read"), "{msg}");
+    }
+
+    #[test]
     fn independent_opaque_types_with_same_name_must_conflict() {
         let err = resolve_fixture(
             "import first\nimport second\n",
