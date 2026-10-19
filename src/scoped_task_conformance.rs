@@ -186,7 +186,9 @@ fn run_trace<H: TraceHost>(mut host: H, events: &[TraceEvent]) -> TraceResult {
     }
     TraceResult {
         records,
-        outcomes: host.finish().expect("fixture must end with no running work"),
+        outcomes: host
+            .finish()
+            .expect("fixture must end with no running work"),
     }
 }
 
@@ -215,10 +217,7 @@ fn seeded_events(seed: u64) -> Vec<TraceEvent> {
     let mut events = vec![
         TraceEvent::Submit,
         TraceEvent::Submit,
-        TraceEvent::Tick(vec![
-            (0, Response::Pending),
-            (1, Response::Pending),
-        ]),
+        TraceEvent::Tick(vec![(0, Response::Pending), (1, Response::Pending)]),
         TraceEvent::Submit,
     ];
     for _ in 0..32 {
@@ -262,7 +261,10 @@ mod tests {
             TraceEvent::Tick(vec![(2, Response::Success(30))]),
         ];
         let trace = assert_hosts_conform(2, 2, &events);
-        assert_eq!(trace.records[2].submission, Some(Err(ScopeError::QueueFull)));
+        assert_eq!(
+            trace.records[2].submission,
+            Some(Err(ScopeError::QueueFull))
+        );
         assert_eq!(
             trace.outcomes,
             vec![
