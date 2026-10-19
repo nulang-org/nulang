@@ -127,26 +127,32 @@ impl<'a> MigrationPurityChecker<'a> {
                 for arg in args {
                     self.walk(scope, arg, bound)?;
                 }
-                if let Expr::Var(name, _) = func.as_ref() {
-                    // Bound values may be function parameters or local aliases.
-                    // Their target is not statically known here: allowing the
-                    // call lets an effectful helper be passed as a callback and
-                    // executed during deterministic migration replay.
-                    if bound.iter().any(|b| b == name) {
-                        return Err(self.forbidden(
-                            scope,
-                            &format!("indirect call through '{name}'"),
-                            *span,
-                        ));
+                match func.as_ref() {
+                    Expr::Var(name, _) => {
+                        // A bound function variable can conceal an effectful
+                        // callback; only statically named functions are expanded.
+                        if bound.iter().any(|b| b == name) {
+                            return Err(self.forbidden(
+                                scope,
+                                &format!("indirect call through '{name}'"),
+                                *span,
+                            ));
+                        }
+                        if self.externs.contains(name) {
+                            return Err(self.forbidden(
+                                scope,
+                                &format!("external/FFI call '{name}'"),
+                                *span,
+                            ));
+                        }
+                        self.expand_function(scope, name)?;
                     }
-                    if self.externs.contains(name) {
-                        return Err(self.forbidden(
-                            scope,
-                            &format!("external/FFI call '{name}'"),
-                            *span,
-                        ));
+                    Expr::Lambda { .. } => {
+                        // The inline lambda body was recursively checked above.
                     }
-                    self.expand_function(scope, name)?;
+                    _ => {
+                        return Err(self.forbidden(scope, "unresolved callable expression", *span));
+                    }
                 }
                 Ok(())
             }
@@ -252,22 +258,30 @@ impl<'a> MigrationPurityChecker<'a> {
                 self.walk(scope, right, bound)?;
                 // A pipe invokes its right-hand function; merely walking the
                 // callee expression does not inspect its function body.
-                if let Expr::Var(name, _) = right.as_ref() {
-                    if bound.iter().any(|b| b == name) {
-                        return Err(self.forbidden(
-                            scope,
-                            &format!("indirect pipe call through '{name}'"),
-                            *span,
-                        ));
+                match right.as_ref() {
+                    Expr::Var(name, _) => {
+                        if bound.iter().any(|b| b == name) {
+                            return Err(self.forbidden(
+                                scope,
+                                &format!("indirect pipe call through '{name}'"),
+                                *span,
+                            ));
+                        }
+                        if self.externs.contains(name) {
+                            return Err(self.forbidden(
+                                scope,
+                                &format!("external/FFI pipe call '{name}'"),
+                                *span,
+                            ));
+                        }
+                        self.expand_function(scope, name)?;
                     }
-                    if self.externs.contains(name) {
-                        return Err(self.forbidden(
-                            scope,
-                            &format!("external/FFI pipe call '{name}'"),
-                            *span,
-                        ));
+                    Expr::Lambda { .. } => {
+                        // The inline lambda body was recursively checked above.
                     }
-                    self.expand_function(scope, name)?;
+                    _ => {
+                        return Err(self.forbidden(scope, "unresolved callable expression", *span));
+                    }
                 }
                 Ok(())
             }
