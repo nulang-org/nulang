@@ -1774,12 +1774,24 @@ impl TypeChecker {
             Decl::Import { .. } => Ok((vec![], Type::unit())),
             Decl::Database { .. } => Ok((vec![], Type::unit())),
             Decl::Given {
-                name, ty, value, ..
+                name,
+                ty,
+                value,
+                span,
             } => {
                 let (s_val, val_ty) = self.infer_expr(ctx, value)?;
+                // Contextual bindings must obey their declared types before
+                // they can become candidates for implicit using arguments.
+                let subst = if let Some(annotation) = ty {
+                    let s_ann = mgu(&apply_subst(&val_ty, &s_val), annotation, *span)?;
+                    compose_subst(&s_ann, &s_val)
+                } else {
+                    s_val
+                };
+                let final_ty = apply_subst(&val_ty, &subst);
                 self.given_bindings
                     .insert(name.clone(), (ty.clone(), value.clone()));
-                Ok((s_val, val_ty))
+                Ok((subst, final_ty))
             }
             Decl::Class { .. } => Ok((vec![], Type::unit())),
             Decl::Impl {
