@@ -136,3 +136,44 @@ fn pick(c: Color) -> Int {
     assert!(checker.warnings.iter().any(|w| w.code == "W0201" && w.msg.contains("Blue")),
         "{:?}", checker.warnings);
 }
+
+
+#[test]
+fn cli_default_accepts_nonexhaustive_match_and_strict_mode_rejects() {
+    use std::process::Command;
+    let source = r#"
+type Color = Red | Green
+fn pick(c: Color) -> Int {
+    match c { | Red => 1 }
+}
+"#;
+    let path = std::env::temp_dir().join(format!(
+        "nulang_match_warnings_{}_{}.nula",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(&path, source).expect("write test source");
+    let binary = env!("CARGO_BIN_EXE_nulang");
+    let stdlib = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/stdlib");
+    let normal = Command::new(binary)
+        .args(["--check"])
+        .arg(&path)
+        .env("NULANG_STDLIB", &stdlib)
+        .output()
+        .expect("run default checker");
+    let strict = Command::new(binary)
+        .args(["--check", "--deny-warnings"])
+        .arg(&path)
+        .env("NULANG_STDLIB", &stdlib)
+        .output()
+        .expect("run strict checker");
+    let _ = std::fs::remove_file(&path);
+
+    assert!(normal.status.success(), "default check: {}", String::from_utf8_lossy(&normal.stderr));
+    assert!(String::from_utf8_lossy(&normal.stderr).contains("W0201"));
+    assert!(!strict.status.success(), "strict checker must reject match coverage warning");
+    assert!(String::from_utf8_lossy(&strict.stderr).contains("W0201"));
+}
