@@ -378,10 +378,15 @@ impl EffectRow {
                 a.extend(b);
                 EffectRow::Open(a, r)
             }
-            (EffectRow::Open(mut a, r1), EffectRow::Open(b, _)) => {
-                // Open rows share the same row variable convention
+            (EffectRow::Open(mut a, r1), EffectRow::Open(b, r2)) => {
                 a.extend(b);
-                EffectRow::Open(a, r1)
+                // Independent unresolved tails cannot be represented by a
+                // single source region. Use a fresh opaque tail rather than
+                // falsely claiming that the union retains either origin's
+                // exact unknown effects. A later checked boundary must not
+                // treat the synthetic tail as an existing allowed tail.
+                let tail = if r1 == r2 { r1 } else { Region::fresh() };
+                EffectRow::Open(a, tail)
             }
         }
     }
