@@ -243,9 +243,33 @@ impl<'a> MigrationPurityChecker<'a> {
                 self.walk(scope, arr, bound)?;
                 self.walk(scope, idx, bound)
             }
-            Expr::Binary { left, right, .. } | Expr::Pipe { left, right, .. } => {
+            Expr::Binary { left, right, .. } => {
                 self.walk(scope, left, bound)?;
                 self.walk(scope, right, bound)
+            }
+            Expr::Pipe { left, right, span } => {
+                self.walk(scope, left, bound)?;
+                self.walk(scope, right, bound)?;
+                // A pipe invokes its right-hand function; merely walking the
+                // callee expression does not inspect its function body.
+                if let Expr::Var(name, _) = right.as_ref() {
+                    if bound.iter().any(|b| b == name) {
+                        return Err(self.forbidden(
+                            scope,
+                            &format!("indirect pipe call through '{name}'"),
+                            *span,
+                        ));
+                    }
+                    if self.externs.contains(name) {
+                        return Err(self.forbidden(
+                            scope,
+                            &format!("external/FFI pipe call '{name}'"),
+                            *span,
+                        ));
+                    }
+                    self.expand_function(scope, name)?;
+                }
+                Ok(())
             }
             Expr::Assign { target, value, .. } => {
                 self.walk(scope, target, bound)?;
