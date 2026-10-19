@@ -10,7 +10,7 @@ let client: LanguageClient | undefined;
  * workspace-folder setting overrides workspace/global settings; NULANG_PATH
  * remains the fallback when nothing was explicitly configured.
  */
-function nulangBinary(uri: vscode.Uri): string {
+function nulangBinary(uri?: vscode.Uri): string {
   const config = vscode.workspace.getConfiguration('nulang', uri);
   const inspected = config.inspect<string>('path');
   const explicit =
@@ -88,7 +88,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // Undefined transport still uses stdio pipes, without the extra flag.
   const uri = vscode.window.activeTextEditor?.document.uri;
   const serverOptions: ServerOptions = {
-    command: uri ? nulangBinary(uri) : 'nulang',
+    command: nulangBinary(uri),
     args: ['--lsp'],
   };
 
