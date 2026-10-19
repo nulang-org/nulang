@@ -121,6 +121,19 @@ carry individual source spans, W0202 points to the enclosing match expression.
 
 See `docs/MIGRATION_RFC_0015.md` for the `catch`/`fail` migration guide.
 
+## Machine-readable warning diagnostics
+
+`nulang --check FILE --json` serializes warnings in the existing
+`diagnostics` array with a stable `Wxxxx` code, `severity: "warning"`,
+the same source span, and an optional `suggestion.message` containing
+migration guidance. A warning-only check returns `ok: true` and exit 0.
+With `--deny-warnings`, the warnings remain in the array alongside the
+rejection error; `ok: false` and the existing nonzero exit are preserved.
+
+This structured-warning guarantee currently covers the `--check --json`
+command. Do not assume identical JSON warning coverage for `run`,
+`nula build`, or `nula test` until those command paths are integrated.
+
 ## Output modes
 
 - **tty**: ariadne report — `[Exxxx] Error: msg` header, `╭─[file:line:col]`

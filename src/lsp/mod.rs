@@ -1843,6 +1843,11 @@ impl NulangLanguageServer {
         let mut tc = TypeChecker::new();
         tc.collect_errors = true;
         let _ = tc.check_module(&ast);
+        diagnostics.extend(
+            tc.warnings
+                .iter()
+                .map(|warning| warning_to_lsp_diagnostic(warning, source)),
+        );
         for err in tc.collected_errors {
             diagnostics.extend(nu_error_to_diagnostic(err));
         }
@@ -2346,6 +2351,46 @@ impl NulangLanguageServer {
         }
         doc_lines.reverse();
         Some(doc_lines.join("\n"))
+    }
+}
+
+/// Map a compiler warning to LSP's UTF-16 coordinates, using the current
+/// document's source rather than a thread-local source map.
+fn warning_to_lsp_diagnostic(warning: &crate::types::NuWarning, source: &str) -> Diagnostic {
+    fn position_at(source: &str, byte_offset: u32) -> Position {
+        let mut offset = (byte_offset as usize).min(source.len());
+        while !source.is_char_boundary(offset) {
+            offset -= 1;
+        }
+        let prefix = &source[..offset];
+        let line = prefix.as_bytes().iter().filter(|&&byte| byte == b'\n').count();
+        let column = prefix
+            .rsplit('\n')
+            .next()
+            .unwrap_or("")
+            .encode_utf16()
+            .count();
+        Position::new(line as u32, column as u32)
+    }
+
+    let message = match &warning.help {
+        Some(help) => format!("{}\nHelp: {}", warning.msg, help),
+        None => warning.msg.clone(),
+    };
+
+    Diagnostic {
+        range: Range::new(
+            position_at(source, warning.span.start),
+            position_at(source, warning.span.end),
+        ),
+        severity: Some(DiagnosticSeverity::WARNING),
+        code: Some(NumberOrString::String(warning.code.to_string())),
+        code_description: None,
+        source: Some("nulang".to_string()),
+        message,
+        related_information: None,
+        tags: None,
+        data: None,
     }
 }
 
@@ -3925,6 +3970,19 @@ mod lsp_tests {
         let engine = InlayHintEngine::new("fun foo) bar(");
         let hints = engine.generate_inlay_hints(None, None, None);
         assert!(hints.is_empty());
+    }
+
+    #[test]
+    fn test_semantic_match_warnings_surface_with_stable_codes_in_lsp() {
+        let source = "fn pick(b: Bool) -> Int { match b { | true => 1 } }";
+        let diagnostics = NulangLanguageServer::compute_diagnostics(source).diagnostics;
+        let warning = diagnostics
+            .iter()
+            .find(|d| matches!(&d.code, Some(NumberOrString::String(code)) if code == "W0201"))
+            .expect("LSP should publish finite-domain coverage warning");
+        assert_eq!(warning.severity, Some(DiagnosticSeverity::WARNING));
+        assert!(warning.message.contains("false"));
+        assert_eq!(warning.range.start.line, 0);
     }
 
     #[test]

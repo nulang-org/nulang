@@ -132,6 +132,67 @@ fn check_json_passing_source_is_ok_with_empty_diagnostics() {
 }
 
 #[test]
+fn check_json_emits_parser_deprecation_warnings_without_failing() {
+    let dir = temp_dir("deprecated_warn");
+    let src = write_temp(&dir, "warn.nula", "fn main() -> Int { fail 1 }\n");
+
+    let (code, stdout, _stderr) = run_check_json(&src);
+    let report: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("one JSON report");
+    assert_eq!(code, 0, "{report:?}");
+    assert_eq!(report["ok"], true);
+    let diagnostics = report["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(diagnostics[0]["code"], "W0102");
+    assert_eq!(diagnostics[0]["severity"], "warning");
+    assert_eq!(diagnostics[0]["span"]["line"], 1);
+    assert_eq!(diagnostics[0]["span"]["file"], src.to_string_lossy().as_ref());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_json_reports_semantic_warnings_from_typechecker() {
+    let dir = temp_dir("match_warn");
+    let src = write_temp(
+        &dir,
+        "match.nula",
+        "type Color = Red | Green | Blue\nfn pick(c: Color) -> Int { match c { | Red => 1 | Green => 2 } }\n",
+    );
+    let (code, stdout, _stderr) = run_check_json(&src);
+    let report: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("one JSON report");
+    assert_eq!(code, 0, "{report:?}");
+    assert_eq!(report["ok"], true);
+    let diagnostics = report["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(diagnostics[0]["code"], "W0201");
+    assert_eq!(diagnostics[0]["severity"], "warning");
+    assert!(diagnostics[0]["message"].as_str().unwrap().contains("Blue"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_json_deny_warnings_returns_warning_and_error_without_duplicate_warnings() {
+    let dir = temp_dir("strict_warn");
+    let src = write_temp(&dir, "warn.nula", "fn main() -> Int { fail 1 }\n");
+    let out = Command::new(nulang_exe())
+        .args(["--json", "--check", "--deny-warnings"])
+        .arg(&src)
+        .env("NULANG_STDLIB", stdlib_dir())
+        .output()
+        .expect("run strict JSON check");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let report: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("one JSON report");
+    assert!(!out.status.success(), "strict mode must reject warnings");
+    assert_eq!(report["ok"], false);
+    let diagnostics = report["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.iter().filter(|d| d["code"] == "W0102").count(), 1);
+    assert!(diagnostics.iter().any(|d| d["severity"] == "error"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn check_without_json_keeps_human_output() {
     let dir = temp_dir("human");
     let src = write_temp(&dir, "ok.nula", "fn main() = 1\n");
