@@ -1,3 +1,187 @@
+//! Experimental read-only reflection over the compiler's HIR actor declarations.
+//!
+//! Produces deterministic, namespace-qualified metadata for tooling and future
+//! typed derivation. No source-level reflection syntax, runtime introspection,
+//! schema-format changes, or compile-time evaluator is introduced here.
+//! HIR currently uses conservative return types for some behaviors, so this
+//! interface intentionally exposes parameter types, effect rows and capabilities,
+//! but does not advertise behavior return types as verified protocol contracts.
+
+use std::collections::BTreeSet;
+
+use crate::ast::StateModel;
+use crate::hir;
+use crate::types::{Capability, EffectRow, Type};
+
+/// One immutable snapshot of an actor's compiler-visible public structure.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActorReflection {
+    pub qualified_name: String,
+    pub schema_version: u32,
+    pub persistent: bool,
+    pub fields: Vec<StateFieldReflection>,
+    pub behaviors: Vec<BehaviorReflection>,
+    pub events: Vec<EventReflection>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StateFieldReflection {
+    pub name: String,
+    pub model: StateModel,
+    pub ty: Type,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BehaviorReflection {
+    pub name: String,
+    /// Parameter declaration order is semantically meaningful and preserved.
+    pub params: Vec<(String, Type)>,
+    pub effects: EffectRow,
+    pub capability: Capability,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventReflection {
+    pub name: String,
+    /// Event payload order is semantically meaningful and preserved.
+    pub params: Vec<(String, Type)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReflectionError {
+    DuplicateActor(String),
+    DuplicateMember {
+        actor: String,
+        kind: &'static str,
+        name: String,
+    },
+}
+
+fn ensure_unique<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+    actor: &str,
+    kind: &'static str,
+) -> Result<(), ReflectionError> {
+    let mut seen = BTreeSet::new();
+    for name in names {
+        if !seen.insert(name) {
+            return Err(ReflectionError::DuplicateMember {
+                actor: actor.to_string(),
+                kind,
+                name: name.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Reflect named actors in a previously validated HIR module.
+///
+/// Actors, fields, behaviors and events are sorted by fully qualified name or
+/// member name for reproducibility. Parameter ordering is never changed.
+/// Duplicate qualified actor names and duplicate members fail closed.
+/// This API is not an admission or compatibility proof: consumers must still
+/// validate type/effect semantics and use the canonical semantic identity
+/// machinery for deployable artifacts.
+pub fn reflect_actors(module: &hir::Module) -> Result<Vec<ActorReflection>, ReflectionError> {
+    let mut prefix = Vec::new();
+    if !module.name.is_empty() {
+        prefix.push(module.name.clone());
+    }
+    let mut actors = Vec::new();
+    collect_actors(&module.decls, &mut prefix, &mut actors)?;
+    actors.sort_by(|a, b| a.qualified_name.cmp(&b.qualified_name));
+    for pair in actors.windows(2) {
+        if pair[0].qualified_name == pair[1].qualified_name {
+            return Err(ReflectionError::DuplicateActor(pair[0].qualified_name.clone()));
+        }
+    }
+    Ok(actors)
+}
+
+fn collect_actors(
+    decls: &[hir::Decl],
+    prefix: &mut Vec<String>,
+    out: &mut Vec<ActorReflection>,
+) -> Result<(), ReflectionError> {
+    for decl in decls {
+        match decl {
+            hir::Decl::Module { name, decls, .. } => {
+                prefix.push(name.clone());
+                let result = collect_actors(decls, prefix, out);
+                prefix.pop();
+                result?;
+            }
+            hir::Decl::Actor(actor) => {
+                let qualified_name = if prefix.is_empty() {
+                    actor.name.clone()
+                } else {
+                    format!("{}::{}", prefix.join("::"), actor.name)
+                };
+
+                ensure_unique(
+                    actor.state_fields.iter().map(|(name, ..)| name.as_str()),
+                    &qualified_name,
+                    "state field",
+                )?;
+                ensure_unique(
+                    actor.behaviors.iter().map(|behavior| behavior.name.as_str()),
+                    &qualified_name,
+                    "behavior",
+                )?;
+                ensure_unique(
+                    actor.events.iter().map(|event| event.name.as_str()),
+                    &qualified_name,
+                    "event",
+                )?;
+
+                let mut fields: Vec<_> = actor
+                    .state_fields
+                    .iter()
+                    .map(|(name, model, ty, _default)| StateFieldReflection {
+                        name: name.clone(),
+                        model: *model,
+                        ty: ty.clone(),
+                    })
+                    .collect();
+                fields.sort_by(|a, b| a.name.cmp(&b.name));
+
+                let mut behaviors: Vec<_> = actor
+                    .behaviors
+                    .iter()
+                    .map(|behavior| BehaviorReflection {
+                        name: behavior.name.clone(),
+                        params: behavior.params.clone(),
+                        effects: behavior.effect.clone(),
+                        capability: behavior.cap,
+                    })
+                    .collect();
+                behaviors.sort_by(|a, b| a.name.cmp(&b.name));
+
+                let mut events: Vec<_> = actor
+                    .events
+                    .iter()
+                    .map(|event| EventReflection {
+                        name: event.name.clone(),
+                        params: event.params.clone(),
+                    })
+                    .collect();
+                events.sort_by(|a, b| a.name.cmp(&b.name));
+
+                out.push(ActorReflection {
+                    qualified_name,
+                    schema_version: actor.version,
+                    persistent: actor.persistent,
+                    fields,
+                    behaviors,
+                    events,
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
