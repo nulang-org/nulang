@@ -687,6 +687,24 @@ mod tests {
     }
 
     #[test]
+    fn test_take_cstr_value_owns_cleanup_after_return() {
+        let source = CString::new("temporary native return").unwrap();
+        // SAFETY: source is live and null-terminated for the copy.
+        let value = unsafe { cstr_to_value(source.as_ptr()) };
+        // SAFETY: value is a copied CString owned by the FFI conversion.
+        let reclaimed = unsafe { take_cstr_value(value) }.expect("owned C string");
+        drop(source);
+        assert_eq!(reclaimed.to_bytes(), b"temporary native return");
+        // Dropping reclaimed releases the temporary even on an early return.
+    }
+
+    #[test]
+    fn test_take_cstr_value_nil_is_not_owned() {
+        // SAFETY: nil is explicitly rejected without reconstructing a CString.
+        assert!(unsafe { take_cstr_value(Value::nil()) }.is_none());
+    }
+
+    #[test]
     fn test_borrowed_cstr_copy_outlives_borrowed_source() {
         let copy = {
             let source = CString::new("borrowed source").unwrap();
