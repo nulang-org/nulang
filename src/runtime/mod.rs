@@ -6624,6 +6624,29 @@ impl Runtime {
         }
     }
 
+    /// Atomically cancel a local reference monitor and remove its pending DOWN.
+    ///
+    /// Returns the number of queued DOWN messages removed (normally zero or
+    /// one). This also works after the target exited and the live registration
+    /// was retired, provided the watcher still owns its mailbox. An in-flight
+    /// selective receive rejects flushing rather than invalidating its match.
+    /// Like monitor_ref, this is local-only and does not provide distributed
+    /// cancellation or durable delivery guarantees.
+    pub fn demonitor_ref_flush(
+        &mut self,
+        watcher: u64,
+        reference: MonitorRef,
+    ) -> Result<usize, &'static str> {
+        let actor = self
+            .actors
+            .get_mut(&watcher)
+            .filter(|actor| actor.state != ActorState::Terminated)
+            .ok_or("monitor DOWN flush requires a live watcher")?;
+        let removed = actor.mailbox.flush_monitor_down(watcher, reference.0)?;
+        let _ = self.demonitor_ref(watcher, reference);
+        Ok(removed)
+    }
+
     /// Retire the monitors attached to an exiting local actor, whether as
     /// watcher or target. Deliver each target-side DOWN at most once.
     pub(crate) fn retire_monitor_refs_on_exit(&mut self, actor_id: u64, reason: &ExitReason) {
