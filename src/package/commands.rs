@@ -840,6 +840,22 @@ fn prepare_package_with_lock(locked: bool) -> NuResult<PathBuf> {
         }
     }
 
+    // A missing or invalid lockfile must fail before the resolver can touch
+    // any local dependency cache or make a remote network request.
+    let existing_lock = if locked {
+        let lock_path = root.join(LOCKFILE_FILE);
+        Some(Lockfile::load(&root).map_err(|e| NuError::PackageError {
+            msg: format!(
+                "--locked requires a readable, valid {}: {}",
+                lock_path.display(),
+                e
+            ),
+            span: Span::default(),
+        })?)
+    } else {
+        None
+    };
+
     eprintln!("  Resolving dependencies...");
     let resolution = resolve(&root, &manifest).map_err(|e| NuError::PackageError {
         msg: format!(
@@ -853,15 +869,7 @@ fn prepare_package_with_lock(locked: bool) -> NuResult<PathBuf> {
 
     let lock_path = root.join(LOCKFILE_FILE);
     let resolved_lock = resolution.to_lockfile();
-    if locked {
-        let existing_lock = Lockfile::load(&root).map_err(|e| NuError::PackageError {
-            msg: format!(
-                "--locked requires a readable, valid {}: {}",
-                lock_path.display(),
-                e
-            ),
-            span: Span::default(),
-        })?;
+    if let Some(existing_lock) = existing_lock {
         if existing_lock.package != resolved_lock.package {
             return Err(NuError::PackageError {
                 msg: format!(
