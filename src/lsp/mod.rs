@@ -3928,6 +3928,33 @@ mod lsp_tests {
     }
 
     #[test]
+    fn test_diagnostics_reports_non_exhaustive_bool_as_warning() {
+        let source = "fn choose(value: Bool) -> Int { match value { | true => 1 } }";
+        let diagnostics = NulangLanguageServer::compute_diagnostics(source).diagnostics;
+        assert!(
+            diagnostics.iter().any(|d| {
+                d.severity == Some(DiagnosticSeverity::WARNING)
+                    && d.code == Some(NumberOrString::String("W0201".to_string()))
+                    && d.message.contains("false")
+            }),
+            "missing W0201 LSP warning: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn test_diagnostics_reports_redundant_match_arm_as_warning() {
+        let source = "fn choose(value: Bool) -> Int { match value { | _ => 1 | false => 2 } }";
+        let diagnostics = NulangLanguageServer::compute_diagnostics(source).diagnostics;
+        assert!(
+            diagnostics.iter().any(|d| {
+                d.severity == Some(DiagnosticSeverity::WARNING)
+                    && d.code == Some(NumberOrString::String("W0202".to_string()))
+            }),
+            "missing W0202 LSP warning: {diagnostics:?}"
+        );
+    }
+
+    #[test]
     fn test_diagnostics_frontend_returns_parsed_ast() {
         let source = "fn main() -> Int { 42 }";
         let result = NulangLanguageServer::compute_diagnostics(source);
