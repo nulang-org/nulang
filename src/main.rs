@@ -801,6 +801,7 @@ fn main() {
         return;
     }
     if let Some(path) = opts.check_file {
+        let mut check_warnings = Vec::new();
         let source = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(e) => {
@@ -815,12 +816,13 @@ fn main() {
             opts.all_errors,
             &opts.with_capabilities,
             opts.deny_warnings,
+            &mut check_warnings,
         ) {
             let code = exit_code(&e);
             if opts.json {
                 // Machine-readable mode: the JSON report is the ONLY output on
                 // stdout; nothing human-rendered is printed.
-                let diags = if opts.all_errors {
+                let mut diags = if opts.all_errors {
                     let all = collect_all_frontend_errors(&source, Some(&path));
                     if all.is_empty() {
                         nulang::json_diagnostics::diagnostics_from_error(&e)
@@ -832,6 +834,7 @@ fn main() {
                 } else {
                     nulang::json_diagnostics::diagnostics_from_error(&e)
                 };
+                diags.extend(check_warnings.iter().map(nulang::json_diagnostics::diagnostic_from_warning));
                 let report =
                     nulang::json_diagnostics::JsonReport::new("check", Some(path.clone()), diags);
                 print!("{}", report.to_json_string());
@@ -850,8 +853,12 @@ fn main() {
             std::process::exit(code);
         }
         if opts.json {
+            let warnings = check_warnings
+                .iter()
+                .map(nulang::json_diagnostics::diagnostic_from_warning)
+                .collect();
             let report =
-                nulang::json_diagnostics::JsonReport::new("check", Some(path.clone()), Vec::new());
+                nulang::json_diagnostics::JsonReport::new("check", Some(path.clone()), warnings);
             print!("{}", report.to_json_string());
         } else {
             println!("Type check passed.");
@@ -894,6 +901,7 @@ fn main() {
                 opts.verbose,
                 &opts.with_capabilities,
                 opts.deny_warnings,
+                None,
             ) {
                 Ok((ast, _)) => {
                     let mut checker = nulang::effect_checker::EffectChecker::new();
@@ -1614,6 +1622,7 @@ fn run_frontend(
     verbose: bool,
     with_capabilities: &[String],
     deny_warnings: bool,
+    mut warnings_out: Option<&mut Vec<nulang::types::NuWarning>>,
 ) -> NuResult<(nulang::ast::AstModule, nulang::typechecker::TypeChecker)> {
     let ps = nulang::prelude_source::PRELUDE_SOURCE;
     let mut pl = Lexer::new(ps);
@@ -1629,6 +1638,9 @@ fn run_frontend(
     // Surface non-fatal frontend warnings (e.g. RFC 0015 deprecations).
     // Warnings never fail compilation unless --deny-warnings is passed.
     let warnings = parser.take_warnings();
+    if let Some(collected) = warnings_out.as_deref_mut() {
+        collected.extend(warnings.iter().cloned());
+    }
     if !warnings.is_empty() {
         let use_color = std::io::stderr().is_terminal();
         for w in &warnings {
@@ -1679,6 +1691,9 @@ fn run_frontend(
     // 3. Type check
     let mut type_checker = TypeChecker::new();
     let module_type = type_checker.check_module(&ast)?;
+    if let Some(collected) = warnings_out.as_deref_mut() {
+        collected.extend(type_checker.warnings.iter().cloned());
+    }
     // Match coverage is warning-only under the 1.x compatibility contract.
     // Strict builds opt into rejection through the existing warning policy.
     if !type_checker.warnings.is_empty() {
@@ -1819,7 +1834,7 @@ fn run_source(
     deny_warnings: bool,
 ) -> NuResult<()> {
     let (ast, type_checker) =
-        run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
+        run_frontend(source, file_path, verbose, with_capabilities, deny_warnings, None)?;
     match backend {
         #[cfg(feature = "wasm-backend")]
         "wasm" => {
@@ -2371,8 +2386,16 @@ fn check_source(
     _all_errors: bool,
     with_capabilities: &[String],
     deny_warnings: bool,
+    warnings_out: &mut Vec<nulang::types::NuWarning>,
 ) -> NuResult<()> {
-    let (_ast, _tc) = run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
+    let (_ast, _tc) = run_frontend(
+        source,
+        file_path,
+        verbose,
+        with_capabilities,
+        deny_warnings,
+        Some(warnings_out),
+    )?;
 
     if verbose {
         println!("Effect check passed.");
@@ -2467,7 +2490,7 @@ fn compile_source_to_nbc(
     behavior_package_version: Option<&str>,
 ) -> NuResult<()> {
     let (mut ast, type_checker) =
-        run_frontend(source, None, false, with_capabilities, deny_warnings)?;
+        run_frontend(source, None, false, with_capabilities, deny_warnings, None)?;
 
     // Optional web-framework pass: rewrite HTML for signals/actions and emit the
     // generic client-side micro-runtime. This runs after effect checking so
@@ -2843,7 +2866,7 @@ mod tests {
             }
         "#;
 
-        let (ast, type_checker) = run_frontend(source, None, false, &[], false)
+        let (ast, type_checker) = run_frontend(source, None, false, &[], false, None)
             .expect("frontend should accept the actor program");
         let module = compile_with_new_pipeline(&ast, "test", &type_checker)
             .expect("actor program should compile");
@@ -2879,7 +2902,7 @@ mod tests {
             }
         "#;
 
-        let (ast, type_checker) = run_frontend(source, None, false, &[], false)
+        let (ast, type_checker) = run_frontend(source, None, false, &[], false, None)
             .expect("frontend should accept persistent actor program");
         let module = compile_with_new_pipeline(&ast, "test", &type_checker)
             .expect("persistent actor program should compile");
@@ -2933,7 +2956,7 @@ mod tests {
                 c
             }
         "#;
-        let (ast, type_checker) = run_frontend(source, None, false, &[], false)
+        let (ast, type_checker) = run_frontend(source, None, false, &[], false, None)
             .expect("frontend should accept the actor program");
         let module = compile_with_new_pipeline(&ast, "test", &type_checker)
             .expect("actor program should compile");
