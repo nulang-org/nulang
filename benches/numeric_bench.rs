@@ -5,9 +5,9 @@
 //! Compare identical sources on the interpreter, cold JIT-enabled VM, and
 //! repeated JIT-enabled VM; "warm" does not imply SIMD was actually emitted.
 //!
-//! Run: cargo bench --bench bench_main -- numeric_kernel
-//! Minimal profile: cargo bench --locked --no-default-features --bench bench_main -- numeric_kernel
-//! Native JIT profile: cargo bench --locked --no-default-features --features native-codegen --bench bench_main -- numeric_kernel
+//! Run: cargo bench --locked --features numeric-bench --bench bench_main -- numeric_kernel
+//! Minimal profile: cargo bench --locked --no-default-features --features numeric-bench --bench bench_main -- numeric_kernel
+//! Native JIT profile: cargo bench --locked --no-default-features --features native-codegen,numeric-bench --bench bench_main -- numeric_kernel
 
 use criterion::{black_box, criterion_group, BatchSize, BenchmarkId, Criterion, Throughput};
 use nulang::bytecode::CodeModule;
