@@ -342,9 +342,12 @@ Functions use `perform` internally to access these effectful operations.
 | `ends_with` | `fn ends_with(s, suffix)` | True when `s` ends with `suffix`. |
 | `contains` | `fn contains(s, sub)` | True when `s` contains the substring `sub`. |
 | `index_of` | `fn index_of(s, ch)` | First index of substring `ch` in `s`, or `-1` if not found. |
+| `index_of_from` | `fn index_of_from(s, needle, start)` | Find a literal substring at or after byte offset `start`, or `-1` if absent/invalid. Empty needle matches at a valid start offset. |
 | `repeat` | `fn repeat(s, n)` | Repeat string `s` `n` times. |
 | `trim` | `fn trim(s)` | Remove leading and trailing whitespace (spaces, tabs, newlines, CR). |
 | `split` | `fn split(s, delim)` | Split string `s` by a delimiter character (a 1-char string). Returns an array of substrings. |
+| `split_literal` | `fn split_literal(s, delimiter)` | Split on a literal string, preserving empty fields. Empty delimiter produces `[s]`. |
+| `split_once` | `fn split_once(s, delimiter)` | Return `Some((before, after))` around the first literal delimiter, otherwise `None`. Empty delimiter matches the start. |
 | `join` | `fn join(parts, sep)` | Join an array of strings with a separator string. |
 | `replace` | `fn replace(s, from, to)` | Replace all occurrences of substring `from` with `to` in `s`. |
 
@@ -364,6 +367,17 @@ let i = index_of("hello", "l")            // 2
 let r = repeat("ab", 3)                   // "ababab"
 let t = trim("  hi  ")                    // "hi"
 let parts = split("a,b,c", ",")           // ["a", "b", "c"]
+let fields = split_literal("a::b::", "::") // ["a", "b", ""]
+let pair = split_once("type:agent", ":")     // Some(("type", "agent"))
 let j = join(["a", "b", "c"], "-")         // "a-b-c"
 let rep = replace("hello world", "o", "x") // "hellx wxrld"
 ```
+
+**Literal matching semantics:** `split_literal` and `split_once` are not
+regular expressions, perform no implicit conversions, and preserve the original
+string's byte content. Search indices are **UTF-8 byte offsets**, not Unicode
+scalar or grapheme indices. Because splits occur at complete, valid UTF-8
+delimiter matches, returned slices remain on character boundaries. Use
+`split_literal` rather than `split` for multi-character separators. These
+functions construct an array or pair; they are not streaming parsers and do
+not yet implement regex captures or Raku-style grammars.
