@@ -79,16 +79,29 @@ pub fn run(args: &[String]) -> NuResult<()> {
         Some("build") => {
             let web = args.get(1).map(String::as_str) == Some("--web");
             if web {
-                cmd_build_web()
-            } else {
-                let json = args[1..].iter().any(|a| a == "--json");
-                if args.len() > 1 && !json {
+                if args.len() != 2 {
                     return Err(NuError::PackageError {
-                        msg: format!("unknown flag '{}' for nula build", args[1]),
+                        msg: format!("unsupported flag '{}' for nula build --web", args[2]),
                         span: Span::default(),
                     });
                 }
-                cmd_build(json)
+                cmd_build_web()
+            } else {
+                let mut json = false;
+                let mut locked = false;
+                for arg in args.iter().skip(1) {
+                    match arg.as_str() {
+                        "--json" => json = true,
+                        "--locked" => locked = true,
+                        other => {
+                            return Err(NuError::PackageError {
+                                msg: format!("unknown flag '{}' for nula build", other),
+                                span: Span::default(),
+                            });
+                        }
+                    }
+                }
+                cmd_build_with_lock(json, locked)
             }
         }
         Some("build-wasm") => cmd_build_wasm(),
@@ -766,6 +779,13 @@ button {
 /// Resolve the package in the current directory, write `Nulang.lock`, and
 /// return the entry point path.
 fn prepare_package() -> NuResult<PathBuf> {
+    prepare_package_with_lock(false)
+}
+
+/// In locked mode, compare the resolved package pins to an existing lockfile
+/// without changing that file. This mode is not offline: remote dependencies
+/// may still need to be fetched by the resolver.
+fn prepare_package_with_lock(locked: bool) -> NuResult<PathBuf> {
     let root = package_root()?;
     let manifest_path = root.join(MANIFEST_FILE);
     let manifest = Manifest::load(&root).map_err(|e| NuError::PackageError {
@@ -832,13 +852,31 @@ fn prepare_package() -> NuResult<PathBuf> {
     })?;
 
     let lock_path = root.join(LOCKFILE_FILE);
-    resolution
-        .to_lockfile()
-        .save(&root)
-        .map_err(|e| NuError::PackageError {
+    let resolved_lock = resolution.to_lockfile();
+    if locked {
+        let existing_lock = Lockfile::load(&root).map_err(|e| NuError::PackageError {
+            msg: format!(
+                "--locked requires a readable, valid {}: {}",
+                lock_path.display(),
+                e
+            ),
+            span: Span::default(),
+        })?;
+        if existing_lock.package != resolved_lock.package {
+            return Err(NuError::PackageError {
+                msg: format!(
+                    "--locked lockfile is out of date: {} does not match resolved dependencies; run 'nulang nula build' to update it",
+                    lock_path.display()
+                ),
+                span: Span::default(),
+            });
+        }
+    } else {
+        resolved_lock.save(&root).map_err(|e| NuError::PackageError {
             msg: format!("failed to write {}: {}", lock_path.display(), e),
             span: Span::default(),
         })?;
+    }
 
     let entry = root.join(&manifest.package.entry);
     if !entry.exists() {
@@ -1064,7 +1102,7 @@ fn build_module_path() -> Option<String> {
 /// `nula build`: resolve dependencies, write the lockfile, type-check entry.
 /// `nula build`: resolve dependencies, write the lockfile, type-check and
 /// compile to a .nbc artifact in .nula/dist/.
-fn cmd_build(json: bool) -> NuResult<()> {
+fn cmd_build_with_lock(json: bool, locked: bool) -> NuResult<()> {
     let root = package_root()?;
     let manifest_path = root.join(MANIFEST_FILE);
     let manifest = Manifest::load(&root).map_err(|e| NuError::PackageError {
@@ -1074,7 +1112,7 @@ fn cmd_build(json: bool) -> NuResult<()> {
     let name = manifest.package.name.clone();
     let version = manifest.package.version.clone();
 
-    let entry = prepare_package()?;
+    let entry = prepare_package_with_lock(locked)?;
     let entry_str = entry.to_string_lossy().into_owned();
 
     if json {
