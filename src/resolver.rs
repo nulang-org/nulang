@@ -39,6 +39,25 @@ fn resolve_imports_with_origins(
         IMPORT_CACHE.with(|c| c.borrow_mut().clear());
     }
 
+    // Until qualified symbol lookup exists, never treat `import X as alias`
+    // like a legacy import: flattening would silently leak wrong bindings.
+    if let Some((alias, span)) = module.decls.iter().find_map(|decl| match decl {
+        Decl::Import {
+            alias: Some(alias),
+            span,
+            ..
+        } => Some((alias.as_str(), *span)),
+        _ => None,
+    }) {
+        return Err(NuError::parse_error(
+            format!(
+                "qualified imports are not yet supported by module resolution (alias '{}'); use an unqualified import or wait for namespace resolution",
+                alias
+            ),
+            span,
+        ));
+    }
+
     let canonical_file = current_file
         .canonicalize()
         .unwrap_or_else(|_| current_file.to_path_buf());
@@ -539,6 +558,16 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn unresolved_import_alias_fails_closed_before_loading_module() {
+        // A parser accepting the syntax must not accidentally resolve this
+        // as an ordinary unqualified import before namespace binding exists.
+        let err = resolve_fixture("import foreign as source\n", &[]).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("qualified imports"), "{msg}");
+        assert!(!msg.contains("cannot read"), "{msg}");
     }
 
     #[test]

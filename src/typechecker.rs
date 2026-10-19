@@ -1771,6 +1771,17 @@ impl TypeChecker {
                 let final_ty = apply_subst(&val_ty, &s1);
                 Ok((s1, final_ty))
             }
+            Decl::Import {
+                alias: Some(alias),
+                span,
+                ..
+            } => Err(NuError::parse_error(
+                format!(
+                    "qualified imports are not yet supported by module resolution (alias '{}')",
+                    alias
+                ),
+                *span,
+            )),
             Decl::Import { .. } => Ok((vec![], Type::unit())),
             Decl::Database { .. } => Ok((vec![], Type::unit())),
             Decl::Given {

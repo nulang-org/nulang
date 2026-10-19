@@ -772,10 +772,14 @@ pub enum Decl {
         decls: Vec<Decl>,
         span: Span,
     },
-    /// Import: import "path" or import Module.{name1, name2}
+    /// Import: `import Module` or a proposed `import Module as Alias`.
+    ///
+    /// Aliased imports are parsed, but must be rejected by semantic passes
+    /// until qualified symbol resolution is implemented end-to-end.
     Import {
         path: String,
         items: Vec<String>,
+        alias: Option<String>,
         span: Span,
     },
     /// Foreign function interface block: extern "lib" { fn f(x: T) -> R }

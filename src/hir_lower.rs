@@ -418,7 +418,7 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
             decls: decls.iter().map(|d| lower_decl(d, tools)).collect(),
             span: *span,
         },
-        Decl::Import { path, items, span } => hir::Decl::Import {
+        Decl::Import { path, items, span, .. } => hir::Decl::Import {
             path: path.clone(),
             items: items.clone(),
             span: *span,
