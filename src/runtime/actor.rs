@@ -994,7 +994,6 @@ impl Drop for Actor {
     }
 }
 
-
 #[cfg(test)]
 mod orca_actor_stored_root_visitor_tests {
     use super::*;
