@@ -92,6 +92,18 @@ pub fn run(args: &[String]) -> NuResult<()> {
             }
         }
         Some("build-wasm") => cmd_build_wasm(),
+        Some("plan") => {
+            if args.len() > 2 || (args.len() == 2 && args[1] != "--json") {
+                return Err(NuError::PackageError {
+                    msg: "usage: nula plan [--json]".into(),
+                    span: Span::default(),
+                });
+            }
+            let root = package_root()?;
+            let plan = crate::package::build_plan::inspect(&root)?;
+            println!("{}", plan);
+            Ok(())
+        },
         Some("test") => {
             let mut filter: Option<&str> = None;
             let mut verbose = false;
@@ -266,7 +278,7 @@ pub fn run(args: &[String]) -> NuResult<()> {
 
         Some(other) => Err(NuError::PackageError {
             msg: format!(
-                "unknown nula subcommand '{}' (expected new, init, build, build-wasm, test, run, add, remove, publish, deploy, watch, doc, list, or clean)",
+                "unknown nula subcommand '{}' (expected new, init, build, build-wasm, plan, test, run, add, remove, publish, deploy, watch, doc, list, or clean)",
                 other
             ),
             span: Span::default(),
@@ -290,6 +302,7 @@ fn print_usage() {
     println!("  init          Scaffold a new package in the current directory");
     println!("  build         Build .nbc + RFC 0020 behavior sidecar in .nula/dist/");
     println!("  build-wasm    Build package to .wasm + .cwasm in .nula/dist/");
+    println!("  plan [--json] Inspect existing source/lock pins without building or modifying files");
     println!("  test [--filter <substr>] [--verbose|-v] [--watch|-w]  Run .nula test files");
     println!("  run           Build and run the package entry point");
     println!("  run --watch   Build and re-run on source changes");
