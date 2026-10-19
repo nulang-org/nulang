@@ -1702,7 +1702,8 @@ fn guess_content_type(path: &Path) -> &'static str {
 }
 
 /// `nula test [--filter <substr>] [--verbose|-v]`: discover and run `.nula`
-/// test files under the package's `tests/` directory, reporting pass/fail.
+/// test files or `fn test_*` cases under `tests/`, reporting pass/fail.
+/// Filters match either a filename, qualified case name, or function name.
 ///
 /// Each test file is executed via the `nulang` exe in the current package
 /// (same process as `nula run`). A test PASSes if it runs to completion
@@ -1720,13 +1721,6 @@ fn cmd_test(filter: Option<&str>, verbose: bool, json: bool) -> NuResult<()> {
         Ok(entries) => entries
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| p.extension().is_some_and(|ext| ext == "nula"))
-            .filter(|p| {
-                filter.map_or(true, |f| {
-                    p.file_stem()
-                        .and_then(|s| s.to_str())
-                        .map_or(false, |s| s.contains(f))
-                })
-            })
             .collect(),
         Err(_) => Vec::new(),
     };
@@ -1750,46 +1744,72 @@ fn cmd_test(filter: Option<&str>, verbose: bool, json: bool) -> NuResult<()> {
     }
 
     let mut tests: Vec<TestCase> = Vec::new();
-    let temp_dir = std::env::temp_dir().join("nula_test");
-    let _ = std::fs::create_dir_all(&temp_dir);
+    // Unique to this invocation, preventing concurrent packages from sharing
+    // wrappers. File names below also distinguish duplicate function names.
+    let temp_dir = std::env::temp_dir().join(format!(
+        "nula_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir(&temp_dir).map_err(|err| NuError::PackageError {
+        msg: format!("cannot create test wrapper directory: {err}"),
+        span: Span::default(),
+    })?;
 
     for file in &test_files {
-        let content = match std::fs::read_to_string(file) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
+        let content = std::fs::read_to_string(file).map_err(|err| NuError::PackageError {
+            msg: format!("cannot read test file {}: {err}", file.display()),
+            span: Span::default(),
+        })?;
         let test_fns = discover_test_functions(&content);
         let relative = file
             .strip_prefix(&tests_dir.parent().unwrap_or(&tests_dir))
             .unwrap_or(file);
+        let matches_file = filter.is_none_or(|needle| {
+            file.file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| stem.contains(needle))
+        });
 
         if test_fns.is_empty() {
-            // No test_* functions: run whole file as one test
-            tests.push(TestCase {
-                display: relative.display().to_string(),
-                file_to_run: file.clone(),
-                is_temp: false,
-            });
+            // No test_* functions: run whole file as one test.
+            if matches_file {
+                tests.push(TestCase {
+                    display: relative.display().to_string(),
+                    file_to_run: file.clone(),
+                    is_temp: false,
+                });
+            }
         } else {
             if verbose {
                 println!("--- {} ---", relative.display());
                 println!("  discovered: {}", test_fns.join(", "));
             }
-            // Strip fn main() for per-function wrappers
+            // Strip fn main() for per-function wrappers.
             let stripped = strip_main_function(&content);
             for fn_name in &test_fns {
+                let display = format!("{}::{}", relative.display(), fn_name);
+                if !filter.is_none_or(|needle| {
+                    matches_file || fn_name.contains(needle) || display.contains(needle)
+                }) {
+                    continue;
+                }
                 let wrapper = format!(
                     "{}{}\nfn main() {{ {}() }}\n",
                     stripped,
                     if stripped.ends_with('\n') { "" } else { "\n" },
                     fn_name
                 );
-                let temp_path = temp_dir.join(format!("test_{}.nula", fn_name));
-                if std::fs::write(&temp_path, &wrapper).is_err() {
-                    continue;
-                }
+                let temp_path = temp_dir.join(format!("case_{:06}.nula", tests.len()));
+                std::fs::write(&temp_path, &wrapper).map_err(|err| NuError::PackageError {
+                    msg: format!("cannot write test wrapper {}: {err}", temp_path.display()),
+                    span: Span::default(),
+                })?;
                 tests.push(TestCase {
-                    display: fn_name.clone(),
+                    display,
                     file_to_run: temp_path,
                     is_temp: true,
                 });
@@ -1916,24 +1936,26 @@ fn cmd_test_watch(filter: Option<&str>, verbose: bool) -> NuResult<()> {
     }
 }
 
-/// Find all `fn test_*` function names in a source string.
+/// Find top-level `fn test_*` declarations, never matching comments, strings,
+/// or nested lambdas. Invalid source stays a whole-file test so the compiler
+/// reports the real lexical/parse error instead of silently skipping the file.
 fn discover_test_functions(source: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut rest = source;
-    while let Some(pos) = rest.find("fn test_") {
-        let start = pos + 3; // skip "fn "
-        let after_fn = &rest[start..];
-        // Find end of identifier: whitespace or '('
-        let end = after_fn
-            .find(|c: char| c.is_whitespace() || c == '(')
-            .unwrap_or(after_fn.len());
-        let name = after_fn[..end].trim().to_string();
-        if !name.is_empty() {
-            names.push(name);
-        }
-        rest = &after_fn[end..];
-    }
-    names
+    let tokens = match crate::lexer::Lexer::new(source).lex() {
+        Ok(tokens) => tokens,
+        Err(_) => return Vec::new(),
+    };
+    let module = match crate::parser::Parser::new(tokens).parse_module() {
+        Ok(module) => module,
+        Err(_) => return Vec::new(),
+    };
+    module
+        .decls
+        .into_iter()
+        .filter_map(|decl| match decl {
+            crate::ast::Decl::Function { name, .. } if name.starts_with("test_") => Some(name),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Strip the `fn main() { ... }` block from source, keeping everything else.
