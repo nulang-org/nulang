@@ -3968,6 +3968,31 @@ impl VM {
         }
         status
     }
+    /// Produce an assertion error with the compiler's source-line metadata.
+    ///
+    /// The VM advances the frame PC before dispatching Perform, so look up
+    /// pc - 1. The information comes from the module's existing debug table:
+    /// no source parsing, new bytecode fields or test-specific ABI required.
+    /// Old/minimal artifacts without line data keep the historic message.
+    fn assertion_failure(
+        &self,
+        frame_idx: usize,
+        module_idx: usize,
+        message: String,
+    ) -> NuError {
+        let source_line = self
+            .frames
+            .get(frame_idx)
+            .and_then(|frame| frame.pc.checked_sub(1))
+            .and_then(|pc| self.modules.get(module_idx)?.line_at(pc))
+            .filter(|line| *line > 0);
+        let message = match source_line {
+            Some(line) => format!("{message} (source line {line})"),
+            None => message,
+        };
+        NuError::runtime_error(message, Span::default())
+    }
+
     fn step_perform(
         &mut self,
         instr: Instruction,
@@ -4005,9 +4030,10 @@ impl VM {
                         self.value_to_string(module_idx, msg_val)
                     };
                     if !cond {
-                        return Err(NuError::runtime_error(
+                        return Err(self.assertion_failure(
+                            frame_idx,
+                            module_idx,
                             format!("assertion failed: {}", msg),
-                            Span::default(),
                         ));
                     }
                     self.frames[frame_idx].regs[dst_reg as usize] = Value::unit();
@@ -4025,9 +4051,10 @@ impl VM {
                         .and_then(|v| v.as_int())
                         .unwrap_or(0);
                     if a != b {
-                        return Err(NuError::runtime_error(
+                        return Err(self.assertion_failure(
+                            frame_idx,
+                            module_idx,
                             format!("assertion failed: expected {}, got {}", b, a),
-                            Span::default(),
                         ));
                     }
                     self.frames[frame_idx].regs[dst_reg as usize] = Value::unit();
@@ -4040,9 +4067,10 @@ impl VM {
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
                     if !cond {
-                        return Err(NuError::runtime_error(
+                        return Err(self.assertion_failure(
+                            frame_idx,
+                            module_idx,
                             "assertion failed".to_string(),
-                            Span::default(),
                         ));
                     }
                     self.frames[frame_idx].regs[dst_reg as usize] = Value::unit();
