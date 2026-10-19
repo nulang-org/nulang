@@ -190,7 +190,8 @@ fn proposal_at_sequence(sequence: u64, lane: usize, epoch: u64) -> DurableTransi
 #[test]
 fn new_activation_fences_stale_writer_without_partial_commits() {
     let mut store = MemoryStore::new();
-    store.commit_transition(proposal(&store, 0, 1)).unwrap();
+    let initial = proposal(&store, 0, 1);
+    store.commit_transition(initial).unwrap();
     let stale = proposal(&store, 0, 1);
     let promoted = proposal(&store, 1, 2);
 
