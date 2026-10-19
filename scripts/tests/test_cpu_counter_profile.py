@@ -1,5 +1,6 @@
 """Contract tests for the opt-in native CPU counter profiler (no perf needed)."""
 import importlib.util
+import hashlib
 import json
 import pathlib
 import sys
@@ -37,6 +38,16 @@ class CounterParsingTests(unittest.TestCase):
                 profile.main(args)
             self.assertEqual(exited.exception.code, 2)
 
+    def test_resolvable_executable_is_fingerprinted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = pathlib.Path(tmp) / "benchmark"
+            binary.write_bytes(b"benchmark-v1")
+            expected = hashlib.sha256(b"benchmark-v1").hexdigest()
+            self.assertEqual(profile.executable_identity([str(binary)]), {
+                "path": str(binary.resolve()), "sha256": expected,
+            })
+            self.assertIsNone(profile.executable_identity([str(binary) + "-missing"]))
+
     def test_missing_perf_fails_before_creating_output(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(profile.shutil, "which", return_value=None):
             dest = pathlib.Path(tmp) / "metrics"
@@ -64,6 +75,7 @@ else:
             saved = json.loads((dest / "manifest.json").read_text())
             self.assertEqual(saved, result)
             self.assertEqual(saved["source_sha"], "012345")
+            self.assertEqual(saved["executable"]["sha256"], hashlib.sha256(pathlib.Path(sys.executable).read_bytes()).hexdigest())
             self.assertEqual(len(saved["runs"]), 2)
             self.assertEqual(saved["runs"][0]["counters"]["cycles"], 1000)
             with mock.patch.object(profile.shutil, "which", return_value=str(fake)):
