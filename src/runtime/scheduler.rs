@@ -392,14 +392,15 @@ impl Scheduler {
 
     /// Pop the next actor for a worker, using the configured priority order.
     ///
-    /// For each priority band in High → Normal → Low order:
+    /// For each band in the selected order:
     /// 1. consume worker-local work,
     /// 2. batch from that priority's global injector,
     /// 3. steal from peers in that priority.
     ///
-    /// This ordering is the key invariant that makes batch transfer safe: a
-    /// previously batched Low task can never run before currently available
-    /// High or Normal work.
+    /// Strict schedulers always try High, then Normal, then Low. Explicit
+    /// weighted schedulers prefer one band per turn, including Low or Normal
+    /// ahead of High on their assigned turns. Each band's local/global
+    /// queue ordering is preserved.
     pub fn next_task(&self, worker_idx: usize) -> Option<u64> {
         let mut steal_attempts = 0u64;
 
@@ -432,8 +433,8 @@ impl Scheduler {
     /// The current runtime has exactly one owning scheduler thread per shard.
     /// It therefore has no useful peers to steal from even though the
     /// scheduler is provisioned with multiple generic worker slots. Skipping
-    /// peer scans here removes three empty High-band probes from the common
-    /// Normal-priority path while retaining batch transfer and strict priority.
+    /// peer scans here removes unused work on the common owner path, while
+    /// retaining priority-aware batching and the selected service policy.
     fn next_owner_task(&self, worker_idx: usize) -> Option<u64> {
         for priority in self.priority_order() {
             if let Some(task) = self.pop_local(worker_idx, priority) {
@@ -783,6 +784,21 @@ mod scheduler_tests {
             );
         }
         assert!(s.dequeue().is_some_and(|id| id < 100));
+    }
+
+    #[test]
+    fn fair_turn_falls_back_to_high_when_preferred_queue_is_empty() {
+        let s = Scheduler::new_with_fair_priority(1, PriorityWeights::new(1, 1, 1))
+            .expect("valid weights");
+        for id in 0..12 {
+            s.enqueue_with_priority(100 + id, ActorPriority::High);
+        }
+        for _ in 0..9 {
+            assert!(
+                s.dequeue().is_some_and(|id| id >= 100),
+                "empty preferred priority must not leave runnable high actors idle"
+            );
+        }
     }
 
     #[test]
