@@ -1958,34 +1958,54 @@ fn discover_test_functions(source: &str) -> Vec<String> {
         .collect()
 }
 
-/// Strip the `fn main() { ... }` block from source, keeping everything else.
+/// Move the source's original entry point out of the way when synthesizing
+/// a test-case main. Only rename an actual top-level declaration, using
+/// source spans from the lexer and parser: string/comment contents and braces
+/// inside string literals are never mistaken for function boundaries.
+///
+/// The old substring-and-brace scanner could delete arbitrary source or
+/// consume later functions when main had an expression body. Keeping the
+/// original body under an inert name avoids guessing where it ends. It is
+/// still typechecked, but never invoked by the generated test entry point.
 fn strip_main_function(source: &str) -> String {
-    if let Some(pos) = source.find("fn main") {
-        // Find the opening brace after "fn main"
-        if let Some(brace_start) = source[pos..].find('{') {
-            let abs_brace = pos + brace_start;
-            // Count braces to find matching close
-            let mut depth = 0;
-            let mut end = abs_brace;
-            for (i, ch) in source[abs_brace..].char_indices() {
-                match ch {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = abs_brace + i + 1;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            let before = &source[..pos];
-            let after = &source[end..];
-            return format!("{}{}", before, after);
+    let tokens = match crate::lexer::Lexer::new(source).lex() {
+        Ok(tokens) => tokens,
+        Err(_) => return source.to_string(),
+    };
+    let module = match crate::parser::Parser::new(tokens.clone()).parse_module() {
+        Ok(module) => module,
+        Err(_) => return source.to_string(),
+    };
+    let Some(start) = module.decls.iter().find_map(|decl| match decl {
+        crate::ast::Decl::Function { name, span, .. } if name == "main" => {
+            Some(span.start)
         }
+        _ => None,
+    }) else {
+        return source.to_string();
+    };
+    let Some(fn_index) = tokens.iter().position(|token| {
+        token.span.start == start && matches!(token.kind, crate::lexer::TokenKind::Fn)
+    }) else {
+        return source.to_string();
+    };
+    let Some(name) = tokens[fn_index + 1..].iter().find(|token| {
+        !matches!(
+            token.kind,
+            crate::lexer::TokenKind::Newline | crate::lexer::TokenKind::Semicolon
+        )
+    }) else {
+        return source.to_string();
+    };
+    if !matches!(&name.kind, crate::lexer::TokenKind::Ident(value) if value == "main") {
+        return source.to_string();
     }
-    source.to_string()
+    let mut rewritten = source.to_string();
+    rewritten.replace_range(
+        name.span.start as usize..name.span.end as usize,
+        "__nula_test_original_main",
+    );
+    rewritten
 }
 /// Run a test file via `nulang`, capturing stderr so error messages appear
 /// after the test name (avoiding interleaved output).
