@@ -67,7 +67,7 @@ fn main() {
         black_box(sum_copies(&data, range.clone(), 100));
 
         for round in 0..PAIRS {
-            let (view, copy) = if round % 2 == 0 {
+            let (view, copy) = if round.is_multiple_of(2) {
                 (
                     measure(|| sum_views(&data, range.clone(), iterations)),
                     measure(|| sum_copies(&data, range.clone(), iterations)),
@@ -105,10 +105,9 @@ mod tests {
     fn equal_checksums_for_copied_and_read_only_views() {
         let data = NumericBuffer::new(vec![1_i64, -2, 3, 4, -5]);
         let span = 1..4;
-        assert_eq!(
-            sum_views(&data, span.clone(), 7),
-            sum_copies(&data, span, 7)
-        );
+        let view_sum = sum_views(&data, span.clone(), 7);
+        let copy_sum = sum_copies(&data, span, 7);
+        assert_eq!(view_sum, copy_sum);
     }
 
     #[test]
