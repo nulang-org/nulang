@@ -664,6 +664,43 @@ mod tests {
     }
 
     #[test]
+    fn test_borrowed_cstr_copy_outlives_borrowed_source() {
+        let copy = {
+            let source = CString::new("borrowed source").unwrap();
+            borrowed_cstr_to_value(source.as_c_str())
+        };
+
+        let ptr = copy.as_ptr().expect("copied string pointer");
+        // SAFETY: borrowed_cstr_to_value owns an independent CString allocation.
+        assert_eq!(
+            unsafe { CStr::from_ptr(ptr as *const c_char) }.to_bytes(),
+            b"borrowed source"
+        );
+        // SAFETY: pointer was returned by borrowed_cstr_to_value.
+        unsafe { free_cstr_value(copy) };
+    }
+
+    #[test]
+    fn test_borrowed_cstr_copy_does_not_take_input_ownership() {
+        let source = CString::new("still owned by caller").unwrap();
+        let copy = borrowed_cstr_to_value(source.as_c_str());
+        assert_eq!(source.as_c_str().to_bytes(), b"still owned by caller");
+        assert_ne!(
+            copy.as_ptr().expect("copy pointer") as *const c_char,
+            source.as_ptr(),
+            "copy must not reuse the source allocation"
+        );
+        // SAFETY: pointer was returned by borrowed_cstr_to_value.
+        unsafe { free_cstr_value(copy) };
+    }
+
+    #[test]
+    fn test_null_native_cstr_returns_nil() {
+        // SAFETY: null is explicitly supported by cstr_to_value.
+        assert!(unsafe { cstr_to_value(std::ptr::null()) }.is_nil());
+    }
+
+    #[test]
     fn test_marshal_voidptr_roundtrip() {
         let mut n: i64 = 123;
         let p = &mut n as *mut i64 as *mut c_void;
