@@ -416,6 +416,43 @@ mod tests {
     }
 
     #[test]
+    fn rejects_effect_hidden_behind_pipe_to_named_helper() {
+        let ast = parse(
+            r#"
+            fn noisy(x: Int) { perform IO.print("effect"); x }
+            entity Account {
+                version: 2
+                state balance: Int = 0
+                events | Changed(value: Int)
+                migration from 1 to 2 {
+                    state => { 1 |> noisy }
+                }
+            }
+            "#,
+        );
+        let err = check_module(&ast.decls).unwrap_err().to_string();
+        assert!(err.contains("perform IO.print"));
+    }
+
+    #[test]
+    fn permits_pipe_to_pure_named_helper() {
+        let ast = parse(
+            r#"
+            fn twice(x: Int) { x + x }
+            entity Account {
+                version: 2
+                state balance: Int = 0
+                events | Changed(value: Int)
+                migration from 1 to 2 {
+                    state => { 2 |> twice }
+                }
+            }
+            "#,
+        );
+        assert!(check_module(&ast.decls).is_ok());
+    }
+
+    #[test]
     fn permits_replay_stream_emit() {
         let ast = parse(
             r#"
