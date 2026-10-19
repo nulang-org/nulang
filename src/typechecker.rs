@@ -4301,6 +4301,38 @@ mod tests {
     }
 
     #[test]
+    fn test_mgu_rejects_nested_function_effect_difference_even_with_same_ntir_hash() {
+        // NTIR represents function param, result and capability but erases
+        // the effect row, so hash equality is not a proof of type unification.
+        let pure = Type::Function {
+            param: Box::new(Type::int()),
+            ret: Box::new(Type::int()),
+            effect: EffectRow::empty(),
+            cap: Capability::Ref,
+        };
+        let io = Type::Function {
+            param: Box::new(Type::int()),
+            ret: Box::new(Type::int()),
+            effect: EffectRow::Closed(vec![Effect::IO]),
+            cap: Capability::Ref,
+        };
+        let a = Type::Tuple(vec![pure]);
+        let b = Type::Tuple(vec![io]);
+        assert_eq!(a.to_ntir().hash(), b.to_ntir().hash());
+        assert!(mgu(&a, &b, sp()).is_err());
+    }
+
+    #[test]
+    fn test_mgu_rejects_array_vs_singleton_tuple_with_same_ntir_hash() {
+        // The content-addressed NTIR representation is intentionally
+        // lossy: array and tuple constructors can share its encoding.
+        let arr = Type::Array(Box::new(Type::int()));
+        let tuple = Type::Tuple(vec![Type::int()]);
+        assert_eq!(arr.to_ntir().hash(), tuple.to_ntir().hash());
+        assert!(mgu(&arr, &tuple, sp()).is_err());
+    }
+
+    #[test]
     fn test_mgu_rejects_function_with_unaccounted_known_effect() {
         let open_fn = Type::Function {
             param: Box::new(Type::int()),
