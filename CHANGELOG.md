@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Fabric on-demand mailbox scoring — 2026-10-18
+- **Fabric publish admission now reads mailbox pressure only for matching local subscribers**, instead of allocating and populating an all-actor mailbox snapshot on every publish.
+- **Ported the regression and exact-base matched-fixture A/B harness** from #1708 onto current main. Historical unmatched-publish microbenchmarks were favorable; new-head CI and measurements remain the promotion gate.
+
 ### Bounded Nulang Web development-server connections — 2026-10-16
 - **The experimental Web development listener caps active connections at 64**, including SSE, and returns `503` with `Retry-After: 1` when full.
 - **Worker capacity is returned by a scoped RAII lease** after normal completion, panic, or thread-spawn failure. One shared `Arc` route table replaces per-connection clones of compiled route modules.
