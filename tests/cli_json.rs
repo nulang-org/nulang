@@ -325,7 +325,6 @@ fn nula_test_json_all_passing_is_ok() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-
 // Python-inspired collection ergonomics: function filtering, syntactic discovery,
 // and independently executable cases with identical function names.
 #[test]
@@ -348,12 +347,19 @@ fn nula_test_filter_selects_functions_inside_a_file() {
     );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("JSON-only report");
     let tests = v["tests"].as_array().expect("tests array");
-    assert_eq!(tests.len(), 1, "must select a function even when the filename doesn't match");
+    assert_eq!(
+        tests.len(),
+        1,
+        "must select a function even when the filename doesn't match"
+    );
     assert_eq!(tests[0]["name"], "tests/checks.nula::test_success");
     assert_eq!(tests[0]["status"], "ok");
 
     let out = run_nula(&dir, &["test", "--json", "--filter", "test_failure"]);
-    assert!(!out.status.success(), "filtered failing function must run and fail");
+    assert!(
+        !out.status.success(),
+        "filtered failing function must run and fail"
+    );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("JSON-only report");
     let tests = v["tests"].as_array().expect("tests array");
     assert_eq!(tests.len(), 1);
@@ -383,7 +389,11 @@ fn nula_test_ignores_phantom_functions_in_comments_and_strings() {
     );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("JSON-only report");
     let tests = v["tests"].as_array().expect("tests array");
-    assert_eq!(tests.len(), 1, "only the actual function should be collected: {tests:?}");
+    assert_eq!(
+        tests.len(),
+        1,
+        "only the actual function should be collected: {tests:?}"
+    );
     assert_eq!(tests[0]["name"], "tests/checks.nula::test_real");
     assert_eq!(tests[0]["status"], "ok");
     let _ = std::fs::remove_dir_all(&dir);
@@ -396,8 +406,14 @@ fn nula_test_same_named_functions_in_distinct_files_do_not_overwrite_wrappers() 
         &dir,
         "fn main() = 1\n",
         &[
-            ("a.nula", "fn test_same() { perform Test.assert(true, \"a passes\") }\n"),
-            ("b.nula", "fn test_same() { perform Test.assert(false, \"b fails\") }\n"),
+            (
+                "a.nula",
+                "fn test_same() { perform Test.assert(true, \"a passes\") }\n",
+            ),
+            (
+                "b.nula",
+                "fn test_same() { perform Test.assert(false, \"b fails\") }\n",
+            ),
         ],
     );
 
@@ -412,7 +428,6 @@ fn nula_test_same_named_functions_in_distinct_files_do_not_overwrite_wrappers() 
     assert_eq!(tests[1]["status"], "failed");
     let _ = std::fs::remove_dir_all(&dir);
 }
-
 
 #[test]
 fn nula_test_main_entrypoint_is_not_confused_by_a_string_literal() {
@@ -467,7 +482,6 @@ fn nula_test_expression_bodied_main_does_not_consume_test_functions() {
     assert_eq!(cases[0]["status"], "ok");
     let _ = std::fs::remove_dir_all(&dir);
 }
-
 
 #[test]
 fn nula_test_filter_without_a_value_is_an_error() {
