@@ -14,6 +14,7 @@ SHA = "a" * 40
 def valid_run(**overrides):
     run = {
         "id": 1234,
+        "run_attempt": 1,
         "head_sha": SHA,
         "head_branch": "main",
         "event": "push",
@@ -27,7 +28,8 @@ def valid_run(**overrides):
 
 def valid_jobs():
     return [
-        {"name": name, "status": "completed", "conclusion": "success"}
+        {"name": name, "status": "completed", "conclusion": "success",
+         "run_id": 1234, "run_attempt": 1, "head_sha": SHA}
         for name in proof.REQUIRED_CI_JOBS
     ]
 
@@ -71,7 +73,7 @@ class ExactHeadReleaseProofTests(unittest.TestCase):
         ):
             with self.subTest(status=status, conclusion=conclusion):
                 jobs = valid_jobs()
-                jobs[0] = {"name": jobs[0]["name"], "status": status, "conclusion": conclusion}
+                jobs[0] = {**jobs[0], "status": status, "conclusion": conclusion}
                 with self.assertRaises(proof.ProofError):
                     proof.validate_exact_head_ci(valid_run(), jobs, SHA)
 
@@ -79,6 +81,26 @@ class ExactHeadReleaseProofTests(unittest.TestCase):
         jobs = valid_jobs()
         with self.assertRaises(proof.ProofError):
             proof.validate_exact_head_ci(valid_run(), jobs + [jobs[0]], SHA)
+
+    def test_required_jobs_must_match_run_commit_and_attempt(self):
+        for override in (
+            {"run_id": 9876},
+            {"head_sha": "b" * 40},
+            {"run_attempt": 2},
+        ):
+            with self.subTest(override=override):
+                jobs = valid_jobs()
+                jobs[0] = {**jobs[0], **override}
+                with self.assertRaises(proof.ProofError):
+                    proof.validate_exact_head_ci(valid_run(), jobs, SHA)
+
+    def test_missing_job_provenance_fails_closed(self):
+        for key in ("run_id", "head_sha", "run_attempt"):
+            with self.subTest(key=key):
+                jobs = valid_jobs()
+                del jobs[0][key]
+                with self.assertRaises(proof.ProofError):
+                    proof.validate_exact_head_ci(valid_run(), jobs, SHA)
 
     def test_workflow_success_must_be_terminal(self):
         for run in (
