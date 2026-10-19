@@ -712,6 +712,68 @@ mod tests {
     }
 
     #[test]
+    fn scoped_instruction_budget_counts_halt_and_rejects_zero_fuel() {
+        let mut module = CodeModule::new("budgeted_core_vm");
+        module.emit(Instruction::new1(OpCode::Const1, 0));
+        module.emit(Instruction::new0(OpCode::Halt));
+        let mut vm = CoreVM::new();
+        let idx = vm.load_module_from_code(&module).unwrap();
+        assert!(
+            vm.run_with_limits(idx, 0, 0, || false)
+                .unwrap_err()
+                .contains("instruction budget exhausted")
+        );
+
+        let mut vm = CoreVM::new();
+        let idx = vm.load_module_from_code(&module).unwrap();
+        assert!(
+            vm.run_with_limits(idx, 0, 1, || false)
+                .unwrap_err()
+                .contains("instruction budget exhausted")
+        );
+
+        let mut vm = CoreVM::new();
+        let idx = vm.load_module_from_code(&module).unwrap();
+        let result = vm.run_with_limits(idx, 0, 2, || false).unwrap();
+        assert_eq!(value_layout::as_int_raw(result), 1);
+    }
+
+    #[test]
+    fn scoped_instruction_budget_stops_an_infinite_bytecode_loop() {
+        let mut module = CodeModule::new("looping_core_vm");
+        module.emit(Instruction::new1(OpCode::Const1, 0));
+        // Offset zero at PC 1 jumps back to PC 1 indefinitely.
+        module.emit(Instruction::new0(OpCode::Jmp));
+        let mut vm = CoreVM::new();
+        let idx = vm.load_module_from_code(&module).unwrap();
+        assert!(
+            vm.run_with_limits(idx, 0, 8, || false)
+                .unwrap_err()
+                .contains("instruction budget exhausted")
+        );
+    }
+
+    #[test]
+    fn scoped_core_vm_cooperatively_cancels_between_instructions() {
+        let mut module = CodeModule::new("cancelled_core_vm");
+        module.emit(Instruction::new1(OpCode::Const1, 0));
+        module.emit(Instruction::new1(OpCode::Const2, 1));
+        module.emit(Instruction::new3(OpCode::IAdd, 0, 1, 0));
+        module.emit(Instruction::new0(OpCode::Halt));
+        let mut vm = CoreVM::new();
+        let idx = vm.load_module_from_code(&module).unwrap();
+        let mut polls = 0;
+        let err = vm
+            .run_with_limits(idx, 0, 16, || {
+                polls += 1;
+                polls == 3
+            })
+            .unwrap_err();
+        assert_eq!(polls, 3);
+        assert!(err.contains("execution cancelled"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn test_core_arith() {
         assert_int("1 + 2 * 3", 7);
         assert_int("(1 + 2) * 3", 9);
