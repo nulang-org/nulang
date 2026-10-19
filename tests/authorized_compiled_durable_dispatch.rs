@@ -308,3 +308,33 @@ fn exact_live_grant_keeps_stable_deduplication_and_replay() {
     assert_eq!(first, replay);
     assert_eq!(store.latest_sequence(42), 2);
 }
+
+#[test]
+fn transient_actor_cannot_create_durable_effect_intent() {
+    let module = compiled_source();
+    let grant = inference_grant();
+    // A live, authorized actor is not necessarily a durable activation.
+    let mut actor = Actor::new(42, "Payments", 16);
+    actor.activation_epoch = 1;
+    actor.install_authority_manifest(&AuthorityManifest::from_grants([grant.clone()]));
+    assert!(!actor.persistent);
+
+    let mut store = MemoryStore::new();
+    let mut coordinator = DurableEffectCoordinator::new(&mut store, 42, 1);
+    let result = coordinator.execute_compiled_async_with_deduplication(
+        &actor,
+        &grant,
+        &module,
+        module.effect_sites[0].pc,
+        "order:42:payment",
+        0,
+        b"request",
+        |_, _| panic!("transient actor must not invoke external provider"),
+    );
+
+    assert!(matches!(
+        result,
+        Err(DurableAsyncDispatchError::ActorNotPersistent)
+    ));
+    assert_eq!(store.latest_sequence(42), 0);
+}
