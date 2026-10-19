@@ -3429,15 +3429,35 @@ impl TypeChecker {
             }
             Pattern::Tuple(pats) => {
                 match scrut_ty {
-                    Type::Tuple(tys) if tys.len() == pats.len() => {
+                    Type::Tuple(tys) => {
+                        // A known tuple has an exact arity. Falling through to
+                        // fresh type variables used to accept too-short and
+                        // too-long patterns, letting MIR bind missing fields
+                        // to nil or silently ignore additional tuple values.
+                        if tys.len() != pats.len() {
+                            return Err(NuError::type_error(
+                                format!(
+                                    "tuple pattern has {} element(s), but the tuple has {}",
+                                    pats.len(),
+                                    tys.len()
+                                ),
+                                Span::default(),
+                            ));
+                        }
                         let mut new_ctx = ctx.clone();
                         for (pat, ty) in pats.iter().zip(tys.iter()) {
                             new_ctx = self.bind_pattern(&new_ctx, pat, ty)?;
                         }
                         Ok(new_ctx)
                     }
+                    Type::Primitive(_) => Err(NuError::type_error(
+                        format!("tuple pattern requires a tuple, found {}", scrut_ty),
+                        Span::default(),
+                    )),
                     _ => {
-                        // Create fresh type vars for tuple elements
+                        // For unresolved or abstract types we cannot prove
+                        // the shape here; retain the existing conservative
+                        // binding path until pattern constraints are unified.
                         let mut new_ctx = ctx.clone();
                         for pat in pats {
                             let elem_ty = Type::Var(TypeVar::fresh());
