@@ -4,7 +4,7 @@
 //!   nulang [OPTIONS] <FILE>
 //!   nulang --repl
 //!   nulang --eval <CODE>
-//!   nulang --check <FILE> [--inspect-types]
+//!   nulang --check <FILE> [--inspect-types] [--inspect-effects]
 //!   nulang --lsp
 //!   nulang --dap [FILE]
 //!   nulang agent <init|run|chat|goals|graph>
@@ -16,6 +16,7 @@
 //!   -e, --eval <CODE>        Evaluate a code string
 //!   -c, --check <FILE>       Type-check a file (don't run)
 //!   --inspect-types          Print inferred declaration types with --check
+//!   --inspect-effects        Print inferred function effect rows with --check
 //!   --doc                    Generate Markdown API docs (docs/api.md)
 //!   --emit-stdlib-docs <dir> Generate per-effect stdlib docs into <dir>
 //!   --lsp                    Start Language Server (stdio)
@@ -444,6 +445,7 @@ fn main() {
             "-v" | "--verbose" => opts.verbose = true,
             "--all-errors" => opts.all_errors = true,
             "--inspect-types" => opts.inspect_types = true,
+            "--inspect-effects" => opts.inspect_effects = true,
             "--json" => opts.json = true,
             "--deny-warnings" => opts.deny_warnings = true,
             "--metrics-port" => {
@@ -535,6 +537,7 @@ fn main() {
                     "--eval",
                     "--check",
                     "--inspect-types",
+                    "--inspect-effects",
                     "--lsp",
                     "--dap",
                     "--doc",
@@ -587,17 +590,17 @@ fn main() {
     // Type inspection is a read-only companion to --check. Keep the existing
     // --json diagnostics schema unchanged until introspection has its own
     // versioned machine-readable contract.
-    if opts.inspect_types && opts.check_file.is_none() {
-        eprintln!("Error: --inspect-types requires --check <FILE>");
+    if (opts.inspect_types || opts.inspect_effects) && opts.check_file.is_none() {
+        eprintln!("Error: --inspect-types/--inspect-effects requires --check <FILE>");
         std::process::exit(1);
     }
-    if opts.inspect_types && opts.json {
-        eprintln!("Error: --inspect-types cannot be combined with --json");
+    if (opts.inspect_types || opts.inspect_effects) && opts.json {
+        eprintln!("Error: --inspect-types/--inspect-effects cannot be combined with --json");
         std::process::exit(1);
     }
     // Reject all alternative execution/compilation modes before their
     // dispatch paths. An inspection request must never evaluate user code.
-    if opts.inspect_types
+    if (opts.inspect_types || opts.inspect_effects)
         && (opts.eval_code.is_some()
             || opts.watch.is_some()
             || opts.init.is_some()
@@ -613,7 +616,7 @@ fn main() {
             || opts.bench_count.is_some()
             || !positional.is_empty())
     {
-        eprintln!("Error: --inspect-types cannot be combined with another command mode");
+        eprintln!("Error: introspection cannot be combined with another command mode");
         std::process::exit(1);
     }
 
@@ -844,16 +847,21 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        if opts.inspect_types {
-            match run_frontend(
+        if opts.inspect_types || opts.inspect_effects {
+            match run_frontend_with_effects(
                 &source,
                 Some(&path),
                 false,
                 &opts.with_capabilities,
                 opts.deny_warnings,
             ) {
-                Ok((_, checker)) => {
-                    print!("{}", format_inferred_decl_types(&checker));
+                Ok((_, checker, effects)) => {
+                    if opts.inspect_types {
+                        print!("{}", format_inferred_decl_types(&checker));
+                    }
+                    if opts.inspect_effects {
+                        print!("{}", format_inferred_function_effects(&effects));
+                    }
                     return;
                 }
                 Err(e) => {
@@ -1082,6 +1090,7 @@ struct Options {
     doc: bool,
     verbose: bool,
     inspect_types: bool,
+    inspect_effects: bool,
     backend: String,
     out_file: Option<String>,
     /// Compile the input to a `.nbc` artifact and write it, don't run.
@@ -1146,6 +1155,7 @@ impl Default for Options {
             doc: false,
             verbose: false,
             inspect_types: false,
+            inspect_effects: false,
             backend: "bytecode".to_string(),
             out_file: None,
             emit_nbc: false,
@@ -1189,7 +1199,12 @@ fn print_help() {
     println!("  -r, --repl       Start interactive REPL");
     println!("  -e, --eval       Evaluate a code string");
     println!("  -c, --check      Type-check a file (don't run)");
-    println!("  --inspect-types   Print inferred declaration types with --check (no execution)");
+    println!(
+        "  --inspect-types   Print inferred declaration types with --check (no execution)"
+    );
+    println!(
+        "  --inspect-effects Print inferred function effect rows with --check (no execution)"
+    );
     println!("  --doc            Generate Markdown API docs (docs/api.md)");
     println!("  --emit-stdlib-docs <dir>  Generate per-effect stdlib Markdown docs into <dir>");
     println!("  --lsp            Start Language Server (stdio)");
@@ -1665,13 +1680,13 @@ fn run_bench<F: FnMut() -> NuResult<()>>(mut run: F, n: usize) -> NuResult<()> {
 ///
 /// `file_path` is an optional display name for diagnostics (e.g. "main.nula").
 #[instrument(level = "debug", skip(source))]
-fn run_frontend(
+fn run_frontend_with_effects(
     source: &str,
     file_path: Option<&str>,
     verbose: bool,
     with_capabilities: &[String],
     deny_warnings: bool,
-) -> NuResult<(nulang::ast::AstModule, nulang::typechecker::TypeChecker)> {
+) -> NuResult<(nulang::ast::AstModule, nulang::typechecker::TypeChecker, EffectChecker)> {
     let ps = nulang::prelude_source::PRELUDE_SOURCE;
     let mut pl = Lexer::new(ps);
     nulang::types::set_source_map_with_file(ps, Some("<prelude>"));
@@ -1841,7 +1856,27 @@ fn run_frontend(
         }
     }
 
-    Ok((ast, type_checker))
+    Ok((ast, type_checker, effect_checker))
+}
+
+// Existing execution and check callers need only the AST and inferred types.
+// Introspection consumes the same checked effect rows without running a
+// second effect-checking pass or changing the backend contract.
+fn run_frontend(
+    source: &str,
+    file_path: Option<&str>,
+    verbose: bool,
+    with_capabilities: &[String],
+    deny_warnings: bool,
+) -> NuResult<(nulang::ast::AstModule, TypeChecker)> {
+    let (ast, checker, _) = run_frontend_with_effects(
+        source,
+        file_path,
+        verbose,
+        with_capabilities,
+        deny_warnings,
+    )?;
+    Ok((ast, checker))
 }
 
 #[cfg_attr(not(feature = "wasm-backend"), allow(unused_variables))]
@@ -2728,10 +2763,33 @@ fn run_nbc_module(
     }
 }
 
+/// Display compiler-validated interprocedural effect rows in deterministic
+/// order. This reports static upper bounds, not observed runtime effects.
+fn format_inferred_function_effects(checker: &EffectChecker) -> String {
+    let mut functions: Vec<_> = checker.function_rows().into_iter().collect();
+    functions.sort_unstable_by(|(name_a, _), (name_b, _)| name_a.cmp(name_b));
+    let mut output = String::from("=== Inferred Function Effects ===\n");
+    for (name, row) in functions {
+        let mut effect_names: Vec<String> = row
+            .effects()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        effect_names.sort_unstable();
+        effect_names.dedup();
+        let open = matches!(row, nulang::types::EffectRow::Open(_, _));
+        if open {
+            effect_names.push("..".to_string());
+        }
+        output.push_str(&format!("{}: {{{}}}\n", name, effect_names.join(", ")));
+    }
+    output
+}
+
 /// Render existing frontend type facts without changing compilation or execution.
 /// Sorted output makes it easy to diff type changes between compiler revisions.
-/// This reports top-level inferred types, not allocation behavior, JIT
-/// specialization decisions, or a complete interprocedural effect analysis.
+/// This reports top-level inferred types, not allocation behavior or JIT
+/// specialization decisions.
 fn format_inferred_decl_types(checker: &TypeChecker) -> String {
     let mut declarations: Vec<_> = checker.inferred_decl_types.iter().collect();
     declarations.sort_unstable_by(|(name_a, _), (name_b, _)| name_a.cmp(name_b));
