@@ -195,6 +195,27 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
+    fn unconfigured_worker_cannot_complete_goal_without_executing_work() {
+        let tmp = std::env::temp_dir().join(format!("nulang-agent-unverified-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        init_project(&tmp).unwrap();
+        let mut runtime = LocalRuntime::open(tmp.clone()).unwrap();
+        let mut stream = Cursor::new(Vec::new());
+
+        let goal_id = runtime.handle_user_message("ship feature X", &mut stream).unwrap();
+        let graph = runtime.store().get_goal_graph(goal_id).unwrap();
+        let events = String::from_utf8(stream.into_inner()).unwrap();
+
+        assert_eq!(graph.goal.status, GoalStatus::Blocked);
+        assert!(graph.tasks.iter().all(|task| task.status != TaskStatus::Completed));
+        assert!(events.contains("task_blocked"));
+        assert!(events.contains("goal_blocked"));
+        assert!(!events.contains("task_completed"));
+        assert!(!events.contains("goal_completed"));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
     fn runtime_emits_nlap_events() {
         let tmp = std::env::temp_dir().join(format!("nulang-agent-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
