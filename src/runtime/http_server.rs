@@ -1588,6 +1588,56 @@ mod tests {
     }
 
     #[test]
+    fn nested_request_context_keeps_outer_response_cookies() {
+        let request = |method| RequestContext {
+            request: HttpRequest {
+                method,
+                path: "/cookie".into(),
+                headers: vec![],
+                body: vec![],
+            },
+            params: HashMap::new(),
+        };
+        let _ = take_response_cookies();
+        with_request_context(request(HttpMethod::Get), || {
+            set_cookie("outer", "one");
+            with_request_context(request(HttpMethod::Post), || {
+                set_cookie("inner", "two");
+                assert_eq!(take_response_cookies().len(), 1);
+                set_cookie("inner_after_read", "three");
+            });
+            assert_eq!(current_request_method().as_deref(), Some("GET"));
+        });
+        let cookies = take_response_cookies();
+        assert_eq!(cookies.len(), 1, "nested response must not overwrite outer cookies");
+        assert!(cookies[0].starts_with("outer=one;"));
+    }
+
+    #[test]
+    fn panicking_handler_does_not_leak_response_cookies() {
+        let _ = take_response_cookies();
+        let failure = std::panic::catch_unwind(|| {
+            with_request_context(
+                RequestContext {
+                    request: HttpRequest {
+                        method: HttpMethod::Get,
+                        path: "/cookie".into(),
+                        headers: vec![],
+                        body: vec![],
+                    },
+                    params: HashMap::new(),
+                },
+                || {
+                    set_cookie("secret", "must-not-leak");
+                    panic!("test panic");
+                },
+            );
+        });
+        assert!(failure.is_err());
+        assert!(take_response_cookies().is_empty());
+    }
+
+    #[test]
     fn test_middleware_security_headers() {
         let mut response = HttpResponse {
             status: 200,
