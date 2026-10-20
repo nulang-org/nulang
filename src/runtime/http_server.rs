@@ -1206,6 +1206,38 @@ fn guess_content_type(path: &Path) -> &'static str {
 mod tests {
     use super::*;
 
+    #[test]
+    fn secure_session_token_is_unpredictable_and_256_bits() {
+        let a = secure_session_token().expect("OS entropy must be available");
+        let b = secure_session_token().expect("OS entropy must be available");
+        assert_eq!(a.len(), 64); // 32 random bytes in lowercase hex
+        assert!(a.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn session_cookies_are_secure_http_only_and_expire_on_clear() {
+        let ctx = RequestContext {
+            request: HttpRequest {
+                method: HttpMethod::Get,
+                path: "/".into(),
+                headers: vec![],
+                body: vec![],
+            },
+            params: HashMap::new(),
+        };
+        with_request_context(ctx, || {
+            set_cookie("nulang_session", "random-token");
+            clear_cookie("nulang_session");
+            let cookies = take_response_cookies();
+            assert_eq!(cookies.len(), 2);
+            assert!(cookies.iter().all(|cookie| cookie.contains("; Secure")));
+            assert!(cookies.iter().all(|cookie| cookie.contains("; HttpOnly")));
+            assert!(cookies[0].contains("; SameSite=Lax"));
+            assert!(cookies[1].contains("; Max-Age=0"));
+        });
+    }
+
     // A deterministic reader forces TCP-like fragmentation without sleeps.
     struct FixedChunkReader<'a> {
         remaining: &'a [u8],
