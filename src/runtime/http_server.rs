@@ -208,11 +208,10 @@ fn read_http_request<R: Read>(reader: &mut R) -> Result<Option<HttpRequest>, Htt
             has_host = true;
             let host = value.trim();
             if host.bytes().any(|byte| {
-                    byte <= 0x20
-                        || byte == 0x7f
-                        || matches!(byte, b',' | b'/' | b'\\' | b'@' | b'#' | b'?')
-                })
-            {
+                byte <= 0x20
+                    || byte == 0x7f
+                    || matches!(byte, b',' | b'/' | b'\\' | b'@' | b'#' | b'?')
+            }) {
                 return Err(HttpReadError::BadRequest);
             }
         } else if name.eq_ignore_ascii_case("content-length") {
@@ -243,7 +242,7 @@ fn read_http_request<R: Read>(reader: &mut R) -> Result<Option<HttpRequest>, Htt
     if has_transfer_encoding {
         return Err(HttpReadError::NotImplemented);
     }
-    // RFC 9112 requires exactly one non-empty Host field for HTTP/1.1.
+    // RFC 9112 requires exactly one Host field line for HTTP/1.1.
     // HTTP/1.0 remains supported for legacy clients without Host.
     if version == 1 && !has_host {
         return Err(HttpReadError::BadRequest);
