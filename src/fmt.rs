@@ -656,6 +656,11 @@ fn fmt_expr(out: &mut String, expr: &Expr, indent: usize, had_unhandled: &mut bo
             Literal::Unit => out.push_str("unit"),
         },
         Expr::Var(name, _) => out.push_str(name),
+        Expr::QualifiedVar { alias, name, .. } => {
+            out.push_str(alias);
+            out.push_str("::");
+            out.push_str(name);
+        },
         Expr::SelfRef(_) => out.push_str("self"),
         Expr::Let {
             name, value, body, ..
