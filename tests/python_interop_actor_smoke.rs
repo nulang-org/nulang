@@ -67,6 +67,32 @@ fn main() {
 }
 
 #[test]
+fn python_call_uses_only_staged_variadic_arguments() {
+    // Actor references and previous effects can leave data in non-argument
+    // frame registers. Python.call must never pass those values to CPython.
+    let output = execute_source(
+        "variadic-arity",
+        r#"
+actor PythonProbe {
+    behavior check() {
+        perform Python.import("builtins")
+        let a = perform Python.call("builtins", "abs", -5)
+        let b = perform Python.call("builtins", "pow", 2, 3)
+        let empty = perform Python.call("builtins", "str")
+        let c = perform Python.call("builtins", "len", empty)
+        a + b + c
+    }
+}
+fn main() {
+    let worker = spawn PythonProbe {} with [Python::import, Python::call]
+    perform IO.print(ask worker check())
+}
+"#,
+    );
+    assert_output(output, "13");
+}
+
+#[test]
 fn reads_non_callable_python_module_attributes() {
     let output = execute_source(
         "attribute",
