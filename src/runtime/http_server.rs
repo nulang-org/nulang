@@ -815,6 +815,34 @@ pub fn render_route_handler(
     }
 }
 
+/// Fail closed when a compiler-bound scalar query or form parameter has more
+/// than one decoded value. The legacy parser remains backward-compatible for
+/// repeated *unbound* keys, including future multi-value form controls.
+fn duplicate_bound_input_response(
+    captured: &HttpRequestBindingInputs,
+    bindings: &[crate::web::bindings::RouteBindingContract],
+) -> Option<HttpResponse> {
+    let binding = captured.ambiguous_bound_input(bindings)?;
+    let source = match binding.source {
+        crate::web::bindings::RouteBindingSource::Query => "query",
+        crate::web::bindings::RouteBindingSource::Form => "form",
+        _ => return None,
+    };
+    let problem = serde_json::json!({
+        "type": "urn:nulang:web:ambiguous_request_input",
+        "title": "Ambiguous request input",
+        "status": 400,
+        "code": "ambiguous_request_input",
+        "source": source,
+        "source_name": binding.source_name,
+    });
+    Some(HttpResponse {
+        status: 400,
+        headers: vec![("Content-Type".into(), "application/problem+json".into())],
+        body: serde_json::to_vec(&problem).expect("fixed problem fields are serializable"),
+    })
+}
+
 fn invalid_ui_action_response(captured: &HttpRequestBindingInputs) -> Option<HttpResponse> {
     captured
         .ui_message_error
@@ -1037,7 +1065,13 @@ impl WebDevServer {
         {
             let captured =
                 HttpRequestBindingInputs::capture(&request.path, &request.headers, &request.body);
-            if let Some(response) = invalid_ui_action_response(&captured) {
+            if let Some(response) = route
+                .plan
+                .as_ref()
+                .and_then(|plan| duplicate_bound_input_response(&captured, &plan.bindings))
+            {
+                response
+            } else if let Some(response) = invalid_ui_action_response(&captured) {
                 response
             } else {
                 let values = captured.values(&params, &request.headers);
@@ -1205,6 +1239,39 @@ fn guess_content_type(path: &Path) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_typed_query_parameter_returns_structured_http_400() {
+        use crate::web::bindings::{RouteBindingContract, RouteBindingSource};
+
+        let captured = HttpRequestBindingInputs::capture(
+            "/users?limit=1&%6cimit=2",
+            &[],
+            b"",
+        );
+        let bound = RouteBindingContract {
+            source: RouteBindingSource::Query,
+            source_name: "limit".to_string(),
+            handler_param: "limit".to_string(),
+            handler_index: 0,
+            ty: Some("Int".to_string()),
+        };
+        let response = duplicate_bound_input_response(&captured, &[bound.clone()]).unwrap();
+        assert_eq!(response.status, 400);
+        assert!(response.headers.iter().any(|(name, value)| {
+            name == "Content-Type" && value == "application/problem+json"
+        }));
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["code"], "ambiguous_request_input");
+        assert_eq!(body["source"], "query");
+        assert_eq!(body["source_name"], "limit");
+        assert!(body.get("handler_param").is_none());
+        assert!(duplicate_bound_input_response(&captured, &[RouteBindingContract {
+            source: RouteBindingSource::Query,
+            source_name: "page".to_string(),
+            ..bound
+        }]).is_none());
+    }
 
     // A deterministic reader forces TCP-like fragmentation without sleeps.
     struct FixedChunkReader<'a> {

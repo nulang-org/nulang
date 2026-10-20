@@ -4,11 +4,12 @@
 //! owns the HTTP-specific parsing needed to build those borrowed views without
 //! coupling the decoder to the runtime server implementation.
 
+use crate::web::bindings::{RouteBindingContract, RouteBindingSource};
 use crate::web::request_bindings::{
-    parse_cookie_header, parse_urlencoded, split_request_target, RequestBindingValues,
+    parse_cookie_header, parse_urlencoded_with_duplicates, RequestBindingValues,
 };
 use nulang_ui_protocol::{decode_host_message, ActionPlacement, HostToRuntimeMessage};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Why a renderer-neutral action envelope was rejected at the HTTP boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,9 +44,11 @@ impl std::fmt::Display for UiActionEnvelopeError {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HttpRequestBindingInputs {
     pub query: HashMap<String, String>,
+    pub duplicate_query_keys: HashSet<String>,
     pub cookies: HashMap<String, String>,
     pub body: Option<String>,
     pub form: HashMap<String, String>,
+    pub duplicate_form_keys: HashSet<String>,
     /// Validated renderer-neutral UI/action message carried alongside a
     /// compatibility form submission. Invalid or unsupported envelopes are
     /// ignored rather than becoming runtime authority.
@@ -62,7 +65,9 @@ impl HttpRequestBindingInputs {
     /// must not be reinterpreted as form data merely because a handler declares
     /// a form binding.
     pub fn capture(target: &str, headers: &[(String, String)], body: &[u8]) -> Self {
-        let (_, query) = split_request_target(target);
+        let query_text = target.split_once('?').map_or("", |(_, query)| query);
+        let (query, duplicate_query_keys) =
+            parse_urlencoded_with_duplicates(query_text.as_bytes());
 
         let mut cookies = HashMap::new();
         for (_, value) in headers
@@ -73,21 +78,50 @@ impl HttpRequestBindingInputs {
         }
 
         let body_text = (!body.is_empty()).then(|| String::from_utf8_lossy(body).into_owned());
-        let form = if is_urlencoded_form(headers) {
-            parse_urlencoded(body)
+        let (form, duplicate_form_keys) = if is_urlencoded_form(headers) {
+            parse_urlencoded_with_duplicates(body)
         } else {
-            HashMap::new()
+            (HashMap::new(), HashSet::new())
         };
-        let (ui_message, ui_message_error) = capture_ui_action_message(&form);
+        // A repeated action identifier is not a valid authorization envelope,
+        // even when the legacy form parser would otherwise keep its last value.
+        let (ui_message, ui_message_error) = if duplicate_form_keys
+            .contains("__nulang_ui_message")
+            || duplicate_form_keys.contains("__nulang_action")
+        {
+            (None, Some(UiActionEnvelopeError::Malformed))
+        } else {
+            capture_ui_action_message(&form)
+        };
 
         Self {
             query,
+            duplicate_query_keys,
             cookies,
             body: body_text,
             form,
+            duplicate_form_keys,
             ui_message,
             ui_message_error,
         }
+    }
+
+    /// Return a compiler-bound scalar input whose URL-encoded name occurred
+    /// multiple times. Unbound repeated inputs remain available to legacy
+    /// consumers until typed multi-value request contracts are introduced.
+    pub fn ambiguous_bound_input<'a>(
+        &self,
+        bindings: &'a [RouteBindingContract],
+    ) -> Option<&'a RouteBindingContract> {
+        bindings.iter().find(|binding| match binding.source {
+            RouteBindingSource::Query => {
+                self.duplicate_query_keys.contains(&binding.source_name)
+            }
+            RouteBindingSource::Form => {
+                self.duplicate_form_keys.contains(&binding.source_name)
+            }
+            _ => false,
+        })
     }
 
     /// Borrow all request sources in the shape consumed by the transport-neutral
@@ -323,6 +357,68 @@ mod tests {
             captured.ui_message_error,
             Some(UiActionEnvelopeError::ClientPlacement)
         );
+    }
+
+    #[test]
+    fn rejects_duplicated_query_and_form_inputs_only_when_scalar_bound() {
+        let headers = vec![(
+            "Content-Type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        )];
+        let captured = HttpRequestBindingInputs::capture(
+            "/users?limit=10&%6cimit=20&tags=a&tags=b",
+            &headers,
+            b"title=first&%74itle=second",
+        );
+        let query_limit = RouteBindingContract {
+            source: RouteBindingSource::Query,
+            source_name: "limit".into(),
+            handler_param: "limit".into(),
+            handler_index: 0,
+            ty: Some("Int".into()),
+        };
+        let form_title = RouteBindingContract {
+            source: RouteBindingSource::Form,
+            source_name: "title".into(),
+            handler_param: "title".into(),
+            handler_index: 1,
+            ty: Some("String".into()),
+        };
+        assert_eq!(
+            captured.ambiguous_bound_input(&[query_limit.clone()]),
+            Some(&query_limit)
+        );
+        assert_eq!(
+            captured.ambiguous_bound_input(&[form_title.clone()]),
+            Some(&form_title)
+        );
+        // Repeated unrelated keys must not break a scalar handler.
+        assert_eq!(
+            captured.ambiguous_bound_input(&[RouteBindingContract {
+                source: RouteBindingSource::Query,
+                source_name: "page".into(),
+                handler_param: "page".into(),
+                handler_index: 0,
+                ty: Some("Int".into()),
+            }]),
+            None
+        );
+    }
+
+    #[test]
+    fn duplicate_ui_action_identity_is_rejected_before_dispatch() {
+        let headers = vec![(
+            "Content-Type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        )];
+        for body in [
+            b"__nulang_action=delete&__nulang_action=save".as_slice(),
+            b"__nulang_ui_message=first&%5f_nulang_ui_message=second".as_slice(),
+        ] {
+            let captured = HttpRequestBindingInputs::capture("/", &headers, body);
+            assert!(captured.ui_message.is_none());
+            assert_eq!(captured.ui_message_error, Some(UiActionEnvelopeError::Malformed));
+        }
     }
 
     fn percent_encode_form_value(value: &str) -> String {

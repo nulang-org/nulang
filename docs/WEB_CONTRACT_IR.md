@@ -154,6 +154,24 @@ Both typed and legacy calls remain inside the existing request context during th
 
 Network-level regression coverage compiles real Nulang handlers and route contracts, starts `WebDevServer` on an ephemeral TCP port, and verifies successful typed query decoding, `400 application/problem+json` decode failures, and legacy route fallback over the wire.
 
+## Repeated scalar request inputs
+
+HTTP query and `application/x-www-form-urlencoded` form fields are scalar
+inputs in Web Contract IR v1. When a route's compiler binding requests a
+scalar key more than once, HTTP dispatch rejects the request with a
+`400 application/problem+json` response and code
+`ambiguous_request_input` before invoking the handler. Duplicate detection
+takes place **after URL percent-decoding**, so `limit` and `%6cimit` count as
+the same field. The problem document identifies the input source and public
+source name, not the handler implementation.
+
+Duplicate unrelated/unbound fields retain legacy last-value behavior to avoid
+breaking existing ambient request consumers. An explicit multi-value input
+contract must be introduced before applications can safely bind repeated form
+or query values as arrays. Regardless of route binding, repeated
+`__nulang_action` or `__nulang_ui_message` form fields invalidate a
+renderer-neutral UI action envelope.
+
 ## Decode failures and HTTP problems
 
 Request decoding distinguishes client input failures from compiler/runtime invariant failures:
