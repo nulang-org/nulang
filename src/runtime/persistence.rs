@@ -637,8 +637,7 @@ fn contains_actor_self_ref(value: &serde_json::Value, source_id: u64) -> bool {
     match value {
         serde_json::Value::Object(fields) => {
             if fields.get("tag").and_then(serde_json::Value::as_str) == Some("Actor")
-                && fields.get("value").and_then(serde_json::Value::as_u64)
-                    == Some(source_id)
+                && fields.get("value").and_then(serde_json::Value::as_u64) == Some(source_id)
             {
                 return true;
             }
@@ -1136,7 +1135,10 @@ impl PersistenceStore for MemoryStore {
             ));
         }
         let source = self.snapshots.get(&from).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "actor snapshot to relocate not found")
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "actor snapshot to relocate not found",
+            )
         })?;
 
         // CRDT identities and atomic transition digests have their own
@@ -1147,14 +1149,11 @@ impl PersistenceStore for MemoryStore {
             || source.crdt_field_map.is_some()
             || self.durable_tails.contains_key(&from)
             || self.committed_transitions.contains_key(&from)
-            || self
-                .workflow_events
-                .get(&from)
-                .is_some_and(|events| {
-                    events.iter().any(|event| {
-                        event.activation_id().is_some() || event.replay_id().is_some()
-                    })
-                })
+            || self.workflow_events.get(&from).is_some_and(|events| {
+                events
+                    .iter()
+                    .any(|event| event.activation_id().is_some() || event.replay_id().is_some())
+            })
         {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
