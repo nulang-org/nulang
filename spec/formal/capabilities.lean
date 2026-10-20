@@ -6,7 +6,7 @@
   Operations: `join`, `is_subtype_of`, `is_sendable`, `is_isolated`,
   `discharge_linear`.
 
-  Theorem `cap_sendable` stated; proof open.
+  Theorem `cap_sendable` is proved below; capability ordering mirrors src/types.rs.
 -/
 
 import types
@@ -51,8 +51,6 @@ def join (a b : Cap) : Cap :=
   | .Val,       .LinearIso => .Val
   | .LinearIso, .Box       => .Box
   | .Box,       .LinearIso => .Box
-  | .LinearIso, .Tag       => .LinearIso
-  | .Tag,       .LinearIso => .LinearIso
   | .Linear,    .Linear    => .Linear
   | .Linear,    .Val       => .Val
   | .Val,       .Linear    => .Val
@@ -66,8 +64,6 @@ def join (a b : Cap) : Cap :=
   | .Ref,       .Linear    => .Box
   | .Linear,    .Box       => .Box
   | .Box,       .Linear    => .Box
-  | .Linear,    .Tag       => .Linear
-  | .Tag,       .Linear    => .Linear
   | .Iso,       .Iso       => .Iso
   | .Iso,       .Trn       => .Trn
   | .Trn,       .Iso       => .Trn
@@ -93,9 +89,10 @@ def join (a b : Cap) : Cap :=
   | .Val,       .Box       => .Box
   | .Box,       .Val       => .Box
   | .Box,       .Box       => .Box
-  | .Tag,       .Tag       => .Tag
-  | .Tag,       c          => c
-  | c,          .Tag       => c
+  -- Tag retains identity but carries no read/write authority: every cap
+  -- may be downgraded to Tag, never implicitly upgraded from Tag.
+  | .Tag,       _          => .Tag
+  | _,          .Tag       => .Tag
 
 -- ------------------------------------------------------------------
 -- Subtyping (partial order)
@@ -179,11 +176,11 @@ theorem join_idem : ∀ a : Cap, join a a = a := by
 
   If the runtime permits a value `v : τ @ cap` to cross an actor
   boundary (`is_sendable cap = true`), then either:
-  1. `cap ≤ Val` (value semantics — immutable, alias-tracked), or
+  1. `cap ≤ Val` (immutable or isolated-transfer compatible), or
   2. `cap = Tag` (tagged pointer — safe to copy, no dereference).
 
-  A value whose capability is `Iso`, `Trn`, or `Ref` must NOT cross
-  an actor boundary — the capability lattice forbids it.
+  `Iso` may cross by ownership transfer; `Trn` and `Ref` must NOT
+  cross an actor boundary.
 
   **Divergence note (2026-07):** The original statement
   `∀ cap, is_sendable cap → le cap .Val` is **false** for `cap = Tag`:
@@ -191,7 +188,7 @@ theorem join_idem : ∀ a : Cap, join a a = a := by
   sendable because tagged pointers carry no ownership and can be
   safely copied across actor boundaries without dereferencing, but
   `Tag` is not a subtype of `Val` in the lattice (it sits at the
-  bottom, not below `Val`).  The corrected statement uses a
+  top of the subtype order, as the least-privileged view). The corrected statement uses a
   disjunction to capture both cases.
 -/
 theorem cap_sendable : ∀ (cap : Cap), is_sendable cap = true → (le cap .Val = true ∨ cap = .Tag) := by
