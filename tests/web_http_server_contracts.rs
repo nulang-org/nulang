@@ -153,6 +153,49 @@ fn invalid_typed_query_is_problem_json_over_real_http() {
 }
 
 #[test]
+fn duplicate_typed_query_is_rejected_over_real_http() {
+    let server = WebDevServer::bind_runtime(0, None, None, vec![typed_query_route()])
+        .expect("bind typed WebDevServer");
+
+    let response = send_raw_request(
+        server.port,
+        "GET /users?limit=10&%6cimit=20 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+
+    assert!(
+        response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+        "{response}"
+    );
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("content-type: application/problem+json\r\n"),
+        "{response}"
+    );
+    let problem: serde_json::Value =
+        serde_json::from_str(response_body(&response)).expect("parse problem JSON");
+    assert_eq!(problem["status"], 400);
+    assert_eq!(problem["code"], "ambiguous_request_input");
+    assert_eq!(problem["source"], "query");
+    assert_eq!(problem["source_name"], "limit");
+    assert!(problem.get("handler_param").is_none());
+}
+
+#[test]
+fn unrelated_duplicate_query_preserves_legacy_compatibility() {
+    let server = WebDevServer::bind_runtime(0, None, None, vec![typed_query_route()])
+        .expect("bind typed WebDevServer");
+
+    let response = send_raw_request(
+        server.port,
+        "GET /users?limit=25&tag=one&tag=two HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert!(response_body(&response).starts_with("25"), "{response}");
+}
+
+#[test]
 fn legacy_route_still_falls_back_over_real_http() {
     let server =
         WebDevServer::bind(0, None, None, vec![legacy_route()]).expect("bind legacy WebDevServer");
