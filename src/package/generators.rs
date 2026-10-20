@@ -24,7 +24,10 @@ fn validate_name(name: &str) -> NuResult<()> {
     if name.len() > 64
         || !matches!(chars.next(), Some('a'..='z'))
         || !chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
-        || matches!(name, "main" | "lib" | "stdlib" | "self" | "super" | "package")
+        || matches!(
+            name,
+            "main" | "lib" | "stdlib" | "self" | "super" | "package"
+        )
     {
         return Err(error(format!(
             "invalid generator name '{name}' (use a lowercase snake_case identifier, at most 64 bytes, not a reserved module name)"
@@ -112,7 +115,10 @@ pub fn generate(root: &Path, kind: &str, name: &str) -> NuResult<Vec<PathBuf>> {
             if let Some(parent) = dest.parent() {
                 fs::create_dir_all(parent)?;
             }
-            let mut file = OpenOptions::new().write(true).create_new(true).open(&dest)?;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&dest)?;
             created.push(dest.clone());
             file.write_all(content.as_bytes())?;
             file.sync_all()
@@ -122,7 +128,10 @@ pub fn generate(root: &Path, kind: &str, name: &str) -> NuResult<Vec<PathBuf>> {
             for file in &created {
                 let _ = fs::remove_file(file);
             }
-            return Err(error(format!("cannot generate '{}': {err}", dest.display())));
+            return Err(error(format!(
+                "cannot generate '{}': {err}",
+                dest.display()
+            )));
         }
     }
 
