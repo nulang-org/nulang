@@ -168,6 +168,7 @@ fn durability_crash_worker() {
             let mut ready = File::create(&pending_marker).expect("create crash marker");
             ready.write_all(stage.as_bytes()).expect("write crash marker");
             ready.sync_all().expect("sync crash marker");
+            drop(ready);
             fs::rename(pending_marker, root.join("ready")).expect("publish crash marker");
             // No graceful destructors: the parent sends a genuine OS kill
             // after observing the committed state marker.
