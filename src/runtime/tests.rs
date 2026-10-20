@@ -669,6 +669,109 @@ fn test_supervisor_restart_rate_limiting() {
     );
 }
 
+/// OTP supervisors must limit restarts across the whole child set, not only
+/// repeatedly failing instances of the same child specification.
+#[test]
+fn test_supervisor_global_restart_intensity_catches_alternating_crashes() {
+    let mut rt = Runtime::new();
+    let sup_id = rt.create_supervisor("aggregate_rate", RestartStrategy::OneForOne);
+    rt.supervisors
+        .get_mut(&sup_id)
+        .unwrap()
+        .set_restart_intensity(2, 60)
+        .unwrap();
+
+    let a = rt.spawn_actor(Box::new(|| vec![]));
+    let b = rt.spawn_actor(Box::new(|| vec![]));
+    rt.supervise_child(sup_id, ChildSpec::new("a", RestartPolicy::Permanent), a);
+    rt.supervise_child(sup_id, ChildSpec::new("b", RestartPolicy::Permanent), b);
+
+    rt.exit_actor(a, ExitReason::Error("a-1".into()));
+    let a2 = rt.supervisors[&sup_id]
+        .children
+        .iter()
+        .find(|(spec, _)| spec.id == "a")
+        .unwrap()
+        .1;
+    rt.exit_actor(b, ExitReason::Error("b-1".into()));
+    let b2 = rt.supervisors[&sup_id]
+        .children
+        .iter()
+        .find(|(spec, _)| spec.id == "b")
+        .unwrap()
+        .1;
+
+    // Neither child has reached its own default five-restart limit.
+    assert_eq!(rt.supervisors[&sup_id].restart_count(a2), 1);
+    assert_eq!(rt.supervisors[&sup_id].restart_count(b2), 1);
+
+    rt.exit_actor(a2, ExitReason::Error("a-2".into()));
+    assert!(
+        !rt.supervisors.contains_key(&sup_id),
+        "the third crash must terminate the supervisor after two aggregate restarts"
+    );
+    assert!(!rt.actors.contains_key(&b2), "remaining children must be shut down");
+}
+
+/// The shutdown protocol must stop later-started dependencies first and
+/// distinguish intentional shutdown from an error in DOWN notifications.
+#[test]
+fn test_supervisor_shutdown_reverses_start_order_and_reports_shutdown() {
+    let mut rt = Runtime::new();
+    let sup_id = rt.create_supervisor("ordered_shutdown", RestartStrategy::OneForOne);
+    let fragile = rt.spawn_actor(Box::new(|| vec![]));
+    let middle = rt.spawn_actor(Box::new(|| vec![]));
+    let last = rt.spawn_actor(Box::new(|| vec![]));
+    rt.supervise_child(
+        sup_id,
+        ChildSpec::new("fragile", RestartPolicy::Permanent).with_limits(1, 60),
+        fragile,
+    );
+    rt.supervise_child(
+        sup_id,
+        ChildSpec::new("middle", RestartPolicy::Transient),
+        middle,
+    );
+    rt.supervise_child(
+        sup_id,
+        ChildSpec::new("last", RestartPolicy::Transient),
+        last,
+    );
+    let watcher = rt.spawn_actor(Box::new(|| vec![]));
+    rt.monitor(watcher, middle);
+    rt.monitor(watcher, last);
+
+    rt.exit_actor(fragile, ExitReason::Error("first".into()));
+    let replacement = rt.supervisors[&sup_id].children[0].1;
+    rt.exit_actor(replacement, ExitReason::Error("second".into()));
+
+    assert!(!rt.supervisors.contains_key(&sup_id));
+    let mailbox = &mut rt.actors.get_mut(&watcher).unwrap().mailbox;
+    let first = mailbox.pop().expect("last child DOWN");
+    let second = mailbox.pop().expect("middle child DOWN");
+    assert_eq!(first.payload[0].as_int(), Some(last as i64));
+    assert_eq!(second.payload[0].as_int(), Some(middle as i64));
+    assert_eq!(first.payload[2].as_int(), Some(4), "shutdown reason");
+    assert_eq!(second.payload[2].as_int(), Some(4), "shutdown reason");
+    assert!(mailbox.pop().is_none());
+}
+
+#[test]
+fn test_transient_child_shutdown_is_not_an_abnormal_restart() {
+    let mut rt = Runtime::new();
+    let sup_id = rt.create_supervisor("transient_shutdown", RestartStrategy::OneForOne);
+    let child = rt.spawn_actor(Box::new(|| vec![]));
+    rt.supervise_child(
+        sup_id,
+        ChildSpec::new("transient", RestartPolicy::Transient),
+        child,
+    );
+    rt.exit_actor(child, ExitReason::Shutdown(None));
+    assert!(rt.supervisors.contains_key(&sup_id));
+    assert_eq!(rt.supervisors[&sup_id].child_count(), 0);
+    assert!(!rt.actors.contains_key(&child));
+}
+
 #[test]
 fn test_supervisor_escalate_to_parent() {
     let mut rt = Runtime::new();
