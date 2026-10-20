@@ -417,6 +417,16 @@ pub(crate) fn perform_web_builtin(
             Some(callbacks.alloc_string(&s))
         }
         Some("route") => Some(crate::vm::Value::unit()),
+        Some("json_response") | Some("text_response") => {
+            let status = regs.first().and_then(|value| value.as_int());
+            let body = resolve(constants, *regs.get(1)?);
+            let json = op_name == Some("json_response");
+            crate::runtime::http_server::set_response_body(status, &body, json);
+            // Outside HTTP serving, keep the return value safe as an Html
+            // fragment. Inside HTTP serving, the explicit response overrides
+            // this fallback and is written without client-script injection.
+            Some(callbacks.alloc_string(&html_escape(&body)))
+        }
         Some("redirect") => {
             let url = resolve(constants, *regs.first()?);
             crate::runtime::http_server::set_response_redirect(&url);
