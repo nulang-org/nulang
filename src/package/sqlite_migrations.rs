@@ -146,10 +146,9 @@ pub async fn apply_sqlite_migrations(
     let sql = preflight_sql(root, &plan)?;
     check_database_path(database_path)?;
     if plan.is_empty() {
-        return Ok(MigrationAudit {
-            applied: 0,
-            pending: Vec::new(),
-        });
+        return Err(package_error(
+            "no SQL migration source files; refusing to assume an empty database ledger",
+        ));
     }
 
     let db = libsql::Builder::new_local(database_path)
@@ -281,6 +280,18 @@ mod tests {
         .unwrap();
         let db = root.join("app.sqlite");
         (root, db)
+    }
+
+    #[tokio::test]
+    async fn sqlite_apply_rejects_empty_plan_without_creating_database() {
+        let (root, db_path) = fixture();
+        let failure = apply_sqlite_migrations(&root, &db_path).await.unwrap_err();
+        assert!(
+            failure.to_string().contains("no SQL migration source files"),
+            "{failure}"
+        );
+        assert!(!db_path.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
