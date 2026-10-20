@@ -820,9 +820,9 @@ pub fn render_route_handler(
 /// repeated *unbound* keys, including future multi-value form controls.
 fn duplicate_bound_input_response(
     captured: &HttpRequestBindingInputs,
-    route: &RuntimeWebRoute,
+    bindings: &[crate::web::bindings::RouteBindingContract],
 ) -> Option<HttpResponse> {
-    let binding = captured.ambiguous_bound_input(&route.plan.as_ref()?.bindings)?;
+    let binding = captured.ambiguous_bound_input(bindings)?;
     let source = match binding.source {
         crate::web::bindings::RouteBindingSource::Query => "query",
         crate::web::bindings::RouteBindingSource::Form => "form",
@@ -1065,7 +1065,11 @@ impl WebDevServer {
         {
             let captured =
                 HttpRequestBindingInputs::capture(&request.path, &request.headers, &request.body);
-            if let Some(response) = duplicate_bound_input_response(&captured, route) {
+            if let Some(response) = route
+                .plan
+                .as_ref()
+                .and_then(|plan| duplicate_bound_input_response(&captured, &plan.bindings))
+            {
                 response
             } else if let Some(response) = invalid_ui_action_response(&captured) {
                 response
