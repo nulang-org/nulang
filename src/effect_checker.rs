@@ -3409,7 +3409,10 @@ mod tests {
         };
         // Iso + Ref => Ref. Neither the missing guard nor the initial
         // accumulator may invent a Tag arm and erase the result authority.
-        assert_eq!(analyzer.infer_cap(&ctx, &match_expr).unwrap(), Capability::Ref);
+        assert_eq!(
+            analyzer.infer_cap(&ctx, &match_expr).unwrap(),
+            Capability::Ref
+        );
     }
 
     #[test]
@@ -3463,8 +3466,12 @@ mod tests {
         let result = analyzer.check_cap_sub(Capability::Ref, Capability::Val, s());
         assert!(result.is_err());
         // Identity-only values must not be upgraded into mutable or readable references.
-        assert!(analyzer.check_cap_sub(Capability::Tag, Capability::Iso, s()).is_err());
-        assert!(analyzer.check_cap_sub(Capability::Tag, Capability::Box, s()).is_err());
+        assert!(analyzer
+            .check_cap_sub(Capability::Tag, Capability::Iso, s())
+            .is_err());
+        assert!(analyzer
+            .check_cap_sub(Capability::Tag, Capability::Box, s())
+            .is_err());
     }
 
     #[test]
