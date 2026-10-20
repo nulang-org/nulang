@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Read-only migration plan and snapshot integrity checking — 2026-10-20
+- **`nula db plan [--json]` hashes version-ordered SQL source files using workspace BLAKE3** and rejects duplicates, missing versions, symlinked files, oversize inputs and malformed migration names.
+- **`nula db verify --ledger <file>` compares against an operator-provided JSON export of an external applied-migration ledger.** Changes to applied SQL fail the checksum verification; applied entries must be a strict prefix of source versions.
+- **No database is queried or mutated.** The exported ledger is not authenticated by the CLI, and a production migration runner with atomic database-side ledger writes and locking remains separate work.
+
 ### Forward-only SQL migration scaffold — 2026-10-20
 - **The package CLI can create deterministic, numbered migration files** with `nula generate migration create_customers`. Names and existing versions are validated, duplicate sequence numbers and symlink directories are rejected, and new files are created without overwrite.
 - **Scaffolding never executes SQL or claims a migration has been applied.** Schema history, multi-database transactional application, drift/rollback policies, and Cloud integration remain future correctness-gated work.
