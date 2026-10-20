@@ -75,6 +75,38 @@ fn web_main() {
     }
 }
 
+fn typed_form_route() -> RuntimeWebRoute {
+    let (module, function_index) =
+        compile_handler("fn endpoint(title: String) -> String { title }", "endpoint");
+    let contract_source = r#"
+fn endpoint(title: String from form("title")) -> String { title }
+
+fn web_main() {
+    perform Web.route("POST", "/submit", endpoint)
+}
+"#;
+    let tokens = Lexer::new(contract_source)
+        .lex()
+        .expect("lex form contract source");
+    let ast = Parser::new(tokens)
+        .parse_module()
+        .expect("parse form contract source");
+    let contracts = compile_module_contracts(&ast);
+    assert!(contracts.diagnostics.is_empty(), "{:?}", contracts.diagnostics);
+    let plan =
+        compile_runtime_route_plan(&contracts.routes[0]).expect("compile form runtime route plan");
+
+    RuntimeWebRoute {
+        route: WebRoute {
+            method: HttpMethod::Post,
+            path: "/submit".to_string(),
+            handler_module: module,
+            handler_func_idx: function_index,
+        },
+        plan: Some(plan),
+    }
+}
+
 fn legacy_route() -> WebRoute {
     let (module, function_index) =
         compile_handler("fn legacy() -> String { \"legacy\" }", "legacy");
@@ -193,6 +225,43 @@ fn unrelated_duplicate_query_preserves_legacy_compatibility() {
 
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
     assert!(response_body(&response).starts_with("25"), "{response}");
+}
+
+#[test]
+fn duplicate_typed_form_is_rejected_over_real_http() {
+    let server = WebDevServer::bind_runtime(0, None, None, vec![typed_form_route()])
+        .expect("bind typed form WebDevServer");
+    let body = "title=first&%74itle=second";
+    let request = format!(
+        "POST /submit HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let response = send_raw_request(server.port, &request);
+    assert!(
+        response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+        "{response}"
+    );
+    let problem: serde_json::Value =
+        serde_json::from_str(response_body(&response)).expect("parse form problem JSON");
+    assert_eq!(problem["code"], "ambiguous_request_input");
+    assert_eq!(problem["source"], "form");
+    assert_eq!(problem["source_name"], "title");
+}
+
+#[test]
+fn unambiguous_typed_form_executes_over_real_http() {
+    let server = WebDevServer::bind_runtime(0, None, None, vec![typed_form_route()])
+        .expect("bind typed form WebDevServer");
+    let body = "title=hello+world";
+    let request = format!(
+        "POST /submit HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let response = send_raw_request(server.port, &request);
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert!(response_body(&response).starts_with("hello world"), "{response}");
 }
 
 #[test]
