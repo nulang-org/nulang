@@ -21,6 +21,32 @@ pub struct Document {
 /// Function pointer type for producing a vector embedding from a text string.
 pub type EmbeddingFn = fn(&str) -> Vec<f32>;
 
+/// Identifies which embedding algorithm produced the cached vectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum EmbeddingSource {
+    #[default]
+    Deterministic,
+    Custom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticMemoryError {
+    MissingEmbeddingProvider,
+}
+
+impl std::fmt::Display for SemanticMemoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingEmbeddingProvider => {
+                write!(f, "custom embedding provider must be reattached after restore")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SemanticMemoryError {}
+
 /// Long-term semantic memory backed by a brute-force vector search.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SemanticMemory {
@@ -32,6 +58,10 @@ pub struct SemanticMemory {
     /// still readable and are embedded on demand.
     #[serde(default)]
     embeddings: Vec<Vec<f32>>,
+    /// Provenance guard prevents mixing cached custom vectors with default
+    /// hash-derived query embeddings after deserialization.
+    #[serde(default)]
+    embedding_source: EmbeddingSource,
     /// Optional custom embedding function. Defaults to a deterministic hash-based
     /// embedding when `None`.
     #[serde(skip)]
@@ -53,6 +83,11 @@ impl SemanticMemory {
             documents: Vec::new(),
             dimensions,
             embeddings: Vec::new(),
+            embedding_source: if embedding_fn.is_some() {
+                EmbeddingSource::Custom
+            } else {
+                EmbeddingSource::Deterministic
+            },
             embedding_fn,
         }
     }
@@ -64,6 +99,11 @@ impl SemanticMemory {
     /// created with a custom embedding function.
     pub fn set_embedding_fn(&mut self, embedding_fn: Option<EmbeddingFn>) {
         self.embedding_fn = embedding_fn;
+        self.embedding_source = if embedding_fn.is_some() {
+            EmbeddingSource::Custom
+        } else {
+            EmbeddingSource::Deterministic
+        };
         self.embeddings = self
             .documents
             .iter()
@@ -82,13 +122,26 @@ impl SemanticMemory {
         // When an older snapshot is loaded, populate its missing vectors before
         // appending so document offsets and cached vectors remain aligned.
         if self.embeddings.len() != self.documents.len() {
-            self.embeddings = self
-                .documents
-                .iter()
-                .map(|doc| self.embed(&doc.content))
-                .collect();
+            self.embeddings = if self.embedding_source == EmbeddingSource::Custom
+                && self.embedding_fn.is_none()
+            {
+                vec![Vec::new(); self.documents.len()]
+            } else {
+                self.documents
+                    .iter()
+                    .map(|doc| self.embed(&doc.content))
+                    .collect()
+            };
         }
-        let embedding = self.embed(&content);
+        // Preserve a placeholder rather than silently producing incompatible
+        // hash embeddings when restoring memory from a custom provider.
+        let embedding = if self.embedding_source == EmbeddingSource::Custom
+            && self.embedding_fn.is_none()
+        {
+            Vec::new()
+        } else {
+            self.embed(&content)
+        };
         self.documents.push(Document {
             id: id.clone(),
             content,
@@ -102,8 +155,22 @@ impl SemanticMemory {
     ///
     /// Returns up to `top_k` results sorted by descending similarity score.
     pub fn search(&self, query: &str, top_k: usize) -> Vec<(&Document, f32)> {
+        // Historical infallible interface: fail closed on missing providers.
+        // New callers should use search_checked() to propagate the error.
+        self.search_checked(query, top_k).unwrap_or_default()
+    }
+
+    /// Fallible search that rejects a missing custom embedding provider.
+    pub fn search_checked(
+        &self,
+        query: &str,
+        top_k: usize,
+    ) -> Result<Vec<(&Document, f32)>, SemanticMemoryError> {
+        if self.embedding_source == EmbeddingSource::Custom && self.embedding_fn.is_none() {
+            return Err(SemanticMemoryError::MissingEmbeddingProvider);
+        }
         if top_k == 0 || self.documents.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let query_embedding = self.embed(query);
@@ -129,7 +196,7 @@ impl SemanticMemory {
 
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         results.truncate(top_k);
-        results
+        Ok(results)
     }
 
     /// Remove the document with the given id.
