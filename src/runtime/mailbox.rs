@@ -698,6 +698,51 @@ mod tests {
     }
 
     #[test]
+    fn routing_depth_uses_application_credits_when_bounded() {
+        let mut bounded = Mailbox::new(1);
+        let system = Message {
+            behavior_id: 99,
+            payload: MessagePayload::from_slice(&[]),
+            sender: 1,
+            priority: MessagePriority::System,
+            trace_id: None,
+        };
+        bounded.push(system).unwrap();
+        assert_eq!(bounded.len(), 1);
+        assert_eq!(bounded.routing_depth(), 0);
+
+        // Selective receive must keep staged supervisor messages logically
+        // queued without claiming application capacity.
+        assert!(bounded.receive_match(&[99]).is_some());
+        assert_eq!(bounded.routing_depth(), 0);
+        bounded.push(make_msg(1, 2)).unwrap();
+        assert_eq!(bounded.len(), 2);
+        assert_eq!(bounded.routing_depth(), 1);
+        assert!(bounded.push(make_msg(2, 3)).is_err());
+
+        bounded.commit_receive_match().unwrap();
+        assert_eq!(bounded.routing_depth(), 1);
+        assert_eq!(bounded.pop().unwrap().behavior_id, 1);
+        assert_eq!(bounded.routing_depth(), 0);
+
+        // An unbounded mailbox uses total depth to avoid additional normal
+        // credit atomic writes on the common unbounded message path.
+        let mut unbounded = Mailbox::new(0);
+        unbounded.push(Message {
+            behavior_id: 99,
+            payload: MessagePayload::from_slice(&[]),
+            sender: 1,
+            priority: MessagePriority::System,
+            trace_id: None,
+        }).unwrap();
+        assert_eq!(unbounded.routing_depth(), 1);
+        unbounded.push(make_msg(1, 2)).unwrap();
+        assert_eq!(unbounded.routing_depth(), 2);
+        unbounded.pop();
+        assert_eq!(unbounded.routing_depth(), 1);
+    }
+
+    #[test]
     fn test_unbounded_never_fails() {
         let mut mb = Mailbox::new(0);
         for i in 0..10000 {
