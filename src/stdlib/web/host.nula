@@ -36,6 +36,21 @@ pub fn raw(s: String) -> Html ! {Web, Render} {
     perform Web.raw(s)
 }
 
+/// Return JSON over HTTP with an explicit status code.
+/// `json` must be an already-serialized JSON document.
+/// Allowed statuses: 200-203, 207-299, and 400-599.
+/// The request host rejects invalid JSON or statuses with HTTP 500.
+/// Outside routed HTTP serving, the value is escaped as an HTML fragment.
+pub fn json_response(status: Int, json: String) -> Html ! {Web, Respond} {
+    perform Web.json_response(status, json)
+}
+
+/// Return unescaped plain text over HTTP, without injecting HTML/client JS.
+/// Uses the same status restrictions as `json_response`.
+pub fn text_response(status: Int, body: String) -> Html ! {Web, Respond} {
+    perform Web.text_response(status, body)
+}
+
 /// Redirect to a same-origin, root-relative URL (e.g. "/dashboard").
 /// Routed HTTP requests return 302 (GET) or 303 (POST) with Location.
 /// Outside an HTTP request, safe local targets retain the HTML fallback.
