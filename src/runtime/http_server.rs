@@ -175,13 +175,11 @@ fn read_http_request<R: Read>(reader: &mut R) -> Result<Option<HttpRequest>, Htt
         .method
         .and_then(HttpMethod::from_str)
         .ok_or(HttpReadError::NotImplemented)?;
-    // Nulang serves origin-form routes, not forward-proxy absolute-form,
-    // CONNECT authority-form, or server-wide asterisk-form request targets.
+    // Preserve the parsed request-target, including RFC 9112 absolute-form
+    // requests. This framing layer rejects forbidden fragments/control bytes;
+    // routing/authority reconstruction belongs to the HTTP dispatch layer.
     let path = parsed.path.ok_or(HttpReadError::BadRequest)?;
-    if !path.starts_with('/')
-        || path.contains('#')
-        || path.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
-    {
+    if path.contains('#') || path.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
         return Err(HttpReadError::BadRequest);
     }
     let path = path.to_string();
@@ -209,8 +207,7 @@ fn read_http_request<R: Read>(reader: &mut R) -> Result<Option<HttpRequest>, Htt
             }
             has_host = true;
             let host = value.trim();
-            if host.is_empty()
-                || host.bytes().any(|byte| {
+            if host.bytes().any(|byte| {
                     byte <= 0x20
                         || byte == 0x7f
                         || matches!(byte, b',' | b'/' | b'\\' | b'@' | b'#' | b'?')
@@ -1318,7 +1315,6 @@ mod tests {
     fn http_request_requires_single_host_for_http_11() {
         for raw in [
             &b"GET /resource HTTP/1.1\r\n\r\n"[..],
-            &b"GET /resource HTTP/1.1\r\nHost: \r\n\r\n"[..],
             &b"GET /resource HTTP/1.1\r\nHost: first.example\r\nhost: second.example\r\n\r\n"[..],
             &b"GET /resource HTTP/1.1\r\nHost: first.example, second.example\r\n\r\n"[..],
             &b"GET /resource HTTP/1.1\r\nHost: bad host\r\n\r\n"[..],
@@ -1350,19 +1346,40 @@ mod tests {
     }
 
     #[test]
-    fn http_request_rejects_invalid_versions_and_request_targets() {
+    fn http_request_rejects_invalid_versions_and_fragments() {
         for raw in [
             &b"GET / HTTP/2.0\r\nHost: localhost\r\n\r\n"[..],
-            &b"GET http://evil.example/private HTTP/1.1\r\nHost: localhost\r\n\r\n"[..],
             &b"GET /resource#fragment HTTP/1.1\r\nHost: localhost\r\n\r\n"[..],
-            &b"OPTIONS * HTTP/1.1\r\nHost: localhost\r\n\r\n"[..],
+            &b"GET http://example.test/a#fragment HTTP/1.1\r\nHost: localhost\r\n\r\n"[..],
         ] {
             assert_eq!(
                 read_http_request(&mut chunks(raw, 4)).unwrap_err(),
                 HttpReadError::BadRequest,
-                "Nulang is an origin HTTP/1.x server, not a forward proxy"
+                "invalid request lines must fail closed"
             );
         }
+    }
+
+    #[test]
+    fn http_request_preserves_absolute_form_and_empty_host_for_routing() {
+        // RFC 9112 permits absolute-form at origin servers, even when a proxy
+        // would normally send it. Parsing must not blanket-reject that form.
+        let absolute = read_http_request(&mut chunks(
+            b"GET http://example.test/resource?x=1 HTTP/1.1\r\nHost: mismatch.test\r\n\r\n",
+            4,
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(absolute.path, "http://example.test/resource?x=1");
+
+        // Empty Host is permitted when the target has no URI authority.
+        let empty_host = read_http_request(&mut chunks(
+            b"GET /resource HTTP/1.1\r\nHost: \r\n\r\n",
+            4,
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(empty_host.path, "/resource");
     }
 
     #[test]
