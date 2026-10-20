@@ -147,9 +147,48 @@ When a custom provider is unavailable after restoration, the original
 `search` method returns no results rather than mixing incompatible vectors.
 Use `search_checked` to receive an explicit `MissingEmbeddingProvider`
 error, then call `set_embedding_fn` with the original provider before
-searching. Storing additional documents before reattaching a custom provider
+searching. The checked API also rejects dimension mismatches and non-finite
+embedding components. Storing additional documents before reattaching a custom provider
 records a placeholder rather than an incompatible vector, and rebuilding
 with `set_embedding_fn` makes those documents searchable.
+
+## Reproducible performance baseline
+
+The opt-in Rust integration benchmark is available at
+`crates/nulang-ai/tests/search_benchmark.rs`. It generates
+deterministic multi-namespace documents and reports indexing throughput and
+query p50/p95/mean. It makes no claims about service-level latency.
+
+```bash
+cargo test -p nulang-ai --lib --locked
+cargo fmt --all --check
+
+# This performance test is ignored in routine CI.
+NULANG_SEARCH_BENCH_DOCS=100000 \
+NULANG_SEARCH_BENCH_QUERIES=500 \
+cargo test -p nulang-ai --test search_benchmark --locked -- --ignored --nocapture
+```
+
+The benchmark defaults to 10,000 documents and 200 queries. Increasing the
+document count up to 1,000,000 is supported but may require substantial RAM.
+Compare Tantivy on identical documents, namespace cardinality, queries, hit
+limits, hardware, and warmed/cold-cache conditions before making migration
+decisions. Record indexing memory and size-on-disk independently; the current
+embedded engine keeps everything in process and does not own a disk-backed
+segment format.
+
+## Search safety and data correctness
+
+- The embedded engine caches namespace document counts and token totals on
+  insert, replacement, and deletion; snapshot restore rebuilds those counters.
+- The semantic-memory checked API validates all query/document vector
+  dimensions and finite numeric values. Invalid or corrupted cached vectors
+  are not silently truncated or mixed with another embedding provider.
+- All engines still require application-level namespace authorization before
+  running a query. This crate does not implement an identity provider,
+  ACL-aware result filtering, billing quotas, or transactional ingestion.
+- The benchmark and tests have no externally verified results until the
+  Rust CI jobs complete successfully.
 
 ## Follow-up work
 
