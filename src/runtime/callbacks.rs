@@ -419,9 +419,16 @@ pub(crate) fn perform_web_builtin(
         Some("route") => Some(crate::vm::Value::unit()),
         Some("redirect") => {
             let url = resolve(constants, *regs.first()?);
+            crate::runtime::http_server::set_response_redirect(&url);
+            // Only a request host can turn the redirect effect into an HTTP
+            // 3xx response. Other execution contexts retain the HTML fallback,
+            // but never emit an unsafe redirect target into raw markup.
+            if !crate::runtime::http_server::safe_local_redirect_target(&url) {
+                return Some(callbacks.alloc_string(""));
+            }
             let out = format!(
                 "<html><head><meta http-equiv=\"refresh\" content=\"0;url={}\"></head></html>",
-                url
+                html_escape(&url)
             );
             Some(callbacks.alloc_string(&out))
         }
