@@ -6807,13 +6807,34 @@ impl Runtime {
             Some("call") => {
                 let module = string_arg(0)?;
                 let function = string_arg(1)?;
-                // VM string values contain module-local pool indices. Resolve
-                // every argument before crossing the Python boundary, rather
-                // than passing invalid indices or placeholder descriptors.
+                // The VM passes the entire register frame to builtin effects.
+                // Python.call is variadic: reading regs[2..] would treat stale
+                // frame values (including actor references) as arguments.
+                // MIR stages the exact count in the reserved r14 scratch slot.
+                let arg_count = match regs
+                    .get(crate::mir_codegen::SPILL_TEMP3 as usize)
+                    .and_then(|value| value.as_int())
+                {
+                    Some(count)
+                        if (2..=crate::mir_codegen::MAX_STAGED_ARGS as i64).contains(&count) =>
+                    {
+                        count as usize
+                    }
+                    _ => {
+                        eprintln!("Python call error: missing or invalid staged argument count");
+                        return Some(Value::nil());
+                    }
+                };
+                let Some(args) = regs.get(2..arg_count) else {
+                    eprintln!("Python call error: truncated argument register frame");
+                    return Some(Value::nil());
+                };
+                // Resolve only the staged arguments. Never capture VM-local
+                // indices, stale registers, or actor references by guessing.
                 let result = crate::runtime::ForeignCallRequest::from_vm_args(
                     &module,
                     &function,
-                    &regs[2..],
+                    args,
                     |id| match constants.get(id as usize) {
                         Some(crate::bytecode::Constant::String(value)) => Some(value.clone()),
                         _ => None,
