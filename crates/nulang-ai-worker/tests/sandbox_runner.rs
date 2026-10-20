@@ -250,3 +250,26 @@ fn existing_shared_receipt_directory_is_not_chmodded() {
     let mode = std::fs::metadata(&receipts).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o755);
 }
+
+#[test]
+#[ignore = "requires a locally cached, pinned OCI image and Docker daemon"]
+fn opt_in_real_docker_smoke_test() {
+    let image = std::env::var("NULANG_TEST_SANDBOX_IMAGE")
+        .expect("set NULANG_TEST_SANDBOX_IMAGE to a local image@sha256:digest");
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("project");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let config = SandboxConfig::new(
+        &workspace,
+        tmp.path().join("receipts"),
+        image,
+        vec!["true".into()],
+        "Tests pass",
+    ).unwrap();
+    let (worker, verifier) = SandboxHarness::docker(config).into_parts();
+    let task = test_task();
+    let WorkerExecution::Executed { evidence } = worker.execute(&task) else {
+        panic!("restricted Docker command failed");
+    };
+    verifier.verify(&task, &evidence).unwrap();
+}
