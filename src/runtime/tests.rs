@@ -8710,3 +8710,67 @@ fn confirmed_node_removal_forgets_crdt_receiver_knowledge() {
         "a peer that rejoins after confirmed removal must receive full state"
     );
 }
+
+
+#[test]
+fn orca_pending_fetch_root_visitor_observes_retained_message_payloads() {
+    let mut runtime = Runtime::new();
+    runtime.pending_fetched_messages.insert(
+        [0xAB; 32],
+        vec![(
+            11,
+            "MissingActor".to_owned(),
+            Message {
+                behavior_id: 7,
+                payload: MessagePayload::from_slice(&[Value::int(401), Value::int(402)]),
+                sender: 17,
+                priority: MessagePriority::Normal,
+                trace_id: None,
+            },
+            Vec::new(),
+            Vec::new(),
+        )],
+    );
+
+    let mut values = Vec::new();
+    runtime.visit_pending_fetched_values(&mut |value| values.push(value));
+    assert_eq!(values, vec![Value::int(401), Value::int(402)]);
+    assert_eq!(runtime.pending_fetched_messages.len(), 1);
+    assert_eq!(runtime.pending_fetched_messages[&[0xAB; 32]].len(), 1);
+}
+
+#[test]
+fn orca_cross_shard_envelope_root_visitor_observes_both_delivery_variants() {
+    let runtime = Runtime::new();
+    let message = CrossShardMsg::DeliverMessage {
+        target_id: 2,
+        behavior_id: 3,
+        payload: vec![Value::int(501), Value::int(502)],
+        sender: 1,
+        trace_id: None,
+        grain_id: None,
+        object_holds: ObjectRefLease::acquire(&runtime.object_store, &[])
+            .expect("empty object-ref lease"),
+    };
+    let mut values = Vec::new();
+    message.visit_payload_values(&mut |value| values.push(value));
+    assert_eq!(values, vec![Value::int(501), Value::int(502)]);
+
+    let named_message = CrossShardMsg::DeliverNamedMessage {
+        target_id: 2,
+        behavior_name: "run".to_owned(),
+        payload: vec![Value::int(503)],
+        sender: 1,
+        trace_id: None,
+        object_holds: ObjectRefLease::acquire(&runtime.object_store, &[])
+            .expect("empty object-ref lease"),
+    };
+    values.clear();
+    named_message.visit_payload_values(&mut |value| values.push(value));
+    assert_eq!(values, vec![Value::int(503)]);
+
+    values.clear();
+    CrossShardMsg::EnqueueActor { actor_id: 7 }
+        .visit_payload_values(&mut |value| values.push(value));
+    assert!(values.is_empty());
+}
