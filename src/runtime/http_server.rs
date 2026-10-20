@@ -1182,7 +1182,10 @@ impl WebDevServer {
                         take_response_cookies();
                         HttpResponse {
                             status: 500,
-                            headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
+                            headers: vec![(
+                                "Content-Type".into(),
+                                "text/plain; charset=utf-8".into(),
+                            )],
                             body: b"Invalid explicit response".to_vec(),
                         }
                     }
@@ -1393,7 +1396,11 @@ mod tests {
         assert!(no_content.body.is_empty());
 
         with_request_context(context.clone(), || {
-            assert!(register_explicit_http_response(204, "forbidden body", false));
+            assert!(register_explicit_http_response(
+                204,
+                "forbidden body",
+                false
+            ));
         });
         assert!(take_explicit_http_response().unwrap().is_err());
 
