@@ -359,6 +359,8 @@ impl HttpServerState {
         let status_text = match response.status {
             200 => "OK",
             201 => "Created",
+            202 => "Accepted",
+            203 => "Non-Authoritative Information",
             204 => "No Content",
             301 => "Moved Permanently",
             302 => "Found",
@@ -370,6 +372,9 @@ impl HttpServerState {
             404 => "Not Found",
             405 => "Method Not Allowed",
             408 => "Request Timeout",
+            409 => "Conflict",
+            410 => "Gone",
+            412 => "Precondition Failed",
             413 => "Payload Too Large",
             417 => "Expectation Failed",
             422 => "Unprocessable Entity",
