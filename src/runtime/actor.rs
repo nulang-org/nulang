@@ -986,16 +986,7 @@ impl Actor {
         matched
     }
 
-    /// Observe Values kept by actor-owned state, event records, registered
-    /// query handlers, and a suspended workflow's execution frames.
-    ///
-    /// This scans scheduler-owned mailbox buffers but NOT their concurrent
-    /// queues; native/runtime roots, active shared-VM frames and in-flight
-    /// deliveries are also outside this partial view. It must NOT be
-    /// interpreted as a complete root set for reclaiming local cycles.
-    /// The caller must check heap provenance before treating a Value as a
-    /// pointer into this actor's heap.
-    pub fn visit_stored_values(&self, visit: &mut impl FnMut(Value)) {
+    fn visit_values_outside_mailbox(&self, visit: &mut impl FnMut(Value)) {
         for &value in self.state_data.values() {
             visit(value);
         }
@@ -1010,7 +1001,29 @@ impl Actor {
         if let Some(suspended) = &self.suspended_execution {
             suspended.vm_state.visit_execution_values(visit);
         }
+    }
+
+    /// Inspect actor state, saved execution and scheduler-local mailbox
+    /// buffers. Concurrent mailbox queues are deliberately excluded.
+    ///
+    /// This partial view is for diagnostics, not local-cycle reclamation.
+    pub fn visit_stored_values(&self, visit: &mut impl FnMut(Value)) {
+        self.visit_values_outside_mailbox(visit);
         self.mailbox.visit_scheduler_owned_values(visit);
+    }
+
+    /// Inspect actor state, saved execution and *all* mailbox lanes when this
+    /// actor and its mailbox are exclusively owned by the scheduler.
+    ///
+    /// This requires a genuine exclusive mailbox safepoint, including a
+    /// guarantee that no concurrent send may publish into the mailbox while
+    /// its SegQueues are temporarily drained and restored. The `&mut self`
+    /// borrow enforces this for safe Rust callers but does not stop external
+    /// channel transfers, native/JIT temporary roots or foreign holds.
+    /// Inspection is not permission to reclaim any object.
+    pub fn visit_all_stored_values_exclusive(&mut self, visit: &mut impl FnMut(Value)) {
+        self.visit_values_outside_mailbox(visit);
+        self.mailbox.visit_all_queued_values_exclusive(visit);
     }
 }
 
