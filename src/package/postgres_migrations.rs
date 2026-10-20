@@ -131,10 +131,9 @@ pub fn apply_postgres_migrations(
     let plan = read_migration_plan(root)?;
     let statements = preflight(root, &plan)?;
     if plan.is_empty() {
-        return Ok(MigrationAudit {
-            applied: 0,
-            pending: Vec::new(),
-        });
+        return Err(error(
+            "no SQL migration source files; refusing to assume an empty database ledger",
+        ));
     }
 
     let mut tx = client
