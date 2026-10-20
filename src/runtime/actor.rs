@@ -958,11 +958,40 @@ mod tests {
 
 
 impl Actor {
+    /// Determine whether a Value names the exact payload address of a
+    /// currently live allocation in this actor's heap.
+    ///
+    /// This compares against the allocator's live-object list *before*
+    /// dereferencing any untrusted pointer; interior addresses and pointers
+    /// owned by other actors are rejected. The lookup is linear in live
+    /// allocations and is intended only for diagnostics/root validation.
+    ///
+    /// A positive result is not a persistent lifetime proof: another
+    /// allocation can later reuse the same address. Before any reclamation,
+    /// a full safepoint and generation-aware identity are still required.
+    pub fn is_live_heap_payload_value(&self, value: Value) -> bool {
+        let Some(ptr) = value.as_ptr() else {
+            return false;
+        };
+        if ptr.is_null() {
+            return false;
+        }
+
+        let mut matched = false;
+        self.heap.iter_live_objects(|_, payload, _| {
+            if payload == ptr {
+                matched = true;
+            }
+        });
+        matched
+    }
+
     /// Observe Values kept by actor-owned state, event records, registered
     /// query handlers, and a suspended workflow's execution frames.
     ///
-    /// This deliberately does not scan mailboxes, native/runtime roots,
-    /// active shared-VM frames or in-flight deliveries. It must NOT be
+    /// This scans scheduler-owned mailbox buffers but NOT their concurrent
+    /// queues; native/runtime roots, active shared-VM frames and in-flight
+    /// deliveries are also outside this partial view. It must NOT be
     /// interpreted as a complete root set for reclaiming local cycles.
     /// The caller must check heap provenance before treating a Value as a
     /// pointer into this actor's heap.
@@ -981,6 +1010,7 @@ impl Actor {
         if let Some(suspended) = &self.suspended_execution {
             suspended.vm_state.visit_execution_values(visit);
         }
+        self.mailbox.visit_scheduler_owned_values(visit);
     }
 }
 
@@ -1027,6 +1057,45 @@ mod orca_actor_stored_root_visitor_tests {
         });
         observed.sort_unstable();
         assert_eq!(observed, vec![31, 32, 33, 34]);
+    }
+
+    #[test]
+    fn stored_actor_root_visitor_includes_scheduler_owned_message_values() {
+        let mut actor = Actor::new(1, "mailbox-observer", 0);
+        actor
+            .mailbox
+            .push_local(Message {
+                behavior_id: 3,
+                payload: MessagePayload::from_slice(&[Value::int(777)]),
+                sender: 2,
+                priority: MessagePriority::Normal,
+                trace_id: None,
+            })
+            .unwrap();
+        let mut observed = Vec::new();
+        actor.visit_stored_values(&mut |value| observed.push(value));
+        assert_eq!(observed, vec![Value::int(777)]);
+        assert_eq!(actor.mailbox.len(), 1);
+        assert_eq!(actor.mailbox.pop().unwrap().sender, 2);
+    }
+
+    #[test]
+    fn actor_heap_provenance_rejects_foreign_interior_and_freed_pointers() {
+        let mut actor = Actor::new(1, "owner", 0);
+        let mut other_actor = Actor::new(2, "other", 0);
+        let other = other_actor.allocate_string("other actor");
+        let owned = actor.allocate_string("owned");
+        assert!(actor.is_live_heap_payload_value(owned));
+        assert!(!actor.is_live_heap_payload_value(other));
+        assert!(!actor.is_live_heap_payload_value(Value::int(123)));
+        let payload = owned.as_ptr().expect("allocated pointer");
+        let interior = unsafe { Value::ptr(payload.wrapping_add(1)) };
+        assert!(!actor.is_live_heap_payload_value(interior));
+
+        // After release, the same numeric address no longer denotes a live
+        // allocation. A future reuse requires generation-aware identity.
+        unsafe { assert!(actor.orca_gc.drop_local_ref(&mut actor.heap, payload)) };
+        assert!(!actor.is_live_heap_payload_value(owned));
     }
 
     #[test]

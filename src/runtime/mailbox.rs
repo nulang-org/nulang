@@ -503,6 +503,42 @@ impl Mailbox {
         None
     }
 
+    /// Observe Values retained by scheduler-owned mailbox buffers, without
+    /// dequeuing messages or disturbing selective-receive cursors.
+    ///
+    /// This is deliberately **not** a complete mailbox root snapshot:
+    /// system_queue and normal_queue accept concurrent producers and
+    /// cannot be safely enumerated using their pop-only SegQueue interface.
+    /// A future collection safepoint must cover those lanes with a proper
+    /// admission barrier or independently tracked roots. Duplicate values
+    /// from an active receive candidate are harmless for inspection.
+    ///
+    /// This read-only method must never be used alone to prove an object is
+    /// unreachable or to reclaim any ORCA heap allocation.
+    pub fn visit_scheduler_owned_values(&self, visit: &mut impl FnMut(Value)) {
+        for message in &self.local_queue {
+            for &value in message.payload.as_slice() {
+                visit(value);
+            }
+        }
+        for buffer in [
+            &self.system_skip_buffer,
+            &self.local_skip_buffer,
+            &self.skip_buffer,
+        ] {
+            for (message, _) in buffer {
+                for &value in message.payload.as_slice() {
+                    visit(value);
+                }
+            }
+        }
+        if let Some((_, _, payload)) = &self.active_match {
+            for &value in payload.as_slice() {
+                visit(value);
+            }
+        }
+    }
+
     /// Total logical message count. Safe to query concurrently.
     pub fn len(&self) -> usize {
         self.queued_count.load(Ordering::Relaxed)
@@ -955,5 +991,117 @@ mod transactional_receive_tests {
             Some(11),
             "reset must rewind indexed cursors and clear tried state"
         );
+    }
+}
+
+#[cfg(test)]
+mod orca_mailbox_root_visitor_tests {
+    use super::*;
+
+    fn message(id: i64, priority: MessagePriority) -> Message {
+        Message {
+            behavior_id: 7,
+            payload: MessagePayload::from_slice(&[Value::int(id)]),
+            sender: id as u64,
+            priority,
+            trace_id: None,
+        }
+    }
+
+    #[test]
+    fn staged_root_visit_preserves_active_match_and_lane_fifo() {
+        let mut mailbox = Mailbox::new(0);
+        mailbox
+            .push_local(message(101, MessagePriority::Normal))
+            .unwrap();
+        mailbox
+            .push_local(message(102, MessagePriority::System))
+            .unwrap();
+        mailbox.push(message(103, MessagePriority::Normal)).unwrap();
+        mailbox.push(message(104, MessagePriority::System)).unwrap();
+
+        let (arm, candidate) = mailbox.receive_match(&[7]).expect("system match");
+        assert_eq!(arm, 0);
+        assert_eq!(candidate[0].as_int(), Some(102));
+        mailbox
+            .push_local(message(105, MessagePriority::Normal))
+            .unwrap();
+        // This remains in concurrent SegQueue, which this partial visitor
+        // deliberately does not pretend to enumerate.
+        mailbox.push(message(106, MessagePriority::Normal)).unwrap();
+
+        let before = mailbox.len();
+        let mut seen = Vec::new();
+        mailbox.visit_scheduler_owned_values(&mut |value| {
+            if let Some(n) = value.as_int() {
+                seen.push(n);
+            }
+        });
+        seen.sort_unstable();
+        assert_eq!(seen, vec![101, 102, 102, 103, 104, 105]);
+        assert_eq!(
+            mailbox.len(),
+            before,
+            "observing must not dequeue messages"
+        );
+
+        let committed = mailbox.commit_receive_match().expect("existing match");
+        assert_eq!(committed[0].as_int(), Some(102));
+        let mut remaining = Vec::new();
+        while let Some(message) = mailbox.pop() {
+            remaining.push(message.sender);
+        }
+        assert_eq!(remaining, vec![104, 101, 105, 103, 106]);
+    }
+
+    #[test]
+    fn staged_root_visit_handles_shared_payload_without_materialization() {
+        let mut mailbox = Mailbox::new(0);
+        let values = [
+            Value::int(1),
+            Value::int(2),
+            Value::int(3),
+            Value::int(4),
+            Value::int(5),
+        ];
+        mailbox
+            .push_local(Message {
+                behavior_id: 2,
+                payload: MessagePayload::from_slice(&values),
+                sender: 3,
+                priority: MessagePriority::Normal,
+                trace_id: None,
+            })
+            .unwrap();
+
+        let mut seen = Vec::new();
+        mailbox.visit_scheduler_owned_values(&mut |value| seen.push(value));
+        assert_eq!(seen, values.to_vec());
+        assert_eq!(
+            mailbox
+                .pop()
+                .expect("unchanged queued value")
+                .payload
+                .as_slice(),
+            values.as_slice()
+        );
+        assert!(mailbox.is_empty());
+    }
+
+    #[test]
+    fn concurrent_mailbox_queues_are_explicitly_not_covered() {
+        let mut mailbox = Mailbox::new(0);
+        mailbox.push(message(7, MessagePriority::Normal)).unwrap();
+        mailbox.push(message(8, MessagePriority::System)).unwrap();
+
+        let mut seen = Vec::new();
+        mailbox.visit_scheduler_owned_values(&mut |value| seen.push(value));
+        assert!(
+            seen.is_empty(),
+            "SegQueues need a separate admission/root barrier"
+        );
+        assert_eq!(mailbox.len(), 2);
+        assert_eq!(mailbox.pop().unwrap().sender, 8);
+        assert_eq!(mailbox.pop().unwrap().sender, 7);
     }
 }
