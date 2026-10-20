@@ -127,7 +127,6 @@ fn step_bound_is_part_of_reproduction_contract() {
     assert_eq!(fresh.verify_deterministic_trace(&trace), Ok(trace.outcome));
 }
 
-
 #[test]
 fn forced_replay_uses_recorded_actor_choice_not_random_seed() {
     let (mut source, _, _) = two_counters(2);
