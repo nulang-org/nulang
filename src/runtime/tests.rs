@@ -76,7 +76,7 @@ fn actor_reply_effect_cancel_is_owner_checked_and_late_send_fails() {
     let other = rt.spawn_actor(Box::new(Vec::new));
     declare_test_behavior(&mut rt, owner, "reply");
     let reference = rt
-        .perform_actor_builtin(Some(owner), Some("reply_open"), &[], &[Value::actor_ref(sender), Value::int(60_000)])
+        .perform_actor_builtin(Some(owner), Some("reply_open"), &[], &[Value::actor_ref(other), Value::int(60_000)])
         .unwrap();
 
     assert_eq!(
