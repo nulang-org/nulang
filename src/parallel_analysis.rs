@@ -635,6 +635,98 @@ mod tests {
             .contains("Net::TcpOut(api.example.com:443)"));
     }
 
+
+    #[test]
+    fn immediately_invoked_lambda_cannot_mutate_unproven_reference_argument() {
+        let mutating = Expr::Lambda {
+            params: vec![crate::ast::Param::new("view", None)],
+            ret_type: None,
+            body: Box::new(Expr::Assign {
+                target: Box::new(Expr::Index {
+                    arr: Box::new(var("view")),
+                    idx: Box::new(int(0)),
+                    span: sp(),
+                }),
+                value: Box::new(int(5)),
+                span: sp(),
+            }),
+            effect: None,
+            span: sp(),
+        };
+        let branches = vec![
+            Expr::App {
+                func: Box::new(mutating),
+                args: vec![var("shared")],
+                span: sp(),
+            },
+            var("shared"),
+        ];
+        assert!(
+            validate_parallel_branches(&branches, sp()).is_err(),
+            "a mutable formal parameter can alias an argument read by a sibling"
+        );
+    }
+
+    #[test]
+    fn immediately_invoked_lambda_checks_formal_even_if_outer_scope_shadows_name() {
+        let mutating = Expr::Lambda {
+            params: vec![crate::ast::Param::new("shared", None)],
+            ret_type: None,
+            body: Box::new(Expr::Assign {
+                target: Box::new(Expr::FieldAccess {
+                    expr: Box::new(var("shared")),
+                    field: "count".to_string(),
+                    span: sp(),
+                }),
+                value: Box::new(int(5)),
+                span: sp(),
+            }),
+            effect: None,
+            span: sp(),
+        };
+        let branches = vec![Expr::Let {
+            name: "shared".to_string(),
+            ty: None,
+            value: Box::new(var("source")),
+            body: Box::new(Expr::App {
+                func: Box::new(mutating),
+                args: vec![var("shared")],
+                span: sp(),
+            }),
+            let_in: true,
+            span: sp(),
+        }];
+        assert!(
+            validate_parallel_branches(&branches, sp()).is_err(),
+            "the inner lambda parameter must not inherit the outer bound name"
+        );
+    }
+
+    #[test]
+    fn immediately_invoked_lambda_pure_parameter_read_is_allowed() {
+        let pure = Expr::Lambda {
+            params: vec![crate::ast::Param::new("value", None)],
+            ret_type: None,
+            body: Box::new(Expr::Binary {
+                op: BinOp::Add,
+                left: Box::new(var("value")),
+                right: Box::new(int(1)),
+                span: sp(),
+            }),
+            effect: None,
+            span: sp(),
+        };
+        let branches = vec![
+            Expr::App {
+                func: Box::new(pure),
+                args: vec![var("shared")],
+                span: sp(),
+            },
+            var("shared"),
+        ];
+        assert!(validate_parallel_branches(&branches, sp()).is_ok());
+    }
+
     #[test]
     fn immediate_lambda_captured_heap_mutation_conflicts_with_other_branch_read() {
         let mutating = Expr::Lambda {
