@@ -341,6 +341,27 @@ enum CrossShardMsg {
     EnqueueActor { actor_id: u64 },
 }
 
+impl CrossShardMsg {
+    /// Observe Values in a single cross-shard envelope *while the caller
+    /// owns the envelope*. The channel queue itself is not enumerated.
+    ///
+    /// Cross-shard actor-heap pointers are forbidden by the message protocol;
+    /// these Values may still identify shared immutable ObjectStore handles.
+    /// Safepoint/root accounting must include envelopes before, during, and
+    /// after channel transfer, not just while this method is invoked.
+    #[allow(dead_code)] // Future diagnostic root barrier; no collector invokes this yet.
+    fn visit_payload_values(&self, visit: &mut impl FnMut(Value)) {
+        match self {
+            Self::DeliverMessage { payload, .. } | Self::DeliverNamedMessage { payload, .. } => {
+                for &value in payload {
+                    visit(value);
+                }
+            }
+            Self::EnqueueActor { .. } => {}
+        }
+    }
+}
+
 /// Admission result for a local-process actor delivery.
 ///
 /// Fabric uses this to distinguish successful mailbox/channel admission from
@@ -640,6 +661,20 @@ impl crate::backends::ForeignInterop for NoOpForeignInterop {
 }
 
 impl Runtime {
+    /// Observe Values in pending bytecode-fetch deliveries retained by this
+    /// runtime. This does not inspect shard channels, actor mailboxes, or
+    /// arbitrary temporary native/JIT handles, and is NOT a safe collector
+    /// root snapshot on its own.
+    pub fn visit_pending_fetched_values(&self, visit: &mut impl FnMut(Value)) {
+        for deliveries in self.pending_fetched_messages.values() {
+            for (_, _, message, _, _) in deliveries {
+                for &value in message.payload.as_slice() {
+                    visit(value);
+                }
+            }
+        }
+    }
+
     pub fn new() -> Self {
         Runtime {
             actors: HashMap::new(),
