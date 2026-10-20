@@ -575,6 +575,40 @@ mod tests {
     }
 
     #[test]
+    fn test_clock_relative_schedule_and_remaining_do_not_consult_wall_time() {
+        let wheel = TimerWheel::new();
+        let logical_now = Instant::now() + Duration::from_secs(60);
+        let timer_id = wheel.send_after_at(logical_now, Duration::from_secs(5), 77, 3, vec![]);
+        assert_eq!(wheel.next_deadline(), Some(logical_now + Duration::from_secs(5)));
+        assert_eq!(
+            wheel.remaining_at(logical_now, timer_id),
+            Some(Duration::from_secs(5)),
+        );
+        assert!(wheel.tick(logical_now + Duration::from_secs(4)).is_empty());
+        assert_eq!(
+            wheel.remaining_at(logical_now + Duration::from_secs(5), timer_id),
+            Some(Duration::ZERO),
+        );
+        let fired = wheel.tick(logical_now + Duration::from_secs(5));
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].0, 77);
+    }
+
+    #[test]
+    fn test_same_deadline_fires_in_stable_timer_id_order() {
+        let wheel = TimerWheel::new();
+        let logical_now = Instant::now();
+        for target in [7, 8, 9] {
+            wheel.send_after_at(logical_now, Duration::from_secs(1), target, 1, vec![]);
+        }
+        let fired = wheel.tick(logical_now + Duration::from_secs(1));
+        assert_eq!(
+            fired.iter().map(|(target, _)| *target).collect::<Vec<_>>(),
+            vec![7, 8, 9],
+        );
+    }
+
+    #[test]
     fn test_virtual_clock_advance_accumulates() {
         let mut clock = VirtualClock::new();
         clock.advance(Duration::from_millis(100));
