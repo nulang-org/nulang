@@ -728,13 +728,15 @@ mod tests {
         // An unbounded mailbox uses total depth to avoid additional normal
         // credit atomic writes on the common unbounded message path.
         let mut unbounded = Mailbox::new(0);
-        unbounded.push(Message {
-            behavior_id: 99,
-            payload: MessagePayload::from_slice(&[]),
-            sender: 1,
-            priority: MessagePriority::System,
-            trace_id: None,
-        }).unwrap();
+        unbounded
+            .push(Message {
+                behavior_id: 99,
+                payload: MessagePayload::from_slice(&[]),
+                sender: 1,
+                priority: MessagePriority::System,
+                trace_id: None,
+            })
+            .unwrap();
         assert_eq!(unbounded.routing_depth(), 1);
         unbounded.push(make_msg(1, 2)).unwrap();
         assert_eq!(unbounded.routing_depth(), 2);
