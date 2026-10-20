@@ -98,7 +98,9 @@ pub fn run(args: &[String]) -> NuResult<()> {
                     }
                     Ok(())
                 }
-                Some("migrate") if args.len() == 5 && args[2] == "--sqlite" && args[4] == "--apply" => {
+                Some("migrate")
+                    if args.len() == 5 && args[2] == "--sqlite" && args[4] == "--apply" =>
+                {
                     #[cfg(feature = "sqlite")]
                     {
                         let database = Path::new(&args[3]);
@@ -120,13 +122,17 @@ pub fn run(args: &[String]) -> NuResult<()> {
                                 &database_path,
                             ),
                         )?;
-                        println!("SQLite database schema ledger now records {} applied migrations", audit.applied);
+                        println!(
+                            "SQLite database schema ledger now records {} applied migrations",
+                            audit.applied
+                        );
                         Ok(())
                     }
                     #[cfg(not(feature = "sqlite"))]
                     {
                         Err(NuError::PackageError {
-                            msg: "SQLite migration support requires the sqlite Cargo feature".into(),
+                            msg: "SQLite migration support requires the sqlite Cargo feature"
+                                .into(),
                             span: Span::default(),
                         })
                     }

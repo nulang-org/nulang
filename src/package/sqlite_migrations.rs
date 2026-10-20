@@ -136,7 +136,10 @@ fn check_database_path(path: &Path) -> NuResult<()> {
 /// The ledger is read and compared while holding that lock; all pending DDL and
 /// ledger inserts commit together or roll back together. This is local embedded
 /// SQLite only, not libSQL remote replication, PostgreSQL or Cloud deployment.
-pub async fn apply_sqlite_migrations(root: &Path, database_path: &Path) -> NuResult<MigrationAudit> {
+pub async fn apply_sqlite_migrations(
+    root: &Path,
+    database_path: &Path,
+) -> NuResult<MigrationAudit> {
     let plan = read_migration_plan(root)?;
     // Preflight the entire source plan before opening the database, so a
     // rejected unsafe statement cannot create an empty local DB file.
@@ -189,7 +192,9 @@ pub async fn apply_sqlite_migrations(root: &Path, database_path: &Path) -> NuRes
                 .get(2)
                 .map_err(|err| sqlite_error("ledger checksum invalid", err))?;
             let expected = plan.get(applied).ok_or_else(|| {
-                package_error("SQLite ledger contains applied versions missing from the source plan")
+                package_error(
+                    "SQLite ledger contains applied versions missing from the source plan",
+                )
             })?;
             if version != expected.version as i64 {
                 return Err(package_error(format!(
@@ -294,10 +299,14 @@ mod tests {
 
         let db = libsql::Builder::new_local(&db_path).build().await.unwrap();
         let conn = db.connect().unwrap();
-        let mut rows = conn.query(
-            "SELECT version, file, checksum_blake3 FROM __nulang_schema_migrations ORDER BY version",
-            (),
-        ).await.unwrap();
+        let mut rows = conn
+            .query(
+                "SELECT version, file, checksum_blake3 \
+                 FROM __nulang_schema_migrations ORDER BY version",
+                (),
+            )
+            .await
+            .unwrap();
         for record in read_migration_plan(&root).unwrap() {
             let row = rows.next().await.unwrap().unwrap();
             let version: i64 = row.get(0).unwrap();
@@ -322,11 +331,19 @@ mod tests {
         assert!(apply_sqlite_migrations(&root, &db_path).await.is_err());
         let db = libsql::Builder::new_local(&db_path).build().await.unwrap();
         let conn = db.connect().unwrap();
-        let mut tables = conn.query(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('customers', '__nulang_schema_migrations')",
-            (),
-        ).await.unwrap();
-        assert!(tables.next().await.unwrap().is_none(), "failed batch must leave no schema or ledger");
+        let mut tables = conn
+            .query(
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'table' \
+                 AND name IN ('customers', '__nulang_schema_migrations')",
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(
+            tables.next().await.unwrap().is_none(),
+            "failed batch must leave no schema or ledger"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -337,7 +354,11 @@ mod tests {
         fs::write(&first, "CREATE TABLE customers (id INTEGER PRIMARY KEY);").unwrap();
         apply_sqlite_migrations(&root, &db_path).await.unwrap();
 
-        fs::write(&first, "CREATE TABLE customers (id INTEGER PRIMARY KEY, edited TEXT);").unwrap();
+        fs::write(
+            &first,
+            "CREATE TABLE customers (id INTEGER PRIMARY KEY, edited TEXT);",
+        )
+        .unwrap();
         let second = generate_migration(&root, "create_orders").unwrap();
         fs::write(&second, "CREATE TABLE orders (id INTEGER PRIMARY KEY);").unwrap();
         let result = apply_sqlite_migrations(&root, &db_path).await.unwrap_err();
