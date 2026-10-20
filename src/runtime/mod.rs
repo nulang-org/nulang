@@ -6636,13 +6636,7 @@ impl Runtime {
         for (reference, watcher, target) in retired {
             self.monitor_refs.remove(&reference);
             if target == actor_id && watcher != actor_id {
-                exit::send_down_message_with_ref(
-                    self,
-                    watcher,
-                    target,
-                    reason,
-                    Some(reference),
-                );
+                exit::send_down_message_with_ref(self, watcher, target, reason, Some(reference));
             }
         }
     }
