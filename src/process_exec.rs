@@ -37,7 +37,9 @@ impl ProcessSpec {
         let executable = executable.into();
         let cwd = cwd.into();
         if !executable.is_absolute() {
-            return Err(ExecError::InvalidSpec("executable must be an absolute path"));
+            return Err(ExecError::InvalidSpec(
+                "executable must be an absolute path",
+            ));
         }
         if !cwd.is_absolute() {
             return Err(ExecError::InvalidSpec("cwd must be an absolute path"));
@@ -82,7 +84,11 @@ pub struct ExecLimits {
 
 impl ExecLimits {
     pub fn new(timeout: Duration, max_output_bytes: usize) -> Result<Self, ExecError> {
-        if timeout.is_zero() || timeout > Duration::from_secs(86_400) || max_output_bytes == 0 || max_output_bytes > 64 * 1024 * 1024 {
+        if timeout.is_zero()
+            || timeout > Duration::from_secs(86_400)
+            || max_output_bytes == 0
+            || max_output_bytes > 64 * 1024 * 1024
+        {
             return Err(ExecError::InvalidLimits);
         }
         Ok(Self {
@@ -145,9 +151,7 @@ enum PipeResult {
 fn read_bounded(mut pipe: impl Read, max: usize) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     // The extra byte distinguishes exactly-at-limit from overflowing output.
-    pipe.by_ref()
-        .take(max as u64 + 1)
-        .read_to_end(&mut bytes)?;
+    pipe.by_ref().take(max as u64 + 1).read_to_end(&mut bytes)?;
     Ok(bytes)
 }
 
@@ -259,8 +263,8 @@ pub fn execute(
                         return Err(ExecError::Capture(error));
                     }
                 };
-                let other_bytes = stdout.as_ref().map_or(0, Vec::len)
-                    + stderr.as_ref().map_or(0, Vec::len);
+                let other_bytes =
+                    stdout.as_ref().map_or(0, Vec::len) + stderr.as_ref().map_or(0, Vec::len);
                 if bytes.len().saturating_add(other_bytes) > limits.max_output_bytes {
                     stop_process(&mut child, status.is_none());
                     return Err(ExecError::OutputLimitExceeded);
