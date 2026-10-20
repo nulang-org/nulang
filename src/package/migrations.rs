@@ -111,6 +111,184 @@ pub fn generate_migration(root: &Path, name: &str) -> NuResult<PathBuf> {
     Ok(path)
 }
 
+
+/// Exact source identity; digest covers unmodified SQL bytes, not DB state.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SqlMigration {
+    pub version: u32,
+    pub file: String,
+    pub checksum_blake3: String,
+}
+
+/// Read-only comparison with a supplied applied-migration ledger export.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MigrationAudit {
+    pub applied: usize,
+    pub pending: Vec<SqlMigration>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AppliedMigrationSnapshot {
+    schema_version: u32,
+    applied: Vec<SqlMigration>,
+}
+
+fn checked_migrations_dir(root: &Path) -> NuResult<PathBuf> {
+    if !root.join("Nulang.toml").is_file() {
+        return Err(error("migration inspection requires a Nulang.toml package root"));
+    }
+    let db = root.join("db");
+    let migrations = db.join("migrations");
+    for dir in [&db, &migrations] {
+        match fs::symlink_metadata(dir) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(error(format!(
+                    "migration directory {} must be a real directory, not a symlink",
+                    dir.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => return Err(error(format!("cannot inspect {}: {err}", dir.display()))),
+        }
+    }
+    Ok(migrations)
+}
+
+fn parsed_sql_filename(file: &str) -> NuResult<u32> {
+    let (digits, suffix) = file
+        .split_once('_')
+        .ok_or_else(|| error(format!("malformed SQL migration filename: {file}")))?;
+    let name = suffix
+        .strip_suffix(".sql")
+        .ok_or_else(|| error(format!("malformed SQL migration filename: {file}")))?;
+    if digits.len() != 6
+        || !digits.bytes().all(|byte| byte.is_ascii_digit())
+        || !valid_migration_name(name)
+    {
+        return Err(error(format!("malformed SQL migration filename: {file}")));
+    }
+    let version: u32 = digits
+        .parse()
+        .map_err(|_| error(format!("invalid SQL migration version: {file}")))?;
+    if version == 0 {
+        return Err(error(format!("zero SQL migration version: {file}")));
+    }
+    Ok(version)
+}
+
+fn read_limited(path: &Path, limit: usize) -> NuResult<Vec<u8>> {
+    use std::io::Read;
+    let meta = fs::symlink_metadata(path)
+        .map_err(|err| error(format!("cannot inspect {}: {err}", path.display())))?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(error(format!(
+            "{} must be a regular file, not a symlink",
+            path.display()
+        )));
+    }
+    if meta.len() > limit as u64 {
+        return Err(error(format!("file {} exceeds {limit} bytes", path.display())));
+    }
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .map_err(|err| error(format!("cannot open {}: {err}", path.display())))?
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|err| error(format!("cannot read {}: {err}", path.display())))?;
+    if bytes.len() > limit {
+        return Err(error(format!("file {} exceeds {limit} bytes", path.display())));
+    }
+    Ok(bytes)
+}
+
+/// List and checksum exact SQL bytes without modifying filesystem or database.
+/// Once any files exist, versions must form a contiguous sequence from 000001.
+pub fn read_migration_plan(root: &Path) -> NuResult<Vec<SqlMigration>> {
+    let dir = checked_migrations_dir(root)?;
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut plan = Vec::new();
+    for entry in fs::read_dir(&dir)
+        .map_err(|err| error(format!("cannot list {}: {err}", dir.display())))?
+    {
+        let entry = entry.map_err(|err| error(format!("cannot read migration entry: {err}")))?;
+        let file = entry.file_name().into_string()
+            .map_err(|_| error("SQL migration filenames must use UTF-8"))?;
+        if !file.ends_with(".sql") {
+            continue;
+        }
+        if plan.len() >= 10_000 {
+            return Err(error("SQL migration inspection supports at most 10000 files"));
+        }
+        let version = parsed_sql_filename(&file)?;
+        let bytes = read_limited(&entry.path(), 4 * 1024 * 1024)?;
+        if std::str::from_utf8(&bytes).is_err() {
+            return Err(error(format!("SQL migration {file} must contain UTF-8")));
+        }
+        plan.push(SqlMigration {
+            version,
+            file,
+            checksum_blake3: blake3::hash(&bytes).to_hex().to_string(),
+        });
+    }
+    plan.sort_unstable_by_key(|migration| migration.version);
+    for (index, migration) in plan.iter().enumerate() {
+        let expected = index as u32 + 1;
+        if migration.version != expected {
+            return Err(error(format!(
+                "SQL migration sequence missing or duplicated version {expected:06}; next source: {}",
+                migration.file
+            )));
+        }
+    }
+    Ok(plan)
+}
+
+/// Compare source against an external, operator-provided ledger JSON snapshot.
+/// This does not authenticate its provenance or query the database.
+pub fn verify_applied_snapshot(root: &Path, snapshot_path: &Path) -> NuResult<MigrationAudit> {
+    let plan = read_migration_plan(root)?;
+    let raw = read_limited(snapshot_path, 2 * 1024 * 1024)?;
+    let snapshot: AppliedMigrationSnapshot = serde_json::from_slice(&raw)
+        .map_err(|err| error(format!("invalid applied migration snapshot JSON: {err}")))?;
+    if snapshot.schema_version != 1 {
+        return Err(error("unsupported applied migration snapshot schema_version"));
+    }
+    if snapshot.applied.len() > plan.len() {
+        return Err(error("applied migration ledger contains an unknown source version"));
+    }
+    for (index, applied) in snapshot.applied.iter().enumerate() {
+        let expected = &plan[index];
+        if applied.version != expected.version {
+            return Err(error(format!(
+                "applied migrations are out of order at version {:06}",
+                expected.version
+            )));
+        }
+        if applied.file != expected.file {
+            return Err(error(format!(
+                "applied migration filename mismatch at version {:06}",
+                expected.version
+            )));
+        }
+        if applied.checksum_blake3 != expected.checksum_blake3 {
+            return Err(error(format!(
+                "applied migration checksum mismatch at version {:06}",
+                expected.version
+            )));
+        }
+    }
+    let applied = snapshot.applied.len();
+    Ok(MigrationAudit {
+        applied,
+        pending: plan.into_iter().skip(applied).collect(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
