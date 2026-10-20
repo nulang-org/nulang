@@ -1102,12 +1102,18 @@ impl WebDevServer {
                         },
                         Some(_) => HttpResponse {
                             status: 400,
-                            headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
+                            headers: vec![(
+                                "Content-Type".into(),
+                                "text/plain; charset=utf-8".into(),
+                            )],
                             body: b"Invalid redirect target".to_vec(),
                         },
                         None => HttpResponse {
                             status: 200,
-                            headers: vec![("Content-Type".into(), "text/html; charset=utf-8".into())],
+                            headers: vec![(
+                                "Content-Type".into(),
+                                "text/html; charset=utf-8".into(),
+                            )],
                             body: inject_client_runtime_script(&html).into_bytes(),
                         },
                     },
