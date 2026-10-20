@@ -32,7 +32,7 @@ fn reconnect_replays_only_missing_output_and_fences_previous_connection() {
             assert_eq!(latest, SessionCursor(2));
             assert_eq!(frames.len(), 1);
             assert_eq!(frames[0].sequence, SessionCursor(2));
-            assert_eq!(frames[0].bytes, b"two");
+            assert_eq!(frames[0].bytes.as_slice(), b"two");
         }
         other => panic!("unexpected outcome: {other:?}"),
     }
@@ -79,6 +79,10 @@ fn owner_is_bound_to_tenant_and_principal_and_hidden_from_other_callers() {
         );
         assert_eq!(
             sessions.read_after("s", identity, SessionCursor(1), SessionCursor(0)),
+            Err(SessionError::NotFound)
+        );
+        assert_eq!(
+            sessions.ack("s", identity, SessionCursor(1), SessionCursor(0)),
             Err(SessionError::NotFound)
         );
         assert_eq!(
@@ -173,6 +177,10 @@ fn close_requires_current_epoch_after_reconnect() {
     let mut sessions = registry();
     sessions.open("s", owner()).unwrap();
     sessions.resume("s", &owner(), SessionCursor(0)).unwrap();
+    assert_eq!(
+        sessions.read_after("s", &owner(), SessionCursor(1), SessionCursor(0)),
+        Err(SessionError::StaleEpoch)
+    );
     assert_eq!(sessions.close("s", &owner(), SessionCursor(1)), Err(SessionError::StaleEpoch));
     sessions.close("s", &owner(), SessionCursor(2)).unwrap();
     assert_eq!(sessions.resume("s", &owner(), SessionCursor(0)), Err(SessionError::NotFound));
