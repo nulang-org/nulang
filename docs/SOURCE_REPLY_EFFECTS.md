@@ -9,13 +9,13 @@ request protocol or a replacement for synchronous `ask`.
 
 ```nulang
 actor Receiver {
-    behavior new_request() {
-        perform Actor.reply_open(5000)
+    behavior new_request(responder: Actor) {
+        perform Actor.reply_open(responder, 5000)
     }
 
     behavior reply(reference: Int, value: Int) {
-        // Validate the correlation against your own pending request state.
-        // A source-level Int reference does not authenticate a sender.
+        // Only the designated responder can send this reply effect.
+        // Still validate correlation against local pending request state.
         perform IO.print(perform Int.to_string(value))
         0
     }
@@ -32,13 +32,16 @@ actor Responder {
 }
 ```
 
-- `Actor.reply_open(ttl_ms: Int) -> Int | Nil` creates a local one-shot
-  reply request owned by the current actor. The timeout must be positive and
-  no longer than 24 hours. It returns the positive correlation reference or
-  nil when no active actor exists, allocation fails, or the timeout is invalid.
+- `Actor.reply_open(responder: Actor, ttl_ms: Int) -> Int | Nil` creates a
+  local one-shot reply request owned by the current actor, **bound to exactly
+  one designated live responder actor**. The timeout must be positive and no
+  longer than 24 hours. It returns the positive correlation reference or nil
+  for a missing actor, invalid responder, allocation failure, or invalid TTL.
 - `Actor.reply_send(reference: Int, value: Int) -> Int | Nil` attempts to
   deliver to the **named `reply(reference: Int, value: Int)` behavior on the
-  ticket owner**. Its return code is `0` accepted, `1` backpressured,
+  ticket owner**. Only the `responder` specified by the owner at
+  `reply_open` may send; other actors receive inactive (3), whether or not
+  the reference exists. Its return code is `0` accepted, `1` backpressured,
   `2` expired, `3` inactive. Nil denotes malformed input or a missing
   reply behavior. Backpressure leaves the request active for retry.
 - `Actor.reply_cancel(reference: Int) -> Bool` revokes a request belonging
@@ -53,11 +56,16 @@ correlation reference against its own expected state before applying results.
 
 These experimental effects are for **trusted, local actor code only**.
 References are positive tagged `Int` values and are **not unforgeable
-capabilities**: malicious code that guesses or learns a reference may spoof a
-reply. Do not use these effects for untrusted tenant security boundaries,
+capabilities**: sender identity comes from the runtime actor context, while
+the integer reference is only a correlation key. A different local actor
+cannot claim the designated responder role by guessing the reference.
+However, these effects do not authenticate external origins or authorize
+access across tenant boundaries. Do not use them for untrusted tenant security boundaries,
 credentials, billing authorization, cross-shard routing, or remote nodes.
 Host-level `LocalReplyTicket` and `ActorAlias` are opaque Rust handles but
-still not independently authenticated over the network.
+still not independently authenticated over the network. Trusted native
+host callers can bypass this source-level sender binding with the lower-level
+Rust alias APIs; those APIs must not be exposed to untrusted code.
 
 The source-level API has no timer wakeup or automatic garbage collection on
 deadline alone. Reply attempts check time, while `expire_local_reply_requests`
