@@ -671,6 +671,89 @@ mod tests {
     }
 
 
+
+    #[test]
+    fn immediate_lambda_mutation_through_local_alias_is_rejected() {
+        let mutating = Expr::Lambda {
+            params: vec![crate::ast::Param::new("view", None)],
+            ret_type: None,
+            body: Box::new(Expr::Let {
+                name: "alias".to_string(),
+                ty: None,
+                value: Box::new(var("view")),
+                body: Box::new(Expr::Assign {
+                    target: Box::new(Expr::Index {
+                        arr: Box::new(var("alias")),
+                        idx: Box::new(int(0)),
+                        span: sp(),
+                    }),
+                    value: Box::new(int(5)),
+                    span: sp(),
+                }),
+                let_in: true,
+                span: sp(),
+            }),
+            effect: None,
+            span: sp(),
+        };
+        assert!(
+            validate_parallel_branches(
+                &[
+                    Expr::App {
+                        func: Box::new(mutating),
+                        args: vec![var("shared")],
+                        span: sp(),
+                    },
+                    var("shared"),
+                ],
+                sp()
+            )
+            .is_err(),
+            "a let-bound alias must not conceal mutation of a lambda parameter"
+        );
+    }
+
+    #[test]
+    fn immediate_lambda_locally_allocated_alias_is_not_a_parameter_alias() {
+        let mutating_local = Expr::Lambda {
+            params: vec![crate::ast::Param::new("view", None)],
+            ret_type: None,
+            body: Box::new(Expr::Let {
+                name: "alias".to_string(),
+                ty: None,
+                value: Box::new(Expr::Array(vec![int(1)], sp())),
+                body: Box::new(Expr::Assign {
+                    target: Box::new(Expr::Index {
+                        arr: Box::new(var("alias")),
+                        idx: Box::new(int(0)),
+                        span: sp(),
+                    }),
+                    value: Box::new(int(5)),
+                    span: sp(),
+                }),
+                let_in: true,
+                span: sp(),
+            }),
+            effect: None,
+            span: sp(),
+        };
+        assert!(
+            validate_parallel_branches(
+                &[
+                    Expr::App {
+                        func: Box::new(mutating_local),
+                        args: vec![var("shared")],
+                        span: sp(),
+                    },
+                    var("shared"),
+                ],
+                sp()
+            )
+            .is_ok(),
+            "a proven local allocation is not a direct alias of the parameter"
+        );
+    }
+
     #[test]
     fn immediately_invoked_lambda_cannot_mutate_unproven_reference_argument() {
         let mutating = Expr::Lambda {
