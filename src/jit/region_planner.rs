@@ -456,16 +456,22 @@ pub(crate) fn find_compilable_region(
     }
 }
 
-/// The code offset of the function containing `pc` (largest
-/// `function_table[i] <= pc`), bounding `direct_call_target`'s backward walk.
+/// Return the last function start at or before `pc`. MIR codegen emits
+/// functions in table order, so offsets are nondecreasing; `partition_point`
+/// avoids scanning the full table for each candidate native direct call.
+fn containing_function_start(offsets: &[usize], pc: usize) -> usize {
+    let end = offsets.partition_point(|&start| start <= pc);
+    if end == 0 {
+        0
+    } else {
+        offsets[end - 1]
+    }
+}
+
+/// Bound `direct_call_target`'s backward walk to the calling function.
+/// Keep the legacy zero fallback for top-level code before the first function.
 pub(crate) fn func_start_for(module: &crate::bytecode::CodeModule, pc: usize) -> usize {
-    module
-        .function_table
-        .iter()
-        .copied()
-        .filter(|&o| o <= pc)
-        .next_back()
-        .unwrap_or(0)
+    containing_function_start(&module.function_table, pc)
 }
 
 /// If the instruction at `pc` is a `Call` of a provably-non-suspending direct
