@@ -4290,6 +4290,27 @@ impl Default for TypeChecker {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+mod qualified_reference_preflight_tests {
+    use super::*;
+    #[test]
+    fn typechecker_rejects_unresolved_module_symbol() {
+        let mut checker = TypeChecker::new();
+        let reference = Expr::QualifiedVar {
+            alias: "codec".into(),
+            name: "encode".into(),
+            span: Span::default(),
+        };
+        let err = checker
+            .infer_expr(&TypeContext::new(), &reference)
+            .expect_err("unbound qualified symbols must never infer as local variables");
+        assert!(
+            format!("{err}").contains("unresolved qualified reference"),
+            "{err}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
