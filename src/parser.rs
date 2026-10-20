@@ -2844,6 +2844,7 @@ impl Parser {
 
         // Handle infix operators
         loop {
+            let separated_by_newline = self.peek_kind() == &TokenKind::Newline;
             self.skip_newlines();
             let op = self.peek_kind().clone();
             if op == TokenKind::Eof {
@@ -3157,7 +3158,7 @@ impl Parser {
             // Contextual low-precedence contract check. Retain the inferred
             // type instead of replacing it with the annotated contract.
             if matches!(&op, TokenKind::Ident(name) if name == "satisfies") {
-                if PREC_PIPE < min_prec {
+                if separated_by_newline || PREC_PIPE < min_prec {
                     break;
                 }
                 self.advance();
