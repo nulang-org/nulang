@@ -11,7 +11,6 @@ use crate::types::{NuError, NuResult, Span};
 // A transaction-scoped advisory lock serializes Nulang migration writers
 // within a database. The ledger remains the authoritative record of progress.
 const LOCK_ID: i64 = 0x4e55_4c41_4e47_534d;
-const LEDGER: &str = "public.__nulang_schema_migrations";
 const CREATE_LEDGER: &str = "CREATE TABLE IF NOT EXISTS public.__nulang_schema_migrations (\
     version BIGINT PRIMARY KEY CHECK (version > 0), \
     file TEXT NOT NULL, \
@@ -288,4 +287,80 @@ mod tests {
         assert!(validate_source_bytes(&record, bytes).is_ok());
         assert!(validate_source_bytes(&record, b"CREATE TABLE customers(id TEXT);").is_err());
     }
+
+    /// Destructive by design: only run against an explicitly disposable
+    /// database named with the protected nulang_migrations_test_ prefix.
+    #[test]
+    #[ignore = "requires an explicitly disposable PostgreSQL test database"]
+    fn applies_and_replays_against_disposable_postgres() {
+        let url = std::env::var("NULANG_TEST_POSTGRES_MIGRATIONS_URL")
+            .expect("set NULANG_TEST_POSTGRES_MIGRATIONS_URL to a disposable test DB");
+        let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        let name: String = client
+            .query_one("SELECT current_database()", &[])
+            .unwrap()
+            .get(0);
+        assert!(
+            name.starts_with("nulang_migrations_test_"),
+            "refusing integration test against database {name}"
+        );
+
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS public.__nulang_schema_migrations; \
+                 DROP TABLE IF EXISTS public.nulang_sample_customers;",
+            )
+            .unwrap();
+
+        let root = std::env::temp_dir().join(format!(
+            "nulang_postgres_migration_live_{}", std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("Nulang.toml"),
+            "[package]\nname = \"pg-live\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let sql_file = crate::package::migrations::generate_migration(
+            &root,
+            "create_sample_customers",
+        )
+        .unwrap();
+        std::fs::write(
+            &sql_file,
+            "CREATE TABLE public.nulang_sample_customers (id BIGINT PRIMARY KEY);",
+        )
+        .unwrap();
+        let applied = apply_postgres_migrations(&root, &mut client).unwrap();
+        assert_eq!(applied.applied, 1);
+        let replay = apply_postgres_migrations(&root, &mut client).unwrap();
+        assert_eq!(replay.applied, 1);
+        let count: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM public.__nulang_schema_migrations",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(count, 1);
+
+        std::fs::write(
+            &sql_file,
+            "CREATE TABLE public.nulang_sample_customers (id TEXT PRIMARY KEY);",
+        )
+        .unwrap();
+        let failure = apply_postgres_migrations(&root, &mut client).unwrap_err();
+        assert!(failure.to_string().contains("checksum mismatch"));
+
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS public.nulang_sample_customers; \
+                 DROP TABLE IF EXISTS public.__nulang_schema_migrations;",
+            )
+            .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
 }

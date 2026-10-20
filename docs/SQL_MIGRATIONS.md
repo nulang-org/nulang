@@ -50,3 +50,13 @@ The applied entries must be an exact prefix of the source sequence, including ea
 ### Future execution gates
 
 Before offering `db migrate`, implement authoritative schema history in the target database, checksums stored within the same transaction as successful schema changes where the engine permits it, concurrency-safe migration claims, rollback/recovery policy, and separate transaction/error behavior for SQLite and PostgreSQL. Nulang Cloud must not infer migrated state from this source-only plan or an untrusted JSON file.
+
+## PostgreSQL transaction backend (experimental, `postgres` feature)
+
+The `postgres` feature adds `package::postgres_migrations::apply_postgres_migrations(root, client)`. It accepts an **existing `&mut postgres::Client`** selected and authenticated by the application or operator, rather than accepting plaintext credentials or constructing an insecure connection for the CLI. There is **no PostgreSQL apply CLI command** in this increment, and Nulang Cloud deployment does not invoke it automatically.
+
+The runner preflights exact SQL BLAKE3 bytes, permits one supported `CREATE TABLE`, `CREATE [UNIQUE] INDEX` or `ALTER TABLE` statement per migration, and rejects multi-statement scripts, transaction-control commands, changes to its reserved ledger identifier, and `CONCURRENTLY`. It uses one PostgreSQL transaction, a fixed transaction-scoped advisory lock, bounded lock/statement timeouts, and an authoritative ledger in `public.__nulang_schema_migrations`. Applied version, filename and digest checks run inside the lock; pending DDL and ledger inserts commit atomically or roll back as one batch.
+
+**Integration gate:** Live tests are ignored by default because they mutate schema. To run the explicit test, create a disposable PostgreSQL database whose name starts with `nulang_migrations_test_`, set `NULANG_TEST_POSTGRES_MIGRATIONS_URL` for that local disposable database, and run the ignored `applies_and_replays_against_disposable_postgres` test with `--features postgres -- --ignored`. The test drops and recreates only its reserved test objects, so never point it at a valuable database. No live PostgreSQL integration was executed during authoring.
+
+This first increment does not include a ready-to-use TLS-enabled PostgreSQL CLI, tenant/schema isolation, zero-downtime online index handling, arbitrary SQL scripts, statement-level audit, or operational deployment approval. Environment-specific credentials, TLS, roles and backups remain the operator's responsibility. Transaction and concurrency claims require passing real database tests before promotion.
