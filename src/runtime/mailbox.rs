@@ -167,6 +167,10 @@ enum MatchLane {
 struct ReceiveLaneIndex {
     positions: FxHashMap<u16, Vec<usize>>,
     cursors: FxHashMap<u16, usize>,
+    /// Allocated only if the caller actually performs a reference-keyed
+    /// receive, so ordinary selective receive keeps its previous memory cost.
+    correlated_positions: Option<FxHashMap<(u16, i64), Vec<usize>>>,
+    correlated_cursors: FxHashMap<(u16, i64), usize>,
     valid: bool,
 }
 
@@ -175,25 +179,37 @@ impl ReceiveLaneIndex {
         Self {
             positions: FxHashMap::default(),
             cursors: FxHashMap::default(),
+            correlated_positions: None,
+            correlated_cursors: FxHashMap::default(),
             valid: true,
         }
     }
 
     #[inline]
-    fn append(&mut self, behavior_id: u16, index: usize) {
+    fn append(&mut self, behavior_id: u16, index: usize, first_int: Option<i64>) {
         if self.valid {
             self.positions.entry(behavior_id).or_default().push(index);
+            if let (Some(reference), Some(positions)) =
+                (first_int, self.correlated_positions.as_mut())
+            {
+                positions.entry((behavior_id, reference)).or_default().push(index);
+            }
         }
     }
 
     fn invalidate(&mut self) {
         self.positions.clear();
         self.cursors.clear();
+        if let Some(positions) = self.correlated_positions.as_mut() {
+            positions.clear();
+        }
+        self.correlated_cursors.clear();
         self.valid = false;
     }
 
     fn reset_cursors(&mut self) {
         self.cursors.clear();
+        self.correlated_cursors.clear();
     }
 
     fn ensure(&mut self, buffer: &VecDeque<(Message, bool)>) {
@@ -201,11 +217,58 @@ impl ReceiveLaneIndex {
             return;
         }
         self.positions.clear();
+        if let Some(positions) = self.correlated_positions.as_mut() {
+            positions.clear();
+        }
         for (idx, (msg, _)) in buffer.iter().enumerate() {
             self.positions.entry(msg.behavior_id).or_default().push(idx);
+            if let (Some(reference), Some(positions)) = (
+                msg.payload.first().and_then(Value::as_int),
+                self.correlated_positions.as_mut(),
+            ) {
+                positions
+                    .entry((msg.behavior_id, reference))
+                    .or_default()
+                    .push(idx);
+            }
         }
         self.cursors.clear();
+        self.correlated_cursors.clear();
         self.valid = true;
+    }
+
+    /// O(1) indexed lookup in the common case. Guard-rejected candidates
+    /// advance this key's cursor but stay queued for the next receive reset.
+    fn next_correlated(
+        &mut self,
+        buffer: &VecDeque<(Message, bool)>,
+        behavior_id: u16,
+        reference: i64,
+    ) -> Option<usize> {
+        self.ensure(buffer);
+        if self.correlated_positions.is_none() {
+            let mut positions: FxHashMap<(u16, i64), Vec<usize>> = FxHashMap::default();
+            for (idx, (message, _)) in buffer.iter().enumerate() {
+                if let Some(first_int) = message.payload.first().and_then(Value::as_int) {
+                    positions
+                        .entry((message.behavior_id, first_int))
+                        .or_default()
+                        .push(idx);
+                }
+            }
+            self.correlated_positions = Some(positions);
+        }
+        let key = (behavior_id, reference);
+        let positions = self.correlated_positions.as_ref()?.get(&key)?;
+        let cursor = self.correlated_cursors.entry(key).or_insert(0);
+        while *cursor < positions.len() {
+            let idx = positions[*cursor];
+            match buffer.get(idx) {
+                Some((_, false)) => return Some(idx),
+                Some((_, true)) | None => *cursor += 1,
+            }
+        }
+        None
     }
 
     fn next_candidate(
@@ -417,8 +480,9 @@ impl Mailbox {
     ) {
         let position = buffer.len();
         let behavior_id = msg.behavior_id;
+        let first_int = msg.payload.first().and_then(Value::as_int);
         buffer.push_back((msg, false));
-        index.append(behavior_id, position);
+        index.append(behavior_id, position, first_int);
     }
 
     fn ensure_receive_indexes(&mut self) {
@@ -499,6 +563,53 @@ impl Mailbox {
         {
             self.active_match = Some((MatchLane::Normal, idx, Arc::clone(&payload)));
             return Some((pos, payload));
+        }
+        None
+    }
+
+    /// Transactional receive for a reply whose FIRST argument is a specific
+    /// correlation Int. Unrelated messages remain queued, even when they have
+    /// the same behavior ID. This is a Rust mailbox primitive; the language
+    /// frontend's general `receive` expression is unchanged.
+    ///
+    /// Like receive_match, callers must commit or reset the candidate.
+    pub fn receive_match_ref(
+        &mut self,
+        behavior_id: u16,
+        reference: i64,
+    ) -> Option<Arc<Vec<Value>>> {
+        self.active_match = None;
+        self.ensure_receive_indexes();
+        self.stage_arrivals();
+        let indexes = self.receive_indexes.as_mut().expect("indexes initialized");
+
+        for (lane, buffer, index) in [
+            (
+                MatchLane::System,
+                &mut self.system_skip_buffer,
+                &mut indexes.system,
+            ),
+            (
+                MatchLane::Local,
+                &mut self.local_skip_buffer,
+                &mut indexes.local,
+            ),
+            (
+                MatchLane::Normal,
+                &mut self.skip_buffer,
+                &mut indexes.normal,
+            ),
+        ] {
+            let Some(position) = index.next_correlated(buffer, behavior_id, reference) else {
+                continue;
+            };
+            let Some((message, tried)) = buffer.get_mut(position) else {
+                continue;
+            };
+            *tried = true;
+            let payload = message.payload.to_shared();
+            self.active_match = Some((lane, position, Arc::clone(&payload)));
+            return Some(payload);
         }
         None
     }
@@ -884,6 +995,83 @@ mod transactional_receive_tests {
         assert_eq!(mb.pop().unwrap().sender, 2);
         assert_eq!(mb.pop().unwrap().sender, 3);
     }
+    #[test]
+    fn correlated_receive_skips_unrelated_refs_without_consuming_or_reordering() {
+        let mut mailbox = Mailbox::new(8);
+        mailbox.push_local(msg(7, 1, MessagePriority::Normal)).unwrap();
+        mailbox.push_local(msg(7, 2, MessagePriority::Normal)).unwrap();
+        mailbox.push_local(msg(7, 3, MessagePriority::Normal)).unwrap();
+
+        let found = mailbox
+            .receive_match_ref(7, 2)
+            .expect("matching correlation found");
+        assert_eq!(found[0].as_int(), Some(2));
+        assert_eq!(mailbox.len(), 3, "lookup must not consume");
+        assert_eq!(
+            mailbox.commit_receive_match().unwrap()[0].as_int(),
+            Some(2)
+        );
+        assert_eq!(mailbox.pop().unwrap().sender, 1);
+        assert_eq!(mailbox.pop().unwrap().sender, 3);
+        assert!(mailbox.is_empty());
+    }
+
+    #[test]
+    fn correlated_receive_rebuilds_after_commit_reset_and_new_arrivals() {
+        let mut mailbox = Mailbox::new(8);
+        mailbox.push(msg(9, 1, MessagePriority::Normal)).unwrap();
+        assert!(mailbox.receive_match_ref(9, 5).is_none());
+        mailbox.push(msg(9, 5, MessagePriority::Normal)).unwrap();
+
+        assert_eq!(
+            mailbox.receive_match_ref(9, 5).unwrap()[0].as_int(),
+            Some(5)
+        );
+        mailbox.reset_receive_match();
+        assert_eq!(
+            mailbox.receive_match_ref(9, 5).unwrap()[0].as_int(),
+            Some(5)
+        );
+        mailbox.commit_receive_match().expect("matched new arrival");
+        assert_eq!(mailbox.pop().unwrap().sender, 1);
+        assert!(mailbox.is_empty());
+    }
+
+    #[test]
+    fn correlated_receive_retains_system_first_then_local_then_normal() {
+        let mut mailbox = Mailbox::new(8);
+        mailbox.push(msg(4, 6, MessagePriority::Normal)).unwrap();
+        mailbox.push(msg(4, 6, MessagePriority::System)).unwrap();
+        mailbox.push_local(msg(4, 6, MessagePriority::Normal)).unwrap();
+        let first = mailbox.receive_match_ref(4, 6).expect("system match");
+        assert_eq!(first[0].as_int(), Some(6));
+        mailbox.commit_receive_match().expect("system commit");
+        let second = mailbox.receive_match_ref(4, 6).expect("local match");
+        assert_eq!(second[0].as_int(), Some(6));
+        mailbox.commit_receive_match().expect("local commit");
+        let third = mailbox.receive_match_ref(4, 6).expect("normal match");
+        assert_eq!(third[0].as_int(), Some(6));
+        mailbox.commit_receive_match().expect("normal commit");
+        assert!(mailbox.is_empty());
+    }
+
+    #[test]
+    fn correlated_receive_preserves_guard_rejection_semantics() {
+        let mut mailbox = Mailbox::new(8);
+        mailbox.push_local(msg(7, 42, MessagePriority::Normal)).unwrap();
+        mailbox.push_local(msg(7, 42, MessagePriority::Normal)).unwrap();
+        let _first = mailbox.receive_match_ref(7, 42).expect("first");
+        let second = mailbox.receive_match_ref(7, 42).expect("second");
+        assert_eq!(second[0].as_int(), Some(42));
+        mailbox.commit_receive_match().unwrap();
+        assert_eq!(mailbox.len(), 1);
+        mailbox.reset_receive_match();
+        let remaining = mailbox.receive_match_ref(7, 42).expect("rejected candidate");
+        assert_eq!(remaining[0].as_int(), Some(42));
+        mailbox.commit_receive_match().unwrap();
+        assert!(mailbox.is_empty());
+    }
+
     #[test]
     fn indexed_receive_preserves_fifo_across_arm_order() {
         let mut mb = Mailbox::new(8);

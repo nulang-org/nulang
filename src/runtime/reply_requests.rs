@@ -3,7 +3,7 @@
 //! This is a typed Rust embedding API, not a language effect or durable wire
 //! protocol. The owning Runtime serializes cancellation, expiry and admission.
 
-use super::{ActorAlias, AliasSendStatus, Runtime};
+use super::{ActorAlias, ActorState, AliasSendStatus, Runtime};
 use crate::vm::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,6 +17,12 @@ pub struct LocalRequestRef(u64);
 impl LocalRequestRef {
     pub fn as_int(self) -> i64 {
         self.0 as i64
+    }
+
+    /// Reject zero, signed negatives, and values outside the tagged-Int range.
+    pub(crate) fn from_positive_int(value: i64) -> Option<Self> {
+        (value > 0 && (value as u64) <= MAX_LOCAL_REQUEST_REF)
+            .then_some(Self(value as u64))
     }
 }
 
@@ -51,6 +57,9 @@ pub enum LocalReplyStatus {
 #[derive(Debug, Clone, Copy)]
 struct PendingLocalRequest {
     owner: u64,
+    /// Only this actor may perform source-level reply_send. None is reserved
+    /// for explicitly trusted host-side tickets created by the Rust API.
+    responder: Option<u64>,
     alias: ActorAlias,
     deadline: Instant,
 }
@@ -77,6 +86,34 @@ impl Runtime {
         owner: u64,
         deadline: Instant,
     ) -> Option<LocalReplyTicket> {
+        self.begin_local_reply_request_inner(owner, None, deadline)
+    }
+
+    /// Bind the source-level request to exactly one designated local actor.
+    /// The caller's runtime actor identity, not a user-supplied integer, is
+    /// checked for every source-level reply attempt.
+    pub(crate) fn begin_local_reply_request_from(
+        &mut self,
+        owner: u64,
+        responder: u64,
+        deadline: Instant,
+    ) -> Option<LocalReplyTicket> {
+        if !self
+            .actors
+            .get(&responder)
+            .is_some_and(|actor| actor.state != ActorState::Terminated)
+        {
+            return None;
+        }
+        self.begin_local_reply_request_inner(owner, Some(responder), deadline)
+    }
+
+    fn begin_local_reply_request_inner(
+        &mut self,
+        owner: u64,
+        responder: Option<u64>,
+        deadline: Instant,
+    ) -> Option<LocalReplyTicket> {
         if deadline <= Instant::now() {
             return None;
         }
@@ -92,6 +129,7 @@ impl Runtime {
             reference,
             PendingLocalRequest {
                 owner,
+                responder,
                 alias,
                 deadline,
             },
@@ -173,6 +211,35 @@ impl Runtime {
                 LocalReplyStatus::Inactive
             }
         }
+    }
+
+    /// Trusted local source-effect bridge: route by reference to the owning
+    /// actor's named reply behavior, if it exists. An absent handler does not
+    /// consume a still-valid ticket, so a corrected handler can retry.
+    pub(crate) fn send_local_reply_by_reference(
+        &mut self,
+        reference: LocalRequestRef,
+        sender: u64,
+        behavior: &str,
+        values: &[Value],
+    ) -> Option<LocalReplyStatus> {
+        let Some(pending) = self.local_reply_requests.pending.get(&reference).copied() else {
+            return Some(LocalReplyStatus::Inactive);
+        };
+        // Check identity before looking up behavior names or deadlines so
+        // unauthorized actors cannot enumerate active request references.
+        // Inactive deliberately matches the result for an unknown ticket.
+        if pending.responder != Some(sender)
+            || !self.actors.get(&sender).is_some_and(|a| a.state != ActorState::Terminated)
+        {
+            return Some(LocalReplyStatus::Inactive);
+        }
+        let behavior_id = self.behavior_id_for(pending.owner, behavior)?;
+        let ticket = LocalReplyTicket {
+            reference,
+            alias: pending.alias,
+        };
+        Some(self.send_local_reply(ticket, behavior_id, values))
     }
 
     /// Eagerly retire deadlines that are no longer valid. This is explicit:

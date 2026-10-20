@@ -22,6 +22,181 @@ fn declare_test_behavior(rt: &mut Runtime, actor_id: u64, name: &str) {
 }
 
 #[test]
+fn actor_reply_effect_open_send_cancel_and_duplicate_are_correlated() {
+    let mut rt = Runtime::new();
+    let owner = rt.spawn_actor(Box::new(Vec::new));
+    let sender = rt.spawn_actor(Box::new(Vec::new));
+    declare_test_behavior(&mut rt, owner, "reply");
+
+    let open = rt
+        .perform_actor_builtin(Some(owner), Some("reply_open"), &[], &[Value::actor_ref(sender), Value::int(60_000)])
+        .expect("reply_open is registered");
+    let request_ref = open.as_int().expect("positive request reference");
+    assert!(request_ref > 0);
+
+    assert_eq!(
+        rt.perform_actor_builtin(
+            Some(sender),
+            Some("reply_send"),
+            &[],
+            &[Value::int(request_ref), Value::int(42)],
+        ),
+        Some(Value::int(0)), // Accepted
+    );
+    assert_eq!(
+        rt.perform_actor_builtin(
+            Some(sender),
+            Some("reply_send"),
+            &[],
+            &[Value::int(request_ref), Value::int(99)],
+        ),
+        Some(Value::int(3)), // Inactive after first reply
+    );
+    assert_eq!(
+        rt.perform_actor_builtin(
+            Some(owner),
+            Some("reply_cancel"),
+            &[],
+            &[Value::int(request_ref)],
+        ),
+        Some(Value::bool(false)), // already retired
+    );
+
+    let msg = rt.actors.get_mut(&owner).unwrap().mailbox.pop().unwrap();
+    assert_eq!(msg.payload[0].as_int(), Some(request_ref));
+    assert_eq!(msg.payload[1].as_int(), Some(42));
+    assert!(rt.actors.get_mut(&owner).unwrap().mailbox.pop().is_none());
+    assert_eq!(rt.local_reply_request_count(), 0);
+}
+
+#[test]
+fn actor_reply_effect_cancel_is_owner_checked_and_late_send_fails() {
+    let mut rt = Runtime::new();
+    let owner = rt.spawn_actor(Box::new(Vec::new));
+    let other = rt.spawn_actor(Box::new(Vec::new));
+    declare_test_behavior(&mut rt, owner, "reply");
+    let reference = rt
+        .perform_actor_builtin(Some(owner), Some("reply_open"), &[], &[Value::actor_ref(other), Value::int(60_000)])
+        .unwrap();
+
+    assert_eq!(
+        rt.perform_actor_builtin(Some(other), Some("reply_cancel"), &[], &[reference]),
+        Some(Value::bool(false))
+    );
+    assert_eq!(
+        rt.perform_actor_builtin(Some(owner), Some("reply_cancel"), &[], &[reference]),
+        Some(Value::bool(true))
+    );
+    assert_eq!(
+        rt.perform_actor_builtin(
+            Some(other),
+            Some("reply_send"),
+            &[],
+            &[reference, Value::int(42)]
+        ),
+        Some(Value::int(3))
+    );
+    assert!(rt.actors.get(&owner).unwrap().mailbox.is_empty());
+}
+
+#[test]
+fn actor_reply_effect_validates_timeout_and_missing_reply_handler() {
+    let mut rt = Runtime::new();
+    let owner = rt.spawn_actor(Box::new(Vec::new));
+    let sender = rt.spawn_actor(Box::new(Vec::new));
+    assert_eq!(
+        rt.perform_actor_builtin(Some(owner), Some("reply_open"), &[], &[Value::actor_ref(sender), Value::int(0)]),
+        Some(Value::nil())
+    );
+    assert_eq!(
+        rt.perform_actor_builtin(Some(owner), Some("reply_open"), &[], &[Value::actor_ref(sender), Value::int(-1)]),
+        Some(Value::nil())
+    );
+    assert_eq!(
+        rt.perform_actor_builtin(None, Some("reply_open"), &[], &[Value::actor_ref(sender), Value::int(100)]),
+        Some(Value::nil())
+    );
+    let reference = rt
+        .perform_actor_builtin(Some(owner), Some("reply_open"), &[], &[Value::actor_ref(sender), Value::int(60_000)])
+        .unwrap();
+    assert_eq!(
+        rt.perform_actor_builtin(
+            Some(sender),
+            Some("reply_send"),
+            &[],
+            &[reference, Value::int(7)],
+        ),
+        Some(Value::nil()), // missing owner.reply(ref: Int, value: Int)
+    );
+    assert_eq!(rt.local_reply_request_count(), 1, "failed dispatch preserves ticket");
+    declare_test_behavior(&mut rt, owner, "reply");
+    assert_eq!(
+        rt.perform_actor_builtin(Some(sender), Some("reply_send"), &[], &[reference, Value::int(7)]),
+        Some(Value::int(0))
+    );
+}
+
+#[test]
+fn actor_reply_effect_only_designated_responder_can_send() {
+    let mut rt = Runtime::new();
+    let owner = rt.spawn_actor(Box::new(Vec::new));
+    let responder = rt.spawn_actor(Box::new(Vec::new));
+    let rogue = rt.spawn_actor(Box::new(Vec::new));
+    declare_test_behavior(&mut rt, owner, "reply");
+
+    let reference = rt
+        .perform_actor_builtin(
+            Some(owner),
+            Some("reply_open"),
+            &[],
+            &[Value::actor_ref(responder), Value::int(60_000)],
+        )
+        .unwrap();
+    assert!(reference.as_int().unwrap() > 0);
+
+    assert_eq!(
+        rt.perform_actor_builtin(
+            Some(rogue),
+            Some("reply_send"),
+            &[],
+            &[reference, Value::int(999)],
+        ),
+        Some(Value::int(3)),
+        "unauthorized sender indistinguishable from inactive reference"
+    );
+    assert_eq!(rt.local_reply_request_count(), 1, "unauthorized reply must not retire ticket");
+    assert!(rt.actors.get(&owner).unwrap().mailbox.is_empty());
+
+    assert_eq!(
+        rt.perform_actor_builtin(
+            Some(responder),
+            Some("reply_send"),
+            &[],
+            &[reference, Value::int(42)],
+        ),
+        Some(Value::int(0))
+    );
+    assert_eq!(rt.actors.get_mut(&owner).unwrap().mailbox.pop().unwrap().payload[1].as_int(), Some(42));
+}
+
+#[test]
+fn actor_reply_effect_rejects_unknown_responder_without_creating_ticket() {
+    let mut rt = Runtime::new();
+    let owner = rt.spawn_actor(Box::new(Vec::new));
+    let nonexisting = u64::MAX;
+    assert_eq!(
+        rt.perform_actor_builtin(
+            Some(owner),
+            Some("reply_open"),
+            &[],
+            &[Value::actor_ref(nonexisting), Value::int(60_000)],
+        ),
+        Some(Value::nil())
+    );
+    assert_eq!(rt.local_reply_request_count(), 0);
+}
+
+#[test]
 fn local_request_reply_is_one_shot_and_payload_carries_correlation() {
     let mut rt = Runtime::new();
     let owner = rt.spawn_actor(Box::new(Vec::new));

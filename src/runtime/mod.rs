@@ -6726,8 +6726,8 @@ impl Runtime {
     // -- Builtin Actor Effects (Actor.*) --
 
     /// Dispatch a built-in `Actor.*` effect performed by `actor_id` (the
-    /// current actor, when any). Every op yields nil except `whereis`,
-    /// which yields the actor ref or nil for unknown names. Ops that need
+    /// current actor, when any). Most ops yield nil; `whereis` and the
+    /// experimental `reply_*` effects return values. Ops that need
     /// a current actor are no-ops outside one, matching the standalone
     /// VM's nil fallback. Returns `None` for unknown op names so the
     /// caller can fall through to other built-in handlers.
@@ -6758,6 +6758,73 @@ impl Runtime {
                     _ => self.demonitor(me, target),
                 }
                 Some(Value::nil())
+            }
+            Some("reply_open") => {
+                let Some(owner) = actor_id else {
+                    return Some(Value::nil());
+                };
+                let Some(responder) = regs.first().and_then(Value::as_actor_id) else {
+                    return Some(Value::nil());
+                };
+                let Some(ttl) = regs.get(1).and_then(Value::as_int) else {
+                    return Some(Value::nil());
+                };
+                // Bound the source-language ticket lifetime to 24h to limit
+                // forgotten-ticket retention. Expiry remains lazy/explicit.
+                if !(1..=86_400_000).contains(&ttl) {
+                    return Some(Value::nil());
+                }
+                let Some(deadline) = Instant::now()
+                    .checked_add(std::time::Duration::from_millis(ttl as u64))
+                else {
+                    return Some(Value::nil());
+                };
+                Some(
+                    self.begin_local_reply_request_from(owner, responder, deadline)
+                        .map(|ticket| Value::int(ticket.reference().as_int()))
+                        .unwrap_or_else(Value::nil),
+                )
+            }
+            Some("reply_send") => {
+                // This experimental source effect is trusted-process-local.
+                // References are not security capabilities or wire addresses.
+                let Some(sender) = actor_id else {
+                    return Some(Value::nil());
+                };
+                let Some(reference) = regs
+                    .first()
+                    .and_then(Value::as_int)
+                    .and_then(LocalRequestRef::from_positive_int)
+                else {
+                    return Some(Value::nil());
+                };
+                let Some(&value) = regs.get(1) else {
+                    return Some(Value::nil());
+                };
+                if value.as_int().is_none() {
+                    return Some(Value::nil());
+                }
+                let result = self.send_local_reply_by_reference(reference, sender, "reply", &[value]);
+                Some(match result {
+                    Some(LocalReplyStatus::Accepted) => Value::int(0),
+                    Some(LocalReplyStatus::Backpressured) => Value::int(1),
+                    Some(LocalReplyStatus::Expired) => Value::int(2),
+                    Some(LocalReplyStatus::Inactive) => Value::int(3),
+                    None => Value::nil(), // owner has no reply behavior
+                })
+            }
+            Some("reply_cancel") => {
+                let reference = regs
+                    .first()
+                    .and_then(Value::as_int)
+                    .and_then(LocalRequestRef::from_positive_int);
+                let canceled = match (actor_id, reference) {
+                    (Some(owner), Some(reference)) => {
+                        self.cancel_local_reply_request(owner, reference)
+                    }
+                    _ => false,
+                };
+                Some(Value::bool(canceled))
             }
             Some("trap_exit") => {
                 let flag = regs.get(0)?.as_bool()?;
