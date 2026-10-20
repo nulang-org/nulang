@@ -192,8 +192,14 @@ fn redirect_is_http_see_other_with_location_and_no_client_runtime_body() {
         "GET /old HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
     );
 
-    assert!(response.starts_with("HTTP/1.1 303 See Other\r\n"), "{response}");
-    assert!(response.contains("\r\nLocation: /new?from=old\r\n"), "{response}");
+    assert!(
+        response.starts_with("HTTP/1.1 303 See Other\r\n"),
+        "{response}"
+    );
+    assert!(
+        response.contains("\r\nLocation: /new?from=old\r\n"),
+        "{response}"
+    );
     assert!(response.contains("\r\nContent-Length: 0\r\n"), "{response}");
     assert_eq!(response_body(&response), "");
 }
@@ -213,8 +219,14 @@ fn post_redirect_uses_see_other_to_avoid_replaying_the_post_body() {
         "POST /submit HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx",
     );
 
-    assert!(response.starts_with("HTTP/1.1 303 See Other\r\n"), "{response}");
-    assert!(response.contains("\r\nLocation: /receipt\r\n"), "{response}");
+    assert!(
+        response.starts_with("HTTP/1.1 303 See Other\r\n"),
+        "{response}"
+    );
+    assert!(
+        response.contains("\r\nLocation: /receipt\r\n"),
+        "{response}"
+    );
 }
 
 #[test]
@@ -223,7 +235,11 @@ fn redirect_rejects_unsafe_uri_schemes_without_emitting_location() {
         0,
         None,
         None,
-        vec![redirect_route(HttpMethod::Get, "/unsafe", "javascript:alert(1)")],
+        vec![redirect_route(
+            HttpMethod::Get,
+            "/unsafe",
+            "javascript:alert(1)",
+        )],
     )
     .expect("bind unsafe redirect WebDevServer");
 
@@ -232,7 +248,10 @@ fn redirect_rejects_unsafe_uri_schemes_without_emitting_location() {
         "GET /unsafe HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
     );
 
-    assert!(response.starts_with("HTTP/1.1 500 Internal Server Error\r\n"), "{response}");
+    assert!(
+        response.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+        "{response}"
+    );
     assert!(!response.contains("\r\nLocation:"), "{response}");
 }
 
