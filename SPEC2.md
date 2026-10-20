@@ -1199,9 +1199,10 @@ capabilities no stronger than the receiver permits. Examples:
 - Reading the same field through `&val { field: &ref T }` yields `&val T`.
 - Reading a `&val T` field through `&box` preserves the `val` guarantee.
 - A `&tag` receiver is opaque: even a primitive record field cannot be read.
-- A field declared `iso` is exposed as `tag` through ordinary reads unless
-  there is a separate proven ownership-transfer operation. Pony's ephemeral
-  aliasing and destructive move-out semantics are **not** implemented here.
+- A field declared `iso`, `lineariso`, or `linear` is exposed as `tag`
+  through ordinary reads unless there is a separate proven ownership-transfer
+  operation. Pony's ephemeral aliasing and destructive move-out semantics are
+  **not** implemented here.
 
 Plain nested records, tuples and arrays propagate the projected reference
 capabilities. This is a **conservative subset** of Pony's viewpoint adaptation
