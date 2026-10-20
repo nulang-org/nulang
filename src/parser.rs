@@ -547,7 +547,9 @@ impl Parser {
                         }
                         if !matches!(derive.as_str(), "eq" | "schema") {
                             return Err(NuError::parse_error(
-                                format!("unsupported derive '{derive}' on '{name}'; expected 'eq' or 'schema'"),
+                                format!(
+                                    "unsupported derive '{derive}' on '{name}'; expected 'eq' or 'schema'"
+                                ),
                                 span,
                             ));
                         }
@@ -557,7 +559,9 @@ impl Parser {
                         let helper = format!("{}_{}", name.to_lowercase(), derive);
                         if !occupied.insert(helper.clone()) {
                             return Err(NuError::parse_error(
-                                format!("generated derive helper '{helper}' collides with an existing function"),
+                                format!(
+                                    "generated derive helper '{helper}' collides with an existing function"
+                                ),
                                 span,
                             ));
                         }
@@ -670,7 +674,9 @@ impl Parser {
         }
         let ty = Self::schema_compatible_type(&Type::Record(fields.to_vec())).ok_or_else(|| {
             NuError::parse_error(
-                format!("cannot derive schema for '{record_name}': unsupported, open, or duplicate field type"),
+                format!(
+                    "cannot derive schema for '{record_name}': unsupported, open, or duplicate field type"
+                ),
                 span,
             )
         })?;
@@ -9247,7 +9253,10 @@ mod tests {
     #[test]
     fn derive_schema_rejects_explicit_helper_name_collision() {
         let err = parse(
-            "@derive(schema)\ntype Payment = { amount: Int }\nfn payment_schema() -> String { \"other\" }",
+            concat!(
+                "@derive(schema)\ntype Payment = { amount: Int }\n",
+                "fn payment_schema() -> String { \"other\" }"
+            ),
         )
         .unwrap_err();
         assert!(format!("{err:?}").contains("collides"), "{err:?}");
@@ -9266,7 +9275,8 @@ mod tests {
 
     #[test]
     fn derive_schema_rejects_duplicate_record_fields() {
-        let err = parse("@derive(schema)\ntype Payment = { amount: Int, amount: String }").unwrap_err();
+        let err =
+            parse("@derive(schema)\ntype Payment = { amount: Int, amount: String }").unwrap_err();
         assert!(format!("{err:?}").contains("cannot derive schema"), "{err:?}");
     }
 
