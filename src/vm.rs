@@ -2324,9 +2324,10 @@ pub struct HandlerFrame {
 ///
 /// A single-shot handler resumes the continuation at most once.
 /// Instead of deep-cloning every frame into a heap-allocated
-/// `Continuation`, we snapshot only the current frame's registers
-/// and restore them on `Resume`.  This avoids a `Vec<Frame>`
-/// allocation (~few hundred bytes + per-frame metadata).
+/// `Continuation`, we snapshot the current frame's registers and spill
+/// slots and restore them on `Resume`. Register-only frames allocate
+/// nothing; frames with spills must clone their spill storage to preserve
+/// continuation semantics.
 #[derive(Debug, Clone)]
 pub struct SingleShotState {
     /// PC after the `PerformDirect` instruction (the continuation point).
@@ -2337,6 +2338,10 @@ pub struct SingleShotState {
     pub step_count: usize,
     /// Snapshot of the current frame's registers at the perform site.
     pub regs: [Value; 256],
+    /// Spill slots belong to the captured frame too. Handler code can write
+    /// to these slots before resuming; they must not leak into the resumed
+    /// computation.
+    pub spilled: Vec<Value>,
 }
 
 impl HandlerFrame {
@@ -4241,6 +4246,7 @@ impl VM {
                 resume_dst: dst_reg,
                 step_count: self.step_count,
                 regs,
+                spilled: frame.spilled.clone(),
             });
         } else {
             let cont = Continuation::capture(self, dst_reg).ok_or_else(|| NuError::VMError {
@@ -5792,6 +5798,7 @@ impl VM {
                 {
                     if let Some(state) = hf.single_shot_state.take() {
                         frame.regs = state.regs;
+                        frame.spilled = state.spilled;
                         frame.regs[state.resume_dst as usize] = val;
                         frame.pc = state.resume_pc;
                         self.step_count = state.step_count;
