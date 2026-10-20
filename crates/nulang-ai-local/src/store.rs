@@ -449,3 +449,25 @@ fn parse_manager_kind(raw: String) -> ManagerKind {
         _ => ManagerKind::Engineering,
     }
 }
+
+#[cfg(test)]
+mod verified_completion_tests {
+    use super::*;
+
+    #[test]
+    fn verified_completion_rolls_back_if_task_is_not_running() {
+        let dir = std::env::temp_dir().join(format!("nulang-evidence-{}", Uuid::new_v4()));
+        let store = SqliteStore::open(&dir).unwrap();
+        let mut task = Task::new(Uuid::new_v4(), "run tests", ManagerKind::Engineering);
+        task.acceptance_criteria = vec!["Tests pass".into()];
+        task.status = TaskStatus::Completed;
+        let evidence = vec![AcceptanceEvidence {
+            criterion: "Tests pass".into(),
+            artifact_ref: "test://verified".into(),
+        }];
+
+        assert!(store.complete_task_verified(&task, &evidence).is_err());
+        assert!(store.task_evidence(task.id).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
