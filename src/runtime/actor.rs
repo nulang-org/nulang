@@ -1032,6 +1032,47 @@ mod orca_actor_stored_root_visitor_tests {
     }
 
     #[test]
+    fn stored_actor_root_visitor_includes_scheduler_owned_message_values() {
+        let mut actor = Actor::new(1, "mailbox-observer", 0);
+        actor
+            .mailbox
+            .push_local(Message {
+                behavior_id: 3,
+                payload: MessagePayload::from_slice(&[Value::int(777)]),
+                sender: 2,
+                priority: MessagePriority::Normal,
+                trace_id: None,
+            })
+            .unwrap();
+        let mut observed = Vec::new();
+        actor.visit_stored_values(&mut |value| observed.push(value));
+        assert_eq!(observed, vec![Value::int(777)]);
+        assert_eq!(actor.mailbox.len(), 1);
+        assert_eq!(actor.mailbox.pop().unwrap().sender, 2);
+    }
+
+    #[test]
+    fn actor_heap_provenance_rejects_foreign_interior_and_freed_pointers() {
+        let mut actor = Actor::new(1, "owner", 0);
+        let other = {
+            let mut other = Actor::new(2, "other", 0);
+            other.allocate_string("other actor")
+        };
+        let owned = actor.allocate_string("owned");
+        assert!(actor.is_live_heap_payload_value(owned));
+        assert!(!actor.is_live_heap_payload_value(other));
+        assert!(!actor.is_live_heap_payload_value(Value::int(123)));
+        let payload = owned.as_ptr().expect("allocated pointer");
+        let interior = unsafe { Value::ptr(payload.wrapping_add(1)) };
+        assert!(!actor.is_live_heap_payload_value(interior));
+
+        // After release, the same numeric address no longer denotes a live
+        // allocation. A future reuse requires generation-aware identity.
+        unsafe { assert!(actor.orca_gc.drop_local_ref(&mut actor.heap, payload)) };
+        assert!(!actor.is_live_heap_payload_value(owned));
+    }
+
+    #[test]
     fn stored_actor_root_visitor_preserves_actor_heap_pointer_identity() {
         let mut actor = Actor::new(1, "heap-root-observer", 0);
         let heap_pointer = actor.allocate_string("still reachable");
