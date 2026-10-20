@@ -110,6 +110,89 @@ impl HttpReadError {
 const MAX_HTTP_HEADERS_SIZE: usize = 16 * 1024;
 const MAX_HTTP_BODY_SIZE: usize = 1_048_576;
 
+/// Convert absolute-form targets to origin-form and retain the URI authority.
+fn normalize_http_request_target(
+    raw: &str,
+    method: HttpMethod,
+) -> Result<(String, Option<String>), HttpReadError> {
+    if raw.contains('#') || raw.bytes().any(|byte| byte <= 0x20 || byte == 0x7f) {
+        return Err(HttpReadError::BadRequest);
+    }
+    if raw.starts_with('/') {
+        return Ok((raw.to_string(), None));
+    }
+    if raw == "*" && method == HttpMethod::Options {
+        return Ok((raw.to_string(), None));
+    }
+    let remainder = if raw
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+    {
+        &raw[7..]
+    } else if raw
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+    {
+        &raw[8..]
+    } else {
+        return Err(HttpReadError::BadRequest);
+    };
+    let authority_end = remainder
+        .find(|ch: char| ch == '/' || ch == '?')
+        .unwrap_or(remainder.len());
+    let authority = &remainder[..authority_end];
+    if !valid_http_authority(authority) {
+        return Err(HttpReadError::BadRequest);
+    }
+    let suffix = &remainder[authority_end..];
+    let path = if suffix.is_empty() {
+        "/".to_string()
+    } else if suffix.starts_with('?') {
+        format!("/{suffix}")
+    } else {
+        suffix.to_string()
+    };
+    Ok((path, Some(authority.to_string())))
+}
+
+/// Validate request authorities conservatively before routing. A blank Host
+/// for a URI without authority is permitted separately at the call site.
+fn valid_http_authority(value: &str) -> bool {
+    if value.is_empty()
+        || value.bytes().any(|byte| {
+            byte <= 0x20
+                || byte >= 0x7f
+                || matches!(byte, b',' | b'/' | b'\\' | b'@' | b'#' | b'?')
+        })
+    {
+        return false;
+    }
+    if let Some(rest) = value.strip_prefix('[') {
+        let Some((host, suffix)) = rest.split_once(']') else {
+            return false;
+        };
+        if host.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        return suffix.is_empty()
+            || suffix
+                .strip_prefix(':')
+                .is_some_and(|port| port.bytes().all(|byte| byte.is_ascii_digit()));
+    }
+    let (host, port) = value.split_once(':').unwrap_or((value, ""));
+    !host.is_empty()
+        && !host.contains(':')
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+        && host.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'-' | b'.' | b'_' | b'~' | b'%' | b'!' | b'$' | b'&'
+                        | b'\'' | b'(' | b')' | b'*' | b'+' | b'=' | b';'
+                )
+        })
+}
+
 /// Reads exactly one HTTP/1.x request. Both HTTP listeners use this same
 /// bounded framing boundary, rather than assuming one read contains a request.
 ///
@@ -175,15 +258,9 @@ fn read_http_request<R: Read>(reader: &mut R) -> Result<Option<HttpRequest>, Htt
         .method
         .and_then(HttpMethod::from_str)
         .ok_or(HttpReadError::NotImplemented)?;
-    // Preserve the parsed request-target, including RFC 9112 absolute-form
-    // requests. This framing layer rejects forbidden fragments/control bytes;
-    // routing/authority reconstruction belongs to the HTTP dispatch layer.
-    let path = parsed.path.ok_or(HttpReadError::BadRequest)?;
-    if path.contains('#') || path.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
-        return Err(HttpReadError::BadRequest);
-    }
-    let path = path.to_string();
-    let headers: Vec<(String, String)> = parsed
+    let raw_target = parsed.path.ok_or(HttpReadError::BadRequest)?;
+    let (path, absolute_authority) = normalize_http_request_target(raw_target, method)?;
+    let mut headers: Vec<(String, String)> = parsed
         .headers
         .iter()
         .map(|header| {
@@ -207,11 +284,7 @@ fn read_http_request<R: Read>(reader: &mut R) -> Result<Option<HttpRequest>, Htt
             }
             has_host = true;
             let host = value.trim();
-            if host.bytes().any(|byte| {
-                byte <= 0x20
-                    || byte >= 0x7f
-                    || matches!(byte, b',' | b'/' | b'\\' | b'@' | b'#' | b'?')
-            }) {
+            if !host.is_empty() && !valid_http_authority(host) {
                 return Err(HttpReadError::BadRequest);
             }
         } else if name.eq_ignore_ascii_case("content-length") {
@@ -246,6 +319,17 @@ fn read_http_request<R: Read>(reader: &mut R) -> Result<Option<HttpRequest>, Htt
     // HTTP/1.0 remains supported for legacy clients without Host.
     if version == 1 && !has_host {
         return Err(HttpReadError::BadRequest);
+    }
+    if let Some(authority) = absolute_authority {
+        // RFC 9112: an absolute request-target overrides a conflicting Host.
+        if let Some((_, host)) = headers
+            .iter_mut()
+            .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+        {
+            *host = authority;
+        } else {
+            headers.push(("Host".into(), authority));
+        }
     }
 
     let content_length = content_length.unwrap_or(0);
