@@ -4841,7 +4841,8 @@ impl Runtime {
             );
             return;
         };
-        self.timer_wheel.send_after_with_context(
+        self.timer_wheel.send_after_with_context_at(
+            self.now(),
             std::time::Duration::from_millis(duration_ms),
             actor_id,
             behavior_id,
@@ -4914,9 +4915,11 @@ impl Runtime {
         if already_waiting {
             return;
         }
-        let timer_id = self
-            .timer_wheel
-            .receive_wait_timeout(std::time::Duration::from_millis(ms as u64), actor_id);
+        let timer_id = self.timer_wheel.receive_wait_timeout_at(
+            self.now(),
+            std::time::Duration::from_millis(ms as u64),
+            actor_id,
+        );
         if let Some(actor) = self.actors.get_mut(&actor_id) {
             actor.receive_wait = Some(crate::runtime::actor::ReceiveWaitState {
                 timer_id,
