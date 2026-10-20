@@ -608,4 +608,83 @@ mod tests {
             .authorities
             .contains("Net::TcpOut(api.example.com:443)"));
     }
+
+    #[test]
+    fn immediate_lambda_captured_heap_mutation_conflicts_with_other_branch_read() {
+        let mutating = Expr::Lambda {
+            params: vec![],
+            ret_type: None,
+            body: Box::new(Expr::Assign {
+                target: Box::new(Expr::Index {
+                    arr: Box::new(var("shared")),
+                    idx: Box::new(int(0)),
+                    span: sp(),
+                }),
+                value: Box::new(int(5)),
+                span: sp(),
+            }),
+            effect: None,
+            span: sp(),
+        };
+        let branches = vec![
+            Expr::App {
+                func: Box::new(mutating),
+                args: vec![],
+                span: sp(),
+            },
+            var("shared"),
+        ];
+        assert!(
+            validate_parallel_branches(&branches, sp()).is_err(),
+            "immediate lambda execution must not hide a captured heap mutation"
+        );
+    }
+
+    #[test]
+    fn immediate_lambda_actor_state_write_is_rejected() {
+        let mutating = Expr::Lambda {
+            params: vec![],
+            ret_type: None,
+            body: Box::new(Expr::Assign {
+                target: Box::new(Expr::FieldAccess {
+                    expr: Box::new(Expr::SelfRef(sp())),
+                    field: "counter".to_string(),
+                    span: sp(),
+                }),
+                value: Box::new(int(5)),
+                span: sp(),
+            }),
+            effect: None,
+            span: sp(),
+        };
+        assert!(
+            validate_parallel_branches(
+                &[Expr::App {
+                    func: Box::new(mutating),
+                    args: vec![],
+                    span: sp(),
+                }],
+                sp()
+            )
+            .is_err(),
+            "calling a lambda must not bypass actor-state isolation"
+        );
+    }
+
+    #[test]
+    fn constructing_a_lambda_does_not_execute_its_body() {
+        let deferred = Expr::Lambda {
+            params: vec![],
+            ret_type: None,
+            body: Box::new(Expr::Assign {
+                target: Box::new(var("shared")),
+                value: Box::new(int(7)),
+                span: sp(),
+            }),
+            effect: None,
+            span: sp(),
+        };
+        assert!(validate_parallel_branches(&[deferred, var("shared")], sp()).is_ok());
+    }
+
 }
