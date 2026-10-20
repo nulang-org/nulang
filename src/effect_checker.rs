@@ -2058,7 +2058,9 @@ impl CapabilityAnalyzer {
                 // Branch merge (same rule as `if`): a binding counts as
                 // consumed after the match only if every arm consumes it.
                 let base = consumed.clone();
-                let mut cap = Capability::Tag;
+                // No arm has produced a capability yet. Tag is the *top*
+                // capability, not the neutral element for a branch fold.
+                let mut cap: Option<Capability> = None;
                 let mut merged: Option<FxHashSet<String>> = None;
                 for (pat, guard, arm_expr) in arms {
                     *consumed = base.clone();
@@ -2072,8 +2074,8 @@ impl CapabilityAnalyzer {
                         .iter()
                         .map(|n| (n.clone(), consumed.remove(n)))
                         .collect();
-                    // A guard runs under the same condition as the arm body,
-                    // so its capability and consumption fold into the arm.
+                    // A guard executes within the arm and affects consumption,
+                    // but the boolean guard value is not an arm result.
                     let guard_result = match guard {
                         Some(guard_expr) => self.infer_cap_tracked(&arm_ctx, guard_expr, consumed),
                         None => Ok(Capability::Tag),
@@ -2085,14 +2087,19 @@ impl CapabilityAnalyzer {
                             consumed.insert(n);
                         }
                     }
-                    cap = cap.join(guard_result?.join(arm_result?));
+                    let _ = guard_result?;
+                    let arm_cap = arm_result?;
+                    cap = Some(match cap {
+                        Some(previous) => previous.join(arm_cap),
+                        None => arm_cap,
+                    });
                     merged = Some(match merged {
                         None => consumed.clone(),
                         Some(m) => m.intersection(consumed).cloned().collect(),
                     });
                 }
                 *consumed = merged.unwrap_or(base);
-                Ok(cap)
+                Ok(cap.unwrap_or(Capability::Tag))
             }
 
             // Block: capability of the last expression (or Unit/Val if empty).
@@ -2346,7 +2353,9 @@ impl CapabilityAnalyzer {
                 // Branch merge (same rule as `match`): consumed-after only if
                 // every arm consumes the binding.
                 let base = consumed.clone();
-                let mut cap = Capability::Tag;
+                // No arm has produced a capability yet. Tag is the *top*
+                // capability, not the neutral element for a branch fold.
+                let mut cap: Option<Capability> = None;
                 let mut merged: Option<FxHashSet<String>> = None;
                 for (_, patterns, guard, body_expr) in arms {
                     *consumed = base.clone();
@@ -2362,8 +2371,8 @@ impl CapabilityAnalyzer {
                         .iter()
                         .map(|n| (n.clone(), consumed.remove(n)))
                         .collect();
-                    // A guard runs under the same condition as the arm body,
-                    // so its capability and consumption fold into the arm.
+                    // A guard executes within the arm and affects consumption,
+                    // but the boolean guard value is not an arm result.
                     let guard_result = match guard {
                         Some(guard_expr) => self.infer_cap_tracked(&arm_ctx, guard_expr, consumed),
                         None => Ok(Capability::Tag),
@@ -2375,7 +2384,12 @@ impl CapabilityAnalyzer {
                             consumed.insert(n);
                         }
                     }
-                    cap = cap.join(guard_result?.join(arm_result?));
+                    let _ = guard_result?;
+                    let arm_cap = arm_result?;
+                    cap = Some(match cap {
+                        Some(previous) => previous.join(arm_cap),
+                        None => arm_cap,
+                    });
                     merged = Some(match merged {
                         None => consumed.clone(),
                         Some(m) => m.intersection(consumed).cloned().collect(),
@@ -2385,14 +2399,18 @@ impl CapabilityAnalyzer {
                 if let Some((_, body)) = after {
                     *consumed = base.clone();
                     let arm_result = self.infer_cap_tracked(ctx, body, consumed);
-                    cap = cap.join(arm_result?);
+                    let arm_cap = arm_result?;
+                    cap = Some(match cap {
+                        Some(previous) => previous.join(arm_cap),
+                        None => arm_cap,
+                    });
                     merged = Some(match merged {
                         None => consumed.clone(),
                         Some(m) => m.intersection(consumed).cloned().collect(),
                     });
                 }
                 *consumed = merged.unwrap_or(base);
-                Ok(cap)
+                Ok(cap.unwrap_or(Capability::Tag))
             }
 
             // Self reference within an actor.
@@ -3362,15 +3380,79 @@ mod tests {
     }
 
     #[test]
+    fn test_cap_match_joins_real_arm_results_without_tag_seed_or_guard() {
+        let mut analyzer = CapabilityAnalyzer::new();
+        let ctx = CapContext::new();
+        let match_expr = Expr::Match {
+            scrutinee: Box::new(Expr::Literal(Literal::Int(1), s())),
+            arms: vec![
+                (
+                    Pattern::Var("a".to_string()),
+                    Some(Expr::Literal(Literal::Bool(true), s())),
+                    Expr::CapAnnotate {
+                        expr: Box::new(Expr::Literal(Literal::Int(2), s())),
+                        cap: Capability::Iso,
+                        span: s(),
+                    },
+                ),
+                (
+                    Pattern::Var("b".to_string()),
+                    None,
+                    Expr::CapAnnotate {
+                        expr: Box::new(Expr::Literal(Literal::Int(3), s())),
+                        cap: Capability::Ref,
+                        span: s(),
+                    },
+                ),
+            ],
+            span: s(),
+        };
+        // Iso + Ref => Ref. Neither the missing guard nor the initial
+        // accumulator may invent a Tag arm and erase the result authority.
+        assert_eq!(
+            analyzer.infer_cap(&ctx, &match_expr).unwrap(),
+            Capability::Ref
+        );
+    }
+
+    #[test]
+    fn test_cap_receive_joins_real_arms_and_timeout_without_tag_seed() {
+        let mut analyzer = CapabilityAnalyzer::new();
+        let ctx = CapContext::new();
+        let receive = Expr::Receive {
+            arms: vec![(
+                "Msg".to_string(),
+                vec![Pattern::Var("value".to_string())],
+                Some(Box::new(Expr::Literal(Literal::Bool(true), s()))),
+                Expr::CapAnnotate {
+                    expr: Box::new(Expr::Literal(Literal::Int(1), s())),
+                    cap: Capability::Iso,
+                    span: s(),
+                },
+            )],
+            after: Some((
+                Box::new(Expr::Literal(Literal::Int(100), s())),
+                Box::new(Expr::CapAnnotate {
+                    expr: Box::new(Expr::Literal(Literal::Int(2), s())),
+                    cap: Capability::Ref,
+                    span: s(),
+                }),
+            )),
+            span: s(),
+        };
+        assert_eq!(analyzer.infer_cap(&ctx, &receive).unwrap(), Capability::Ref);
+    }
+
+    #[test]
     fn test_check_cap_sub_passes() {
         let mut analyzer = CapabilityAnalyzer::new();
         // Val <: Box (val can be read as box)
         assert!(analyzer
             .check_cap_sub(Capability::Val, Capability::Box, s())
             .is_ok());
-        // Tag <: Iso (tag is bottom of the lattice)
+        // A mutable reference may be reduced to an opaque identity-only tag.
         assert!(analyzer
-            .check_cap_sub(Capability::Tag, Capability::Iso, s())
+            .check_cap_sub(Capability::Ref, Capability::Tag, s())
             .is_ok());
         // Ref <: Box (ref can be read as box)
         assert!(analyzer
@@ -3383,6 +3465,13 @@ mod tests {
         let mut analyzer = CapabilityAnalyzer::new();
         let result = analyzer.check_cap_sub(Capability::Ref, Capability::Val, s());
         assert!(result.is_err());
+        // Identity-only values must not be upgraded into mutable or readable references.
+        assert!(analyzer
+            .check_cap_sub(Capability::Tag, Capability::Iso, s())
+            .is_err());
+        assert!(analyzer
+            .check_cap_sub(Capability::Tag, Capability::Box, s())
+            .is_err());
     }
 
     #[test]

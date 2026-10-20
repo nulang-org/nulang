@@ -70,7 +70,8 @@ pub enum PrimitiveType {
 ///     \ /
 ///     Tag
 /// ```
-/// Subtyping: lineariso <: iso <: trn <: ref <: box, linear <: val <: box, ref <: tag, val <: tag, box <: tag
+/// Subtyping: lineariso <: iso <: trn <: ref <: box, linear <: val <: box, ref <: tag, val <: tag, box <: tag.
+/// tag is the least-privileged view (top of the subtype order): it preserves identity only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Capability {
     LinearIso, // Unique ownership with linear type tracking (provably consumed exactly once)
@@ -118,8 +119,6 @@ impl Capability {
             (LinearIso, Val) | (Val, LinearIso) => Val,
             // LinearIso with Box (same as Iso with Box)
             (LinearIso, Box) | (Box, LinearIso) => Box,
-            // LinearIso with Tag (same as Iso with Tag)
-            (LinearIso, Tag) | (Tag, LinearIso) => LinearIso,
 
             // Linear joins: Linear behaves like Val except Linear join Linear = Linear
             (Linear, Linear) => Linear,
@@ -129,7 +128,6 @@ impl Capability {
             (Linear, Trn) | (Trn, Linear) => Val,
             (Linear, Ref) | (Ref, Linear) => Box,
             (Linear, Box) | (Box, Linear) => Box,
-            (Linear, Tag) | (Tag, Linear) => Linear,
 
             // Original capability joins (unchanged)
             (Iso, Iso) => Iso,
@@ -146,8 +144,9 @@ impl Capability {
             | (Val, Box)
             | (Box, Val)
             | (Box, Box) => Box,
-            (Tag, c) | (c, Tag) if c == Tag => Tag,
-            (Tag, c) | (c, Tag) => c, // tag is bottom-ish for read-only
+            // Every capability can be downgraded to identity-only Tag; a Tag
+            // reference cannot regain read or write authority by subtyping.
+            (Tag, _) | (_, Tag) => Tag,
         }
     }
 
@@ -2589,9 +2588,66 @@ mod tests {
     }
 
     #[test]
+    fn test_tag_is_least_privileged_capability_for_all_eight_capabilities() {
+        // tag preserves identity but cannot be used to regain readable or
+        // writable authority. All capabilities can forget authority to tag.
+        let caps = [
+            Capability::LinearIso,
+            Capability::Linear,
+            Capability::Iso,
+            Capability::Trn,
+            Capability::Ref,
+            Capability::Val,
+            Capability::Box,
+            Capability::Tag,
+        ];
+        for cap in caps {
+            assert_eq!(cap.join(Capability::Tag), Capability::Tag, "{cap:?} + tag");
+            assert_eq!(Capability::Tag.join(cap), Capability::Tag, "tag + {cap:?}");
+            assert!(cap.is_subtype_of(Capability::Tag), "{cap:?} <: tag");
+            if cap != Capability::Tag {
+                assert!(
+                    !Capability::Tag.is_subtype_of(cap),
+                    "tag must not grant {cap:?} authority"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_capability_join_preserves_lattice_laws_exhaustively() {
+        let caps = [
+            Capability::LinearIso,
+            Capability::Linear,
+            Capability::Iso,
+            Capability::Trn,
+            Capability::Ref,
+            Capability::Val,
+            Capability::Box,
+            Capability::Tag,
+        ];
+        for a in caps {
+            assert_eq!(a.join(a), a, "idempotence for {a:?}");
+            for b in caps {
+                assert_eq!(a.join(b), b.join(a), "commutativity for {a:?} and {b:?}");
+                for c in caps {
+                    assert_eq!(
+                        a.join(b).join(c),
+                        a.join(b.join(c)),
+                        "associativity for {a:?}, {b:?}, {c:?}"
+                    );
+                    if a.is_subtype_of(b) && b.is_subtype_of(c) {
+                        assert!(a.is_subtype_of(c), "transitivity: {a:?} <: {b:?} <: {c:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_linear_join_tag() {
-        assert_eq!(Capability::Linear.join(Capability::Tag), Capability::Linear);
-        assert_eq!(Capability::Tag.join(Capability::Linear), Capability::Linear);
+        assert_eq!(Capability::Linear.join(Capability::Tag), Capability::Tag);
+        assert_eq!(Capability::Tag.join(Capability::Linear), Capability::Tag);
     }
 
     #[test]
