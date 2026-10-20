@@ -37,7 +37,7 @@ pub struct LocalRuntime {
     conversation_id: Uuid,
     project_id: String,
     director: LocalDirector,
-    engineering: EngineeringManager,
+    engineering: Box<dyn Manager>,
     worker: Box<dyn Worker>,
     verifier: Box<dyn EvidenceVerifier>,
 }
@@ -55,6 +55,23 @@ impl LocalRuntime {
     /// The default open() is deliberately non-executing and fail-closed.
     pub fn open_with_execution(
         project_dir: PathBuf,
+        worker: Box<dyn Worker>,
+        verifier: Box<dyn EvidenceVerifier>,
+    ) -> Result<Self, RuntimeError> {
+        Self::open_with_manager(
+            project_dir,
+            Box::new(EngineeringManager),
+            worker,
+            verifier,
+        )
+    }
+
+    /// A trusted host can provide a task planner consistent with the
+    /// sandbox's supported capabilities. Planner output is still subject
+    /// to worker policy and independent verification.
+    pub fn open_with_manager(
+        project_dir: PathBuf,
+        manager: Box<dyn Manager>,
         worker: Box<dyn Worker>,
         verifier: Box<dyn EvidenceVerifier>,
     ) -> Result<Self, RuntimeError> {
@@ -88,7 +105,7 @@ impl LocalRuntime {
             conversation_id,
             project_id,
             director: LocalDirector::new("director-local"),
-            engineering: EngineeringManager,
+            engineering: manager,
             worker,
             verifier,
         })
