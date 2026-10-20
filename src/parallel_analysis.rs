@@ -346,7 +346,14 @@ fn summarize_expr(expr: &Expr, bound: &HashSet<String>, out: &mut ParallelBranch
                 }
                 let mut lambda_bound = bound.clone();
                 lambda_bound.extend(params.iter().map(|param| param.name.clone()));
+                // A return from the invoked function finishes that function,
+                // not the enclosing scoped-concurrency branch. Preserve an
+                // earlier branch-level return, if one was already observed.
+                let enclosing_return = out.control_escapes.contains("return");
                 summarize_expr(body, &lambda_bound, out);
+                if !enclosing_return {
+                    out.control_escapes.remove("return");
+                }
             }
             out.effects.insert("Call".to_string());
         }
