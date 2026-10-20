@@ -16,6 +16,8 @@ The compiler synthesizes a **private, pure, zero-argument** function named
 result describes an object whose fields are all required. Nested closed
 records and arrays of supported types are accepted. Schema properties and
 `required` entries are sorted by field name for deterministic output.
+Every generated record object has `"additionalProperties": false`,
+including nested records, matching Nulang's closed-record contract.
 
 ### Contract and limitations
 
