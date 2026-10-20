@@ -1818,6 +1818,136 @@ fn test_unlink_actors() {
 }
 
 #[test]
+fn actor_monitor_ref_effect_returns_unique_refs_and_correlated_down() {
+    let mut rt = Runtime::new();
+    let watcher = rt.spawn_actor(Box::new(Vec::new));
+    let target = rt.spawn_actor(Box::new(Vec::new));
+    let one = rt
+        .perform_actor_builtin(
+            Some(watcher),
+            Some("monitor_ref"),
+            &[],
+            &[Value::actor_ref(target)],
+        )
+        .expect("Actor.monitor_ref builtin");
+    let two = rt
+        .perform_actor_builtin(
+            Some(watcher),
+            Some("monitor_ref"),
+            &[],
+            &[Value::actor_ref(target)],
+        )
+        .expect("Actor.monitor_ref builtin");
+    let first = one.as_int().expect("first monitor reference is an Int");
+    let second = two.as_int().expect("second monitor reference is an Int");
+    assert!(first > 0);
+    assert!(second > 0);
+    assert_ne!(first, second);
+
+    rt.exit_actor(target, ExitReason::Normal);
+    let mut found = vec![];
+    let mailbox = &mut rt.actors.get_mut(&watcher).unwrap().mailbox;
+    while let Some(message) = mailbox.pop() {
+        assert_eq!(message.payload.len(), 4);
+        found.push(message.payload[3].as_int().unwrap());
+    }
+    found.sort_unstable();
+    let mut expected = vec![first, second];
+    expected.sort_unstable();
+    assert_eq!(found, expected);
+}
+
+#[test]
+fn actor_demonitor_ref_effect_rejects_other_watcher_and_cancels_exactly_one() {
+    let mut rt = Runtime::new();
+    let watcher = rt.spawn_actor(Box::new(Vec::new));
+    let stranger = rt.spawn_actor(Box::new(Vec::new));
+    let target = rt.spawn_actor(Box::new(Vec::new));
+    let first = rt
+        .perform_actor_builtin(
+            Some(watcher),
+            Some("monitor_ref"),
+            &[],
+            &[Value::actor_ref(target)],
+        )
+        .unwrap();
+    let second = rt
+        .perform_actor_builtin(
+            Some(watcher),
+            Some("monitor_ref"),
+            &[],
+            &[Value::actor_ref(target)],
+        )
+        .unwrap();
+    assert_eq!(
+        rt.perform_actor_builtin(Some(stranger), Some("demonitor_ref"), &[], &[first]),
+        Some(Value::bool(false))
+    );
+    assert_eq!(
+        rt.perform_actor_builtin(Some(watcher), Some("demonitor_ref"), &[], &[first]),
+        Some(Value::bool(true))
+    );
+    assert_eq!(
+        rt.perform_actor_builtin(Some(watcher), Some("demonitor_ref"), &[], &[first]),
+        Some(Value::bool(false))
+    );
+
+    rt.exit_actor(target, ExitReason::Normal);
+    let mailbox = &mut rt.actors.get_mut(&watcher).unwrap().mailbox;
+    let down = mailbox.pop().expect("surviving monitor receives DOWN");
+    assert_eq!(down.payload[3].as_int(), second.as_int());
+    assert!(mailbox.pop().is_none());
+}
+
+#[test]
+fn actor_demonitor_ref_flush_effect_clears_queued_down_and_reports_count() {
+    let mut rt = Runtime::new();
+    let watcher = rt.spawn_actor(Box::new(Vec::new));
+    let target = rt.spawn_actor(Box::new(Vec::new));
+    let reference = rt
+        .perform_actor_builtin(
+            Some(watcher),
+            Some("monitor_ref"),
+            &[],
+            &[Value::actor_ref(target)],
+        )
+        .unwrap();
+    rt.exit_actor(target, ExitReason::Normal);
+    assert_eq!(
+        rt.perform_actor_builtin(
+            Some(watcher),
+            Some("demonitor_ref_flush"),
+            &[],
+            &[reference]
+        ),
+        Some(Value::int(1))
+    );
+    assert!(rt.actors.get(&watcher).unwrap().mailbox.is_empty());
+    assert_eq!(
+        rt.perform_actor_builtin(
+            Some(watcher),
+            Some("demonitor_ref_flush"),
+            &[],
+            &[reference]
+        ),
+        Some(Value::int(0))
+    );
+    assert_eq!(
+        rt.perform_actor_builtin(None, Some("monitor_ref"), &[], &[Value::actor_ref(watcher)]),
+        Some(Value::nil())
+    );
+    assert_eq!(
+        rt.perform_actor_builtin(
+            Some(watcher),
+            Some("demonitor_ref_flush"),
+            &[],
+            &[Value::int(0)]
+        ),
+        Some(Value::nil())
+    );
+}
+
+#[test]
 fn monitor_ref_flush_removes_only_the_correlated_queued_down() {
     let mut rt = Runtime::new();
     let watcher = rt.spawn_actor(Box::new(Vec::new));

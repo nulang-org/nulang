@@ -6729,6 +6729,42 @@ impl Runtime {
                 }
                 Some(Value::nil())
             }
+            Some("monitor_ref") => {
+                let target = regs.first().and_then(Value::as_actor_id);
+                Some(match (actor_id, target) {
+                    (Some(watcher), Some(target)) => self
+                        .monitor_ref(watcher, target)
+                        .map(|reference| Value::int(reference.0 as i64))
+                        .unwrap_or_else(Value::nil),
+                    _ => Value::nil(),
+                })
+            }
+            Some("demonitor_ref") => {
+                let reference = regs
+                    .first()
+                    .and_then(Value::as_int)
+                    .filter(|token| *token > 0);
+                let canceled = match (actor_id, reference) {
+                    (Some(watcher), Some(token)) => {
+                        self.demonitor_ref(watcher, MonitorRef(token as u64))
+                    }
+                    _ => false,
+                };
+                Some(Value::bool(canceled))
+            }
+            Some("demonitor_ref_flush") => {
+                let reference = regs
+                    .first()
+                    .and_then(Value::as_int)
+                    .filter(|token| *token > 0);
+                Some(match (actor_id, reference) {
+                    (Some(watcher), Some(token)) => self
+                        .demonitor_ref_flush(watcher, MonitorRef(token as u64))
+                        .map(|removed| Value::int(removed as i64))
+                        .unwrap_or_else(|_| Value::nil()),
+                    _ => Value::nil(),
+                })
+            }
             Some("trap_exit") => {
                 let flag = regs.get(0)?.as_bool()?;
                 if let Some(me) = actor_id {
