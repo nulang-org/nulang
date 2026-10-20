@@ -1841,8 +1841,14 @@ fn monitor_references_distinguish_independent_watches_and_cancel_exactly_one() {
     assert_eq!(down.payload[1].as_int(), Some(watcher as i64));
     assert_eq!(down.payload[2].as_int(), Some(1));
     assert_eq!(down.payload[3].as_int(), Some(second.0 as i64));
-    assert!(mailbox.pop().is_none(), "canceled monitor must not send DOWN");
-    assert!(!rt.demonitor_ref(watcher, second), "delivered ref is retired");
+    assert!(
+        mailbox.pop().is_none(),
+        "canceled monitor must not send DOWN"
+    );
+    assert!(
+        !rt.demonitor_ref(watcher, second),
+        "delivered ref is retired"
+    );
 }
 
 #[test]
@@ -1858,7 +1864,10 @@ fn monitor_reference_reports_noproc_and_is_not_left_registered() {
     assert_eq!(down.payload[2].as_int(), Some(1));
     assert_eq!(down.payload[3].as_int(), Some(reference.0 as i64));
     assert!(!rt.demonitor_ref(watcher, reference));
-    assert!(rt.monitor_ref(absent, watcher).is_none(), "dead watcher rejected");
+    assert!(
+        rt.monitor_ref(absent, watcher).is_none(),
+        "dead watcher rejected"
+    );
     rt.actors.get_mut(&watcher).unwrap().state = ActorState::Terminated;
     assert!(
         rt.monitor_ref(watcher, absent).is_none(),
@@ -1873,7 +1882,10 @@ fn monitor_reference_cleanup_on_watcher_exit_does_not_send_to_dead_actor() {
     let target = rt.spawn_actor(Box::new(Vec::new));
     let reference = rt.monitor_ref(watcher, target).expect("monitor");
     rt.exit_actor(watcher, ExitReason::Normal);
-    assert!(!rt.demonitor_ref(watcher, reference), "watcher death removes reference");
+    assert!(
+        !rt.demonitor_ref(watcher, reference),
+        "watcher death removes reference"
+    );
 
     rt.exit_actor(target, ExitReason::Normal);
     assert_eq!(rt.monitor_refs.len(), 0, "monitor registry must be empty");
@@ -1884,7 +1896,9 @@ fn monitor_reference_survives_supervisor_shutdown_notification() {
     let mut rt = Runtime::new();
     let watcher = rt.spawn_actor(Box::new(Vec::new));
     let supervisor_id = rt.create_supervisor("shutdown-root", RestartStrategy::OneForOne);
-    let reference = rt.monitor_ref(watcher, supervisor_id).expect("monitor supervisor");
+    let reference = rt
+        .monitor_ref(watcher, supervisor_id)
+        .expect("monitor supervisor");
 
     let supervisor = rt.supervisors.remove(&supervisor_id).unwrap();
     super::exit::shutdown_supervisor(&mut rt, supervisor_id, &supervisor);
