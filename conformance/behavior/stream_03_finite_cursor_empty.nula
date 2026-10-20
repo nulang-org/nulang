@@ -1,0 +1,10 @@
+// An empty finite source completes on the first demand.
+import stdlib::finite_stream
+
+fn main() {
+    let empty: FiniteCursor[Int] = from_items([])
+    match advance(empty) {
+        | Exhausted => perform IO.print("empty")
+        | Produced(_, _) => perform IO.print("unexpected-item")
+    }
+}
