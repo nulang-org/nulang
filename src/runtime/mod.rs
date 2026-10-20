@@ -6763,7 +6763,10 @@ impl Runtime {
                 let Some(owner) = actor_id else {
                     return Some(Value::nil());
                 };
-                let Some(ttl) = regs.first().and_then(Value::as_int) else {
+                let Some(responder) = regs.first().and_then(Value::as_actor_id) else {
+                    return Some(Value::nil());
+                };
+                let Some(ttl) = regs.get(1).and_then(Value::as_int) else {
                     return Some(Value::nil());
                 };
                 // Bound the source-language ticket lifetime to 24h to limit
@@ -6777,7 +6780,7 @@ impl Runtime {
                     return Some(Value::nil());
                 };
                 Some(
-                    self.begin_local_reply_request(owner, deadline)
+                    self.begin_local_reply_request_from(owner, responder, deadline)
                         .map(|ticket| Value::int(ticket.reference().as_int()))
                         .unwrap_or_else(Value::nil),
                 )
@@ -6785,9 +6788,9 @@ impl Runtime {
             Some("reply_send") => {
                 // This experimental source effect is trusted-process-local.
                 // References are not security capabilities or wire addresses.
-                if actor_id.is_none() {
+                let Some(sender) = actor_id else {
                     return Some(Value::nil());
-                }
+                };
                 let Some(reference) = regs
                     .first()
                     .and_then(Value::as_int)
@@ -6801,7 +6804,7 @@ impl Runtime {
                 if value.as_int().is_none() {
                     return Some(Value::nil());
                 }
-                let result = self.send_local_reply_by_reference(reference, "reply", &[value]);
+                let result = self.send_local_reply_by_reference(reference, sender, "reply", &[value]);
                 Some(match result {
                     Some(LocalReplyStatus::Accepted) => Value::int(0),
                     Some(LocalReplyStatus::Backpressured) => Value::int(1),
