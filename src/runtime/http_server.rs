@@ -1236,6 +1236,39 @@ fn guess_content_type(path: &Path) -> &'static str {
 mod tests {
     use super::*;
 
+    #[test]
+    fn duplicate_typed_query_parameter_returns_structured_http_400() {
+        use crate::web::bindings::{RouteBindingContract, RouteBindingSource};
+
+        let captured = HttpRequestBindingInputs::capture(
+            "/users?limit=1&%6cimit=2",
+            &[],
+            b"",
+        );
+        let bound = RouteBindingContract {
+            source: RouteBindingSource::Query,
+            source_name: "limit".to_string(),
+            handler_param: "limit".to_string(),
+            handler_index: 0,
+            ty: Some("Int".to_string()),
+        };
+        let response = duplicate_bound_input_response(&captured, &[bound.clone()]).unwrap();
+        assert_eq!(response.status, 400);
+        assert!(response.headers.iter().any(|(name, value)| {
+            name == "Content-Type" && value == "application/problem+json"
+        }));
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["code"], "ambiguous_request_input");
+        assert_eq!(body["source"], "query");
+        assert_eq!(body["source_name"], "limit");
+        assert!(body.get("handler_param").is_none());
+        assert!(duplicate_bound_input_response(&captured, &[RouteBindingContract {
+            source: RouteBindingSource::Query,
+            source_name: "page".to_string(),
+            ..bound
+        }]).is_none());
+    }
+
     // A deterministic reader forces TCP-like fragmentation without sleeps.
     struct FixedChunkReader<'a> {
         remaining: &'a [u8],
