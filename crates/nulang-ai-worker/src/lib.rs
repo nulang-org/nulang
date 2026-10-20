@@ -1,3 +1,5 @@
+pub mod sandbox;
+
 //! Worker agents execute tasks and return evidence for independent verification.
 
 use nulang_ai_core::{AcceptanceEvidence, Task};
