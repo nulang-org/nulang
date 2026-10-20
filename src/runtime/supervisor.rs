@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use super::*;
+use crate::authority::AuthorityManifest;
 use crate::primitives::ActorRole;
 use crate::types::ExitReason;
 
@@ -347,6 +348,25 @@ impl Supervisor {
             new_actor.sequence = snap.sequence;
             new_actor.activation_epoch = snap.activation_epoch;
             new_actor.waiting_signal = snap.waiting_signal.clone();
+            // Persisted authority is a security boundary, not just actor
+            // metadata. Validate the full token set before any history move
+            // or actor publication; partial manifests must never be applied.
+            let manifest = match AuthorityManifest::from_tokens(
+                snap.authority_tokens.iter().map(String::as_str),
+            ) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    warn!(
+                        supervisor = %self.name,
+                        child = %spec.id,
+                        old_actor_id,
+                        %error,
+                        "refusing supervised restart with invalid durable authority"
+                    );
+                    return None;
+                }
+            };
+            new_actor.install_authority_manifest(&manifest);
         } else {
             for (name, value) in &template.state_data {
                 new_actor.set_state_field(name.clone(), *value);
@@ -366,12 +386,6 @@ impl Supervisor {
         new_actor.parent = Some(self.id);
         if let Some(module) = &template.bytecode_module {
             new_actor.bytecode_module = Some(Box::new(module.clone()));
-            runtime.register_recovery_module(
-                new_id,
-                module.clone(),
-                template.bytecode_offsets.clone(),
-                template.compensation_offsets.clone(),
-            );
         }
         let role = match new_actor.role() {
             Ok(role) => role,
@@ -386,6 +400,44 @@ impl Supervisor {
             }
         };
         let is_workflow = matches!(role, ActorRole::Workflow);
+
+        // A durable restart is not safe unless *all* recovery records can
+        // move together. The old snapshot, journals, and effect receipts must
+        // stay untouched on failure; never substitute save_snapshot + clear.
+        if template.persistent {
+            if snapshot.is_none() {
+                warn!(
+                    supervisor = %self.name,
+                    child = %spec.id,
+                    old_actor_id,
+                    "refusing persistent child restart without a recoverable checkpoint"
+                );
+                return None;
+            }
+            if let Err(error) = runtime
+                .persistence
+                .rekey_actor_history(old_actor_id, new_id)
+            {
+                warn!(
+                    supervisor = %self.name,
+                    child = %spec.id,
+                    old_actor_id,
+                    new_actor_id = new_id,
+                    %error,
+                    "refusing persistent child restart: atomic history relocation failed"
+                );
+                return None;
+            }
+        }
+
+        if let Some(module) = &template.bytecode_module {
+            runtime.register_recovery_module(
+                new_id,
+                module.clone(),
+                template.bytecode_offsets.clone(),
+                template.compensation_offsets.clone(),
+            );
+        }
         runtime.actors.insert(new_id, new_actor);
         // Register CRDT-backed fields with the CrdtManager.
         if let Some(ref mut mgr) = runtime.crdt_manager {
@@ -394,13 +446,6 @@ impl Supervisor {
         }
         if is_workflow {
             runtime.layout_workflow_behavior_table(new_id);
-        }
-
-        // Re-key the snapshot under the new actor id so future restarts find it.
-        if let Some(mut snap) = snapshot {
-            snap.actor_id = new_id;
-            let _ = runtime.persistence.save_snapshot(snap);
-            let _ = runtime.persistence.clear(old_actor_id);
         }
 
         // If the dead child was itself a supervisor, recreate its

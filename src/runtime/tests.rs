@@ -897,6 +897,274 @@ fn test_restarted_child_restores_behavior_and_state() {
     assert_eq!(count, Some(Value::int(5)));
 }
 
+/// Restart must re-key the entire legacy recovery history or fail before
+/// publishing a fresh actor. A snapshot alone is insufficient for replay.
+#[test]
+fn test_supervisor_restart_atomically_rekeys_legacy_recovery_history() {
+    let mut rt = Runtime::new();
+    let supervisor_id = rt.create_supervisor("history_sup", RestartStrategy::OneForOne);
+    let mut models = HashMap::new();
+    models.insert("count".to_string(), StateModel::Durable);
+    let child_id = rt.spawn_persistent_actor(
+        Box::new(|| vec![("count".to_string(), Value::int(1))]),
+        models,
+    );
+    rt.persistence
+        .save_snapshot(ActorSnapshot {
+            actor_id: child_id,
+            sequence: 3,
+            state: [("count".to_string(), PersistedValue::Int(42))]
+                .into_iter()
+                .collect(),
+            ..ActorSnapshot::default()
+        })
+        .unwrap();
+    rt.persistence
+        .append_journal(
+            child_id,
+            JournalEntry {
+                sequence: 3,
+                behavior_id: 5,
+                payload: vec![PersistedValue::Int(9)],
+            },
+        )
+        .unwrap();
+    rt.persistence
+        .append_workflow_event(
+            child_id,
+            WorkflowEvent::SignalReceived {
+                sequence: 3,
+                name: "wake".to_string(),
+                payload: None,
+            },
+        )
+        .unwrap();
+    rt.persistence
+        .append_event(
+            child_id,
+            EventEntry {
+                sequence: 3,
+                field_name: "count".to_string(),
+                event_name: "Increased".to_string(),
+                args: vec![PersistedValue::Int(9)],
+                value: PersistedValue::Int(42),
+            },
+        )
+        .unwrap();
+
+    rt.supervise_child(
+        supervisor_id,
+        ChildSpec::new("counter", RestartPolicy::Permanent),
+        child_id,
+    );
+    rt.exit_actor(child_id, ExitReason::Error("simulated crash".to_string()));
+
+    let restarted = rt.supervisors[&supervisor_id].children[0].1;
+    assert_ne!(restarted, child_id);
+    assert_eq!(
+        rt.actors[&restarted].get_state_field("count"),
+        Some(Value::int(42))
+    );
+    assert_eq!(rt.persistence.load_snapshot(restarted).unwrap().sequence, 3);
+    assert_eq!(rt.persistence.read_journal(restarted).len(), 1);
+    assert_eq!(rt.persistence.read_workflow_events(restarted).len(), 1);
+    assert_eq!(rt.persistence.read_events(restarted).len(), 1);
+    assert!(rt.persistence.load_snapshot(child_id).is_none());
+    assert!(rt.persistence.read_journal(child_id).is_empty());
+    assert!(rt.persistence.read_workflow_events(child_id).is_empty());
+    assert!(rt.persistence.read_events(child_id).is_empty());
+}
+
+/// When a backend cannot relocate all history atomically, keeping the old
+/// checkpoint is preferable to restarting with incomplete replay metadata.
+#[test]
+fn test_supervisor_restart_refuses_unsupported_atomic_rekey() {
+    let mut rt = Runtime::new();
+    let path = std::env::temp_dir().join(format!(
+        "nulang_supervisor_rekey_{}_{}",
+        std::process::id(),
+        fresh_actor_id()
+    ));
+    rt.persistence = Box::new(JsonFileStore::new(&path).unwrap());
+    let supervisor_id = rt.create_supervisor("file_sup", RestartStrategy::OneForOne);
+    let mut models = HashMap::new();
+    models.insert("count".to_string(), StateModel::Durable);
+    let child_id = rt.spawn_persistent_actor(
+        Box::new(|| vec![("count".to_string(), Value::int(1))]),
+        models,
+    );
+    let before = rt.persistence.load_snapshot(child_id).unwrap();
+    rt.supervise_child(
+        supervisor_id,
+        ChildSpec::new("counter", RestartPolicy::Permanent),
+        child_id,
+    );
+    rt.exit_actor(child_id, ExitReason::Error("simulated crash".to_string()));
+
+    assert_eq!(
+        rt.persistence.load_snapshot(child_id).unwrap().sequence,
+        before.sequence
+    );
+    assert!(
+        !rt.actors
+            .values()
+            .any(|actor| actor.parent == Some(supervisor_id)),
+        "unsupported history relocation must not publish a replacement"
+    );
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn test_supervisor_restart_refuses_history_with_old_actor_self_reference() {
+    let mut rt = Runtime::new();
+    let supervisor_id = rt.create_supervisor("self_ref_sup", RestartStrategy::OneForOne);
+    let mut models = HashMap::new();
+    models.insert("self_ref".to_string(), StateModel::Durable);
+    let child_id = rt.spawn_persistent_actor(Box::new(Vec::new), models);
+    rt.persistence
+        .save_snapshot(ActorSnapshot {
+            actor_id: child_id,
+            state: [("self_ref".to_string(), PersistedValue::Actor(child_id))]
+                .into_iter()
+                .collect(),
+            ..ActorSnapshot::default()
+        })
+        .unwrap();
+    rt.supervise_child(
+        supervisor_id,
+        ChildSpec::new("self_ref", RestartPolicy::Permanent),
+        child_id,
+    );
+    rt.exit_actor(child_id, ExitReason::Error("simulated crash".to_string()));
+    assert!(rt.persistence.load_snapshot(child_id).is_some());
+    assert!(
+        !rt.actors
+            .values()
+            .any(|actor| actor.parent == Some(supervisor_id)),
+        "actor must not restart with a stale reference to its old identity"
+    );
+}
+
+#[test]
+fn test_supervisor_restart_refuses_missing_persistent_checkpoint() {
+    let mut rt = Runtime::new();
+    let supervisor_id = rt.create_supervisor("missing_sup", RestartStrategy::OneForOne);
+    let mut models = HashMap::new();
+    models.insert("count".to_string(), StateModel::Durable);
+    let child_id = rt.spawn_persistent_actor(
+        Box::new(|| vec![("count".to_string(), Value::int(7))]),
+        models,
+    );
+    rt.supervise_child(
+        supervisor_id,
+        ChildSpec::new("counter", RestartPolicy::Permanent),
+        child_id,
+    );
+    rt.persistence.clear(child_id).unwrap();
+    rt.exit_actor(child_id, ExitReason::Error("simulated crash".to_string()));
+
+    assert!(
+        !rt.actors
+            .values()
+            .any(|actor| actor.parent == Some(supervisor_id)),
+        "missing durable history must not silently reset an actor to its defaults"
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn test_supervisor_restart_atomically_rekeys_sqlite_history() {
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(LibsqlStore::in_memory().unwrap());
+    let supervisor_id = rt.create_supervisor("sqlite_sup", RestartStrategy::OneForOne);
+    let mut models = HashMap::new();
+    models.insert("count".to_string(), StateModel::Durable);
+    let child_id = rt.spawn_persistent_actor(
+        Box::new(|| vec![("count".to_string(), Value::int(1))]),
+        models,
+    );
+    rt.persistence
+        .append_journal(
+            child_id,
+            JournalEntry {
+                sequence: 1,
+                behavior_id: 5,
+                payload: vec![PersistedValue::Int(7)],
+            },
+        )
+        .unwrap();
+    rt.supervise_child(
+        supervisor_id,
+        ChildSpec::new("counter", RestartPolicy::Permanent),
+        child_id,
+    );
+    rt.exit_actor(child_id, ExitReason::Error("simulated crash".to_string()));
+
+    let restarted = rt.supervisors[&supervisor_id].children[0].1;
+    assert_ne!(restarted, child_id);
+    assert!(rt.persistence.load_snapshot(restarted).is_some());
+    assert_eq!(rt.persistence.read_journal(restarted).len(), 1);
+    assert!(rt.persistence.load_snapshot(child_id).is_none());
+    assert!(rt.persistence.read_journal(child_id).is_empty());
+}
+
+#[test]
+fn test_supervisor_restart_restores_validated_authority_manifest() {
+    let mut rt = Runtime::new();
+    let supervisor_id = rt.create_supervisor("authority_sup", RestartStrategy::OneForOne);
+    let child_id = rt.spawn_persistent_actor(Box::new(Vec::new), HashMap::new());
+    let manifest = crate::authority::AuthorityManifest::from_tokens([
+        "Fs::Read(/srv/input)",
+        "Env::Read(REGION)",
+    ])
+    .unwrap();
+    rt.actors
+        .get_mut(&child_id)
+        .unwrap()
+        .install_authority_manifest(&manifest);
+    rt.checkpoint_actor(child_id);
+    rt.supervise_child(
+        supervisor_id,
+        ChildSpec::new("authority_child", RestartPolicy::Permanent),
+        child_id,
+    );
+    rt.exit_actor(child_id, ExitReason::Error("simulated crash".to_string()));
+
+    let new_id = rt.supervisors[&supervisor_id].children[0].1;
+    assert_ne!(new_id, child_id);
+    assert_eq!(
+        rt.actors[&new_id].authority_manifest().unwrap(),
+        manifest,
+        "supervised restart must preserve the validated authority boundary"
+    );
+}
+
+#[test]
+fn test_supervisor_restart_rejects_malformed_authority_snapshot() {
+    let mut rt = Runtime::new();
+    let supervisor_id = rt.create_supervisor("invalid_authority_sup", RestartStrategy::OneForOne);
+    let child_id = rt.spawn_persistent_actor(Box::new(Vec::new), HashMap::new());
+    let mut snapshot = rt.persistence.load_snapshot(child_id).unwrap();
+    snapshot
+        .authority_tokens
+        .insert("Secret::Read(".to_string());
+    rt.persistence.save_snapshot(snapshot).unwrap();
+    rt.supervise_child(
+        supervisor_id,
+        ChildSpec::new("invalid_authority", RestartPolicy::Permanent),
+        child_id,
+    );
+    rt.exit_actor(child_id, ExitReason::Error("simulated crash".to_string()));
+
+    assert!(rt.persistence.load_snapshot(child_id).is_some());
+    assert!(
+        !rt.actors
+            .values()
+            .any(|actor| actor.parent == Some(supervisor_id)),
+        "a malformed authority manifest must reject the entire restart"
+    );
+}
+
 /// Supervisor restart of a persistent child must hydrate state from the
 /// persistence store, not from the captured RestartTemplate (which holds
 /// the *original* state from registration time).

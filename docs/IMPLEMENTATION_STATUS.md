@@ -128,12 +128,15 @@ Important boundaries:
 
 - atomic relocation of legacy snapshot, message journal, workflow-event and
   domain-event records is implemented for in-memory `MemoryStore` and
-  transactional `LibsqlStore` (under the `sqlite` feature). It is not yet
-  wired into supervisor restart; other backends return `Unsupported`.
-  Identity-bound atomic transitions and workflow activation/replay receipts
-  are deliberately not re-keyed. MemoryStore is ephemeral, and the relocation
-  contract alone does not establish end-to-end process-crash recovery or
-  stable logical actor identity;
+  transactional `LibsqlStore` (under the `sqlite` feature). Supervised
+  persistent restarts use this relocation contract and refuse to restart on
+  unsupported backends or missing snapshots, rather than dropping journals.
+  Recovered authority tokens are validated as a complete manifest before
+  activation; malformed manifests prevent restart. Identity-bound atomic
+  transitions, CRDT state, embedded old self-references,
+  and workflow activation/replay receipts are deliberately not re-keyed.
+  MemoryStore is ephemeral; this does not yet establish end-to-end
+  process-crash recovery or stable logical actor identity;
 - persistent actors/entities/workflows are implemented and recoverable, but
   the higher-level durable semantic model is still being stabilized;
 - deterministic replay requires effect results and identity to be preserved
