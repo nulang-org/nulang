@@ -7990,6 +7990,16 @@ mod tests {
     }
 
     #[test]
+    fn test_satisfies_identifier_on_next_line_is_not_a_postfix_check() {
+        // A new statement named 'satisfies' must not be mistaken for
+        // the type-check operator following the previous expression.
+        let source = "fn main() {\n  let satisfies = 0\n  let n = 1\n  satisfies = 2\n  n\n}";
+        let tokens = Lexer::new(source).lex().unwrap();
+        let module = Parser::new(tokens).parse_module();
+        assert!(module.is_ok(), "satisfies after newline should be a variable: {:?}", module.err());
+    }
+
+    #[test]
     fn test_satisfies_preserves_contextual_identifier() {
         let expr = parse_expr("let satisfies = 7 in satisfies").unwrap();
         assert!(matches!(expr, Expr::Let { name, .. } if name == "satisfies"));
