@@ -220,9 +220,7 @@ fn explicit_response_route(
     status: u16,
     body_source: &str,
 ) -> WebRoute {
-    let source = format!(
-        "fn handler() {{ perform Web.{effect}({status}, {body_source}) }}"
-    );
+    let source = format!("fn handler() {{ perform Web.{effect}({status}, {body_source}) }}");
     let (module, function_index) = compile_handler(&source, "handler");
     WebRoute {
         method,
