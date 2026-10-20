@@ -2850,7 +2850,12 @@ impl Runtime {
                         // applies it on the retired heap.
                         // SAFETY: as above; the single scheduler thread is
                         // the only mutator of any header.
-                        unsafe { (*source_header).foreign_count += 1 };
+                        unsafe {
+                            (*source_header).foreign_count = (*source_header)
+                                .foreign_count
+                                .checked_add(1)
+                                .expect("ORCA retired foreign reference count overflow");
+                        };
                         self.coordinator.submit_op(ForeignRefOp {
                             target_actor: target_id,
                             owner_actor: owner_id,
@@ -2954,11 +2959,17 @@ impl Runtime {
                 // the only mutator of any header.
                 unsafe {
                     let header = &mut *source_header;
-                    if op.delta >= 0 {
-                        header.foreign_count += op.delta as u32;
+                    header.foreign_count = if op.delta >= 0 {
+                        header
+                            .foreign_count
+                            .checked_add(op.delta as u32)
+                            .expect("ORCA retired foreign reference count overflow")
                     } else {
-                        header.foreign_count -= (-op.delta) as u32;
-                    }
+                        header
+                            .foreign_count
+                            .checked_sub(op.delta.unsigned_abs())
+                            .expect("ORCA retired foreign reference count underflow")
+                    };
                 }
             }
         }
@@ -3722,7 +3733,12 @@ impl Runtime {
                 // The owner has exited: its heap is retired (kept alive by
                 // the in-flight send bump), so bump the header directly.
                 // SAFETY: as above; single scheduler thread.
-                unsafe { (*header).foreign_count += 1 };
+                unsafe {
+                    (*header).foreign_count = (*header)
+                        .foreign_count
+                        .checked_add(1)
+                        .expect("ORCA retired foreign reference count overflow");
+                };
             }
             if let Some(receiver) = self.actors.get_mut(&receiver_id) {
                 receiver.orca_gc.record_held_ref(owner_id, header);
@@ -3798,7 +3814,12 @@ impl Runtime {
             } else {
                 // SAFETY: the hold kept foreign_count > 0, so the owner's
                 // heap was retired (not freed) and the header is valid.
-                unsafe { (*header).foreign_count -= 1 };
+                unsafe {
+                    (*header).foreign_count = (*header)
+                        .foreign_count
+                        .checked_sub(1)
+                        .expect("ORCA retired foreign reference count underflow");
+                };
             }
         }
         self.object_store.drop_refs(&object_ids);
