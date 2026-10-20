@@ -114,7 +114,9 @@ The `stdlib::web::types` module defines `Html` as an **opaque type** — a compi
 The `stdlib::web::html` module adds ergonomic helpers: `el`, `txt`, `attr`, `body`, `head`, `title`, `document`. It re-exports `text`, `raw`, and `redirect` from `stdlib::web::host`.
 
 :::note
-`Web.redirect` produces an HTML page with a `<meta http-equiv="refresh">` and is sent with status 200 — not an HTTP 3xx. Browsers follow it; API clients will not.
+In a routed `nula dev` HTTP request, `Web.redirect(url)` emits a real `303 See Other` response with a `Location` header and an empty body. POST redirects therefore direct clients to perform a GET rather than resubmitting the request body. The Location value must be a printable relative URI reference or an explicit HTTP(S) URL; unsafe schemes, protocol-relative URLs, and control characters are rejected.
+
+Outside a routed HTTP request (for example, evaluating a fragment or rendering a static page), `Web.redirect` retains its legacy HTML meta-refresh fallback for compatibility. The `nula dev` host remains experimental and is not production-security-certified.
 :::
 
 ### Reading the Request
