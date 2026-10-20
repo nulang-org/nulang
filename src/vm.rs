@@ -4237,15 +4237,11 @@ impl VM {
         if binding.single_shot {
             // Fast path: snapshot registers inline — no heap allocation.
             let frame = &self.frames[frame_idx];
-            let mut regs = [Value::nil(); 256];
-            for (i, r) in frame.regs.iter().enumerate() {
-                regs[i] = *r;
-            }
             self.handler_stack[hf_idx].single_shot_state = Some(SingleShotState {
                 resume_pc: frame.pc,
                 resume_dst: dst_reg,
                 step_count: self.step_count,
-                regs,
+                regs: frame.regs,
                 spilled: frame.spilled.clone(),
             });
         } else {
@@ -5786,17 +5782,15 @@ impl VM {
             }
             OpCode::Resume => {
                 let val = frame.regs[instr.op1 as usize];
-                // The continuation lives on the innermost *matching* handler
-                // frame (Perform uses rposition), which is not necessarily the
-                // top of the stack when nested handlers bind different effects.
-                // Check single-shot state first — no heap allocation needed.
-                if let Some(hf) = self
-                    .handler_stack
-                    .iter_mut()
-                    .rev()
-                    .find(|hf| hf.single_shot_state.is_some())
-                {
-                    if let Some(state) = hf.single_shot_state.take() {
+                // Resume the innermost outstanding continuation, regardless
+                // of its representation. Checking every single-shot state
+                // before every general capture can incorrectly resume an
+                // outer effect while an inner general handler is active.
+                let handler_idx = self.handler_stack.iter().rposition(|hf| {
+                    hf.single_shot_state.is_some() || hf.captured_continuation.is_some()
+                });
+                if let Some(idx) = handler_idx {
+                    if let Some(state) = self.handler_stack[idx].single_shot_state.take() {
                         frame.regs = state.regs;
                         frame.spilled = state.spilled;
                         frame.regs[state.resume_dst as usize] = val;
@@ -5804,14 +5798,7 @@ impl VM {
                         self.step_count = state.step_count;
                         return Ok(());
                     }
-                }
-                if let Some(hf) = self
-                    .handler_stack
-                    .iter_mut()
-                    .rev()
-                    .find(|hf| hf.captured_continuation.is_some())
-                {
-                    if let Some(cont) = hf.captured_continuation.take() {
+                    if let Some(cont) = self.handler_stack[idx].captured_continuation.take() {
                         cont.restore(self, val);
                         return Ok(());
                     }
