@@ -1187,7 +1187,10 @@ impl WebDevServer {
                         }
                     }
                     (Ok(Some(body)), None) => response_from_rendered(
-                        route.plan.as_ref().and_then(|plan| plan.response_type.as_deref()),
+                        route
+                            .plan
+                            .as_ref()
+                            .and_then(|plan| plan.response_type.as_deref()),
                         body,
                     ),
                     (Ok(None), _) => HttpResponse {
@@ -1352,16 +1355,18 @@ mod tests {
     fn html_response_type_keeps_html_rendering_but_unknown_types_fail_closed() {
         let html = response_from_rendered(Some("Html"), "<p>OK</p>".into());
         assert_eq!(html.status, 200);
-        assert!(html.headers.iter().any(|(k, v)| {
-            k == "Content-Type" && v == "text/html; charset=utf-8"
-        }));
+        assert!(html
+            .headers
+            .iter()
+            .any(|(k, v)| { k == "Content-Type" && v == "text/html; charset=utf-8" }));
         assert!(String::from_utf8_lossy(&html.body).contains("<p>OK</p>"));
 
         let legacy = response_from_rendered(None, "<p>old</p>".into());
         assert_eq!(legacy.status, 200);
-        assert!(legacy.headers.iter().any(|(k, v)| {
-            k == "Content-Type" && v == "text/html; charset=utf-8"
-        }));
+        assert!(legacy
+            .headers
+            .iter()
+            .any(|(k, v)| { k == "Content-Type" && v == "text/html; charset=utf-8" }));
 
         let unsupported = response_from_rendered(Some("CustomRecord"), "secret".into());
         assert_eq!(unsupported.status, 500);
