@@ -105,7 +105,7 @@ jobs:
       # The Rust tests do not execute Nulang-authored stdlib tests by default.
       # Verify Enumerable semantics with the just-built Nulang interpreter.
       - name: Run standard-library list behavior tests
-        run: cargo run --locked -- src/stdlib/list_test.nula
+        run: cargo run --locked --bin nulang -- src/stdlib/list_test.nula
 
       - name: Test
         # nextest isolates individual tests in their own processes and schedules
