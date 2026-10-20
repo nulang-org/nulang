@@ -1278,6 +1278,57 @@ mod tests {
     }
 
     #[test]
+    fn http_request_requires_single_host_for_http_11() {
+        for raw in [
+            &b"GET /resource HTTP/1.1\r\n\r\n"[..],
+            &b"GET /resource HTTP/1.1\r\nHost: \r\n\r\n"[..],
+            &b"GET /resource HTTP/1.1\r\nHost: first.example\r\nhost: second.example\r\n\r\n"[..],
+            &b"GET /resource HTTP/1.1\r\nHost: first.example, second.example\r\n\r\n"[..],
+            &b"GET /resource HTTP/1.1\r\nHost: bad host\r\n\r\n"[..],
+        ] {
+            assert_eq!(
+                read_http_request(&mut chunks(raw, 3)).unwrap_err(),
+                HttpReadError::BadRequest,
+                "invalid or ambiguous HTTP/1.1 Host must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn http_request_accepts_single_host_and_legacy_http_10() {
+        let http11 = read_http_request(&mut chunks(
+            b"GET /resource?limit=1 HTTP/1.1\r\nHost: api.example:8080\r\n\r\n",
+            2,
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(http11.path, "/resource?limit=1");
+
+        // HTTP/1.0 did not require Host; keep compatibility with legacy clients.
+        let http10 =
+            read_http_request(&mut chunks(b"GET /legacy HTTP/1.0\r\n\r\n", 2))
+                .unwrap()
+                .unwrap();
+        assert_eq!(http10.path, "/legacy");
+    }
+
+    #[test]
+    fn http_request_rejects_invalid_versions_and_request_targets() {
+        for raw in [
+            &b"GET / HTTP/2.0\r\nHost: localhost\r\n\r\n"[..],
+            &b"GET http://evil.example/private HTTP/1.1\r\nHost: localhost\r\n\r\n"[..],
+            &b"GET /resource#fragment HTTP/1.1\r\nHost: localhost\r\n\r\n"[..],
+            &b"OPTIONS * HTTP/1.1\r\nHost: localhost\r\n\r\n"[..],
+        ] {
+            assert_eq!(
+                read_http_request(&mut chunks(raw, 4)).unwrap_err(),
+                HttpReadError::BadRequest,
+                "Nulang is an origin HTTP/1.x server, not a forward proxy"
+            );
+        }
+    }
+
+    #[test]
     fn http_request_reassembles_fragmented_headers_and_exact_body() {
         let raw = b"POST /submit HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello";
         let request = read_http_request(&mut chunks(raw, 3)).unwrap().unwrap();
