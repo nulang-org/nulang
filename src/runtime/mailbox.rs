@@ -503,6 +503,42 @@ impl Mailbox {
         None
     }
 
+    /// Observe Values retained by scheduler-owned mailbox buffers, without
+    /// dequeuing messages or disturbing selective-receive cursors.
+    ///
+    /// This is deliberately **not** a complete mailbox root snapshot:
+    /// system_queue and normal_queue accept concurrent producers and
+    /// cannot be safely enumerated using their pop-only SegQueue interface.
+    /// A future collection safepoint must cover those lanes with a proper
+    /// admission barrier or independently tracked roots. Duplicate values
+    /// from an active receive candidate are harmless for inspection.
+    ///
+    /// This read-only method must never be used alone to prove an object is
+    /// unreachable or to reclaim any ORCA heap allocation.
+    pub fn visit_scheduler_owned_values(&self, visit: &mut impl FnMut(Value)) {
+        for message in &self.local_queue {
+            for &value in message.payload.as_slice() {
+                visit(value);
+            }
+        }
+        for buffer in [
+            &self.system_skip_buffer,
+            &self.local_skip_buffer,
+            &self.skip_buffer,
+        ] {
+            for (message, _) in buffer {
+                for &value in message.payload.as_slice() {
+                    visit(value);
+                }
+            }
+        }
+        if let Some((_, _, payload)) = &self.active_match {
+            for &value in payload.iter() {
+                visit(value);
+            }
+        }
+    }
+
     /// Total logical message count. Safe to query concurrently.
     pub fn len(&self) -> usize {
         self.queued_count.load(Ordering::Relaxed)
