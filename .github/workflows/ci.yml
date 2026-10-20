@@ -202,6 +202,12 @@ jobs:
       - name: Smoke test (eval)
         run: ./target/release/nulang --eval 'perform IO.print("hello")'
 
+      # Exercise the actual Nulang-authored stdlib test suite, not only Rust
+      # unit tests or scaffolded package smoke tests. This includes the
+      # Enumerable-style generic collection regressions.
+      - name: Run standard-library list behavior tests
+        run: ./target/release/nulang src/stdlib/list_test.nula
+
       - name: Scaffold test package
         run: ./target/release/nulang nula new test-pkg
 
