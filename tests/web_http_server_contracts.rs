@@ -168,7 +168,7 @@ fn legacy_route_still_falls_back_over_real_http() {
 
 fn redirect_route(method: HttpMethod, path: &str, target: &str) -> WebRoute {
     let source = format!(
-        "fn go() -> Html {{ perform Web.redirect(\"{target}\") }}"
+        "fn go() {{ perform Web.redirect(\"{target}\") }}"
     );
     let (module, function_index) = compile_handler(&source, "go");
     WebRoute {
