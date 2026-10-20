@@ -116,3 +116,18 @@ fn nbc_structural_verifier_rejects_invalid_effect_constant_type() {
     module.instructions[0] = Instruction::new3(OpCode::Perform, 0, 0, 0);
     assert_rejected(&module, "string constant");
 }
+
+#[test]
+fn nbc_structural_verifier_core_vm_admission_is_atomic() {
+    let mut vm = nulang::core_vm::CoreVM::new();
+    let mut invalid = simple_module();
+    invalid.entry_point = Some(invalid.instructions.len());
+    let invalid_bytes = invalid.to_nbc(None).unwrap();
+
+    assert!(vm.load_nbc_with_structural_verification(&invalid_bytes).is_err());
+    assert!(vm.modules.is_empty(), "rejection must not publish a partial module");
+
+    let valid_bytes = simple_module().to_nbc(None).unwrap();
+    assert_eq!(vm.load_nbc_with_structural_verification(&valid_bytes), Ok(0));
+    assert_eq!(vm.modules.len(), 1);
+}
