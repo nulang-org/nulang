@@ -9,6 +9,7 @@
 pub mod client;
 pub mod debate;
 pub mod memory;
+pub mod meilisearch;
 pub mod mock;
 pub mod pipeline;
 pub mod procedural_memory;
@@ -24,6 +25,7 @@ pub mod usage;
 pub use client::{complete_sync, LlmClient};
 pub use debate::{Debate, DebateRuntime, Participant, Stance};
 pub use memory::{EpisodicMemory, Turn};
+pub use meilisearch::{MeilisearchClient, MeilisearchError, MeilisearchTask, MeilisearchTaskStatus};
 pub use mock::MockLlmClient;
 pub use pipeline::{Pipeline, PipelineRuntime, PipelineStage};
 pub use procedural_memory::{Pattern, ProceduralMemory};
