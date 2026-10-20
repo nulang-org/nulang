@@ -315,7 +315,7 @@ impl Supervisor {
             RestartPolicy::Temporary => false,
             RestartPolicy::Transient => {
                 !matches!(reason, ExitReason::Normal | ExitReason::Shutdown(_))
-            },
+            }
             RestartPolicy::RespawnOnNodeLoss => true,
         };
         if !policy_allows {
@@ -746,8 +746,8 @@ impl Supervisor {
             runtime.remove_actor_reaping(actor_id);
             return SupervisorAction::Ignore;
         }
-        // Check the supervisor's aggregate budget once per abnormal child
-        // exit, before replacing any siblings for OneForAll/RestForOne.
+        // Check the aggregate budget once per automatic restart event,
+        // before replacing any siblings for OneForAll/RestForOne.
         if self.restart_intensity_exhausted(Instant::now()) {
             return SupervisorAction::Shutdown;
         }
