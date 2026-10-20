@@ -4235,7 +4235,8 @@ impl VM {
         self.handler_stack[hf_idx].resume_dst = binding.result_reg;
 
         if binding.single_shot {
-            // Fast path: snapshot registers inline — no heap allocation.
+            // Fast path: register-only frames snapshot inline without allocation.
+            // Spill slots are cloned only when the function actually has them.
             let frame = &self.frames[frame_idx];
             self.handler_stack[hf_idx].single_shot_state = Some(SingleShotState {
                 resume_pc: frame.pc,
