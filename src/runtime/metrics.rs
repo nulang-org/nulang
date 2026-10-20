@@ -295,3 +295,106 @@ impl MetricsSnapshot {
         }
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::super::{ActorMailboxMetric, Runtime, SupervisorChildMetric, SupervisorMetric};
+
+    #[test]
+    fn test_mailbox_depth_export_handles_large_counts_and_ties() {
+        let mut snapshot = Runtime::new().metrics_snapshot();
+        snapshot.actors_mailboxes = vec![
+            ActorMailboxMetric {
+                actor_id: 9,
+                depth: 7,
+            },
+            ActorMailboxMetric {
+                actor_id: 3,
+                depth: usize::MAX,
+            },
+            ActorMailboxMetric {
+                actor_id: 2,
+                depth: usize::MAX / 2 + 1,
+            },
+            ActorMailboxMetric {
+                actor_id: 1,
+                depth: 7,
+            },
+        ];
+
+        let output = snapshot.to_prometheus_text();
+        let lines: Vec<&str> = output
+            .lines()
+            .filter(|line| line.starts_with("nulang_actor_mailbox_depth{"))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                format!(
+                    "nulang_actor_mailbox_depth{{actor_id=\"3\"}} {}",
+                    usize::MAX
+                ),
+                format!(
+                    "nulang_actor_mailbox_depth{{actor_id=\"2\"}} {}",
+                    usize::MAX / 2 + 1
+                ),
+                "nulang_actor_mailbox_depth{actor_id=\"1\"} 7".to_string(),
+                "nulang_actor_mailbox_depth{actor_id=\"9\"} 7".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_mailbox_depth_export_selects_deepest_fifty() {
+        let mut snapshot = Runtime::new().metrics_snapshot();
+        snapshot.actors_mailboxes = (1..=75)
+            .rev()
+            .map(|id| ActorMailboxMetric {
+                actor_id: id,
+                depth: id as usize,
+            })
+            .collect();
+
+        let output = snapshot.to_prometheus_text();
+        let lines: Vec<&str> = output
+            .lines()
+            .filter(|line| line.starts_with("nulang_actor_mailbox_depth{"))
+            .collect();
+        assert_eq!(lines.len(), 50);
+        assert_eq!(lines[0], "nulang_actor_mailbox_depth{actor_id=\"75\"} 75");
+        assert_eq!(lines[49], "nulang_actor_mailbox_depth{actor_id=\"26\"} 26");
+    }
+
+    #[test]
+    fn test_supervision_topology_handles_cycle_without_recursion() {
+        let mut snapshot = Runtime::new().metrics_snapshot();
+        snapshot.supervisors = vec![
+            SupervisorMetric {
+                id: 1,
+                name: "root".to_string(),
+                strategy: "OneForOne".to_string(),
+                parent: None,
+                children: vec![SupervisorChildMetric {
+                    actor_id: 2,
+                    spec_id: "worker".to_string(),
+                }],
+            },
+            SupervisorMetric {
+                id: 2,
+                name: "child".to_string(),
+                strategy: "OneForOne".to_string(),
+                parent: Some(1),
+                children: vec![SupervisorChildMetric {
+                    actor_id: 2,
+                    spec_id: "self-reference".to_string(),
+                }],
+            },
+        ];
+
+        let output = snapshot.render_topology_text();
+        assert_eq!(output.matches("supervisor root [").count(), 1);
+        assert_eq!(output.matches("supervisor child [").count(), 1);
+        assert!(output.contains("(cycle/repeated supervisor id: 2)"));
+    }
+}
