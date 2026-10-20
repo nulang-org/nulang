@@ -4,6 +4,8 @@
 //! Handlers are non-capturing `fn(String) -> String` — no closures with env.
 //! Status is always 200; Content-Type is always text/plain.
 
+use rand_core::{OsRng, RngCore};
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -534,15 +536,27 @@ where
     result
 }
 
-/// Add a `Set-Cookie` header for the current response.
+/// Generate a cryptographically random, 256-bit opaque session secret.
+///
+/// This host operation is intentionally nondeterministic and must never be
+/// replayed as a fresh authentication decision in a durable workflow.
+/// Failed OS entropy acquisition is a hard failure, not a counter fallback.
+pub fn secure_session_token() -> Option<String> {
+    let mut bytes = [0u8; 32];
+    let mut rng = OsRng;
+    rng.try_fill_bytes(&mut bytes).ok()?;
+    Some(hex::encode(bytes))
+}
+
+/// Add a secure, HTTP-only `Set-Cookie` header for the current response.
 pub fn set_cookie(name: &str, value: &str) {
-    let cookie = format!("{}={}; Path=/; HttpOnly; SameSite=Lax", name, value);
+    let cookie = format!("{}={}; Path=/; HttpOnly; Secure; SameSite=Lax", name, value);
     RESPONSE_COOKIES.with(|c| c.borrow_mut().push(cookie));
 }
 
 /// Add a `Set-Cookie` header that clears the named cookie.
 pub fn clear_cookie(name: &str) {
-    let cookie = format!("{}=; Path=/; Max-Age=0; SameSite=Lax", name);
+    let cookie = format!("{}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax", name);
     RESPONSE_COOKIES.with(|c| c.borrow_mut().push(cookie));
 }
 
@@ -1205,6 +1219,38 @@ fn guess_content_type(path: &Path) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secure_session_token_is_unpredictable_and_256_bits() {
+        let a = secure_session_token().expect("OS entropy must be available");
+        let b = secure_session_token().expect("OS entropy must be available");
+        assert_eq!(a.len(), 64); // 32 random bytes in lowercase hex
+        assert!(a.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn session_cookies_are_secure_http_only_and_expire_on_clear() {
+        let ctx = RequestContext {
+            request: HttpRequest {
+                method: HttpMethod::Get,
+                path: "/".into(),
+                headers: vec![],
+                body: vec![],
+            },
+            params: HashMap::new(),
+        };
+        with_request_context(ctx, || {
+            set_cookie("nulang_session", "random-token");
+            clear_cookie("nulang_session");
+            let cookies = take_response_cookies();
+            assert_eq!(cookies.len(), 2);
+            assert!(cookies.iter().all(|cookie| cookie.contains("; Secure")));
+            assert!(cookies.iter().all(|cookie| cookie.contains("; HttpOnly")));
+            assert!(cookies[0].contains("; SameSite=Lax"));
+            assert!(cookies[1].contains("; Max-Age=0"));
+        });
+    }
 
     // A deterministic reader forces TCP-like fragmentation without sleeps.
     struct FixedChunkReader<'a> {

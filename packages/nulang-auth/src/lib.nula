@@ -16,11 +16,10 @@ fn session_key(token: String) -> String {
     "nulang_auth:session:" + token
 }
 
-fn next_token() -> String {
-    let raw = kv_get("nulang_auth:token_counter")
-    let n = if raw == "" then { 0 } else { perform String.to_int(raw) }
-    kv_set("nulang_auth:token_counter", perform Int.to_string(n + 1))
-    "session-" + perform Int.to_string(n + 1)
+fn next_token() -> String ! {Web, Request} {
+    // Never derive authentication tokens from predictable counters.
+    // An unavailable OS CSPRNG returns "" and login must fail closed.
+    perform Web.secure_token()
 }
 
 /// Returns the current user id from the session cookie, or "" if none.
@@ -46,11 +45,15 @@ pub fn require(with_user) -> Html ! {Web, Request, String, Respond} {
     }
 }
 
-/// Start a session for `user` and set the session cookie.
+/// Start a development session with an unguessable token.\n/// The web KV store is ephemeral: do not use this package in production yet.
 pub fn login(user: User) -> Unit ! {Web, Request, String, Int, Respond} {
     let token = next_token()
-    kv_set(session_key(token), user)
-    set_cookie("nulang_session", token)
+    if token != "" then {
+        kv_set(session_key(token), user)
+        set_cookie("nulang_session", token)
+    } else {
+        // Authentication must not succeed when secure randomness is unavailable.
+    }
 }
 
 /// End the current session and clear the cookie.
