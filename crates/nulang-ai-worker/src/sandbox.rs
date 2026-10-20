@@ -64,16 +64,27 @@ impl SandboxConfig {
         if criterion.trim().is_empty() {
             return Err("acceptance criterion cannot be empty".into());
         }
-        fs::create_dir_all(receipt_dir.as_ref()).map_err(|e| e.to_string())?;
-        let receipt_dir = receipt_dir.as_ref().canonicalize().map_err(|e| e.to_string())?;
+        let receipt_dir_input = receipt_dir.as_ref();
+        let existed = receipt_dir_input.exists();
+        fs::create_dir_all(receipt_dir_input).map_err(|e| e.to_string())?;
+        let receipt_dir = receipt_dir_input.canonicalize().map_err(|e| e.to_string())?;
         if receipt_dir.starts_with(&workspace) {
             return Err("receipts must live outside the mounted workspace".into());
         }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&receipt_dir, fs::Permissions::from_mode(0o700))
-                .map_err(|e| e.to_string())?;
+            let mode = fs::metadata(&receipt_dir)
+                .map_err(|e| e.to_string())?
+                .permissions()
+                .mode();
+            if existed && (mode & 0o077) != 0 {
+                return Err("existing receipt directory must be private (mode 0700)".into());
+            }
+            if !existed {
+                fs::set_permissions(&receipt_dir, fs::Permissions::from_mode(0o700))
+                    .map_err(|e| e.to_string())?;
+            }
         }
 
         Ok(Self {
