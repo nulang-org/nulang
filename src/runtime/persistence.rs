@@ -2399,7 +2399,9 @@ impl PersistenceStore for LibsqlStore {
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
                 {
                     for idx in 0..columns.len() {
-                        let json: String = row.get(idx).map_err(|e| {
+                        // The selected legacy tables have at most two fixed columns,
+                        // so the enumeration index always fits libSQL's i32 API.
+                        let json: String = row.get(idx as i32).map_err(|e| {
                             io::Error::new(io::ErrorKind::InvalidData, e.to_string())
                         })?;
                         if json_history_contains_self_ref(&json, from)? {
