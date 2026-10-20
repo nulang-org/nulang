@@ -1189,6 +1189,28 @@ These relationships enable safe capability transitions. For example, a function 
 
 `tag` is the **least-privileged view** and the top of the subtyping order: every capability can be downgraded to `tag`, but a `tag` reference must never be implicitly promoted to a readable or writable capability. The least-upper-bound operation therefore satisfies `join(tag, C) = tag` for every capability `C`. This is important for merges of control-flow branches with different capabilities: introducing an opaque identity view must not silently restore authority.
 
+### 3.9.1a Receiver viewpoint projection (Experimental)
+
+Nulang's compiler begins tracking the receiver's reference capability while
+resolving record and tuple fields. A reference-typed field is viewed with
+capabilities no stronger than the receiver permits. Examples:
+
+- Reading a `&ref T` field through `&box { field: &ref T }` yields `&box T`.
+- Reading the same field through `&val { field: &ref T }` yields `&val T`.
+- Reading a `&val T` field through `&box` preserves the `val` guarantee.
+- A `&tag` receiver is opaque: even a primitive record field cannot be read.
+- A field declared `iso` is exposed as `tag` through ordinary reads unless
+  there is a separate proven ownership-transfer operation. Pony's ephemeral
+  aliasing and destructive move-out semantics are **not** implemented here.
+
+Plain nested records, tuples and arrays propagate the projected reference
+capabilities. This is a **conservative subset** of Pony's viewpoint adaptation
+and does not introduce arrow types or polymorphic viewpoint constraints.
+Generic applications, opaque nominals, unknown row fields, and the independent
+capability-analysis pass still need end-to-end verification before treating
+the feature as a stable actor-isolation guarantee. Do not treat a read-only
+projection as an ownership-transfer or sendability proof.
+
 ### 3.9.2 Recover Expressions
 
 `recover` is a keyword in the current implementation (`src/lexer.rs`), and the `recover { body }` expression is implemented (Experimental). Its current meaning is narrower than Pony's: it is an **isolated scope with a sendability check** — the body is evaluated normally, and the capability checker requires the body's result to be sendable (`iso`, `val`, or `tag`; `src/effect_checker.rs` reports "recover body must evaluate to a sendable value" otherwise). The typechecker infers the body's type unchanged (`src/typechecker.rs`), and lowering is transparent (`src/hir_lower.rs`): `recover` does not wrap the result in `Ok`/`Error` and does not itself change any capability.
