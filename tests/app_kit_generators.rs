@@ -46,7 +46,8 @@ fn feature_generates_a_module_and_an_executable_test_fixture() {
     assert_eq!(files.len(), 2);
 
     let module = std::fs::read_to_string(package.root().join("src/customer_profile.nula")).unwrap();
-    let test = std::fs::read_to_string(package.root().join("tests/test_customer_profile.nula")).unwrap();
+    let test =
+        std::fs::read_to_string(package.root().join("tests/test_customer_profile.nula")).unwrap();
     assert!(module.contains("pub fn customer_profile_label() -> String"));
     assert!(test.contains("import customer_profile"));
     assert!(test.contains("fn test_customer_profile_label()"));
@@ -69,7 +70,17 @@ fn existing_test_is_never_overwritten_or_partially_scaffolded() {
 #[test]
 fn rejects_invalid_or_unsafe_feature_names() {
     let package = PackageFixture::new("invalid");
-    for name in ["", "../escape", "nested/path", "customer-name", "8customer", "Customer", "main", "lib", "_hidden"] {
+    for name in [
+        "",
+        "../escape",
+        "nested/path",
+        "customer-name",
+        "8customer",
+        "Customer",
+        "main",
+        "lib",
+        "_hidden",
+    ] {
         assert!(
             generate(package.root(), "feature", name).is_err(),
             "should reject {name:?}"
