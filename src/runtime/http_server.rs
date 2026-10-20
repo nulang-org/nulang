@@ -1022,12 +1022,44 @@ impl WebDevServer {
                 return;
             }
         };
-        let path = request.path.clone();
 
-        let mut response = if path.starts_with(Self::SSE_PATH_PREFIX) {
-            let room = &path[Self::SSE_PATH_PREFIX.len()..];
-            Self::serve_sse(room, &mut stream, shutdown.clone());
+        // Streaming keeps its own socket lifetime; only finite HTTP responses
+        // go through the shared injectable dispatch pipeline.
+        if request.path.starts_with(Self::SSE_PATH_PREFIX) {
+            let room = &request.path[Self::SSE_PATH_PREFIX.len()..];
+            Self::serve_sse(room, &mut stream, shutdown);
             return;
+        }
+        let response = Self::inject(
+            routes.as_slice(),
+            request,
+            static_dir.as_deref(),
+            output_dir.as_deref(),
+        );
+        HttpServerState::write_response(&mut stream, &response);
+    }
+
+    /// Execute a structured HTTP request without binding a TCP socket.
+    ///
+    /// This shares routing, typed request binding, legacy fallback, static
+    /// containment, cookie handling and middleware with real HTTP connections.
+    /// It intentionally does not exercise wire framing, transfer encodings or
+    /// long-lived SSE streams; retain socket-level tests for those behaviors.
+    pub fn inject(
+        routes: &[RuntimeWebRoute],
+        request: HttpRequest,
+        static_dir: Option<&Path>,
+        output_dir: Option<&Path>,
+    ) -> HttpResponse {
+        // Injection may reuse a calling thread: no response state can cross
+        // synthetic request boundaries (including unmatched static requests).
+        let _ = take_response_cookies();
+        let mut response = if request.path.starts_with(Self::SSE_PATH_PREFIX) {
+            HttpResponse {
+                status: 501,
+                headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
+                body: b"Streaming is not supported by request injection".to_vec(),
+            }
         } else if let Some((route, params)) = routes
             .iter()
             .filter(|r| r.route.method == request.method)
@@ -1085,7 +1117,7 @@ impl WebDevServer {
                 }
             }
         } else {
-            Self::serve_static(static_dir.as_deref(), output_dir.as_deref(), &request.path)
+            Self::serve_static(static_dir, output_dir, &request.path)
         };
         for cookie in take_response_cookies() {
             response.headers.push(("Set-Cookie".into(), cookie));
@@ -1094,7 +1126,7 @@ impl WebDevServer {
         for m in &middlewares {
             m.apply(&request, &mut response);
         }
-        HttpServerState::write_response(&mut stream, &response);
+        response
     }
 
     fn serve_sse(room: &str, stream: &mut TcpStream, shutdown: Arc<AtomicBool>) {
