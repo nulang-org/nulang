@@ -63,10 +63,23 @@ type Folder<T> = Box<dyn Fn(T, &T) -> T + Send + Sync>;
 
 enum Node<T> {
     Source(Vec<T>),
-    Map { input: NodeId, apply: Mapper<T> },
-    Filter { input: NodeId, retain: Predicate<T> },
-    Fold { input: NodeId, initial: T, fold: Folder<T> },
-    Concat { left: NodeId, right: NodeId },
+    Map {
+        input: NodeId,
+        apply: Mapper<T>,
+    },
+    Filter {
+        input: NodeId,
+        retain: Predicate<T>,
+    },
+    Fold {
+        input: NodeId,
+        initial: T,
+        fold: Folder<T>,
+    },
+    Concat {
+        left: NodeId,
+        right: NodeId,
+    },
 }
 
 impl<T> Node<T> {
@@ -83,8 +96,8 @@ impl<T> Node<T> {
 
 /// A finite, homogeneous, typed DAG with a sequential reference executor.
 ///
-/// \`fold\` emits a one-element collection containing the accumulator, even
-/// for empty input. \`concat\` preserves left-before-right order. No operator
+/// `fold` emits a one-element collection containing the accumulator, even
+/// for empty input. `concat` preserves left-before-right order. No operator
 /// may be used to infer effect or ownership safety of Nulang source code.
 pub struct DataflowGraph<T> {
     limits: Limits,
@@ -170,7 +183,11 @@ impl<T> DataflowGraph<T> {
         self.add(Node::Concat { left, right })
     }
 
-    fn check_output_budget(&self, length: usize, already_materialized: usize) -> Result<(), GraphError> {
+    fn check_output_budget(
+        &self,
+        length: usize,
+        already_materialized: usize,
+    ) -> Result<(), GraphError> {
         if length > self.limits.max_items_per_node {
             return Err(GraphError::TooManyItems {
                 limit: self.limits.max_items_per_node,
@@ -189,7 +206,7 @@ impl<T: Clone> DataflowGraph<T> {
     /// Execute a target and only the transitive nodes required by that target.
     ///
     /// Each call recomputes its target; no memoization across calls or effect
-    /// replay is implied. For \`filter\`, item budgets are checked before each
+    /// replay is implied. For `filter`, item budgets are checked before each
     /// retained element is cloned. A callback panic propagates as a panic.
     pub fn execute(&self, target: NodeId) -> Result<Vec<T>, GraphError> {
         self.validate(target)?;
@@ -224,7 +241,7 @@ impl<T: Clone> DataflowGraph<T> {
                 Node::Map { input, apply } => {
                     let values = results[input.0].as_ref().expect("validated predecessor");
                     self.check_output_budget(values.len(), materialized)?;
-                    values.iter().map(|value| apply(value)).collect()
+                    values.iter().map(apply.as_ref()).collect()
                 }
                 Node::Filter { input, retain } => {
                     let values = results[input.0].as_ref().expect("validated predecessor");
@@ -244,17 +261,18 @@ impl<T: Clone> DataflowGraph<T> {
                 } => {
                     let values = results[input.0].as_ref().expect("validated predecessor");
                     self.check_output_budget(1, materialized)?;
-                    let value = values.iter().fold(initial.clone(), |acc, item| fold(acc, item));
+                    let value = values.iter().fold(initial.clone(), fold.as_ref());
                     vec![value]
                 }
                 Node::Concat { left, right } => {
                     let a = results[left.0].as_ref().expect("validated left predecessor");
                     let b = results[right.0].as_ref().expect("validated right predecessor");
-                    let length = a.len().checked_add(b.len()).ok_or(
-                        GraphError::TooManyItems {
+                    let length = a
+                        .len()
+                        .checked_add(b.len())
+                        .ok_or(GraphError::TooManyItems {
                             limit: self.limits.max_items_per_node,
-                        },
-                    )?;
+                        })?;
                     self.check_output_budget(length, materialized)?;
                     a.iter().chain(b.iter()).cloned().collect()
                 }
