@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import json
 import os
 import re
 import sys
@@ -10,20 +11,58 @@ import subprocess
 WARNINGS_BASELINE = 0
 
 
+def parse_cargo_warning_messages(stream):
+    """Return warnings from Cargo's documented newline-delimited JSON stream.
+
+    Text-filtering stderr is unsafe: legitimate diagnostics can mention
+    "warnings" or "generated" in their filename or message. A successful
+    process without Cargo's final successful build marker is also not evidence
+    that the warnings gate executed to completion.
+    """
+    warnings = []
+    saw_successful_build = False
+
+    for line_number, line in enumerate(stream.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"non-JSON Cargo message at line {line_number}") from exc
+        if not isinstance(event, dict):
+            raise ValueError(f"invalid Cargo JSON object at line {line_number}")
+
+        reason = event.get("reason")
+        if reason == "compiler-message":
+            message = event.get("message")
+            if not isinstance(message, dict) or not isinstance(message.get("level"), str):
+                raise ValueError(f"invalid compiler-message at line {line_number}")
+            if message["level"] == "warning":
+                warnings.append(
+                    message.get("rendered")
+                    or message.get("message")
+                    or "<warning without rendered text>"
+                )
+        elif reason == "build-finished":
+            if event.get("success") is not True:
+                raise ValueError("Cargo build-finished marker did not report success")
+            saw_successful_build = True
+
+    if not saw_successful_build:
+        raise ValueError("Cargo JSON stream missing successful build-finished marker")
+
+    return warnings
+
+
 def check_warnings_for(feature_args, label):
-    """Run cargo check --tests with the given feature args and fail if
-    compiler warnings/errors are produced. Errors (not just warnings) are
-    fatal here too: a feature combination that doesn't compile is exactly
-    how the ai-runtime/core coupling bug (fixed 2026-08-01 — crate::ai::*
-    used unconditionally outside its #[cfg(feature = "ai-runtime")] gate)
-    slipped past this script for as long as it did — check_warnings()
-    originally checked only the default feature set, while CI's
-    minimal-build job (--no-default-features) was the only thing that
-    would have caught it.
+    """Run Cargo check and count structured compiler warnings, fail closed.
+
+    Cargo JSON output is authoritative for compiler diagnostic severity; stderr
+    contains progress and human summaries that must not determine the count.
     """
     print(f"Running cargo check --tests {label} to count compiler warnings...")
     res = subprocess.run(
-        ["cargo", "check", "--tests", "--message-format=short"] + feature_args,
+        ["cargo", "check", "--tests", "--message-format=json"] + feature_args,
         capture_output=True,
         text=True,
     )
@@ -35,35 +74,27 @@ def check_warnings_for(feature_args, label):
         print(res.stderr)
         return False
 
-    # Count individual warning lines, excluding cargo's summary lines.
-    # With --message-format=short, cargo prefixes each diagnostic with
-    # path:line:col:, so warnings do NOT start the line — match the
-    # "warning: " diagnostic marker as a substring instead, while still
-    # excluding the "generated N warning(s)" summary lines.
-    count = len(
-        [
-            line
-            for line in res.stderr.splitlines()
-            if "warning: " in line
-            and "generated" not in line
-            and "warnings" not in line
-        ]
-    )
+    try:
+        warnings = parse_cargo_warning_messages(res.stdout)
+    except ValueError as exc:
+        print(f"Error: cargo check --tests {label} returned invalid diagnostic evidence: {exc}")
+        if res.stderr:
+            print(res.stderr)
+        return False
 
+    count = len(warnings)
     print(f"cargo check --tests {label} warning count: {count} (baseline: {WARNINGS_BASELINE}).")
-
     if count > WARNINGS_BASELINE:
         print(
             f"Error: cargo check --tests {label} produced {count} warning(s), exceeding the baseline of {WARNINGS_BASELINE}."
         )
         print("Fix the warnings or document the reason for raising the baseline.")
-        print(f"cargo check --tests {label} output:")
-        print(res.stderr)
+        for warning in warnings[:10]:
+            print(warning)
         return False
 
     print(f"Success: cargo check --tests {label} warning count is within baseline.")
     return True
-
 
 def check_warnings():
     """Run cargo check --tests across every feature combination CI exercises
