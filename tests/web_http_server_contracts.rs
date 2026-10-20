@@ -362,3 +362,27 @@ fn web_response_rejects_statuses_that_cannot_have_this_body() {
         assert!(!response.contains("Location:"), "{response}");
     }
 }
+
+#[test]
+fn web_api_responses_use_standard_reason_phrases() {
+    for (status, reason) in [(202, "Accepted"), (409, "Conflict")] {
+        let source = format!(
+            "fn api() {{ perform Web.text_response({status}, \"response\") }}"
+        );
+        let server = WebDevServer::bind(
+            0,
+            None,
+            None,
+            vec![explicit_response_route(HttpMethod::Get, &source, "api")],
+        )
+        .expect("bind status reason route");
+        let response = send_raw_request(
+            server.port,
+            "GET /respond HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        assert!(
+            response.starts_with(&format!("HTTP/1.1 {status} {reason}\r\n")),
+            "{response}"
+        );
+    }
+}
