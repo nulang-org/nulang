@@ -1823,10 +1823,20 @@ fn actor_monitor_ref_effect_returns_unique_refs_and_correlated_down() {
     let watcher = rt.spawn_actor(Box::new(Vec::new));
     let target = rt.spawn_actor(Box::new(Vec::new));
     let one = rt
-        .perform_actor_builtin(Some(watcher), Some("monitor_ref"), &[], &[Value::actor_ref(target)])
+        .perform_actor_builtin(
+            Some(watcher),
+            Some("monitor_ref"),
+            &[],
+            &[Value::actor_ref(target)],
+        )
         .expect("Actor.monitor_ref builtin");
     let two = rt
-        .perform_actor_builtin(Some(watcher), Some("monitor_ref"), &[], &[Value::actor_ref(target)])
+        .perform_actor_builtin(
+            Some(watcher),
+            Some("monitor_ref"),
+            &[],
+            &[Value::actor_ref(target)],
+        )
         .expect("Actor.monitor_ref builtin");
     let first = one.as_int().expect("first monitor reference is an Int");
     let second = two.as_int().expect("second monitor reference is an Int");
@@ -1854,10 +1864,20 @@ fn actor_demonitor_ref_effect_rejects_other_watcher_and_cancels_exactly_one() {
     let stranger = rt.spawn_actor(Box::new(Vec::new));
     let target = rt.spawn_actor(Box::new(Vec::new));
     let first = rt
-        .perform_actor_builtin(Some(watcher), Some("monitor_ref"), &[], &[Value::actor_ref(target)])
+        .perform_actor_builtin(
+            Some(watcher),
+            Some("monitor_ref"),
+            &[],
+            &[Value::actor_ref(target)],
+        )
         .unwrap();
     let second = rt
-        .perform_actor_builtin(Some(watcher), Some("monitor_ref"), &[], &[Value::actor_ref(target)])
+        .perform_actor_builtin(
+            Some(watcher),
+            Some("monitor_ref"),
+            &[],
+            &[Value::actor_ref(target)],
+        )
         .unwrap();
     assert_eq!(
         rt.perform_actor_builtin(Some(stranger), Some("demonitor_ref"), &[], &[first]),
@@ -1885,16 +1905,31 @@ fn actor_demonitor_ref_flush_effect_clears_queued_down_and_reports_count() {
     let watcher = rt.spawn_actor(Box::new(Vec::new));
     let target = rt.spawn_actor(Box::new(Vec::new));
     let reference = rt
-        .perform_actor_builtin(Some(watcher), Some("monitor_ref"), &[], &[Value::actor_ref(target)])
+        .perform_actor_builtin(
+            Some(watcher),
+            Some("monitor_ref"),
+            &[],
+            &[Value::actor_ref(target)],
+        )
         .unwrap();
     rt.exit_actor(target, ExitReason::Normal);
     assert_eq!(
-        rt.perform_actor_builtin(Some(watcher), Some("demonitor_ref_flush"), &[], &[reference]),
+        rt.perform_actor_builtin(
+            Some(watcher),
+            Some("demonitor_ref_flush"),
+            &[],
+            &[reference]
+        ),
         Some(Value::int(1))
     );
     assert!(rt.actors.get(&watcher).unwrap().mailbox.is_empty());
     assert_eq!(
-        rt.perform_actor_builtin(Some(watcher), Some("demonitor_ref_flush"), &[], &[reference]),
+        rt.perform_actor_builtin(
+            Some(watcher),
+            Some("demonitor_ref_flush"),
+            &[],
+            &[reference]
+        ),
         Some(Value::int(0))
     );
     assert_eq!(
@@ -1902,7 +1937,12 @@ fn actor_demonitor_ref_flush_effect_clears_queued_down_and_reports_count() {
         Some(Value::nil())
     );
     assert_eq!(
-        rt.perform_actor_builtin(Some(watcher), Some("demonitor_ref_flush"), &[], &[Value::int(0)]),
+        rt.perform_actor_builtin(
+            Some(watcher),
+            Some("demonitor_ref_flush"),
+            &[],
+            &[Value::int(0)]
+        ),
         Some(Value::nil())
     );
 }
@@ -1916,7 +1956,9 @@ fn monitor_ref_flush_removes_only_the_correlated_queued_down() {
     let second = rt.monitor_ref(watcher, target).expect("second watch");
 
     rt.exit_actor(target, ExitReason::Error("failed".to_string()));
-    let removed = rt.demonitor_ref_flush(watcher, first).expect("flush completed");
+    let removed = rt
+        .demonitor_ref_flush(watcher, first)
+        .expect("flush completed");
     assert_eq!(removed, 1);
 
     let mailbox = &mut rt.actors.get_mut(&watcher).unwrap().mailbox;
@@ -1944,10 +1986,14 @@ fn monitor_ref_flush_preserves_selective_receive_staging_and_order() {
     assert_eq!(rt.demonitor_ref_flush(watcher, first), Ok(1));
     let mailbox = &mut rt.actors.get_mut(&watcher).unwrap().mailbox;
     assert_eq!(mailbox.len(), 1);
-    let (arm, payload) = mailbox.receive_match(&[0]).expect("other DOWN still visible");
+    let (arm, payload) = mailbox
+        .receive_match(&[0])
+        .expect("other DOWN still visible");
     assert_eq!(arm, 0);
     assert_eq!(payload[3].as_int(), Some(second.0 as i64));
-    mailbox.commit_receive_match().expect("commit surviving DOWN");
+    mailbox
+        .commit_receive_match()
+        .expect("commit surviving DOWN");
     assert!(mailbox.is_empty());
 }
 
@@ -1997,8 +2043,14 @@ fn monitor_references_distinguish_independent_watches_and_cancel_exactly_one() {
     assert_eq!(down.payload[1].as_int(), Some(watcher as i64));
     assert_eq!(down.payload[2].as_int(), Some(1));
     assert_eq!(down.payload[3].as_int(), Some(second.0 as i64));
-    assert!(mailbox.pop().is_none(), "canceled monitor must not send DOWN");
-    assert!(!rt.demonitor_ref(watcher, second), "delivered ref is retired");
+    assert!(
+        mailbox.pop().is_none(),
+        "canceled monitor must not send DOWN"
+    );
+    assert!(
+        !rt.demonitor_ref(watcher, second),
+        "delivered ref is retired"
+    );
 }
 
 #[test]
@@ -2014,7 +2066,10 @@ fn monitor_reference_reports_noproc_and_is_not_left_registered() {
     assert_eq!(down.payload[2].as_int(), Some(1));
     assert_eq!(down.payload[3].as_int(), Some(reference.0 as i64));
     assert!(!rt.demonitor_ref(watcher, reference));
-    assert!(rt.monitor_ref(absent, watcher).is_none(), "dead watcher rejected");
+    assert!(
+        rt.monitor_ref(absent, watcher).is_none(),
+        "dead watcher rejected"
+    );
     rt.actors.get_mut(&watcher).unwrap().state = ActorState::Terminated;
     assert!(
         rt.monitor_ref(watcher, absent).is_none(),
@@ -2029,7 +2084,10 @@ fn monitor_reference_cleanup_on_watcher_exit_does_not_send_to_dead_actor() {
     let target = rt.spawn_actor(Box::new(Vec::new));
     let reference = rt.monitor_ref(watcher, target).expect("monitor");
     rt.exit_actor(watcher, ExitReason::Normal);
-    assert!(!rt.demonitor_ref(watcher, reference), "watcher death removes reference");
+    assert!(
+        !rt.demonitor_ref(watcher, reference),
+        "watcher death removes reference"
+    );
 
     rt.exit_actor(target, ExitReason::Normal);
     assert_eq!(rt.monitor_refs.len(), 0, "monitor registry must be empty");
@@ -2040,7 +2098,9 @@ fn monitor_reference_survives_supervisor_shutdown_notification() {
     let mut rt = Runtime::new();
     let watcher = rt.spawn_actor(Box::new(Vec::new));
     let supervisor_id = rt.create_supervisor("shutdown-root", RestartStrategy::OneForOne);
-    let reference = rt.monitor_ref(watcher, supervisor_id).expect("monitor supervisor");
+    let reference = rt
+        .monitor_ref(watcher, supervisor_id)
+        .expect("monitor supervisor");
 
     let supervisor = rt.supervisors.remove(&supervisor_id).unwrap();
     super::exit::shutdown_supervisor(&mut rt, supervisor_id, &supervisor);
