@@ -284,6 +284,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y python3-dev
@@ -300,6 +302,25 @@ jobs:
       # Format check is blocking — the codebase has been rustfmt'd.
       - name: Format check
         run: cargo fmt --check
+      # Check the complete range introduced by each event. PR checkout uses a
+      # merge candidate, so HEAD^1 is its base; pushes use the event range.
+      - name: Check committed whitespace errors
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+        run: |
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            git diff-tree --check --no-commit-id -r HEAD^1 HEAD
+          elif [[ "$PUSH_BEFORE" == "0000000000000000000000000000000000000000" ]]; then
+            empty_tree="$(git hash-object -w -t tree --stdin </dev/null)"
+            git diff --check "$empty_tree" "$PUSH_AFTER"
+          else
+            if ! git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
+              git fetch --no-tags --depth=1 origin "$PUSH_BEFORE"
+            fi
+            git diff --check "$PUSH_BEFORE" "$PUSH_AFTER"
+          fi
 
       # Clippy with default features — correctness lints are blocking.
       - name: Clippy (default features)

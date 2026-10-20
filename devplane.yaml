@@ -37,7 +37,6 @@ risk:
       - devplane.yaml
       - scripts/ci-local.sh
       - .github/**
-      - .woodpecker/**
       - .buildkite/**
     level: critical
     requires:
