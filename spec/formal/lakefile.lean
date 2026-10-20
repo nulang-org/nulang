@@ -12,6 +12,7 @@ lean_lib «Nulang» {
   -- newer type-language/capability-lattice/effect-row formalization.  Both
   -- must be compiled: 89bd0d6 dropped the top-level roots from the default
   -- target, orphaning the soundness proofs from `lake build` (they are back
-  -- since 2026-08-14).
-  roots := #[`Nulang, `types, `capabilities, `effects]
+  -- since 2026-08-14).  The compositional scoped-effect bridge is an
+  -- explicit root to prevent it from silently leaving the build graph.
+  roots := #[`Nulang, `types, `capabilities, `effects, `trace_effect_rows, `effect_typing_counterexamples]
 }
