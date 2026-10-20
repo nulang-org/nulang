@@ -1,4 +1,9 @@
 # Nulang Changelog
+
+### Wasmtime security update — 2026-10-20
+- **Bumped Wasmtime and its Pulley runtime dependencies from 48.0.6 to 48.0.7** to address RUSTSEC-2026-0379 (AArch64 Cranelift branch-table target correctness) and RUSTSEC-2026-0378 (component-model stream payload mismatch panic). Both vulnerabilities were detected by the October 20 RustSec audit CI gate.
+- **Kept the security audit enabled and preserved the existing language and runtime semantics.** The 14 matching lockfile packages carry published registry checksums; locked Cargo resolution and full cross-backend CI are required before promotion.
+
 ### Fabric on-demand mailbox scoring — 2026-10-18
 - **Fabric publish admission now reads mailbox pressure only for matching local subscribers**, instead of allocating and populating an all-actor mailbox snapshot on every publish.
 - **Ported the regression and exact-base matched-fixture A/B harness** from #1708 onto current main. Historical unmatched-publish microbenchmarks were favorable; new-head CI and measurements remain the promotion gate.
