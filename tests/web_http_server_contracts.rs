@@ -253,7 +253,10 @@ fn explicit_json_response_uses_201_and_canonical_json_over_http() {
         server.port,
         "POST /created HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
     );
-    assert!(response.starts_with("HTTP/1.1 201 Created\r\n"), "{response}");
+    assert!(
+        response.starts_with("HTTP/1.1 201 Created\r\n"),
+        "{response}"
+    );
     assert!(
         response.contains("\r\nContent-Type: application/json\r\n"),
         "{response}"
@@ -325,15 +328,16 @@ fn invalid_explicit_json_and_unsupported_status_fail_closed() {
     ] {
         let response = send_raw_request(
             server.port,
-            &format!(
-                "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-            ),
+            &format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
         );
         assert!(
             response.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
             "{response}"
         );
-        assert!(!response_body(&response).contains(rejected_body), "{response}");
+        assert!(
+            !response_body(&response).contains(rejected_body),
+            "{response}"
+        );
         assert!(!response.contains("\r\nLocation:"), "{response}");
     }
 }
@@ -389,8 +393,8 @@ fn response_endpoint() {
         handler_module: module,
         handler_func_idx: function_index,
     };
-    let server = WebDevServer::bind(0, None, None, vec![route])
-        .expect("bind explicit response with cookie");
+    let server =
+        WebDevServer::bind(0, None, None, vec![route]).expect("bind explicit response with cookie");
     let response = send_raw_request(
         server.port,
         "GET /invalid-cookie HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
