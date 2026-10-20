@@ -90,6 +90,9 @@ mod cluster_dst;
 mod cluster_dst_trace_tests;
 
 #[cfg(test)]
+mod dst_trace_tests;
+
+#[cfg(test)]
 mod cluster_sim;
 
 #[cfg(test)]
@@ -612,7 +615,7 @@ pub struct Runtime {
 unsafe impl Send for Runtime {}
 
 /// Outcome of `Runtime::run_scheduler_deterministic`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DeterministicRunResult {
     /// No actor has a non-empty mailbox; the run completed normally.
     Quiescent { steps: u64 },
@@ -621,6 +624,45 @@ pub enum DeterministicRunResult {
     /// since every step executed real actor code via `step_actor`, not
     /// a simulated stand-in.
     StepLimitExceeded { steps: u64 },
+}
+
+/// One logical decision made by the real-runtime deterministic scheduler.
+///
+/// Actor choices are represented by rank within the sorted ready set, not
+/// process-global actor IDs. This permits reproduction using freshly created
+/// runtimes whose actor ID counters have advanced. Timer advances record their
+/// occurrence but not raw `Instant` deltas, which depend on wall-clock setup.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DeterministicScheduleEvent {
+    ActorStep {
+        ready_count: usize,
+        selected_ready_index: usize,
+    },
+    TimerAdvance,
+}
+
+/// Reproducible schedule decisions and terminal result of one bounded run.
+/// This is test evidence, not a durable effect log or full state snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeterministicScheduleTrace {
+    pub seed: u64,
+    pub max_steps: u64,
+    pub events: Vec<DeterministicScheduleEvent>,
+    pub outcome: DeterministicRunResult,
+}
+
+/// A fresh run did not reproduce the recorded schedule or termination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeterministicTraceMismatch {
+    Event {
+        index: usize,
+        expected: Option<DeterministicScheduleEvent>,
+        actual: Option<DeterministicScheduleEvent>,
+    },
+    Outcome {
+        expected: DeterministicRunResult,
+        actual: DeterministicRunResult,
+    },
 }
 
 /// No-op foreign-interop bridge used when `DefaultForeignInterop` fails
@@ -3357,6 +3399,64 @@ impl Runtime {
         rng: &mut crate::dst::DeterministicRng,
         max_steps: u64,
     ) -> DeterministicRunResult {
+        self.run_scheduler_deterministic_with_rng_recording(rng, max_steps, None)
+    }
+
+    /// Record real actor execution choices under a seeded scheduler.
+    /// Reproduction requires the same workload and mocked/receipt-backed
+    /// external effects. This method deliberately does not record side effects,
+    /// actor heap snapshots, or network delivery ordering.
+    pub fn run_scheduler_deterministic_recorded(
+        &mut self,
+        seed: u64,
+        max_steps: u64,
+    ) -> DeterministicScheduleTrace {
+        let mut rng = crate::dst::DeterministicRng::new(seed);
+        let mut events = Vec::new();
+        let outcome =
+            self.run_scheduler_deterministic_with_rng_recording(&mut rng, max_steps, Some(&mut events));
+        DeterministicScheduleTrace { seed, max_steps, events, outcome }
+    }
+
+    /// Re-execute on a FRESH, equivalently initialized runtime with the
+    /// recorded seed and step bound; reject schedule or outcome drift.
+    ///
+    /// Verification occurs after execution. Do not use this with uncontrolled
+    /// external effects: it is not a sandbox or a side-effect-free trace player.
+    /// Because recorded actor references use sorted rank, identical workflows
+    /// can be compared even when their process-global actor IDs differ.
+    pub fn verify_deterministic_trace(
+        &mut self,
+        expected: &DeterministicScheduleTrace,
+    ) -> Result<DeterministicRunResult, DeterministicTraceMismatch> {
+        let actual =
+            self.run_scheduler_deterministic_recorded(expected.seed, expected.max_steps);
+        for index in 0..expected.events.len().max(actual.events.len()) {
+            let wanted = expected.events.get(index);
+            let observed = actual.events.get(index);
+            if wanted != observed {
+                return Err(DeterministicTraceMismatch::Event {
+                    index,
+                    expected: wanted.cloned(),
+                    actual: observed.cloned(),
+                });
+            }
+        }
+        if expected.outcome != actual.outcome {
+            return Err(DeterministicTraceMismatch::Outcome {
+                expected: expected.outcome,
+                actual: actual.outcome,
+            });
+        }
+        Ok(actual.outcome)
+    }
+
+    fn run_scheduler_deterministic_with_rng_recording(
+        &mut self,
+        rng: &mut crate::dst::DeterministicRng,
+        max_steps: u64,
+        mut events: Option<&mut Vec<DeterministicScheduleEvent>>,
+    ) -> DeterministicRunResult {
         let mut steps: u64 = 0;
         loop {
             if steps >= max_steps {
@@ -3368,8 +3468,29 @@ impl Runtime {
             self.drain_cross_shard_messages();
             // Tick timers first (respects virtual clock via self.now())
             self.tick_timers();
+            // Only allocate and sort a second ready set when trace recording
+            // is requested. Production and cluster DST keep their old path.
+            let ready_at_selection = if events.is_some() {
+                let mut ready: Vec<u64> = self.actors.iter()
+                    .filter(|(_, actor)| !actor.mailbox.is_empty())
+                    .map(|(id, _)| *id)
+                    .collect();
+                ready.sort_unstable();
+                ready
+            } else {
+                Vec::new()
+            };
             match self.pick_ready_actor_deterministic(rng) {
                 Some(actor_id) => {
+                    if let Some(ref mut trace) = events {
+                        let selected_ready_index = ready_at_selection
+                            .binary_search(&actor_id)
+                            .expect("selected actor must belong to ready set");
+                        trace.push(DeterministicScheduleEvent::ActorStep {
+                            ready_count: ready_at_selection.len(),
+                            selected_ready_index,
+                        });
+                    }
                     self.step_actor(actor_id);
                     steps += 1;
                     if steps % GC_PUMP_INTERVAL == 0 {
@@ -3411,6 +3532,9 @@ impl Runtime {
                         .next_deadline()
                         .expect("timer wheel non-empty implies a deadline");
                     let delta = deadline.saturating_duration_since(self.now());
+                    if let Some(ref mut trace) = events {
+                        trace.push(DeterministicScheduleEvent::TimerAdvance);
+                    }
                     if delta.is_zero() {
                         // Deadline already at/behind the clock but the tick
                         // at loop top didn't fire it (deadline raced the
