@@ -33,9 +33,9 @@ while (( $# )); do
     esac
 done
 
-[[ "$SEEDS" =~ ^[0-9]+$ ]] || usage_error "--seeds must be a non-negative decimal integer"
+[[ "$SEEDS" =~ ^[0-9]+$ ]] || usage_error "--seeds must be a positive decimal integer"
 [[ "$BATCH_SIZE" =~ ^[0-9]+$ ]] || usage_error "--batch-size must be a positive decimal integer"
-[[ -z "$TIME_SECS" || "$TIME_SECS" =~ ^[0-9]+$ ]] || usage_error "--time must be a non-negative decimal integer"
+[[ -z "$TIME_SECS" || "$TIME_SECS" =~ ^[0-9]+$ ]] || usage_error "--time must be a positive decimal integer"
 [[ "$SEED_BASE" =~ ^[0-9]+$ || "$SEED_BASE" =~ ^0x[0-9a-fA-F]+$ ]] || usage_error "--seed-base must be decimal or 0x-prefixed hex"
 
 # Compare as decimal strings before shell arithmetic so oversized values cannot
@@ -59,7 +59,11 @@ else
     SEED_START=$((10#$SEED_BASE))
 fi
 
+(( 10#$SEEDS > 0 )) || usage_error "--seeds must be positive"
 (( 10#$BATCH_SIZE > 0 )) || usage_error "--batch-size must be positive"
+if [[ -n "$TIME_SECS" ]]; then
+    (( 10#$TIME_SECS > 0 )) || usage_error "--time must be positive"
+fi
 
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/ct-bfuzz}"
 export NULANG_STDLIB="${NULANG_STDLIB:-${PWD}/src/stdlib}"
@@ -70,6 +74,10 @@ build_flags=()
 cargo build "${build_flags[@]}" --no-default-features --features difffuzz --bin nula_difffuzz
 
 BIN="${CARGO_TARGET_DIR}/${PROFILE}/nula_difffuzz"
+# The driver can stop before consuming --seeds when its deadline expires.
+# Preserve its actual machine-produced coverage report for each batch.
+summary_file=$(mktemp)
+trap 'rm -f "$summary_file"' EXIT
 remaining=$((10#$SEEDS))
 completed=0
 batch_limit=$((10#$BATCH_SIZE))
@@ -88,9 +96,46 @@ while (( remaining > 0 )); do
     printf -v current_seed '%u' "$((SEED_START + completed))"
     echo "difffuzz.sh: seed-base=$current_seed seeds=$batch remaining=$remaining" >&2
     "$BIN" --seeds "$batch" --seed-base "$current_seed" "${time_args[@]}" \
-        --crashers fuzz/differential/crashers "${EXTRA[@]}"
-    completed=$((completed + batch))
-    remaining=$((remaining - batch))
+        --crashers fuzz/differential/crashers "${EXTRA[@]}" | tee "$summary_file"
+
+    # Require exactly one complete summary. A malformed/missing report must
+    # not turn an interrupted or incompatible driver run into green coverage.
+    reported=""
+    report_count=0
+    while IFS= read -r line; do
+        if [[ "$line" == campaign:* ]]; then
+            (( report_count += 1 ))
+            if [[ "$line" =~ ^campaign:\ ([0-9]+)\ programs\ generated\ in\  ]]; then
+                reported="${BASH_REMATCH[1]}"
+            else
+                echo "difffuzz.sh: malformed campaign summary" >&2
+                exit 1
+            fi
+        fi
+    done < "$summary_file"
+    if (( report_count != 1 )) || [[ -z "$reported" ]] || ! within_u64 "$reported" "$batch"; then
+        echo "difffuzz.sh: missing, duplicate, or out-of-range campaign summary" >&2
+        exit 1
+    fi
+    generated=$((10#$reported))
+    if (( generated == 0 )); then
+        echo "difffuzz.sh: campaign made no progress" >&2
+        exit 1
+    fi
+    completed=$((completed + generated))
+    remaining=$((remaining - generated))
+    if (( generated < batch )); then
+        echo "difffuzz.sh: partial batch: generated $generated of $batch requested seeds" >&2
+        if [[ -z "$TIME_SECS" ]]; then
+            echo "difffuzz.sh: incomplete batch without a time limit; generated $completed of $SEEDS seeds" >&2
+            exit 1
+        fi
+        break
+    fi
 done
 
-echo "difffuzz.sh: complete; scheduled $completed of $SEEDS seeds" >&2
+if (( completed == 0 )); then
+    echo "difffuzz.sh: no seeds generated; campaign cannot pass" >&2
+    exit 1
+fi
+echo "difffuzz.sh: complete; generated $completed of $SEEDS seeds" >&2
