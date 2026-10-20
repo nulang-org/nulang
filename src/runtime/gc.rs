@@ -1533,7 +1533,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn test_receive_ref_rejects_overflow_without_consuming_foreign_credit() {
         let mut heap = MockHeap::new();
@@ -1575,5 +1574,4 @@ mod tests {
             assert_eq!((*header).foreign_count, 0);
         }
     }
-
 }
