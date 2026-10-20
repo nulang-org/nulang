@@ -105,9 +105,10 @@ cargo test --locked --features wasm-backend
 
 The new conformance fixture is
 `conformance/behavior/actor_19_correlated_reply_effects.nula`; its expected
-output tests accepted (0), duplicate/inactive (3), canceled and late (3)
-source-level reply behavior. Rust tests cover the reply payload correlation,
-owner-checked cancellation, invalid timeouts and missing handlers, indexed
+output tests unauthorized spoofing (3), accepted (0), duplicate/inactive
+(3), canceled and late (3) source-level reply behavior. Rust tests cover the
+reply payload correlation, designated responder checks, owner-checked
+cancellation, invalid timeouts and missing handlers, indexed
 out-of-order selection, reset, arrival, and priority lanes.
 
 No compile/test result is claimed until the exact-head CI runs.
