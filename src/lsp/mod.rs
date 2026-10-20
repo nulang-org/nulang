@@ -3742,6 +3742,56 @@ mod lsp_tests {
         );
     }
 
+    #[test]
+    fn test_incremental_sync_crlf_uses_logical_line_end() {
+        let source = "ab\r\ncd\r\n";
+        assert_eq!(
+            apply_document_changes(
+                source,
+                &[range_change(Position::new(0, 1), Position::new(0, 2), "Y")],
+            ),
+            Some("aY\r\ncd\r\n".to_string())
+        );
+        assert_eq!(
+            apply_document_changes(
+                source,
+                &[range_change(Position::new(1, 2), Position::new(1, 2), "!")],
+            ),
+            Some("ab\r\ncd!\r\n".to_string())
+        );
+        assert_eq!(
+            apply_document_changes(
+                source,
+                &[range_change(Position::new(2, 0), Position::new(2, 0), "!")],
+            ),
+            Some("ab\r\ncd\r\n!".to_string())
+        );
+    }
+
+    #[test]
+    fn test_incremental_sync_crlf_rejects_positions_inside_line_ending_atomically() {
+        let source = "ab\r\ncd\r\n";
+        // Column 3 would be *after* CR, an illegal logical LSP column.
+        assert_eq!(
+            apply_document_changes(
+                source,
+                &[range_change(Position::new(0, 3), Position::new(0, 3), "x")],
+            ),
+            None
+        );
+        // Even after one valid edit the invalid EOL edit must roll back.
+        assert_eq!(
+            apply_document_changes(
+                source,
+                &[
+                    range_change(Position::new(0, 0), Position::new(0, 1), "A"),
+                    range_change(Position::new(1, 3), Position::new(1, 3), "x"),
+                ],
+            ),
+            None
+        );
+    }
+
     /// Function parameter without type annotation gets an inlay hint.
     #[test]
     fn test_type_inlay_for_fn_param() {
