@@ -156,13 +156,13 @@ fn transition_contract_holds(script: &[Step]) -> bool {
                 if let Some(tx) = &last_accepted {
                     let mut conflict = tx.clone();
                     let snapshot = conflict.snapshot.as_mut().unwrap();
-                    let PersistedValue::Int(original) = snapshot.state["value"] else {
+                    let Some(PersistedValue::Int(original)) = snapshot.state.get("value") else {
                         return false;
                     };
-                    snapshot.state.insert(
-                        "value".to_string(),
-                        PersistedValue::Int(original + 1),
-                    );
+                    let changed = *original + 1;
+                    snapshot
+                        .state
+                        .insert("value".to_string(), PersistedValue::Int(changed));
                     if !matches!(
                         store.commit_transition(conflict),
                         Err(ref err) if err.kind() == ErrorKind::AlreadyExists
