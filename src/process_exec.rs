@@ -82,7 +82,7 @@ pub struct ExecLimits {
 
 impl ExecLimits {
     pub fn new(timeout: Duration, max_output_bytes: usize) -> Result<Self, ExecError> {
-        if timeout.is_zero() || max_output_bytes == 0 || max_output_bytes > 64 * 1024 * 1024 {
+        if timeout.is_zero() || timeout > Duration::from_secs(86_400) || max_output_bytes == 0 || max_output_bytes > 64 * 1024 * 1024 {
             return Err(ExecError::InvalidLimits);
         }
         Ok(Self {
@@ -187,6 +187,7 @@ pub fn execute(
         return Err(ExecError::Denied);
     }
     if limits.timeout.is_zero()
+        || limits.timeout > Duration::from_secs(86_400)
         || limits.max_output_bytes == 0
         || limits.max_output_bytes > 64 * 1024 * 1024
     {
