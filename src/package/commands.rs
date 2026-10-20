@@ -98,6 +98,45 @@ pub fn run(args: &[String]) -> NuResult<()> {
                     }
                     Ok(())
                 }
+                Some("migrate")
+                    if args.len() == 5 && args[2] == "--sqlite" && args[4] == "--apply" =>
+                {
+                    #[cfg(feature = "sqlite")]
+                    {
+                        let database = Path::new(&args[3]);
+                        let database_path = if database.is_absolute() {
+                            database.to_path_buf()
+                        } else {
+                            root.join(database)
+                        };
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|err| NuError::PackageError {
+                                msg: format!("cannot initialize SQLite migration runtime: {err}"),
+                                span: Span::default(),
+                            })?;
+                        let audit = runtime.block_on(
+                            crate::package::sqlite_migrations::apply_sqlite_migrations(
+                                &root,
+                                &database_path,
+                            ),
+                        )?;
+                        println!(
+                            "SQLite database schema ledger now records {} applied migrations",
+                            audit.applied
+                        );
+                        Ok(())
+                    }
+                    #[cfg(not(feature = "sqlite"))]
+                    {
+                        Err(NuError::PackageError {
+                            msg: "SQLite migration support requires the sqlite Cargo feature"
+                                .into(),
+                            span: Span::default(),
+                        })
+                    }
+                }
                 Some("verify") if args.len() == 4 && args[2] == "--ledger" => {
                     let ledger = Path::new(&args[3]);
                     let snapshot_path = if ledger.is_absolute() {
@@ -117,7 +156,7 @@ pub fn run(args: &[String]) -> NuResult<()> {
                     Ok(())
                 }
                 _ => Err(NuError::PackageError {
-                    msg: "usage: nula db plan [--json] | nula db verify --ledger <trusted-export.json>"
+                    msg: "usage: nula db plan [--json] | nula db verify --ledger <trusted-export.json> | nula db migrate --sqlite <file> --apply"
                         .to_string(),
                     span: Span::default(),
                 }),
@@ -353,6 +392,7 @@ fn print_usage() {
     println!("  generate migration <name>  Create the next forward-only SQL migration");
     println!("  db plan [--json]  Inspect SQL migration files and BLAKE3 checksums");
     println!("  db verify --ledger <path>  Compare against a trusted external applied ledger export");
+    println!("  db migrate --sqlite <file> --apply  Atomically apply reviewed local SQLite DDL");
     println!("  build         Build .nbc + RFC 0020 behavior sidecar in .nula/dist/");
     println!("  build-wasm    Build package to .wasm + .cwasm in .nula/dist/");
     println!("  test [--filter <substr>] [--verbose|-v] [--watch|-w]  Run .nula test files");
@@ -2879,6 +2919,20 @@ mod tests {
         assert_eq!(std::fs::read(&source).unwrap(), contents_before);
         assert!(!dir.join("db/schema_migrations").exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_sqlite_migrate_requires_explicit_apply_opt_in() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_sqlite_optin_cli_{}", std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        scaffold_package(&dir, "optin-test", "default").unwrap();
+        let _guard = ChangeDir::new(&dir);
+        assert!(run(&["db".into(), "migrate".into(), "--sqlite".into(), "app.sqlite".into()]).is_err());
+        assert!(!dir.join("app.sqlite").exists());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
