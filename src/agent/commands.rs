@@ -192,3 +192,23 @@ fn cmd_mcp(args: &[String]) -> NuResult<()> {
         _ => Err(agent_err("usage: nulang agent mcp serve [--port <n>]")),
     }
 }
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+
+    #[test]
+    fn nonexecuting_local_agent_run_exits_with_failure() {
+        let dir = std::env::temp_dir().join(format!("nulang-agent-cli-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        nulang_ai_local::init_project(&dir).unwrap();
+        let args = vec![
+            "--project".to_string(),
+            dir.to_string_lossy().to_string(),
+            "--message".to_string(),
+            "run verification".to_string(),
+        ];
+        assert!(cmd_run(&args).is_err(), "an unverified goal must not exit successfully");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
