@@ -1,4 +1,8 @@
 # Nulang Changelog
+### PostgreSQL database-authoritative schema migration backend (experimental) — 2026-10-20
+- **Feature-gated `apply_postgres_migrations` uses an existing authenticated PostgreSQL client**, transaction-scoped advisory serialization, strict DDL preflight, and exact BLAKE3 ledger validation. SQL and ledger changes commit or roll back atomically.
+- **No new connection/TLS policy, credentials CLI or automatic cloud deployment changes.** Unit admission tests and an explicitly ignored, disposable-database live integration case accompany the API; actual database-backed verification remains required.
+
 ### Read-only migration plan and snapshot integrity checking — 2026-10-20
 - **`nula db plan [--json]` hashes version-ordered SQL source files using workspace BLAKE3** and rejects duplicates, missing versions, symlinked files, oversize inputs and malformed migration names.
 - **`nula db verify --ledger <file>` compares against an operator-provided JSON export of an external applied-migration ledger.** Changes to applied SQL fail the checksum verification; applied entries must be a strict prefix of source versions.
