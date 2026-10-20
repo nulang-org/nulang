@@ -1060,6 +1060,44 @@ mod orca_actor_stored_root_visitor_tests {
     }
 
     #[test]
+    fn exclusive_actor_value_snapshot_visits_state_and_all_mailbox_lanes() {
+        let mut actor = Actor::new(1, "exclusive-root-observer", 0);
+        actor
+            .state_data
+            .insert("state".to_string(), Value::int(700));
+        actor
+            .mailbox
+            .push(Message {
+                behavior_id: 1,
+                payload: MessagePayload::from_slice(&[Value::int(701)]),
+                sender: 2,
+                priority: MessagePriority::Normal,
+                trace_id: None,
+            })
+            .unwrap();
+        actor
+            .mailbox
+            .push_local(Message {
+                behavior_id: 2,
+                payload: MessagePayload::from_slice(&[Value::int(702)]),
+                sender: 3,
+                priority: MessagePriority::Normal,
+                trace_id: None,
+            })
+            .unwrap();
+
+        let mut observed = Vec::new();
+        actor.visit_all_stored_values_exclusive(&mut |value| {
+            observed.push(value.as_int().expect("integer root"));
+        });
+        observed.sort_unstable();
+        assert_eq!(observed, vec![700, 701, 702]);
+        assert_eq!(actor.mailbox.len(), 2);
+        assert_eq!(actor.mailbox.pop().unwrap().sender, 3);
+        assert_eq!(actor.mailbox.pop().unwrap().sender, 2);
+    }
+
+    #[test]
     fn stored_actor_root_visitor_includes_scheduler_owned_message_values() {
         let mut actor = Actor::new(1, "mailbox-observer", 0);
         actor
