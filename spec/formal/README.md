@@ -33,6 +33,7 @@ Two layers are formalized:
 | `capabilities.lean` | Capability lattice laws, `cap_sendable`, `discharge_sendable` | Proved (`linear_at_most_once` open) |
 | `effects.lean` | Effect rows; scoped `EffectTrace`/`Escapes`/`Unhandled` operational model | Scoped handler-safety proved; full expression soundness open |
 | `trace_effect_rows.lean` | Compositional static residual-effect predicate + exactness bridge to `Escapes` | Static/dynamic correspondence (scoped trace only) |
+| `effect_typing_counterexamples.lean` | Concrete type derivations exhibiting latent-function and handler-body effect gaps | Soundness counterexamples; must be inverted when typing rules are corrected |
 
 ## Theorems
 
@@ -97,6 +98,15 @@ sequencing takes the union, and handling one label subtracts that label.
 with incoming handlers prevents an unhandled operation. Regression examples
 check label subtraction, preservation of unrelated effects, and an unhandled
 operation outside the matching handler.
+
+Two compiled Lean examples in `effect_typing_counterexamples.lean` demonstrate
+that the **existing** `HasTypeEff` judgment permits empty effect rows for:
+(1) invoking a lambda whose body performs `IO`, and (2) an `IO` handler
+whose unchecked body performs `Net`. These examples are intentionally
+*positive* derivations of an unsound judgment, not tests that the language
+already rejects the programs. A sound redesign must replace them with
+non-derivability checks while adding latent function effects and typing
+handler bodies.
 
 This is a static/dynamic correspondence proof for the **trace fragment**.
 It is not a proof that the production `EffectRow.union` implementation,
