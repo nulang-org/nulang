@@ -9162,9 +9162,11 @@ mod tests {
             "@derive(schema)\ntype Payment = { currency: String, amount: Int, paid: Bool }",
         );
         let value: serde_json::Value = serde_json::from_str(&schema).unwrap();
+        assert_eq!(value["additionalProperties"], false);
         assert_eq!(
             value,
             serde_json::json!({
+                "additionalProperties": false,
                 "type": "object",
                 "properties": {
                     "amount": { "type": "integer" },
@@ -9195,6 +9197,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&schema).unwrap();
         assert_eq!(value["properties"]["items"]["type"], "array");
         assert_eq!(value["properties"]["items"]["items"]["properties"]["count"]["type"], "integer");
+        assert_eq!(value["properties"]["items"]["items"]["additionalProperties"], false);
     }
 
     #[test]
