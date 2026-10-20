@@ -167,6 +167,9 @@ enum MatchLane {
 struct ReceiveLaneIndex {
     positions: FxHashMap<u16, Vec<usize>>,
     cursors: FxHashMap<u16, usize>,
+    /// Lazy correlation index for messages whose FIRST argument is an Int.
+    correlated_positions: FxHashMap<(u16, i64), Vec<usize>>,
+    correlated_cursors: FxHashMap<(u16, i64), usize>,
     valid: bool,
 }
 
@@ -175,25 +178,36 @@ impl ReceiveLaneIndex {
         Self {
             positions: FxHashMap::default(),
             cursors: FxHashMap::default(),
+            correlated_positions: FxHashMap::default(),
+            correlated_cursors: FxHashMap::default(),
             valid: true,
         }
     }
 
     #[inline]
-    fn append(&mut self, behavior_id: u16, index: usize) {
+    fn append(&mut self, behavior_id: u16, index: usize, first_int: Option<i64>) {
         if self.valid {
             self.positions.entry(behavior_id).or_default().push(index);
+            if let Some(reference) = first_int {
+                self.correlated_positions
+                    .entry((behavior_id, reference))
+                    .or_default()
+                    .push(index);
+            }
         }
     }
 
     fn invalidate(&mut self) {
         self.positions.clear();
         self.cursors.clear();
+        self.correlated_positions.clear();
+        self.correlated_cursors.clear();
         self.valid = false;
     }
 
     fn reset_cursors(&mut self) {
         self.cursors.clear();
+        self.correlated_cursors.clear();
     }
 
     fn ensure(&mut self, buffer: &VecDeque<(Message, bool)>) {
@@ -201,11 +215,41 @@ impl ReceiveLaneIndex {
             return;
         }
         self.positions.clear();
+        self.correlated_positions.clear();
         for (idx, (msg, _)) in buffer.iter().enumerate() {
             self.positions.entry(msg.behavior_id).or_default().push(idx);
+            if let Some(reference) = msg.payload.first().and_then(Value::as_int) {
+                self.correlated_positions
+                    .entry((msg.behavior_id, reference))
+                    .or_default()
+                    .push(idx);
+            }
         }
         self.cursors.clear();
+        self.correlated_cursors.clear();
         self.valid = true;
+    }
+
+    /// O(1) indexed lookup in the common case. Guard-rejected candidates
+    /// advance this key's cursor but stay queued for the next receive reset.
+    fn next_correlated(
+        &mut self,
+        buffer: &VecDeque<(Message, bool)>,
+        behavior_id: u16,
+        reference: i64,
+    ) -> Option<usize> {
+        self.ensure(buffer);
+        let key = (behavior_id, reference);
+        let positions = self.correlated_positions.get(&key)?;
+        let cursor = self.correlated_cursors.entry(key).or_insert(0);
+        while *cursor < positions.len() {
+            let idx = positions[*cursor];
+            match buffer.get(idx) {
+                Some((_, false)) => return Some(idx),
+                Some((_, true)) | None => *cursor += 1,
+            }
+        }
+        None
     }
 
     fn next_candidate(
@@ -417,8 +461,9 @@ impl Mailbox {
     ) {
         let position = buffer.len();
         let behavior_id = msg.behavior_id;
+        let first_int = msg.payload.first().and_then(Value::as_int);
         buffer.push_back((msg, false));
-        index.append(behavior_id, position);
+        index.append(behavior_id, position, first_int);
     }
 
     fn ensure_receive_indexes(&mut self) {
@@ -499,6 +544,53 @@ impl Mailbox {
         {
             self.active_match = Some((MatchLane::Normal, idx, Arc::clone(&payload)));
             return Some((pos, payload));
+        }
+        None
+    }
+
+    /// Transactional receive for a reply whose FIRST argument is a specific
+    /// correlation Int. Unrelated messages remain queued, even when they have
+    /// the same behavior ID. This is a Rust mailbox primitive; the language
+    /// frontend's general `receive` expression is unchanged.
+    ///
+    /// Like receive_match, callers must commit or reset the candidate.
+    pub fn receive_match_ref(
+        &mut self,
+        behavior_id: u16,
+        reference: i64,
+    ) -> Option<Arc<Vec<Value>>> {
+        self.active_match = None;
+        self.ensure_receive_indexes();
+        self.stage_arrivals();
+        let indexes = self.receive_indexes.as_mut().expect("indexes initialized");
+
+        for (lane, buffer, index) in [
+            (
+                MatchLane::System,
+                &mut self.system_skip_buffer,
+                &mut indexes.system,
+            ),
+            (
+                MatchLane::Local,
+                &mut self.local_skip_buffer,
+                &mut indexes.local,
+            ),
+            (
+                MatchLane::Normal,
+                &mut self.skip_buffer,
+                &mut indexes.normal,
+            ),
+        ] {
+            let Some(position) = index.next_correlated(buffer, behavior_id, reference) else {
+                continue;
+            };
+            let Some((message, tried)) = buffer.get_mut(position) else {
+                continue;
+            };
+            *tried = true;
+            let payload = message.payload.to_shared();
+            self.active_match = Some((lane, position, Arc::clone(&payload)));
+            return Some(payload);
         }
         None
     }
