@@ -33,6 +33,8 @@ enum EmbeddingSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SemanticMemoryError {
     MissingEmbeddingProvider,
+    EmbeddingDimensionMismatch { expected: usize, actual: usize },
+    InvalidEmbeddingValue,
 }
 
 impl std::fmt::Display for SemanticMemoryError {
@@ -40,6 +42,12 @@ impl std::fmt::Display for SemanticMemoryError {
         match self {
             Self::MissingEmbeddingProvider => {
                 write!(f, "custom embedding provider must be reattached after restore")
+            }
+            Self::EmbeddingDimensionMismatch { expected, actual } => {
+                write!(f, "invalid embedding dimension: expected {expected}, got {actual}")
+            }
+            Self::InvalidEmbeddingValue => {
+                write!(f, "embedding contains a non-finite value")
             }
         }
     }
@@ -174,27 +182,27 @@ impl SemanticMemory {
         }
 
         let query_embedding = self.embed(query);
-        let mut results: Vec<(&Document, f32)> = self
-            .documents
-            .iter()
-            .enumerate()
-            .map(|(index, doc)| {
-                // The fallback preserves compatibility with old serialized
-                // SemanticMemory values that did not contain embeddings.
-                let fallback;
-                let doc_embedding = match self.embeddings.get(index) {
-                    Some(embedding) if embedding.len() == self.dimensions => embedding,
-                    _ => {
-                        fallback = self.embed(&doc.content);
-                        &fallback
-                    }
-                };
-                let score = cosine_similarity(&query_embedding, doc_embedding);
-                (doc, score)
-            })
-            .collect();
+        validate_embedding(&query_embedding, self.dimensions)?;
+        let mut results: Vec<(&Document, f32)> = Vec::with_capacity(self.documents.len());
 
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (index, doc) in self.documents.iter().enumerate() {
+            // Legacy snapshots without embeddings are re-embedded on demand.
+            // Invalid *present* embeddings fail closed rather than silently
+            // comparing truncated vectors or falling back to another provider.
+            let fallback;
+            let doc_embedding = match self.embeddings.get(index) {
+                Some(embedding) => embedding,
+                None => {
+                    fallback = self.embed(&doc.content);
+                    &fallback
+                }
+            };
+            validate_embedding(doc_embedding, self.dimensions)?;
+            let score = cosine_similarity(&query_embedding, doc_embedding);
+            results.push((doc, score));
+        }
+
+        results.sort_by(|a, b| b.1.total_cmp(&a.1));
         results.truncate(top_k);
         Ok(results)
     }
@@ -306,6 +314,22 @@ fn l2_normalize(vec: &mut [f32]) {
             *v /= norm;
         }
     }
+}
+
+fn validate_embedding(
+    embedding: &[f32],
+    expected: usize,
+) -> Result<(), SemanticMemoryError> {
+    if embedding.len() != expected {
+        return Err(SemanticMemoryError::EmbeddingDimensionMismatch {
+            expected,
+            actual: embedding.len(),
+        });
+    }
+    if !embedding.iter().all(|component| component.is_finite()) {
+        return Err(SemanticMemoryError::InvalidEmbeddingValue);
+    }
+    Ok(())
 }
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
