@@ -351,12 +351,9 @@ pub(crate) fn send_down_message_with_ref(
         }),
     ];
     let payload = match reference {
-        Some(reference) => MessagePayload::from_slice(&[
-            base[0],
-            base[1],
-            base[2],
-            Value::int(reference.0 as i64),
-        ]),
+        Some(reference) => {
+            MessagePayload::from_slice(&[base[0], base[1], base[2], Value::int(reference.0 as i64)])
+        }
         None => MessagePayload::from_slice(&base),
     };
     let down_msg = Message {
