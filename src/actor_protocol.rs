@@ -137,7 +137,13 @@ fn infer_simple_return_type(
             Literal::Nil => Type::nil(),
             Literal::Unit => Type::unit(),
         }),
-        Expr::TypeAnnotate { ty, .. } => Some(ty.clone()),
+        Expr::TypeAnnotate { expr, ty, preserve_inferred, .. } => {
+            if *preserve_inferred {
+                infer_simple_return_type(expr, state_fields)
+            } else {
+                Some(ty.clone())
+            }
+        },
         Expr::FieldAccess { expr, field, .. } if matches!(expr.as_ref(), Expr::SelfRef(_)) => {
             state_fields
                 .iter()
@@ -478,6 +484,7 @@ fn validate_call(
         *arg = Expr::TypeAnnotate {
             expr: Box::new(original),
             ty: expected.clone(),
+            preserve_inferred: false,
             span: arg_span,
         };
     }
@@ -690,6 +697,7 @@ fn annotate_expr(
                 *expr = Expr::TypeAnnotate {
                     expr: Box::new(inner),
                     ty: ret,
+                    preserve_inferred: false,
                     span: ask_span,
                 };
             }
