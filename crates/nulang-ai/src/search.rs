@@ -111,6 +111,14 @@ struct IndexedDocument {
     token_count: usize,
 }
 
+/// Cached statistics for a single search namespace. Updates are applied
+/// alongside document/posting mutations rather than recomputed per query.
+#[derive(Default)]
+struct NamespaceStats {
+    count: usize,
+    token_count: usize,
+}
+
 /// An in-process namespace-isolated inverted index.
 ///
 /// Not thread-safe by itself; synchronize externally if shared between tasks.
@@ -121,6 +129,7 @@ pub struct EmbeddedSearch {
     documents: HashMap<(String, String), IndexedDocument>,
     // (namespace, term) -> (document ID -> term frequency).
     postings: HashMap<(String, String), HashMap<String, usize>>,
+    namespace_stats: HashMap<String, NamespaceStats>,
 }
 
 impl EmbeddedSearch {
@@ -138,6 +147,7 @@ impl EmbeddedSearch {
 
         let key = (document.namespace.clone(), document.id.clone());
         if let Some(previous) = self.documents.remove(&key) {
+            self.remove_namespace_stats(&previous.document.namespace, previous.token_count);
             for term in term_frequencies(&previous.document.text).into_keys() {
                 match self.postings.entry((previous.document.namespace.clone(), term)) {
                     Entry::Occupied(mut entry) => {
@@ -159,6 +169,12 @@ impl EmbeddedSearch {
                 .or_default()
                 .insert(document.id.clone(), count);
         }
+        let stats = self
+            .namespace_stats
+            .entry(document.namespace.clone())
+            .or_default();
+        stats.count += 1;
+        stats.token_count += token_count;
         self.documents.insert(
             key,
             IndexedDocument {
@@ -174,6 +190,7 @@ impl EmbeddedSearch {
             return false;
         };
 
+        self.remove_namespace_stats(namespace, previous.token_count);
         for term in term_frequencies(&previous.document.text).into_keys() {
             if let Entry::Occupied(mut entry) =
                 self.postings.entry((namespace.to_owned(), term))
@@ -187,11 +204,19 @@ impl EmbeddedSearch {
         true
     }
 
+    fn remove_namespace_stats(&mut self, namespace: &str, token_count: usize) {
+        let Some(stats) = self.namespace_stats.get_mut(namespace) else {
+            return;
+        };
+        stats.count -= 1;
+        stats.token_count -= token_count;
+        if stats.count == 0 {
+            self.namespace_stats.remove(namespace);
+        }
+    }
+
     pub fn document_count(&self, namespace: &str) -> usize {
-        self.documents
-            .values()
-            .filter(|stored| stored.document.namespace == namespace)
-            .count()
+        self.namespace_stats.get(namespace).map_or(0, |stats| stats.count)
     }
 
     /// BM25 relevance, descending, breaking equal scores by document ID.
@@ -205,18 +230,11 @@ impl EmbeddedSearch {
             return Vec::new();
         }
 
-        let mut count = 0usize;
-        let mut total_length = 0usize;
-        for stored in self.documents.values() {
-            if stored.document.namespace == query.namespace {
-                count += 1;
-                total_length += stored.token_count;
-            }
-        }
-        if count == 0 {
+        let Some(stats) = self.namespace_stats.get(&query.namespace) else {
             return Vec::new();
-        }
-        let avg_length = (total_length as f64 / count as f64).max(1.0);
+        };
+        let count = stats.count;
+        let avg_length = (stats.token_count as f64 / count as f64).max(1.0);
         let mut scores: HashMap<&str, f64> = HashMap::new();
 
         for term in terms {
@@ -513,6 +531,41 @@ mod tests {
         assert!(backend.remove_document("alice", "1").unwrap());
         assert!(backend.query(&SearchQuery::new("alice", "actors")).unwrap().is_empty());
         assert_eq!(backend.query(&SearchQuery::new("bob", "actors")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn namespace_statistics_track_replace_delete_and_recovery() {
+        let mut index = EmbeddedSearch::new();
+        index.upsert(document("alpha", "1", "three token sentence", "docs")).unwrap();
+        index.upsert(document("alpha", "2", "one", "docs")).unwrap();
+        index.upsert(document("beta", "1", "separate namespace", "docs")).unwrap();
+
+        assert_eq!(index.document_count("alpha"), 2);
+        assert_eq!(index.namespace_stats.get("alpha").unwrap().token_count, 4);
+        index.upsert(document("alpha", "1", "two tokens", "docs")).unwrap();
+        assert_eq!(index.namespace_stats.get("alpha").unwrap().token_count, 3);
+        assert!(index.delete("alpha", "2"));
+        assert_eq!(index.namespace_stats.get("alpha").unwrap().token_count, 2);
+        assert!(index.delete("alpha", "1"));
+        assert!(!index.namespace_stats.contains_key("alpha"));
+        assert_eq!(index.document_count("beta"), 1);
+
+        let recovered = EmbeddedSearch::from_snapshot(index.snapshot()).unwrap();
+        assert_eq!(recovered.document_count("beta"), 1);
+        assert_eq!(recovered.namespace_stats.get("beta").unwrap().token_count, 2);
+        assert!(recovered.search(&SearchQuery::new("alpha", "tokens")).is_empty());
+        assert_eq!(recovered.search(&SearchQuery::new("beta", "separate")).len(), 1);
+    }
+
+    #[test]
+    fn empty_documents_do_not_divide_by_zero() {
+        let mut index = EmbeddedSearch::new();
+        index.upsert(document("a", "empty", "", "docs")).unwrap();
+        index.upsert(document("a", "real", "some text", "docs")).unwrap();
+        let hits = index.search(&SearchQuery::new("a", "some"));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].document.id, "real");
+        assert!(hits[0].score.is_finite());
     }
 
 }
