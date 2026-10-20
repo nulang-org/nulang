@@ -589,7 +589,7 @@ pub(crate) fn set_response_body(status: Option<i64>, body: &str, json: bool) {
     // Redirects are handled separately by `Web.redirect`.
     let status = status
         .and_then(|value| u16::try_from(value).ok())
-        .filter(|value| matches!(value, 200..=203 | 207..=299 | 400..=599));
+        .filter(|value| matches!(*value, 200..=203 | 207..=299 | 400..=599));
     let response = if let Some(status) = status {
         if body.len() <= 4 * 1024 * 1024
             && (!json || serde_json::from_str::<serde_json::Value>(body).is_ok())
@@ -1143,7 +1143,7 @@ impl WebDevServer {
                     Ok(Some(html)) => match explicit_response {
                         Some(ExplicitWebResponse::Redirect(location))
                             if safe_local_redirect_target(&location) =>
-                        {
+                        HttpResponse {
                             // POST/redirect/GET avoids inadvertently replaying form submission.
                             status: if request.method == HttpMethod::Post { 303 } else { 302 },
                             headers: vec![
