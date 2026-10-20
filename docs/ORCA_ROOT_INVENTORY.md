@@ -22,6 +22,9 @@ root snapshot at a scheduler safepoint and confirm object provenance.
 | Actor `state_data` | `Actor::visit_stored_values` | Read-only |
 | Actor `event_log` payload values and `query_handlers` | `Actor::visit_stored_values` | Read-only |
 | Actor `suspended_execution.vm_state` | `Actor::visit_stored_values` | Read-only |
+| Scheduler-local mailbox queue, three selective-receive staging buffers, active candidate | `Mailbox::visit_scheduler_owned_values` (also called by `Actor::visit_stored_values`) | Read-only; **excludes concurrent queues** |
+| Messages retained pending bytecode fetch | `Runtime::visit_pending_fetched_values` | Read-only; **excludes active channels** |
+| An individually owned cross-shard envelope (two delivery variants) | `CrossShardMsg::visit_payload_values` | Read-only; **does not enumerate channels** |
 
 These APIs emit **Values**, not verified heap addresses. A collector must
 check each pointer's allocation provenance and owner before dereferencing it.
@@ -30,14 +33,17 @@ may delay collection, but missing roots could free live data.
 
 ## Blocking gaps: do not promote this to a tracing collector
 
-1. **Mailboxes:** normal and system queues use `crossbeam::SegQueue`, plus
-   local queues, three selective-receive skip buffers and an `active_match`
-   payload. A naive pop-and-push snapshot changes ordering and interacts with
-   concurrent producers. Implement a safe read barrier or a safepoint-backed
-   explicit pending-root registry, then test every queue lane.
-2. **In-flight values:** shard `RuntimeMsg` payloads, forwarded deliveries,
-   coordinator pending operations, `pending_fetched_messages`, and handoff
-   state must not disappear from the root set while in transit.
+1. **Concurrent mailbox lanes:** normal and system queues use `crossbeam::SegQueue`.
+   The scheduler-local queue, three selective-receive skip buffers and active
+   candidate now have an inspection-only visitor. A naive pop-and-push scan
+   of the remaining SegQueues changes ordering and races with producers.
+   A proper admission/root barrier or safepoint-backed root registry is still
+   required before collection can rely on mailbox visibility.
+2. **In-flight values:** individually owned `CrossShardMsg` envelopes and
+   `pending_fetched_messages` have read-only payload visitors, but shard
+   channel queues, send/receive handoffs, forwarded deliveries and other
+   pending operations are not covered by a complete lifetime barrier. A
+   single envelope inspection does **not** prove delivery-channel safety.
 3. **Native and JIT execution:** interpreter staging registers, runtime callback
    temporary Values, detached JIT register arrays, native/FFI handles, and
    top-level `main_heap` roots are not necessarily represented by the
@@ -63,8 +69,10 @@ integration tests, never use these visitor results to reclaim any object.
   active interpreter/JIT-state pin tests.
 - Suspended workflow, nested effect continuation, single-shot state and
   wake/resume tests.
-- System, normal and local mailbox lanes, selective-receive skipped and
-  active candidate payloads, in-flight cross-shard transfer.
+- Scheduler-local and selective-receive mailbox inspection with no dequeue,
+  plus separate concurrent SegQueue admission/root barrier and transfer races.
+- Individually owned cross-shard envelopes, retained fetch retries and full
+  cross-shard channel handoff, including interrupted delivery.
 - Actor state/event/query, foreign-held/retired-owner, stale pointer reuse,
   pinned object and adversarial continuation-depth tests.
 - Candidate work budget, collection pauses, RSS and allocation overhead on
@@ -80,6 +88,9 @@ reclamation criterion.
 cargo fmt --all -- --check
 cargo test --locked orca_execution_root_visitor_tests
 cargo test --locked orca_actor_stored_root_visitor_tests
+cargo test --locked orca_mailbox_root_visitor_tests
+cargo test --locked orca_pending_fetch_root_visitor
+cargo test --locked orca_cross_shard_envelope_root_visitor
 cargo test --locked --lib
 cargo test --locked --features wasm-backend --lib
 cargo clippy --locked --all-targets --all-features -- -D warnings
