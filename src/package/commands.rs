@@ -76,6 +76,53 @@ pub fn run(args: &[String]) -> NuResult<()> {
             cmd_new(path_arg, template)
         }
         Some("init") => cmd_init(),
+        Some("db") => {
+            let root = package_root()?;
+            match args.get(1).map(String::as_str) {
+                Some("plan") if args.len() == 2 || (args.len() == 3 && args[2] == "--json") => {
+                    let plan = crate::package::migrations::read_migration_plan(&root)?;
+                    if args.get(2).map(String::as_str) == Some("--json") {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&plan)
+                                .expect("migration plan has serializable scalar fields")
+                        );
+                    } else {
+                        for migration in &plan {
+                            println!(
+                                "{:06} {} blake3:{}",
+                                migration.version, migration.file, migration.checksum_blake3
+                            );
+                        }
+                        println!("{} local migration files; database not inspected", plan.len());
+                    }
+                    Ok(())
+                }
+                Some("verify") if args.len() == 4 && args[2] == "--ledger" => {
+                    let ledger = Path::new(&args[3]);
+                    let snapshot_path = if ledger.is_absolute() {
+                        ledger.to_path_buf()
+                    } else {
+                        root.join(ledger)
+                    };
+                    let audit = crate::package::migrations::verify_applied_snapshot(
+                        &root,
+                        &snapshot_path,
+                    )?;
+                    println!(
+                        "Ledger snapshot matches {} applied migrations; {} pending sources. Read-only; database not queried.",
+                        audit.applied,
+                        audit.pending.len()
+                    );
+                    Ok(())
+                }
+                _ => Err(NuError::PackageError {
+                    msg: "usage: nula db plan [--json] | nula db verify --ledger <trusted-export.json>"
+                        .to_string(),
+                    span: Span::default(),
+                }),
+            }
+        },
         Some("generate") => match (
             args.get(1).map(String::as_str),
             args.get(2).map(String::as_str),
@@ -281,7 +328,7 @@ pub fn run(args: &[String]) -> NuResult<()> {
 
         Some(other) => Err(NuError::PackageError {
             msg: format!(
-                "unknown nula subcommand '{}' (expected new, init, generate, build, build-wasm, test, run, add, remove, publish, deploy, watch, doc, list, or clean)",
+                "unknown nula subcommand '{}' (expected new, init, generate, db, build, build-wasm, test, run, add, remove, publish, deploy, watch, doc, list, or clean)",
                 other
             ),
             span: Span::default(),
@@ -304,6 +351,8 @@ fn print_usage() {
     println!("                Templates: default, cli, lib, full");
     println!("  init          Scaffold a new package in the current directory");
     println!("  generate migration <name>  Create the next forward-only SQL migration");
+    println!("  db plan [--json]  Inspect SQL migration files and BLAKE3 checksums");
+    println!("  db verify --ledger <path>  Compare against a trusted external applied ledger export");
     println!("  build         Build .nbc + RFC 0020 behavior sidecar in .nula/dist/");
     println!("  build-wasm    Build package to .wasm + .cwasm in .nula/dist/");
     println!("  test [--filter <substr>] [--verbose|-v] [--watch|-w]  Run .nula test files");
