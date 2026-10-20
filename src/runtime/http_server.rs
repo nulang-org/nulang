@@ -518,10 +518,24 @@ pub struct RequestContext {
     pub params: HashMap<String, String>,
 }
 
+/// HTTP response chosen explicitly by a Nulang Web handler. This is a host
+/// side-channel until a source-level response algebra and portable response
+/// contract are introduced. It never changes Nulang's compiler semantics.
+#[derive(Debug)]
+enum ExplicitWebResponse {
+    Redirect(String),
+    Body {
+        status: u16,
+        content_type: &'static str,
+        body: String,
+    },
+    Invalid,
+}
+
 thread_local! {
     static CURRENT_REQUEST: RefCell<Option<RequestContext>> = const { RefCell::new(None) };
     static RESPONSE_COOKIES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-    static RESPONSE_REDIRECT: RefCell<Option<String>> = const { RefCell::new(None) };
+    static EXPLICIT_WEB_RESPONSE: RefCell<Option<ExplicitWebResponse>> = const { RefCell::new(None) };
 }
 
 /// Set the request context for the current thread, run `f`, then clear it.
@@ -531,7 +545,7 @@ where
 {
     CURRENT_REQUEST.with(|c| *c.borrow_mut() = Some(ctx));
     RESPONSE_COOKIES.with(|c| c.borrow_mut().clear());
-    RESPONSE_REDIRECT.with(|c| *c.borrow_mut() = None);
+    EXPLICIT_WEB_RESPONSE.with(|c| *c.borrow_mut() = None);
     let result = f();
     CURRENT_REQUEST.with(|c| *c.borrow_mut() = None);
     result
@@ -558,13 +572,49 @@ pub fn take_response_cookies() -> Vec<String> {
 /// Outside an HTTP request the operation keeps its legacy HTML fallback.
 pub fn set_response_redirect(location: &str) {
     if CURRENT_REQUEST.with(|c| c.borrow().is_some()) {
-        RESPONSE_REDIRECT.with(|c| *c.borrow_mut() = Some(location.to_owned()));
+        EXPLICIT_WEB_RESPONSE.with(|c| {
+            *c.borrow_mut() = Some(ExplicitWebResponse::Redirect(location.to_owned()))
+        });
     }
 }
 
-/// Retrieve (and clear) the redirect requested during the just-rendered request.
-fn take_response_redirect() -> Option<String> {
-    RESPONSE_REDIRECT.with(|c| c.borrow_mut().take())
+/// Select a typed JSON or plain-text response for the currently executing route.
+/// Bad application response data is a server error, never a success response
+/// and never reclassified as invalid input from an HTTP client.
+pub(crate) fn set_response_body(status: Option<i64>, body: &str, json: bool) {
+    if !CURRENT_REQUEST.with(|c| c.borrow().is_some()) {
+        return;
+    }
+    // Responses with a body cannot have 1xx, 204/205/206, or 3xx statuses.
+    // Redirects are handled separately by `Web.redirect`.
+    let status = status
+        .and_then(|value| u16::try_from(value).ok())
+        .filter(|value| matches!(value, 200..=203 | 207..=299 | 400..=599));
+    let response = if let Some(status) = status {
+        if body.len() <= 4 * 1024 * 1024
+            && (!json || serde_json::from_str::<serde_json::Value>(body).is_ok())
+        {
+            ExplicitWebResponse::Body {
+                status,
+                content_type: if json {
+                    "application/json; charset=utf-8"
+                } else {
+                    "text/plain; charset=utf-8"
+                },
+                body: body.to_owned(),
+            }
+        } else {
+            ExplicitWebResponse::Invalid
+        }
+    } else {
+        ExplicitWebResponse::Invalid
+    };
+    EXPLICIT_WEB_RESPONSE.with(|c| *c.borrow_mut() = Some(response));
+}
+
+/// Consume the explicit response produced during the just-rendered request.
+fn take_explicit_web_response() -> Option<ExplicitWebResponse> {
+    EXPLICIT_WEB_RESPONSE.with(|c| c.borrow_mut().take())
 }
 
 /// Only same-origin, root-relative redirect targets are accepted. Disallow
@@ -1077,7 +1127,7 @@ impl WebDevServer {
                     request: request.clone(),
                     params: params.clone(),
                 };
-                let (rendered, redirect) = with_request_context(ctx, || {
+                let (rendered, explicit_response) = with_request_context(ctx, || {
                     let result = match render_direct_request(route, &values) {
                         Ok(Some(rendered)) => Ok(Some(rendered)),
                         Ok(None) => Ok(render_route_handler(
@@ -1087,11 +1137,13 @@ impl WebDevServer {
                         )),
                         Err(error) => Err(error),
                     };
-                    (result, take_response_redirect())
+                    (result, take_explicit_web_response())
                 });
                 match rendered {
-                    Ok(Some(html)) => match redirect {
-                        Some(location) if safe_local_redirect_target(&location) => HttpResponse {
+                    Ok(Some(html)) => match explicit_response {
+                        Some(ExplicitWebResponse::Redirect(location))
+                            if safe_local_redirect_target(&location) =>
+                        {
                             // POST/redirect/GET avoids inadvertently replaying form submission.
                             status: if request.method == HttpMethod::Post { 303 } else { 302 },
                             headers: vec![
@@ -1100,13 +1152,33 @@ impl WebDevServer {
                             ],
                             body: Vec::new(),
                         },
-                        Some(_) => HttpResponse {
+                        Some(ExplicitWebResponse::Redirect(_)) => HttpResponse {
                             status: 400,
                             headers: vec![(
                                 "Content-Type".into(),
                                 "text/plain; charset=utf-8".into(),
                             )],
                             body: b"Invalid redirect target".to_vec(),
+                        },
+                        Some(ExplicitWebResponse::Body {
+                            status,
+                            content_type,
+                            body,
+                        }) => HttpResponse {
+                            status,
+                            headers: vec![
+                                ("Content-Type".into(), content_type.into()),
+                                ("Cache-Control".into(), "no-store".into()),
+                            ],
+                            body: body.into_bytes(),
+                        },
+                        Some(ExplicitWebResponse::Invalid) => HttpResponse {
+                            status: 500,
+                            headers: vec![(
+                                "Content-Type".into(),
+                                "text/plain; charset=utf-8".into(),
+                            )],
+                            body: b"Invalid application response".to_vec(),
                         },
                         None => HttpResponse {
                             status: 200,
