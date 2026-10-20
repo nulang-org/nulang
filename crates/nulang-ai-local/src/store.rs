@@ -2,7 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use nulang_ai_core::{
-    ConversationState, Goal, GoalGraph, GoalStatus, ManagerKind, Task, TaskStatus,
+    AcceptanceEvidence, ConversationState, Goal, GoalGraph, GoalStatus, ManagerKind, Task, TaskStatus,
 };
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
@@ -21,6 +21,8 @@ pub enum StoreError {
     GoalNotFound(Uuid),
     #[error("conversation not found: {0}")]
     ConversationNotFound(Uuid),
+    #[error("invalid verified completion: {0}")]
+    InvalidCompletion(String),
 }
 
 pub struct SqliteStore {
@@ -78,6 +80,12 @@ impl SqliteStore {
                 messages_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS task_evidence (
+                task_id TEXT NOT NULL,
+                criterion TEXT NOT NULL,
+                artifact_ref TEXT NOT NULL,
+                PRIMARY KEY (task_id, criterion)
             );
             "#,
         )?;
@@ -155,6 +163,55 @@ impl SqliteStore {
             ],
         )?;
         Ok(())
+    }
+
+    /// Atomically persist verified evidence and promote a running task to
+    /// Completed. A process crash cannot leave a Completed row without proof.
+    /// This method is called only after the host's verifier has accepted it.
+    pub fn complete_task_verified(
+        &self,
+        task: &Task,
+        evidence: &[AcceptanceEvidence],
+    ) -> Result<(), StoreError> {
+        if task.status != TaskStatus::Completed {
+            return Err(StoreError::InvalidCompletion(
+                "verified completion requires Completed task status".into(),
+            ));
+        }
+        let mut conn = Connection::open(&self.path)?;
+        let tx = conn.transaction()?;
+        for item in evidence {
+            tx.execute(
+                "INSERT INTO task_evidence (task_id, criterion, artifact_ref) VALUES (?1, ?2, ?3)",
+                params![task.id.to_string(), item.criterion, item.artifact_ref],
+            )?;
+        }
+        let updated = tx.execute(
+            "UPDATE tasks SET status = 'completed', updated_at = ?2 WHERE id = ?1 AND status = 'running'",
+            params![task.id.to_string(), task.updated_at.to_rfc3339()],
+        )?;
+        if updated != 1 {
+            return Err(StoreError::InvalidCompletion(
+                "task is missing or is not running".into(),
+            ));
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn task_evidence(&self, task_id: Uuid) -> Result<Vec<AcceptanceEvidence>, StoreError> {
+        let conn = Connection::open(&self.path)?;
+        let mut stmt = conn.prepare(
+            "SELECT criterion, artifact_ref FROM task_evidence WHERE task_id = ?1 ORDER BY criterion",
+        )?;
+        stmt.query_map(params![task_id.to_string()], |row| {
+            Ok(AcceptanceEvidence {
+                criterion: row.get(0)?,
+                artifact_ref: row.get(1)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::from)
     }
 
     pub fn upsert_conversation(&self, conv: &ConversationState) -> Result<(), StoreError> {
