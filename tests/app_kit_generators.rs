@@ -50,8 +50,9 @@ fn feature_generates_a_module_and_an_executable_test_fixture() {
         std::fs::read_to_string(package.root().join("tests/test_customer_profile.nula")).unwrap();
     assert!(module.contains("pub fn customer_profile_label() -> String"));
     assert!(test.contains("import customer_profile"));
-    assert!(test.contains("fn test_customer_profile_label()"));
+    assert!(test.contains("fn main()"));
     assert!(test.contains("customer_profile_label() == \"customer_profile\""));
+    assert!(!test.contains("fn test_customer_profile_label()"));
 }
 
 #[test]
@@ -125,4 +126,35 @@ fn refuses_to_generate_through_symlinked_source_directories() {
     let err = generate(package.root(), "module", "customer").unwrap_err();
     assert!(err.to_string().contains("symlink"));
     assert!(!outside.root().join("customer.nula").exists());
+}
+
+#[test]
+fn generated_feature_passes_the_real_nula_package_test_runner() {
+    // The nula test runner writes per-function wrappers to a temporary
+    // directory. Generated tests must remain in their package so that
+    // `import customer_profile` resolves to src/customer_profile.nula.
+    let package = PackageFixture::new("compile_smoke");
+    std::fs::create_dir_all(package.root().join("src")).unwrap();
+    std::fs::write(
+        package.root().join("src/main.nula"),
+        "fn main() { perform IO.print(\"ready\") }\n",
+    )
+    .unwrap();
+    generate(package.root(), "feature", "customer_profile").unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_nulang"))
+        .args(["nula", "test", "--filter", "test_customer_profile"])
+        .current_dir(package.root())
+        .output()
+        .expect("run nulang nula test");
+    assert!(
+        output.status.success(),
+        "generated feature did not compile/run:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+        "the CLI must execute a real test, not silently report zero tests"
+    );
 }
