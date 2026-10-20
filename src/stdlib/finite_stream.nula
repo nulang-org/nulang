@@ -1,0 +1,39 @@
+// Nulang standard library — EXPERIMENTAL finite, array-backed pull cursor.
+// Import: import stdlib::finite_stream
+//
+// This is a source-language reference implementation, not yet a production
+// Stream[T] primitive. In particular, FiniteCursor is a copyable record: the
+// compiler does NOT enforce one-shot/linear ownership, no external I/O source
+// or cancellation exists, and Array.length currently uses the standard
+// in-memory Array effect. An advancing pull only reads the requested element.
+//
+// Do not rename either type to Stream or reserve the unqualified Stream
+// identifier; users already declare Stream[T] as recursive generic ADTs.
+
+/// A finite array and the index of its next unread element.
+/// Currently a *value cursor*: cloning/reusing it repeats a read.
+pub type FiniteCursor[T] = { items: [T], offset: Int }
+
+/// One step, with exhaustion distinct from a successful item.
+/// The absence of a source error is intentional: array-backed reads
+/// are indexed only after validating 0 <= offset < Array.length.
+pub type FiniteStep[T] = Exhausted | Produced((T, FiniteCursor[T]))
+
+/// Construct a cursor without advancing through any items.
+pub fn from_items[T](items: [T]) -> FiniteCursor[T] {
+    { items: items, offset: 0 }
+}
+
+/// Demand at most the single current item and return a new cursor.
+/// Does not allocate an output array, spawn, prefetch or run callbacks.
+/// Reusing the old cursor repeats that item until linear ownership lands.
+pub fn advance[T](cursor: FiniteCursor[T]) -> FiniteStep[T] {
+    if cursor.offset >= 0 && cursor.offset < perform Array.length(cursor.items) then {
+        Produced(
+            cursor.items[cursor.offset],
+            { items: cursor.items, offset: cursor.offset + 1 }
+        )
+    } else {
+        Exhausted
+    }
+}
