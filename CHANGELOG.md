@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Actor interpreter fairness and scheduler-scoped continuations — 2026-10-16
+- **Transient actors can cooperatively yield interpreted bytecode and resume without new messages.** Per-dispatch instruction quanta preserve standalone VM run-to-completion and leave durable/workflow turns unchanged pending safe checkpoint semantics.
+- **Scheduler-only preemption preserves synchronous actor contracts.** Direct asks and mailbox flushes cannot expose a partial bytecode result; resumed actor dispatches retain non-blocking timed receive and async effect semantics.
+- **Deterministic scheduling runs yielded continuations to completion.** The seeded ready set includes runnable continuations even when mail is empty, but excludes actors waiting on external completion. Regression tests exercise these boundaries.
+
 ### Fabric on-demand mailbox scoring — 2026-10-18
 - **Fabric publish admission now reads mailbox pressure only for matching local subscribers**, instead of allocating and populating an all-actor mailbox snapshot on every publish.
 - **Ported the regression and exact-base matched-fixture A/B harness** from #1708 onto current main. Historical unmatched-publish microbenchmarks were favorable; new-head CI and measurements remain the promotion gate.

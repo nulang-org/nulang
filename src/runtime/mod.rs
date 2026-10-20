@@ -1312,12 +1312,8 @@ impl Runtime {
         }
     }
 
-    /// Resume an actor that yielded at a JIT safepoint.
-    ///
-    /// Mirrors the structure of `resume_suspended_llm_step` but without
-    /// LLM-specific logic: re-installs callbacks, restores VM state,
-    /// resets the safepoint counter, and resumes execution.
-    #[cfg(feature = "native-codegen")]
+    /// Resume an actor whose interpreter quantum or JIT safepoint expired.
+    /// This must run on the next scheduler turn even when its mailbox is empty.
     fn resume_suspended_jit_yield(&mut self, actor_id: u64) {
         let suspended = match self.actors.get_mut(&actor_id) {
             Some(actor) => actor.suspended_execution.take(),
@@ -1326,7 +1322,11 @@ impl Runtime {
         let Some(suspended) = suspended else { return };
 
         if self.vm.is_none() {
+            // A missing VM cannot make progress. Park rather than repeatedly
+            // requeueing this actor and spinning an entire scheduler shard.
+            warn!(actor_id, "cooperative continuation has no runtime VM");
             if let Some(actor) = self.actors.get_mut(&actor_id) {
+                actor.jit_yield_pending = false;
                 actor.suspended_execution = Some(suspended);
             }
             return;
@@ -1342,14 +1342,30 @@ impl Runtime {
             }));
             vm.restore_suspended_state(suspended.vm_state);
 
-            // Reset the safepoint budget and wire the pointer for JIT code.
+            // Until durable completion is coupled to resumptions, keep
+            // interpreter-quantum suspension limited to transient actors.
+            let instruction_budget = (*self_ptr).actors.get(&actor_id).and_then(|actor| {
+                (!actor.persistent && !actor.is_workflow).then_some(actor.max_reductions)
+            });
+            vm.set_cooperative_instruction_budget(instruction_budget);
+            // JIT regions have their own safe-point budget in addition to
+            // the interpreter's per-dispatch quantum.
+            #[cfg(feature = "native-codegen")]
             if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
                 actor.jit_safepoint_counter = crate::backends::JIT_SAFEPOINT_BUDGET;
                 crate::jit::runtime::set_jit_safepoint_ptr(&mut actor.jit_safepoint_counter);
             }
 
+            // The first scheduler dispatch restores this flag on return.
+            // Continuations must preserve scheduler-only asynchronous waits,
+            // or receive-after/LLM operations incorrectly run synchronously.
+            let saved_suspend = (*self_ptr).suspend_enabled;
+            (*self_ptr).suspend_enabled = true;
             (*self_ptr).vm_exec_begin();
             let result = vm.resume();
+            (*self_ptr).suspend_enabled = saved_suspend;
+            vm.set_cooperative_instruction_budget(None);
+            #[cfg(feature = "native-codegen")]
             crate::jit::runtime::clear_jit_safepoint_ptr();
 
             match result {
@@ -1382,6 +1398,7 @@ impl Runtime {
                         let receive_timeout = vm.suspended_receive_timeout.take();
                         if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
                             let marker = suspension_marker(actor, signal_name);
+                            actor.jit_yield_pending = false;
                             actor.waiting_signal = marker;
                             actor.suspended_execution =
                                 Some(crate::runtime::actor::SuspendedExecution {
@@ -3115,14 +3132,14 @@ impl Runtime {
     }
 
     /// Close one actor turn and enqueue it exactly once when runnable mailbox
-    /// work remains.
+    /// work or a cooperative bytecode continuation remains.
     pub(crate) fn finish_actor_turn(&mut self, actor_id: u64) {
         let should_requeue = self
             .actors
             .get(&actor_id)
             .map(|actor| {
-                !actor.mailbox.is_empty()
-                    && actor.suspended_execution.is_none()
+                ((actor.jit_yield_pending && actor.suspended_execution.is_some())
+                    || (!actor.mailbox.is_empty() && actor.suspended_execution.is_none()))
                     && matches!(
                         actor.state,
                         ActorState::Running | ActorState::Created | ActorState::Waiting
@@ -3295,7 +3312,13 @@ impl Runtime {
         let mut ready: Vec<u64> = self
             .actors
             .iter()
-            .filter(|(_, a)| !a.mailbox.is_empty())
+            .filter(|(_, actor)| {
+                matches!(
+                    actor.state,
+                    ActorState::Running | ActorState::Created | ActorState::Waiting
+                ) && ((actor.jit_yield_pending && actor.suspended_execution.is_some())
+                    || (!actor.mailbox.is_empty() && actor.suspended_execution.is_none()))
+            })
             .map(|(id, _)| *id)
             .collect();
         if ready.is_empty() {
@@ -3855,21 +3878,22 @@ impl Runtime {
     pub fn step_actor(&mut self, actor_id: u64) {
         self.current_actor = Some(actor_id);
 
-        // If the actor yielded at a JIT safepoint, resume it inline before
-        // attempting to receive the next message. The resume may complete the
-        // behavior (clearing suspended_execution) or re-suspend (setting it
-        // again), after which the normal suspended_execution guard below
-        // prevents processing new messages while the behavior is live.
-        #[cfg(feature = "native-codegen")]
-        {
-            let jit_yield = self
-                .actors
-                .get(&actor_id)
-                .map(|a| a.jit_yield_pending)
-                .unwrap_or(false);
-            if jit_yield {
-                self.resume_suspended_jit_yield(actor_id);
-            }
+        // A cooperative yield is a runnable continuation, not an external
+        // suspension. Resume it before receiving another message, even when
+        // the mailbox is empty, and retain non-reentrant actor execution.
+        let yielded = self
+            .actors
+            .get(&actor_id)
+            .map(|actor| actor.jit_yield_pending)
+            .unwrap_or(false);
+        if yielded {
+            self.resume_suspended_jit_yield(actor_id);
+            // One resumed continuation consumes this scheduler turn. Even if
+            // it completes, processing another queued message here would
+            // bypass the fair scheduling handoff to other ready actors.
+            // finish_actor_turn will requeue this actor when mail remains.
+            self.current_actor = None;
+            return;
         }
 
         let msg_opt = {
@@ -4283,6 +4307,17 @@ impl Runtime {
                 let result = self.run_bytecode_behavior(actor_id, behavior_idx, &payload);
                 self.suspend_enabled = saved_suspend;
                 match result {
+                    Ok(_)
+                        if self
+                            .actors
+                            .get(&actor_id)
+                            .is_some_and(|actor| actor.jit_yield_pending) =>
+                    {
+                        // A scheduling yield is not a completed behavior or
+                        // a durable checkpoint boundary. The continuation
+                        // retains exclusive ownership until it finishes.
+                        processed = false;
+                    }
                     Ok(_) => {
                         self.checkpoint_actor(actor_id);
                         processed = true;
@@ -5271,37 +5306,62 @@ impl Runtime {
 
             (*self_ptr).vm_exec_begin();
 
+            // A native safepoint yield is a scheduler handoff, not a legal
+            // return from synchronous asks or mailbox flushing. Save the
+            // prior thread-local pointer so a nested synchronous ask cannot
+            // silently disable the outer actor's remaining JIT preemption.
             #[cfg(feature = "native-codegen")]
-            {
-                // Reset native-codegen safepoint counter for this behavior.
-                if let Some(actor) = self.actors.get_mut(&actor_id) {
-                    actor.jit_safepoint_counter = crate::backends::JIT_SAFEPOINT_BUDGET;
-                    crate::jit::runtime::set_jit_safepoint_ptr(&mut actor.jit_safepoint_counter);
-                }
-            }
-
-            let result = vm.run_from(module_idx, code_offset);
-
-            #[cfg(feature = "native-codegen")]
-            {
-                // JIT safepoint yield: capture state for inline resume.
-                if vm.yield_pending {
-                    if let Some(vm_state) = vm.take_suspended_state() {
-                        if let Some(actor) = self.actors.get_mut(&actor_id) {
-                            actor.suspended_execution =
-                                Some(crate::runtime::actor::SuspendedExecution {
-                                    vm_state,
-                                    behavior_idx: 0,
-                                    activation: actor.current_workflow_activation,
-                                    step_name: String::new(),
-                                });
-                            actor.jit_yield_pending = true;
-                        }
+            let previous_jit_safepoint_ptr = {
+                let ptr = if (*self_ptr).suspend_enabled {
+                    if let Some(actor) = self.actors.get_mut(&actor_id) {
+                        actor.jit_safepoint_counter = crate::backends::JIT_SAFEPOINT_BUDGET;
+                        &mut actor.jit_safepoint_counter as *mut u64
+                    } else {
+                        std::ptr::null_mut()
                     }
-                    crate::jit::runtime::clear_jit_safepoint_ptr();
-                    (*self_ptr).vm_exec_end();
-                    return Ok(Value::nil());
+                } else {
+                    std::ptr::null_mut()
+                };
+                crate::jit::runtime::swap_jit_safepoint_ptr(ptr)
+            };
+
+            // Bound interpreted actor work between scheduler turns. JIT
+            // regions also honor their existing independent safepoint budget.
+            // Until durable completion is coupled to resumptions, keep
+            // interpreter-quantum suspension limited to transient actors.
+            // Direct synchronous asks and mailbox flushes must finish the
+            // invoked behavior before returning to their caller. Only the
+            // scheduler-driven entry path enables cooperative dispatch.
+            let instruction_budget = if (*self_ptr).suspend_enabled {
+                (*self_ptr).actors.get(&actor_id).and_then(|actor| {
+                    (!actor.persistent && !actor.is_workflow).then_some(actor.max_reductions)
+                })
+            } else {
+                None
+            };
+            vm.set_cooperative_instruction_budget(instruction_budget);
+            let result = vm.run_from(module_idx, code_offset);
+            vm.set_cooperative_instruction_budget(None);
+
+            // Cooperative yield: capture the continuation before another
+            // actor can use the shared VM.
+            if vm.yield_pending {
+                if let Some(vm_state) = vm.take_suspended_state() {
+                    if let Some(actor) = self.actors.get_mut(&actor_id) {
+                        actor.suspended_execution =
+                            Some(crate::runtime::actor::SuspendedExecution {
+                                vm_state,
+                                behavior_idx: 0,
+                                activation: actor.current_workflow_activation,
+                                step_name: String::new(),
+                            });
+                        actor.jit_yield_pending = true;
+                    }
                 }
+                #[cfg(feature = "native-codegen")]
+                let _ = crate::jit::runtime::swap_jit_safepoint_ptr(previous_jit_safepoint_ptr);
+                (*self_ptr).vm_exec_end();
+                return Ok(Value::nil());
             }
             // Capture VM state for a workflow signal wait, a non-blocking
             // LLM call, or a timed selective receive. Doing this here avoids
@@ -5330,9 +5390,9 @@ impl Runtime {
             // the shared VM, which would clobber the frames an un-captured
             // suspend still needs. Runs on every path, so wakes of other
             // actors are not lost when THIS actor suspends.
-            (*self_ptr).vm_exec_end();
             #[cfg(feature = "native-codegen")]
-            crate::jit::runtime::clear_jit_safepoint_ptr();
+            let _ = crate::jit::runtime::swap_jit_safepoint_ptr(previous_jit_safepoint_ptr);
+            (*self_ptr).vm_exec_end();
             // String-id values index into this runtime VM's constant pool. When
             // the result is returned to a different VM (e.g. the top-level VM
             // that invoked `ask`), the id is meaningless there. Convert string

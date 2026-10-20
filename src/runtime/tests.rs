@@ -12,6 +12,554 @@ use crate::vm::{Frame, Value};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
+#[test]
+fn bytecode_actor_preempts_and_completes_without_a_followup_message() {
+    use crate::bytecode::{BehaviorTableEntry, Instruction, OpCode};
+
+    let mut module = CodeModule::new("preemption");
+    let field_idx = module.add_constant(Constant::String("done".to_string()));
+    assert_eq!(
+        field_idx, 0,
+        "StateSet resolves the field from constant slot zero"
+    );
+    let one_idx = module.add_constant(Constant::Int(1));
+    module.add_behavior(BehaviorTableEntry {
+        name: "Busy.run".to_string(),
+        param_count: 0,
+        code_offset: 0,
+        local_count: 4,
+        effect_mask: 0,
+        compensate_offset: None,
+        content_hash: None,
+        source_location: None,
+        parallel_branches: None,
+    });
+    for _ in 0..24 {
+        module.emit(Instruction::new0(OpCode::Nop));
+    }
+    module.emit(Instruction::new3(
+        OpCode::ConstU,
+        ((one_idx >> 8) & 0xFF) as u8,
+        (one_idx & 0xFF) as u8,
+        1,
+    ));
+    module.emit(Instruction::new3(OpCode::StateSet, 0, 0, 1));
+    module.emit(Instruction::new1(OpCode::RetVal, 1));
+
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![("done".to_string(), Value::int(0))]));
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.max_reductions = 4;
+        actor.bytecode_module = Some(Box::new(module.clone()));
+        actor.bytecode_offsets = vec![0];
+        actor.compensation_offsets = vec![None];
+    }
+    rt.register_recovery_module(actor_id, module, vec![0], vec![None]);
+    rt.send_message_by_id(actor_id, 0, &[]);
+
+    assert_eq!(rt.claim_next_ready_actor(), Some(actor_id));
+    rt.step_actor(actor_id);
+    let actor = &rt.actors[&actor_id];
+    assert!(
+        actor.jit_yield_pending,
+        "interpreter should pause the behavior"
+    );
+    assert!(actor.mailbox.is_empty(), "original message was consumed");
+    assert_eq!(actor.get_state_field("done"), Some(Value::int(0)));
+    rt.finish_actor_turn(actor_id);
+
+    let mut continuations = 0;
+    while rt.actors[&actor_id].jit_yield_pending && continuations < 16 {
+        assert_eq!(
+            rt.claim_next_ready_actor(),
+            Some(actor_id),
+            "the continuation must be runnable without any new message"
+        );
+        rt.step_actor(actor_id);
+        rt.finish_actor_turn(actor_id);
+        continuations += 1;
+    }
+    assert!(
+        continuations >= 2,
+        "multiple quantum boundaries should be exercised"
+    );
+    assert!(
+        !rt.actors[&actor_id].jit_yield_pending,
+        "behavior should complete"
+    );
+    assert_eq!(
+        rt.actors[&actor_id].get_state_field("done"),
+        Some(Value::int(1))
+    );
+    assert_eq!(
+        rt.claim_next_ready_actor(),
+        None,
+        "no duplicate ready token"
+    );
+}
+
+/// Resuming one preempted behavior must not consume a second message in
+/// the same scheduling turn. The next message remains independently runnable.
+#[test]
+fn resumed_bytecode_turn_yields_to_queued_mail_before_next_dispatch() {
+    use crate::bytecode::{BehaviorTableEntry, Instruction, OpCode};
+
+    let mut module = CodeModule::new("non-reentrant-resume");
+    let field_idx = module.add_constant(Constant::String("phase".to_string()));
+    assert_eq!(
+        field_idx, 0,
+        "StateSet resolves the field from constant slot zero"
+    );
+    let one_idx = module.add_constant(Constant::Int(1));
+    let two_idx = module.add_constant(Constant::Int(2));
+    for name in ["Busy.first", "Busy.second"] {
+        module.add_behavior(BehaviorTableEntry {
+            name: name.to_string(),
+            param_count: 0,
+            code_offset: 0,
+            local_count: 4,
+            effect_mask: 0,
+            compensate_offset: None,
+            content_hash: None,
+            source_location: None,
+            parallel_branches: None,
+        });
+    }
+    for _ in 0..10 {
+        module.emit(Instruction::new0(OpCode::Nop));
+    }
+    module.emit(Instruction::new3(
+        OpCode::ConstU,
+        (one_idx >> 8) as u8,
+        one_idx as u8,
+        1,
+    ));
+    module.emit(Instruction::new3(OpCode::StateSet, 0, 0, 1));
+    module.emit(Instruction::new1(OpCode::RetVal, 1));
+    let second_offset = module.instructions.len();
+    module.emit(Instruction::new3(
+        OpCode::ConstU,
+        (two_idx >> 8) as u8,
+        two_idx as u8,
+        1,
+    ));
+    module.emit(Instruction::new3(OpCode::StateSet, 0, 0, 1));
+    module.emit(Instruction::new1(OpCode::RetVal, 1));
+
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![("phase".to_string(), Value::int(0))]));
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.max_reductions = 4;
+        actor.bytecode_module = Some(Box::new(module.clone()));
+        actor.bytecode_offsets = vec![0, second_offset];
+        actor.compensation_offsets = vec![None, None];
+    }
+    rt.register_recovery_module(actor_id, module, vec![0, second_offset], vec![None, None]);
+    rt.send_message_by_id(actor_id, 0, &[]);
+    rt.send_message_by_id(actor_id, 1, &[]);
+
+    let mut saw_first_completion = false;
+    for _ in 0..12 {
+        assert_eq!(rt.claim_next_ready_actor(), Some(actor_id));
+        rt.step_actor(actor_id);
+        if rt.actors[&actor_id].get_state_field("phase") == Some(Value::int(1))
+            && !rt.actors[&actor_id].jit_yield_pending
+        {
+            assert_eq!(
+                rt.actors[&actor_id].mailbox.len(),
+                1,
+                "the second message must wait for a new scheduler turn"
+            );
+            assert!(!rt.actors[&actor_id].jit_yield_pending);
+            saw_first_completion = true;
+            rt.finish_actor_turn(actor_id);
+            break;
+        }
+        rt.finish_actor_turn(actor_id);
+    }
+    assert!(
+        saw_first_completion,
+        "first behavior must finish after resumption"
+    );
+
+    assert_eq!(rt.claim_next_ready_actor(), Some(actor_id));
+    rt.step_actor(actor_id);
+    rt.finish_actor_turn(actor_id);
+    assert_eq!(
+        rt.actors[&actor_id].get_state_field("phase"),
+        Some(Value::int(2))
+    );
+}
+
+#[test]
+fn cooperative_yield_is_requeued_even_without_mail() {
+    let mut rt = Runtime::new();
+    let actor_id = 42_000_001;
+    let mut actor = Actor::new(actor_id, "yielding", 0);
+    actor.state = ActorState::Running;
+    actor.run_state = ActorRunState::Running;
+    let mut vm = crate::vm::VM::new_without_jit();
+    vm.set_current_frame(Frame::new(None, 0));
+    actor.suspended_execution = Some(SuspendedExecution {
+        vm_state: vm.take_suspended_state().unwrap(),
+        behavior_idx: 0,
+        activation: None,
+        step_name: String::new(),
+    });
+    actor.jit_yield_pending = true;
+    assert!(actor.mailbox.is_empty());
+    rt.actors.insert(actor_id, actor);
+
+    rt.finish_actor_turn(actor_id);
+
+    assert_eq!(
+        rt.claim_next_ready_actor(),
+        Some(actor_id),
+        "a cooperative yield must remain runnable without a new message"
+    );
+}
+
+#[test]
+fn external_wait_is_not_requeued_without_a_completion() {
+    let mut rt = Runtime::new();
+    let actor_id = 42_000_002;
+    let mut actor = Actor::new(actor_id, "waiting", 0);
+    actor.state = ActorState::Running;
+    actor.run_state = ActorRunState::Running;
+    let mut vm = crate::vm::VM::new_without_jit();
+    vm.set_current_frame(Frame::new(None, 0));
+    actor.suspended_execution = Some(SuspendedExecution {
+        vm_state: vm.take_suspended_state().unwrap(),
+        behavior_idx: 0,
+        activation: None,
+        step_name: String::new(),
+    });
+    actor.jit_yield_pending = false;
+    rt.actors.insert(actor_id, actor);
+
+    rt.finish_actor_turn(actor_id);
+
+    assert_eq!(
+        rt.claim_next_ready_actor(),
+        None,
+        "a signal or external-I/O wait must not spin the scheduler"
+    );
+}
+
+#[test]
+fn preempted_actor_yields_to_already_runnable_peer() {
+    use crate::bytecode::{BehaviorTableEntry, Instruction, OpCode};
+
+    fn mark_peer_run(actor: &mut Actor, _args: &[Value]) {
+        actor.set_state_field("seen", Value::int(1));
+    }
+
+    let mut busy_module = CodeModule::new("fairness-peer");
+    busy_module.add_behavior(BehaviorTableEntry {
+        name: "Busy.spin".to_string(),
+        param_count: 0,
+        code_offset: 0,
+        local_count: 4,
+        effect_mask: 0,
+        compensate_offset: None,
+        content_hash: None,
+        source_location: None,
+        parallel_branches: None,
+    });
+    for _ in 0..24 {
+        busy_module.emit(Instruction::new0(OpCode::Nop));
+    }
+    busy_module.emit(Instruction::new1(OpCode::RetVal, 0));
+
+    let mut rt = Runtime::new();
+    let busy = rt.spawn_actor(Box::new(Vec::new));
+    let peer = rt.spawn_actor(Box::new(|| vec![("seen".to_string(), Value::int(0))]));
+    {
+        let actor = rt.actors.get_mut(&busy).unwrap();
+        actor.max_reductions = 4;
+        actor.bytecode_module = Some(Box::new(busy_module.clone()));
+        actor.bytecode_offsets = vec![0];
+        actor.compensation_offsets = vec![None];
+    }
+    rt.register_recovery_module(busy, busy_module, vec![0], vec![None]);
+    rt.actors
+        .get_mut(&peer)
+        .unwrap()
+        .register_behavior("Probe.mark", mark_peer_run);
+
+    // A is queued first. Its cooperative requeue must not jump in front
+    // of an already runnable same-priority peer.
+    rt.send_message_by_id(busy, 0, &[]);
+    rt.send_message_by_id(peer, 0, &[]);
+    assert_eq!(rt.claim_next_ready_actor(), Some(busy));
+    rt.step_actor(busy);
+    assert!(rt.actors[&busy].jit_yield_pending);
+    rt.finish_actor_turn(busy);
+
+    assert_eq!(
+        rt.claim_next_ready_actor(),
+        Some(peer),
+        "a yielding CPU-bound actor must yield its next turn to a ready peer"
+    );
+    rt.step_actor(peer);
+    rt.finish_actor_turn(peer);
+    assert_eq!(
+        rt.actors[&peer].get_state_field("seen"),
+        Some(Value::int(1))
+    );
+    assert!(
+        rt.actors[&busy].jit_yield_pending,
+        "the busy continuation must remain pending while the peer executes"
+    );
+}
+
+/// Synchronous callers must run to completion even after the loop tiers up
+/// into Cranelift and exceeds the native actor safepoint budget.
+#[cfg(feature = "native-codegen")]
+#[test]
+fn synchronous_actor_ask_does_not_yield_from_a_hot_jit_loop() {
+    use crate::bytecode::{BehaviorTableEntry, Instruction, OpCode};
+
+    let mut module = CodeModule::new("synchronous-ask-jit-quantum");
+    let limit_idx = module.add_constant(Constant::Int(5_000));
+    module.add_behavior(BehaviorTableEntry {
+        name: "Busy.count".to_string(),
+        param_count: 0,
+        code_offset: 0,
+        local_count: 4,
+        effect_mask: 0,
+        compensate_offset: None,
+        content_hash: None,
+        source_location: None,
+        parallel_branches: None,
+    });
+    module.emit(Instruction::new1(OpCode::Const0, 0));
+    module.emit(Instruction::new3(
+        OpCode::ConstU,
+        ((limit_idx >> 8) & 0xFF) as u8,
+        (limit_idx & 0xFF) as u8,
+        1,
+    ));
+    module.emit(Instruction::new1(OpCode::IInc, 0));
+    module.emit(Instruction::new3(OpCode::ICmpLt, 0, 1, 2));
+    // Jump from pc 4 to the loop head at pc 2.
+    let back: i16 = -3;
+    module.emit(Instruction::new3(
+        OpCode::JmpT,
+        2,
+        ((back as u16) >> 8) as u8,
+        (back as u16 & 0xFF) as u8,
+    ));
+    module.emit(Instruction::new1(OpCode::RetVal, 0));
+
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(Vec::new));
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.max_reductions = 4;
+        actor.bytecode_module = Some(Box::new(module.clone()));
+        actor.bytecode_offsets = vec![0];
+        actor.compensation_offsets = vec![None];
+    }
+    rt.register_recovery_module(actor_id, module, vec![0], vec![None]);
+
+    assert_eq!(
+        rt.ask_actor_sync(actor_id, 0, &[]).unwrap(),
+        Value::int(5_000),
+        "a synchronous ask must not expose a partial native JIT continuation"
+    );
+    assert!(
+        rt.vm.as_ref().is_some_and(|vm| vm.jit_compiled_count() > 0),
+        "the loop must tier up so the assertion actually exercises native execution"
+    );
+    assert!(!rt.actors[&actor_id].jit_yield_pending);
+    assert!(rt.actors[&actor_id].suspended_execution.is_none());
+}
+
+#[test]
+fn synchronous_actor_ask_runs_to_completion_past_instruction_quantum() {
+    use crate::bytecode::{BehaviorTableEntry, Instruction, OpCode};
+
+    let mut module = CodeModule::new("synchronous-ask-quantum");
+    let answer_idx = module.add_constant(Constant::Int(42));
+    module.add_behavior(BehaviorTableEntry {
+        name: "Busy.answer".to_string(),
+        param_count: 0,
+        code_offset: 0,
+        local_count: 4,
+        effect_mask: 0,
+        compensate_offset: None,
+        content_hash: None,
+        source_location: None,
+        parallel_branches: None,
+    });
+    for _ in 0..24 {
+        module.emit(Instruction::new0(OpCode::Nop));
+    }
+    module.emit(Instruction::new3(
+        OpCode::ConstU,
+        (answer_idx >> 8) as u8,
+        answer_idx as u8,
+        1,
+    ));
+    module.emit(Instruction::new1(OpCode::RetVal, 1));
+
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(Vec::new));
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.max_reductions = 4;
+        actor.bytecode_module = Some(Box::new(module.clone()));
+        actor.bytecode_offsets = vec![0];
+        actor.compensation_offsets = vec![None];
+    }
+    rt.register_recovery_module(actor_id, module, vec![0], vec![None]);
+
+    assert_eq!(rt.ask_actor_sync(actor_id, 0, &[]).unwrap(), Value::int(42));
+    assert!(!rt.actors[&actor_id].jit_yield_pending);
+    assert!(rt.actors[&actor_id].suspended_execution.is_none());
+}
+
+#[test]
+fn deterministic_scheduler_resumes_interpreter_without_another_message() {
+    use crate::bytecode::{BehaviorTableEntry, Instruction, OpCode};
+
+    let mut module = CodeModule::new("deterministic-quantum");
+    module.add_constant(Constant::String("result".to_string()));
+    let answer_idx = module.add_constant(Constant::Int(42));
+    module.add_behavior(BehaviorTableEntry {
+        name: "Busy.answer".to_string(),
+        param_count: 0,
+        code_offset: 0,
+        local_count: 4,
+        effect_mask: 0,
+        compensate_offset: None,
+        content_hash: None,
+        source_location: None,
+        parallel_branches: None,
+    });
+    for _ in 0..24 {
+        module.emit(Instruction::new0(OpCode::Nop));
+    }
+    module.emit(Instruction::new3(
+        OpCode::ConstU,
+        (answer_idx >> 8) as u8,
+        answer_idx as u8,
+        1,
+    ));
+    module.emit(Instruction::new3(OpCode::StateSet, 0, 0, 1));
+    module.emit(Instruction::new1(OpCode::RetVal, 1));
+
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![("result".to_string(), Value::int(0))]));
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.max_reductions = 4;
+        actor.bytecode_module = Some(Box::new(module.clone()));
+        actor.bytecode_offsets = vec![0];
+        actor.compensation_offsets = vec![None];
+    }
+    rt.register_recovery_module(actor_id, module, vec![0], vec![None]);
+    rt.send_message_by_id(actor_id, 0, &[]);
+
+    let result = rt.run_scheduler_deterministic(7, 20);
+    assert!(matches!(result, DeterministicRunResult::Quiescent { .. }));
+    assert_eq!(
+        rt.actors[&actor_id].get_state_field("result"),
+        Some(Value::int(42))
+    );
+    assert!(!rt.actors[&actor_id].jit_yield_pending);
+}
+
+#[test]
+fn preempted_actor_preserves_timed_receive_suspension_on_resume() {
+    use crate::bytecode::{BehaviorTableEntry, Instruction, OpCode};
+
+    let mut module = CodeModule::new("preempt-then-receive");
+    let timeout_idx = module.add_constant(Constant::Int(10_000));
+    let receive_spec_idx = module.add_constant(Constant::String("0:".to_string()));
+    module.add_behavior(BehaviorTableEntry {
+        name: "Busy.wait".to_string(),
+        param_count: 0,
+        code_offset: 0,
+        local_count: 4,
+        effect_mask: 0,
+        compensate_offset: None,
+        content_hash: None,
+        source_location: None,
+        parallel_branches: None,
+    });
+    for _ in 0..8 {
+        module.emit(Instruction::new0(OpCode::Nop));
+    }
+    module.emit(Instruction::new3(
+        OpCode::ConstU,
+        (timeout_idx >> 8) as u8,
+        timeout_idx as u8,
+        0,
+    ));
+    module.emit(Instruction::new3(
+        OpCode::ReceiveWait,
+        (receive_spec_idx >> 8) as u8,
+        receive_spec_idx as u8,
+        1,
+    ));
+    module.emit(Instruction::new1(OpCode::RetVal, 1));
+
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(Vec::new));
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.max_reductions = 4;
+        actor.bytecode_module = Some(Box::new(module.clone()));
+        actor.bytecode_offsets = vec![0];
+        actor.compensation_offsets = vec![None];
+    }
+    rt.register_recovery_module(actor_id, module, vec![0], vec![None]);
+    rt.send_message_by_id(actor_id, 0, &[]);
+
+    for _ in 0..6 {
+        let Some(next_id) = rt.claim_next_ready_actor() else {
+            break;
+        };
+        assert_eq!(next_id, actor_id);
+        rt.step_actor(actor_id);
+        rt.finish_actor_turn(actor_id);
+        if !rt.actors[&actor_id].jit_yield_pending {
+            break;
+        }
+    }
+    let actor = &rt.actors[&actor_id];
+    assert!(
+        actor.suspended_execution.is_some(),
+        "receive after a quantum must suspend instead of taking the timeout arm"
+    );
+    assert!(
+        !actor.jit_yield_pending,
+        "a timed receive is an external wait, not another runnable quantum"
+    );
+}
+
+#[test]
+fn deterministic_picker_excludes_actors_waiting_on_external_completion() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(Vec::new));
+    rt.send_message_by_id(actor_id, 0, &[]);
+    let mut vm = crate::vm::VM::new_without_jit();
+    vm.set_current_frame(Frame::new(None, 0));
+    let actor = rt.actors.get_mut(&actor_id).unwrap();
+    actor.suspended_execution = Some(SuspendedExecution {
+        vm_state: vm.take_suspended_state().unwrap(),
+        behavior_idx: 0,
+        activation: None,
+        step_name: String::new(),
+    });
+    let mut rng = crate::dst::DeterministicRng::new(7);
+    assert_eq!(rt.pick_ready_actor_deterministic(&mut rng), None);
+}
+
 fn noop_test_behavior(_actor: &mut Actor, _args: &[Value]) {}
 
 fn declare_test_behavior(rt: &mut Runtime, actor_id: u64, name: &str) {
