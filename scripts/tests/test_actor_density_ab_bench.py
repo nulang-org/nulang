@@ -111,5 +111,72 @@ class ComparisonTests(unittest.TestCase):
         )
 
 
+
+class EvidenceValidationTests(unittest.TestCase):
+    def test_rejects_nonfinite_probe_timing(self):
+        for value in ("nan", "inf", "-inf"):
+            with self.subTest(value=value):
+                output = (
+                    "mode=construct\nactor_count=10000\nactor_struct_bytes=2432\n"
+                    f"construct_ns_per_item={value}\n"
+                    "rss_construct_delta_bytes_per_actor=2400.0\n"
+                )
+                with self.assertRaisesRegex(RuntimeError, "must be positive and finite"):
+                    actor_density_ab_bench.parse_probe(output, "construct")
+
+    def test_rejects_nonfinite_optional_measurements(self):
+        for field, value in (
+            ("rss_spawn_delta_bytes_per_actor", "nan"),
+            ("scheduler_settle_seconds", "inf"),
+            ("actor_heap_used_bytes_per_actor", "-inf"),
+        ):
+            with self.subTest(field=field, value=value):
+                measurements = {
+                    "rss_spawn_delta_bytes_per_actor": "3600.0",
+                    "scheduler_settle_seconds": "0.004",
+                    "actor_heap_used_bytes_per_actor": "0.0",
+                }
+                measurements[field] = value
+                output = (
+                    "mode=idle\nactor_count=10000\nactor_struct_bytes=2432\n"
+                    "spawn_ns_per_item=6000.0\n"
+                    + "".join(f"{key}={item}\n" for key, item in measurements.items())
+                )
+                with self.assertRaisesRegex(RuntimeError, f"invalid {field}"):
+                    actor_density_ab_bench.parse_probe(output, "idle")
+
+    def test_rejects_negative_idle_diagnostics(self):
+        for field in ("scheduler_settle_seconds", "actor_heap_used_bytes_per_actor"):
+            with self.subTest(field=field):
+                output = (
+                    "mode=idle\nactor_count=10000\nactor_struct_bytes=2432\n"
+                    "spawn_ns_per_item=6000.0\n"
+                    "rss_spawn_delta_bytes_per_actor=3600.0\n"
+                    "scheduler_settle_seconds=0.004\n"
+                    "actor_heap_used_bytes_per_actor=0.0\n"
+                    + f"{field}=-1.0\n"
+                )
+                with self.assertRaisesRegex(RuntimeError, f"{field} must be non-negative"):
+                    actor_density_ab_bench.parse_probe(output, "idle")
+
+    def test_rejects_probe_actor_count_mismatch(self):
+        row = {"actor_count": 9999}
+        with self.assertRaisesRegex(
+            RuntimeError, "candidate/idle: probe reported 9999 actors; requested 10000"
+        ):
+            actor_density_ab_bench.require_probe_actor_count(
+                row, 10000, variant="candidate", mode="idle"
+            )
+
+    def test_accepts_probe_actor_count_match(self):
+        actor_density_ab_bench.require_probe_actor_count(
+            {"actor_count": 10000}, 10000, variant="base", mode="construct"
+        )
+
+    def test_rejects_nonfinite_paired_comparison(self):
+        with self.assertRaisesRegex(RuntimeError, "values must be positive and finite"):
+            actor_density_ab_bench.paired_lower_is_better([100.0], [float("nan")])
+
+
 if __name__ == "__main__":
     unittest.main()
