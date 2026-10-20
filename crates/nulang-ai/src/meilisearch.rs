@@ -58,6 +58,8 @@ pub struct MeilisearchTask {
 pub struct MeilisearchTaskStatus {
     pub uid: u64,
     pub status: String,
+    #[serde(rename = "indexUid")]
+    pub index_uid: Option<String>,
 }
 
 /// Configure exclusively on a trusted server, using a key restricted to
@@ -192,7 +194,11 @@ impl MeilisearchClient {
     {
         let uid = uid.to_string();
         let url = self.endpoint(&["tasks", &uid]);
-        self.response(self.client.get(url)).await
+        let status: MeilisearchTaskStatus = self.response(self.client.get(url)).await?;
+        if status.index_uid.as_deref() != Some(self.index_uid.as_str()) {
+            return Err(MeilisearchError::NamespaceMismatch);
+        }
+        Ok(status)
     }
 }
 
@@ -289,6 +295,17 @@ mod tests {
         ).unwrap();
         assert!(matches!(client.validate_namespace("tenant-b"), Err(MeilisearchError::NamespaceMismatch)));
         assert!(matches!(validate_document_id("../escaping"), Err(MeilisearchError::InvalidDocumentId)));
+    }
+
+    #[test]
+    fn task_status_requires_its_index_to_match_the_tenant() {
+        let client = MeilisearchClient::new(
+            "https://search.example.com", "test-key", "tenant-a"
+        ).unwrap();
+        let foreign: MeilisearchTaskStatus = serde_json::from_str(
+            r#"{"uid":7,"status":"succeeded","indexUid":"nulang_tenant-b"}"#
+        ).unwrap();
+        assert_ne!(foreign.index_uid.as_deref(), Some(client.index_uid()));
     }
 
     #[test]
