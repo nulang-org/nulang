@@ -18,10 +18,22 @@ fn reconnect_replays_only_missing_output_and_fences_previous_connection() {
     let mut sessions = registry();
     let ready = sessions.open("opaque-session-1", owner()).unwrap();
     assert_eq!(ready.epoch, SessionCursor(1));
-    assert_eq!(sessions.append_output("opaque-session-1", b"one".to_vec()).unwrap(), SessionCursor(1));
-    assert_eq!(sessions.append_output("opaque-session-1", b"two".to_vec()).unwrap(), SessionCursor(2));
+    assert_eq!(
+        sessions
+            .append_output("opaque-session-1", b"one".to_vec())
+            .unwrap(),
+        SessionCursor(1)
+    );
+    assert_eq!(
+        sessions
+            .append_output("opaque-session-1", b"two".to_vec())
+            .unwrap(),
+        SessionCursor(2)
+    );
 
-    let initial = sessions.read_after("opaque-session-1", &owner(), ready.epoch, SessionCursor(0)).unwrap();
+    let initial = sessions
+        .read_after("opaque-session-1", &owner(), ready.epoch, SessionCursor(0))
+        .unwrap();
     assert!(matches!(initial, SessionReplay::Replayed { .. }));
     sessions.ack("opaque-session-1", &owner(), ready.epoch, SessionCursor(1)).unwrap();
 
@@ -155,9 +167,55 @@ fn protocol_rejects_wrong_version_and_preserves_u64_cursors_in_json() {
         bytes: b"ok".to_vec(),
     };
     assert_eq!(
-        serde_json::from_str::<SessionServerMessage>(&serde_json::to_string(&output).unwrap()).unwrap(),
+        serde_json::from_str::<SessionServerMessage>(&serde_json::to_string(&output).unwrap())
+            .unwrap(),
         output
     );
+}
+
+
+#[test]
+fn byte_budget_eviction_is_explicit_and_surviving_frames_remain_ordered() {
+    let mut sessions = SessionRegistry::new(10, 8).unwrap();
+    sessions.open("s", owner()).unwrap();
+    sessions.append_output("s", b"abcd".to_vec()).unwrap();
+    sessions.append_output("s", b"efgh".to_vec()).unwrap();
+    sessions.append_output("s", b"ijkl".to_vec()).unwrap();
+
+    assert_eq!(
+        sessions.resume("s", &owner(), SessionCursor(0)).unwrap(),
+        SessionReplay::Gap {
+            epoch: SessionCursor(2),
+            requested: SessionCursor(0),
+            first_available: SessionCursor(2),
+            latest: SessionCursor(3),
+        }
+    );
+    match sessions.read_after("s", &owner(), SessionCursor(2), SessionCursor(1)).unwrap() {
+        SessionReplay::Replayed { frames, .. } => {
+            assert_eq!(frames.len(), 2);
+            assert_eq!(frames[0].sequence, SessionCursor(2));
+            assert_eq!(frames[0].bytes.as_slice(), b"efgh");
+            assert_eq!(frames[1].sequence, SessionCursor(3));
+            assert_eq!(frames[1].bytes.as_slice(), b"ijkl");
+        }
+        other => panic!("unexpected outcome: {other:?}"),
+    }
+}
+
+#[test]
+fn rejected_future_resume_does_not_fence_the_active_connection() {
+    let mut sessions = registry();
+    let ready = sessions.open("s", owner()).unwrap();
+    sessions.append_output("s", b"one".to_vec()).unwrap();
+    assert_eq!(
+        sessions.resume("s", &owner(), SessionCursor(2)),
+        Err(SessionError::CursorAhead)
+    );
+    assert!(matches!(
+        sessions.read_after("s", &owner(), ready.epoch, SessionCursor(0)),
+        Ok(SessionReplay::Replayed { .. })
+    ));
 }
 
 #[test]
