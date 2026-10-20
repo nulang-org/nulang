@@ -4790,6 +4790,93 @@ mod tests {
         assert_eq!(apply_subst(&ty, &s), Type::int());
     }
 
+    #[test]
+    fn test_field_viewpoint_preserves_receiver_read_restrictions() {
+        // A mutable field reached through a box/val receiver must never
+        // regain ref write authority.
+        for (receiver, expected) in [
+            (Capability::Ref, Capability::Ref),
+            (Capability::Box, Capability::Box),
+            (Capability::Val, Capability::Val),
+            (Capability::Trn, Capability::Box),
+        ] {
+            let mut tc = TypeChecker::new();
+            let ty = Type::Reference {
+                cap: receiver,
+                inner: Box::new(Type::Record(vec![(
+                    "value".into(),
+                    Type::Reference {
+                        cap: Capability::Ref,
+                        inner: Box::new(Type::int()),
+                    },
+                )])),
+            };
+            let ctx = ctx_with("holder", ty);
+            let (s, projected) = tc.infer_expr(&ctx, &field(var("holder"), "value")).unwrap();
+            assert_eq!(
+                apply_subst(&projected, &s),
+                Type::Reference { cap: expected, inner: Box::new(Type::int()) },
+                "receiver {receiver:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_field_viewpoint_preserves_immutable_field_and_hides_iso_aliases() {
+        for (receiver, field_cap, expected) in [
+            (Capability::Box, Capability::Val, Capability::Val),
+            (Capability::Box, Capability::Iso, Capability::Tag),
+            (Capability::Val, Capability::Ref, Capability::Val),
+            (Capability::Box, Capability::Tag, Capability::Tag),
+        ] {
+            let mut tc = TypeChecker::new();
+            let ctx = ctx_with("holder", Type::Reference {
+                cap: receiver,
+                inner: Box::new(Type::Record(vec![(
+                    "child".into(),
+                    Type::Reference { cap: field_cap, inner: Box::new(Type::int()) },
+                )])),
+            });
+            let (s, projected) = tc.infer_expr(&ctx, &field(var("holder"), "child")).unwrap();
+            assert_eq!(
+                apply_subst(&projected, &s),
+                Type::Reference { cap: expected, inner: Box::new(Type::int()) },
+                "receiver {receiver:?}, field {field_cap:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_field_viewpoint_rejects_tag_receiver_even_for_scalar_fields() {
+        let mut tc = TypeChecker::new();
+        let ctx = ctx_with("holder", Type::Reference {
+            cap: Capability::Tag,
+            inner: Box::new(Type::Record(vec![("count".into(), Type::int())])),
+        });
+        assert!(tc.infer_expr(&ctx, &field(var("holder"), "count")).is_err());
+    }
+
+    #[test]
+    fn test_field_viewpoint_propagates_into_nested_record_values() {
+        let mut tc = TypeChecker::new();
+        let ctx = ctx_with("holder", Type::Reference {
+            cap: Capability::Box,
+            inner: Box::new(Type::Record(vec![(
+                "child".into(),
+                Type::Record(vec![(
+                    "value".into(),
+                    Type::Reference { cap: Capability::Ref, inner: Box::new(Type::int()) },
+                )]),
+            )])),
+        });
+        let expr = field(field(var("holder"), "child"), "value");
+        let (s, projected) = tc.infer_expr(&ctx, &expr).unwrap();
+        assert_eq!(
+            apply_subst(&projected, &s),
+            Type::Reference { cap: Capability::Box, inner: Box::new(Type::int()) },
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Test: Recursive functions (let rec)
     // -----------------------------------------------------------------------
