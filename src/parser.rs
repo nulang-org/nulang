@@ -3154,6 +3154,23 @@ impl Parser {
                 continue;
             }
 
+            // Contextual low-precedence contract check. Retain the inferred
+            // type instead of replacing it with the annotated contract.
+            if matches!(&op, TokenKind::Ident(name) if name == "satisfies") {
+                if PREC_PIPE < min_prec {
+                    break;
+                }
+                self.advance();
+                let ty = self.parse_type()?;
+                left = Expr::TypeAnnotate {
+                    expr: Box::new(left),
+                    ty,
+                    preserve_inferred: true,
+                    span: self.current_span(),
+                };
+                continue;
+            }
+
             if self.consume_if(&TokenKind::Colon) {
                 let span = self.current_span();
                 let is_cap = if let TokenKind::Ident(ref s) = self.peek_kind() {
@@ -3174,6 +3191,7 @@ impl Parser {
                     left = Expr::TypeAnnotate {
                         expr: Box::new(left),
                         ty,
+                        preserve_inferred: false,
                         span,
                     };
                 }
@@ -3356,13 +3374,23 @@ impl Parser {
                         // `let _ = expr [in body]` — wildcard binding, desugar to discard
                         if self.peek_kind() == &TokenKind::Ident("_".to_string()) {
                             self.advance(); // consume '_'
-                            let _ty = if self.consume_if(&TokenKind::Colon) {
+                            let ty = if self.consume_if(&TokenKind::Colon) {
                                 Some(self.parse_type()?)
                             } else {
                                 None
                             };
                             self.expect(TokenKind::Assign)?;
                             let value = self.parse_expr()?;
+                            // A discarded binding still has to honor its annotation.
+                            let value = match ty {
+                                Some(ty) => Expr::TypeAnnotate {
+                                    expr: Box::new(value),
+                                    ty,
+                                    preserve_inferred: false,
+                                    span,
+                                },
+                                None => value,
+                            };
                             if self.consume_if(&TokenKind::In) {
                                 let body = self.parse_expr()?;
                                 Ok(Expr::Block {
