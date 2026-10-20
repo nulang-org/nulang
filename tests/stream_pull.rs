@@ -8,6 +8,36 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 #[test]
+fn fold_consumes_success_values_in_order() {
+    let source = [Ok::<i32, &'static str>(2), Ok(3), Ok(5)];
+    let sum = PullStream::new(source.into_iter())
+        .try_fold_ok(0, |total, item| total + item)
+        .unwrap();
+    assert_eq!(sum, 10);
+}
+
+#[test]
+fn fold_stops_on_first_error_without_reading_later_records() {
+    let count = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&count);
+    let source = [Ok(2), Err("broken"), Ok(100)].into_iter().map(move |result| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        result
+    });
+    let result = PullStream::new(source).try_fold_ok(0, |total, item| total + item);
+    assert_eq!(result.unwrap_err(), "broken");
+    assert_eq!(count.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn crlf_split_across_reader_buffers_keeps_record_boundaries() {
+    let buffered = std::io::BufReader::with_capacity(1, Cursor::new(b"a\r\nb\n"));
+    let lines = BoundedLines::new(buffered, 3).unwrap();
+    let collected = PullStream::new(lines).try_collect_bounded(2).unwrap();
+    assert_eq!(collected, ["a", "b"]);
+}
+
+#[test]
 fn lazy_filter_and_map_only_pull_requested_items() {
     let reads = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&reads);
