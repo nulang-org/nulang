@@ -6659,13 +6659,7 @@ impl Runtime {
         for (reference, watcher, target) in retired {
             self.monitor_refs.remove(&reference);
             if target == actor_id && watcher != actor_id {
-                exit::send_down_message_with_ref(
-                    self,
-                    watcher,
-                    target,
-                    reason,
-                    Some(reference),
-                );
+                exit::send_down_message_with_ref(self, watcher, target, reason, Some(reference));
             }
         }
     }
@@ -6746,7 +6740,10 @@ impl Runtime {
                 })
             }
             Some("demonitor_ref") => {
-                let reference = regs.first().and_then(Value::as_int).filter(|token| *token > 0);
+                let reference = regs
+                    .first()
+                    .and_then(Value::as_int)
+                    .filter(|token| *token > 0);
                 let canceled = match (actor_id, reference) {
                     (Some(watcher), Some(token)) => {
                         self.demonitor_ref(watcher, MonitorRef(token as u64))
@@ -6756,7 +6753,10 @@ impl Runtime {
                 Some(Value::bool(canceled))
             }
             Some("demonitor_ref_flush") => {
-                let reference = regs.first().and_then(Value::as_int).filter(|token| *token > 0);
+                let reference = regs
+                    .first()
+                    .and_then(Value::as_int)
+                    .filter(|token| *token > 0);
                 Some(match (actor_id, reference) {
                     (Some(watcher), Some(token)) => self
                         .demonitor_ref_flush(watcher, MonitorRef(token as u64))
