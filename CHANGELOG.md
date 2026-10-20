@@ -3,6 +3,10 @@
 - **Fabric publish admission now reads mailbox pressure only for matching local subscribers**, instead of allocating and populating an all-actor mailbox snapshot on every publish.
 - **Ported the regression and exact-base matched-fixture A/B harness** from #1708 onto current main. Historical unmatched-publish microbenchmarks were favorable; new-head CI and measurements remain the promotion gate.
 
+### Criterion paired-confirmation report-path matching — 2026-10-18
+- **Map Criterion's historical `directory_name` to the exact `full_id` emitted in `new/benchmark.json`.** The paired regression confirmer no longer guesses how escaped underscores and slashes correspond to executable benchmark filters.
+- **Fail closed on unmapped or colliding IDs**, with regression tests for names containing underscores.
+
 ### Bounded Nulang Web development-server connections — 2026-10-16
 - **The experimental Web development listener caps active connections at 64**, including SSE, and returns `503` with `Retry-After: 1` when full.
 - **Worker capacity is returned by a scoped RAII lease** after normal completion, panic, or thread-spawn failure. One shared `Arc` route table replaces per-connection clones of compiled route modules.
