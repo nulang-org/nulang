@@ -230,8 +230,11 @@ pub(crate) fn handle_llm_error(rt: &mut Runtime, actor_id: u64, error: LlmError)
                 actor.set_state_field("llm_attempt", crate::vm::Value::int(new_attempt as i64));
             }
             let delay_ms = compute_backoff(retry, attempt, actor_id);
-            rt.timer_wheel
-                .schedule_llm_retry(std::time::Duration::from_millis(delay_ms), actor_id);
+            rt.timer_wheel.schedule_llm_retry_at(
+                rt.now(),
+                std::time::Duration::from_millis(delay_ms),
+                actor_id,
+            );
             return;
         }
     }
