@@ -539,6 +539,33 @@ impl Mailbox {
         }
     }
 
+    /// Inspect every queued payload at an **exclusive mailbox safepoint**.
+    ///
+    /// Requires exclusive `&mut self`: no concurrent producer may retain a
+    /// shared reference to this Mailbox during the visit. We temporarily
+    /// remove and restore system/normal SegQueue entries via `drain`, so
+    /// callers must not use this method while producers are publishing.
+    /// The existing selective-receive candidate, lane FIFO and logical
+    /// capacity are preserved. The active candidate may appear twice; this
+    /// is an inspection visitor, not reference-credit accounting.
+    ///
+    /// This does NOT establish a full runtime safepoint: VM temporaries,
+    /// cross-shard channels, foreign holds and JIT/native roots are excluded.
+    /// Never use these values alone to prove an object unreachable.
+    pub fn visit_all_queued_values_exclusive(&mut self, visit: &mut impl FnMut(Value)) {
+        let snapshot = self.drain();
+        for message in &snapshot {
+            for &value in message.payload.as_slice() {
+                visit(value);
+            }
+        }
+        if let Some((_, _, payload)) = &self.active_match {
+            for &value in payload.as_slice() {
+                visit(value);
+            }
+        }
+    }
+
     /// Total logical message count. Safe to query concurrently.
     pub fn len(&self) -> usize {
         self.queued_count.load(Ordering::Relaxed)
@@ -1086,6 +1113,78 @@ mod orca_mailbox_root_visitor_tests {
             values.as_slice()
         );
         assert!(mailbox.is_empty());
+    }
+
+    #[test]
+    fn exclusive_root_snapshot_visits_concurrent_lanes_without_consuming_messages() {
+        let mut mailbox = Mailbox::new(0);
+        mailbox.push(message(100, MessagePriority::System)).unwrap();
+        mailbox.push(message(200, MessagePriority::Normal)).unwrap();
+        mailbox
+            .push_local(message(300, MessagePriority::Normal))
+            .unwrap();
+
+        // Stage the three older messages in their selective-receive lanes.
+        assert!(mailbox.receive_match(&[99]).is_none());
+        mailbox.push(message(400, MessagePriority::System)).unwrap();
+        mailbox.push(message(500, MessagePriority::Normal)).unwrap();
+        mailbox
+            .push_local(message(600, MessagePriority::Normal))
+            .unwrap();
+
+        let before = mailbox.len();
+        let mut observed = Vec::new();
+        mailbox.visit_all_queued_values_exclusive(&mut |value| {
+            observed.push(value.as_int().expect("integer message payload"));
+        });
+        assert_eq!(observed, vec![100, 400, 300, 600, 200, 500]);
+        assert_eq!(mailbox.len(), before, "snapshot must retain logical capacity");
+
+        let mut delivered = Vec::new();
+        while let Some(message) = mailbox.pop() {
+            delivered.push(message.sender as i64);
+        }
+        assert_eq!(delivered, observed, "snapshot must preserve lane FIFO");
+    }
+
+    #[test]
+    fn exclusive_root_snapshot_keeps_selective_receive_candidate_valid() {
+        let mut mailbox = Mailbox::new(0);
+        mailbox.push(message(10, MessagePriority::Normal)).unwrap();
+        mailbox.push(message(20, MessagePriority::Normal)).unwrap();
+
+        let candidate = mailbox.receive_match(&[7]).expect("first candidate");
+        assert_eq!(candidate.1[0].as_int(), Some(10));
+
+        let mut observed = Vec::new();
+        mailbox.visit_all_queued_values_exclusive(&mut |value| {
+            observed.push(value.as_int().expect("integer message payload"));
+        });
+        // The active candidate shares an Arc with the staged message. Both
+        // appearances are conservative roots, not two ownership credits.
+        assert_eq!(observed, vec![10, 20, 10]);
+        assert_eq!(mailbox.len(), 2);
+        let committed = mailbox.commit_receive_match().expect("unchanged match");
+        assert_eq!(committed[0].as_int(), Some(10));
+        assert_eq!(mailbox.pop().unwrap().sender, 20);
+        assert!(mailbox.is_empty());
+    }
+
+    #[test]
+    fn exclusive_root_snapshot_does_not_change_bounded_mailbox_admission() {
+        let mut mailbox = Mailbox::new(2);
+        mailbox.push(message(1, MessagePriority::Normal)).unwrap();
+        mailbox.push(message(2, MessagePriority::Normal)).unwrap();
+
+        let mut observed = Vec::new();
+        mailbox.visit_all_queued_values_exclusive(&mut |value| observed.push(value));
+        assert_eq!(observed, vec![Value::int(1), Value::int(2)]);
+        assert_eq!(mailbox.len(), 2);
+        assert!(mailbox.push(message(3, MessagePriority::Normal)).is_err());
+        assert_eq!(mailbox.pop().unwrap().sender, 1);
+        assert!(mailbox.push(message(3, MessagePriority::Normal)).is_ok());
+        assert_eq!(mailbox.pop().unwrap().sender, 2);
+        assert_eq!(mailbox.pop().unwrap().sender, 3);
     }
 
     #[test]

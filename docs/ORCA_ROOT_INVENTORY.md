@@ -23,6 +23,7 @@ root snapshot at a scheduler safepoint and confirm object provenance.
 | Actor `event_log` payload values and `query_handlers` | `Actor::visit_stored_values` | Read-only |
 | Actor `suspended_execution.vm_state` | `Actor::visit_stored_values` | Read-only |
 | Scheduler-local mailbox queue, three selective-receive staging buffers, active candidate | `Mailbox::visit_scheduler_owned_values` (also called by `Actor::visit_stored_values`) | Read-only; **excludes concurrent queues** |
+| Exclusive mailbox inspection, including SegQueue system/normal lanes | `Mailbox::visit_all_queued_values_exclusive`, `Actor::visit_all_stored_values_exclusive` | **Requires exclusive actor/mailbox ownership**; copies and restores queues; not a concurrent producer root barrier |
 | Messages retained pending bytecode fetch | `Runtime::visit_pending_fetched_values` | Read-only; **excludes active channels** |
 | An individually owned cross-shard envelope (two delivery variants) | `CrossShardMsg::visit_payload_values` | Read-only; **does not enumerate channels** |
 | Exact live allocation identity in a single actor heap | `Actor::is_live_heap_payload_value` | Current address-provenance check only; **not generation-aware** |
@@ -34,12 +35,16 @@ may delay collection, but missing roots could free live data.
 
 ## Blocking gaps: do not promote this to a tracing collector
 
-1. **Concurrent mailbox lanes:** normal and system queues use `crossbeam::SegQueue`.
-   The scheduler-local queue, three selective-receive skip buffers and active
-   candidate now have an inspection-only visitor. A naive pop-and-push scan
-   of the remaining SegQueues changes ordering and races with producers.
-   A proper admission/root barrier or safepoint-backed root registry is still
-   required before collection can rely on mailbox visibility.
+1. **Concurrent mailbox admission:** normal and system queues use
+   `crossbeam::SegQueue`. The new exclusive snapshot can inspect both by
+   temporarily draining/restoring them while holding a unique `&mut Mailbox`,
+   and the scheduler-local/staged visitor still works without queue mutation.
+   This is **not** an admission/root publication barrier for concurrent
+   producers. Do not invoke it during a send, from another thread, or in the
+   presence of arbitrary unsafe aliases. Before collection relies on it,
+   prove a scheduler safepoint that excludes producers and preserves pending
+   cross-shard/FFI/JIT and foreign-held roots. Running it each turn would
+   allocate/copy messages; benchmark overhead before ever enabling it.
 2. **In-flight values:** individually owned `CrossShardMsg` envelopes and
    `pending_fetched_messages` have read-only payload visitors, but shard
    channel queues, send/receive handoffs, forwarded deliveries and other
@@ -73,8 +78,11 @@ integration tests, never use these visitor results to reclaim any object.
   active interpreter/JIT-state pin tests.
 - Suspended workflow, nested effect continuation, single-shot state and
   wake/resume tests.
-- Scheduler-local and selective-receive mailbox inspection with no dequeue,
-  plus separate concurrent SegQueue admission/root barrier and transfer races.
+- Exclusive mailbox snapshot across all queues, staged buffers and
+  active candidates: preserve FIFO, current match, capacity, and rejection
+  semantics; prove no concurrent sends or root handoff can race with snapshot.
+- Separate concurrent SegQueue admission/root barrier and transfer races
+  for any collection that does not run at a true exclusive safepoint.
 - Individually owned cross-shard envelopes, retained fetch retries and full
   cross-shard channel handoff, including interrupted delivery.
 - Actor state/event/query, exact live payload provenance, foreign-held/retired-
@@ -95,6 +103,8 @@ cargo test --locked orca_execution_root_visitor_tests
 cargo test --locked orca_actor_stored_root_visitor_tests
 cargo test --locked actor_heap_provenance_rejects_foreign_interior_and_freed_pointers
 cargo test --locked orca_mailbox_root_visitor_tests
+cargo test --locked exclusive_root_snapshot
+cargo test --locked exclusive_actor_value_snapshot
 cargo test --locked orca_pending_fetch_root_visitor
 cargo test --locked orca_cross_shard_envelope_root_visitor
 cargo test --locked --lib

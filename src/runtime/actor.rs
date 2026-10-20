@@ -986,16 +986,7 @@ impl Actor {
         matched
     }
 
-    /// Observe Values kept by actor-owned state, event records, registered
-    /// query handlers, and a suspended workflow's execution frames.
-    ///
-    /// This scans scheduler-owned mailbox buffers but NOT their concurrent
-    /// queues; native/runtime roots, active shared-VM frames and in-flight
-    /// deliveries are also outside this partial view. It must NOT be
-    /// interpreted as a complete root set for reclaiming local cycles.
-    /// The caller must check heap provenance before treating a Value as a
-    /// pointer into this actor's heap.
-    pub fn visit_stored_values(&self, visit: &mut impl FnMut(Value)) {
+    fn visit_values_outside_mailbox(&self, visit: &mut impl FnMut(Value)) {
         for &value in self.state_data.values() {
             visit(value);
         }
@@ -1010,7 +1001,29 @@ impl Actor {
         if let Some(suspended) = &self.suspended_execution {
             suspended.vm_state.visit_execution_values(visit);
         }
+    }
+
+    /// Inspect actor state, saved execution and scheduler-local mailbox
+    /// buffers. Concurrent mailbox queues are deliberately excluded.
+    ///
+    /// This partial view is for diagnostics, not local-cycle reclamation.
+    pub fn visit_stored_values(&self, visit: &mut impl FnMut(Value)) {
+        self.visit_values_outside_mailbox(visit);
         self.mailbox.visit_scheduler_owned_values(visit);
+    }
+
+    /// Inspect actor state, saved execution and *all* mailbox lanes when this
+    /// actor and its mailbox are exclusively owned by the scheduler.
+    ///
+    /// This requires a genuine exclusive mailbox safepoint, including a
+    /// guarantee that no concurrent send may publish into the mailbox while
+    /// its SegQueues are temporarily drained and restored. The `&mut self`
+    /// borrow enforces this for safe Rust callers but does not stop external
+    /// channel transfers, native/JIT temporary roots or foreign holds.
+    /// Inspection is not permission to reclaim any object.
+    pub fn visit_all_stored_values_exclusive(&mut self, visit: &mut impl FnMut(Value)) {
+        self.visit_values_outside_mailbox(visit);
+        self.mailbox.visit_all_queued_values_exclusive(visit);
     }
 }
 
@@ -1057,6 +1070,44 @@ mod orca_actor_stored_root_visitor_tests {
         });
         observed.sort_unstable();
         assert_eq!(observed, vec![31, 32, 33, 34]);
+    }
+
+    #[test]
+    fn exclusive_actor_value_snapshot_visits_state_and_all_mailbox_lanes() {
+        let mut actor = Actor::new(1, "exclusive-root-observer", 0);
+        actor
+            .state_data
+            .insert("state".to_string(), Value::int(700));
+        actor
+            .mailbox
+            .push(Message {
+                behavior_id: 1,
+                payload: MessagePayload::from_slice(&[Value::int(701)]),
+                sender: 2,
+                priority: MessagePriority::Normal,
+                trace_id: None,
+            })
+            .unwrap();
+        actor
+            .mailbox
+            .push_local(Message {
+                behavior_id: 2,
+                payload: MessagePayload::from_slice(&[Value::int(702)]),
+                sender: 3,
+                priority: MessagePriority::Normal,
+                trace_id: None,
+            })
+            .unwrap();
+
+        let mut observed = Vec::new();
+        actor.visit_all_stored_values_exclusive(&mut |value| {
+            observed.push(value.as_int().expect("integer root"));
+        });
+        observed.sort_unstable();
+        assert_eq!(observed, vec![700, 701, 702]);
+        assert_eq!(actor.mailbox.len(), 2);
+        assert_eq!(actor.mailbox.pop().unwrap().sender, 3);
+        assert_eq!(actor.mailbox.pop().unwrap().sender, 2);
     }
 
     #[test]
