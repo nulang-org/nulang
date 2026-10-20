@@ -21,10 +21,20 @@ actor Sender {
     }
 }
 
+actor Unauthorized {
+    behavior spoof(reference: Int) {
+        let status = perform Actor.reply_send(reference, 999)
+        perform IO.print(perform Int.to_string(status))
+        0
+    }
+}
+
 fn main() {
     let collector = spawn Collector {}
     let sender = spawn Sender {}
+    let unauthorized = spawn Unauthorized {}
     let reference = ask collector open(sender)
+    let _spoofed = ask unauthorized spoof(reference)
     let _first = ask sender send_twice(reference)
     let canceled_reference = ask collector open(sender)
     let canceled = ask collector cancel(canceled_reference)
