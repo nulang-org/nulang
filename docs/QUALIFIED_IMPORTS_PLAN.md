@@ -28,11 +28,16 @@ exports into the importing module. Only declarations marked explicitly
 `public` are currently discoverable (functions, type aliases, record types,
 and variant types), and same-name overloads retain their separate entries.
 Missing aliases, private names, and conflicting alias origins fail closed.
+The `resolve_unique` helper now also requires an explicit lexical symbol
+kind (function versus type), rejects wrong-kind exports, and refuses to
+silently pick between overloaded candidates. It returns an **owned**
+`QualifiedSymbol` with canonical source identity and no local alias.
+Type-directed overload selection is still unimplemented.
 
 **This index is not yet consumed by the production typechecker, HIR/MIR,
 bytecode, WASM, native backends, or LSP.** The ordinary compile path still
 rejects alias imports. Support for nested reexports, visibility on other
-declaration types, constructors, and type-directed overload lookup belongs
+declaration types, constructors, and signature-driven overload selection belongs
 in subsequent changes. Filesystem paths are resolver metadata only and
 must not be written into runtime type identifiers or serialized artifacts.
 
