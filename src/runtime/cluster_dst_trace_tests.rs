@@ -3,6 +3,7 @@
 //! not evidence that the production runtime violates an invariant.
 
 use super::cluster_dst::DeterministicCluster;
+use crate::dst::property::{check_trace_property, TracePropertyConfig};
 use crate::dst::shrink::{minimize_failing_trace, MinimizationStatus};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -88,4 +89,68 @@ fn invalid_fault_sequences_do_not_count_as_reproduced_failures() {
         Fault::CrashNodeOne,
         Fault::RestartNodeOne,
     ]));
+}
+
+#[test]
+fn seeded_fault_scripts_shrink_against_fresh_real_runtimes() {
+    let result = check_trace_property(
+        TracePropertyConfig {
+            seed: 0x5eed,
+            cases: 8,
+            max_shrink_replays: 200,
+        },
+        |rng| {
+            // The failure is intentionally constructed to test the harness,
+            // not a claim that production Nulang violates an invariant.
+            vec![
+                Fault::Advance(1 + rng.next() % 3),
+                Fault::CrashNodeOne,
+                Fault::Advance(1 + rng.next() % 5),
+                Fault::Advance(1 + rng.next() % 3),
+            ]
+        },
+        |script| !reproduces_crashed_node_clock_gap(script),
+    );
+    let failure = result.expect_err("expected injected stopped-clock signature");
+
+    assert_eq!(failure.case_index, 0);
+    assert_eq!(failure.minimized.status, MinimizationStatus::OneMinimal);
+    assert_eq!(failure.minimized.trace.len(), 2);
+    assert!(matches!(failure.minimized.trace[0], Fault::CrashNodeOne));
+    assert!(matches!(failure.minimized.trace[1], Fault::Advance(rounds) if rounds > 0));
+    assert!(reproduces_crashed_node_clock_gap(&failure.minimized.trace));
+}
+
+#[test]
+fn generated_live_cluster_rounds_preserve_virtual_clock_alignment() {
+    let result = check_trace_property(
+        TracePropertyConfig {
+            seed: 0xc10c,
+            cases: 8,
+            max_shrink_replays: 100,
+        },
+        |rng| {
+            (0..(1 + rng.next() % 4))
+                .map(|_| Fault::Advance(1 + rng.next() % 3))
+                .collect::<Vec<_>>()
+        },
+        |script| {
+            // Replay each generated case against new real Runtime instances;
+            // local virtual-time steps advance for all healthy nodes.
+            let mut cluster = DeterministicCluster::new(&[addr(9563), addr(9564)], 0x5eed);
+            let mut total_rounds = 0;
+            for &operation in script {
+                let Fault::Advance(rounds) = operation else {
+                    return false;
+                };
+                cluster.run_rounds(rounds);
+                total_rounds += rounds;
+            }
+            cluster.limit_hits == 0
+                && cluster.round == total_rounds
+                && cluster.node(0).virtual_clock.as_ref().unwrap().elapsed()
+                    == cluster.node(1).virtual_clock.as_ref().unwrap().elapsed()
+        },
+    );
+    assert_eq!(result, Ok(8));
 }
