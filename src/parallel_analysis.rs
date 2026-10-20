@@ -943,6 +943,29 @@ mod tests {
     }
 
     #[test]
+    fn immediate_lambda_return_is_local_to_lambda_scope() {
+        let returning = Expr::Lambda {
+            params: vec![],
+            ret_type: None,
+            body: Box::new(Expr::Return(Some(Box::new(int(7))), sp())),
+            effect: None,
+            span: sp(),
+        };
+        let branches = vec![
+            Expr::App {
+                func: Box::new(returning),
+                args: vec![],
+                span: sp(),
+            },
+            int(3),
+        ];
+        assert!(
+            validate_parallel_branches(&branches, sp()).is_ok(),
+            "a return from an invoked lambda must not escape the par branch"
+        );
+    }
+
+    #[test]
     fn immediately_invoked_lambda_pure_parameter_read_is_allowed() {
         let pure = Expr::Lambda {
             params: vec![crate::ast::Param::new("value", None)],
