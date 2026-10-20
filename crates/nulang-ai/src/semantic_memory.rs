@@ -28,6 +28,10 @@ pub struct SemanticMemory {
     pub documents: Vec<Document>,
     /// Dimensionality of the embedding vectors.
     pub dimensions: usize,
+    /// Precomputed document vectors. Legacy snapshots without this field are
+    /// still readable and are embedded on demand.
+    #[serde(default)]
+    embeddings: Vec<Vec<f32>>,
     /// Optional custom embedding function. Defaults to a deterministic hash-based
     /// embedding when `None`.
     #[serde(skip)]
@@ -48,6 +52,7 @@ impl SemanticMemory {
         Self {
             documents: Vec::new(),
             dimensions,
+            embeddings: Vec::new(),
             embedding_fn,
         }
     }
@@ -60,11 +65,22 @@ impl SemanticMemory {
     ) -> String {
         let content = content.into();
         let id = deterministic_id(&content);
+        // When an older snapshot is loaded, populate its missing vectors before
+        // appending so document offsets and cached vectors remain aligned.
+        if self.embeddings.len() != self.documents.len() {
+            self.embeddings = self
+                .documents
+                .iter()
+                .map(|doc| self.embed(&doc.content))
+                .collect();
+        }
+        let embedding = self.embed(&content);
         self.documents.push(Document {
             id: id.clone(),
             content,
             metadata,
         });
+        self.embeddings.push(embedding);
         id
     }
 
@@ -80,9 +96,19 @@ impl SemanticMemory {
         let mut results: Vec<(&Document, f32)> = self
             .documents
             .iter()
-            .map(|doc| {
-                let doc_embedding = self.embed(&doc.content);
-                let score = cosine_similarity(&query_embedding, &doc_embedding);
+            .enumerate()
+            .map(|(index, doc)| {
+                // The fallback preserves compatibility with old serialized
+                // SemanticMemory values that did not contain embeddings.
+                let fallback;
+                let doc_embedding = match self.embeddings.get(index) {
+                    Some(embedding) if embedding.len() == self.dimensions => embedding,
+                    _ => {
+                        fallback = self.embed(&doc.content);
+                        &fallback
+                    }
+                };
+                let score = cosine_similarity(&query_embedding, doc_embedding);
                 (doc, score)
             })
             .collect();
@@ -97,6 +123,12 @@ impl SemanticMemory {
     /// Returns `true` if a document was removed.
     pub fn delete(&mut self, id: &str) -> bool {
         if let Some(pos) = self.documents.iter().position(|doc| doc.id == id) {
+            if self.embeddings.len() == self.documents.len() {
+                self.embeddings.remove(pos);
+            } else {
+                // Partial/legacy caches cannot safely retain positional entries.
+                self.embeddings.clear();
+            }
             self.documents.remove(pos);
             true
         } else {
