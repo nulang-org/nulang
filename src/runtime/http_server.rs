@@ -1317,6 +1317,7 @@ mod tests {
             &b"GET /resource HTTP/1.1\r\nHost: first.example\r\nhost: second.example\r\n\r\n"[..],
             &b"GET /resource HTTP/1.1\r\nHost: first.example, second.example\r\n\r\n"[..],
             &b"GET /resource HTTP/1.1\r\nHost: bad host\r\n\r\n"[..],
+            &b"GET /resource HTTP/1.1\r\nHost: \xff\r\n\r\n"[..],
         ] {
             assert_eq!(
                 read_http_request(&mut chunks(raw, 3)).unwrap_err(),
