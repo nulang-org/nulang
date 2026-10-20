@@ -102,6 +102,11 @@ jobs:
       - name: Build
         run: cargo build --locked --all-targets
 
+      # The Rust tests do not execute Nulang-authored stdlib tests by default.
+      # Verify Enumerable semantics with the just-built Nulang interpreter.
+      - name: Run standard-library list behavior tests
+        run: cargo run --locked -- src/stdlib/list_test.nula
+
       - name: Test
         # nextest isolates individual tests in their own processes and schedules
         # test binaries concurrently, reducing wall-clock time without changing
@@ -201,12 +206,6 @@ jobs:
 
       - name: Smoke test (eval)
         run: ./target/release/nulang --eval 'perform IO.print("hello")'
-
-      # Exercise the actual Nulang-authored stdlib test suite, not only Rust
-      # unit tests or scaffolded package smoke tests. This includes the
-      # Enumerable-style generic collection regressions.
-      - name: Run standard-library list behavior tests
-        run: ./target/release/nulang src/stdlib/list_test.nula
 
       - name: Scaffold test package
         run: ./target/release/nulang nula new test-pkg
