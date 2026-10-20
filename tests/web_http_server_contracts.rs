@@ -224,8 +224,8 @@ fn explicit_response_route(
     status: u16,
     body_source: &str,
 ) -> WebRoute {
-    let source = format!("fn handler() {{ perform Web.{effect}({status}, {body_source}) }}");
-    let (module, function_index) = compile_handler(&source, "handler");
+    let source = format!("fn response_endpoint() {{ perform Web.{effect}({status}, {body_source}) }}");
+    let (module, function_index) = compile_handler(&source, "response_endpoint");
     WebRoute {
         method,
         path: path.to_string(),
@@ -377,12 +377,12 @@ fn explicit_response_metadata_does_not_escape_its_request() {
 #[test]
 fn rejected_explicit_response_does_not_commit_session_cookies() {
     let source = r#"
-fn handler() {
+fn response_endpoint() {
     perform Web.set_cookie("session", "do-not-commit")
     perform Web.respond_json(201, "{invalid json}")
 }
 "#;
-    let (module, function_index) = compile_handler(source, "handler");
+    let (module, function_index) = compile_handler(source, "response_endpoint");
     let route = WebRoute {
         method: HttpMethod::Get,
         path: "/invalid-cookie".to_string(),
