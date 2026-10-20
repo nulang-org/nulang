@@ -59,8 +59,9 @@ impl std::error::Error for JsonSchemaError {}
 
 /// Every configured field is required, non-null, and precisely typed.
 /// Unexpected keys are rejected. Names are compared case-sensitively.
-/// A parsed serde_json object has already lost information on duplicate keys;
-/// this adapter does not detect duplicate keys in the original JSON text.
+/// The JsonlRecords parser rejects duplicate JSON object keys before
+/// materializing serde_json::Value. This adapter validates typed fields,
+/// but does not independently re-check original JSON syntax.
 #[derive(Debug, Clone)]
 pub struct JsonSchema {
     fields: Vec<JsonField>,
