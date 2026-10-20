@@ -463,6 +463,9 @@ impl Supervisor {
             let mut new_sup = Supervisor::new(new_id, old_sup.name.clone(), old_sup.strategy);
             new_sup.children = old_sup.children;
             new_sup.restart_history = old_sup.restart_history;
+            new_sup.max_restarts = old_sup.max_restarts;
+            new_sup.restart_window_secs = old_sup.restart_window_secs;
+            new_sup.global_restart_history = old_sup.global_restart_history;
             new_sup.parent = old_sup.parent;
             new_sup.template = old_sup.template;
             new_sup.next_dynamic_id = old_sup.next_dynamic_id;
@@ -775,7 +778,7 @@ impl Supervisor {
                 }
             }
         };
-        if matches!(action, SupervisorAction::Restarted(_)) {
+        if matches!(&action, SupervisorAction::Restarted(_)) {
             self.global_restart_history.push(Instant::now());
         }
         action
