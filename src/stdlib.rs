@@ -681,9 +681,9 @@ impl StdLib {
                     name: "Actor.reply_open",
                     effect: "Actor",
                     op: "reply_open",
-                    signature: "reply_open(ttl_ms: Int) -> Int | Nil",
+                    signature: "reply_open(responder: Actor, ttl_ms: Int) -> Int | Nil",
                     implemented_in: ImplSite::RuntimeHost,
-                    description: "Open a trusted local, one-shot reply ticket for the current actor with a positive timeout up to 24h; returns its correlated Int reference or nil. Reply delivery is not durable or distributed.",
+                    description: "Open a local one-shot reply ticket addressed to the current actor, bound to one live responder actor, with a positive timeout up to 24h. Returns its correlated Int reference or nil. Delivery is not durable or distributed.",
                 },
                 BuiltinOp {
                     name: "Actor.reply_send",
@@ -691,7 +691,7 @@ impl StdLib {
                     op: "reply_send",
                     signature: "reply_send(reference: Int, value: Int) -> Int | Nil",
                     implemented_in: ImplSite::RuntimeHost,
-                    description: "Send a one-shot correlated local reply to the ticket owner's reply(reference: Int, value: Int) behavior. Returns 0=accepted, 1=backpressured, 2=expired, 3=inactive, nil=invalid argument or missing handler. References are not authorization capabilities.",
+                    description: "Send a one-shot correlated local reply to the ticket owner's reply(reference: Int, value: Int) behavior. Returns 0=accepted, 1=backpressured, 2=expired, 3=inactive, nil=invalid argument or missing handler. Only the explicitly designated responder actor can send; references alone are not authorization capabilities.",
                 },
                 BuiltinOp {
                     name: "Actor.reply_cancel",
