@@ -1,62 +1,89 @@
-# Deterministic scheduler schedule traces (experimental)
+# Deterministic scheduler traces (experimental)
 
-Nulang's real-runtime deterministic scheduler already accepts a seed and step
-budget, supports virtual clocks, and executes real actor behavior through
-`Runtime::step_actor`. The additional recorded-schedule API captures which
-ready actor was selected at each step and when the virtual clock was advanced.
+The deterministic test scheduler executes real Nulang actor behaviors using a
+seed and a bounded step budget. Its recorded trace stores the ready-set rank of
+each selected actor, logical timer-advance events, and the termination result.
+The trace does not record an actor snapshot, external effects, or wire traffic.
 
-## Rust test harness
+## Recording a regression trace
 
-1. Construct a fresh `Runtime`, install a virtual clock, and register actors
-   and their initial messages.
-2. Call `run_scheduler_deterministic_recorded(seed, max_steps)`.
-3. Save the returned `DeterministicScheduleTrace` using `serde_json`. It includes
-   the seed, budget, event sequence, and terminal outcome.
-4. Reconstruct the *same* initial workload on a **fresh** runtime and call
-   `verify_deterministic_trace(&recorded_trace)`. A mismatched scheduling
-   decision, step count, or terminal result returns
-   `DeterministicTraceMismatch`.
-5. Assert domain-specific state invariants separately: a matching schedule alone
-   does **not** prove identical application states.
+On a freshly initialized Rust `Runtime`, install a virtual clock, register
+actors and initial messages, then call:
 
-Actor steps store the selected **rank in the sorted ready actor IDs** and the
-number of ready actors, not process-global actor IDs. That lets a new runtime
-reproduce a schedule even if it allocates different numeric IDs.
-
-Timer advances are recorded as logical events rather than nanosecond durations.
-The current timer wheel computes deadlines from `Instant::now()`, so raw
-deadline deltas cannot be assumed identical across separately initialized
-runtimes. This trace proves event order and step count, **not** an exact
-wall-clock timeline.
-
-## Scope and limitations
-
-- This is seeded **re-execution and verification**, not a forced scheduler
-  trace interpreter. It detects divergence *after* a bounded run finishes.
-- Install a virtual clock for timer-bearing workloads and control all sources
-  of external nondeterminism. Test handlers, fakes, or persisted idempotent
-  receipts are required for effects that would otherwise mutate the world.
-- A trace does not capture message contents, actor state, network delivery,
-  storage history, or side effects. Recording is not automatically enabled
-  in the production scheduler and does not change its scheduling policy.
-- The selected-ready rank assumes equivalent actor creation order within
-  compared runs; actor ID values themselves can differ.
-- For distributed tests, use `cluster_dst::DeterministicCluster` (test-only)
-  and `dst::shrink::minimize_failing_trace`. Cross-node packet/partition replay
-  is not yet integrated into this single-runtime schedule record.
-- Keep `max_steps` bounded and only verify traces against independent,
-  equivalently initialized runtimes. A nonmatching trace does not roll back
-  execution.
-
-## Regression gate
-
-```bash
-cargo test --locked dst_trace_tests
-cargo test --locked
-cargo fmt --all -- --check
+```rust
+let trace = runtime.run_scheduler_deterministic_recorded(42, 1000);
+let json = serde_json::to_string_pretty(&trace)?;
 ```
 
-Next validation: use a real actor program with message-driven timer creation
-and durable-effect fakes, then reproduce its fault across fresh runtimes with
-controlled clock origins. Only after that should the harness claim complete
-clock/fault/event replay.
+Use the trace with an **independently rebuilt, equivalent** runtime. There
+are two different checks:
+
+- `verify_deterministic_trace(&trace)`: re-executes with the same seed,
+  records its choices, then compares the two traces **after** the run.
+- `replay_deterministic_trace(&trace)`: **forces** the recorded actor selection
+  by rank within the sorted ready set. It validates the ready-set size,
+  selected index, and timer-advance events **before** each step, rejecting the
+  first missing or incompatible event. It also checks the terminal outcome and
+  extra trace events.
+
+The forced-replay path does **not** redraw choices from the seed; the seed is
+still carried as provenance in JSON. Both paths use real actor execution. Both
+require controlled effects, and neither rolls back matching steps already
+executed before divergence.
+
+Actor identifiers are process-global, so the trace intentionally uses sorted
+ready-set ranks rather than raw actor IDs. Different numeric IDs are fine if
+the relative actor creation order, behavior, messages, and injected effects are
+equivalent. The harness must separately assert application state, durable
+receipts, and invariants; a matching schedule is not a state-equivalence proof.
+
+## Timer clock boundary
+
+The standalone `TimerWheel` convenience APIs still schedule relative to
+`Instant::now()`, preserving existing real-time callers. Its explicit
+clock-relative APIs (`send_after_at`, `send_after_with_context_at`,
+`receive_wait_timeout_at`, `schedule_llm_retry_at`, `remaining_at`, and
+other corresponding `*_at` methods) use the caller's `Instant`.
+
+The runtime's workflow timer re-arming, receive timeouts, actor timer callbacks,
+and LLM retry scheduling now pass `Runtime::now()`. These must remain
+clock-consistent with the runtime's `tick_timers_at` and virtual-clock
+advancement. Equal-deadline timers fire in ascending timer-ID order.
+
+Traces record logical timer advances, **not** raw `Instant` values or elapsed
+nanoseconds. Each fresh test runtime has a distinct virtual-clock epoch.
+Tests should schedule through the runtime clock after advancing it and should
+not mix standalone real-time timer-wheel methods with virtual-time programs.
+
+## Safety boundaries and future work
+
+- These APIs are a **test harness**, not a live production scheduler or a
+  persisted durable actor-history format.
+- No network packets, external side effects, nondeterministic RNG results,
+  persistence snapshots, or process-kill outcomes are captured in these traces.
+  Use deterministic providers and fault-injection fixtures for such tests.
+- Forced replay detects mismatch before an actor step or timer advance, but
+  network draining and already due timer delivery may happen before mismatch
+  detection, and previously matched effects cannot be reversed.
+- `max_steps` caps actor turns plus logical timer advances. A step-limit result
+  is a bounded-test outcome, **not** by itself proof of deadlock.
+- `cluster_dst::DeterministicCluster` and `dst::shrink` remain the mechanism
+  for inter-node network faults, partitions, hard crashes, and trace shrinking;
+  those fault schedules are not yet integrated with this actor-choice trace.
+- A next hardening step is unified event/fault replay with receipt-backed
+  provider failure injection and explicit clock epochs. Keep it separate from
+  live runtime semantics until multi-backend conformance is established.
+
+## Verification gate
+
+```bash
+cargo fmt --all -- --check
+cargo test --locked dst_trace_tests
+cargo test --locked runtime::timer::tests
+cargo test --locked
+cargo check --all-targets
+cargo check --all-targets --no-default-features
+```
+
+Run these on the exact PR head in a working Rust environment. CI workflows with
+zero jobs or skipped correctness jobs do not constitute verification.

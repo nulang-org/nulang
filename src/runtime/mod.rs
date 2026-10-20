@@ -3458,6 +3458,135 @@ impl Runtime {
         Ok(actual.outcome)
     }
 
+    /// Execute a recorded actor schedule on an equivalently initialized runtime.
+    ///
+    /// Unlike `verify_deterministic_trace`, this method *forces* recorded actor
+    /// choices, checking ready-set size and bounds before calling `step_actor`.
+    /// A missing or incompatible event fails immediately without executing that
+    /// mismatched actor turn or advancing the virtual clock. No rollback of
+    /// earlier matching turns or host effects is provided.
+    ///
+    /// The source trace's seed is retained as metadata. Replay consumes the
+    /// choices recorded in `events`, not fresh RNG draws. External effects
+    /// require a deterministic test host; this is not production recovery.
+    pub fn replay_deterministic_trace(
+        &mut self,
+        expected: &DeterministicScheduleTrace,
+    ) -> Result<DeterministicRunResult, DeterministicTraceMismatch> {
+        let mut steps = 0u64;
+        let mut event_index = 0usize;
+        loop {
+            if steps >= expected.max_steps {
+                return Self::check_replay_termination(
+                    expected,
+                    event_index,
+                    DeterministicRunResult::StepLimitExceeded { steps },
+                );
+            }
+            self.drain_cross_shard_messages();
+            self.tick_timers();
+            let mut ready: Vec<u64> = self
+                .actors
+                .iter()
+                .filter(|(_, actor)| !actor.mailbox.is_empty())
+                .map(|(id, _)| *id)
+                .collect();
+            ready.sort_unstable();
+
+            if !ready.is_empty() {
+                let observed = expected.events.get(event_index);
+                let selected_index = match observed {
+                    Some(DeterministicScheduleEvent::ActorStep {
+                        ready_count,
+                        selected_ready_index,
+                    }) if *ready_count == ready.len()
+                        && *selected_ready_index < ready.len() => *selected_ready_index,
+                    _ => {
+                        let attempted_index = match observed {
+                            Some(DeterministicScheduleEvent::ActorStep {
+                                selected_ready_index,
+                                ..
+                            }) => *selected_ready_index,
+                            _ => 0,
+                        };
+                        return Err(DeterministicTraceMismatch::Event {
+                            index: event_index,
+                            expected: observed.cloned(),
+                            actual: Some(DeterministicScheduleEvent::ActorStep {
+                                ready_count: ready.len(),
+                                selected_ready_index: attempted_index,
+                            }),
+                        });
+                    }
+                };
+                event_index += 1;
+                self.step_actor(ready[selected_index]);
+                steps += 1;
+                if steps % GC_PUMP_INTERVAL == 0 {
+                    self.process_deferred_all();
+                }
+                if steps % DEHYDRATE_CHECK_INTERVAL == 0 {
+                    self.dehydrate_idle_grains();
+                }
+            } else if self.virtual_clock.is_some() && !self.timer_wheel.is_empty() {
+                if expected.events.get(event_index)
+                    != Some(&DeterministicScheduleEvent::TimerAdvance)
+                {
+                    return Err(DeterministicTraceMismatch::Event {
+                        index: event_index,
+                        expected: expected.events.get(event_index).cloned(),
+                        actual: Some(DeterministicScheduleEvent::TimerAdvance),
+                    });
+                }
+                event_index += 1;
+                let deadline = self
+                    .timer_wheel
+                    .next_deadline()
+                    .expect("nonempty timer wheel must have a deadline");
+                let delta = deadline.saturating_duration_since(self.now());
+                if delta.is_zero() {
+                    self.advance_time(std::time::Duration::from_millis(1));
+                } else {
+                    self.advance_time(delta);
+                }
+                steps += 1;
+                if steps % DEHYDRATE_CHECK_INTERVAL == 0 {
+                    self.dehydrate_idle_grains();
+                }
+            } else {
+                // Mirror the seeded scheduler's quiescent GC finalization.
+                self.process_gc_ops();
+                self.process_deferred_all();
+                return Self::check_replay_termination(
+                    expected,
+                    event_index,
+                    DeterministicRunResult::Quiescent { steps },
+                );
+            }
+        }
+    }
+
+    fn check_replay_termination(
+        expected: &DeterministicScheduleTrace,
+        event_index: usize,
+        outcome: DeterministicRunResult,
+    ) -> Result<DeterministicRunResult, DeterministicTraceMismatch> {
+        if let Some(next) = expected.events.get(event_index) {
+            return Err(DeterministicTraceMismatch::Event {
+                index: event_index,
+                expected: Some(next.clone()),
+                actual: None,
+            });
+        }
+        if expected.outcome != outcome {
+            return Err(DeterministicTraceMismatch::Outcome {
+                expected: expected.outcome,
+                actual: outcome,
+            });
+        }
+        Ok(outcome)
+    }
+
     fn run_scheduler_deterministic_with_rng_recording(
         &mut self,
         rng: &mut crate::dst::DeterministicRng,
@@ -4841,7 +4970,8 @@ impl Runtime {
             );
             return;
         };
-        self.timer_wheel.send_after_with_context(
+        self.timer_wheel.send_after_with_context_at(
+            self.now(),
             std::time::Duration::from_millis(duration_ms),
             actor_id,
             behavior_id,
@@ -4914,9 +5044,11 @@ impl Runtime {
         if already_waiting {
             return;
         }
-        let timer_id = self
-            .timer_wheel
-            .receive_wait_timeout(std::time::Duration::from_millis(ms as u64), actor_id);
+        let timer_id = self.timer_wheel.receive_wait_timeout_at(
+            self.now(),
+            std::time::Duration::from_millis(ms as u64),
+            actor_id,
+        );
         if let Some(actor) = self.actors.get_mut(&actor_id) {
             actor.receive_wait = Some(crate::runtime::actor::ReceiveWaitState {
                 timer_id,

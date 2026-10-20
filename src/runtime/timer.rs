@@ -124,7 +124,10 @@ impl PartialOrd for TimerEntry {
 impl Ord for TimerEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Reverse: BinaryHeap is max-heap, we want min-heap (soonest first)
-        other.fire_at.cmp(&self.fire_at)
+        other
+            .fire_at
+            .cmp(&self.fire_at)
+            .then_with(|| other.id.0.cmp(&self.id.0))
     }
 }
 
@@ -169,10 +172,29 @@ impl TimerWheel {
         self.send_after_with_context(delay, target_actor, behavior_id, payload, String::new())
     }
 
-    /// Schedule a message to be sent to an actor after a delay, carrying an
-    /// opaque context string through to the fire handler.
+    /// Schedule a message relative to an explicitly supplied clock.
+    /// Runtime callers MUST pass `Runtime::now()` for virtual-clock safety.
+    pub fn send_after_at(
+        &self,
+        now: Instant,
+        delay: Duration,
+        target_actor: u64,
+        behavior_id: u16,
+        payload: Vec<Value>,
+    ) -> TimerId {
+        self.send_after_with_context_at(
+            now,
+            delay,
+            target_actor,
+            behavior_id,
+            payload,
+            String::new(),
+        )
+    }
+
+    /// Schedule a message with context relative to the real clock.
     ///
-    /// Returns the `TimerId` which can be used to cancel the timer.
+    /// For virtual-time testing, use `send_after_with_context_at`.
     pub fn send_after_with_context(
         &self,
         delay: Duration,
@@ -181,8 +203,28 @@ impl TimerWheel {
         payload: Vec<Value>,
         context: String,
     ) -> TimerId {
+        self.send_after_with_context_at(
+            Instant::now(),
+            delay,
+            target_actor,
+            behavior_id,
+            payload,
+            context,
+        )
+    }
+
+    /// Clock-relative variant of `send_after_with_context`.
+    pub fn send_after_with_context_at(
+        &self,
+        now: Instant,
+        delay: Duration,
+        target_actor: u64,
+        behavior_id: u16,
+        payload: Vec<Value>,
+        context: String,
+    ) -> TimerId {
         let id = TimerId(self.next_id.fetch_add(1, Ordering::SeqCst));
-        let fire_at = Instant::now() + delay;
+        let fire_at = now + delay;
 
         let entry = TimerEntry {
             id,
@@ -205,8 +247,19 @@ impl TimerWheel {
 
     /// Schedule an actor exit after a delay.
     pub fn exit_after(&self, delay: Duration, target_actor: u64, reason: String) -> TimerId {
+        self.exit_after_at(Instant::now(), delay, target_actor, reason)
+    }
+
+    /// Clock-relative variant of `exit_after`. Pass the owning runtime's clock.
+    pub fn exit_after_at(
+        &self,
+        now: Instant,
+        delay: Duration,
+        target_actor: u64,
+        reason: String,
+    ) -> TimerId {
         let id = TimerId(self.next_id.fetch_add(1, Ordering::SeqCst));
-        let fire_at = Instant::now() + delay;
+        let fire_at = now + delay;
 
         let entry = TimerEntry {
             id,
@@ -225,8 +278,13 @@ impl TimerWheel {
 
     /// Schedule an unconditional kill after a delay.
     pub fn kill_after(&self, delay: Duration, target_actor: u64) -> TimerId {
+        self.kill_after_at(Instant::now(), delay, target_actor)
+    }
+
+    /// Clock-relative variant of `kill_after`. Pass the owning runtime's clock.
+    pub fn kill_after_at(&self, now: Instant, delay: Duration, target_actor: u64) -> TimerId {
         let id = TimerId(self.next_id.fetch_add(1, Ordering::SeqCst));
-        let fire_at = Instant::now() + delay;
+        let fire_at = now + delay;
 
         let entry = TimerEntry {
             id,
@@ -248,8 +306,18 @@ impl TimerWheel {
     /// timed out and resumes it; the re-executed `ReceiveWait` then resolves
     /// with the no-match sentinel.
     pub fn receive_wait_timeout(&self, delay: Duration, target_actor: u64) -> TimerId {
+        self.receive_wait_timeout_at(Instant::now(), delay, target_actor)
+    }
+
+    /// Clock-relative variant of `receive_wait_timeout`. Pass the owning runtime's clock.
+    pub fn receive_wait_timeout_at(
+        &self,
+        now: Instant,
+        delay: Duration,
+        target_actor: u64,
+    ) -> TimerId {
         let id = TimerId(self.next_id.fetch_add(1, Ordering::SeqCst));
-        let fire_at = Instant::now() + delay;
+        let fire_at = now + delay;
 
         let entry = TimerEntry {
             id,
@@ -289,8 +357,18 @@ impl TimerWheel {
     /// Schedule an LLM retry for an actor after a delay. On fire the
     /// runtime re-builds and re-dispatches the in-flight request.
     pub fn schedule_llm_retry(&self, delay: Duration, target_actor: u64) -> TimerId {
+        self.schedule_llm_retry_at(Instant::now(), delay, target_actor)
+    }
+
+    /// Clock-relative variant of `schedule_llm_retry`. Pass the owning runtime's clock.
+    pub fn schedule_llm_retry_at(
+        &self,
+        now: Instant,
+        delay: Duration,
+        target_actor: u64,
+    ) -> TimerId {
         let id = TimerId(self.next_id.fetch_add(1, Ordering::SeqCst));
-        let fire_at = Instant::now() + delay;
+        let fire_at = now + delay;
 
         let entry = TimerEntry {
             id,
@@ -332,6 +410,11 @@ impl TimerWheel {
     ///
     /// Returns `None` if the timer is not found or has already fired.
     pub fn remaining(&self, timer_id: TimerId) -> Option<Duration> {
+        self.remaining_at(Instant::now(), timer_id)
+    }
+
+    /// Evaluate remaining duration relative to the caller's clock.
+    pub fn remaining_at(&self, now: Instant, timer_id: TimerId) -> Option<Duration> {
         let timers = match self.timers.read() {
             Ok(t) => t,
             Err(_) => return None,
@@ -339,7 +422,6 @@ impl TimerWheel {
 
         for entry in timers.iter() {
             if entry.id == timer_id && !entry.cancelled.load(Ordering::SeqCst) {
-                let now = Instant::now();
                 if entry.fire_at > now {
                     return Some(entry.fire_at - now);
                 }
@@ -499,7 +581,7 @@ mod tests {
 
         // Nothing fired at t=0
         let wheel = TimerWheel::new();
-        let _id = wheel.send_after(Duration::from_secs(5), 42, 1, vec![Value::int(1)]);
+        let _id = wheel.send_after_at(clock.now(), Duration::from_secs(5), 42, 1, vec![Value::int(1)]);
         assert_eq!(wheel.tick(clock.now()).len(), 0);
 
         // Advance 3s — still not enough
@@ -515,6 +597,40 @@ mod tests {
         // Virtual clock preserves its base
         assert!(clock.now() > start);
         assert!(clock.elapsed() >= Duration::from_secs(6));
+    }
+
+    #[test]
+    fn test_clock_relative_schedule_and_remaining_do_not_consult_wall_time() {
+        let wheel = TimerWheel::new();
+        let logical_now = Instant::now() + Duration::from_secs(60);
+        let timer_id = wheel.send_after_at(logical_now, Duration::from_secs(5), 77, 3, vec![]);
+        assert_eq!(wheel.next_deadline(), Some(logical_now + Duration::from_secs(5)));
+        assert_eq!(
+            wheel.remaining_at(logical_now, timer_id),
+            Some(Duration::from_secs(5)),
+        );
+        assert!(wheel.tick(logical_now + Duration::from_secs(4)).is_empty());
+        assert_eq!(
+            wheel.remaining_at(logical_now + Duration::from_secs(5), timer_id),
+            Some(Duration::ZERO),
+        );
+        let fired = wheel.tick(logical_now + Duration::from_secs(5));
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].0, 77);
+    }
+
+    #[test]
+    fn test_same_deadline_fires_in_stable_timer_id_order() {
+        let wheel = TimerWheel::new();
+        let logical_now = Instant::now();
+        for target in [7, 8, 9] {
+            wheel.send_after_at(logical_now, Duration::from_secs(1), target, 1, vec![]);
+        }
+        let fired = wheel.tick(logical_now + Duration::from_secs(1));
+        assert_eq!(
+            fired.iter().map(|(target, _)| *target).collect::<Vec<_>>(),
+            vec![7, 8, 9],
+        );
     }
 
     #[test]
