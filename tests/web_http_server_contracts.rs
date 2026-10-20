@@ -180,7 +180,6 @@ fn legacy_route_still_falls_back_over_real_http() {
     assert!(response_body(&response).starts_with("legacy"), "{response}");
 }
 
-
 #[test]
 fn web_redirect_returns_real_http_location_for_get() {
     let server = WebDevServer::bind(
@@ -222,7 +221,11 @@ fn web_redirect_after_post_uses_see_other() {
 
 #[test]
 fn web_redirect_rejects_external_and_header_injection_targets() {
-    for unsafe_target in ["//outside.example/login", "https://outside.example/", "/safe\r\nX-Injected: yes"] {
+    for unsafe_target in [
+        "//outside.example/login",
+        "https://outside.example/",
+        "/safe\r\nX-Injected: yes",
+    ] {
         let server = WebDevServer::bind(
             0,
             None,
