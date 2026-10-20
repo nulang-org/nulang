@@ -1536,6 +1536,47 @@ mod tests {
     }
 
     #[test]
+    fn request_context_is_restored_after_handler_panics() {
+        assert_eq!(current_request_method(), None);
+        let result = std::panic::catch_unwind(|| {
+            with_request_context(
+                RequestContext {
+                    request: HttpRequest {
+                        method: HttpMethod::Post,
+                        path: "/test".into(),
+                        headers: vec![],
+                        body: vec![],
+                    },
+                    params: HashMap::new(),
+                },
+                || panic!("simulate a handler panic"),
+            );
+        });
+        assert!(result.is_err());
+        assert_eq!(current_request_method(), None, "panic must not leak request context");
+    }
+
+    #[test]
+    fn nested_request_context_restores_the_outer_request() {
+        let request = |method| RequestContext {
+            request: HttpRequest {
+                method,
+                path: "/test".into(),
+                headers: vec![],
+                body: vec![],
+            },
+            params: HashMap::new(),
+        };
+        with_request_context(request(HttpMethod::Get), || {
+            with_request_context(request(HttpMethod::Post), || {
+                assert_eq!(current_request_method().as_deref(), Some("POST"));
+            });
+            assert_eq!(current_request_method().as_deref(), Some("GET"));
+        });
+        assert_eq!(current_request_method(), None);
+    }
+
+    #[test]
     fn test_middleware_security_headers() {
         let mut response = HttpResponse {
             status: 200,
