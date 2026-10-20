@@ -325,6 +325,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rejects_duplicated_query_and_form_inputs_only_when_scalar_bound() {
+        let headers = vec![(
+            "Content-Type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        )];
+        let captured = HttpRequestBindingInputs::capture(
+            "/users?limit=10&%6cimit=20&tags=a&tags=b",
+            &headers,
+            b"title=first&%74itle=second",
+        );
+        let query_limit = RouteBindingContract {
+            source: RouteBindingSource::Query,
+            source_name: "limit".into(),
+            handler_param: "limit".into(),
+            handler_index: 0,
+            ty: Some("Int".into()),
+        };
+        let form_title = RouteBindingContract {
+            source: RouteBindingSource::Form,
+            source_name: "title".into(),
+            handler_param: "title".into(),
+            handler_index: 1,
+            ty: Some("String".into()),
+        };
+        assert_eq!(
+            captured.ambiguous_bound_input(&[query_limit.clone()]),
+            Some(&query_limit)
+        );
+        assert_eq!(
+            captured.ambiguous_bound_input(&[form_title.clone()]),
+            Some(&form_title)
+        );
+        // Repeated unrelated keys must not break a scalar handler.
+        assert_eq!(
+            captured.ambiguous_bound_input(&[RouteBindingContract {
+                source: RouteBindingSource::Query,
+                source_name: "page".into(),
+                handler_param: "page".into(),
+                handler_index: 0,
+                ty: Some("Int".into()),
+            }]),
+            None
+        );
+    }
+
+    #[test]
+    fn duplicate_ui_action_identity_is_rejected_before_dispatch() {
+        let headers = vec![(
+            "Content-Type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        )];
+        for body in [
+            b"__nulang_action=delete&__nulang_action=save".as_slice(),
+            b"__nulang_ui_message=first&%5f_nulang_ui_message=second".as_slice(),
+        ] {
+            let captured = HttpRequestBindingInputs::capture("/", &headers, body);
+            assert!(captured.ui_message.is_none());
+            assert_eq!(captured.ui_message_error, Some(UiActionEnvelopeError::Malformed));
+        }
+    }
+
     fn percent_encode_form_value(value: &str) -> String {
         value
             .bytes()
