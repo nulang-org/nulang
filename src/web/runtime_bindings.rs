@@ -31,6 +31,9 @@ pub struct RuntimeRoutePlan {
     pub segments: Vec<RuntimeRouteSegment>,
     pub bindings: Vec<RouteBindingContract>,
     pub handler_param_count: usize,
+    /// Compiler-derived return type. The HTTP adapter consumes this metadata
+    /// to select a safe response representation, without re-parsing source.
+    pub response_type: Option<String>,
     /// True when every declared handler parameter is supplied directly from a
     /// route input and every path parameter has a direct binding. Legacy routes
     /// that still rely on ambient `Web.param` access keep this false.
@@ -120,6 +123,7 @@ pub fn compile_runtime_route_plan(
         segments,
         bindings: binding_compilation.bindings,
         handler_param_count: contract.handler_params.len(),
+        response_type: contract.response_type.clone(),
         direct_call,
     })
 }
