@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Experimental Web JSON and text responses — 2026-10-20
+- **Routed web handlers can select explicit HTTP JSON and plain-text responses** with status-bearing `Web.json_response` and `Web.text_response` host operations. Unlike ordinary HTML rendering, these responses carry appropriate `Content-Type` headers, do not inject client scripts, and default to `Cache-Control: no-store`.
+- **Malformed JSON, invalid body-bearing statuses, and responses exceeding 4 MiB fail closed** as HTTP 500 rather than returning partial success. Network-level tests cover normal 201/422 responses and error conditions.
+- **This change builds on the experimental redirect response work** and does not establish compiler-level `Json[T]`/response schemas, OpenAPI media inference, portable WASM host parity, or a production-qualified internet-facing server. Exact-head CI remains a promotion requirement.
+
 ### Fabric on-demand mailbox scoring — 2026-10-18
 - **Fabric publish admission now reads mailbox pressure only for matching local subscribers**, instead of allocating and populating an all-actor mailbox snapshot on every publish.
 - **Ported the regression and exact-base matched-fixture A/B harness** from #1708 onto current main. Historical unmatched-publish microbenchmarks were favorable; new-head CI and measurements remain the promotion gate.
