@@ -1013,6 +1013,12 @@ mod tests {
             "fn main() { let x = 0.1; let y = 0.2; -(x + 1.0 / 0.0) }",
             "fn main() { let x = 0.1; let y = 0.2; -(x + y) }",
             "fn main() { --(1 + 2,) }",
+            // Exact 2026-10-15 nightly shard reproducers (main 4415b19).
+            // Interpreter/JIT and interpreter/AOT outcomes must agree;
+            // error categories must not acquire duplicated runtime prefixes.
+            "let a = [1.5, 2.5]; 1.0 / 0.0 + a[1]",
+            "101.0 / 0.00 / 4.0",
+            "fn cond(c, a, b) { if- c then a else b }; cond(true, 1, 2) + cond(false, 10, 20)",
         ] {
             match differential_fuzz_one(src) {
                 Ok(_) => {}
