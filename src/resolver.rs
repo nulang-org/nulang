@@ -109,8 +109,6 @@ impl QualifiedImportIndex {
         Ok(())
     }
 
-    /// Resolve a public symbol without falling back to unrelated unqualified
-    /// bindings. Overloads are preserved for subsequent type-directed lookup.
     /// Select one explicitly exported symbol of the requested lexical kind.
     ///
     /// This is a fail-closed preparatory lookup, *not* overload selection:
@@ -151,6 +149,8 @@ impl QualifiedImportIndex {
         Ok(selected.clone())
     }
 
+    /// Resolve all public candidates, preserving overloads for later
+    /// signature-driven selection without falling back to local names.
     pub fn resolve(
         &self,
         alias: &str,
@@ -1000,7 +1000,10 @@ mod tests {
         let err = index
             .resolve_unique("codec", "encode", QualifiedSymbolKind::Function, sp())
             .unwrap_err();
-        assert!(format!("{err}").contains("ambiguous qualified reference"), "{err}");
+        assert!(
+            format!("{err}").contains("ambiguous qualified reference"),
+            "{err}"
+        );
         assert_eq!(index.resolve("codec", "encode", sp()).unwrap().len(), 2);
         std::fs::remove_file(path).unwrap();
     }
@@ -1050,11 +1053,17 @@ mod tests {
         let err = index
             .resolve_unique("api", "build", QualifiedSymbolKind::Type, sp())
             .unwrap_err();
-        assert!(format!("{err}").contains("not exported as a type"), "{err}");
+        assert!(
+            format!("{err}").contains("not exported as a type"),
+            "{err}"
+        );
         let unknown = index
             .resolve_unique("missing", "build", QualifiedSymbolKind::Function, sp())
             .unwrap_err();
-        assert!(format!("{unknown}").contains("unknown module alias"), "{unknown}");
+        assert!(
+            format!("{unknown}").contains("unknown module alias"),
+            "{unknown}"
+        );
         std::fs::remove_file(path).unwrap();
     }
 
