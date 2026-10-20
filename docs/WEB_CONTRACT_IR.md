@@ -197,7 +197,7 @@ effects provide a bounded first step toward status-aware responses:
 
 ```nulang
 fn create() {
-    perform Web.respond_json(201, "{\\\"created\\\":true}")
+    perform Web.respond_json(201, "{\"created\":true}")
 }
 
 fn invalid() {
