@@ -247,11 +247,11 @@ pub fn execute(
         }
         match receiver.recv_timeout(remaining.min(Duration::from_millis(10))) {
             Ok(message) => {
-                let captured = match message {
-                    PipeResult::Stdout(result) => (&mut stdout, result),
-                    PipeResult::Stderr(result) => (&mut stderr, result),
+                let (is_stdout, result) = match message {
+                    PipeResult::Stdout(result) => (true, result),
+                    PipeResult::Stderr(result) => (false, result),
                 };
-                let bytes = match captured.1 {
+                let bytes = match result {
                     Ok(bytes) => bytes,
                     Err(error) => {
                         stop_process(&mut child, status.is_none());
@@ -264,7 +264,11 @@ pub fn execute(
                     stop_process(&mut child, status.is_none());
                     return Err(ExecError::OutputLimitExceeded);
                 }
-                *captured.0 = Some(bytes);
+                if is_stdout {
+                    stdout = Some(bytes);
+                } else {
+                    stderr = Some(bytes);
+                }
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
