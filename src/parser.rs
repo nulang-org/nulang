@@ -7941,6 +7941,50 @@ mod tests {
     }
 
     #[test]
+    fn test_satisfies_checks_whole_binary_expression() {
+        // 'satisfies' is a low-precedence type check, not a cast on the RHS.
+        let expr = parse_expr("1 + 2 satisfies Int").unwrap();
+        match expr {
+            Expr::TypeAnnotate { expr, ty, .. } => {
+                assert!(matches!(expr.as_ref(), Expr::Binary { op: BinOp::Add, .. }));
+                assert_eq!(ty, Type::int());
+            }
+            other => panic!("expected a checked binary expression, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_satisfies_type_mismatch_is_rejected() {
+        let expr = parse_expr("42 satisfies Bool").unwrap();
+        let mut checker = crate::typechecker::TypeChecker::new();
+        let ctx = crate::typechecker::TypeContext::new();
+        assert!(checker.infer_expr(&ctx, &expr).is_err());
+    }
+
+    #[test]
+    fn test_satisfies_preserves_contextual_identifier() {
+        let expr = parse_expr("let satisfies = 7 in satisfies").unwrap();
+        assert!(matches!(expr, Expr::Let { name, .. } if name == "satisfies"));
+    }
+
+    #[test]
+    fn test_typed_discarded_binding_validates_annotation() {
+        let expr = parse_expr("let _: Bool = 42 in 7").unwrap();
+        let mut checker = crate::typechecker::TypeChecker::new();
+        let ctx = crate::typechecker::TypeContext::new();
+        assert!(checker.infer_expr(&ctx, &expr).is_err());
+    }
+
+    #[test]
+    fn test_typed_discarded_binding_allows_compatible_value() {
+        let expr = parse_expr("let _: Int = 42 in 7").unwrap();
+        let mut checker = crate::typechecker::TypeChecker::new();
+        let ctx = crate::typechecker::TypeContext::new();
+        let (_, ty) = checker.infer_expr(&ctx, &expr).unwrap();
+        assert_eq!(ty, Type::int());
+    }
+
+    #[test]
     fn test_parse_type_annotation() {
         let expr = parse_expr("(x : Int)").unwrap();
         match expr {
