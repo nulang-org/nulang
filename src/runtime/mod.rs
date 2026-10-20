@@ -2196,14 +2196,24 @@ impl Runtime {
             if self.actor_is_persistent(actor_id) {
                 let seq = self.next_sequence(actor_id);
                 let payload = self.persist_journal_payload(actor_id, journal_source_actor, args);
-                let _ = self.persistence.append_journal(
+                if let Err(error) = self.persistence.append_journal(
                     actor_id,
                     JournalEntry {
                         sequence: seq,
                         behavior_id,
                         payload,
                     },
-                );
+                ) {
+                    // A synchronous native ask must not mutate durable actor
+                    // state if its triggering command cannot be recovered.
+                    self.current_actor = None;
+                    return Err(NuError::VMError {
+                        msg: format!(
+                            "actor {actor_id} native ask durable journal admission failed: {error}"
+                        ),
+                        span: Span::default(),
+                    });
+                }
             }
             let _ = self.dispatch_native_handler(actor_id, behavior_idx, args);
             self.checkpoint_actor(actor_id);

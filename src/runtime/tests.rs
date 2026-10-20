@@ -8710,3 +8710,123 @@ fn confirmed_node_removal_forgets_crdt_receiver_knowledge() {
         "a peer that rejoins after confirmed removal must receive full state"
     );
 }
+
+struct RejectAskJournal {
+    inner: MemoryStore,
+}
+
+impl PersistenceStore for RejectAskJournal {
+    fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> std::io::Result<()> {
+        self.inner.save_snapshot(snapshot)
+    }
+
+    fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+        self.inner.load_snapshot(actor_id)
+    }
+
+    fn append_journal(&mut self, _actor_id: u64, _entry: JournalEntry) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "injected native ask journal failure",
+        ))
+    }
+
+    fn read_journal(&self, actor_id: u64) -> Vec<JournalEntry> {
+        self.inner.read_journal(actor_id)
+    }
+
+    fn append_workflow_event(
+        &mut self,
+        actor_id: u64,
+        event: WorkflowEvent,
+    ) -> std::io::Result<()> {
+        self.inner.append_workflow_event(actor_id, event)
+    }
+
+    fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
+        self.inner.read_workflow_events(actor_id)
+    }
+
+    fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> std::io::Result<()> {
+        self.inner.append_event(actor_id, entry)
+    }
+
+    fn read_events(&self, actor_id: u64) -> Vec<EventEntry> {
+        self.inner.read_events(actor_id)
+    }
+
+    fn latest_sequence(&self, actor_id: u64) -> u64 {
+        self.inner.latest_sequence(actor_id)
+    }
+
+    fn clear(&mut self, actor_id: u64) -> std::io::Result<()> {
+        self.inner.clear(actor_id)
+    }
+}
+
+#[test]
+fn persistent_native_ask_refuses_handler_when_command_journal_fails() {
+    fn increment(actor: &mut Actor, _args: &[Value]) {
+        let count = actor
+            .get_state_field("count")
+            .and_then(|value| value.as_int())
+            .unwrap_or(0);
+        actor.set_state_field("count", Value::int(count + 1));
+    }
+
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(RejectAskJournal {
+        inner: MemoryStore::new(),
+    });
+    let actor_id = rt.spawn_persistent_actor(
+        Box::new(|| vec![("count".to_string(), Value::int(0))]),
+        HashMap::new(),
+    );
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("inc", increment);
+
+    let error = rt
+        .ask_actor_sync(actor_id, 0, &[])
+        .expect_err("failed durable admission must stop the native ask");
+    assert!(error
+        .to_string()
+        .contains("injected native ask journal failure"));
+    assert_eq!(
+        rt.actors[&actor_id]
+            .get_state_field("count")
+            .and_then(|value| value.as_int()),
+        Some(0),
+        "handler must not mutate a persistent actor after journal failure"
+    );
+    assert!(rt.persistence.read_journal(actor_id).is_empty());
+    assert_eq!(
+        rt.current_actor, None,
+        "failed ask must clear runtime actor context"
+    );
+}
+
+#[test]
+fn transient_native_ask_does_not_require_durable_journal() {
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(RejectAskJournal {
+        inner: MemoryStore::new(),
+    });
+    let actor_id = rt.spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("inc", |actor, _args| {
+            actor.set_state_field("count", Value::int(1));
+        });
+
+    rt.ask_actor_sync(actor_id, 0, &[])
+        .expect("transient actor does not journal");
+    assert_eq!(
+        rt.actors[&actor_id]
+            .get_state_field("count")
+            .and_then(|value| value.as_int()),
+        Some(1)
+    );
+}
