@@ -86,7 +86,12 @@ impl MetricsSnapshot {
         out.push_str("# HELP nulang_actor_mailbox_depth Per-actor mailbox depth\n");
         out.push_str("# TYPE nulang_actor_mailbox_depth gauge\n");
         let mut sorted: Vec<_> = self.actors_mailboxes.clone();
-        sorted.sort_by_key(|m| -(m.depth as i64));
+        sorted.sort_unstable_by(|left, right| {
+            right
+                .depth
+                .cmp(&left.depth)
+                .then_with(|| left.actor_id.cmp(&right.actor_id))
+        });
         for m in sorted.iter().take(50) {
             out.push_str(&format!(
                 "nulang_actor_mailbox_depth{{actor_id=\"{}\"}} {}\n",
@@ -258,11 +263,19 @@ impl MetricsSnapshot {
             .filter(|s| !child_sup_ids.contains(&s.id))
             .collect();
 
-        if roots.is_empty() {
+        if self.supervisors.is_empty() {
             out.push_str("  (no supervisors)\n");
         }
+        let mut visited = std::collections::HashSet::new();
         for root in roots {
-            Self::render_supervisor_node(root, 0, &sup_by_id, &mut out);
+            Self::render_supervisor_node(root, 0, &sup_by_id, &mut visited, &mut out);
+        }
+        // Malformed snapshots can contain disconnected cycles with no roots.
+        // Include those components without repeatedly visiting their nodes.
+        for supervisor in &self.supervisors {
+            if !visited.contains(&supervisor.id) {
+                Self::render_supervisor_node(supervisor, 0, &sup_by_id, &mut visited, &mut out);
+            }
         }
         out
     }
@@ -271,9 +284,17 @@ impl MetricsSnapshot {
         sup: &super::SupervisorMetric,
         depth: usize,
         sup_by_id: &HashMap<u64, &super::SupervisorMetric>,
+        visited: &mut std::collections::HashSet<u64>,
         out: &mut String,
     ) {
         let indent = "  ".repeat(depth);
+        if !visited.insert(sup.id) {
+            out.push_str(&format!(
+                "{indent}(cycle/repeated supervisor id: {})\n",
+                sup.id
+            ));
+            return;
+        }
         out.push_str(&format!(
             "{}supervisor {} [{}]\n",
             indent, sup.name, sup.strategy
@@ -281,7 +302,7 @@ impl MetricsSnapshot {
         for child in &sup.children {
             match sup_by_id.get(&child.actor_id) {
                 Some(child_sup) => {
-                    Self::render_supervisor_node(child_sup, depth + 1, sup_by_id, out)
+                    Self::render_supervisor_node(child_sup, depth + 1, sup_by_id, visited, out)
                 }
                 None => {
                     out.push_str(&format!(
