@@ -306,7 +306,12 @@ pub(crate) fn handle_supervisor_parent_exit(
 pub(crate) fn shutdown_supervisor(rt: &mut Runtime, supervisor_id: u64, supervisor: &Supervisor) {
     // OTP starts children in specification order and shuts them down in
     // reverse order so later-started dependents stop before their providers.
-    let child_ids: Vec<u64> = supervisor.children.iter().rev().map(|(_, id)| *id).collect();
+    let child_ids: Vec<u64> = supervisor
+        .children
+        .iter()
+        .rev()
+        .map(|(_, id)| *id)
+        .collect();
     // Intentional shutdown is not an application error. In particular,
     // transient children must not interpret it as a reason to restart.
     let reason = ExitReason::Shutdown(None);
