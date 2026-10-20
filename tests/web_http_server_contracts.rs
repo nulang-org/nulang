@@ -369,3 +369,32 @@ fn explicit_response_metadata_does_not_escape_its_request() {
     );
     assert!(response_body(&second).starts_with("legacy"), "{second}");
 }
+
+#[test]
+fn rejected_explicit_response_does_not_commit_session_cookies() {
+    let source = r#"
+fn handler() {
+    perform Web.set_cookie("session", "do-not-commit")
+    perform Web.respond_json(201, "{invalid json}")
+}
+"#;
+    let (module, function_index) = compile_handler(source, "handler");
+    let route = WebRoute {
+        method: HttpMethod::Get,
+        path: "/invalid-cookie".to_string(),
+        handler_module: module,
+        handler_func_idx: function_index,
+    };
+    let server = WebDevServer::bind(0, None, None, vec![route])
+        .expect("bind explicit response with cookie");
+    let response = send_raw_request(
+        server.port,
+        "GET /invalid-cookie HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+        "{response}"
+    );
+    assert!(!response.contains("\r\nSet-Cookie:"), "{response}");
+    assert!(!response_body(&response).contains("do-not-commit"));
+}
