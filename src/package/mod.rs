@@ -16,5 +16,7 @@ mod identity_verify;
 pub mod lockfile;
 pub mod manifest;
 pub mod migrations;
+#[cfg(feature = "sqlite")]
+pub mod sqlite_migrations;
 pub mod module_invalidation;
 pub mod resolver;

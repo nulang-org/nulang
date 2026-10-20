@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Local SQLite transactional SQL migration runner (experimental) — 2026-10-20
+- **`nula db migrate --sqlite <file> --apply` is a gated explicit, local-only SQLite operation.** It applies tightly restricted single-statement DDL under an IMMEDIATE libSQL transaction with an authoritative in-database version/checksum ledger.
+- **A failed pending migration rolls back schema changes and ledger writes together.** Replays compare existing versions, filenames and BLAKE3 checksums before attempting new DDL. Non-transactional/multi-statement SQL is rejected.
+- **This does not qualify remote libSQL, PostgreSQL or Nulang Cloud deployment migrations.** Native toolchain and exact-head CI plus SQLite rollback/restart/concurrency drills are promotion prerequisites.
+
 ### Read-only migration plan and snapshot integrity checking — 2026-10-20
 - **`nula db plan [--json]` hashes version-ordered SQL source files using workspace BLAKE3** and rejects duplicates, missing versions, symlinked files, oversize inputs and malformed migration names.
 - **`nula db verify --ledger <file>` compares against an operator-provided JSON export of an external applied-migration ledger.** Changes to applied SQL fail the checksum verification; applied entries must be a strict prefix of source versions.
