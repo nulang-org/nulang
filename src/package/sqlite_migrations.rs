@@ -400,4 +400,111 @@ mod tests {
         assert_eq!(fs::metadata(external).unwrap().len(), 0);
         fs::remove_dir_all(root).unwrap();
     }
+
+    #[tokio::test]
+    async fn retry_after_a_failed_batch_commits_exactly_once_after_correction() {
+        let (root, db_path) = fixture();
+        let first = generate_migration(&root, "create_customers").unwrap();
+        let second = generate_migration(&root, "create_orders").unwrap();
+        fs::write(&first, "CREATE TABLE customers (id INTEGER PRIMARY KEY);").unwrap();
+        fs::write(&second, "CREATE TABLE orders (").unwrap();
+
+        assert!(apply_sqlite_migrations(&root, &db_path).await.is_err());
+
+        // Reopening and retrying must not see stale ledger state after failure.
+        fs::write(&second, "CREATE TABLE orders (id INTEGER PRIMARY KEY);").unwrap();
+        let recovered = apply_sqlite_migrations(&root, &db_path).await.unwrap();
+        assert_eq!(recovered.applied, 2);
+        let replayed = apply_sqlite_migrations(&root, &db_path).await.unwrap();
+        assert_eq!(replayed.applied, 2);
+
+        let db = libsql::Builder::new_local(&db_path).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        let mut ledger = conn
+            .query(
+                "SELECT COUNT(*) FROM __nulang_schema_migrations",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = ledger.next().await.unwrap().unwrap();
+        let count: i64 = row.get(0).unwrap();
+        assert_eq!(count, 2);
+        drop(ledger);
+        drop(conn);
+        drop(db);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_runners_do_not_double_apply_or_skip_ledger_versions() {
+        let (root, db_path) = fixture();
+        let first = generate_migration(&root, "create_customers").unwrap();
+        fs::write(
+            &first,
+            "CREATE TABLE customers (id INTEGER PRIMARY KEY);",
+        )
+        .unwrap();
+
+        // Both runners begin against the same empty local database.
+        // Serialized ledger checks under BEGIN IMMEDIATE must prevent duplicate DDL.
+        let (left, right) = tokio::join!(
+            apply_sqlite_migrations(&root, &db_path),
+            apply_sqlite_migrations(&root, &db_path)
+        );
+        assert!(left.is_ok(), "first runner failed: {left:?}");
+        assert!(right.is_ok(), "second runner failed: {right:?}");
+
+        let db = libsql::Builder::new_local(&db_path).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        let mut rows = conn
+            .query(
+                "SELECT version, file FROM __nulang_schema_migrations ORDER BY version",
+                (),
+            )
+            .await
+            .unwrap();
+        let first = rows.next().await.unwrap().unwrap();
+        let version: i64 = first.get(0).unwrap();
+        assert_eq!(version, 1);
+        assert!(rows.next().await.unwrap().is_none());
+        drop(rows);
+        drop(conn);
+        drop(db);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_runner_preserves_other_database_contents_across_migrations() {
+        let (root, db_path) = fixture();
+        let db = libsql::Builder::new_local(&db_path).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE existing (id INTEGER PRIMARY KEY)", ())
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO existing(id) VALUES(7)", ())
+            .await
+            .unwrap();
+        drop(conn);
+        drop(db);
+
+        let first = generate_migration(&root, "create_customers").unwrap();
+        fs::write(
+            &first,
+            "CREATE TABLE customers (id INTEGER PRIMARY KEY);",
+        )
+        .unwrap();
+        apply_sqlite_migrations(&root, &db_path).await.unwrap();
+
+        let db = libsql::Builder::new_local(&db_path).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        let mut rows = conn.query("SELECT id FROM existing", ()).await.unwrap();
+        let id: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(id, 7);
+        drop(rows);
+        drop(conn);
+        drop(db);
+        fs::remove_dir_all(root).unwrap();
+    }
+
 }

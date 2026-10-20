@@ -1,4 +1,7 @@
 # Nulang Changelog
+### SQLite migration recovery and concurrent apply regression coverage — 2026-10-20
+- Added direct SQLite integration cases for concurrent apply against one DB, retry after failed DDL, and noninterference with existing application tables. These tests are not yet certified by exact-head CI.
+
 ### Local SQLite transactional SQL migration runner (experimental) — 2026-10-20
 - **`nula db migrate --sqlite <file> --apply` is a gated explicit, local-only SQLite operation.** It applies tightly restricted single-statement DDL under an IMMEDIATE libSQL transaction with an authoritative in-database version/checksum ledger.
 - **A failed pending migration rolls back schema changes and ledger writes together.** Replays compare existing versions, filenames and BLAKE3 checksums before attempting new DDL. Non-transactional/multi-statement SQL is rejected.

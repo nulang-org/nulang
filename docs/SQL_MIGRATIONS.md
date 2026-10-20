@@ -70,3 +70,7 @@ The runner uses the repository's existing `libsql` embedded SQLite support. It s
 The source files are preflighted before connecting, limited to 1 MiB each and 16 MiB across the plan, and hashed again before use. The runner rejects symlinked SQL source files and local DB file. This is not hardened against concurrent adversarial filesystem mutation or alternate SQLite connections that tamper with the ledger.
 
 **Operational limits:** Local embedded SQLite only. Not for libSQL remote/replicated databases, Nulang Cloud tenants, or PostgreSQL. No down/rollback migrations, schema drift reconciliation, tenant propagation, or automatic deployment admission. A real environment must take a consistent database backup and run qualified crash/concurrency/fault-injection tests before promoting a migration. The loader has not undergone production security qualification.
+
+### Additional recovery test gates
+
+The SQLite runner now includes integration cases for two callers applying the same pending file concurrently (only one ledger entry must remain), for a failed DDL batch retried after source correction, and for preserving unrelated existing tables. These are **committed test cases, not evidence that they passed**; Rust toolchain/CI is still required. Because the implementation is experimental, production activation should also exercise actual process termination during a transaction and restart from a copied production-like database, including WAL/recovery and timeout paths.
