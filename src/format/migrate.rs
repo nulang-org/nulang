@@ -57,8 +57,12 @@ pub fn migrate_nbc(bytes: &[u8], target_version: u32) -> Result<Vec<u8>, FormatE
             },
         });
     }
-    // v1 -> v1: identity (the only registered migration today).
+    // v1 -> v1: preserve the original bytes, but only after validating
+    // that the artifact is a complete, loadable v1 module. A version header
+    // alone does not prove that the instruction stream or metadata is valid.
+    // In particular, do not return success for truncated or corrupt history.
     if from == 1 && target_version == 1 {
+        crate::bytecode::CodeModule::from_nbc(bytes)?;
         return Ok(bytes.to_vec());
     }
     Err(FormatError::UnsupportedVersion {
