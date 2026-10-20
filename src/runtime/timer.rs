@@ -124,7 +124,10 @@ impl PartialOrd for TimerEntry {
 impl Ord for TimerEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Reverse: BinaryHeap is max-heap, we want min-heap (soonest first)
-        other.fire_at.cmp(&self.fire_at).then_with(|| other.id.0.cmp(&self.id.0))
+        other
+            .fire_at
+            .cmp(&self.fire_at)
+            .then_with(|| other.id.0.cmp(&self.id.0))
     }
 }
 
@@ -169,10 +172,6 @@ impl TimerWheel {
         self.send_after_with_context(delay, target_actor, behavior_id, payload, String::new())
     }
 
-    /// Schedule a message to be sent to an actor after a delay, carrying an
-    /// opaque context string through to the fire handler.
-    ///
-    /// Returns the `TimerId` which can be used to cancel the timer.
     /// Schedule a message relative to an explicitly supplied clock.
     /// Runtime callers MUST pass `Runtime::now()` for virtual-clock safety.
     pub fn send_after_at(
@@ -183,9 +182,19 @@ impl TimerWheel {
         behavior_id: u16,
         payload: Vec<Value>,
     ) -> TimerId {
-        self.send_after_with_context_at(now, delay, target_actor, behavior_id, payload, String::new())
+        self.send_after_with_context_at(
+            now,
+            delay,
+            target_actor,
+            behavior_id,
+            payload,
+            String::new(),
+        )
     }
 
+    /// Schedule a message with context relative to the real clock.
+    ///
+    /// For virtual-time testing, use `send_after_with_context_at`.
     pub fn send_after_with_context(
         &self,
         delay: Duration,
@@ -242,7 +251,13 @@ impl TimerWheel {
     }
 
     /// Clock-relative variant of `exit_after`. Pass the owning runtime's clock.
-    pub fn exit_after_at(&self, now: Instant, delay: Duration, target_actor: u64, reason: String) -> TimerId {
+    pub fn exit_after_at(
+        &self,
+        now: Instant,
+        delay: Duration,
+        target_actor: u64,
+        reason: String,
+    ) -> TimerId {
         let id = TimerId(self.next_id.fetch_add(1, Ordering::SeqCst));
         let fire_at = now + delay;
 
@@ -295,7 +310,12 @@ impl TimerWheel {
     }
 
     /// Clock-relative variant of `receive_wait_timeout`. Pass the owning runtime's clock.
-    pub fn receive_wait_timeout_at(&self, now: Instant, delay: Duration, target_actor: u64) -> TimerId {
+    pub fn receive_wait_timeout_at(
+        &self,
+        now: Instant,
+        delay: Duration,
+        target_actor: u64,
+    ) -> TimerId {
         let id = TimerId(self.next_id.fetch_add(1, Ordering::SeqCst));
         let fire_at = now + delay;
 
@@ -341,7 +361,12 @@ impl TimerWheel {
     }
 
     /// Clock-relative variant of `schedule_llm_retry`. Pass the owning runtime's clock.
-    pub fn schedule_llm_retry_at(&self, now: Instant, delay: Duration, target_actor: u64) -> TimerId {
+    pub fn schedule_llm_retry_at(
+        &self,
+        now: Instant,
+        delay: Duration,
+        target_actor: u64,
+    ) -> TimerId {
         let id = TimerId(self.next_id.fetch_add(1, Ordering::SeqCst));
         let fire_at = now + delay;
 
@@ -556,7 +581,7 @@ mod tests {
 
         // Nothing fired at t=0
         let wheel = TimerWheel::new();
-        let _id = wheel.send_after(Duration::from_secs(5), 42, 1, vec![Value::int(1)]);
+        let _id = wheel.send_after_at(clock.now(), Duration::from_secs(5), 42, 1, vec![Value::int(1)]);
         assert_eq!(wheel.tick(clock.now()).len(), 0);
 
         // Advance 3s — still not enough
