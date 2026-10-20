@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Experimental structured `par` effect-scheduling metadata — 2026-10-19
+- **Compiler-owned safety metadata is available for future scoped execution.** Effects are classified separately from durable replay behavior; unknown calls and custom effects fail closed to sequential scheduling, while reference capability analysis remains an independent requirement. This does not enable parallel execution or alter runtime behavior.
+
 ### Fabric on-demand mailbox scoring — 2026-10-18
 - **Fabric publish admission now reads mailbox pressure only for matching local subscribers**, instead of allocating and populating an all-actor mailbox snapshot on every publish.
 - **Ported the regression and exact-base matched-fixture A/B harness** from #1708 onto current main. Historical unmatched-publish microbenchmarks were favorable; new-head CI and measurements remain the promotion gate.
