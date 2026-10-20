@@ -26,7 +26,11 @@ jobs:
           git show e7d1da13041c7d8020327b7892a551473a54f428:Cargo.toml > Cargo.toml
           git show e7d1da13041c7d8020327b7892a551473a54f428:Cargo.lock > Cargo.lock
           sed -i 's/wasmtime = { version = "48.0.6"/wasmtime = { version = "48.0.7"/' Cargo.toml
+          sed -i 's/^ureq = \["dep:ureq"\]/ureq = ["dep:ureq", "dep:native-tls"]/' Cargo.toml
+          sed -i 's/^ureq = { version = "2", optional = true }/ureq = { version = "2", optional = true, default-features = false, features = ["native-tls", "gzip"] }/' Cargo.toml
+          sed -i '/^ureq = { version = "2", optional = true, default-features = false/a native-tls = { version = "0.2", optional = true }' Cargo.toml
           grep '^wasmtime = ' Cargo.toml
+          grep '^ureq = ' Cargo.toml
       - name: Identify legacy root trust dependencies
         run: |
           cargo tree --locked --all-features -i webpki-roots@0.26.11 || true
@@ -42,7 +46,22 @@ jobs:
           cargo tree --locked --all-features -i webpki-roots@0.26.11 || true
           cargo tree --locked --all-features -i rustls-webpki@0.103.16 || true
           git diff --stat -- Cargo.lock Cargo.toml
-          git diff -- Cargo.lock | tail -n 220
+          if grep -A2 '^name = "webpki-roots"
+      - name: Upload Cargo-resolved lockfile
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: security-resolved-lockfile
+          path: Cargo.lock
+          if-no-files-found: error
+          retention-days: 1
+ Cargo.lock | grep -Fq '"0.26.11"'; then
+            echo "::error::Legacy root bundle remains in resolved graph"
+            exit 1
+          fi
+          echo "NULANG_LOCK_BEGIN"
+          cat Cargo.lock
+          echo "NULANG_LOCK_END"
       - name: Upload Cargo-resolved lockfile
         if: always()
         uses: actions/upload-artifact@v7
