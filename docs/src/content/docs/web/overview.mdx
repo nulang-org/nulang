@@ -119,6 +119,29 @@ In routed HTTP requests served by `nula dev`, `Web.redirect("/path")` returns a 
 Outside the routed HTTP request host (for example, standalone evaluation or static output), the operation retains its legacy meta-refresh HTML fallback for safe local targets. This is still an **experimental** web feature, not a production deployment security certification.
 :::
 
+### Explicit JSON and plain-text HTTP responses
+
+Routed handlers can return JSON or text without an HTML page wrapper by using the new Web host operations:
+
+```nulang
+import stdlib::web::host
+
+fn created() {
+    json_response(201, "{\"ok\":true}")
+}
+
+fn invalid() {
+    text_response(422, "Invalid form input")
+}
+```
+
+- `json_response(status, json)` sets `Content-Type: application/json; charset=utf-8` and checks that `json` is valid serialized JSON before sending it.
+- `text_response(status, body)` sends plain UTF-8 text, without HTML escaping or injected browser scripts.
+- For both operations, statuses 200–203, 207–299, and 400–599 are permitted. A redirect requires `Web.redirect`; 204/205/206, 3xx, or invalid statuses cannot be used with these body-bearing helpers.
+- A handler with malformed JSON, an unsupported status, or an oversized response body fails with HTTP 500. Responses are limited to 4 MiB and default to `Cache-Control: no-store`.
+
+These are **experimental request-host operations** that still return an `Html`-compatible value at the source level for compatibility with existing routing. They are an incremental implementation step, not the proposed complete `Json[T]`/`HttpResponse[T]` compiler type algebra. Outside routed HTTP serving, their returned values are HTML-escaped fallback strings.
+
 ### Reading the Request
 
 Inside a handler, these operations access the current request:
