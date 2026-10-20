@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Differential fuzzing campaign runner. Builds once and executes bounded batches
 # in separate processes to release JIT/AOT allocations between batches.
+# Each batch must report its actual generated count. --time may intentionally
+# stop early, but incomplete coverage is always reported rather than inferred.
 # Usage: scripts/difffuzz.sh [--seeds N] [--seed-base N|0xN] [--time SECONDS]
 #                             [--batch-size N] [--release] [--quiet]
 set -euo pipefail
