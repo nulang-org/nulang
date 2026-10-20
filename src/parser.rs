@@ -8993,4 +8993,110 @@ mod tests {
         let result = parse_expr("par");
         assert!(result.is_err(), "bare 'par' must be a parse error");
     }
+
+    // Crystal-inspired, compiler-only @derive(schema) contract.
+    // These tests intentionally precede the implementation commit.
+    fn schema_helper_json(source: &str) -> String {
+        let ast = parse(source).expect("schema derivation must parse");
+        let helper = ast
+            .decls
+            .iter()
+            .find(|decl| matches!(decl, Decl::Function { name, .. } if name == "payment_schema"))
+            .expect("derive must generate payment_schema");
+        match helper {
+            Decl::Function {
+                params,
+                ret_type,
+                body: Expr::Literal(Literal::String(schema), _),
+                ..
+            } => {
+                assert!(params.is_empty());
+                assert_eq!(*ret_type, Some(Type::string()));
+                schema.clone()
+            }
+            other => panic!("expected pure static string helper, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn derive_schema_emits_closed_record_schema_with_required_fields() {
+        let schema = schema_helper_json(
+            "@derive(schema)\ntype Payment = { currency: String, amount: Int, paid: Bool }",
+        );
+        let value: serde_json::Value = serde_json::from_str(&schema).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "amount": { "type": "integer" },
+                    "currency": { "type": "string" },
+                    "paid": { "type": "boolean" }
+                },
+                "required": ["amount", "currency", "paid"]
+            })
+        );
+    }
+
+    #[test]
+    fn derive_schema_bytes_ignore_record_declaration_field_order() {
+        let a = schema_helper_json(
+            "@derive(schema)\ntype Payment = { amount: Int, currency: String }",
+        );
+        let b = schema_helper_json(
+            "@derive(schema)\ntype Payment = { currency: String, amount: Int }",
+        );
+        assert_eq!(a, b, "generated JSON must be deterministic");
+    }
+
+    #[test]
+    fn derive_schema_accepts_nested_closed_records_and_arrays() {
+        let schema = schema_helper_json(
+            "@derive(schema)\ntype Payment = { items: [{ label: String, count: Int }] }",
+        );
+        let value: serde_json::Value = serde_json::from_str(&schema).unwrap();
+        assert_eq!(value["properties"]["items"]["type"], "array");
+        assert_eq!(value["properties"]["items"]["items"]["properties"]["count"]["type"], "integer");
+    }
+
+    #[test]
+    fn derive_schema_rejects_generic_records() {
+        let err = parse("@derive(schema)\ntype Payment[T] = { value: T }").unwrap_err();
+        assert!(format!("{err:?}").contains("cannot derive schema"), "{err:?}");
+    }
+
+    #[test]
+    fn derive_schema_rejects_unsupported_field_types() {
+        let err = parse("@derive(schema)\ntype Payment = { owner: &ref String }").unwrap_err();
+        assert!(format!("{err:?}").contains("cannot derive schema"), "{err:?}");
+    }
+
+    #[test]
+    fn derive_unknown_name_fails_instead_of_silently_ignoring() {
+        let err = parse("@derive(json)\ntype Payment = { amount: Int }").unwrap_err();
+        assert!(format!("{err:?}").contains("unsupported derive"), "{err:?}");
+    }
+
+    #[test]
+    fn derive_schema_rejects_duplicate_requests() {
+        let err = parse("@derive(schema, schema)\ntype Payment = { amount: Int }").unwrap_err();
+        assert!(format!("{err:?}").contains("duplicate derive"), "{err:?}");
+    }
+
+    #[test]
+    fn derive_schema_rejects_explicit_helper_name_collision() {
+        let err = parse(
+            "@derive(schema)\ntype Payment = { amount: Int }\nfn payment_schema() -> String { \"other\" }",
+        )
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("collides"), "{err:?}");
+    }
+
+    #[test]
+    fn derive_eq_still_generates_structural_helper() {
+        let ast = parse("@derive(eq)\ntype Point = { x: Int, y: Int }").unwrap();
+        assert!(ast.decls.iter().any(
+            |d| matches!(d, Decl::Function { name, .. } if name == "point_eq")
+        ));
+    }
 }
