@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Supervisor mailbox priority and bounded admission isolation — 2026-10-19
+- **Locally enqueued supervisor/system signals use the system-priority mailbox lane**, preventing earlier normal application traffic from delaying control signals on ordinary receives.
+- **Supervisor/system messages do not consume normal/bulk mailbox capacity credits**, even during selective receive. Total logical message depth is tracked separately from bounded application credits, which are released only after consuming normal/bulk messages.
+- **Nine focused regression tests** combine three local-priority tests with six system-credit, concurrent-admission, reset, and selective-receive tests ported from #1946. Unbounded system traffic remains possible, and exact-head CI must validate the combined fix before merge.
+
 ### Fabric on-demand mailbox scoring — 2026-10-18
 - **Fabric publish admission now reads mailbox pressure only for matching local subscribers**, instead of allocating and populating an all-actor mailbox snapshot on every publish.
 - **Ported the regression and exact-base matched-fixture A/B harness** from #1708 onto current main. Historical unmatched-publish microbenchmarks were favorable; new-head CI and measurements remain the promotion gate.
