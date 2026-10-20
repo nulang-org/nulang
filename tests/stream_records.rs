@@ -1,8 +1,8 @@
 //! Behavioral contracts for bounded incremental JSONL and RFC-4180-style CSV readers.
 //! This is a Rust-host API atop the experimental pull-stream foundation.
 
-use nulang::stream_records::{CsvRecords, JsonlError, JsonlRecords};
 use nulang::stream_pull::{PullStream, StreamFailure};
+use nulang::stream_records::{CsvRecords, JsonlError, JsonlRecords};
 use serde_json::json;
 use std::io::{BufReader, Cursor, ErrorKind};
 
@@ -11,13 +11,19 @@ fn jsonl_decodes_objects_arrays_and_scalars_in_source_order() {
     let input = Cursor::new(b"{\"id\":1}\n[true,false]\n42");
     let reader = JsonlRecords::new(input, 64).unwrap();
     let rows = PullStream::new(reader).try_collect_bounded(3).unwrap();
-    assert_eq!(rows, vec![json!({"id": 1}), json!([true, false]), json!(42)]);
+    assert_eq!(
+        rows,
+        vec![json!({"id": 1}), json!([true, false]), json!(42)]
+    );
 }
 
 #[test]
 fn jsonl_handles_empty_input_without_a_phantom_row() {
     let reader = JsonlRecords::new(Cursor::new(b""), 8).unwrap();
-    assert!(PullStream::new(reader).try_collect_bounded(2).unwrap().is_empty());
+    assert!(PullStream::new(reader)
+        .try_collect_bounded(2)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -52,12 +58,15 @@ fn csv_parses_quoted_delimiters_multiline_fields_and_escaped_quotes() {
     let buffered = BufReader::with_capacity(1, Cursor::new(input));
     let reader = CsvRecords::new(buffered, 128, 3).unwrap();
     let rows = PullStream::new(reader).try_collect_bounded(4).unwrap();
-    assert_eq!(rows, vec![
-        vec!["name", "notes"],
-        vec!["Alice", "hello, world"],
-        vec!["Bob", "line 1\nline 2"],
-        vec!["Chris", "say \"hello\""],
-    ]);
+    assert_eq!(
+        rows,
+        vec![
+            vec!["name", "notes"],
+            vec!["Alice", "hello, world"],
+            vec!["Bob", "line 1\nline 2"],
+            vec!["Chris", "say \"hello\""],
+        ]
+    );
 }
 
 #[test]
@@ -71,14 +80,20 @@ fn csv_preserves_empty_columns_trailing_column_and_utf8() {
 #[test]
 fn csv_rejects_oversize_multiline_record_before_emitting_partials() {
     let mut reader = CsvRecords::new(Cursor::new(b"\"123\n456\"\nsecond\n"), 8, 2).unwrap();
-    assert_eq!(reader.next().unwrap().unwrap_err().kind(), ErrorKind::InvalidData);
+    assert_eq!(
+        reader.next().unwrap().unwrap_err().kind(),
+        ErrorKind::InvalidData
+    );
     assert!(reader.next().is_none());
 }
 
 #[test]
 fn csv_rejects_more_columns_than_the_configured_limit() {
     let mut reader = CsvRecords::new(Cursor::new(b"a,b,c\n"), 40, 2).unwrap();
-    assert_eq!(reader.next().unwrap().unwrap_err().kind(), ErrorKind::InvalidData);
+    assert_eq!(
+        reader.next().unwrap().unwrap_err().kind(),
+        ErrorKind::InvalidData
+    );
     assert!(reader.next().is_none());
 }
 
@@ -86,7 +101,10 @@ fn csv_rejects_more_columns_than_the_configured_limit() {
 fn csv_rejects_bare_quote_unclosed_quote_and_non_newline_cr() {
     for bytes in [&b"a\"b\n"[..], &b"\"unclosed"[..], &b"a\rb"[..]] {
         let mut reader = CsvRecords::new(Cursor::new(bytes), 64, 2).unwrap();
-        assert_eq!(reader.next().unwrap().unwrap_err().kind(), ErrorKind::InvalidData);
+        assert_eq!(
+            reader.next().unwrap().unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
         assert!(reader.next().is_none());
     }
 }
