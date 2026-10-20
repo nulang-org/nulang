@@ -156,6 +156,19 @@ fn branch_conflict(
     None
 }
 
+/// Resolve directly executed lambda expressions through transparent type and
+/// capability annotations. Deferred/indirect closure calls are deliberately
+/// outside this local proof; they require effect and alias analysis.
+fn immediately_invoked_lambda(expr: &Expr) -> Option<(&[crate::ast::Param], &Expr)> {
+    match expr {
+        Expr::Lambda { params, body, .. } => Some((params, body)),
+        Expr::CapAnnotate { expr, .. } | Expr::TypeAnnotate { expr, .. } => {
+            immediately_invoked_lambda(expr)
+        }
+        _ => None,
+    }
+}
+
 fn summarize_expr(expr: &Expr, bound: &HashSet<String>, out: &mut ParallelBranchSummary) {
     match expr {
         Expr::Literal(..) | Expr::SelfRef(_) | Expr::Panic(..) => {}
@@ -179,6 +192,19 @@ fn summarize_expr(expr: &Expr, bound: &HashSet<String>, out: &mut ParallelBranch
             summarize_expr(func, bound, out);
             for arg in args {
                 summarize_expr(arg, bound, out);
+            }
+            // Constructing a closure is inert, but immediately invoking one
+            // executes its body in this branch. Account for captured writes,
+            // actor-state mutations, and control effects instead of treating
+            // the whole call as an opaque closure construction.
+            //
+            // This is not a general call/alias proof: parameter-to-argument
+            // aliasing and indirect calls still require the separate scoped
+            // ownership/effect checks before `par` becomes concurrent.
+            if let Some((params, body)) = immediately_invoked_lambda(func) {
+                let mut lambda_bound = bound.clone();
+                lambda_bound.extend(params.iter().map(|param| param.name.clone()));
+                summarize_expr(body, &lambda_bound, out);
             }
             out.effects.insert("Call".to_string());
         }
