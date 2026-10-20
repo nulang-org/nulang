@@ -230,6 +230,11 @@ impl ContainerDriver for DockerDriver {
             self.remove_container(&name);
         }
         let exit_code = result?;
+        let total_bytes = stdout.metadata().map_err(|e| e.to_string())?.len()
+            .saturating_add(stderr.metadata().map_err(|e| e.to_string())?.len());
+        if total_bytes > OUTPUT_LIMIT {
+            return Err("sandbox output limit exceeded".into());
+        }
         stdout.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
         stderr.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
         let mut out = String::new();
