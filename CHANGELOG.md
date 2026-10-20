@@ -1,6 +1,6 @@
 # Nulang Changelog
 ### Cross-runtime CI diagnostics and Go 1.27 comparison — 2026-10-19
-- **Cross-runtime benchmarking now prints captured command errors and partial timeout logs**, with a validated per-execution deadline (300 seconds by default) for warm-up and measured subprocesses; optional version probes stay quiet.
+- **Cross-runtime benchmarking now prints captured command errors and partial timeout logs**, with a validated per-execution deadline (300 seconds by default) for warm-up and measured subprocesses; optional version probes stay quiet and now fail open after 5 seconds instead of hanging report generation.
 - **The benchmark comparison CI now installs Go 1.27.x**, records the detected toolchain and measurement deadline in JSON output, and runs focused subprocess regression tests before expensive builds. No new performance claim is made; rerun exact-head measurements before comparing against historical Go 1.25 results.
 
 ### Fabric on-demand mailbox scoring — 2026-10-18
