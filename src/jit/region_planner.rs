@@ -734,6 +734,51 @@ mod planner_tests {
     }
 
     #[test]
+    fn test_containing_function_start_matches_linear_oracle_at_boundaries() {
+        // Function offsets are nondecreasing, as emitted by mir_codegen.
+        // Preserve the previous scan's behavior on empty tables, gaps and
+        // duplicate offsets (the latest matching function wins).
+        let offsets = [3usize, 8, 8, 25, 70];
+        for pc in [0, 2, 3, 7, 8, 9, 24, 25, 69, 70, 100] {
+            let expected = offsets
+                .iter()
+                .copied()
+                .filter(|&start| start <= pc)
+                .next_back()
+                .unwrap_or(0);
+            assert_eq!(containing_function_start(&offsets, pc), expected, "pc={pc}");
+        }
+        assert_eq!(containing_function_start(&[], 99), 0);
+    }
+
+    #[test]
+    fn test_containing_function_start_matches_large_function_table() {
+        let offsets: Vec<usize> = (0..16_384).map(|i| i * 3 + 2).collect();
+        for pc in [0, 1, 2, 3, 4, 5, 12_345, 49_150, 49_151, 65_535] {
+            let expected = offsets
+                .iter()
+                .copied()
+                .filter(|&start| start <= pc)
+                .next_back()
+                .unwrap_or(0);
+            assert_eq!(containing_function_start(&offsets, pc), expected, "pc={pc}");
+        }
+    }
+
+    #[test]
+    fn test_native_direct_call_cannot_look_into_previous_function() {
+        let mut module = CodeModule::new("function_boundary");
+        module.function_table.extend([0, 2]);
+        module.emit(Instruction::new1(OpCode::Const0, 254));
+        module.emit(Instruction::new0(OpCode::Ret));
+        module.emit(Instruction::new1(OpCode::Const0, 0));
+        module.emit(Instruction::new0(OpCode::Call));
+
+        assert_eq!(func_start_for(&module, 3), 2);
+        assert_eq!(native_direct_call(&module, 3, None, None), None);
+    }
+
+    #[test]
     fn test_region_planner_rejects_short_straight_line_region() {
         let mut module = CodeModule::new("planner_short");
         module.emit(Instruction::new1(OpCode::Const0, 0));
