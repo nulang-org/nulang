@@ -705,7 +705,7 @@ impl Runtime {
     /// borrow protects the unsharded Runtime from safe Rust aliases; it does
     /// not establish authority over independently managed native handles.
     #[allow(dead_code)] // Future diagnostic only; no collector invokes it.
-    pub(crate) fn orca_diagnostic_roots_at_quiescence(
+    pub(crate) fn orca_diagnostic_roots_if_not_executing(
         &mut self,
         actor_id: u64,
     ) -> Result<Vec<Value>, OrcaRootAuditBlocked> {
