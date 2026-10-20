@@ -1848,6 +1848,13 @@ impl TypeChecker {
 
             // Variables: look up in context, instantiate scheme
             Expr::Var(name, span) => self.infer_var(ctx, name, *span),
+            Expr::QualifiedVar { alias, name, span } => Err(NuError::parse_error(
+                format!(
+                    "unresolved qualified reference '{}::{}': module symbol binding is not yet supported",
+                    alias, name
+                ),
+                *span,
+            )),
 
             // Lambda: introduce fresh type vars for params, infer body
             Expr::Lambda {
