@@ -533,7 +533,7 @@ impl Mailbox {
             }
         }
         if let Some((_, _, payload)) = &self.active_match {
-            for &value in payload.iter() {
+            for &value in payload.as_slice() {
                 visit(value);
             }
         }
