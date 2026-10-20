@@ -99,6 +99,16 @@ mod tests {
 
 
     #[test]
+    fn identity_migration_reports_bad_magic_not_truncation() {
+        let mut bytes = CodeModule::new("t").to_nbc(None).unwrap();
+        bytes[0] = b'X';
+        assert!(matches!(
+            migrate_nbc(&bytes, 1),
+            Err(FormatError::BadMagic { .. })
+        ));
+    }
+
+    #[test]
     fn identity_migration_rejects_missing_metadata_body() {
         // A valid versioned header alone is not a valid .nbc artifact.
         // Previously migrate_nbc returned Ok for this truncated input.
