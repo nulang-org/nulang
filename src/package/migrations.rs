@@ -180,4 +180,120 @@ mod tests {
         assert_eq!(fs::read_dir(&external).unwrap().count(), 0);
         fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn migration_plan_digests_exact_sql_bytes_in_version_order() {
+        let root = fixture();
+        let first = generate_migration(&root, "create_customers").unwrap();
+        let second = generate_migration(&root, "add_email_index").unwrap();
+        fs::write(&first, "CREATE TABLE customers (id INTEGER PRIMARY KEY);\n").unwrap();
+        fs::write(&second, "CREATE INDEX customers_id ON customers(id);\n").unwrap();
+
+        let plan = read_migration_plan(&root).unwrap();
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].version, 1);
+        assert_eq!(plan[0].file, "000001_create_customers.sql");
+        assert_eq!(plan[1].version, 2);
+        assert_eq!(
+            plan[0].checksum_blake3,
+            blake3::hash(b"CREATE TABLE customers (id INTEGER PRIMARY KEY);\n")
+                .to_hex()
+                .to_string()
+        );
+        assert_ne!(plan[0].checksum_blake3, plan[1].checksum_blake3);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn verifies_external_applied_ledger_prefix_and_reports_only_pending() {
+        let root = fixture();
+        generate_migration(&root, "first").unwrap();
+        generate_migration(&root, "second").unwrap();
+        let plan = read_migration_plan(&root).unwrap();
+        let snapshot = root.join("trusted-ledger-export.json");
+        fs::write(
+            &snapshot,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "applied": [plan[0]]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let audit = verify_applied_snapshot(&root, &snapshot).unwrap();
+        assert_eq!(audit.applied, 1);
+        assert_eq!(audit.pending.len(), 1);
+        assert_eq!(audit.pending[0].version, 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_drifted_sql_after_a_snapshot_claims_it_was_applied() {
+        let root = fixture();
+        let path = generate_migration(&root, "first").unwrap();
+        let plan = read_migration_plan(&root).unwrap();
+        let snapshot = root.join("trusted-ledger-export.json");
+        fs::write(
+            &snapshot,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "applied": [plan[0]]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(&path, "-- modified after being recorded\n").unwrap();
+
+        let error = verify_applied_snapshot(&root, &snapshot).unwrap_err();
+        assert!(error.to_string().contains("checksum mismatch"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_gap_missing_source_and_out_of_order_ledger_entries() {
+        let root = fixture();
+        let one = generate_migration(&root, "one").unwrap();
+        let two = generate_migration(&root, "two").unwrap();
+        let plan = read_migration_plan(&root).unwrap();
+        let snapshot = root.join("ledger.json");
+
+        fs::write(
+            &snapshot,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "applied": [plan[1]]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(verify_applied_snapshot(&root, &snapshot).is_err());
+
+        fs::remove_file(&one).unwrap();
+        assert!(read_migration_plan(&root).is_err(), "missing version one");
+        assert!(!verify_applied_snapshot(&root, &snapshot).is_ok());
+        assert!(two.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_plan_refuses_symlinked_sql_files_or_ledger_snapshots() {
+        let root = fixture();
+        generate_migration(&root, "first").unwrap();
+        let outside = root.join("original.sql");
+        fs::write(&outside, "SELECT 1;").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("db/migrations/000002_alias.sql"))
+            .unwrap();
+        assert!(read_migration_plan(&root).is_err());
+        fs::remove_file(root.join("db/migrations/000002_alias.sql")).unwrap();
+
+        let snapshot = root.join("snapshot.json");
+        fs::write(&snapshot, r#"{"schema_version":1,"applied":[]}"#).unwrap();
+        let snapshot_link = root.join("snapshot-link.json");
+        std::os::unix::fs::symlink(&snapshot, &snapshot_link).unwrap();
+        assert!(verify_applied_snapshot(&root, &snapshot_link).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
 }
