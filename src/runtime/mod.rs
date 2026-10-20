@@ -6811,15 +6811,12 @@ impl Runtime {
                 // Python.call is variadic: reading regs[2..] would treat stale
                 // frame values (including actor references) as arguments.
                 // MIR stages the exact count in the reserved r14 scratch slot.
+                let max_staged = crate::mir_codegen::MAX_STAGED_ARGS as i64;
                 let arg_count = match regs
                     .get(crate::mir_codegen::SPILL_TEMP3 as usize)
                     .and_then(|value| value.as_int())
                 {
-                    Some(count)
-                        if (2..=crate::mir_codegen::MAX_STAGED_ARGS as i64).contains(&count) =>
-                    {
-                        count as usize
-                    }
+                    Some(count) if (2..=max_staged).contains(&count) => count as usize,
                     _ => {
                         eprintln!("Python call error: missing or invalid staged argument count");
                         return Some(Value::nil());
