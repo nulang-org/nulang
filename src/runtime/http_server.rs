@@ -209,7 +209,7 @@ fn read_http_request<R: Read>(reader: &mut R) -> Result<Option<HttpRequest>, Htt
             let host = value.trim();
             if host.bytes().any(|byte| {
                 byte <= 0x20
-                    || byte == 0x7f
+                    || byte >= 0x7f
                     || matches!(byte, b',' | b'/' | b'\\' | b'@' | b'#' | b'?')
             }) {
                 return Err(HttpReadError::BadRequest);
