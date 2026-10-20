@@ -313,7 +313,9 @@ impl Supervisor {
         let policy_allows = match policy {
             RestartPolicy::Permanent => true,
             RestartPolicy::Temporary => false,
-            RestartPolicy::Transient => !matches!(reason, ExitReason::Normal | ExitReason::Shutdown(_)),
+            RestartPolicy::Transient => {
+                !matches!(reason, ExitReason::Normal | ExitReason::Shutdown(_))
+            }
             RestartPolicy::RespawnOnNodeLoss => true,
         };
         if !policy_allows {
