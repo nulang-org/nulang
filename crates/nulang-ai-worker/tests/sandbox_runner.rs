@@ -165,3 +165,50 @@ fn task_text_never_becomes_a_shell_command() {
     let plans = driver.plans.lock().unwrap();
     assert_eq!(plans[0].argv, vec!["cargo", "test", "--workspace"]);
 }
+
+#[test]
+fn changing_a_host_receipt_after_execution_invalidates_verification() {
+    let (tmp, harness, _driver) = fixture(Ok(SandboxOutcome {
+        exit_code: 0,
+        stdout: "passed".into(),
+        stderr: String::new(),
+    }));
+    let (worker, verifier) = harness.into_parts();
+    let task = test_task();
+    let WorkerExecution::Executed { evidence } = worker.execute(&task) else { panic!() };
+    verifier.verify(&task, &evidence).unwrap();
+
+    let receipt_path = std::fs::read_dir(tmp.path().join("receipts"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::write(receipt_path, "tampered").unwrap();
+    assert!(verifier.verify(&task, &evidence).is_err());
+}
+
+#[test]
+fn receipts_cannot_be_stored_inside_read_only_source_workspace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    assert!(SandboxConfig::new(
+        &project,
+        project.join("receipts"),
+        format!("rust@sha256:{}", "a".repeat(64)),
+        vec!["cargo".into(), "test".into()],
+        "Tests pass",
+    ).is_err());
+}
+
+#[test]
+fn oversized_execution_output_is_rejected_even_with_success_status() {
+    let (_tmp, harness, _) = fixture(Ok(SandboxOutcome {
+        exit_code: 0,
+        stdout: "x".repeat(4 * 1024 * 1024 + 1),
+        stderr: String::new(),
+    }));
+    let (worker, _) = harness.into_parts();
+    assert!(matches!(worker.execute(&test_task()), WorkerExecution::Failed { .. }));
+}
