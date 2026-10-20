@@ -13,6 +13,9 @@
 
 pub mod shrink;
 
+#[cfg(test)]
+mod property_tests;
+
 use std::collections::{HashMap, VecDeque};
 
 /// Seed count for DST seed-sweep tests. Defaults to `default`; the
