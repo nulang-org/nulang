@@ -33,6 +33,9 @@ pub struct ParallelBranchSummary {
     pub authorities: BTreeSet<String>,
     /// Control-flow escapes that cannot be scoped to one concurrent child yet.
     pub control_escapes: BTreeSet<String>,
+    /// Mutable lambda formals without proven unique argument ownership.
+    /// These are rejected until the scoped executor has alias provenance.
+    pub unproven_parameter_aliases: BTreeSet<String>,
     /// Deferred cleanup currently depends on sequential scope-exit ordering.
     pub uses_defer: bool,
 }
@@ -55,6 +58,21 @@ pub fn validate_parallel_branches(
                     branch.index,
                     branch
                         .control_escapes
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                span,
+            ));
+        }
+        if !branch.unproven_parameter_aliases.is_empty() {
+            return Err(par_error(
+                format!(
+                    "par branch {} mutates immediate lambda parameter(s) without an ownership proof ({}); aliasing of task arguments is not established",
+                    branch.index,
+                    branch
+                        .unproven_parameter_aliases
                         .iter()
                         .cloned()
                         .collect::<Vec<_>>()
@@ -172,6 +190,126 @@ fn branch_conflict(
     None
 }
 
+/// Resolve directly executed lambda expressions through transparent type and
+/// capability annotations. Deferred/indirect closure calls are deliberately
+/// outside this local proof; they require effect and alias analysis.
+fn immediately_invoked_lambda(expr: &Expr) -> Option<(&[crate::ast::Param], &Expr)> {
+    match expr {
+        Expr::Lambda { params, body, .. } => Some((params, body)),
+        Expr::CapAnnotate { expr, .. } | Expr::TypeAnnotate { expr, .. } => {
+            immediately_invoked_lambda(expr)
+        }
+        _ => None,
+    }
+}
+
+/// Only a direct variable reference (optionally annotated) establishes a
+/// syntactically known alias. Arbitrary expressions need ownership provenance.
+fn direct_alias_source(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Var(name, _) => Some(name.as_str()),
+        Expr::CapAnnotate { expr, .. } | Expr::TypeAnnotate { expr, .. } => {
+            direct_alias_source(expr)
+        }
+        _ => None,
+    }
+}
+
+/// Conservatively detect aggregate writes through let-bound reference aliases.
+/// The alias set is lexical: shadowing replaces its entry, and only a direct
+/// variable binding propagates it. This is not a proof for indirect calls or
+/// aliases hidden behind results returned by other functions.
+fn mutates_aggregate_through_alias(expr: &Expr, aliases: &HashSet<String>) -> bool {
+    match expr {
+        Expr::Assign { target, value, .. } => {
+            let writes_alias = matches!(
+                target.as_ref(),
+                Expr::FieldAccess { .. } | Expr::Index { .. }
+            ) && root_var(target).is_some_and(|root| aliases.contains(root));
+            writes_alias || mutates_aggregate_through_alias(value, aliases)
+        }
+        Expr::Let {
+            name, value, body, ..
+        } => {
+            let in_initializer = mutates_aggregate_through_alias(value, aliases);
+            let mut nested = aliases.clone();
+            nested.remove(name);
+            if direct_alias_source(value).is_some_and(|source| aliases.contains(source)) {
+                nested.insert(name.clone());
+            }
+            in_initializer || mutates_aggregate_through_alias(body, &nested)
+        }
+        Expr::Block { exprs, .. } | Expr::Par { exprs, .. } => exprs
+            .iter()
+            .any(|part| mutates_aggregate_through_alias(part, aliases)),
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            mutates_aggregate_through_alias(cond, aliases)
+                || mutates_aggregate_through_alias(then_branch, aliases)
+                || else_branch.as_ref().is_some_and(|other| {
+                    mutates_aggregate_through_alias(other, aliases)
+                })
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            mutates_aggregate_through_alias(scrutinee, aliases)
+                || arms.iter().any(|(pattern, guard, body)| {
+                    let mut shadowed = HashSet::new();
+                    pattern_bindings(pattern, &mut shadowed);
+                    let nested: HashSet<String> =
+                        aliases.difference(&shadowed).cloned().collect();
+                    guard.as_ref().is_some_and(|check| {
+                        mutates_aggregate_through_alias(check, &nested)
+                    }) || mutates_aggregate_through_alias(body, &nested)
+                })
+        }
+        Expr::While { cond, body, .. } => {
+            mutates_aggregate_through_alias(cond, aliases)
+                || mutates_aggregate_through_alias(body, aliases)
+        }
+        Expr::For {
+            var, iterable, body, ..
+        } => {
+            let mut nested = aliases.clone();
+            nested.remove(var);
+            mutates_aggregate_through_alias(iterable, aliases)
+                || mutates_aggregate_through_alias(body, &nested)
+        }
+        Expr::App { func, args, .. } => {
+            let in_args = args
+                .iter()
+                .any(|arg| mutates_aggregate_through_alias(arg, aliases));
+            if let Some((params, body)) = immediately_invoked_lambda(func) {
+                let mut nested = aliases.clone();
+                for param in params {
+                    nested.remove(&param.name);
+                }
+                in_args || mutates_aggregate_through_alias(body, &nested)
+            } else {
+                in_args || mutates_aggregate_through_alias(func, aliases)
+            }
+        }
+        Expr::Binary { left, right, .. } | Expr::Pipe { left, right, .. } => {
+            mutates_aggregate_through_alias(left, aliases)
+                || mutates_aggregate_through_alias(right, aliases)
+        }
+        Expr::CapAnnotate { expr, .. }
+        | Expr::TypeAnnotate { expr, .. }
+        | Expr::Unary { expr, .. }
+        | Expr::Recover { body: expr, .. }
+        | Expr::Hide { body: expr, .. }
+        | Expr::Seal { body: expr, .. } => mutates_aggregate_through_alias(expr, aliases),
+        // A closure declaration does not execute its body.
+        Expr::Lambda { .. } => false,
+        _ => false,
+    }
+}
+
 fn summarize_expr(expr: &Expr, bound: &HashSet<String>, out: &mut ParallelBranchSummary) {
     match expr {
         Expr::Literal(..) | Expr::SelfRef(_) | Expr::Panic(..) => {}
@@ -197,15 +335,67 @@ fn summarize_expr(expr: &Expr, bound: &HashSet<String>, out: &mut ParallelBranch
             for arg in args {
                 summarize_expr(arg, bound, out);
             }
+            // Constructing a closure is inert, but immediately invoking one
+            // executes its body in this branch. Account for captured writes,
+            // actor-state mutations, and control effects instead of treating
+            // the whole call as an opaque closure construction.
+            //
+            // Without alias provenance, mutation of an aggregate rooted at
+            // a lambda parameter must fail closed: that formal can alias an
+            // argument simultaneously read by a sibling branch. Summarize
+            // once with the formal names considered free to reveal mutated
+            // roots, then normally with them bound to find captured effects.
+            // Indirect calls and rebinding aliases still require a separate
+            // compiler ownership/effect proof before `par` runs concurrently.
+            if let Some((params, body)) = immediately_invoked_lambda(func) {
+                if !params.is_empty() {
+                    let mut alias_scope = bound.clone();
+                    for param in params {
+                        alias_scope.remove(&param.name);
+                    }
+                    let mut alias_check = ParallelBranchSummary::default();
+                    summarize_expr(body, &alias_scope, &mut alias_check);
+                    for param in params {
+                        if alias_check.heap_mutations.contains(&param.name) {
+                            out.unproven_parameter_aliases.insert(param.name.clone());
+                        }
+                    }
+                }
+                let mut lambda_bound = bound.clone();
+                lambda_bound.extend(params.iter().map(|param| param.name.clone()));
+                // A return from the invoked function finishes that function,
+                // not the enclosing scoped-concurrency branch. Preserve an
+                // earlier branch-level return, if one was already observed.
+                let enclosing_return = out.control_escapes.contains("return");
+                summarize_expr(body, &lambda_bound, out);
+                if !enclosing_return {
+                    out.control_escapes.remove("return");
+                }
+            }
             out.effects.insert("Call".to_string());
-            // Until callee effect summaries are threaded into this pass, an
-            // arbitrary call may hide observable effects.
+            // An unknown callee may hide observable effects. This constraint
+            // remains even after inspecting the immediate lambda body.
             constrain(out, ParallelEffectConstraint::SequentialOnly);
         }
         Expr::Let {
             name, value, body, ..
         } => {
             summarize_expr(value, bound, out);
+            // A lexical alias can hide a write that the ordinary bound-name
+            // summary ignores. Recover the original root when the initializer
+            // is a direct variable reference. Local values with no alias
+            // source (e.g. a fresh array literal) retain their existing rules.
+            if let Some(source) = direct_alias_source(value) {
+                let mut aliases = HashSet::new();
+                aliases.insert(name.clone());
+                if mutates_aggregate_through_alias(body, &aliases) {
+                    if bound.contains(source) {
+                        out.unproven_parameter_aliases.insert(source.to_string());
+                    } else {
+                        out.heap_mutations.insert(source.to_string());
+                    }
+                }
+            }
             let mut nested = bound.clone();
             nested.insert(name.clone());
             summarize_expr(body, &nested, out);
@@ -796,4 +986,354 @@ mod tests {
             .authorities
             .contains("Net::TcpOut(api.example.com:443)"));
     }
+
+    #[test]
+    fn immediate_lambda_mutation_through_local_alias_is_rejected() {
+        let mutating = Expr::Lambda {
+            params: vec![crate::ast::Param::new("view", None)],
+            ret_type: None,
+            body: Box::new(Expr::Let {
+                name: "alias".to_string(),
+                ty: None,
+                value: Box::new(var("view")),
+                body: Box::new(Expr::Assign {
+                    target: Box::new(Expr::Index {
+                        arr: Box::new(var("alias")),
+                        idx: Box::new(int(0)),
+                        span: sp(),
+                    }),
+                    value: Box::new(int(5)),
+                    span: sp(),
+                }),
+                mutable: false,
+                let_in: true,
+                span: sp(),
+            }),
+            effect: None,
+            span: sp(),
+        };
+        assert!(
+            validate_parallel_branches(
+                &[
+                    Expr::App {
+                        func: Box::new(mutating),
+                        args: vec![var("shared")],
+                        span: sp(),
+                    },
+                    var("shared"),
+                ],
+                sp()
+            )
+            .is_err(),
+            "a let-bound alias must not conceal mutation of a lambda parameter"
+        );
+    }
+
+    #[test]
+    fn immediate_lambda_locally_allocated_alias_is_not_a_parameter_alias() {
+        let mutating_local = Expr::Lambda {
+            params: vec![crate::ast::Param::new("view", None)],
+            ret_type: None,
+            body: Box::new(Expr::Let {
+                name: "alias".to_string(),
+                ty: None,
+                value: Box::new(Expr::Array(vec![int(1)], sp())),
+                body: Box::new(Expr::Assign {
+                    target: Box::new(Expr::Index {
+                        arr: Box::new(var("alias")),
+                        idx: Box::new(int(0)),
+                        span: sp(),
+                    }),
+                    value: Box::new(int(5)),
+                    span: sp(),
+                }),
+                mutable: false,
+                let_in: true,
+                span: sp(),
+            }),
+            effect: None,
+            span: sp(),
+        };
+        assert!(
+            validate_parallel_branches(
+                &[
+                    Expr::App {
+                        func: Box::new(mutating_local),
+                        args: vec![var("shared")],
+                        span: sp(),
+                    },
+                    var("shared"),
+                ],
+                sp()
+            )
+            .is_ok(),
+            "a proven local allocation is not a direct alias of the parameter"
+        );
+    }
+
+    #[test]
+    fn immediately_invoked_lambda_cannot_mutate_unproven_reference_argument() {
+        let mutating = Expr::Lambda {
+            params: vec![crate::ast::Param::new("view", None)],
+            ret_type: None,
+            body: Box::new(Expr::Assign {
+                target: Box::new(Expr::Index {
+                    arr: Box::new(var("view")),
+                    idx: Box::new(int(0)),
+                    span: sp(),
+                }),
+                value: Box::new(int(5)),
+                span: sp(),
+            }),
+            effect: None,
+            span: sp(),
+        };
+        let branches = vec![
+            Expr::App {
+                func: Box::new(mutating),
+                args: vec![var("shared")],
+                span: sp(),
+            },
+            var("shared"),
+        ];
+        assert!(
+            validate_parallel_branches(&branches, sp()).is_err(),
+            "a mutable formal parameter can alias an argument read by a sibling"
+        );
+    }
+
+    #[test]
+    fn immediately_invoked_lambda_checks_formal_even_if_outer_scope_shadows_name() {
+        let mutating = Expr::Lambda {
+            params: vec![crate::ast::Param::new("shared", None)],
+            ret_type: None,
+            body: Box::new(Expr::Assign {
+                target: Box::new(Expr::FieldAccess {
+                    expr: Box::new(var("shared")),
+                    field: "count".to_string(),
+                    span: sp(),
+                }),
+                value: Box::new(int(5)),
+                span: sp(),
+            }),
+            effect: None,
+            span: sp(),
+        };
+        let branches = vec![Expr::Let {
+            name: "shared".to_string(),
+            ty: None,
+            value: Box::new(var("source")),
+            body: Box::new(Expr::App {
+                func: Box::new(mutating),
+                args: vec![var("shared")],
+                span: sp(),
+            }),
+            mutable: false,
+            let_in: true,
+            span: sp(),
+        }];
+        assert!(
+            validate_parallel_branches(&branches, sp()).is_err(),
+            "the inner lambda parameter must not inherit the outer bound name"
+        );
+    }
+
+    #[test]
+    fn immediate_lambda_return_is_local_to_lambda_scope() {
+        let returning = Expr::Lambda {
+            params: vec![],
+            ret_type: None,
+            body: Box::new(Expr::Return(Some(Box::new(int(7))), sp())),
+            effect: None,
+            span: sp(),
+        };
+        let branches = vec![
+            Expr::App {
+                func: Box::new(returning),
+                args: vec![],
+                span: sp(),
+            },
+            int(3),
+        ];
+        assert!(
+            validate_parallel_branches(&branches, sp()).is_ok(),
+            "a return from an invoked lambda must not escape the par branch"
+        );
+    }
+
+    #[test]
+    fn immediately_invoked_lambda_pure_parameter_read_is_allowed() {
+        let pure = Expr::Lambda {
+            params: vec![crate::ast::Param::new("value", None)],
+            ret_type: None,
+            body: Box::new(Expr::Binary {
+                op: BinOp::Add,
+                left: Box::new(var("value")),
+                right: Box::new(int(1)),
+                span: sp(),
+            }),
+            effect: None,
+            span: sp(),
+        };
+        let branches = vec![
+            Expr::App {
+                func: Box::new(pure),
+                args: vec![var("shared")],
+                span: sp(),
+            },
+            var("shared"),
+        ];
+        assert!(validate_parallel_branches(&branches, sp()).is_ok());
+    }
+
+    #[test]
+    fn immediate_lambda_captured_heap_mutation_conflicts_with_other_branch_read() {
+        let mutating = Expr::Lambda {
+            params: vec![],
+            ret_type: None,
+            body: Box::new(Expr::Assign {
+                target: Box::new(Expr::Index {
+                    arr: Box::new(var("shared")),
+                    idx: Box::new(int(0)),
+                    span: sp(),
+                }),
+                value: Box::new(int(5)),
+                span: sp(),
+            }),
+            effect: None,
+            span: sp(),
+        };
+        let branches = vec![
+            Expr::App {
+                func: Box::new(mutating),
+                args: vec![],
+                span: sp(),
+            },
+            var("shared"),
+        ];
+        assert!(
+            validate_parallel_branches(&branches, sp()).is_err(),
+            "immediate lambda execution must not hide a captured heap mutation"
+        );
+    }
+
+    #[test]
+    fn immediate_lambda_actor_state_write_is_rejected() {
+        let mutating = Expr::Lambda {
+            params: vec![],
+            ret_type: None,
+            body: Box::new(Expr::Assign {
+                target: Box::new(Expr::FieldAccess {
+                    expr: Box::new(Expr::SelfRef(sp())),
+                    field: "counter".to_string(),
+                    span: sp(),
+                }),
+                value: Box::new(int(5)),
+                span: sp(),
+            }),
+            effect: None,
+            span: sp(),
+        };
+        assert!(
+            validate_parallel_branches(
+                &[Expr::App {
+                    func: Box::new(mutating),
+                    args: vec![],
+                    span: sp(),
+                }],
+                sp()
+            )
+            .is_err(),
+            "calling a lambda must not bypass actor-state isolation"
+        );
+    }
+
+    #[test]
+    fn constructing_a_lambda_does_not_execute_its_body() {
+        let deferred = Expr::Lambda {
+            params: vec![],
+            ret_type: None,
+            body: Box::new(Expr::Assign {
+                target: Box::new(var("shared")),
+                value: Box::new(int(7)),
+                span: sp(),
+            }),
+            effect: None,
+            span: sp(),
+        };
+        assert!(validate_parallel_branches(&[deferred, var("shared")], sp()).is_ok());
+    }
+
+    #[test]
+    fn immediately_invoked_lambda_exposes_suspension_and_captured_mutation() {
+        let branch = Expr::App {
+            func: Box::new(Expr::Lambda {
+                params: vec![],
+                ret_type: None,
+                body: Box::new(Expr::Block {
+                    exprs: vec![
+                        Expr::Perform {
+                            effect: "Timer".to_string(),
+                            op: "sleep".to_string(),
+                            args: vec![int(10)],
+                            span: sp(),
+                        },
+                        Expr::Assign {
+                            target: Box::new(Expr::Index {
+                                arr: Box::new(var("shared")),
+                                idx: Box::new(int(0)),
+                                span: sp(),
+                            }),
+                            value: Box::new(int(5)),
+                            span: sp(),
+                        },
+                    ],
+                    span: sp(),
+                }),
+                effect: None,
+                span: sp(),
+            }),
+            args: vec![],
+            span: sp(),
+        };
+        let summary = summarize_branch(0, &branch);
+        assert!(summary.may_suspend, "lambda execution must propagate may_suspend");
+        assert!(summary.effects.contains("Timer.sleep"));
+        assert_eq!(
+            summary.effect_constraint,
+            ParallelEffectConstraint::SequentialOnly
+        );
+        assert!(
+            validate_parallel_branches(&[branch, var("shared")], sp()).is_err(),
+            "effect and capture checks must agree on the executed body"
+        );
+    }
+
+    #[test]
+    fn immediate_lambda_mutable_alias_still_requires_ownership_proof_with_effects() {
+        let branch = Expr::App {
+            func: Box::new(Expr::Lambda {
+                params: vec![crate::ast::Param::new("view", None)],
+                ret_type: None,
+                body: Box::new(Expr::Assign {
+                    target: Box::new(Expr::Index {
+                        arr: Box::new(var("view")),
+                        idx: Box::new(int(0)),
+                        span: sp(),
+                    }),
+                    value: Box::new(int(5)),
+                    span: sp(),
+                }),
+                effect: None,
+                span: sp(),
+            }),
+            args: vec![var("shared")],
+            span: sp(),
+        };
+        assert!(
+            validate_parallel_branches(&[branch, var("shared")], sp()).is_err(),
+            "the effect-analysis stack must retain the alias fail-closed rule"
+        );
+    }
+
 }
