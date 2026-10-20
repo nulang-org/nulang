@@ -2173,7 +2173,7 @@ impl NulangLanguageServer {
                 Self::extract_expr_types(right, source, map);
             }
             // Leaf nodes: no sub-expressions to walk
-            Expr::Literal(..) | Expr::Var(..) | Expr::SelfRef(..) => {}
+            Expr::Literal(..) | Expr::Var(..) | Expr::QualifiedVar { .. } | Expr::SelfRef(..) => {}
             // Consume/recover: walk inner expression
             Expr::Consume { expr, .. } => {
                 Self::extract_expr_types(expr, source, map);
