@@ -1,5 +1,10 @@
 # Nulang Changelog
 
+### Explicit unresolved qualified references (experimental) — 2026-10-19
+- **The parser records `alias::symbol` as `Expr::QualifiedVar` instead of an unqualified string variable.** The formatter round-trips this source form; missing symbols produce a parser error.
+- **Type/effect/capability frontends reject unbound qualified references**, and HIR lowering checks the internal invariant rather than silently emitting an incorrect local variable.
+- Parser, formatter, and typechecker regressions were added before implementation. Rust/Cargo execution and exact-head CI are required before promotion. Qualified imports remain non-executable.
+
 ### Qualified export kind checks (experimental) — 2026-10-19
 - **Resolver-only qualified lookup now requires the expected symbol category.** Wrong-kind exports and ambiguous same-kind overloads fail closed instead of silently choosing a candidate.
 - Four regression tests cover ambiguous functions, separate type/function lookup, incorrect lexical kinds, and alias-independent symbol identity.
