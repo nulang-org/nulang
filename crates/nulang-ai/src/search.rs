@@ -73,6 +73,32 @@ impl std::fmt::Display for SearchError {
 
 impl std::error::Error for SearchError {}
 
+/// An owned hit suitable for a remote or embedded backend boundary.
+///
+/// Scores are backend-specific and should not be compared across engines.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OwnedSearchHit {
+    pub document: SearchDocument,
+    pub score: f64,
+}
+
+/// Provider-independent, synchronous search API.
+///
+/// Authorize namespace access in the application before invoking a backend.
+/// Remote async backends can provide a separate asynchronous API or a
+/// synchronous adapter; this trait does not imply cloud availability.
+pub trait SearchBackend {
+    fn index_document(&mut self, document: SearchDocument) -> Result<(), SearchError>;
+    fn remove_document(&mut self, namespace: &str, id: &str) -> Result<bool, SearchError>;
+    fn query(&self, query: &SearchQuery) -> Result<Vec<OwnedSearchHit>, SearchError>;
+    fn facets(
+        &self,
+        namespace: &str,
+        attribute: &str,
+        filters: &BTreeMap<String, String>,
+    ) -> Result<BTreeMap<String, usize>, SearchError>;
+}
+
 /// Serializable source documents. The inverted index is rebuilt on restore.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchSnapshot {
@@ -294,6 +320,35 @@ impl EmbeddedSearch {
             index.upsert(document)?;
         }
         Ok(index)
+    }
+}
+
+impl SearchBackend for EmbeddedSearch {
+    fn index_document(&mut self, document: SearchDocument) -> Result<(), SearchError> {
+        EmbeddedSearch::upsert(self, document)
+    }
+
+    fn remove_document(&mut self, namespace: &str, id: &str) -> Result<bool, SearchError> {
+        Ok(EmbeddedSearch::delete(self, namespace, id))
+    }
+
+    fn query(&self, query: &SearchQuery) -> Result<Vec<OwnedSearchHit>, SearchError> {
+        Ok(EmbeddedSearch::search(self, query)
+            .into_iter()
+            .map(|hit| OwnedSearchHit {
+                document: hit.document.clone(),
+                score: hit.score,
+            })
+            .collect())
+    }
+
+    fn facets(
+        &self,
+        namespace: &str,
+        attribute: &str,
+        filters: &BTreeMap<String, String>,
+    ) -> Result<BTreeMap<String, usize>, SearchError> {
+        Ok(EmbeddedSearch::facet_counts(self, namespace, attribute, filters))
     }
 }
 
