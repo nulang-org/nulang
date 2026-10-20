@@ -16,7 +16,7 @@
 //! every artifact already upgraded through it). New steps are added; existing
 //! steps are immutable.
 
-use crate::format::constants::{FormatError, NBC_HEADER_LEN};
+use crate::format::constants::{FormatError, BYTECODE_MAGIC, NBC_HEADER_LEN};
 
 /// The list of format versions this runtime can migrate *between* (inclusive).
 /// Today only v1 exists, so the only legal migration is the identity v1 -> v1.
@@ -29,7 +29,7 @@ pub fn peek_format_version(bytes: &[u8]) -> Option<u32> {
     if bytes.len() < NBC_HEADER_LEN {
         return None;
     }
-    if &bytes[0..4] != b"NLBC" {
+    if bytes[0..4] != BYTECODE_MAGIC {
         return None;
     }
     Some(u32::from_be_bytes(bytes[4..8].try_into().unwrap()))
@@ -43,10 +43,21 @@ pub fn peek_format_version(bytes: &[u8]) -> Option<u32> {
 /// add a `v1_to_v2` step here and this function will walk `v1 -> v2`
 /// automatically.
 pub fn migrate_nbc(bytes: &[u8], target_version: u32) -> Result<Vec<u8>, FormatError> {
-    let from = peek_format_version(bytes).ok_or(FormatError::Truncated {
-        need: NBC_HEADER_LEN,
-        have: bytes.len(),
-    })?;
+    let from = match peek_format_version(bytes) {
+        Some(version) => version,
+        None if bytes.len() < NBC_HEADER_LEN => {
+            return Err(FormatError::Truncated {
+                need: NBC_HEADER_LEN,
+                have: bytes.len(),
+            });
+        }
+        None => {
+            return Err(FormatError::BadMagic {
+                expected: BYTECODE_MAGIC,
+                got: bytes[0..4].try_into().expect("complete header"),
+            });
+        }
+    };
     if !KNOWN_VERSIONS.contains(&from) || !KNOWN_VERSIONS.contains(&target_version) {
         return Err(FormatError::UnsupportedVersion {
             max_supported: *KNOWN_VERSIONS.last().unwrap(),
