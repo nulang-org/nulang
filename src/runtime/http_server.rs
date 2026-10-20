@@ -1206,6 +1206,39 @@ fn guess_content_type(path: &Path) -> &'static str {
 mod tests {
     use super::*;
 
+    #[test]
+    fn explicit_text_response_types_are_plain_text_without_browser_runtime() {
+        for type_name in ["String", "Int", "Float", "Bool"] {
+            let response = response_from_rendered(Some(type_name), "42".into());
+            assert_eq!(response.status, 200);
+            assert_eq!(
+                response.headers,
+                vec![("Content-Type".into(), "text/plain; charset=utf-8".into())]
+            );
+            assert_eq!(response.body, b"42");
+        }
+    }
+
+    #[test]
+    fn html_response_type_keeps_html_rendering_but_unknown_types_fail_closed() {
+        let html = response_from_rendered(Some("Html"), "<p>OK</p>".into());
+        assert_eq!(html.status, 200);
+        assert!(html.headers.iter().any(|(k, v)| {
+            k == "Content-Type" && v == "text/html; charset=utf-8"
+        }));
+        assert!(String::from_utf8_lossy(&html.body).contains("<p>OK</p>"));
+
+        let legacy = response_from_rendered(None, "<p>old</p>".into());
+        assert_eq!(legacy.status, 200);
+        assert!(legacy.headers.iter().any(|(k, v)| {
+            k == "Content-Type" && v == "text/html; charset=utf-8"
+        }));
+
+        let unsupported = response_from_rendered(Some("CustomRecord"), "secret".into());
+        assert_eq!(unsupported.status, 500);
+        assert!(!String::from_utf8_lossy(&unsupported.body).contains("secret"));
+    }
+
     // A deterministic reader forces TCP-like fragmentation without sleeps.
     struct FixedChunkReader<'a> {
         remaining: &'a [u8],
