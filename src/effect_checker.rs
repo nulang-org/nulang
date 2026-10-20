@@ -3362,6 +3362,67 @@ mod tests {
     }
 
     #[test]
+    fn test_cap_match_joins_real_arm_results_without_tag_seed_or_guard() {
+        let mut analyzer = CapabilityAnalyzer::new();
+        let ctx = CapContext::new();
+        let match_expr = Expr::Match {
+            scrutinee: Box::new(Expr::Literal(Literal::Int(1), s())),
+            arms: vec![
+                (
+                    Pattern::Var("a".to_string()),
+                    Some(Expr::Literal(Literal::Bool(true), s())),
+                    Expr::CapAnnotate {
+                        expr: Box::new(Expr::Literal(Literal::Int(2), s())),
+                        cap: Capability::Iso,
+                        span: s(),
+                    },
+                ),
+                (
+                    Pattern::Var("b".to_string()),
+                    None,
+                    Expr::CapAnnotate {
+                        expr: Box::new(Expr::Literal(Literal::Int(3), s())),
+                        cap: Capability::Ref,
+                        span: s(),
+                    },
+                ),
+            ],
+            span: s(),
+        };
+        // Iso + Ref => Ref. Neither the missing guard nor the initial
+        // accumulator may invent a Tag arm and erase the result authority.
+        assert_eq!(analyzer.infer_cap(&ctx, &match_expr).unwrap(), Capability::Ref);
+    }
+
+    #[test]
+    fn test_cap_receive_joins_real_arms_and_timeout_without_tag_seed() {
+        let mut analyzer = CapabilityAnalyzer::new();
+        let ctx = CapContext::new();
+        let receive = Expr::Receive {
+            arms: vec![(
+                "Msg".to_string(),
+                vec![Pattern::Var("value".to_string())],
+                Some(Expr::Literal(Literal::Bool(true), s())),
+                Expr::CapAnnotate {
+                    expr: Box::new(Expr::Literal(Literal::Int(1), s())),
+                    cap: Capability::Iso,
+                    span: s(),
+                },
+            )],
+            after: Some((
+                Box::new(Expr::Literal(Literal::Int(100), s())),
+                Box::new(Expr::CapAnnotate {
+                    expr: Box::new(Expr::Literal(Literal::Int(2), s())),
+                    cap: Capability::Ref,
+                    span: s(),
+                }),
+            )),
+            span: s(),
+        };
+        assert_eq!(analyzer.infer_cap(&ctx, &receive).unwrap(), Capability::Ref);
+    }
+
+    #[test]
     fn test_check_cap_sub_passes() {
         let mut analyzer = CapabilityAnalyzer::new();
         // Val <: Box (val can be read as box)
