@@ -102,6 +102,50 @@ artifact verification, and minimizing tool permissions. NLAP now emits
 events; existing `task_completed` and `goal_completed` events are
 emitted only after successful verification.
 
+## Opt-in Container Test Executor
+
+The `nulang-ai-worker::sandbox` module provides an opt-in, local test runner.
+It does not change the default `nulang agent run` behavior: without a host
+executor and verifier, the default agent remains blocked.
+
+A trusted application host supplies:
+
+1. A locally cached OCI image **pinned by SHA-256 digest**.
+2. A fixed command as an argument vector, such as `["cargo", "test", "--workspace"]`.
+3. An existing workspace and a separate private receipt directory.
+4. A task manager that creates **test-only** tasks with `required_capabilities:
+   ["test"]` and exactly the configured acceptance criterion.
+
+The host constructs a `SandboxConfig`, creates
+`SandboxHarness::docker(config).into_parts()`, and passes the worker and
+verifier into `LocalRuntime::open_with_manager` alongside its trusted
+manager implementation. A host can instead use
+`SandboxHarness::with_driver(config, Arc::new(DockerDriver::new("podman")))`
+to select a compatible local container CLI.
+
+The runner invokes the engine **without a shell**, with networking disabled,
+all Linux capabilities dropped, a non-root UID/GID, a read-only root
+filesystem, read-only source binding, private temporary storage, resource
+limits and a timeout. It refuses test-only requests that require `code`,
+`shell` or other capabilities. No model-supplied task text enters the
+command or image arguments.
+
+A successful exit creates a host-owned transcript and an ephemeral sealed
+receipt bound to the exact task and criterion. The independent verifier
+checks that receipt and its transcript digest before a task can be marked
+completed. A missing or modified receipt blocks completion. Transcripts can
+contain sensitive test output; the configured host is responsible for their
+retention and access controls.
+
+**Scope and limitations:** This is a Docker/Podman-based local development
+runner, not a security boundary for mutually untrusted Cloud tenants.
+A malicious container engine, privileged Docker daemon, kernel exploit, or
+compromised host falls outside its threat model. Nulang Cloud should use
+isolated workers or microVMs with independent identities and enforcement.
+Receipts are held in memory until shutdown; the next step is a durable,
+reconcilable execution journal and outbox. The host must also ensure a test
+result genuinely satisfies the user's *goal*, not just a narrower task.
+
 ## Next
 
 - [Memory](/ai/memory/) — episodic, semantic, and procedural memory subsystems

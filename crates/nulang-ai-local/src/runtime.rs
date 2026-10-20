@@ -37,7 +37,7 @@ pub struct LocalRuntime {
     conversation_id: Uuid,
     project_id: String,
     director: LocalDirector,
-    engineering: EngineeringManager,
+    engineering: Box<dyn Manager>,
     worker: Box<dyn Worker>,
     verifier: Box<dyn EvidenceVerifier>,
 }
@@ -55,6 +55,23 @@ impl LocalRuntime {
     /// The default open() is deliberately non-executing and fail-closed.
     pub fn open_with_execution(
         project_dir: PathBuf,
+        worker: Box<dyn Worker>,
+        verifier: Box<dyn EvidenceVerifier>,
+    ) -> Result<Self, RuntimeError> {
+        Self::open_with_manager(
+            project_dir,
+            Box::new(EngineeringManager),
+            worker,
+            verifier,
+        )
+    }
+
+    /// A trusted host can provide a task planner consistent with the
+    /// sandbox's supported capabilities. Planner output is still subject
+    /// to worker policy and independent verification.
+    pub fn open_with_manager(
+        project_dir: PathBuf,
+        manager: Box<dyn Manager>,
         worker: Box<dyn Worker>,
         verifier: Box<dyn EvidenceVerifier>,
     ) -> Result<Self, RuntimeError> {
@@ -88,7 +105,7 @@ impl LocalRuntime {
             conversation_id,
             project_id,
             director: LocalDirector::new("director-local"),
-            engineering: EngineeringManager,
+            engineering: manager,
             worker,
             verifier,
         })
@@ -452,6 +469,81 @@ mod tests {
         assert!(events.contains("task_failed"));
         assert!(events.contains("goal_blocked"));
         assert!(!events.contains("task_completed"));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    struct TestOnlyManager;
+
+    impl Manager for TestOnlyManager {
+        fn manager_kind(&self) -> nulang_ai_core::ManagerKind {
+            nulang_ai_core::ManagerKind::Engineering
+        }
+
+        fn plan_tasks(
+            &self,
+            goal_id: Uuid,
+            _intent: &str,
+            _budget_usd: f64,
+        ) -> Vec<nulang_ai_core::Task> {
+            let mut task = nulang_ai_core::Task::new(
+                goal_id,
+                "run approved, pinned test suite",
+                nulang_ai_core::ManagerKind::Engineering,
+            );
+            task.required_capabilities = vec!["test".into()];
+            task.acceptance_criteria = vec!["Tests pass".into()];
+            vec![task]
+        }
+    }
+
+    struct PassingSandbox;
+
+    impl nulang_ai_worker::sandbox::ContainerDriver for PassingSandbox {
+        fn run(
+            &self,
+            _plan: &nulang_ai_worker::sandbox::SandboxPlan,
+        ) -> Result<nulang_ai_worker::sandbox::SandboxOutcome, String> {
+            Ok(nulang_ai_worker::sandbox::SandboxOutcome {
+                exit_code: 0,
+                stdout: "test result: ok".into(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn test_only_goal_completes_through_verified_sandbox_receipt() {
+        use nulang_ai_worker::sandbox::{SandboxConfig, SandboxHarness};
+        use std::sync::Arc;
+
+        let tmp = std::env::temp_dir().join(format!("nulang-sandbox-integration-{}", Uuid::new_v4()));
+        let workspace = tmp.join("project");
+        std::fs::create_dir_all(&workspace).unwrap();
+        init_project(&workspace).unwrap();
+        let config = SandboxConfig::new(
+            &workspace,
+            tmp.join("receipts"),
+            format!("rust@sha256:{}", "a".repeat(64)),
+            vec!["cargo".into(), "test".into(), "--workspace".into()],
+            "Tests pass",
+        ).unwrap();
+        let (worker, verifier) = SandboxHarness::with_driver(config, Arc::new(PassingSandbox))
+            .into_parts();
+        let mut runtime = LocalRuntime::open_with_manager(
+            workspace,
+            Box::new(TestOnlyManager),
+            Box::new(worker),
+            Box::new(verifier),
+        ).unwrap();
+
+        let mut output = Cursor::new(Vec::new());
+        let id = runtime.handle_user_message("run the approved test suite", &mut output).unwrap();
+        let graph = runtime.store().get_goal_graph(id).unwrap();
+        assert_eq!(graph.goal.status, GoalStatus::Completed);
+        let evidence = runtime.store().task_evidence(graph.tasks[0].id).unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert!(evidence[0].artifact_ref.starts_with("nulang-sandbox://"));
+        assert!(String::from_utf8(output.into_inner()).unwrap().contains("task_verified"));
         let _ = std::fs::remove_dir_all(tmp);
     }
 
