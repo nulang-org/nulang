@@ -1,7 +1,7 @@
 // Experimental source-level correlated one-shot replies.
 // Acceptance means local admission, not necessarily handler execution.
 actor Collector {
-    behavior open() { perform Actor.reply_open(60000) }
+    behavior open(responder: Actor) { perform Actor.reply_open(responder, 60000) }
     behavior cancel(reference: Int) { perform Actor.reply_cancel(reference) }
     behavior reply(reference: Int, value: Int) { 0 }
 }
@@ -24,9 +24,9 @@ actor Sender {
 fn main() {
     let collector = spawn Collector {}
     let sender = spawn Sender {}
-    let reference = ask collector open()
+    let reference = ask collector open(sender)
     let _first = ask sender send_twice(reference)
-    let canceled_reference = ask collector open()
+    let canceled_reference = ask collector open(sender)
     let canceled = ask collector cancel(canceled_reference)
     if canceled then {
         perform IO.print("canceled")
