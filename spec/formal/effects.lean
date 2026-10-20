@@ -110,6 +110,16 @@ def mem (eff : EffectLabel) (r : EffectRow) : Bool :=
   | .Closed ls => ls.contains eff
   | .Open ls _ => ls.contains eff  -- open: the variable may carry `eff`; conservative: false
 
+/--
+  Remove a lexically handled label from an effect row. For open rows, this
+  only removes a known label; the unresolved region remains open. Full
+  row-variable unification and scoped-label semantics are future work.
+-/
+def without (handled : EffectLabel) : EffectRow → EffectRow
+  | .Closed labels => .Closed (labels.filter (fun label => !(label == handled)))
+  | .Open labels region =>
+      .Open (labels.filter (fun label => !(label == handled))) region
+
 -- ------------------------------------------------------------------
 -- Free regions
 -- ------------------------------------------------------------------
@@ -178,85 +188,111 @@ inductive EffExpr where
 deriving Repr, Inhabited
 
 -- ==================================================================
--- EFFECT-ANNOTATED TYPING JUDGMENT  Δ ⊢ e : τ ! r
+-- EFFECT-AWARE FUNCTION TYPES AND TYPING JUDGMENT
 -- ==================================================================
 
 /--
-  The effect-annotated typing judgment for Nulang.
+  Functions carry their *latent* effect row in their type. Creating a
+  closure does not execute its body, but applying the closure does.
 
-  `HasTypeEff Γ e τ r` means "in context `Γ`, expression `e` has type `τ`
-  and may perform effects described by row `r`."
-
-  Rules:
-
-  - `Var` / `Lit*` / `Unit`: pure terms — effect row is empty.
-  - `Lambda`: body effects are *latent*; lambda creation is pure.
-  - `App`: effects of function and argument combine via row union.
-  - `Let`: effects of bound expression and body combine.
-  - `If`: effects of guard and both branches combine.
-  - `Perform`: performing an effect adds its label to the row.
-  - `Handle`: handling removes the effect label from the row.
-
-  Dependencies (from `spec/formal/types.lean`):
-  `Context` (`List (Name × Scheme)`), `Scheme.generalize`,
-  `Scheme.instantiate`, `defaultFresh`, `Context.freeTypeVars`.
+  This is an intentionally monomorphic formal core: Ty annotations in
+  EffExpr are lifted to EffTy. A general HM effect-polymorphism scheme
+  with open-row unification is not yet formalized.
 -/
-inductive HasTypeEff : Context → EffExpr → Ty → EffectRow → Prop where
+inductive EffTy where
+| base : Ty → EffTy
+| arrow : EffTy → EffTy → EffectRow → EffTy
+deriving Repr, Inhabited
 
--- Pure rules: variables and literals have no effects.
-| tVar : ∀ {Γ x τ σ},
-    Context.lookup Γ x = some σ →
-    (σ.instantiate defaultFresh).1 = τ →
+/-- Interpret a core type annotation as an effect-aware type.
+    Existing unannotated function arrows are conservatively pure here;
+    effectful higher-order annotation syntax remains an open design task. -/
+def EffTy.fromTy : Ty → EffTy
+  | .fn input output =>
+      .arrow (fromTy input) (fromTy output) EffectRow.empty
+  | ty => .base ty
+
+/-- An effect-aware context retains latent effects for let-bound functions. -/
+abbrev EffContext := List (Name × EffTy)
+
+def EffContext.lookup (Γ : EffContext) (x : Name) : Option EffTy :=
+  match Γ with
+  | [] => none
+  | (name, ty) :: rest =>
+      if x == name then some ty else EffContext.lookup rest x
+
+def EffContext.empty : EffContext := []
+
+/--
+  HasTypeEff Γ e τ r assigns the *immediate* effects of evaluating e.
+  Lambda creation is pure; its function type stores body effects. At
+  application, those latent effects are added to the function and
+  argument evaluation rows. A handler's own body is also type-checked
+  and cannot silently introduce an untracked effect.
+
+  This judgment is sounder than the earlier version for these two
+  previously documented counterexamples, but it does not establish
+  complete effect safety for continuation resumptions, higher-order
+  polymorphism, closures, or open-row unification.
+-/
+inductive HasTypeEff : EffContext → EffExpr → EffTy → EffectRow → Prop where
+
+| tVar : ∀ {Γ x τ},
+    EffContext.lookup Γ x = some τ →
     HasTypeEff Γ (.var x) τ EffectRow.empty
 
 | tLitInt : ∀ {Γ n},
-    HasTypeEff Γ (.litInt n) .int EffectRow.empty
+    HasTypeEff Γ (.litInt n) (.base .int) EffectRow.empty
 
 | tLitBool : ∀ {Γ b},
-    HasTypeEff Γ (.litBool b) .bool EffectRow.empty
+    HasTypeEff Γ (.litBool b) (.base .bool) EffectRow.empty
 
 | tLitString : ∀ {Γ s},
-    HasTypeEff Γ (.litString s) .string EffectRow.empty
+    HasTypeEff Γ (.litString s) (.base .string) EffectRow.empty
 
 | tUnit : ∀ {Γ},
-    HasTypeEff Γ .unitVal .unit EffectRow.empty
+    HasTypeEff Γ .unitVal (.base .unit) EffectRow.empty
 
--- Lambda: the body may have effects, but creating the closure is pure.
+-- The lambda body has latent effects stored on the function type.
 | tLambda : ∀ {Γ x τ₁ e τ₂ r},
-    HasTypeEff ((x, ⟨[], τ₁⟩) :: Γ) e τ₂ r →
-    HasTypeEff Γ (.lambda x τ₁ e) (.fn τ₁ τ₂) EffectRow.empty
+    HasTypeEff ((x, EffTy.fromTy τ₁) :: Γ) e τ₂ r →
+    HasTypeEff Γ (.lambda x τ₁ e)
+      (.arrow (EffTy.fromTy τ₁) τ₂ r) EffectRow.empty
 
--- Application: effect rows of function and argument are combined.
-| tApp : ∀ {Γ e₁ e₂ τ₁ τ₂ r₁ r₂},
-    HasTypeEff Γ e₁ (.fn τ₂ τ₁) r₁ →
-    HasTypeEff Γ e₂ τ₂ r₂ →
-    HasTypeEff Γ (.app e₁ e₂) τ₁ (EffectRow.union r₁ r₂)
+-- Evaluating the application includes the latent effect row.
+| tApp : ∀ {Γ e₁ e₂ τ₁ τ₂ rFn rArg latent},
+    HasTypeEff Γ e₁ (.arrow τ₂ τ₁ latent) rFn →
+    HasTypeEff Γ e₂ τ₂ rArg →
+    HasTypeEff Γ (.app e₁ e₂) τ₁
+      (EffectRow.union (EffectRow.union rFn rArg) latent)
 
--- Let: generalize the bound expression's type, combine effect rows.
+-- Binding and reading a value do not erase its latent function effects.
+-- Polymorphic let-generalization will require an effect-aware scheme.
 | tLet : ∀ {Γ x e₁ e₂ τ₁ τ₂ r₁ r₂},
     HasTypeEff Γ e₁ τ₁ r₁ →
-    HasTypeEff ((x, Scheme.generalize (Context.freeTypeVars Γ) τ₁) :: Γ) e₂ τ₂ r₂ →
+    HasTypeEff ((x, τ₁) :: Γ) e₂ τ₂ r₂ →
     HasTypeEff Γ (.letIn x e₁ e₂) τ₂ (EffectRow.union r₁ r₂)
 
--- If: effect rows of all three sub-expressions are combined.
 | tIf : ∀ {Γ e₁ e₂ e₃ τ r₁ r₂ r₃},
-    HasTypeEff Γ e₁ .bool r₁ →
+    HasTypeEff Γ e₁ (.base .bool) r₁ →
     HasTypeEff Γ e₂ τ r₂ →
     HasTypeEff Γ e₃ τ r₃ →
     HasTypeEff Γ (.ifThenElse e₁ e₂ e₃) τ
       (EffectRow.union r₁ (EffectRow.union r₂ r₃))
 
--- Perform: the effect label is added to the row.
--- The argument expression must be pure (no further effects).
+-- In this subset the argument to an effect operation is pure.
 | tPerform : ∀ {Γ eff e τ},
     HasTypeEff Γ e τ EffectRow.empty →
     HasTypeEff Γ (.perform eff e) τ (EffectRow.singleton eff)
 
--- Handle: the handled effect is removed from the row.
--- The handler body `h` is assumed well-formed (its typing is orthogonal).
-| tHandle : ∀ {Γ e eff h τ r},
-    HasTypeEff Γ e τ (EffectRow.union (EffectRow.singleton eff) r) →
-    HasTypeEff Γ (.handle e eff h) τ r
+-- Both the handled computation and handler body must be typed.
+-- The handler body is conservatively included even if it never runs.
+-- More precise handler typing needs continuation/result signatures.
+| tHandle : ∀ {Γ e eff h τ rBody rHandler},
+    HasTypeEff Γ e τ rBody →
+    HasTypeEff Γ h τ rHandler →
+    HasTypeEff Γ (.handle e eff h) τ
+      (EffectRow.union (EffectRow.without eff rBody) rHandler)
 
 -- ==================================================================
 -- HANDLER STACK SEMANTICS
