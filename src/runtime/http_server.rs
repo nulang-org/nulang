@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+use rand_core::{OsRng, RngCore};
 
 use crate::bytecode::CodeModule;
 use crate::value_layout::PAYLOAD_MASK;
@@ -534,15 +535,27 @@ where
     result
 }
 
-/// Add a `Set-Cookie` header for the current response.
+/// Generate a cryptographically random, 256-bit opaque session secret.
+///
+/// This host operation is intentionally nondeterministic and must never be
+/// replayed as a fresh authentication decision in a durable workflow.
+/// Failed OS entropy acquisition is a hard failure, not a counter fallback.
+pub fn secure_session_token() -> Option<String> {
+    let mut bytes = [0u8; 32];
+    let mut rng = OsRng;
+    rng.try_fill_bytes(&mut bytes).ok()?;
+    Some(hex::encode(bytes))
+}
+
+/// Add a secure, HTTP-only `Set-Cookie` header for the current response.
 pub fn set_cookie(name: &str, value: &str) {
-    let cookie = format!("{}={}; Path=/; HttpOnly; SameSite=Lax", name, value);
+    let cookie = format!("{}={}; Path=/; HttpOnly; Secure; SameSite=Lax", name, value);
     RESPONSE_COOKIES.with(|c| c.borrow_mut().push(cookie));
 }
 
 /// Add a `Set-Cookie` header that clears the named cookie.
 pub fn clear_cookie(name: &str) {
-    let cookie = format!("{}=; Path=/; Max-Age=0; SameSite=Lax", name);
+    let cookie = format!("{}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax", name);
     RESPONSE_COOKIES.with(|c| c.borrow_mut().push(cookie));
 }
 
