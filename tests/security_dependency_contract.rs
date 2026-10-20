@@ -11,7 +11,13 @@ fn patched_transport_dependencies_exclude_vulnerable_locked_versions() {
         ("webpki-roots", "0.26.11"),
         ("webpki-roots", "1.0.9"),
     ] {
-        let forbidden = format!("[[package]]\nname = \"{}\"\nversion = \"{}\"", name, version);
-        assert!(!lock.contains(&forbidden), "outdated {name} {version} reintroduced");
+        let forbidden = format!(
+            "[[package]]\nname = \"{}\"\nversion = \"{}\"",
+            name, version
+        );
+        assert!(
+            !lock.contains(&forbidden),
+            "outdated {name} {version} reintroduced"
+        );
     }
 }

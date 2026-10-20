@@ -22,7 +22,6 @@ pub(crate) fn verified_https_agent() -> Result<ureq::Agent, String> {
         .build())
 }
 
-
 /// Client for a package registry server.
 pub struct RegistryClient {
     registry_url: String,
@@ -50,7 +49,9 @@ impl RegistryClient {
             let url = format!("{}/api/v1/packages/{}/{}", self.base_url(), name, version);
             let agent = verified_https_agent()?;
             let request = match &self.token {
-                Some(token) => agent.put(&url).set("Authorization", &format!("Bearer {}", token)),
+                Some(token) => agent
+                    .put(&url)
+                    .set("Authorization", &format!("Bearer {}", token)),
                 None => agent.put(&url),
             };
             match request.send_bytes(tarball) {
@@ -158,7 +159,9 @@ mod tls_transport_tests {
         let port = listener.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept HTTPS connection");
-            stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
             let mut first = [0u8; 5];
             let count = stream.read(&mut first).unwrap_or(0);
             let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
@@ -166,7 +169,14 @@ mod tls_transport_tests {
             first[0]
         });
         let client = RegistryClient::new(format!("https://127.0.0.1:{}", port), None);
-        assert!(client.fetch("test", "1.0.0").is_err(), "plain server must not be trusted as HTTPS");
-        assert_eq!(server.join().unwrap(), 0x16, "expected a TLS ClientHello record");
+        assert!(
+            client.fetch("test", "1.0.0").is_err(),
+            "plain server must not be trusted as HTTPS"
+        );
+        assert_eq!(
+            server.join().unwrap(),
+            0x16,
+            "expected a TLS ClientHello record"
+        );
     }
 }

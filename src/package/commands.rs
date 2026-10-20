@@ -2383,7 +2383,8 @@ fn cmd_deploy(
             span: Span::default(),
         }
     })?;
-    let response: ureq::Response = agent.post(&url)
+    let response: ureq::Response = agent
+        .post(&url)
         .set("Authorization", &format!("Bearer {}", token))
         .set("Content-Type", "application/gzip")
         .send_bytes(&tarball)
