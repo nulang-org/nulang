@@ -85,6 +85,7 @@ fn runtime_surfaces_transport_connect_failure_to_sender_actor() {
         .expect("transport failure must become a sender-visible system message");
 
     assert_eq!(message.behavior_id, 0);
+    assert_eq!(message.priority, nulang::runtime::MessagePriority::System);
     assert_eq!(message.payload[0].as_int(), Some(8));
     assert_eq!(
         message.payload[1].as_int(),
@@ -125,12 +126,117 @@ fn runtime_marks_transport_write_failure_as_ambiguous() {
         .expect("transport failure must become a sender-visible system message");
 
     assert_eq!(message.behavior_id, 0);
+    assert_eq!(message.priority, nulang::runtime::MessagePriority::System);
     assert_eq!(message.payload[0].as_int(), Some(8));
     assert_eq!(
         message.payload[1].as_int(),
         Some(1),
         "write failure must remain distinguishable as an ambiguous delivery outcome"
     );
+}
+
+#[test]
+fn runtime_delivery_failure_bypasses_full_bounded_mailbox() {
+    let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 41_003);
+    let local_node = NodeId::new(&local_addr);
+    let remote_node = NodeId(0xD00D);
+
+    let mut runtime = Runtime::new();
+    let sender = runtime.spawn_actor(Box::new(Vec::new));
+    let actor = runtime.actors.get_mut(&sender).unwrap();
+    actor.mailbox = nulang::runtime::Mailbox::new(1);
+    actor
+        .mailbox
+        .push_local(nulang::runtime::Message {
+            behavior_id: 0,
+            payload: nulang::runtime::MessagePayload::from_slice(&[nulang::vm::Value::int(99)]),
+            sender: 0,
+            priority: nulang::runtime::MessagePriority::Normal,
+            trace_id: None,
+        })
+        .expect("fill the bounded mailbox with ordinary traffic");
+
+    let mut cluster = ClusterState::new(local_node, local_addr);
+    let mut resolver = AddressResolver::new(local_node);
+    let mut transport = FailureTransport {
+        node_id: local_node,
+        addr: local_addr,
+        failures: vec![TransportSendFailure {
+            to_node: remote_node,
+            packet_seq: 27,
+            sender_actor: Some(sender),
+            reason: TransportSendFailureReason::Write,
+        }],
+    };
+    process_network_packets(&mut runtime, &mut transport, &mut cluster, &mut resolver);
+
+    let mailbox = &mut runtime.actors.get_mut(&sender).unwrap().mailbox;
+    let failure = mailbox
+        .pop()
+        .expect("system failure must bypass normal capacity");
+    assert_eq!(failure.priority, nulang::runtime::MessagePriority::System);
+    assert_eq!(failure.payload[0].as_int(), Some(8));
+    assert_eq!(failure.payload[1].as_int(), Some(1));
+    let original = mailbox
+        .pop()
+        .expect("existing normal mail must be retained");
+    assert_eq!(original.payload[0].as_int(), Some(99));
+}
+
+/// Synchronous routing errors must use the same capacity-exempt feedback path
+/// as failures arriving later from a transport worker.
+#[test]
+fn runtime_sync_resolve_failure_bypasses_full_bounded_mailbox() {
+    let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 41_004);
+    let local_node = NodeId::new(&local_addr);
+    let unknown_node = NodeId(0xD0E0);
+
+    let mut runtime = Runtime::new();
+    let sender = runtime.spawn_actor(Box::new(Vec::new));
+    let actor = runtime.actors.get_mut(&sender).unwrap();
+    actor.mailbox = nulang::runtime::Mailbox::new(1);
+    actor
+        .mailbox
+        .push_local(nulang::runtime::Message {
+            behavior_id: 0,
+            payload: nulang::runtime::MessagePayload::from_slice(&[nulang::vm::Value::int(99)]),
+            sender: 0,
+            priority: nulang::runtime::MessagePriority::Normal,
+            trace_id: None,
+        })
+        .expect("fill the sender's bounded mailbox");
+
+    let cluster = ClusterState::new(local_node, local_addr);
+    let mut resolver = AddressResolver::new(local_node);
+    let mut transport = FailureTransport {
+        node_id: local_node,
+        addr: local_addr,
+        failures: vec![],
+    };
+    runtime.current_actor = Some(sender);
+    nulang::runtime::send_distributed(
+        &mut runtime,
+        &mut transport,
+        &cluster,
+        &mut resolver,
+        nulang::runtime::ActorAddress::remote(unknown_node, 123),
+        "handle",
+        &[],
+    );
+    runtime.current_actor = None;
+
+    let mailbox = &mut runtime.actors.get_mut(&sender).unwrap().mailbox;
+    let feedback = mailbox
+        .pop()
+        .expect("synchronous route error must be visible");
+    assert_eq!(feedback.behavior_id, 0);
+    assert_eq!(feedback.priority, nulang::runtime::MessagePriority::System);
+    assert_eq!(feedback.payload[0].as_int(), Some(5)); // unknown route
+    assert_eq!(feedback.payload[1], nulang::vm::Value::nil());
+    let original = mailbox
+        .pop()
+        .expect("original normal message must remain queued");
+    assert_eq!(original.payload[0].as_int(), Some(99));
 }
 
 #[cfg(feature = "tcp")]
