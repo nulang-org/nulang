@@ -1,0 +1,23 @@
+// Source-language finite pull reference: a pull returns one value + next offset.
+// This does not claim single-owner cursor safety; the value is copyable today.
+import stdlib::finite_stream
+
+fn main() {
+    let start: FiniteCursor[Int] = from_items([10, 20])
+    match advance(start) {
+        | Produced(a, second) => {
+            perform IO.print(perform Int.to_string(a))
+            match advance(second) {
+                | Produced(b, third) => {
+                    perform IO.print(perform Int.to_string(b))
+                    match advance(third) {
+                        | Exhausted => perform IO.print("done")
+                        | Produced(_, _) => perform IO.print("unexpected-third")
+                    }
+                }
+                | Exhausted => perform IO.print("unexpected-short")
+            }
+        }
+        | Exhausted => perform IO.print("unexpected-empty")
+    }
+}
