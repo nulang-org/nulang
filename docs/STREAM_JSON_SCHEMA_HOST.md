@@ -51,11 +51,12 @@ let rows = collect_budgeted(typed, CollectionBudget::new(1000, 1024 * 1024)?, |r
 
 ## Explicit limitations
 
-- **Duplicate JSON keys are not rejected.** `JsonlRecords` currently
-  deserializes with `serde_json::Value`, which does not retain duplicate
-  occurrences. A future parsing stage must detect duplicate input keys
-  *before* converting the record into `Value`. Do not use this adapter as a
-  cryptographic canonicalization or security-policy parser.
+- **Duplicate JSON keys are rejected at the parser boundary** by the
+  subsequent strict JSONL parsing slice. That deserializer rejects repeated
+  keys at every object depth, after JSON string escapes are decoded and
+  before constructing `serde_json::Value`. This remains *non-canonical*
+  JSON: Unicode normalization, number representation and serialization are
+  not standardized for cryptographic signing.
 - The `payload_bytes()` measurement accounts for UTF-8 key/value lengths
   plus simple scalar widths. It excludes JSON escaping, allocation capacity,
   allocator metadata and peak RSS. It is a **logical payload estimate**,
@@ -80,7 +81,6 @@ cargo fmt --all -- --check
 ```
 
 Keep draft until the three prerequisite PRs are validated/promoted and this
-head passes all relevant checks. A sensible next increment is strict
-duplicate-key detection before deserialization and fixed serialized-byte
-budgets, followed by comprehensive parser+VM conformance before exposing
-language-level typed streams.
+head passes all relevant checks. A sensible next increment is explicit serialized-byte
+budgets and parser edge-case conformance, followed by comprehensive
+parser+VM conformance before exposing language-level typed streams.

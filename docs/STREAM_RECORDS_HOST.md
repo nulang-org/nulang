@@ -55,7 +55,7 @@ let rows = PullStream::new(CsvRecords::new(file, 256 * 1024, 256)?)
   relaxed quoting, BOM removal, or arbitrary dialect inference.
 - Structured `serde_json::Value` materializes each JSON record; individual
   records are byte-bounded but total collection allocations depend on chosen
-  item-count limits and decoded data. JSON duplicate keys are not preserved.
+  item-count limits and decoded data. JSON object keys are checked for duplicates before `serde_json::Value` is constructed.
 - Pull-driven operation is synchronous, not an asynchronous channel or
   scheduler-level backpressure system. No actor execution is enabled.
 

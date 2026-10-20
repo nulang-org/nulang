@@ -61,7 +61,7 @@ impl<R: BufRead> Iterator for JsonlRecords<R> {
             return None;
         }
         match self.lines.next()? {
-            Ok(line) => match serde_json::from_str(&line) {
+            Ok(line) => match crate::stream_json_strict::parse_strict_json(&line) {
                 Ok(value) => Some(Ok(value)),
                 Err(error) => {
                     self.finished = true;
