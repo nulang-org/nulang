@@ -140,7 +140,7 @@ pub fn flatten_decls(decls: &[Decl]) -> Vec<&Decl> {
 /// bindings, etc.) and should not be included in the result.
 fn free_vars(expr: &Expr, bound: &mut Vec<String>, acc: &mut Vec<String>) {
     match expr {
-        Expr::Literal(_, _) => {}
+        Expr::Literal(_, _) | Expr::QualifiedVar { .. } => {}
         Expr::FString(parts, _) => {
             for part in parts {
                 free_vars(part, bound, acc);
@@ -552,6 +552,10 @@ impl EffectChecker {
                 Ok(merged)
             }
             Expr::Var(_, _) => Ok(EffectRow::empty()),
+            Expr::QualifiedVar { alias, name, span } => Err(NuError::parse_error(
+                format!("unresolved qualified reference '{}::{}'", alias, name),
+                *span,
+            )),
 
             // Lambda: effects are given by its annotation, or inferred from the
             // body if unannotated. If annotated, the body must not perform effects
@@ -1611,6 +1615,7 @@ impl<'a> DurableEffectWalker<'a> {
             // Leaves: nothing to walk.
             Expr::Literal(..)
             | Expr::Var(..)
+            | Expr::QualifiedVar { .. }
             | Expr::SelfRef(..)
             | Expr::Break(..)
             | Expr::Panic(..)
@@ -1868,6 +1873,10 @@ impl CapabilityAnalyzer {
                 Ok(cap)
             }
 
+            Expr::QualifiedVar { alias, name, span } => Err(NuError::parse_error(
+                format!("unresolved qualified reference '{}::{}'", alias, name),
+                *span,
+            )),
             Expr::Var(name, span) => {
                 let cap = ctx.lookup(name);
                 if cap.is_linear() {
@@ -2689,6 +2698,7 @@ fn expr_span(expr: &Expr) -> Span {
         Expr::Literal(_, s) => *s,
         Expr::FString(_, s) => *s,
         Expr::Var(_, s) => *s,
+        Expr::QualifiedVar { span, .. } => *span,
         Expr::Lambda { span, .. } => *span,
         Expr::App { span, .. } => *span,
         Expr::Let { span, .. } => *span,
