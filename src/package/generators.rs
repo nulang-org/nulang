@@ -80,9 +80,26 @@ pub fn generate(root: &Path, kind: &str, name: &str) -> NuResult<Vec<PathBuf>> {
         ));
     }
 
-    // Fail before creating anything if any requested output exists.
+    // Preflight every output before creating anything. In particular, a
+    // symlinked src/ or tests/ directory must not escape the package root.
     for (relative, _) in &files {
         let dest = root.join(relative);
+        if let Some(parent) = dest.parent() {
+            if let Ok(metadata) = fs::symlink_metadata(parent) {
+                if metadata.file_type().is_symlink() {
+                    return Err(error(format!(
+                        "cannot generate through symlinked directory '{}'",
+                        parent.display()
+                    )));
+                }
+                if !metadata.is_dir() {
+                    return Err(error(format!(
+                        "generator output parent '{}' is not a directory",
+                        parent.display()
+                    )));
+                }
+            }
+        }
         if dest.symlink_metadata().is_ok() {
             return Err(error(format!("file '{}' already exists", dest.display())));
         }
