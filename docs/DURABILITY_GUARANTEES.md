@@ -172,6 +172,30 @@ A production external-effect adapter should have all of the following:
 - deterministic crash-window tests;
 - provider-specific timeout, throttling, response-loss, and failover tests.
 
+## Real process-kill recovery gate (Rust host boundary)
+
+`tests/durable_effect_process_kill.rs` adds three subprocess crash windows
+against a file-backed SQLite store: after `Prepared`, after an idempotent
+provider mutation but before `Completed`, and after `Completed` before the
+owner resumes. A parent process waits for an atomically published checkpoint,
+then forcibly kills the child using the OS process termination API. A fresh
+child process reopens both the durable store and an on-disk provider fixture.
+
+The test asserts that a prepared operation keeps a stable idempotency key
+through recovery, that a provider-side committed mutation is observed once
+even if the call is retried, and that a completed receipt is returned without
+redispatch. A separate case advances activation epoch 1 to epoch 2 through
+the storage commit boundary and proves that the stale owner cannot retry or
+commit a late receipt. The tests are local-only and have a bounded startup
+polling deadline, not a fixed wait used to decide when a crash occurs.
+
+**Scope:** This validates the `DurableEffectCoordinator` trusted Rust host
+API, using a provider that implements idempotency on disk. It does not yet
+execute a `.nula` `PerformAsync` callback, terminate during a SQLite
+transaction, simulate power loss, or prove that arbitrary external providers
+honor idempotency. Cross-process journal recovery and process kill are now
+tested independently of those still-open integration boundaries.
+
 ## Release gate
 
 Run:
@@ -180,9 +204,12 @@ Run:
 bash scripts/test-durability-guarantees.sh
 ```
 
-The gate is deterministic and performs no public network calls, sleeps, or
-wall-clock assertions. It covers semantic-site artifact propagation, storage
-recovery, crash-window behavior, and the lower-level durable-effect contracts.
+The gate performs no public network calls. Most tests are deterministic and
+require no wall-clock delays. The process-kill integration test uses bounded
+OS-process checkpoint polling and forceful termination to validate actual
+restart behavior; timing is not treated as proof of correctness. The gate
+covers semantic-site artifact propagation, storage recovery, crash windows,
+and lower-level durable-effect contracts.
 
 ## Competitive benchmark contract
 
