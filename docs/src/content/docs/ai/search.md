@@ -76,6 +76,65 @@ The `SearchBackend` trait supplies the common synchronous operations:
 between engines. Future Tantivy backends may implement the same trait without
 introducing search keywords into the language core.
 
+## Meilisearch remote adapter
+
+The Rust crate also exposes an async Meilisearch client using the existing
+reqwest dependency. This adapter is distinct from the synchronous
+SearchBackend trait. It is an **experimental integration**, not hosted
+Nulang Cloud search.
+
+```rust
+use nulang_ai::{MeilisearchClient, SearchDocument, SearchQuery};
+use std::collections::BTreeMap;
+
+let client = MeilisearchClient::new(
+    "https://search.example.com",
+    std::env::var("MEILISEARCH_TENANT_API_KEY")?,
+    "workspace_a",
+)?;
+let update = client.upsert(&SearchDocument {
+    namespace: "workspace_a".into(),
+    id: "article_1".into(),
+    text: "Nulang durable actors".into(),
+    attributes: BTreeMap::from([("category".into(), "docs".into())]),
+}).await?;
+
+// Write APIs queue tasks asynchronously. Check that this task is marked
+// "succeeded" before expecting the newly indexed document to be visible.
+let state = client.task_status(update.task_uid).await?;
+if state.status != "succeeded" {
+    // Handle enqueued, processing, or failed states.
+}
+
+let hits = client.search(&SearchQuery::new("workspace_a", "durable")).await?;
+```
+
+A client instance is bound to exactly one namespace and one derived index
+UID, such as `nulang_workspace_a`. The credentials must be issued
+and restricted **server-side** to that index. The client checks namespace
+identity on writes, reads, and task status responses. Do not accept a user
+chosen endpoint, API key, or namespace without authenticated authorization.
+
+Non-loopback HTTP endpoints, empty keys, invalid index identifiers, and
+unsafe document IDs are rejected before network access. Redirect following
+is disabled. Query limits are capped at 200, and empty queries do not
+fall through to Meilisearch's match-all behavior.
+
+Exact attribute filters require corresponding Meilisearch
+`filterableAttributes` configuration. The adapter does not
+implicitly change index settings, because those require broader
+administrative privileges. Its own index-specific API key should not
+have cross-tenant permissions. Index creation may also need to be
+provisioned separately using an administrative service.
+
+Meilisearch relevance scores are not BM25 scores. They must not be
+compared numerically with scores from the embedded backend.
+
+The current Nulang-language `http-client` seed package does not
+forward configured HTTP headers through its sender, so a secure native
+Nulang-language Meilisearch package is not shipped in this change.
+HTTP authorization capability and a language-level adapter remain follow-ups.
+
 ## AI semantic-memory improvement
 
 `SemanticMemory` now caches document embeddings on store and persists
@@ -98,6 +157,6 @@ with `set_embedding_fn` makes those documents searchable.
    when the corresponding Cargo.lock can be regenerated and checked in.
 2. Add a stable, capability-checked `nlc.search` package facade backed by
    the Rust implementation.
-3. Add language-sensitive analyzers and Meilisearch/OpenSearch adapters.
+3. Add language-sensitive analyzers, OpenSearch adapters, and a Nulang-language search facade; harden and integration-test the existing Meilisearch Rust adapter.
 4. Add durable ingestion cursors, tenant authorization, cost limits and
    consistency contracts before offering managed Nulang Cloud search.
