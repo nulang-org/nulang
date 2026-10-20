@@ -182,9 +182,13 @@ fn web_main() {
         .parse_module()
         .expect("parse text route");
     let contracts = compile_module_contracts(&ast);
-    assert!(contracts.diagnostics.is_empty(), "{:?}", contracts.diagnostics);
-    let plan = compile_runtime_route_plan(&contracts.routes[0])
-        .expect("compile text response route");
+    assert!(
+        contracts.diagnostics.is_empty(),
+        "{:?}",
+        contracts.diagnostics
+    );
+    let plan =
+        compile_runtime_route_plan(&contracts.routes[0]).expect("compile text response route");
     assert_eq!(plan.response_type.as_deref(), Some("String"));
     RuntimeWebRoute {
         route: WebRoute {
