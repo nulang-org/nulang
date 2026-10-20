@@ -317,7 +317,6 @@ impl MetricsSnapshot {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::super::{ActorMailboxMetric, Runtime, SupervisorChildMetric, SupervisorMetric};
@@ -385,6 +384,39 @@ mod tests {
         assert_eq!(lines.len(), 50);
         assert_eq!(lines[0], "nulang_actor_mailbox_depth{actor_id=\"75\"} 75");
         assert_eq!(lines[49], "nulang_actor_mailbox_depth{actor_id=\"26\"} 26");
+    }
+
+    #[test]
+    fn test_topology_renders_rootless_cycle_instead_of_claiming_no_supervisors() {
+        let mut snapshot = Runtime::new().metrics_snapshot();
+        snapshot.supervisors = vec![
+            SupervisorMetric {
+                id: 11,
+                name: "alpha".to_string(),
+                strategy: "OneForOne".to_string(),
+                parent: Some(12),
+                children: vec![SupervisorChildMetric {
+                    actor_id: 12,
+                    spec_id: "beta-link".to_string(),
+                }],
+            },
+            SupervisorMetric {
+                id: 12,
+                name: "beta".to_string(),
+                strategy: "OneForOne".to_string(),
+                parent: Some(11),
+                children: vec![SupervisorChildMetric {
+                    actor_id: 11,
+                    spec_id: "alpha-link".to_string(),
+                }],
+            },
+        ];
+
+        let output = snapshot.render_topology_text();
+        assert!(!output.contains("(no supervisors)"));
+        assert_eq!(output.matches("supervisor alpha [").count(), 1);
+        assert_eq!(output.matches("supervisor beta [").count(), 1);
+        assert!(output.contains("(cycle/repeated supervisor id: 11)"));
     }
 
     #[test]
