@@ -247,3 +247,118 @@ fn web_redirect_rejects_external_and_header_injection_targets() {
         assert!(!response.contains("X-Injected:"), "{response}");
     }
 }
+
+
+fn explicit_response_route(
+    method: HttpMethod,
+    source: &str,
+    handler_name: &str,
+) -> WebRoute {
+    let (module, function_index) = compile_handler(source, handler_name);
+    WebRoute {
+        method,
+        path: "/respond".to_string(),
+        handler_module: module,
+        handler_func_idx: function_index,
+    }
+}
+
+#[test]
+fn web_json_response_sets_status_media_type_and_preserves_json_bytes() {
+    let source = r#"fn api() { perform Web.json_response(201, "{\"ok\":true,\"count\":2}") }"#;
+    let server = WebDevServer::bind(
+        0,
+        None,
+        None,
+        vec![explicit_response_route(HttpMethod::Get, source, "api")],
+    )
+    .expect("bind JSON response route");
+
+    let response = send_raw_request(
+        server.port,
+        "GET /respond HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(response.starts_with("HTTP/1.1 201 Created\r\n"), "{response}");
+    assert!(
+        response.contains("Content-Type: application/json; charset=utf-8\r\n"),
+        "{response}"
+    );
+    assert_eq!(response_body(&response), r#"{"ok":true,"count":2}"#);
+    assert!(!response.contains("nulang-client"), "{response}");
+}
+
+#[test]
+fn web_text_response_uses_plain_text_without_html_encoding_or_script_injection() {
+    let source = r#"fn api() { perform Web.text_response(422, "invalid <input> & retry") }"#;
+    let server = WebDevServer::bind(
+        0,
+        None,
+        None,
+        vec![explicit_response_route(HttpMethod::Get, source, "api")],
+    )
+    .expect("bind text response route");
+
+    let response = send_raw_request(
+        server.port,
+        "GET /respond HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 422 Unprocessable Entity\r\n"),
+        "{response}"
+    );
+    assert!(
+        response.contains("Content-Type: text/plain; charset=utf-8\r\n"),
+        "{response}"
+    );
+    assert_eq!(response_body(&response), "invalid <input> & retry");
+}
+
+#[test]
+fn web_json_response_rejects_invalid_json_without_returning_partial_success() {
+    let source = r#"fn api() { perform Web.json_response(200, "not-json") }"#;
+    let server = WebDevServer::bind(
+        0,
+        None,
+        None,
+        vec![explicit_response_route(HttpMethod::Get, source, "api")],
+    )
+    .expect("bind invalid JSON response route");
+
+    let response = send_raw_request(
+        server.port,
+        "GET /respond HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+        "{response}"
+    );
+    assert_eq!(response_body(&response), "Invalid application response");
+    assert!(!response.contains("not-json"), "{response}");
+}
+
+#[test]
+fn web_response_rejects_statuses_that_cannot_have_this_body() {
+    for source in [
+        r#"fn api() { perform Web.text_response(204, "has a body") }"#,
+        r#"fn api() { perform Web.text_response(302, "missing location") }"#,
+        r#"fn api() { perform Web.json_response(700, "{}") }"#,
+    ] {
+        let server = WebDevServer::bind(
+            0,
+            None,
+            None,
+            vec![explicit_response_route(HttpMethod::Get, source, "api")],
+        )
+        .expect("bind invalid HTTP status response route");
+
+        let response = send_raw_request(
+            server.port,
+            "GET /respond HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+            "source {source}: {response}"
+        );
+        assert!(!response.contains("Location:"), "{response}");
+    }
+}
