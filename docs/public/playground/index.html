@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nulang Playground</title>
+<meta name="description" content="Run Nulang in your browser — the compiler and CoreVM run locally as WebAssembly. No server, no install.">
+<script>
+  (() => {
+    const stored = localStorage.getItem('starlight-theme');
+    const theme = stored === 'dark' || stored === 'light'
+      ? stored
+      : (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+    document.documentElement.dataset.theme = theme;
+  })();
+</script>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="header-inner">
+    <a class="brand" href="/" aria-label="Nulang home"><span>Nu</span>lang</a>
+    <nav aria-label="Primary">
+      <a href="/getting-started/quick-start/">Docs</a>
+      <a href="https://github.com/nulang-org/nulang">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <section class="intro">
+    <div class="eyebrow">Browser playground · CoreVM</div>
+    <h1>Try Nulang without installing anything.</h1>
+    <p>
+      The real compiler frontend and CoreVM run locally in WebAssembly.
+      Your code stays in your browser.
+    </p>
+  </section>
+
+  <section class="workspace" aria-label="Nulang playground">
+    <div class="toolbar">
+      <label for="examples">Example</label>
+      <select id="examples"></select>
+      <button id="run" disabled>Run <span aria-hidden="true">▶</span></button>
+      <span id="status" aria-live="polite">loading compiler…</span>
+    </div>
+
+    <div class="panes">
+      <div class="pane">
+        <div class="pane-heading">
+          <h2>Source</h2>
+          <span>Ctrl/Cmd + Enter to run</span>
+        </div>
+        <textarea id="editor" spellcheck="false" aria-label="Nulang source code"></textarea>
+      </div>
+      <div class="pane">
+        <div class="pane-heading">
+          <h2>Output</h2>
+          <span>Compiler + program output</span>
+        </div>
+        <pre id="output" aria-live="polite"></pre>
+      </div>
+    </div>
+  </section>
+
+  <section class="scope-note">
+    <strong>What runs here?</strong>
+    <p>
+      The playground supports the frozen Core subset, pure functions, closures,
+      recursion, and effects such as <code>IO.print</code>. Actors, networking,
+      FFI, and JIT execution require the native runtime.
+    </p>
+  </section>
+
+  <details class="about">
+    <summary>How this playground is built</summary>
+    <p>
+      <code>nulang_playground.wasm</code> contains the real Nulang lexer, parser,
+      typechecker, MIR lowering, bytecode generator, and CoreVM interpreter from
+      the main repository. It does not use a separate toy parser.
+    </p>
+    <p>
+      <a href="https://github.com/nulang-org/nulang/tree/main/playground">Inspect the playground source on GitHub →</a>
+    </p>
+  </details>
+</main>
+
+<footer>
+  <a href="/">nulang.org</a>
+  <span>Apache 2.0</span>
+</footer>
+
+<script src="playground.js"></script>
+</body>
+</html>
