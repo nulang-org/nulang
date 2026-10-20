@@ -78,6 +78,22 @@ class CrossRuntimeCommandTests(unittest.TestCase):
         self.assertIn("last successful actor turn", stderr.getvalue())
         self.assertIn("timed out", stderr.getvalue())
 
+    def test_version_probe_timeout_is_bounded_quiet_and_nonfatal(self):
+        timeout = subprocess.TimeoutExpired(
+            ["hung-tool", "--version"], 5.0, output=b"partial tool output\\n"
+        )
+        stderr = io.StringIO()
+        with mock.patch.object(
+            cross_runtime_bench.subprocess, "run", side_effect=timeout
+        ) as runner:
+            with contextlib.redirect_stderr(stderr):
+                version = cross_runtime_bench.maybe_version(["hung-tool", "--version"])
+
+        self.assertIsNone(version)
+        self.assertEqual("", stderr.getvalue())
+        self.assertGreater(runner.call_args.kwargs["timeout"], 0)
+        self.assertLessEqual(runner.call_args.kwargs["timeout"], 10.0)
+
     def test_non_finite_timeout_is_rejected_before_building(self):
         for value in ("nan", "inf", "0", "-1"):
             with self.subTest(value=value):
