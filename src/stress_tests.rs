@@ -1137,6 +1137,13 @@ fn stress_remote_actor_cache_lru_eviction() {
 fn stress_supervisor_restart_intensity() {
     let mut rt = Runtime::new();
     let sup = rt.create_supervisor("intense", RestartStrategy::OneForOne);
+    // Exercise 50 independent restarts without crossing the deliberately
+    // configured supervisor-wide threshold (the production default is 5).
+    rt.supervisors
+        .get_mut(&sup)
+        .unwrap()
+        .set_restart_intensity(50, 60)
+        .unwrap();
 
     let mut children = Vec::new();
     for i in 0..50 {

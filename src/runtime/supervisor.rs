@@ -178,9 +178,9 @@ pub struct ChildTemplate {
 /// of child actors according to a restart strategy. If a child fails, the
 /// supervisor applies the strategy to determine which children to restart.
 ///
-/// If the maximum restart intensity is exceeded for any child, the supervisor
-/// itself shuts down (returning `SupervisorAction::Shutdown`), which typically
-/// causes escalation to a parent supervisor.
+/// Restart intensity is checked both for each child specification and across
+/// the whole supervisor. Exceeding either limit shuts down the supervisor
+/// (returning `SupervisorAction::Shutdown`) and escalates to its parent.
 pub struct Supervisor {
     /// The actor ID of this supervisor.
     pub id: u64,
@@ -194,6 +194,14 @@ pub struct Supervisor {
     /// Uses spec.id (String) so that restarts are tracked per child spec,
     /// not per actor_id (which changes on each restart).
     pub restart_history: Vec<(String, Instant)>,
+    /// Maximum automatic restart events across all children in the period.
+    /// Unlike per-child limits, alternating failures cannot evade this bound.
+    pub max_restarts: u32,
+    /// Rolling window for supervisor-wide automatic restart events (seconds).
+    pub restart_window_secs: u32,
+    /// Successful crash-triggered restarts, counted once per triggering exit
+    /// regardless of how many sibling children a strategy replaces.
+    global_restart_history: Vec<Instant>,
     /// Parent supervisor actor ID (if any).
     pub parent: Option<u64>,
     /// Child template for `SimpleOneForOne` supervisors: the one actor type
@@ -215,10 +223,38 @@ impl Supervisor {
             strategy,
             children: Vec::new(),
             restart_history: Vec::new(),
+            max_restarts: 5,
+            restart_window_secs: 60,
+            global_restart_history: Vec::new(),
             parent: None,
             template: None,
             next_dynamic_id: 0,
         }
+    }
+
+    /// Configure a supervisor-wide restart budget. Zero restarts is valid,
+    /// but a zero-second window is not. Changing the budget preserves recent
+    /// history instead of resetting safety accounting.
+    pub fn set_restart_intensity(
+        &mut self,
+        max_restarts: u32,
+        period_secs: u32,
+    ) -> Result<(), &'static str> {
+        if period_secs == 0 {
+            return Err("supervisor restart period must be positive");
+        }
+        self.max_restarts = max_restarts;
+        self.restart_window_secs = period_secs;
+        Ok(())
+    }
+
+    /// Return true if another automatic restart would breach the aggregate
+    /// budget. Expired events are removed without affecting per-child history.
+    fn restart_intensity_exhausted(&mut self, now: Instant) -> bool {
+        let window = Duration::from_secs(u64::from(self.restart_window_secs));
+        self.global_restart_history
+            .retain(|event| now.saturating_duration_since(*event) < window);
+        self.global_restart_history.len() >= self.max_restarts as usize
     }
 
     /// Register a child actor under this supervisor.
@@ -277,7 +313,9 @@ impl Supervisor {
         let policy_allows = match policy {
             RestartPolicy::Permanent => true,
             RestartPolicy::Temporary => false,
-            RestartPolicy::Transient => !matches!(reason, ExitReason::Normal),
+            RestartPolicy::Transient => {
+                !matches!(reason, ExitReason::Normal | ExitReason::Shutdown(_))
+            }
             RestartPolicy::RespawnOnNodeLoss => true,
         };
         if !policy_allows {
@@ -425,6 +463,9 @@ impl Supervisor {
             let mut new_sup = Supervisor::new(new_id, old_sup.name.clone(), old_sup.strategy);
             new_sup.children = old_sup.children;
             new_sup.restart_history = old_sup.restart_history;
+            new_sup.max_restarts = old_sup.max_restarts;
+            new_sup.restart_window_secs = old_sup.restart_window_secs;
+            new_sup.global_restart_history = old_sup.global_restart_history;
             new_sup.parent = old_sup.parent;
             new_sup.template = old_sup.template;
             new_sup.next_dynamic_id = old_sup.next_dynamic_id;
@@ -684,7 +725,9 @@ impl Supervisor {
                 runtime.remove_actor_reaping(actor_id);
                 return SupervisorAction::Ignore;
             }
-            if spec.restart_policy == RestartPolicy::Transient && reason == ExitReason::Normal {
+            if spec.restart_policy == RestartPolicy::Transient
+                && matches!(&reason, ExitReason::Normal | ExitReason::Shutdown(_))
+            {
                 self.remove_child(actor_id);
                 runtime.remove_actor_reaping(actor_id);
                 return SupervisorAction::Ignore;
@@ -703,7 +746,13 @@ impl Supervisor {
             runtime.remove_actor_reaping(actor_id);
             return SupervisorAction::Ignore;
         }
-        match self.strategy {
+        // Check the aggregate budget once per automatic restart event,
+        // before replacing any siblings for OneForAll/RestForOne.
+        if self.restart_intensity_exhausted(Instant::now()) {
+            return SupervisorAction::Shutdown;
+        }
+
+        let action = match self.strategy {
             RestartStrategy::OneForOne => match self.restart_child(actor_id, runtime) {
                 Some(new_id) => SupervisorAction::Restarted(new_id),
                 None => SupervisorAction::Shutdown,
@@ -728,7 +777,11 @@ impl Supervisor {
                     None => SupervisorAction::Shutdown,
                 }
             }
+        };
+        if matches!(&action, SupervisorAction::Restarted(_)) {
+            self.global_restart_history.push(Instant::now());
         }
+        action
     }
 
     /// Count how many times a given child has been restarted within its time window.
@@ -810,6 +863,28 @@ mod tests {
         assert_eq!(sup.strategy, RestartStrategy::OneForOne);
         assert!(sup.children.is_empty());
         assert!(sup.parent.is_none());
+    }
+
+    #[test]
+    fn test_supervisor_restart_intensity_window_expires() {
+        let mut sup = Supervisor::new(1, "limits", RestartStrategy::OneForOne);
+        sup.set_restart_intensity(1, 60).unwrap();
+        let now = Instant::now();
+        sup.global_restart_history
+            .push(now - Duration::from_secs(61));
+        assert!(!sup.restart_intensity_exhausted(now));
+
+        sup.global_restart_history.push(now);
+        assert!(sup.restart_intensity_exhausted(now));
+    }
+
+    #[test]
+    fn test_supervisor_restart_intensity_rejects_zero_period() {
+        let mut sup = Supervisor::new(1, "limits", RestartStrategy::OneForOne);
+        assert!(sup.set_restart_intensity(1, 0).is_err());
+        assert_eq!(sup.restart_window_secs, 60);
+        assert!(sup.set_restart_intensity(0, 30).is_ok());
+        assert!(sup.restart_intensity_exhausted(Instant::now()));
     }
 
     #[test]
