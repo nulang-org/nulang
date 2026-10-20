@@ -1,8 +1,107 @@
 //! Conservative compiler-side screening for future dataflow optimizations.
 //!
-//! An eligible *candidate* is not permission to optimize: type checking,
-//! immutable/reference-capability validation, semantic equivalence and a
-//! backend-specific proof are additional mandatory gates.
+//! A positive *candidate* result is not permission to optimize: it does not
+//! establish input immutability, full type/capability safety, callback
+//! determinism, or bytecode/WASM observational equivalence. The caller must
+//! supply only compiler-validated immutable input names. This pass is not
+//! connected to MIR lowering or runtime scheduling.
+
+use crate::ast::Expr;
+use crate::effect_checker::{EffectChecker, EffectContext};
+use crate::types::EffectRow;
+use std::collections::BTreeSet;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IneligibleReason {
+    /// Calls, mutation, actor state, effects, unverified captures or any
+    /// construct outside the deliberately small supported AST subset.
+    UnsupportedShapeOrCapture,
+    /// The canonical checker found a nonempty, open or unresolved effect row.
+    NonPureOrUnknownEffect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataflowEligibility {
+    /// A *screened candidate*, NOT an optimization or concurrency license.
+    Candidate,
+    Ineligible(IneligibleReason),
+}
+
+/// Screen a closed, deliberately restricted expression subset for future
+/// optimization research. No source or backend behavior changes.
+///
+/// `immutable_inputs` are asserted by the caller; this function cannot
+/// independently establish their reference capabilities or whether they are
+/// mutable at the call site. A production optimizer must instead obtain
+/// inputs from the canonical checked-and-resolved compiler environment.
+pub fn classify_pure_candidate(
+    expr: &Expr,
+    immutable_inputs: &[&str],
+    checker: &mut EffectChecker,
+) -> DataflowEligibility {
+    let inputs = immutable_inputs
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<BTreeSet<_>>();
+    if !supported_pure_shape(expr, &inputs) {
+        return DataflowEligibility::Ineligible(IneligibleReason::UnsupportedShapeOrCapture);
+    }
+    // An empty row alone is *not* sufficient, because unknown/indirect
+    // calls can be underrepresented by effect inference. Shape checks above
+    // reject all call sites and other opaque constructs.
+    match checker.infer_effects(&EffectContext::empty(), expr) {
+        Ok(EffectRow::Closed(effects)) if effects.is_empty() => {
+            DataflowEligibility::Candidate
+        }
+        _ => DataflowEligibility::Ineligible(IneligibleReason::NonPureOrUnknownEffect),
+    }
+}
+
+fn supported_pure_shape(expr: &Expr, inputs: &BTreeSet<String>) -> bool {
+    match expr {
+        Expr::Literal(..) => true,
+        Expr::Var(name, _) => inputs.contains(name),
+        Expr::Binary { left, right, .. } => {
+            supported_pure_shape(left, inputs) && supported_pure_shape(right, inputs)
+        }
+        Expr::Unary { expr, .. } => supported_pure_shape(expr, inputs),
+        Expr::Tuple(items, _) | Expr::Block { exprs: items, .. } => {
+            items.iter().all(|item| supported_pure_shape(item, inputs))
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            supported_pure_shape(cond, inputs)
+                && supported_pure_shape(then_branch, inputs)
+                && else_branch
+                    .as_ref()
+                    .is_none_or(|branch| supported_pure_shape(branch, inputs))
+        }
+        Expr::Let {
+            name,
+            value,
+            body,
+            mutable: false,
+            ..
+        } => {
+            if !supported_pure_shape(value, inputs) {
+                return false;
+            }
+            let mut extended = inputs.clone();
+            extended.insert(name.clone());
+            supported_pure_shape(body, &extended)
+        }
+        // Deliberately reject App even when effect inference returns an empty
+        // row: unresolved callees, closures and shadowed names are not proof
+        // of purity. Reject mutation, panic, consume, loops, effects, match,
+        // aggregate read/write, actors, reference annotations and all other
+        // source forms until their contracts can be proved separately.
+        _ => false,
+    }
+}
 
 #[cfg(test)]
 mod tests {
