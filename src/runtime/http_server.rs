@@ -1269,6 +1269,28 @@ fn guess_content_type(path: &Path) -> &'static str {
 mod tests {
     use super::*;
 
+    #[test]
+    fn redirect_locations_reject_header_injection_and_unsafe_schemes() {
+        assert!(valid_http_redirect_location("/dashboard?next=%2F"));
+        assert!(valid_http_redirect_location("https://example.com/path"));
+        assert!(valid_http_redirect_location("../relative"));
+        for unsafe_target in [
+            "",
+            "//evil.example/path",
+            "javascript:alert(1)",
+            "data:text/html,hi",
+            "/ok\r\nSet-Cookie: injected=1",
+            "/path with spaces",
+            "/path\\evil",
+            "http://",
+        ] {
+            assert!(
+                !valid_http_redirect_location(unsafe_target),
+                "accepted unsafe Location: {unsafe_target:?}"
+            );
+        }
+    }
+
     // A deterministic reader forces TCP-like fragmentation without sleeps.
     struct FixedChunkReader<'a> {
         remaining: &'a [u8],
