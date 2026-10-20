@@ -35,6 +35,9 @@ hung actor workload fails the comparison instead of consuming the entire CI
 job. Failed commands print captured output (including partial output on
 timeouts) to aid exact-revision debugging. Build steps remain outside this
 measurement deadline and under the CI job timeout.
+Optional toolchain/Git version probes are best-effort and capped at 5 seconds each;
+a missing, failing, or hanging probe records no version rather than blocking the
+report. The probe deadline does not change runtime measurement or build limits.
 
 The GitHub workflow uses the Go 1.27 toolchain as its current comparison
 baseline. The emitted JSON records the exact Go version for every run; results
