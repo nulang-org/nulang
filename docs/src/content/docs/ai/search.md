@@ -67,15 +67,30 @@ Search relevancy (BM25) considers all documents in the selected namespace;
 filters restrict the returned hits. Facet counts apply namespace and exact
 filters, but not the full-text query.
 
+## Provider-independent Rust API
+
+The `SearchBackend` trait supplies the common synchronous operations:
+`index_document`, `remove_document`, `query`, and `facets`.
+`EmbeddedSearch` implements this trait today. `query` returns owned
+`OwnedSearchHit` values; scores are provider-specific and not comparable
+between engines. Future Tantivy backends may implement the same trait without
+introducing search keywords into the language core.
+
 ## AI semantic-memory improvement
 
 `SemanticMemory` now caches document embeddings on store and persists
 them in serialized memory. Existing snapshots without the `embeddings`
 field remain readable using an on-demand fallback. Vector retrieval
 remains a linear scan; the default embeddings remain deterministic
-hash-derived features, **not trained semantic embeddings**. Custom embedding
-functions are not serialized and must be reattached by application code
-after restoration if the same embedding model is required.
+hash-derived features, **not trained semantic embeddings**. Custom embedding functions are not serialized. The serialized provider marker
+now distinguishes custom embeddings from the default deterministic algorithm.
+When a custom provider is unavailable after restoration, the original
+`search` method returns no results rather than mixing incompatible vectors.
+Use `search_checked` to receive an explicit `MissingEmbeddingProvider`
+error, then call `set_embedding_fn` with the original provider before
+searching. Storing additional documents before reattaching a custom provider
+records a placeholder rather than an incompatible vector, and rebuilding
+with `set_embedding_fn` makes those documents searchable.
 
 ## Follow-up work
 
