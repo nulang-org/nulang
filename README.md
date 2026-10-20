@@ -179,6 +179,29 @@ workflow uses the default `GITHUB_TOKEN`, GitHub requires a maintainer to
 approve the generated PR's workflow runs; an optional `DOCS_SYNC_TOKEN`
 PAT/App token removes that approval step.
 
+### OpenHands-assisted repairs
+
+[`.github/workflows/openhands-repair.yml`](.github/workflows/openhands-repair.yml)
+is an opt-in, maintainer-dispatched OpenHands Cloud repair workflow. It runs
+only from `main`, starts an isolated Cloud conversation, and never passes a
+write-capable GitHub token to the agent. OpenHands must create a separate branch
+and pull request through its own authorized GitHub integration; required GitHub
+Actions checks remain the merge gate.
+
+To enable it:
+
+1. [Authorize OpenHands Cloud for this repository](https://docs.openhands.dev/openhands/usage/cloud/github-installation).
+2. Create an OpenHands Cloud API key and save it as the repository Actions
+   secret `OPENHANDS_API_KEY`; the workflow fails closed until that secret
+   exists.
+3. Use **Actions → OpenHands Assisted Repair → Run workflow** from `main` with
+   a concrete repair or CI-investigation task.
+
+The Cloud agent is asked to run the relevant Rust formatter, tests, and CI
+checks in its sandbox, but its results are advisory. A missing toolchain or
+dependency must be reported rather than treated as a passing check; required
+GitHub Actions checks remain authoritative.
+
 ---
 
 ## Package Manager

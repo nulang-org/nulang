@@ -1,0 +1,52 @@
+name: OpenHands Assisted Repair
+
+# Manually starts a managed OpenHands Cloud conversation. The agent works in
+# its own sandbox and opens a new PR through the separately authorized
+# OpenHands GitHub integration; this workflow never gives the agent GITHUB_TOKEN.
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "Concrete repair or CI-investigation task for OpenHands."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: openhands-repair-main
+  cancel-in-progress: false
+
+jobs:
+  start-repair:
+    # Run only a trusted default-branch workflow. This avoids exposing the
+    # OpenHands secret to pull-request or issue event payloads.
+    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
+    name: Start OpenHands repair
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      OPENHANDS_REPOSITORY: ${{ github.repository }}
+      OPENHANDS_TASK: ${{ inputs.task }}
+    steps:
+      - name: Checkout trusted workflow revision
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Require OpenHands configuration
+        shell: bash
+        env:
+          OPENHANDS_API_KEY: ${{ secrets.OPENHANDS_API_KEY }}
+        run: |
+          if [[ -z "${OPENHANDS_API_KEY:-}" ]]; then
+            echo "::error::OPENHANDS_API_KEY is not configured. Create an OpenHands Cloud API key and store it as this repository Actions secret."
+            exit 1
+          fi
+
+      - name: Start repair conversation
+        shell: bash
+        env:
+          OPENHANDS_API_KEY: ${{ secrets.OPENHANDS_API_KEY }}
+        run: python3 scripts/openhands_repair.py

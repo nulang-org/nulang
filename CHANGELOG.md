@@ -1,4 +1,9 @@
 # Nulang Changelog
+
+### Opt-in OpenHands repair dispatch — CI automation — 2026-10-20
+- **Maintainers can launch an OpenHands Cloud repair conversation from the trusted `main` workflow.** The workflow uses a repository `OPENHANDS_API_KEY` secret, starts the agent in its own sandbox, and requires the separately authorized OpenHands GitHub integration to create a new repair PR.
+- **OpenHands is advisory rather than a CI bypass.** The repair prompt requires relevant Rust formatting/tests and explicit environment-limit reporting, while protected GitHub Actions checks remain the source of truth for merge eligibility.
+
 ### Fabric on-demand mailbox scoring — 2026-10-18
 - **Fabric publish admission now reads mailbox pressure only for matching local subscribers**, instead of allocating and populating an all-actor mailbox snapshot on every publish.
 - **Ported the regression and exact-base matched-fixture A/B harness** from #1708 onto current main. Historical unmatched-publish microbenchmarks were favorable; new-head CI and measurements remain the promotion gate.
