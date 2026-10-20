@@ -815,6 +815,36 @@ pub fn render_route_handler(
     }
 }
 
+/// Map compiler-derived source return types to HTTP payload representations.
+///
+/// An absent response contract preserves legacy HTML rendering. Explicit
+/// primitive scalar responses are text, not HTML; we must not inject the
+/// browser hydration script into API or text responses. Unsupported response
+/// types fail closed until their wire representation is defined in Web
+/// Contract IR, rather than making up JSON or leaking VM debug values.
+fn response_from_rendered(response_type: Option<&str>, body: String) -> HttpResponse {
+    match response_type {
+        Some("String" | "Int" | "Float" | "Bool") => HttpResponse {
+            status: 200,
+            headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
+            body: body.into_bytes(),
+        },
+        Some("Html") | None => HttpResponse {
+            status: 200,
+            headers: vec![("Content-Type".into(), "text/html; charset=utf-8".into())],
+            body: inject_client_runtime_script(&body).into_bytes(),
+        },
+        Some(other) => {
+            eprintln!("unsupported typed web response type: {other}");
+            HttpResponse {
+                status: 500,
+                headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
+                body: b"Unsupported typed response".to_vec(),
+            }
+        }
+    }
+}
+
 fn invalid_ui_action_response(captured: &HttpRequestBindingInputs) -> Option<HttpResponse> {
     captured
         .ui_message_error
@@ -1056,11 +1086,10 @@ impl WebDevServer {
                         Err(error) => Err(error),
                     });
                 match rendered {
-                    Ok(Some(html)) => HttpResponse {
-                        status: 200,
-                        headers: vec![("Content-Type".into(), "text/html; charset=utf-8".into())],
-                        body: inject_client_runtime_script(&html).into_bytes(),
-                    },
+                    Ok(Some(body)) => response_from_rendered(
+                        route.plan.as_ref().and_then(|plan| plan.response_type.as_deref()),
+                        body,
+                    ),
                     Ok(None) => HttpResponse {
                         status: 500,
                         headers: vec![("Content-Type".into(), "text/plain".into())],
