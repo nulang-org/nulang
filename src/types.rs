@@ -2589,6 +2589,63 @@ mod tests {
     }
 
     #[test]
+    fn test_tag_is_least_privileged_capability_for_all_eight_capabilities() {
+        // tag preserves identity but cannot be used to regain readable or
+        // writable authority. All capabilities can forget authority to tag.
+        let caps = [
+            Capability::LinearIso,
+            Capability::Linear,
+            Capability::Iso,
+            Capability::Trn,
+            Capability::Ref,
+            Capability::Val,
+            Capability::Box,
+            Capability::Tag,
+        ];
+        for cap in caps {
+            assert_eq!(cap.join(Capability::Tag), Capability::Tag, "{cap:?} + tag");
+            assert_eq!(Capability::Tag.join(cap), Capability::Tag, "tag + {cap:?}");
+            assert!(cap.is_subtype_of(Capability::Tag), "{cap:?} <: tag");
+            if cap != Capability::Tag {
+                assert!(
+                    !Capability::Tag.is_subtype_of(cap),
+                    "tag must not grant {cap:?} authority"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_capability_join_preserves_lattice_laws_exhaustively() {
+        let caps = [
+            Capability::LinearIso,
+            Capability::Linear,
+            Capability::Iso,
+            Capability::Trn,
+            Capability::Ref,
+            Capability::Val,
+            Capability::Box,
+            Capability::Tag,
+        ];
+        for a in caps {
+            assert_eq!(a.join(a), a, "idempotence for {a:?}");
+            for b in caps {
+                assert_eq!(a.join(b), b.join(a), "commutativity for {a:?} and {b:?}");
+                for c in caps {
+                    assert_eq!(
+                        a.join(b).join(c),
+                        a.join(b.join(c)),
+                        "associativity for {a:?}, {b:?}, {c:?}"
+                    );
+                    if a.is_subtype_of(b) && b.is_subtype_of(c) {
+                        assert!(a.is_subtype_of(c), "transitivity: {a:?} <: {b:?} <: {c:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_linear_join_tag() {
         assert_eq!(Capability::Linear.join(Capability::Tag), Capability::Linear);
         assert_eq!(Capability::Tag.join(Capability::Linear), Capability::Linear);
