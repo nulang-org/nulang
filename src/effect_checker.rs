@@ -3368,9 +3368,9 @@ mod tests {
         assert!(analyzer
             .check_cap_sub(Capability::Val, Capability::Box, s())
             .is_ok());
-        // Tag <: Iso (tag is bottom of the lattice)
+        // A mutable reference may be reduced to an opaque identity-only tag.
         assert!(analyzer
-            .check_cap_sub(Capability::Tag, Capability::Iso, s())
+            .check_cap_sub(Capability::Ref, Capability::Tag, s())
             .is_ok());
         // Ref <: Box (ref can be read as box)
         assert!(analyzer
@@ -3383,6 +3383,9 @@ mod tests {
         let mut analyzer = CapabilityAnalyzer::new();
         let result = analyzer.check_cap_sub(Capability::Ref, Capability::Val, s());
         assert!(result.is_err());
+        // Identity-only values must not be upgraded into mutable or readable references.
+        assert!(analyzer.check_cap_sub(Capability::Tag, Capability::Iso, s()).is_err());
+        assert!(analyzer.check_cap_sub(Capability::Tag, Capability::Box, s()).is_err());
     }
 
     #[test]
