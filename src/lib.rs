@@ -97,6 +97,7 @@ pub mod stream_budget;
 pub mod stream_pull;
 pub mod stream_records;
 pub mod stream_json_schema;
+mod stream_json_strict;
 pub mod stream_schema;
 #[cfg(test)]
 pub mod stress_tests;
