@@ -1,5 +1,10 @@
 # Nulang Changelog
 
+### Qualified export kind checks (experimental) — 2026-10-19
+- **Resolver-only qualified lookup now requires the expected symbol category.** Wrong-kind exports and ambiguous same-kind overloads fail closed instead of silently choosing a candidate.
+- Four regression tests cover ambiguous functions, separate type/function lookup, incorrect lexical kinds, and alias-independent symbol identity.
+- This does not enable qualified expression compilation. Rust test results and exact-head CI validation remain outstanding.
+
 ### Qualified module symbol indexing (experimental) — 2026-10-19
 - **Direct aliased modules can be indexed by canonical source path without flattening exports.** Explicitly public functions/types are visible; private symbols, unknown names, and alias-origin conflicts fail closed, with overloads retained.
 - Seven resolver tests cover source identities, visibility, missing symbols, duplicate aliases, opaque provenance, source-file indexing, and local name shadowing.

@@ -109,8 +109,48 @@ impl QualifiedImportIndex {
         Ok(())
     }
 
-    /// Resolve a public symbol without falling back to unrelated unqualified
-    /// bindings. Overloads are preserved for subsequent type-directed lookup.
+    /// Select one explicitly exported symbol of the requested lexical kind.
+    ///
+    /// This is a fail-closed preparatory lookup, *not* overload selection:
+    /// two eligible candidates are ambiguous until the typechecker has
+    /// enough information to choose by their signatures. Returning owned
+    /// identity metadata avoids retaining a borrow of this lookup index.
+    pub fn resolve_unique(
+        &self,
+        alias: &str,
+        symbol: &str,
+        kind: QualifiedSymbolKind,
+        span: Span,
+    ) -> NuResult<QualifiedSymbol> {
+        let candidates = self.resolve(alias, symbol, span)?;
+        let kind_name = match kind {
+            QualifiedSymbolKind::Function => "function",
+            QualifiedSymbolKind::Type => "type",
+        };
+        let mut matching = candidates.iter().filter(|entry| entry.kind == kind);
+        let selected = matching.next().ok_or_else(|| {
+            NuError::parse_error(
+                format!(
+                    "'{}' is not exported as a {} by module alias '{}'",
+                    symbol, kind_name, alias
+                ),
+                span,
+            )
+        })?;
+        if matching.next().is_some() {
+            return Err(NuError::parse_error(
+                format!(
+                    "ambiguous qualified reference '{}::{}': more than one exported {} matches",
+                    alias, symbol, kind_name
+                ),
+                span,
+            ));
+        }
+        Ok(selected.clone())
+    }
+
+    /// Resolve all public candidates, preserving overloads for later
+    /// signature-driven selection without falling back to local names.
     pub fn resolve(
         &self,
         alias: &str,
@@ -942,6 +982,109 @@ mod tests {
         };
         let err = index_qualified_imports(&module, &path).unwrap_err();
         assert!(format!("{err}").contains("alias shadows local declaration"), "{err}");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn qualified_lookup_fails_closed_on_function_overloads() {
+        let path = temp_module_path("overloads");
+        let module = AstModule {
+            name: "test".into(),
+            decls: vec![public_fn("encode"), public_fn("encode")],
+        };
+        let mut index = QualifiedImportIndex::default();
+        index.bind("codec", &path, &module, sp()).unwrap();
+
+        // Until type-directed overload selection is available, never pick
+        // whichever candidate happens to be returned first.
+        let err = index
+            .resolve_unique("codec", "encode", QualifiedSymbolKind::Function, sp())
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("ambiguous qualified reference"),
+            "{err}"
+        );
+        assert_eq!(index.resolve("codec", "encode", sp()).unwrap().len(), 2);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn qualified_lookup_filters_by_lexical_symbol_kind() {
+        let path = temp_module_path("kinds");
+        let module = AstModule {
+            name: "test".into(),
+            decls: vec![
+                public_fn("Value"),
+                Decl::TypeAlias {
+                    name: "Value".into(),
+                    type_params: vec![],
+                    body: crate::types::Type::int(),
+                    opaque: true,
+                    public: true,
+                    span: sp(),
+                },
+            ],
+        };
+        let mut index = QualifiedImportIndex::default();
+        index.bind("types", &path, &module, sp()).unwrap();
+
+        let function = index
+            .resolve_unique("types", "Value", QualifiedSymbolKind::Function, sp())
+            .expect("function namespace");
+        let ty = index
+            .resolve_unique("types", "Value", QualifiedSymbolKind::Type, sp())
+            .expect("type namespace");
+        assert_eq!(function.kind, QualifiedSymbolKind::Function);
+        assert_eq!(ty.kind, QualifiedSymbolKind::Type);
+        assert_eq!(function.origin, ty.origin);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn qualified_lookup_rejects_wrong_kind_without_fallback() {
+        let path = temp_module_path("wrong_kind");
+        let module = AstModule {
+            name: "test".into(),
+            decls: vec![public_fn("build")],
+        };
+        let mut index = QualifiedImportIndex::default();
+        index.bind("api", &path, &module, sp()).unwrap();
+
+        let err = index
+            .resolve_unique("api", "build", QualifiedSymbolKind::Type, sp())
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("not exported as a type"),
+            "{err}"
+        );
+        let unknown = index
+            .resolve_unique("missing", "build", QualifiedSymbolKind::Function, sp())
+            .unwrap_err();
+        assert!(
+            format!("{unknown}").contains("unknown module alias"),
+            "{unknown}"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn qualified_lookup_identity_is_independent_of_local_alias() {
+        let path = temp_module_path("alias_identity");
+        let module = AstModule {
+            name: "test".into(),
+            decls: vec![public_fn("run")],
+        };
+        let mut index = QualifiedImportIndex::default();
+        index.bind("primary", &path, &module, sp()).unwrap();
+        index.bind("secondary", &path, &module, sp()).unwrap();
+
+        let first = index
+            .resolve_unique("primary", "run", QualifiedSymbolKind::Function, sp())
+            .unwrap();
+        let second = index
+            .resolve_unique("secondary", "run", QualifiedSymbolKind::Function, sp())
+            .unwrap();
+        assert_eq!(first, second);
         std::fs::remove_file(path).unwrap();
     }
 
