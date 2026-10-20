@@ -744,7 +744,8 @@ mod tests {
     #[test]
     fn scheduler_local_system_signal_preempts_earlier_local_normal_message() {
         let mut mb = Mailbox::new(2);
-        mb.push_local(make_msg(1, 10)).expect("first normal message");
+        mb.push_local(make_msg(1, 10))
+            .expect("first normal message");
 
         let system = Message {
             behavior_id: 2,
@@ -753,7 +754,8 @@ mod tests {
             priority: MessagePriority::System,
             trace_id: None,
         };
-        mb.push_local(system).expect("system signal must bypass admission");
+        mb.push_local(system)
+            .expect("system signal must bypass admission");
 
         assert_eq!(mb.len(), 2);
         let first = mb.pop().expect("supervisor signal must be dispatched");
