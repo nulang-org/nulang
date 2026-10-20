@@ -187,6 +187,113 @@ fn immediately_invoked_lambda(expr: &Expr) -> Option<(&[crate::ast::Param], &Exp
     }
 }
 
+/// Only a direct variable reference (optionally annotated) establishes a
+/// syntactically known alias. Arbitrary expressions need ownership provenance.
+fn direct_alias_source(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Var(name, _) => Some(name.as_str()),
+        Expr::CapAnnotate { expr, .. } | Expr::TypeAnnotate { expr, .. } => {
+            direct_alias_source(expr)
+        }
+        _ => None,
+    }
+}
+
+/// Conservatively detect aggregate writes through let-bound reference aliases.
+/// The alias set is lexical: shadowing replaces its entry, and only a direct
+/// variable binding propagates it. This is not a proof for indirect calls or
+/// aliases hidden behind results returned by other functions.
+fn mutates_aggregate_through_alias(expr: &Expr, aliases: &HashSet<String>) -> bool {
+    match expr {
+        Expr::Assign { target, value, .. } => {
+            let writes_alias = matches!(
+                target.as_ref(),
+                Expr::FieldAccess { .. } | Expr::Index { .. }
+            ) && root_var(target).is_some_and(|root| aliases.contains(root));
+            writes_alias || mutates_aggregate_through_alias(value, aliases)
+        }
+        Expr::Let {
+            name, value, body, ..
+        } => {
+            let in_initializer = mutates_aggregate_through_alias(value, aliases);
+            let mut nested = aliases.clone();
+            nested.remove(name);
+            if direct_alias_source(value).is_some_and(|source| aliases.contains(source)) {
+                nested.insert(name.clone());
+            }
+            in_initializer || mutates_aggregate_through_alias(body, &nested)
+        }
+        Expr::Block { exprs, .. } | Expr::Par { exprs, .. } => exprs
+            .iter()
+            .any(|part| mutates_aggregate_through_alias(part, aliases)),
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            mutates_aggregate_through_alias(cond, aliases)
+                || mutates_aggregate_through_alias(then_branch, aliases)
+                || else_branch.as_ref().is_some_and(|other| {
+                    mutates_aggregate_through_alias(other, aliases)
+                })
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            mutates_aggregate_through_alias(scrutinee, aliases)
+                || arms.iter().any(|(pattern, guard, body)| {
+                    let mut shadowed = HashSet::new();
+                    pattern_bindings(pattern, &mut shadowed);
+                    let nested: HashSet<String> =
+                        aliases.difference(&shadowed).cloned().collect();
+                    guard.as_ref().is_some_and(|check| {
+                        mutates_aggregate_through_alias(check, &nested)
+                    }) || mutates_aggregate_through_alias(body, &nested)
+                })
+        }
+        Expr::While { cond, body, .. } => {
+            mutates_aggregate_through_alias(cond, aliases)
+                || mutates_aggregate_through_alias(body, aliases)
+        }
+        Expr::For {
+            var, iterable, body, ..
+        } => {
+            let mut nested = aliases.clone();
+            nested.remove(var);
+            mutates_aggregate_through_alias(iterable, aliases)
+                || mutates_aggregate_through_alias(body, &nested)
+        }
+        Expr::App { func, args, .. } => {
+            let in_args = args
+                .iter()
+                .any(|arg| mutates_aggregate_through_alias(arg, aliases));
+            if let Some((params, body)) = immediately_invoked_lambda(func) {
+                let mut nested = aliases.clone();
+                for param in params {
+                    nested.remove(&param.name);
+                }
+                in_args || mutates_aggregate_through_alias(body, &nested)
+            } else {
+                in_args || mutates_aggregate_through_alias(func, aliases)
+            }
+        }
+        Expr::Binary { left, right, .. } | Expr::Pipe { left, right, .. } => {
+            mutates_aggregate_through_alias(left, aliases)
+                || mutates_aggregate_through_alias(right, aliases)
+        }
+        Expr::CapAnnotate { expr, .. }
+        | Expr::TypeAnnotate { expr, .. }
+        | Expr::Unary { expr, .. }
+        | Expr::Recover { body: expr, .. }
+        | Expr::Hide { body: expr, .. }
+        | Expr::Seal { body: expr, .. } => mutates_aggregate_through_alias(expr, aliases),
+        // A closure declaration does not execute its body.
+        Expr::Lambda { .. } => false,
+        _ => false,
+    }
+}
+
 fn summarize_expr(expr: &Expr, bound: &HashSet<String>, out: &mut ParallelBranchSummary) {
     match expr {
         Expr::Literal(..) | Expr::SelfRef(_) | Expr::Panic(..) => {}
@@ -247,6 +354,21 @@ fn summarize_expr(expr: &Expr, bound: &HashSet<String>, out: &mut ParallelBranch
             name, value, body, ..
         } => {
             summarize_expr(value, bound, out);
+            // A lexical alias can hide a write that the ordinary bound-name
+            // summary ignores. Recover the original root when the initializer
+            // is a direct variable reference. Local values with no alias
+            // source (e.g. a fresh array literal) retain their existing rules.
+            if let Some(source) = direct_alias_source(value) {
+                let mut aliases = HashSet::new();
+                aliases.insert(name.clone());
+                if mutates_aggregate_through_alias(body, &aliases) {
+                    if bound.contains(source) {
+                        out.unproven_parameter_aliases.insert(source.to_string());
+                    } else {
+                        out.heap_mutations.insert(source.to_string());
+                    }
+                }
+            }
             let mut nested = bound.clone();
             nested.insert(name.clone());
             summarize_expr(body, &nested, out);
