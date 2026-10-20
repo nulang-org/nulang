@@ -1261,6 +1261,14 @@ mod tests {
     }
 
     #[test]
+    fn test_fmt_qualified_reference_round_trip() {
+        let src = "fn encode() = codec::run(1)";
+        let formatted = format_source(src).expect("qualified reference formatting");
+        assert!(formatted.contains("codec::run(1)"), "{formatted}");
+        assert_idempotent(src);
+    }
+
+    #[test]
     fn test_fmt_cap_ref_constructors() {
         // `&cap` must format with the capability keyword AND a space before
         // the operand: the old `op_sym_unary` printed "ref" for every Ref op
