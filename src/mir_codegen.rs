@@ -37,13 +37,13 @@ const FUNC_VALUE_REG: u8 = 254;
 /// First general-purpose local register. r0..(LOCAL_BASE-1) is the call/effect staging zone,
 /// r12..r14 are spill scratch registers, and rLOCAL_BASE..253 hold MIR locals that are not spilled.
 pub const LOCAL_BASE: u32 = 15;
-const MAX_STAGED_ARGS: usize = 12;
+pub(crate) const MAX_STAGED_ARGS: usize = 12;
 const SCRATCH0: u8 = 0;
 const SCRATCH1: u8 = 1;
 const SPILL_TEMP: u8 = 12;
 const SPILL_TEMP2: u8 = 13;
 #[allow(dead_code)]
-const SPILL_TEMP3: u8 = 14;
+pub(crate) const SPILL_TEMP3: u8 = 14;
 
 fn not_yet_implemented(feature: &str, span: Span) -> NuError {
     NuError::NotYetImplemented {
@@ -1099,6 +1099,13 @@ impl MirCodegen {
                 resolved_handler,
             } => {
                 self.stage_args(args)?;
+                // Python.call is variadic, but Perform currently carries no
+                // argument count. r14 is scratch (not a live local), so record
+                // the exact staged arity after staging and before dispatch.
+                // Do not infer arity from stale registers in the VM frame.
+                if effect == "Python" && op == "call" {
+                    self.load_constant(SPILL_TEMP3, &Constant::Int(args.len() as i64));
+                }
                 let effect_operation = format!("{effect}.{op}");
                 let effect_pc = self.current_offset();
                 self.record_effect_site(effect_pc, effect_site, &effect_operation)?;
