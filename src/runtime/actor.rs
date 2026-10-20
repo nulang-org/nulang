@@ -1082,10 +1082,8 @@ mod orca_actor_stored_root_visitor_tests {
     #[test]
     fn actor_heap_provenance_rejects_foreign_interior_and_freed_pointers() {
         let mut actor = Actor::new(1, "owner", 0);
-        let other = {
-            let mut other = Actor::new(2, "other", 0);
-            other.allocate_string("other actor")
-        };
+        let mut other_actor = Actor::new(2, "other", 0);
+        let other = other_actor.allocate_string("other actor");
         let owned = actor.allocate_string("owned");
         assert!(actor.is_live_heap_payload_value(owned));
         assert!(!actor.is_live_heap_payload_value(other));
