@@ -163,8 +163,8 @@ impl Capability {
     /// alias: the compiler needs explicit consume/move-out semantics first.
     ///
     /// `None` means the receiver is opaque and cannot be dereferenced.
-    /// `lineariso` and `linear` are treated as `iso` and `val` for reads;
-    /// field reads do not discharge the parent's linear consumption obligation.
+    /// Linear receivers borrow as `iso`/`val` for reads, but linear *fields*
+    /// are opaque until a separate move-out discharges their obligation.
     pub fn viewpoint_read(self, field: Capability) -> Option<Capability> {
         use Capability::*;
         let origin = match self {
@@ -173,9 +173,10 @@ impl Capability {
             Linear => Val,
             other => other,
         };
+        // A field-level linear resource cannot be borrowed as a reusable
+        // reference: move-out/consume must discharge its obligation first.
         let inner = match field {
-            LinearIso => Iso,
-            Linear => Val,
+            LinearIso | Linear => return Some(Tag),
             other => other,
         };
         Some(match (origin, inner) {
@@ -2657,7 +2658,8 @@ mod tests {
         assert_eq!(Linear.viewpoint_read(Ref), Val.viewpoint_read(Ref));
         // A field read must not discharge the linear obligation on its owner.
         assert_eq!(LinearIso.viewpoint_read(LinearIso), Some(Tag));
-        assert_eq!(Ref.viewpoint_read(Linear), Some(Val));
+        assert_eq!(Ref.viewpoint_read(Linear), Some(Tag));
+        assert_eq!(Val.viewpoint_read(LinearIso), Some(Tag));
     }
 
     #[test]
