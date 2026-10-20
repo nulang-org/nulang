@@ -1,0 +1,10 @@
+// Compatibility guard: Stream[T] is already a legal user-defined generic ADT.
+// Future lazy streams must not reserve this nominal name or reclassify Nil.
+// This duplicates the core generics_07 shape with an explicit type annotation
+// to prove generic applications remain usable in signatures.
+type Stream[T] = Nil | Cons((T, Stream[T]))
+
+fn main() {
+    let items: Stream[Int] = Cons(1, Cons(2, Nil))
+    perform IO.print("stream-type-compat-ok")
+}
