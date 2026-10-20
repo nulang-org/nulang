@@ -1,10 +1,12 @@
 /-
-  Known counterexamples in the *current* effect-annotated typing judgment.
+  Regression witnesses for two previously unsound empty-effect derivations.
 
-  These are positive derivations of wrongly empty effect rows. They deliberately
-  record open soundness gaps so a future HasTypeEff redesign has precise
-  regression cases to invert (the fixed judgment should reject both).
-  No claim about the production compiler is made by this file.
+  Before effect-aware function types and typed handler bodies, the same
+  expressions admitted HasTypeEff judgments with an empty effect row.
+  The updated typing rules account for IO and Net instead.
+
+  This formal fragment is monomorphic and does not yet model higher-order
+  polymorphic effect rows, captured environments, or continuation resumptions.
 -/
 
 import effects
@@ -12,44 +14,43 @@ import effects
 namespace Nulang
 
 /--
-  The current function type Ty.fn does not carry a latent effect row.
-  A lambda body may perform IO, yet tLambda gives the closure an empty
-  immediate row and tApp ignores effects of invoking the closure.
+  Calling an IO-performing lambda must include its *latent* IO effect.
+  Lambda creation itself remains pure.
 -/
-example : HasTypeEff Context.empty
+example : HasTypeEff EffContext.empty
     (.app (.lambda "x" .int (.perform .IO (.litInt 0))) (.litInt 1))
-    .int EffectRow.empty := by
+    (EffTy.base .int) (EffectRow.singleton .IO) := by
   have hBody : HasTypeEff
-      [("x", ⟨[], Ty.int⟩)]
-      (.perform .IO (.litInt 0)) .int (EffectRow.singleton .IO) :=
+      [("x", EffTy.base Ty.int)]
+      (.perform .IO (.litInt 0)) (EffTy.base .int) (EffectRow.singleton .IO) :=
     HasTypeEff.tPerform HasTypeEff.tLitInt
-  have hLambda : HasTypeEff Context.empty
+  have hLambda : HasTypeEff EffContext.empty
       (.lambda "x" .int (.perform .IO (.litInt 0)))
-      (.fn .int .int) EffectRow.empty :=
+      (EffTy.arrow (EffTy.base .int) (EffTy.base .int) (EffectRow.singleton .IO))
+      EffectRow.empty :=
     HasTypeEff.tLambda hBody
-  have hArg : HasTypeEff Context.empty
-      (.litInt 1) .int EffectRow.empty := HasTypeEff.tLitInt
+  have hArg : HasTypeEff EffContext.empty
+      (.litInt 1) (EffTy.base .int) EffectRow.empty := HasTypeEff.tLitInt
   have hApp := HasTypeEff.tApp hLambda hArg
-  simpa [EffectRow.union, EffectRow.empty] using hApp
+  simpa [EffectRow.union, EffectRow.empty, EffectRow.singleton] using hApp
 
 /--
-  The current tHandle constructor has no typing premise for the handler body,
-  so one can attach an IO handler body that performs Net yet obtain an empty
-  result effect row. A sound handler rule must account for handler-body effects
-  as well as the effects of the handled expression.
+  Handling IO does not erase the Net effect introduced by the handler body.
 -/
-example : HasTypeEff Context.empty
+example : HasTypeEff EffContext.empty
     (.handle (.perform .IO (.litInt 0))
       .IO (.perform .Net (.litInt 1)))
-    .int EffectRow.empty := by
-  have hPerform : HasTypeEff Context.empty
+    (EffTy.base .int) (EffectRow.singleton .Net) := by
+  have hPerform : HasTypeEff EffContext.empty
       (.perform .IO (.litInt 0))
-      .int (EffectRow.singleton .IO) :=
+      (EffTy.base .int) (EffectRow.singleton .IO) :=
     HasTypeEff.tPerform HasTypeEff.tLitInt
-  have hExpected : HasTypeEff Context.empty
-      (.perform .IO (.litInt 0)) .int
-      (EffectRow.union (EffectRow.singleton .IO) EffectRow.empty) := by
-    simpa [EffectRow.union, EffectRow.empty, EffectRow.singleton] using hPerform
-  exact HasTypeEff.tHandle hExpected
+  have hHandler : HasTypeEff EffContext.empty
+      (.perform .Net (.litInt 1))
+      (EffTy.base .int) (EffectRow.singleton .Net) :=
+    HasTypeEff.tPerform HasTypeEff.tLitInt
+  have hHandled := HasTypeEff.tHandle hPerform hHandler
+  simpa [EffectRow.union, EffectRow.without, EffectRow.empty,
+    EffectRow.singleton, List.filter] using hHandled
 
 end Nulang
