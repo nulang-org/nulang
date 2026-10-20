@@ -80,6 +80,28 @@ Nulang's LLM client is provider-agnostic. The `model` field selects the provider
 
 Pipeline orchestration is available via the Rust `nulang-ai` crate (`Pipeline::new()`, `Pipeline::stage()`, `Pipeline::run()`) and can be accessed through the runtime API. A language-level pipeline expression is pending.
 
+## Local Agent Execution Safety
+
+The `nulang agent run` CLI currently initializes a local orchestration scaffold.
+Its default `LocalWorker` does **not** run shell commands, modify files, or
+execute acceptance checks. It reports the task as blocked instead of claiming
+that work was completed. A blocked goal returns a non-success CLI exit.
+
+Hosts embedding `nulang-ai-local` can use `LocalRuntime::open_with_execution`
+to provide a `Worker` and an independent `EvidenceVerifier`. A worker returns
+`WorkerExecution::Executed` with acceptance-criterion artifact references.
+The local runtime checks that every required criterion has a nonempty
+reference and requires the host verifier to validate the real artifacts.
+Only then does it atomically persist the evidence and promote the task to
+`Completed` in SQLite. Unconfigured or rejected verification blocks completion.
+
+This is a **verification boundary**, not a shipped sandbox or a trusted
+test runner. The host is responsible for actual execution, sandboxing,
+artifact verification, and minimizing tool permissions. NLAP now emits
+`task_verified`, `task_blocked`, `task_failed`, and `goal_blocked`
+events; existing `task_completed` and `goal_completed` events are
+emitted only after successful verification.
+
 ## Next
 
 - [Memory](/ai/memory/) — episodic, semantic, and procedural memory subsystems
