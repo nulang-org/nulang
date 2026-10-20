@@ -1455,10 +1455,12 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(absolute.path, "/resource?x=1");
-        assert_eq!(
-            absolute.headers.iter().find(|(key, _)| key.eq_ignore_ascii_case("host")).map(|(_, value)| value.as_str()),
-            Some("example.test"),
-        );
+        let effective_host = absolute
+            .headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("host"))
+            .map(|(_, value)| value.as_str());
+        assert_eq!(effective_host, Some("example.test"));
 
         // A URI with no explicit path still routes to '/'.
         let no_path = read_http_request(&mut chunks(
@@ -1468,10 +1470,12 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(no_path.path, "/?x=1");
-        assert_eq!(
-            no_path.headers.iter().find(|(key, _)| key.eq_ignore_ascii_case("host")).map(|(_, value)| value.as_str()),
-            Some("example.test"),
-        );
+        let effective_host = no_path
+            .headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("host"))
+            .map(|(_, value)| value.as_str());
+        assert_eq!(effective_host, Some("example.test"));
 
         // Empty Host is permitted when the target has no URI authority.
         let empty_host = read_http_request(&mut chunks(
@@ -1577,7 +1581,8 @@ mod tests {
 
     #[test]
     fn http_request_does_not_consume_pipelined_bytes_as_body() {
-        let raw = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\nokGET / HTTP/1.1\r\n\r\n";
+        let raw =
+            b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\nokGET / HTTP/1.1\r\n\r\n";
         let request = read_http_request(&mut chunks(raw, 128)).unwrap().unwrap();
         assert_eq!(request.body, b"ok");
     }
