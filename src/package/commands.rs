@@ -76,6 +76,21 @@ pub fn run(args: &[String]) -> NuResult<()> {
             cmd_new(path_arg, template)
         }
         Some("init") => cmd_init(),
+        Some("generate") => match (
+            args.get(1).map(String::as_str),
+            args.get(2).map(String::as_str),
+            args.len(),
+        ) {
+            (Some("migration"), Some(name), 3) => {
+                let path = crate::package::migrations::generate_migration(&package_root()?, name)?;
+                println!("Created migration {}", path.display());
+                Ok(())
+            }
+            _ => Err(NuError::PackageError {
+                msg: "usage: nula generate migration <snake_case_name>".to_string(),
+                span: Span::default(),
+            }),
+        },
         Some("build") => {
             let web = args.get(1).map(String::as_str) == Some("--web");
             if web {
@@ -266,7 +281,7 @@ pub fn run(args: &[String]) -> NuResult<()> {
 
         Some(other) => Err(NuError::PackageError {
             msg: format!(
-                "unknown nula subcommand '{}' (expected new, init, build, build-wasm, test, run, add, remove, publish, deploy, watch, doc, list, or clean)",
+                "unknown nula subcommand '{}' (expected new, init, generate, build, build-wasm, test, run, add, remove, publish, deploy, watch, doc, list, or clean)",
                 other
             ),
             span: Span::default(),
@@ -288,6 +303,7 @@ fn print_usage() {
     println!("                Scaffold a new package directory");
     println!("                Templates: default, cli, lib, full");
     println!("  init          Scaffold a new package in the current directory");
+    println!("  generate migration <name>  Create the next forward-only SQL migration");
     println!("  build         Build .nbc + RFC 0020 behavior sidecar in .nula/dist/");
     println!("  build-wasm    Build package to .wasm + .cwasm in .nula/dist/");
     println!("  test [--filter <substr>] [--verbose|-v] [--watch|-w]  Run .nula test files");
@@ -2751,6 +2767,28 @@ mod tests {
         let err = cmd_init().expect_err("second init should fail");
         assert!(matches!(err, NuError::PackageError { msg: _, span: _ }));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_generate_migration_creates_versioned_sql_in_package_root() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_generate_migration_cli_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        scaffold_package(&dir, "db-app", "default").unwrap();
+        {
+            let _guard = ChangeDir::new(&dir);
+            run(&[
+                "generate".to_string(),
+                "migration".to_string(),
+                "create_customers".to_string(),
+            ])
+            .expect("CLI should generate SQL migration");
+        }
+        assert!(dir.join("db/migrations/000001_create_customers.sql").is_file());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

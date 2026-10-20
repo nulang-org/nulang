@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Forward-only SQL migration scaffold — 2026-10-20
+- **The package CLI can create deterministic, numbered migration files** with `nula generate migration create_customers`. Names and existing versions are validated, duplicate sequence numbers and symlink directories are rejected, and new files are created without overwrite.
+- **Scaffolding never executes SQL or claims a migration has been applied.** Schema history, multi-database transactional application, drift/rollback policies, and Cloud integration remain future correctness-gated work.
+
 ### Fabric on-demand mailbox scoring — 2026-10-18
 - **Fabric publish admission now reads mailbox pressure only for matching local subscribers**, instead of allocating and populating an all-actor mailbox snapshot on every publish.
 - **Ported the regression and exact-base matched-fixture A/B harness** from #1708 onto current main. Historical unmatched-publish microbenchmarks were favorable; new-head CI and measurements remain the promotion gate.
