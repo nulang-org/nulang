@@ -165,3 +165,103 @@ fn legacy_route_still_falls_back_over_real_http() {
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
     assert!(response_body(&response).starts_with("legacy"), "{response}");
 }
+
+fn redirect_route(method: HttpMethod, path: &str, target: &str) -> WebRoute {
+    let source = format!(
+        "fn go() -> Html {{ perform Web.redirect(\"{target}\") }}"
+    );
+    let (module, function_index) = compile_handler(&source, "go");
+    WebRoute {
+        method,
+        path: path.to_string(),
+        handler_module: module,
+        handler_func_idx: function_index,
+    }
+}
+
+#[test]
+fn redirect_is_http_see_other_with_location_and_no_client_runtime_body() {
+    let server = WebDevServer::bind(
+        0,
+        None,
+        None,
+        vec![redirect_route(HttpMethod::Get, "/old", "/new?from=old")],
+    )
+    .expect("bind redirect WebDevServer");
+
+    let response = send_raw_request(
+        server.port,
+        "GET /old HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+
+    assert!(response.starts_with("HTTP/1.1 303 See Other\r\n"), "{response}");
+    assert!(response.contains("\r\nLocation: /new?from=old\r\n"), "{response}");
+    assert!(response.contains("\r\nContent-Length: 0\r\n"), "{response}");
+    assert_eq!(response_body(&response), "");
+}
+
+#[test]
+fn post_redirect_uses_see_other_to_avoid_replaying_the_post_body() {
+    let server = WebDevServer::bind(
+        0,
+        None,
+        None,
+        vec![redirect_route(HttpMethod::Post, "/submit", "/receipt")],
+    )
+    .expect("bind post redirect WebDevServer");
+
+    let response = send_raw_request(
+        server.port,
+        "POST /submit HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx",
+    );
+
+    assert!(response.starts_with("HTTP/1.1 303 See Other\r\n"), "{response}");
+    assert!(response.contains("\r\nLocation: /receipt\r\n"), "{response}");
+}
+
+#[test]
+fn redirect_rejects_unsafe_uri_schemes_without_emitting_location() {
+    let server = WebDevServer::bind(
+        0,
+        None,
+        None,
+        vec![redirect_route(HttpMethod::Get, "/unsafe", "javascript:alert(1)")],
+    )
+    .expect("bind unsafe redirect WebDevServer");
+
+    let response = send_raw_request(
+        server.port,
+        "GET /unsafe HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+
+    assert!(response.starts_with("HTTP/1.1 500 Internal Server Error\r\n"), "{response}");
+    assert!(!response.contains("\r\nLocation:"), "{response}");
+}
+
+#[test]
+fn redirect_metadata_is_request_scoped_and_does_not_leak_to_next_route() {
+    let server = WebDevServer::bind(
+        0,
+        None,
+        None,
+        vec![
+            redirect_route(HttpMethod::Get, "/old", "/new"),
+            legacy_route(),
+        ],
+    )
+    .expect("bind redirect and legacy WebDevServer");
+
+    let first = send_raw_request(
+        server.port,
+        "GET /old HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(first.starts_with("HTTP/1.1 303 See Other\r\n"), "{first}");
+
+    let second = send_raw_request(
+        server.port,
+        "GET /legacy HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(second.starts_with("HTTP/1.1 200 OK\r\n"), "{second}");
+    assert!(!second.contains("\r\nLocation:"), "{second}");
+    assert!(response_body(&second).starts_with("legacy"), "{second}");
+}
