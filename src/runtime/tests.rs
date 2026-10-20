@@ -8790,7 +8790,9 @@ fn persistent_native_ask_refuses_handler_when_command_journal_fails() {
     let error = rt
         .ask_actor_sync(actor_id, 0, &[])
         .expect_err("failed durable admission must stop the native ask");
-    assert!(error.to_string().contains("injected native ask journal failure"));
+    assert!(error
+        .to_string()
+        .contains("injected native ask journal failure"));
     assert_eq!(
         rt.actors[&actor_id]
             .get_state_field("count")
@@ -8799,7 +8801,10 @@ fn persistent_native_ask_refuses_handler_when_command_journal_fails() {
         "handler must not mutate a persistent actor after journal failure"
     );
     assert!(rt.persistence.read_journal(actor_id).is_empty());
-    assert_eq!(rt.current_actor, None, "failed ask must clear runtime actor context");
+    assert_eq!(
+        rt.current_actor, None,
+        "failed ask must clear runtime actor context"
+    );
 }
 
 #[test]
@@ -8809,12 +8814,12 @@ fn transient_native_ask_does_not_require_durable_journal() {
         inner: MemoryStore::new(),
     });
     let actor_id = rt.spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
-    rt.actors.get_mut(&actor_id).unwrap().register_behavior(
-        "inc",
-        |actor, _args| {
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("inc", |actor, _args| {
             actor.set_state_field("count", Value::int(1));
-        },
-    );
+        });
 
     rt.ask_actor_sync(actor_id, 0, &[])
         .expect("transient actor does not journal");
