@@ -8804,4 +8804,3 @@ fn retired_heap_rejects_foreign_reference_overflow() {
     });
     rt.process_gc_ops();
 }
-
