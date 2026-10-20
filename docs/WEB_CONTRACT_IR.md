@@ -168,6 +168,28 @@ The transport-neutral `RequestDecodeError` exposes stable machine-readable codes
 
 Compiler/runtime binding defects deliberately remain server errors. They must not be presented as mistakes made by the caller.
 
+## Initial HTTP response media contract
+
+The experimental native `WebDevServer` consumes `RouteContract.response_type`
+through the same validated `RuntimeRoutePlan` used by request dispatch.
+This is an intentionally small first slice of the response algebra:
+
+- Explicit `Html` returns `200 text/html; charset=utf-8` and permits the
+  existing browser runtime injection.
+- Explicit `String`, `Int`, `Float`, and `Bool` return
+  `200 text/plain; charset=utf-8` with no client runtime injection.
+- Legacy routes with no compiler-return-type metadata retain the existing
+  HTML response behavior.
+- Other explicitly declared types return `500` without serializing the
+  handler value. Do not assume `Json[T]`, byte streams, or a custom record
+  have a safe wire format until the response algebra and codecs are defined.
+
+This is **not** a general `Response[T]` API yet. Explicit status, headers,
+binary payloads, streaming, and JSON schema serialization remain follow-up
+work. `Web.redirect` behavior is separately tracked in PR #2084. WASM/Cloud
+host equivalence must be demonstrated before presenting any response type
+as Cloud portable.
+
 ## OpenAPI
 
 OpenAPI 3.1 generation consumes the same `ContractCompilation` and binding IR; it does not reparse Nulang source.
