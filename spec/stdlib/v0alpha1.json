@@ -100,6 +100,13 @@
       "source": "src/stdlib/test.nula",
       "stability": "experimental",
       "description": "Testing assertions and helpers over the built-in Test effect."
+    },
+    {
+      "name": "finite_stream",
+      "import": "stdlib::finite_stream",
+      "source": "src/stdlib/finite_stream.nula",
+      "stability": "experimental",
+      "description": "Finite array-backed pull cursor reference; no linear ownership or external IO."
     }
   ]
 }

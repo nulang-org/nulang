@@ -1,0 +1,19 @@
+// Local user-defined Stream[T] remains legal alongside explicit stdlib import.
+import stdlib::finite_stream
+
+type Stream[T] = Nil | Cons((T, Stream[T]))
+
+fn main() {
+    let original: Stream[Int] = Cons(1, Nil)
+    let finite: FiniteCursor[String] = from_items(["hello"])
+    match advance(finite) {
+        | Produced(value, rest) => {
+            perform IO.print(value)
+            match advance(rest) {
+                | Exhausted => perform IO.print("done")
+                | Produced(_, _) => perform IO.print("unexpected")
+            }
+        }
+        | Exhausted => perform IO.print("unexpected-empty")
+    }
+}

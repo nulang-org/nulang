@@ -108,4 +108,12 @@ pub const STDLIB_MODULES: &[StdlibModule] = &[
         description: "Testing assertions and helpers over the built-in Test effect.",
         package_mirror: None,
     },
+    StdlibModule {
+        name: "finite_stream",
+        import_path: "stdlib::finite_stream",
+        source_path: "src/stdlib/finite_stream.nula",
+        stability: StabilityTier::Experimental,
+        description: "Finite array-backed pull cursor reference; no linear ownership or external IO.",
+        package_mirror: None,
+    },
 ];
