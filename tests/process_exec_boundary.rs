@@ -4,9 +4,7 @@
 
 #![cfg(unix)]
 
-use nulang::process_exec::{
-    execute, ExecError, ExecLimits, ProcessPolicy, ProcessSpec,
-};
+use nulang::process_exec::{execute, ExecError, ExecLimits, ProcessPolicy, ProcessSpec};
 use std::time::Duration;
 
 fn shell(script: &str) -> ProcessSpec {
@@ -80,7 +78,11 @@ fn rejects_output_larger_than_the_capture_budget() {
     policy.allow_exact(command.clone());
 
     assert!(matches!(
-        execute(&policy, &command, ExecLimits::new(Duration::from_secs(3), 4).unwrap()),
+        execute(
+            &policy,
+            &command,
+            ExecLimits::new(Duration::from_secs(3), 4).unwrap()
+        ),
         Err(ExecError::OutputLimitExceeded)
     ));
 }
@@ -92,7 +94,11 @@ fn counts_stdout_and_stderr_against_one_shared_budget() {
     policy.allow_exact(command.clone());
 
     assert!(matches!(
-        execute(&policy, &command, ExecLimits::new(Duration::from_secs(3), 6).unwrap()),
+        execute(
+            &policy,
+            &command,
+            ExecLimits::new(Duration::from_secs(3), 6).unwrap()
+        ),
         Err(ExecError::OutputLimitExceeded)
     ));
 }
@@ -104,7 +110,11 @@ fn terminates_an_overlong_command() {
     policy.allow_exact(command.clone());
 
     assert!(matches!(
-        execute(&policy, &command, ExecLimits::new(Duration::from_millis(50), 1024).unwrap()),
+        execute(
+            &policy,
+            &command,
+            ExecLimits::new(Duration::from_millis(50), 1024).unwrap()
+        ),
         Err(ExecError::TimedOut)
     ));
 }
