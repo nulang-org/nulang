@@ -154,6 +154,37 @@ Both typed and legacy calls remain inside the existing request context during th
 
 Network-level regression coverage compiles real Nulang handlers and route contracts, starts `WebDevServer` on an ephemeral TCP port, and verifies successful typed query decoding, `400 application/problem+json` decode failures, and legacy route fallback over the wire.
 
+## In-process request injection for host tests
+
+The Rust host test API `WebDevServer::inject(routes, request, static_dir, output_dir)`
+dispatches an already-structured `HttpRequest` without binding a listener.
+The socket-backed development server and injection share route selection, compiled
+request-source bindings, legacy fallback, static-file containment, response
+cookies, and response middleware.
+
+```rust
+use nulang::runtime::{HttpMethod, HttpRequest, WebDevServer};
+
+let response = WebDevServer::inject(
+    &compiled_routes,
+    HttpRequest {
+        method: HttpMethod::Get,
+        path: "/users?limit=25".into(),
+        headers: vec![],
+        body: vec![],
+    },
+    None,
+    None,
+);
+assert_eq!(response.status, 200);
+```
+
+The helper is intended for deterministic host-side tests. It does **not**
+parse raw HTTP bytes or test TCP framing, request-size admission, transfer
+encodings, connection lifetime, or SSE streaming. Injecting the SSE endpoint
+returns `501` explicitly. Keep real-socket tests for the wire protocol and
+streaming behavior; synthetic requests are not a substitute.
+
 ## Decode failures and HTTP problems
 
 Request decoding distinguishes client input failures from compiler/runtime invariant failures:
