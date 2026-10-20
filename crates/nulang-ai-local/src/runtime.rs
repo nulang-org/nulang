@@ -9,7 +9,9 @@ use nulang_ai_core::{
 use nulang_ai_director::{Director, LocalDirector};
 use nulang_ai_manager::{EngineeringManager, Manager};
 use nulang_ai_protocol::format_event_line;
-use nulang_ai_worker::{LocalWorker, Worker};
+use nulang_ai_worker::{
+    validate_evidence, EvidenceVerifier, LocalWorker, RejectUnverified, Worker, WorkerExecution,
+};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -36,11 +38,26 @@ pub struct LocalRuntime {
     project_id: String,
     director: LocalDirector,
     engineering: EngineeringManager,
-    worker: LocalWorker,
+    worker: Box<dyn Worker>,
+    verifier: Box<dyn EvidenceVerifier>,
 }
 
 impl LocalRuntime {
     pub fn open(project_dir: PathBuf) -> Result<Self, RuntimeError> {
+        Self::open_with_execution(
+            project_dir,
+            Box::new(LocalWorker::new("worker-local")),
+            Box::new(RejectUnverified),
+        )
+    }
+
+    /// Configure both an executor and an independent trusted evidence verifier.
+    /// The default open() is deliberately non-executing and fail-closed.
+    pub fn open_with_execution(
+        project_dir: PathBuf,
+        worker: Box<dyn Worker>,
+        verifier: Box<dyn EvidenceVerifier>,
+    ) -> Result<Self, RuntimeError> {
         if !project_dir.join("agent.toml").exists() {
             return Err(RuntimeError::MissingConfig(project_dir));
         }
@@ -72,7 +89,8 @@ impl LocalRuntime {
             project_id,
             director: LocalDirector::new("director-local"),
             engineering: EngineeringManager,
-            worker: LocalWorker::new("worker-local"),
+            worker,
+            verifier,
         })
     }
 
@@ -130,6 +148,8 @@ impl LocalRuntime {
         let tasks =
             self.engineering
                 .plan_tasks(goal_id, text, self.config.director.default_budget_usd);
+        let mut all_verified = !tasks.is_empty();
+        let mut block_reasons = Vec::new();
         for task in tasks {
             self.store.upsert_task(&task)?;
             self.emit(
@@ -140,11 +160,9 @@ impl LocalRuntime {
                 },
             )?;
 
-            let agent_id = task
-                .assigned_agent_id
-                .clone()
-                .unwrap_or_else(|| self.worker.agent_id().to_string());
+            let agent_id = self.worker.agent_id().to_string();
             let mut running = task;
+            running.assigned_agent_id = Some(agent_id.clone());
             running.status = TaskStatus::Running;
             running.updated_at = Utc::now();
             self.store.upsert_task(&running)?;
@@ -156,21 +174,110 @@ impl LocalRuntime {
                 },
             )?;
 
-            let completed = self.worker.execute(&running);
-            self.store.upsert_task(&completed)?;
+            match self.worker.execute(&running) {
+                WorkerExecution::Executed { evidence } => {
+                    // Worker assertions and artifact references are not proof.
+                    // Both structural checks and the independent host verifier
+                    // must accept them before any Completed state is persisted.
+                    let verification = validate_evidence(&running, &evidence)
+                        .and_then(|_| self.verifier.verify(&running, &evidence));
+                    match verification {
+                        Ok(()) => {
+                            let mut completed = running;
+                            completed.status = TaskStatus::Completed;
+                            completed.updated_at = Utc::now();
+                            self.store.complete_task_verified(&completed, &evidence)?;
+                            self.emit(
+                                out,
+                                SwarmEvent::TaskVerified {
+                                    task_id: completed.id,
+                                    agent_id: agent_id.clone(),
+                                    evidence,
+                                },
+                            )?;
+                            self.emit(
+                                out,
+                                SwarmEvent::TaskCompleted {
+                                    task_id: completed.id,
+                                    agent_id,
+                                },
+                            )?;
+                        }
+                        Err(reason) => {
+                            all_verified = false;
+                            block_reasons.push(reason.clone());
+                            let mut blocked = running;
+                            blocked.status = TaskStatus::Blocked;
+                            blocked.updated_at = Utc::now();
+                            self.store.upsert_task(&blocked)?;
+                            self.emit(
+                                out,
+                                SwarmEvent::TaskBlocked {
+                                    task_id: blocked.id,
+                                    agent_id,
+                                    reason,
+                                },
+                            )?;
+                        }
+                    }
+                }
+                WorkerExecution::Blocked { reason } => {
+                    all_verified = false;
+                    block_reasons.push(reason.clone());
+                    let mut blocked = running;
+                    blocked.status = TaskStatus::Blocked;
+                    blocked.updated_at = Utc::now();
+                    self.store.upsert_task(&blocked)?;
+                    self.emit(
+                        out,
+                        SwarmEvent::TaskBlocked {
+                            task_id: blocked.id,
+                            agent_id,
+                            reason,
+                        },
+                    )?;
+                }
+                WorkerExecution::Failed { reason } => {
+                    all_verified = false;
+                    block_reasons.push(reason.clone());
+                    let mut failed = running;
+                    failed.status = TaskStatus::Failed;
+                    failed.updated_at = Utc::now();
+                    self.store.upsert_task(&failed)?;
+                    self.emit(
+                        out,
+                        SwarmEvent::TaskFailed {
+                            task_id: failed.id,
+                            agent_id,
+                            reason,
+                        },
+                    )?;
+                }
+            }
+        }
+
+        goal.status = if all_verified {
+            GoalStatus::Completed
+        } else {
+            GoalStatus::Blocked
+        };
+        goal.updated_at = Utc::now();
+        self.store.upsert_goal(&goal)?;
+        if all_verified {
+            self.emit(out, SwarmEvent::GoalCompleted { goal_id })?;
+        } else {
             self.emit(
                 out,
-                SwarmEvent::TaskCompleted {
-                    task_id: completed.id,
-                    agent_id,
+                SwarmEvent::GoalBlocked {
+                    goal_id,
+                    reason: if block_reasons.is_empty() {
+                        "no tasks were planned".into()
+                    } else {
+                        block_reasons.join("; ")
+                    },
                 },
             )?;
         }
-
-        goal.status = GoalStatus::Completed;
-        goal.updated_at = Utc::now();
-        self.store.upsert_goal(&goal)?;
-        self.emit(out, SwarmEvent::GoalCompleted { goal_id })?;
 
         Ok(goal_id)
     }
@@ -228,7 +335,7 @@ mod tests {
         assert!(text.contains("goal_created"));
         assert!(text.contains("task_created"));
         let graph = rt.store().get_goal_graph(goal_id).unwrap();
-        assert_eq!(graph.goal.status, GoalStatus::Completed);
+        assert_eq!(graph.goal.status, GoalStatus::Blocked);
         let _ = std::fs::remove_dir_all(tmp);
     }
 }
