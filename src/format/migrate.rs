@@ -93,6 +93,44 @@ mod tests {
         assert_eq!(migrated, bytes, "identity migration must be byte-identical");
     }
 
+
+    #[test]
+    fn identity_migration_rejects_missing_metadata_body() {
+        // A valid versioned header alone is not a valid .nbc artifact.
+        // Previously migrate_nbc returned Ok for this truncated input.
+        let mut bytes = CodeModule::new("t").to_nbc(None).unwrap();
+        bytes.truncate(NBC_HEADER_LEN);
+        assert!(matches!(
+            migrate_nbc(&bytes, 1),
+            Err(FormatError::Truncated { .. })
+        ));
+    }
+
+    #[test]
+    fn identity_migration_rejects_unknown_opcode() {
+        let mut module = CodeModule::new("t");
+        module.emit(Instruction::new0(OpCode::Halt));
+        let mut bytes = module.to_nbc(None).unwrap();
+        bytes[NBC_HEADER_LEN] = 0xFE;
+        assert!(matches!(
+            migrate_nbc(&bytes, 1),
+            Err(FormatError::UnknownOpcode { opcode: 0xFE })
+        ));
+    }
+
+    #[test]
+    fn identity_migration_rejects_corrupt_metadata() {
+        let bytes = CodeModule::new("t").to_nbc(None).unwrap();
+        let mut corrupt = bytes;
+        // The encoded body must be valid JSON, not just have a plausible length.
+        let last = corrupt.last_mut().expect("nonempty metadata");
+        *last = b'!';
+        assert!(matches!(
+            migrate_nbc(&corrupt, 1),
+            Err(FormatError::BodyDecode(_))
+        ));
+    }
+
     #[test]
     fn test_migrate_rejects_unknown_versions() {
         let bytes = CodeModule::new("t").to_nbc(None).unwrap();
