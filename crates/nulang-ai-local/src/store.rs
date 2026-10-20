@@ -2,9 +2,10 @@
 
 use chrono::{DateTime, Utc};
 use nulang_ai_core::{
-    ConversationState, Goal, GoalGraph, GoalStatus, ManagerKind, Task, TaskStatus,
+    AcceptanceEvidence, ConversationState, Goal, GoalGraph, GoalStatus, ManagerKind, Task, TaskStatus,
 };
 use rusqlite::{params, Connection};
+use nulang_ai_worker::validate_evidence;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
@@ -21,6 +22,8 @@ pub enum StoreError {
     GoalNotFound(Uuid),
     #[error("conversation not found: {0}")]
     ConversationNotFound(Uuid),
+    #[error("invalid verified completion: {0}")]
+    InvalidCompletion(String),
 }
 
 pub struct SqliteStore {
@@ -78,6 +81,12 @@ impl SqliteStore {
                 messages_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS task_evidence (
+                task_id TEXT NOT NULL,
+                criterion TEXT NOT NULL,
+                artifact_ref TEXT NOT NULL,
+                PRIMARY KEY (task_id, criterion)
             );
             "#,
         )?;
@@ -155,6 +164,55 @@ impl SqliteStore {
             ],
         )?;
         Ok(())
+    }
+
+    /// Atomically persist verified evidence and promote a running task to
+    /// Completed. A process crash cannot leave a Completed row without proof.
+    /// This method is called only after the host's verifier has accepted it.
+    pub(crate) fn complete_task_verified(
+        &self,
+        task: &Task,
+        evidence: &[AcceptanceEvidence],
+    ) -> Result<(), StoreError> {
+        validate_evidence(task, evidence).map_err(StoreError::InvalidCompletion)?;
+        if task.status != TaskStatus::Completed {
+            return Err(StoreError::InvalidCompletion(
+                "verified completion requires Completed task status".into(),
+            ));
+        }
+        let mut conn = Connection::open(&self.path)?;
+        let tx = conn.transaction()?;
+        for item in evidence {
+            tx.execute(
+                "INSERT INTO task_evidence (task_id, criterion, artifact_ref) VALUES (?1, ?2, ?3)",
+                params![task.id.to_string(), item.criterion, item.artifact_ref],
+            )?;
+        }
+        let updated = tx.execute(
+            "UPDATE tasks SET status = 'completed', updated_at = ?2 WHERE id = ?1 AND status = 'running'",
+            params![task.id.to_string(), task.updated_at.to_rfc3339()],
+        )?;
+        if updated != 1 {
+            return Err(StoreError::InvalidCompletion(
+                "task is missing or is not running".into(),
+            ));
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn task_evidence(&self, task_id: Uuid) -> Result<Vec<AcceptanceEvidence>, StoreError> {
+        let conn = Connection::open(&self.path)?;
+        let mut stmt = conn.prepare(
+            "SELECT criterion, artifact_ref FROM task_evidence WHERE task_id = ?1 ORDER BY criterion",
+        )?;
+        let rows = stmt.query_map(params![task_id.to_string()], |row| {
+            Ok(AcceptanceEvidence {
+                criterion: row.get(0)?,
+                artifact_ref: row.get(1)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
     }
 
     pub fn upsert_conversation(&self, conv: &ConversationState) -> Result<(), StoreError> {
@@ -389,5 +447,27 @@ fn parse_manager_kind(raw: String) -> ManagerKind {
         "data" => ManagerKind::Data,
         "voice" => ManagerKind::Voice,
         _ => ManagerKind::Engineering,
+    }
+}
+
+#[cfg(test)]
+mod verified_completion_tests {
+    use super::*;
+
+    #[test]
+    fn verified_completion_rolls_back_if_task_is_not_running() {
+        let dir = std::env::temp_dir().join(format!("nulang-evidence-{}", Uuid::new_v4()));
+        let store = SqliteStore::open(&dir).unwrap();
+        let mut task = Task::new(Uuid::new_v4(), "run tests", ManagerKind::Engineering);
+        task.acceptance_criteria = vec!["Tests pass".into()];
+        task.status = TaskStatus::Completed;
+        let evidence = vec![AcceptanceEvidence {
+            criterion: "Tests pass".into(),
+            artifact_ref: "test://verified".into(),
+        }];
+
+        assert!(store.complete_task_verified(&task, &evidence).is_err());
+        assert!(store.task_evidence(task.id).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
