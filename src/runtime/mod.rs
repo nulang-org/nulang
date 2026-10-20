@@ -6763,14 +6763,19 @@ impl Runtime {
                 let Some(owner) = actor_id else {
                     return Some(Value::nil());
                 };
-                let ttl = regs.first().and_then(Value::as_int)?;
+                let Some(ttl) = regs.first().and_then(Value::as_int) else {
+                    return Some(Value::nil());
+                };
                 // Bound the source-language ticket lifetime to 24h to limit
                 // forgotten-ticket retention. Expiry remains lazy/explicit.
                 if !(1..=86_400_000).contains(&ttl) {
                     return Some(Value::nil());
                 }
-                let deadline = Instant::now()
-                    .checked_add(std::time::Duration::from_millis(ttl as u64))?;
+                let Some(deadline) = Instant::now()
+                    .checked_add(std::time::Duration::from_millis(ttl as u64))
+                else {
+                    return Some(Value::nil());
+                };
                 Some(
                     self.begin_local_reply_request(owner, deadline)
                         .map(|ticket| Value::int(ticket.reference().as_int()))
@@ -6783,11 +6788,16 @@ impl Runtime {
                 if actor_id.is_none() {
                     return Some(Value::nil());
                 }
-                let reference = regs
+                let Some(reference) = regs
                     .first()
                     .and_then(Value::as_int)
-                    .and_then(LocalRequestRef::from_positive_int)?;
-                let value = *regs.get(1)?;
+                    .and_then(LocalRequestRef::from_positive_int)
+                else {
+                    return Some(Value::nil());
+                };
+                let Some(&value) = regs.get(1) else {
+                    return Some(Value::nil());
+                };
                 if value.as_int().is_none() {
                     return Some(Value::nil());
                 }
