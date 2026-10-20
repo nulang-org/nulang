@@ -527,11 +527,22 @@ pub fn with_request_context<F, R>(ctx: RequestContext, f: F) -> R
 where
     F: FnOnce() -> R,
 {
-    CURRENT_REQUEST.with(|c| *c.borrow_mut() = Some(ctx));
-    RESPONSE_COOKIES.with(|c| c.borrow_mut().clear());
-    let result = f();
-    CURRENT_REQUEST.with(|c| *c.borrow_mut() = None);
-    result
+    // The same host thread can execute multiple injected requests. Restore its
+    // prior context on both normal completion and unwinding; otherwise a panic
+    // could expose one request's data to a later request on that thread.
+    struct RestoreRequestContext(Option<RequestContext>);
+    impl Drop for RestoreRequestContext {
+        fn drop(&mut self) {
+            CURRENT_REQUEST.with(|current| {
+                *current.borrow_mut() = self.0.take();
+            });
+        }
+    }
+
+    let previous = CURRENT_REQUEST.with(|current| current.replace(Some(ctx)));
+    let _restore = RestoreRequestContext(previous);
+    RESPONSE_COOKIES.with(|current| current.borrow_mut().clear());
+    f()
 }
 
 /// Add a `Set-Cookie` header for the current response.
