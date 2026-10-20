@@ -961,6 +961,101 @@ fn test_supervisor_restart_hydrates_from_persistence() {
     );
 }
 
+/// A non-durable supervised child must not inherit a dangling pointer into
+/// its previous incarnation's heap when its initial state contains a string.
+#[test]
+fn test_supervisor_restart_rehydrates_heap_string_state() {
+    let mut rt = Runtime::new();
+    let sup_id = rt.create_supervisor("string_sup", RestartStrategy::OneForOne);
+    let child_id = rt.spawn_actor(Box::new(Vec::new));
+    {
+        let child = rt.actors.get_mut(&child_id).unwrap();
+        let label = child.allocate_string("safe-after-restart");
+        assert!(label.is_ptr());
+        child.set_state_field("label", label);
+    }
+
+    rt.supervise_child(
+        sup_id,
+        ChildSpec::new("string_child", RestartPolicy::Permanent),
+        child_id,
+    );
+    rt.exit_actor(child_id, ExitReason::Error("crash".to_string()));
+
+    let replacement = rt.supervisors[&sup_id].children[0].1;
+    assert_ne!(replacement, child_id);
+    let child = rt.actors.get(&replacement).unwrap();
+    let label = child.get_state_field("label").unwrap();
+    assert_eq!(
+        child.persist_value(&label),
+        PersistedValue::String("safe-after-restart".to_string()),
+        "string must be allocated in the replacement's heap, not lost or reused"
+    );
+}
+
+/// A restart must fail closed for state that cannot be faithfully reconstructed.
+/// Arrays are not representable in PersistedValue; copying their raw pointers
+/// would permit use-after-free when the original actor's heap is reaped.
+#[test]
+fn test_supervisor_refuses_unsafe_heap_array_restart_template() {
+    let mut rt = Runtime::new();
+    let sup_id = rt.create_supervisor("array_sup", RestartStrategy::OneForOne);
+    let child_id = rt.spawn_actor(Box::new(Vec::new));
+    {
+        let child = rt.actors.get_mut(&child_id).unwrap();
+        let values = child.allocate_array(vec![Value::int(10), Value::int(20)]);
+        assert!(values.is_ptr());
+        child.set_state_field("values", values);
+    }
+
+    rt.supervise_child(
+        sup_id,
+        ChildSpec::new("array_child", RestartPolicy::Permanent),
+        child_id,
+    );
+    assert!(
+        rt.supervisors[&sup_id].children[0].0.restart.is_none(),
+        "an unsupported pointer must not be stored in a restart template"
+    );
+
+    rt.exit_actor(child_id, ExitReason::Error("crash".to_string()));
+    assert!(
+        !rt.supervisors.contains_key(&sup_id),
+        "restart failure should escalate rather than spawn a corrupted child"
+    );
+}
+
+/// Module-pool string IDs are local to the original bytecode module.
+/// Supervision must materialize their text instead of retaining an opaque ID.
+#[test]
+fn test_supervisor_restart_rehydrates_constant_pool_string_state() {
+    let mut rt = Runtime::new();
+    let sup_id = rt.create_supervisor("constant_sup", RestartStrategy::OneForOne);
+    let child_id = rt.spawn_actor(Box::new(Vec::new));
+    {
+        let child = rt.actors.get_mut(&child_id).unwrap();
+        let mut module = CodeModule::new("constant-child");
+        let string_id = module.add_constant(Constant::String("pool-text".to_string()));
+        child.bytecode_module = Some(Box::new(module));
+        child.set_state_field("text", Value::string(string_id as u32));
+    }
+
+    rt.supervise_child(
+        sup_id,
+        ChildSpec::new("constant_child", RestartPolicy::Permanent),
+        child_id,
+    );
+    rt.exit_actor(child_id, ExitReason::Error("crash".to_string()));
+
+    let replacement = rt.supervisors[&sup_id].children[0].1;
+    let child = rt.actors.get(&replacement).unwrap();
+    let text = child.get_state_field("text").unwrap();
+    assert_eq!(
+        child.persist_value(&text),
+        PersistedValue::String("pool-text".to_string())
+    );
+}
+
 /// Regression test: a restarted bytecode child must keep its bytecode
 /// module, behavior offsets, and captured initial state so it still
 /// resolves and runs its bytecode behaviors after a restart.
