@@ -76,6 +76,23 @@ pub fn run(args: &[String]) -> NuResult<()> {
             cmd_new(path_arg, template)
         }
         Some("init") => cmd_init(),
+        Some("make") => {
+            if args.len() != 3 {
+                return Err(NuError::PackageError {
+                    msg: "usage: nula make <feature|module|test> <snake_case_name>".to_string(),
+                    span: Span::default(),
+                });
+            }
+            let files = crate::package::generators::generate(
+                &package_root()?,
+                &args[1],
+                &args[2],
+            )?;
+            for file in files {
+                println!("Created {}", file.display());
+            }
+            Ok(())
+        },
         Some("build") => {
             let web = args.get(1).map(String::as_str) == Some("--web");
             if web {
@@ -266,7 +283,7 @@ pub fn run(args: &[String]) -> NuResult<()> {
 
         Some(other) => Err(NuError::PackageError {
             msg: format!(
-                "unknown nula subcommand '{}' (expected new, init, build, build-wasm, test, run, add, remove, publish, deploy, watch, doc, list, or clean)",
+                "unknown nula subcommand '{}' (expected new, init, make, build, build-wasm, test, run, add, remove, publish, deploy, watch, doc, list, or clean)",
                 other
             ),
             span: Span::default(),
@@ -288,6 +305,7 @@ fn print_usage() {
     println!("                Scaffold a new package directory");
     println!("                Templates: default, cli, lib, full");
     println!("  init          Scaffold a new package in the current directory");
+    println!("  make <feature|module|test> <name>  Generate source and tests without overwriting");
     println!("  build         Build .nbc + RFC 0020 behavior sidecar in .nula/dist/");
     println!("  build-wasm    Build package to .wasm + .cwasm in .nula/dist/");
     println!("  test [--filter <substr>] [--verbose|-v] [--watch|-w]  Run .nula test files");
