@@ -107,7 +107,10 @@ fn local_reply_aliases_are_not_valid_in_other_runtime_instances() {
         second_runtime.send_to_local_alias(alias_a, 0, &[Value::int(1)]),
         AliasSendStatus::Inactive
     );
-    assert_eq!(second_runtime.actors.get(&owner_b).unwrap().mailbox.len(), 0);
+    assert_eq!(
+        second_runtime.actors.get(&owner_b).unwrap().mailbox.len(),
+        0
+    );
 }
 
 #[test]
@@ -118,10 +121,16 @@ fn local_reply_alias_registry_caps_outstanding_aliases_per_actor() {
     for _ in 0..MAX_LOCAL_ALIASES_PER_ACTOR {
         aliases.push(runtime.create_local_alias(owner).expect("under alias cap"));
     }
-    assert!(runtime.create_local_alias(owner).is_none(), "cap rejects more aliases");
+    assert!(
+        runtime.create_local_alias(owner).is_none(),
+        "cap rejects more aliases"
+    );
     let old = aliases.pop().unwrap();
     assert!(runtime.deactivate_local_alias(owner, old));
-    assert!(runtime.create_local_alias(owner).is_some(), "released slot is reusable");
+    assert!(
+        runtime.create_local_alias(owner).is_some(),
+        "released slot is reusable"
+    );
 }
 
 #[test]
@@ -146,7 +155,15 @@ fn local_reply_alias_reports_backpressure_and_remains_active_for_retry() {
         AliasSendStatus::Accepted
     );
     assert_eq!(
-        runtime.actors.get_mut(&receiver).unwrap().mailbox.pop().unwrap().payload[0].as_int(),
+        runtime
+            .actors
+            .get_mut(&receiver)
+            .unwrap()
+            .mailbox
+            .pop()
+            .unwrap()
+            .payload[0]
+            .as_int(),
         Some(3)
     );
 }
