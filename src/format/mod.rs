@@ -16,3 +16,4 @@
 pub mod constants;
 pub mod migrate;
 pub mod nbc;
+pub mod verify;
