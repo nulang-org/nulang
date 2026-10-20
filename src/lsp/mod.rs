@@ -4642,6 +4642,60 @@ mod lsp_tests {
         );
     }
 
+    /// Verify the LSP handler (not only the edit helper) preserves all
+    /// unmodified source when the client sends a ranged didChange.
+    #[tokio::test]
+    async fn test_protocol_incremental_change_preserves_surrounding_source() {
+        let (mut service, mut socket) = LspService::new(|client| NulangLanguageServer::new(client));
+        init(&mut service).await;
+        call(
+            &mut service,
+            did_open_req(DOC_URL, 1, "fn add(x: Int, y: Int) { x + y }"),
+        )
+        .await;
+        socket.next().await.expect("initial diagnostics");
+
+        call(
+            &mut service,
+            Request::build("textDocument/didChange")
+                .params(serde_json::json!({
+                    "textDocument": { "uri": DOC_URL, "version": 2 },
+                    "contentChanges": [{
+                        "range": {
+                            "start": { "line": 0, "character": 3 },
+                            "end": { "line": 0, "character": 6 }
+                        },
+                        "text": "sum"
+                    }]
+                }))
+                .finish(),
+        )
+        .await;
+
+        let diagnostic_message = socket.next().await.expect("updated diagnostics");
+        assert_eq!(diagnostic_message.method(), "textDocument/publishDiagnostics");
+        let params = diagnostic_message.params().cloned().expect("diagnostic payload");
+        assert_eq!(
+            params["diagnostics"].as_array().map(Vec::len),
+            Some(0),
+            "the rest of the declaration must remain valid after a ranged edit: {params}"
+        );
+
+        let resp = call(&mut service, document_symbol_req(DOC_URL))
+            .await
+            .expect("symbol response");
+        let (_id, result) = resp.into_parts();
+        let value = result.expect("symbols");
+        let names: Vec<&str> = value
+            .as_array()
+            .expect("document symbols array")
+            .iter()
+            .filter_map(|s| s["name"].as_str())
+            .collect();
+        assert!(names.contains(&"sum"), "symbol must reflect edited name: {names:?}");
+        assert!(!names.contains(&"add"), "old symbol name persisted: {names:?}");
+    }
+
     /// hover over a function declaration returns its signature text through
     /// the full JSON-RPC round-trip.
     #[tokio::test]
