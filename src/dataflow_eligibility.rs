@@ -244,4 +244,100 @@ mod tests {
             DataflowEligibility::Ineligible(IneligibleReason::UnsupportedShapeOrCapture)
         );
     }
+
+    fn typed_transform_module(
+        input_cap: Option<crate::types::Capability>,
+        body: Expr,
+    ) -> crate::ast::AstModule {
+        use crate::ast::{Decl, Param};
+        use crate::types::{EffectRow, Type};
+
+        crate::ast::AstModule {
+            name: "DataflowScreen".into(),
+            decls: vec![Decl::Function {
+                name: "transform".into(),
+                type_params: vec![],
+                type_param_constraints: vec![],
+                params: vec![Param {
+                    name: "item".into(),
+                    ty: Some(Type::int()),
+                    cap: input_cap,
+                }],
+                default_values: vec![None],
+                using_params: vec![],
+                ret_type: Some(Type::int()),
+                error_type: None,
+                effect: Some(EffectRow::empty()),
+                cap: None,
+                requires: vec![],
+                ensures: vec![],
+                body,
+                annotations: vec![],
+                public: false,
+                span: sp(),
+            }],
+        }
+    }
+
+    #[test]
+    fn validated_immutable_function_parameters_produce_candidate() {
+        let module = typed_transform_module(
+            Some(crate::types::Capability::Val),
+            add(var("item"), num(1)),
+        );
+        assert_eq!(
+            super::classify_checked_function_candidate(&module, "transform"),
+            DataflowEligibility::Candidate
+        );
+    }
+
+    #[test]
+    fn missing_immutable_annotation_is_not_proven_by_default_capability() {
+        let module = typed_transform_module(None, add(var("item"), num(1)));
+        assert_ne!(
+            super::classify_checked_function_candidate(&module, "transform"),
+            DataflowEligibility::Candidate
+        );
+    }
+
+    #[test]
+    fn mutable_reference_parameters_do_not_qualify() {
+        let module = typed_transform_module(
+            Some(crate::types::Capability::Ref),
+            add(var("item"), num(1)),
+        );
+        assert_ne!(
+            super::classify_checked_function_candidate(&module, "transform"),
+            DataflowEligibility::Candidate
+        );
+    }
+
+    #[test]
+    fn compiler_type_errors_reject_even_pure_looking_expressions() {
+        let module = typed_transform_module(
+            Some(crate::types::Capability::Val),
+            add(var("item"), Expr::Literal(Literal::Bool(true), sp())),
+        );
+        assert_ne!(
+            super::classify_checked_function_candidate(&module, "transform"),
+            DataflowEligibility::Candidate
+        );
+    }
+
+    #[test]
+    fn missing_and_ambiguous_function_declarations_fail_closed() {
+        let mut module = typed_transform_module(
+            Some(crate::types::Capability::Val),
+            add(var("item"), num(1)),
+        );
+        assert_ne!(
+            super::classify_checked_function_candidate(&module, "missing"),
+            DataflowEligibility::Candidate
+        );
+        module.decls.push(module.decls[0].clone());
+        assert_ne!(
+            super::classify_checked_function_candidate(&module, "transform"),
+            DataflowEligibility::Candidate
+        );
+    }
 }
