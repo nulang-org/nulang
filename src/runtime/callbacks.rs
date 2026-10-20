@@ -433,9 +433,8 @@ pub(crate) fn perform_web_builtin(
                 .unwrap_or(0);
             let body = resolve(constants, *regs.get(1)?);
             let is_json = op_name == Some("respond_json");
-            if crate::runtime::http_server::register_explicit_http_response(
-                status, &body, is_json,
-            ) {
+            if crate::runtime::http_server::register_explicit_http_response(status, &body, is_json)
+            {
                 Some(callbacks.alloc_string(""))
             } else {
                 // A response has no meaning outside a routed HTTP request.
