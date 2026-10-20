@@ -2624,6 +2624,43 @@ mod tests {
     }
 
     #[test]
+    fn test_viewpoint_read_matrix_has_no_authority_upgrades() {
+        use Capability::*;
+        // Columns are iso, trn, ref, val, box, tag. Isolated fields do not
+        // support move-out/ephemeral recovery yet and are deliberately Tag.
+        let fields = [Iso, Trn, Ref, Val, Box, Tag];
+        let rows = [
+            (Iso, [Tag, Tag, Tag, Val, Tag, Tag]),
+            (Trn, [Tag, Box, Box, Val, Box, Tag]),
+            (Ref, [Tag, Box, Ref, Val, Box, Tag]),
+            (Val, [Val, Val, Val, Val, Val, Tag]),
+            (Box, [Tag, Box, Box, Val, Box, Tag]),
+        ];
+        for (receiver, expected) in rows {
+            for (field, want) in fields.into_iter().zip(expected) {
+                assert_eq!(
+                    receiver.viewpoint_read(field),
+                    Some(want),
+                    "receiver {receiver:?}, field {field:?}"
+                );
+            }
+        }
+        for field in [LinearIso, Linear, Iso, Trn, Ref, Val, Box, Tag] {
+            assert_eq!(Tag.viewpoint_read(field), None, "opaque receiver");
+        }
+    }
+
+    #[test]
+    fn test_viewpoint_read_linear_extends_non_linear_guarantees() {
+        use Capability::*;
+        assert_eq!(LinearIso.viewpoint_read(Ref), Iso.viewpoint_read(Ref));
+        assert_eq!(Linear.viewpoint_read(Ref), Val.viewpoint_read(Ref));
+        // A field read must not discharge the linear obligation on its owner.
+        assert_eq!(LinearIso.viewpoint_read(LinearIso), Some(Tag));
+        assert_eq!(Ref.viewpoint_read(Linear), Some(Val));
+    }
+
+    #[test]
     fn test_tag_is_least_privileged_capability_for_all_eight_capabilities() {
         // tag preserves identity but cannot be used to regain readable or
         // writable authority. All capabilities can forget authority to tag.
