@@ -52,6 +52,8 @@ impl From<reqwest::Error> for MeilisearchError {
 pub struct MeilisearchTask {
     pub task_uid: u64,
     pub status: String,
+    /// Task acknowledgments must identify the tenant-scoped index.
+    pub index_uid: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -124,6 +126,14 @@ impl MeilisearchClient {
         else { Ok(()) }
     }
 
+    fn validate_task_index(&self, index_uid: Option<&str>) -> Result<(), MeilisearchError> {
+        if index_uid == Some(self.index_uid.as_str()) {
+            Ok(())
+        } else {
+            Err(MeilisearchError::NamespaceMismatch)
+        }
+    }
+
     fn is_empty_query(&self, query: &SearchQuery) -> Result<bool, MeilisearchError> {
         self.validate_namespace(&query.namespace)?;
         Ok(query.text.trim().is_empty() || query.limit == 0)
@@ -151,8 +161,10 @@ impl MeilisearchClient {
         self.validate_namespace(&document.namespace)?;
         validate_document_id(&document.id)?;
         let url = self.endpoint(&["indexes", &self.index_uid, "documents"]);
-        self.response(self.client.post(url)
-            .query(&[("primaryKey", "id")]).json(&[document])).await
+        let task: MeilisearchTask = self.response(self.client.post(url)
+            .query(&[("primaryKey", "id")]).json(&[document])).await?;
+        self.validate_task_index(task.index_uid.as_deref())?;
+        Ok(task)
     }
 
     /// Queue a deletion; completion is asynchronous.
@@ -162,7 +174,9 @@ impl MeilisearchClient {
         self.validate_namespace(namespace)?;
         validate_document_id(id)?;
         let url = self.endpoint(&["indexes", &self.index_uid, "documents", id]);
-        self.response(self.client.delete(url)).await
+        let task: MeilisearchTask = self.response(self.client.delete(url)).await?;
+        self.validate_task_index(task.index_uid.as_deref())?;
+        Ok(task)
     }
 
     /// Returns hits from the configured namespace only.
@@ -195,9 +209,7 @@ impl MeilisearchClient {
         let uid = uid.to_string();
         let url = self.endpoint(&["tasks", &uid]);
         let status: MeilisearchTaskStatus = self.response(self.client.get(url)).await?;
-        if status.index_uid.as_deref() != Some(self.index_uid.as_str()) {
-            return Err(MeilisearchError::NamespaceMismatch);
-        }
+        self.validate_task_index(status.index_uid.as_deref())?;
         Ok(status)
     }
 }
