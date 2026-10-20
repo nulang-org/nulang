@@ -1,7 +1,7 @@
 //! RED-first regression contract for opt-in NBC structural verification.
 //! Existing `from_nbc` remains the compatibility decoder, not a verifier.
 
-use nulang::bytecode::{CodeModule, Constant, Instruction, OpCode};
+use nulang::bytecode::{CodeModule, Constant, HandlerBinding, HandlerTable, Instruction, OpCode};
 use nulang::format::verify::verify_module_structure;
 
 fn simple_module() -> CodeModule {
@@ -130,4 +130,44 @@ fn nbc_structural_verifier_core_vm_admission_is_atomic() {
     let valid_bytes = simple_module().to_nbc(None).unwrap();
     assert_eq!(vm.load_nbc_with_structural_verification(&valid_bytes), Ok(0));
     assert_eq!(vm.modules.len(), 1);
+}
+
+#[test]
+fn nbc_structural_verifier_rejects_handler_metadata_out_of_bounds() {
+    let mut module = simple_module();
+    module.handler_tables.push(HandlerTable {
+        bindings: vec![HandlerBinding {
+            effect_name: "IO.print".into(),
+            handler_offset: 2,
+            arg_count: 1,
+            result_reg: 0,
+            single_shot: true,
+        }],
+        fallback_offset: None,
+    });
+    assert_rejected(&module, "handler table");
+
+    module.handler_tables[0].bindings[0].handler_offset = 1;
+    module.handler_tables[0].fallback_offset = Some(2);
+    assert_rejected(&module, "handler table");
+}
+
+#[test]
+fn nbc_structural_verifier_validates_direct_handler_binding() {
+    let mut module = simple_module();
+    module.handler_tables.push(HandlerTable {
+        bindings: vec![HandlerBinding {
+            effect_name: "IO.print".into(),
+            handler_offset: 1,
+            arg_count: 0,
+            result_reg: 0,
+            single_shot: true,
+        }],
+        fallback_offset: None,
+    });
+    module.instructions[0] = Instruction::new3(OpCode::PerformDirect, 0, 0, 0);
+    assert!(verify_module_structure(&module).is_ok());
+
+    module.instructions[0] = Instruction::new3(OpCode::PerformDirect, 0, 1, 0);
+    assert_rejected(&module, "PerformDirect binding");
 }
