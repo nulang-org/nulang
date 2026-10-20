@@ -958,6 +958,34 @@ mod tests {
 
 
 impl Actor {
+    /// Determine whether a Value names the exact payload address of a
+    /// currently live allocation in this actor's heap.
+    ///
+    /// This compares against the allocator's live-object list *before*
+    /// dereferencing any untrusted pointer; interior addresses and pointers
+    /// owned by other actors are rejected. The lookup is linear in live
+    /// allocations and is intended only for diagnostics/root validation.
+    ///
+    /// A positive result is not a persistent lifetime proof: another
+    /// allocation can later reuse the same address. Before any reclamation,
+    /// a full safepoint and generation-aware identity are still required.
+    pub fn is_live_heap_payload_value(&self, value: Value) -> bool {
+        let Some(ptr) = value.as_ptr() else {
+            return false;
+        };
+        if ptr.is_null() {
+            return false;
+        }
+
+        let mut matched = false;
+        self.heap.iter_live_objects(|_, payload, _| {
+            if payload == ptr {
+                matched = true;
+            }
+        });
+        matched
+    }
+
     /// Observe Values kept by actor-owned state, event records, registered
     /// query handlers, and a suspended workflow's execution frames.
     ///
