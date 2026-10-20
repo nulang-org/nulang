@@ -32,6 +32,7 @@ Two layers are formalized:
 | `types.lean` | HM `HasType`, small-step semantics, `progress`/`preservation`/`type_soundness` | **Proved** |
 | `capabilities.lean` | Capability lattice laws, `cap_sendable`, `discharge_sendable` | Proved (`linear_at_most_once` open) |
 | `effects.lean` | Effect rows; scoped `EffectTrace`/`Escapes`/`Unhandled` operational model | Scoped handler-safety proved; full expression soundness open |
+| `trace_effect_rows.lean` | Compositional static residual-effect predicate + exactness bridge to `Escapes` | Static/dynamic correspondence (scoped trace only) |
 
 ## Theorems
 
@@ -84,6 +85,24 @@ body. The submodel also excludes continuations and resumption. Bridging
 this proof to the complete typed operational semantics is still open; the
 formal trace theorem must not be presented as production-wide effect
 soundness or a guarantee about external side effects.
+
+### Compositional trace-effect inference (scoped model)
+
+`trace_effect_rows.lean` defines `StaticEffects trace label` inductively
+by *computation over the trace*: performing an effect adds its label,
+sequencing takes the union, and handling one label subtracts that label.
+`static_effects_exact` proves this predicate coincides with the independent
+`Escapes` relation from `effects.lean`.
+`static_effects_safe` then establishes that covering all residual labels
+with incoming handlers prevents an unhandled operation. Regression examples
+check label subtraction, preservation of unrelated effects, and an unhandled
+operation outside the matching handler.
+
+This is a static/dynamic correspondence proof for the **trace fragment**.
+It is not a proof that the production `EffectRow.union` implementation,
+`HasTypeEff` typing rules, or compiler inference are sound. That connection,
+particularly latent function effects and handler-body typing, remains a
+separate required validation.
 
 ## Build
 
