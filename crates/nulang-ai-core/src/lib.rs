@@ -164,6 +164,14 @@ pub struct ConversationMessage {
     pub timestamp: DateTime<Utc>,
 }
 
+/// Evidence references are only accepted after a trusted verifier checks them.
+/// A free-form worker assertion is never sufficient to complete a task.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AcceptanceEvidence {
+    pub criterion: String,
+    pub artifact_ref: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SwarmEvent {
@@ -173,6 +181,10 @@ pub enum SwarmEvent {
     },
     GoalCompleted {
         goal_id: Uuid,
+    },
+    GoalBlocked {
+        goal_id: Uuid,
+        reason: String,
     },
     TaskCreated {
         task_id: Uuid,
@@ -191,6 +203,21 @@ pub enum SwarmEvent {
     TaskCompleted {
         task_id: Uuid,
         agent_id: String,
+    },
+    TaskVerified {
+        task_id: Uuid,
+        agent_id: String,
+        evidence: Vec<AcceptanceEvidence>,
+    },
+    TaskBlocked {
+        task_id: Uuid,
+        agent_id: String,
+        reason: String,
+    },
+    TaskFailed {
+        task_id: Uuid,
+        agent_id: String,
+        reason: String,
     },
     DirectorThinking {
         conversation_id: Uuid,
