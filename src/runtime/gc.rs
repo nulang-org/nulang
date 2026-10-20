@@ -1533,4 +1533,47 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn test_receive_ref_rejects_overflow_without_consuming_foreign_credit() {
+        let mut heap = MockHeap::new();
+        let mut gc = OrcaGc::new(1);
+        let ptr = gc.alloc_object(&mut heap, 16, TypeTag::Raw).unwrap();
+        let header = unsafe { heap.header_ptr(ptr) };
+        unsafe {
+            (*header).ref_count = u32::MAX;
+            (*header).foreign_count = 1;
+        }
+
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            gc.receive_ref(&heap, ptr);
+        }));
+        assert!(rejected.is_err(), "overflow must reject the transfer");
+        unsafe {
+            assert_eq!((*header).ref_count, u32::MAX);
+            assert_eq!((*header).foreign_count, 1);
+        }
+    }
+
+    #[test]
+    fn test_receive_ref_rejects_underflow_without_adding_local_credit() {
+        let mut heap = MockHeap::new();
+        let mut gc = OrcaGc::new(1);
+        let ptr = gc.alloc_object(&mut heap, 16, TypeTag::Raw).unwrap();
+        let header = unsafe { heap.header_ptr(ptr) };
+        unsafe {
+            (*header).ref_count = 1;
+            (*header).foreign_count = 0;
+        }
+
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            gc.receive_ref(&heap, ptr);
+        }));
+        assert!(rejected.is_err(), "missing credit must reject the transfer");
+        unsafe {
+            assert_eq!((*header).ref_count, 1);
+            assert_eq!((*header).foreign_count, 0);
+        }
+    }
+
 }
