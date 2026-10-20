@@ -1756,5 +1756,4 @@ mod tests {
             runtime.free_object(b);
         }
     }
-
 }
