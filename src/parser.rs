@@ -506,7 +506,7 @@ impl Parser {
         }
         self.check_route_params(&app_decls, &decls)?;
         decls.extend(self.desugar_app_decls(app_decls));
-        let decls = Self::expand_contracts(Self::expand_derives(decls));
+        let decls = Self::expand_contracts(Self::expand_derives(decls)?);
         Ok(AstModule {
             name: "main".to_string(),
             decls,
@@ -516,7 +516,16 @@ impl Parser {
     /// Desugar `@derive(eq)` on record types into a synthetic structural-equality
     /// function `{name}_eq(a, b) -> Bool`. Walks top-level and nested-module decls
     /// so a derive inside a `module { }` block is expanded too.
-    fn expand_derives(decls: Vec<Decl>) -> Vec<Decl> {
+    fn expand_derives(decls: Vec<Decl>) -> NuResult<Vec<Decl>> {
+        // Reserve explicit names first; synthesized functions must never
+        // silently shadow user definitions (including later declarations).
+        let mut occupied: std::collections::HashSet<String> = decls
+            .iter()
+            .filter_map(|decl| match decl {
+                Decl::Function { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
         let mut out = Vec::with_capacity(decls.len());
         for decl in decls {
             match decl {
@@ -528,18 +537,48 @@ impl Parser {
                     public,
                     span,
                 } => {
-                    let wants_eq = derives.iter().any(|d| d == "eq");
+                    let mut requested = std::collections::HashSet::new();
+                    for derive in &derives {
+                        if !requested.insert(derive.as_str()) {
+                            return Err(NuError::parse_error(
+                                format!("duplicate derive '{derive}' on record '{name}'"),
+                                span,
+                            ));
+                        }
+                        if !matches!(derive.as_str(), "eq" | "schema") {
+                            return Err(NuError::parse_error(
+                                format!("unsupported derive '{derive}' on '{name}'; expected 'eq' or 'schema'"),
+                                span,
+                            ));
+                        }
+                    }
+                    let mut generated = Vec::with_capacity(derives.len());
+                    for derive in &derives {
+                        let helper = format!("{}_{}", name.to_lowercase(), derive);
+                        if !occupied.insert(helper.clone()) {
+                            return Err(NuError::parse_error(
+                                format!("generated derive helper '{helper}' collides with an existing function"),
+                                span,
+                            ));
+                        }
+                        let function = match derive.as_str() {
+                            "eq" => Self::derive_eq_function(&name, &fields, span),
+                            "schema" => {
+                                Self::derive_schema_function(&name, &type_params, &fields, span)?
+                            }
+                            _ => unreachable!("derive name checked above"),
+                        };
+                        generated.push(function);
+                    }
                     out.push(Decl::RecordType {
-                        name: name.clone(),
-                        type_params: type_params.clone(),
-                        fields: fields.clone(),
+                        name,
+                        type_params,
+                        fields,
                         derives,
                         public,
                         span,
                     });
-                    if wants_eq {
-                        out.push(Self::derive_eq_function(&name, &fields, span));
-                    }
+                    out.extend(generated);
                 }
                 Decl::Module {
                     name,
@@ -550,14 +589,96 @@ impl Parser {
                     out.push(Decl::Module {
                         name,
                         exports,
-                        decls: Self::expand_derives(inner),
+                        decls: Self::expand_derives(inner)?,
                         span,
                     });
                 }
                 other => out.push(other),
             }
         }
-        out
+        Ok(out)
+    }
+
+    /// Normalize the *supported* record subset before converting to JSON
+    /// Schema. Unlike the permissive @tool converter, derive must not emit
+    /// an empty '{}' schema for unresolved or runtime-only types.
+    fn schema_compatible_type(ty: &Type) -> Option<Type> {
+        match ty {
+            Type::Primitive(
+                PrimitiveType::Int
+                | PrimitiveType::Float
+                | PrimitiveType::Bool
+                | PrimitiveType::String
+                | PrimitiveType::Nil
+                | PrimitiveType::Unit,
+            ) => Some(ty.clone()),
+            Type::Array(inner) => {
+                Some(Type::Array(Box::new(Self::schema_compatible_type(inner)?)))
+            }
+            Type::Record(fields) => {
+                let mut fields = fields.clone();
+                fields.sort_by(|a, b| a.0.cmp(&b.0));
+                let mut checked: Vec<(String, Type)> = Vec::with_capacity(fields.len());
+                for (name, field_ty) in fields {
+                    if name.is_empty()
+                        || name == crate::types::RECORD_ROW_TAIL_FIELD
+                        || checked.last().is_some_and(|(previous, _)| previous == &name)
+                    {
+                        return None;
+                    }
+                    checked.push((name, Self::schema_compatible_type(&field_ty)?));
+                }
+                Some(Type::Record(checked))
+            }
+            _ => None,
+        }
+    }
+
+    /// Synthesize a pure, constant JSON Schema string. This is an inspection
+    /// helper, NOT a runtime JSON codec or a durable wire-format contract.
+    fn derive_schema_function(
+        record_name: &str,
+        type_params: &[String],
+        fields: &[(String, Type)],
+        span: Span,
+    ) -> NuResult<Decl> {
+        if !type_params.is_empty() {
+            return Err(NuError::parse_error(
+                format!("cannot derive schema for generic record '{record_name}'"),
+                span,
+            ));
+        }
+        let ty = Self::schema_compatible_type(&Type::Record(fields.to_vec())).ok_or_else(|| {
+            NuError::parse_error(
+                format!("cannot derive schema for '{record_name}': unsupported, open, or duplicate field type"),
+                span,
+            )
+        })?;
+        let schema = crate::tool_schema::type_to_json_schema(&ty);
+        let json = serde_json::to_string(&schema).map_err(|error| {
+            NuError::parse_error(
+                format!("cannot derive schema for '{record_name}': {error}"),
+                span,
+            )
+        })?;
+        Ok(Decl::Function {
+            name: format!("{}_schema", record_name.to_lowercase()),
+            type_params: vec![],
+            type_param_constraints: vec![],
+            params: vec![],
+            default_values: vec![],
+            using_params: vec![],
+            ret_type: Some(Type::string()),
+            error_type: None,
+            effect: None,
+            cap: None,
+            requires: vec![],
+            ensures: vec![],
+            body: Expr::Literal(Literal::String(json), span),
+            annotations: vec![],
+            public: false,
+            span,
+        })
     }
 
     /// Synthesize `fn {record_name}_eq(a, b) -> Bool` comparing every field with
@@ -747,6 +868,14 @@ impl Parser {
         self.skip_newlines();
         let public = self.consume_if(&TokenKind::Pub);
         self.skip_newlines();
+        if annotations.iter().any(|a| matches!(a, FunctionAnnotation::Derive(_)))
+            && !matches!(self.peek_kind(), TokenKind::Type)
+        {
+            return Err(NuError::parse_error(
+                "@derive is supported only on record types".to_string(),
+                self.current_span(),
+            ));
+        }
         match self.peek_kind() {
             TokenKind::Fn => self.parse_function(public, annotations),
             TokenKind::Actor
@@ -782,10 +911,17 @@ impl Parser {
                     })
                     .flatten()
                     .collect();
-                match self.peek_kind() {
+                let decl = match self.peek_kind() {
                     TokenKind::Alias => self.parse_type_alias(public, false),
-                    _ => self.parse_type_decl_variant_or_record(public, derives),
+                    _ => self.parse_type_decl_variant_or_record(public, derives.clone()),
+                }?;
+                if !derives.is_empty() && !matches!(decl, Decl::RecordType { .. }) {
+                    return Err(NuError::parse_error(
+                        "@derive is supported only on record types".to_string(),
+                        self.current_span(),
+                    ));
                 }
+                Ok(decl)
             }
             TokenKind::Handler => self.parse_named_handler(),
             TokenKind::Effect => self.parse_effect_decl(),
@@ -851,6 +987,7 @@ impl Parser {
             };
             self.expect(TokenKind::LParen)?;
             let mut fields: FxHashMap<String, String> = FxHashMap::default();
+            let mut positional_fields = Vec::new();
             self.skip_newlines();
             while !self.match_token(&TokenKind::RParen) && !self.is_at_end() {
                 let field_name = self.expect_ident("annotation field name")?;
@@ -858,6 +995,7 @@ impl Parser {
                     let field_value = self.expect_string("annotation field value")?;
                     fields.insert(field_name, field_value);
                 } else {
+                    positional_fields.push(field_name.clone());
                     fields.insert(String::new(), field_name);
                 }
                 self.skip_newlines();
@@ -890,13 +1028,13 @@ impl Parser {
                     annotations.push(FunctionAnnotation::Backend { kind });
                 }
                 "derive" => {
-                    // `@derive(eq)` — nameless fields are stored under the
-                    // empty key (no `:`), named ones under their field name.
-                    let names: Vec<String> = fields
-                        .into_iter()
-                        .map(|(k, v)| if k.is_empty() { v } else { k })
-                        .collect();
-                    annotations.push(FunctionAnnotation::Derive(names));
+                    if fields.keys().any(|key| !key.is_empty()) || positional_fields.is_empty() {
+                        return Err(NuError::parse_error(
+                            "@derive requires one or more positional names".to_string(),
+                            self.current_span(),
+                        ));
+                    }
+                    annotations.push(FunctionAnnotation::Derive(positional_fields));
                 }
                 "placement" => {
                     let value = fields.remove("").unwrap_or_default();
