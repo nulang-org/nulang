@@ -847,7 +847,11 @@ impl Runtime {
                     let owner_shard = (*actor_id % shard_count as u64) as u16;
                     if owner_shard == shard_idx {
                         let actor = actors.get(actor_id)?;
-                        let depth = actor.mailbox.len();
+                        // Only occupied Normal/Bulk credits count toward a
+                        // bounded actor's application capacity. Supervisor
+                        // messages bypass that capacity and must not exclude
+                        // an otherwise eligible consumer-group worker.
+                        let depth = actor.mailbox.routing_depth();
                         let capacity = actor.mailbox.capacity();
                         if capacity > 0 && depth >= capacity {
                             return None;
@@ -1176,6 +1180,48 @@ mod tests {
         // Once both bounded mailboxes are full, no worker is eligible.
         let saturated = rt
             .fabric_publish_report("jobs.run", &[Value::int(3)])
+            .unwrap();
+        assert_eq!(saturated.selected, 0);
+        assert_eq!(saturated.admitted, 0);
+    }
+
+    #[test]
+    fn fabric_group_ignores_supervisor_signals_when_reserving_application_capacity() {
+        let mut rt = Runtime::new();
+        let actor_id = 9100_u64;
+        let mut worker = Actor::new(actor_id, "supervised-fabric-worker", 1);
+        worker.state = ActorState::Running;
+        worker.register_behavior("work", noop);
+
+        // A supervisor burst bypasses application credits. These three signals
+        // must not make a capacity-one application mailbox ineligible.
+        for sender in 1..=3 {
+            worker
+                .mailbox
+                .push(crate::runtime::mailbox::Message {
+                    behavior_id: 0,
+                    payload: crate::runtime::mailbox::MessagePayload::from_slice(&[]),
+                    sender,
+                    priority: crate::runtime::mailbox::MessagePriority::System,
+                    trace_id: None,
+                })
+                .expect("supervisor traffic must bypass the application cap");
+        }
+        rt.actors.insert(actor_id, worker);
+        rt.fabric_subscribe_group("jobs.*", "workers", actor_id, "work")
+            .unwrap();
+
+        let first = rt
+            .fabric_publish_report("jobs.run", &[Value::int(1)])
+            .unwrap();
+        assert_eq!(first.selected, 1, "system traffic must not hide an eligible worker");
+        assert_eq!(first.admitted, 1);
+        assert_eq!(rt.actors.get(&actor_id).unwrap().mailbox.len(), 4);
+
+        // Once the application credit is genuinely occupied, a subsequent
+        // publication must not select this saturated worker.
+        let saturated = rt
+            .fabric_publish_report("jobs.run", &[Value::int(2)])
             .unwrap();
         assert_eq!(saturated.selected, 0);
         assert_eq!(saturated.admitted, 0);
