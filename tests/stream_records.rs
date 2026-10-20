@@ -34,7 +34,7 @@ fn jsonl_rejects_blank_records_and_invalid_utf8() {
     assert!(matches!(blanks.next().unwrap(), Err(JsonlError::Parse(_))));
     assert!(blanks.next().is_none());
 
-    let mut bytes = JsonlRecords::new(Cursor::new(&[0xff, b'\n'][..]), 32).unwrap();
+    let mut bytes = JsonlRecords::new(Cursor::new(vec![0xff, b'\n']), 32).unwrap();
     assert!(matches!(bytes.next().unwrap(), Err(JsonlError::Io(_))));
     assert!(bytes.next().is_none());
 }
