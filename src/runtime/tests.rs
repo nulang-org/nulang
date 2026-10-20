@@ -813,6 +813,11 @@ fn test_supervised_supervisor_keeps_supervising_after_restart() {
         grandchild,
     );
     rt.supervisors.get_mut(&child_sup).unwrap().parent = Some(parent);
+    rt.supervisors
+        .get_mut(&child_sup)
+        .unwrap()
+        .set_restart_intensity(2, 45)
+        .unwrap();
 
     // Crash the child supervisor's actor: the parent restarts it under a
     // fresh actor id.
@@ -830,6 +835,8 @@ fn test_supervised_supervisor_keeps_supervising_after_restart() {
         !rt.supervisors.contains_key(&child_sup),
         "the old supervisor struct must not linger under a dead actor id"
     );
+    assert_eq!(rt.supervisors[&new_sup_id].max_restarts, 2);
+    assert_eq!(rt.supervisors[&new_sup_id].restart_window_secs, 45);
     let gc_id = rt.supervisors[&new_sup_id].children[0].1;
     assert_eq!(
         rt.actors.get(&gc_id).unwrap().parent,
