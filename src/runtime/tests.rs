@@ -8774,13 +8774,14 @@ fn orca_cross_shard_envelope_root_visitor_observes_both_delivery_variants() {
     assert!(values.is_empty());
 }
 
-
 #[test]
 fn orca_diagnostic_root_audit_includes_actor_mailbox_and_pending_fetch_values() {
     let mut runtime = Runtime::new();
     let id = runtime.spawn_actor(Box::new(Vec::new));
     let actor = runtime.actors.get_mut(&id).expect("actor");
-    actor.state_data.insert("state".into(), Value::int(901));
+    actor
+        .state_data
+        .insert("state".into(), Value::int(901));
     actor
         .mailbox
         .push(Message {
@@ -8832,8 +8833,14 @@ fn orca_diagnostic_root_audit_includes_actor_mailbox_and_pending_fetch_values() 
         ]
     );
     assert_eq!(runtime.actors[&id].mailbox.len(), 2);
-    assert_eq!(runtime.actors.get_mut(&id).unwrap().mailbox.pop().unwrap().sender, 2);
-    assert_eq!(runtime.actors.get_mut(&id).unwrap().mailbox.pop().unwrap().sender, 3);
+    assert_eq!(
+        runtime.actors.get_mut(&id).unwrap().mailbox.pop().unwrap().sender,
+        2
+    );
+    assert_eq!(
+        runtime.actors.get_mut(&id).unwrap().mailbox.pop().unwrap().sender,
+        3
+    );
 }
 
 #[test]
