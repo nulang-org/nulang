@@ -291,7 +291,10 @@ impl OrcaGc {
             "local_ref called on object not owned by this actor"
         );
 
-        header.ref_count += 1;
+        header.ref_count = header
+            .ref_count
+            .checked_add(1)
+            .expect("ORCA local reference count overflow");
         self.stats.local_refs_created += 1;
     }
 
@@ -318,7 +321,10 @@ impl OrcaGc {
             "drop_local_ref called on object not owned by this actor"
         );
 
-        header.ref_count -= 1;
+        header.ref_count = header
+            .ref_count
+            .checked_sub(1)
+            .expect("ORCA local reference count underflow");
 
         self.stats.local_refs_dropped += 1;
 
@@ -368,7 +374,10 @@ impl OrcaGc {
         );
 
         // Mark the reference as in-flight.
-        header.foreign_count += 1;
+        header.foreign_count = header
+            .foreign_count
+            .checked_add(1)
+            .expect("ORCA foreign reference count overflow");
         self.stats.foreign_refs_sent += 1;
 
         ForeignRefOp {
@@ -398,10 +407,17 @@ impl OrcaGc {
         );
 
         // In-flight reference has arrived.
-        header.foreign_count -= 1;
-
-        // We now hold a local reference.
-        header.ref_count += 1;
+        let next_foreign = header
+            .foreign_count
+            .checked_sub(1)
+            .expect("ORCA foreign reference count underflow");
+        let next_local = header
+            .ref_count
+            .checked_add(1)
+            .expect("ORCA local reference count overflow");
+        header.foreign_count = next_foreign;
+        // Transfer the in-flight credit atomically into a local reference.
+        header.ref_count = next_local;
 
         self.stats.foreign_refs_received += 1;
     }
@@ -427,7 +443,10 @@ impl OrcaGc {
             "inc_foreign_hold called on object not owned by this actor"
         );
 
-        header.foreign_count += 1;
+        header.foreign_count = header
+            .foreign_count
+            .checked_add(1)
+            .expect("ORCA foreign reference count overflow");
         self.stats.foreign_refs_received += 1;
     }
 
@@ -468,12 +487,16 @@ impl OrcaGc {
         let header = unsafe { &mut *op.object_header };
 
         let prev_foreign = if op.delta >= 0 {
-            header.foreign_count += op.delta as u32;
+            header.foreign_count = header
+                .foreign_count
+                .checked_add(op.delta as u32)
+                .expect("ORCA foreign reference count overflow");
             header.foreign_count
         } else {
-            let delta = (-op.delta) as u32;
-            header.foreign_count -= delta;
-            // The count *after* subtraction.
+            header.foreign_count = header
+                .foreign_count
+                .checked_sub(op.delta.unsigned_abs())
+                .expect("ORCA foreign reference count underflow");
             header.foreign_count
         };
 
@@ -1463,5 +1486,92 @@ mod tests {
             0,
             "object freed once the hold is released"
         );
+    }
+
+    // Broken ref-count barriers must fail with a stable diagnostic in both
+    // debug and release builds; wrapping counts can silently prolong a heap
+    // object's lifetime or free it while a foreign reader still holds it.
+    #[test]
+    #[should_panic(expected = "ORCA local reference count underflow")]
+    fn test_drop_local_ref_rejects_zero_count() {
+        let mut heap = MockHeap::new();
+        let mut gc = OrcaGc::new(1);
+        let ptr = gc.alloc_object(&mut heap, 16, TypeTag::Raw).unwrap();
+        unsafe {
+            (*heap.header_ptr(ptr)).ref_count = 0;
+            gc.drop_local_ref(&mut heap, ptr);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "ORCA foreign reference count underflow")]
+    fn test_process_foreign_op_rejects_missing_credit() {
+        let mut heap = MockHeap::new();
+        let mut gc = OrcaGc::new(1);
+        let ptr = gc.alloc_object(&mut heap, 16, TypeTag::Raw).unwrap();
+        let header = unsafe { heap.header_ptr(ptr) };
+        gc.process_foreign_op(
+            &mut heap,
+            ForeignRefOp {
+                target_actor: 2,
+                owner_actor: 1,
+                object_header: header,
+                delta: -1,
+            },
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "ORCA local reference count overflow")]
+    fn test_local_ref_rejects_overflow() {
+        let mut heap = MockHeap::new();
+        let mut gc = OrcaGc::new(1);
+        let ptr = gc.alloc_object(&mut heap, 16, TypeTag::Raw).unwrap();
+        unsafe {
+            (*heap.header_ptr(ptr)).ref_count = u32::MAX;
+            gc.local_ref(&heap, ptr);
+        }
+    }
+
+    #[test]
+    fn test_receive_ref_rejects_overflow_without_consuming_foreign_credit() {
+        let mut heap = MockHeap::new();
+        let mut gc = OrcaGc::new(1);
+        let ptr = gc.alloc_object(&mut heap, 16, TypeTag::Raw).unwrap();
+        let header = unsafe { heap.header_ptr(ptr) };
+        unsafe {
+            (*header).ref_count = u32::MAX;
+            (*header).foreign_count = 1;
+        }
+
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            gc.receive_ref(&heap, ptr);
+        }));
+        assert!(rejected.is_err(), "overflow must reject the transfer");
+        unsafe {
+            assert_eq!((*header).ref_count, u32::MAX);
+            assert_eq!((*header).foreign_count, 1);
+        }
+    }
+
+    #[test]
+    fn test_receive_ref_rejects_underflow_without_adding_local_credit() {
+        let mut heap = MockHeap::new();
+        let mut gc = OrcaGc::new(1);
+        let ptr = gc.alloc_object(&mut heap, 16, TypeTag::Raw).unwrap();
+        let header = unsafe { heap.header_ptr(ptr) };
+        unsafe {
+            (*header).ref_count = 1;
+            (*header).foreign_count = 0;
+        }
+
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            gc.receive_ref(&heap, ptr);
+        }));
+        assert!(rejected.is_err(), "missing credit must reject the transfer");
+        unsafe {
+            assert_eq!((*header).ref_count, 1);
+            assert_eq!((*header).foreign_count, 0);
+        }
     }
 }
