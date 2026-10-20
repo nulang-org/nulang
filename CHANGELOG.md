@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Fabric routing honors bounded application credits — 2026-10-20
+- **Consumer-group placement uses Normal/Bulk mailbox credit occupancy rather than total message depth when a capacity is configured**, so supervisor-only traffic cannot incorrectly exclude an eligible local worker. Unbounded actors retain total depth as the placement heuristic without added send-path atomics.
+- **Regression coverage** verifies supervisor bursts followed by one admitted application publication, genuine capacity saturation, and selective-receive staging/commit accounting. This change depends on the credit isolation in PR #2001; exact-head Rust/CI validation is required before promotion.
+
 ### Supervisor mailbox priority and bounded admission isolation — 2026-10-19
 - **Locally enqueued supervisor/system signals use the system-priority mailbox lane**, preventing earlier normal application traffic from delaying control signals on ordinary receives.
 - **Supervisor/system messages do not consume normal/bulk mailbox capacity credits**, even during selective receive. Total logical message depth is tracked separately from bounded application credits, which are released only after consuming normal/bulk messages.
