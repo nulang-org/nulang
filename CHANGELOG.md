@@ -3,6 +3,10 @@
 - **Fabric publish admission now reads mailbox pressure only for matching local subscribers**, instead of allocating and populating an all-actor mailbox snapshot on every publish.
 - **Ported the regression and exact-base matched-fixture A/B harness** from #1708 onto current main. Historical unmatched-publish microbenchmarks were favorable; new-head CI and measurements remain the promotion gate.
 
+### Timer deadline heap-head fast path — 2026-10-18
+- **`TimerWheel::next_deadline()` directly reads an active heap head** instead of scanning every timer, retaining the read-only linear fallback when the earliest timer was cancelled.
+- **Ported the deterministic cancellation coverage and matched-fixture Criterion A/B harness** from #1823 to current main. New exact-head CI and confirmation remain required before promotion.
+
 ### Bounded Nulang Web development-server connections — 2026-10-16
 - **The experimental Web development listener caps active connections at 64**, including SSE, and returns `503` with `Retry-After: 1` when full.
 - **Worker capacity is returned by a scoped RAII lease** after normal completion, panic, or thread-spawn failure. One shared `Arc` route table replaces per-connection clones of compiled route modules.
