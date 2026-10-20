@@ -258,6 +258,12 @@ Nulang source
 
 The runtime should ultimately execute each route under lightweight supervised request execution with structured cancellation and backpressure. Request-scoped dependencies should move from ambient state toward effect handlers. Stateful realtime/domain coordination should continue to use explicit persistent or virtual actors rather than making every model object an actor.
 
+## Experimental explicit response host effects
+
+`Web.json_response(status: Int, json: String)` and `Web.text_response(status: Int, body: String)` select concrete JSON/plain-text HTTP responses in the native development host, including appropriate Content-Type and status validation. They are request-scoped side effects and currently return `Html`-compatible placeholders so legacy route signatures remain valid.
+
+This is **not** the compiler-level response algebra described in priority 1 below: Web Contract IR still cannot infer response status/media types from these dynamic effects, and OpenAPI must not invent them. Production WASM-host parity, status/body algebra, and declaration-driven response metadata remain future work.
+
 ## Remaining implementation priorities
 
 1. Define an explicit request/response algebra (`Json[T]`, `Html`, bytes, streams, typed bodies/media) so Contract IR and OpenAPI can represent payloads without guessing.
