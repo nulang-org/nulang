@@ -56,6 +56,23 @@ pub enum SearchError {
     DuplicateSnapshotDocument { namespace: String, id: String },
 }
 
+impl std::fmt::Display for SearchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyNamespace => write!(f, "search namespace must not be empty"),
+            Self::EmptyDocumentId => write!(f, "search document id must not be empty"),
+            Self::UnsupportedSnapshotVersion(version) => {
+                write!(f, "unsupported search snapshot version: {version}")
+            }
+            Self::DuplicateSnapshotDocument { namespace, id } => {
+                write!(f, "duplicate snapshot document {namespace}/{id}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SearchError {}
+
 /// Serializable source documents. The inverted index is rebuilt on restore.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchSnapshot {
