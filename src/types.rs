@@ -155,6 +155,42 @@ impl Capability {
         self.join(other) == other
     }
 
+    /// Conservative read projection of a field through a receiver.
+    ///
+    /// This models the receiver-dependent part of Pony-style viewpoint
+    /// adaptation without requiring ephemeral alias/ownership recovery.
+    /// In particular, extracting an `iso` field never returns a new `iso`
+    /// alias: the compiler needs explicit consume/move-out semantics first.
+    ///
+    /// `None` means the receiver is opaque and cannot be dereferenced.
+    /// `lineariso` and `linear` are treated as `iso` and `val` for reads;
+    /// field reads do not discharge the parent's linear consumption obligation.
+    pub fn viewpoint_read(self, field: Capability) -> Option<Capability> {
+        use Capability::*;
+        let origin = match self {
+            Tag => return None,
+            LinearIso => Iso,
+            Linear => Val,
+            other => other,
+        };
+        let inner = match field {
+            LinearIso => Iso,
+            Linear => Val,
+            other => other,
+        };
+        Some(match (origin, inner) {
+            (_, Tag) => Tag,
+            (Val, _) | (_, Val) => Val,
+            (Box, Iso) | (Ref, Iso) | (Trn, Iso) => Tag,
+            (Box, _) | (Trn, _) => Box,
+            (Ref, Trn) => Box,
+            (Ref, other) => other,
+            (Iso, _) => Tag,
+            // `origin` is never Tag/LinearIso/Linear here.
+            _ => unreachable!("normalized receiver capability"),
+        })
+    }
+
     /// Can this capability be sent to another actor?
     pub fn is_sendable(self) -> bool {
         matches!(
