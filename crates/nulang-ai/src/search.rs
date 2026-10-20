@@ -440,4 +440,24 @@ mod tests {
             Err(SearchError::UnsupportedSnapshotVersion(99))
         ));
     }
+    #[test]
+    fn backend_trait_preserves_scoped_search_and_facet_contract() {
+        let mut backend: Box<dyn SearchBackend> = Box::new(EmbeddedSearch::new());
+        backend.index_document(document("alice", "1", "typed actors and messages", "docs")).unwrap();
+        backend.index_document(document("bob", "1", "typed actors and messages", "secret")).unwrap();
+
+        let alice = backend.query(&SearchQuery::new("alice", "actors")).unwrap();
+        assert_eq!(alice.len(), 1);
+        assert_eq!(alice[0].document.namespace, "alice");
+        assert!(alice[0].score > 0.0);
+        assert_eq!(
+            backend.facets("alice", "category", &BTreeMap::new()).unwrap(),
+            BTreeMap::from([("docs".to_string(), 1)])
+        );
+
+        assert!(backend.remove_document("alice", "1").unwrap());
+        assert!(backend.query(&SearchQuery::new("alice", "actors")).unwrap().is_empty());
+        assert_eq!(backend.query(&SearchQuery::new("bob", "actors")).unwrap().len(), 1);
+    }
+
 }
