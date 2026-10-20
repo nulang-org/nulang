@@ -2959,6 +2959,36 @@ impl TypeChecker {
     }
 
     /// Infer the type of a field access expression.
+    /// Apply a read-only receiver's viewpoint to reference-typed fields.
+    /// Plain records, tuples, and arrays are projected recursively so a
+    /// nested record cannot expose an unprojected mutable reference.
+    /// Generic applications and opaque nominals require future constraint
+    /// propagation; this helper does not grant capabilities through them.
+    fn project_field_viewpoint(ty: Type, receiver: Capability) -> Type {
+        match ty {
+            Type::Reference { cap, inner } => Type::Reference {
+                cap: receiver.viewpoint_read(cap).unwrap_or(Capability::Tag),
+                inner,
+            },
+            Type::Record(fields) => Type::Record(
+                fields
+                    .into_iter()
+                    .map(|(name, ty)| (name, Self::project_field_viewpoint(ty, receiver)))
+                    .collect(),
+            ),
+            Type::Tuple(items) => Type::Tuple(
+                items
+                    .into_iter()
+                    .map(|ty| Self::project_field_viewpoint(ty, receiver))
+                    .collect(),
+            ),
+            Type::Array(item) => {
+                Type::Array(Box::new(Self::project_field_viewpoint(*item, receiver)))
+            }
+            other => other,
+        }
+    }
+
     fn infer_field_access(
         &mut self,
         ctx: &TypeContext,
@@ -3093,11 +3123,25 @@ impl TypeChecker {
         let (s1, record_ty) = self.infer_expr(ctx, expr)?;
         let mut current_ty = apply_subst(&record_ty, &s1);
 
-        // Peel reference wrappers so field access works through
-        // &ref / &val / &iso etc.  x.field where x : &ref {field: T} => T.
+        // Follow reference wrappers, preserving the effective receiver
+        // viewpoint rather than discarding each capability. An opaque tag
+        // cannot be used to inspect fields, even if they are scalars.
+        let mut receiver_cap: Option<Capability> = None;
         loop {
             match current_ty {
-                Type::Reference { inner, .. } => {
+                Type::Reference { cap, inner } => {
+                    let visible = match receiver_cap {
+                        Some(view) => view.viewpoint_read(cap),
+                        None if cap.is_readable() => Some(cap),
+                        None => None,
+                    };
+                    let Some(visible) = visible.filter(|c| c.is_readable()) else {
+                        return Err(NuError::cap_error(
+                            "cannot access fields through an opaque tag reference".to_string(),
+                            span,
+                        ));
+                    };
+                    receiver_cap = Some(visible);
                     current_ty = apply_subst(&inner, &s1);
                 }
                 _ => break,
@@ -3108,7 +3152,11 @@ impl TypeChecker {
             Type::Record(ref fs) => {
                 let (fields, tail) = split_record(fs);
                 if let Some((_, field_ty)) = fields.iter().find(|(name, _)| name == field) {
-                    return Ok((s1, field_ty.clone()));
+                    let projected = match receiver_cap {
+                        Some(view) => Self::project_field_viewpoint(field_ty.clone(), view),
+                        None => field_ty.clone(),
+                    };
+                    return Ok((s1, projected));
                 }
                 // An open record absorbs the access: extend its row variable
                 // with the demanded field, so multiple accesses on the same
@@ -3129,7 +3177,11 @@ impl TypeChecker {
                 // Numeric field access on a tuple: t.0, t.1, etc.
                 if let Ok(idx) = field.parse::<usize>() {
                     if idx < elems.len() {
-                        return Ok((s1, elems[idx].clone()));
+                        let projected = match receiver_cap {
+                            Some(view) => Self::project_field_viewpoint(elems[idx].clone(), view),
+                            None => elems[idx].clone(),
+                        };
+                        return Ok((s1, projected));
                     }
                     return Err(NuError::TypeError {
                         msg: format!(
