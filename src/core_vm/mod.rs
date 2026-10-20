@@ -182,7 +182,11 @@ impl CoreVM {
     where
         F: FnMut() -> bool,
     {
-        self.run_inner(module_idx, entry_pc, Some((instruction_budget, cancellation_requested)))
+        self.run_inner(
+            module_idx,
+            entry_pc,
+            Some((instruction_budget, cancellation_requested)),
+        )
     }
 
     fn run_inner<F>(
@@ -759,19 +763,17 @@ mod tests {
         module.emit(Instruction::new0(OpCode::Halt));
         let mut vm = CoreVM::new();
         let idx = vm.load_module_from_code(&module).unwrap();
-        assert!(
-            vm.run_with_limits(idx, 0, 0, || false)
-                .unwrap_err()
-                .contains("instruction budget exhausted")
-        );
+        assert!(vm
+            .run_with_limits(idx, 0, 0, || false)
+            .unwrap_err()
+            .contains("instruction budget exhausted"));
 
         let mut vm = CoreVM::new();
         let idx = vm.load_module_from_code(&module).unwrap();
-        assert!(
-            vm.run_with_limits(idx, 0, 1, || false)
-                .unwrap_err()
-                .contains("instruction budget exhausted")
-        );
+        assert!(vm
+            .run_with_limits(idx, 0, 1, || false)
+            .unwrap_err()
+            .contains("instruction budget exhausted"));
 
         let mut vm = CoreVM::new();
         let idx = vm.load_module_from_code(&module).unwrap();
@@ -787,11 +789,10 @@ mod tests {
         module.emit(Instruction::new0(OpCode::Jmp));
         let mut vm = CoreVM::new();
         let idx = vm.load_module_from_code(&module).unwrap();
-        assert!(
-            vm.run_with_limits(idx, 0, 8, || false)
-                .unwrap_err()
-                .contains("instruction budget exhausted")
-        );
+        assert!(vm
+            .run_with_limits(idx, 0, 8, || false)
+            .unwrap_err()
+            .contains("instruction budget exhausted"));
     }
 
     #[test]
@@ -811,7 +812,10 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(polls, 3);
-        assert!(err.contains("execution cancelled"), "unexpected error: {err}");
+        assert!(
+            err.contains("execution cancelled"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
