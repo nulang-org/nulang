@@ -40,6 +40,12 @@ done
 printf '%s,%s,%s\\n' "$base" "$seeds" "${time:-}" >> "$DIFF_FUZZ_TRACE"
 if [[ "${FAIL_AT_BASE:-}" == "$base" ]]; then exit 1; fi
 if [[ -n "${FUZZ_SLEEP:-}" ]]; then sleep "$FUZZ_SLEEP"; fi
+if [[ "${FUZZ_OMIT_SUMMARY:-}" != 1 ]]; then
+  printf 'campaign: %s programs generated in 0.1s\\n' "${FUZZ_GENERATED:-$seeds}"
+  if [[ "${FUZZ_DUPLICATE_SUMMARY:-}" == 1 ]]; then
+    printf 'campaign: %s programs generated in 0.1s\\n' "$seeds"
+  fi
+fi
 """)
         fuzzer.chmod(0o755)
 
@@ -111,6 +117,41 @@ if [[ -n "${FUZZ_SLEEP:-}" ]]; then sleep "$FUZZ_SLEEP"; fi
                 result = self.run_fuzz(*args)
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertEqual(self.invocations(), [])
+
+    def test_rejects_zero_seed_and_zero_second_campaigns(self):
+        for args in (("--seeds", "0"), ("--time", "0")):
+            with self.subTest(args=args):
+                result = self.run_fuzz(*args)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(self.invocations(), [])
+
+    def test_refuses_missing_duplicate_or_invalid_campaign_summary(self):
+        for environment in (
+            {"FUZZ_OMIT_SUMMARY": "1"},
+            {"FUZZ_DUPLICATE_SUMMARY": "1"},
+            {"FUZZ_GENERATED": "999"},
+            {"FUZZ_GENERATED": "0"},
+            {"FUZZ_GENERATED": "garbage"},
+        ):
+            with self.subTest(environment=environment):
+                result = self.run_fuzz("--seeds", "4", **environment)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.invocations(), ["0,4,"])
+                self.trace.unlink()
+
+    def test_unbounded_campaign_rejects_partial_batch(self):
+        result = self.run_fuzz("--seeds", "8", "--batch-size", "5", FUZZ_GENERATED="3")
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.invocations(), ["0,5,"])
+        self.assertIn("3 of 8", result.stderr)
+
+    def test_time_limited_campaign_reports_only_generated_seeds(self):
+        result = self.run_fuzz("--seeds", "8", "--batch-size", "5",
+                               "--time", "30", FUZZ_GENERATED="3")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.invocations(), ["0,5,30"])
+        self.assertIn("3 of 8", result.stderr)
+        self.assertNotIn("8 of 8", result.stderr)
 
     def test_single_global_time_limit_applies_across_batched_processes(self):
         result = self.run_fuzz("--seeds", "1800", "--time", "1", FUZZ_SLEEP="1.1")
