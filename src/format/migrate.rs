@@ -29,7 +29,7 @@ pub fn peek_format_version(bytes: &[u8]) -> Option<u32> {
     if bytes.len() < NBC_HEADER_LEN {
         return None;
     }
-    if bytes[0..4] != BYTECODE_MAGIC {
+    if &bytes[0..4] != BYTECODE_MAGIC.as_slice() {
         return None;
     }
     Some(u32::from_be_bytes(bytes[4..8].try_into().unwrap()))
