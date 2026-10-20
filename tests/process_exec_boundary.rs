@@ -86,6 +86,18 @@ fn rejects_output_larger_than_the_capture_budget() {
 }
 
 #[test]
+fn counts_stdout_and_stderr_against_one_shared_budget() {
+    let command = shell("printf abcd; printf efgh >&2");
+    let mut policy = ProcessPolicy::new();
+    policy.allow_exact(command.clone());
+
+    assert!(matches!(
+        execute(&policy, &command, ExecLimits::new(Duration::from_secs(3), 6).unwrap()),
+        Err(ExecError::OutputLimitExceeded)
+    ));
+}
+
+#[test]
 fn terminates_an_overlong_command() {
     let command = shell("sleep 2");
     let mut policy = ProcessPolicy::new();
