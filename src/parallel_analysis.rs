@@ -1200,6 +1200,7 @@ mod tests {
                     value: Box::new(int(5)),
                     span: sp(),
                 }),
+                mutable: false,
                 let_in: true,
                 span: sp(),
             }),
@@ -1241,6 +1242,7 @@ mod tests {
                     value: Box::new(int(5)),
                     span: sp(),
                 }),
+                mutable: false,
                 let_in: true,
                 span: sp(),
             }),
@@ -1321,6 +1323,7 @@ mod tests {
                 args: vec![var("shared")],
                 span: sp(),
             }),
+            mutable: false,
             let_in: true,
             span: sp(),
         }];
