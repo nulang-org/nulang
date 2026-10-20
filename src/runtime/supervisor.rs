@@ -813,6 +813,28 @@ mod tests {
     }
 
     #[test]
+    fn test_supervisor_restart_intensity_window_expires() {
+        let mut sup = Supervisor::new(1, "limits", RestartStrategy::OneForOne);
+        sup.set_restart_intensity(1, 60).unwrap();
+        let now = Instant::now();
+        sup.global_restart_history
+            .push(now - Duration::from_secs(61));
+        assert!(!sup.restart_intensity_exhausted(now));
+
+        sup.global_restart_history.push(now);
+        assert!(sup.restart_intensity_exhausted(now));
+    }
+
+    #[test]
+    fn test_supervisor_restart_intensity_rejects_zero_period() {
+        let mut sup = Supervisor::new(1, "limits", RestartStrategy::OneForOne);
+        assert!(sup.set_restart_intensity(1, 0).is_err());
+        assert_eq!(sup.restart_window_secs, 60);
+        assert!(sup.set_restart_intensity(0, 30).is_ok());
+        assert!(sup.restart_intensity_exhausted(Instant::now()));
+    }
+
+    #[test]
     fn test_supervisor_handle_exit_unknown() {
         let mut sup = Supervisor::new(1, "test_sup", RestartStrategy::OneForOne);
         let mut rt = Runtime::new();
