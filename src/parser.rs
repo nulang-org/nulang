@@ -3338,6 +3338,14 @@ impl Parser {
                     TokenKind::Ident(name) => {
                         let name = name.clone();
                         self.advance();
+                        if self.consume_if(&TokenKind::DoubleColon) {
+                            let symbol = self.expect_ident("qualified symbol")?;
+                            return Ok(Expr::QualifiedVar {
+                                alias: name,
+                                name: symbol,
+                                span,
+                            });
+                        }
                         // Check for assignment
                         if self.consume_if(&TokenKind::Assign) {
                             let val = self.parse_expr()?;
@@ -3354,6 +3362,14 @@ impl Parser {
                     TokenKind::UpperIdent(name) => {
                         let name = name.clone();
                         self.advance();
+                        if self.consume_if(&TokenKind::DoubleColon) {
+                            let symbol = self.expect_ident("qualified symbol")?;
+                            return Ok(Expr::QualifiedVar {
+                                alias: name,
+                                name: symbol,
+                                span,
+                            });
+                        }
                         Ok(Expr::Var(name, span))
                     }
 
