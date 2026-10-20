@@ -11,7 +11,7 @@
   item 5 non-breaking phase).  `LLM` is deprecated but still listed for
   backward compatibility.
 
-  Theorem `effect_safety` stated; proof open.
+  A scoped effect safety theorem is proved below; full expression soundness remains open.
 -/
 
 import types
@@ -148,30 +148,9 @@ def dispatch (handlers : List Handler) (eff : EffectLabel) : DispatchResult :=
   if handlers.any (·.label == eff) then .handled else .unhandled
 
 -- ------------------------------------------------------------------
--- Soundness theorem (open proof)
--- ------------------------------------------------------------------
-
-/--
-  **Theorem: Effect Safety**
-  If `Δ ⊢ e : τ ! r` and `r` is closed (no regions) and `r` has
-  no unhandled effects, then the computation `e` cannot perform
-  an unhandled effect at runtime.
-
-  Formally: for all closed `r`, if dispatch returns `.handled` for
-  every label in `r`, then the computation is safe.
-
-  Proof follows Koka's handler soundness model.  The obstacle is
-  integrating the handler stack dynamics (push/pop on `Handle`/`Unwind`)
-  which are runtime state, not purely static.
--/
-theorem effect_safety
-  (handlers : List Handler) (_r : EffectRow)
-  (_h_closed : ∀ (h : Handler), dispatch handlers h.label = .handled) :
-  True := by
-  trivial
-  -- Full proof requires modeling the operational semantics of
-  -- handler-stack push/pop, which is deferred to the combined
-  -- formalization (spec/formal/combined.lean, planned).
+-- The operational effect-safety theorem lives after HandlerStack, where
+-- the model can account for handler scope.  A row-only assertion here
+-- previously returned True and established no safety property.
 
 end EffectRow
 
@@ -338,36 +317,120 @@ def HandlerScope (hs : HandlerStack) (eff : EffectLabel) : Prop :=
   eff ∈ hs
 
 -- ==================================================================
--- STATIC EFFECT SAFETY
+-- SCOPED EFFECT EXECUTION MODEL
 -- ==================================================================
 
-/--
-  **Theorem: Static Effect Safety**
+/-
+  This deliberately small execution trace captures the control structures
+  needed to reason about dynamically scoped effect handlers: performing an
+  operation, sequencing computations, and entering/leaving a handler scope.
 
-  If a closed program `e` types with an empty effect row, then the
-  computation is pure — it performs no effects and requires no
-  handlers at runtime.
-
-  Formally: `HasTypeEff · e τ {}` implies that no effect label ever
-  needs to be on the handler stack.  The typing derivation contains
-  no `tPerform` or `tHandle` rule applications, only the pure fragment
-  (`tVar`, `tLit*`, `tUnit`, `tLambda`, `tApp`, `tLet`, `tIf`).
-
-  Proof sketch: by induction on the typing derivation `h`.
-  - Every pure rule propagates `EffectRow.empty`.
-  - `tPerform` requires a non-empty row (`singleton eff`), so it
-    cannot appear in a derivation ending in `EffectRow.empty`.
-  - `tHandle` requires `EffectRow.union (singleton eff) r` in the
-    premise, which is non-empty when the premise is `tPerform`; for
-    the row to be empty, the derivation cannot reach `tHandle`.
-  Therefore the derivation uses only pure rules.  ∎
+  It does NOT yet model closures, continuations, resumptions, handler-body
+  effects, or the complete HasTypeEff judgment.  In particular HasTypeEff
+  currently loses latent effects at function application.  Consequently
+  these theorems must not be represented as soundness of every Nulang term.
 -/
-theorem effect_safety_static
-  (e : EffExpr) (τ : Ty)
-  (_h : HasTypeEff Context.empty e τ EffectRow.empty) :
-  True := by
-  trivial
-  -- Full proof: induction on h, showing that no tPerform/tHandle
-  -- can appear when the row is EffectRow.empty.
+inductive EffectTrace where
+| done    : EffectTrace
+| perform : EffectLabel → EffectTrace
+| seq     : EffectTrace → EffectTrace → EffectTrace
+| handle  : EffectLabel → EffectTrace → EffectTrace
+deriving Repr
+
+/--
+  An effect escapes a trace when no *lexically enclosing* handler in that
+  trace intercepts it.  This describes the residual static effect set, as
+  a proposition, without trusting a concrete row-unification algorithm.
+-/
+inductive Escapes : EffectTrace → EffectLabel → Prop where
+| perform (eff : EffectLabel) :
+    Escapes (.perform eff) eff
+| seqLeft {left right eff} :
+    Escapes left eff → Escapes (.seq left right) eff
+| seqRight {left right eff} :
+    Escapes right eff → Escapes (.seq left right) eff
+| handle {handler body eff} :
+    Escapes body eff → eff ≠ handler →
+    Escapes (.handle handler body) eff
+
+/--
+  A perform reaches runtime without any matching active handler.
+  Entering a handler evaluates its body with the handler pushed; returning
+  from the body restores the caller's stack (the pop is implicit in scope).
+  Sequencing propagates a possible unhandled operation on either side.
+-/
+inductive Unhandled : HandlerStack → EffectTrace → EffectLabel → Prop where
+| perform {hs eff} :
+    eff ∉ hs → Unhandled hs (.perform eff) eff
+| seqLeft {hs left right eff} :
+    Unhandled hs left eff → Unhandled hs (.seq left right) eff
+| seqRight {hs left right eff} :
+    Unhandled hs right eff → Unhandled hs (.seq left right) eff
+| handle {hs handler body eff} :
+    Unhandled (handler :: hs) body eff →
+    Unhandled hs (.handle handler body) eff
+
+/--
+  Soundness bridge: every dynamically unhandled operation escapes the
+  lexically scoped handlers *and* is absent from the caller's handler stack.
+  Proved by induction over runtime unhandled-operation derivations.
+-/
+theorem unhandled_implies_escape {hs : HandlerStack}
+    {trace : EffectTrace} {eff : EffectLabel}
+    (h : Unhandled hs trace eff) :
+    Escapes trace eff ∧ eff ∉ hs := by
+  induction h with
+  | perform hnot =>
+      exact ⟨.perform _, hnot⟩
+  | seqLeft _ ih =>
+      exact ⟨.seqLeft ih.1, ih.2⟩
+  | seqRight _ ih =>
+      exact ⟨.seqRight ih.1, ih.2⟩
+  | handle _ ih =>
+      refine ⟨.handle ih.1 ?_, ?_⟩
+      · intro heq
+        apply ih.2
+        simp [heq]
+      · intro hmem
+        apply ih.2
+        simp [hmem]
+
+/--
+  Scoped handler safety: if every statically escaping effect is covered by
+  the incoming handler stack, no operation can be unhandled at runtime.
+-/
+theorem effect_safety (hs : HandlerStack) (trace : EffectTrace)
+    (hcovered : ∀ eff, Escapes trace eff → eff ∈ hs) :
+    ∀ eff, ¬ Unhandled hs trace eff := by
+  intro eff hbad
+  have ⟨hescapes, hmissing⟩ := unhandled_implies_escape hbad
+  exact hmissing (hcovered eff hescapes)
+
+/--
+  Empty residual-effect safety: a trace with no escaping operations needs
+  no external handler.  Internal performed operations may still exist, but
+  each must be handled by its own lexical scope.
+-/
+theorem effect_safety_static (trace : EffectTrace)
+    (hclosed : ∀ eff, ¬ Escapes trace eff) :
+    ∀ eff, ¬ Unhandled HandlerStack.empty trace eff := by
+  intro eff hbad
+  exact hclosed eff (unhandled_implies_escape hbad).1
+
+-- Regression witnesses: the property is not True by construction.
+-- An unhandled perform is reachable, while a locally handled perform is not.
+example : Unhandled HandlerStack.empty (.perform .IO) .IO :=
+  .perform (by simp [HandlerStack.empty])
+
+example : Escapes (.perform .IO) .IO := .perform .IO
+
+example : ¬ Unhandled HandlerStack.empty (.handle .IO (.perform .IO)) .IO := by
+  have hclosed : ∀ eff, ¬ Escapes (.handle .IO (.perform .IO)) eff := by
+    intro eff h
+    cases h with
+    | handle inner hneq =>
+        cases inner
+        exact hneq rfl
+  exact effect_safety_static _ hclosed .IO
 
 end Nulang
