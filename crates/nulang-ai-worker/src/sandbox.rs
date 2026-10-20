@@ -44,6 +44,12 @@ impl SandboxConfig {
         if !workspace.is_dir() {
             return Err("workspace must be a directory".into());
         }
+        // Docker --mount uses comma-separated key=value fields. Reject paths
+        // that could be reinterpreted as additional mount options.
+        let mount_source = workspace.to_str().ok_or("workspace must be UTF-8")?;
+        if mount_source.contains([',', '\n', '\r']) {
+            return Err("workspace contains unsafe Docker mount delimiters".into());
+        }
         let image = image.into();
         let Some((name, digest)) = image.rsplit_once("@sha256:") else {
             return Err("OCI image must be pinned with @sha256:<64 hex digits>".into());
