@@ -961,8 +961,9 @@ impl Actor {
     /// Observe Values kept by actor-owned state, event records, registered
     /// query handlers, and a suspended workflow's execution frames.
     ///
-    /// This deliberately does not scan mailboxes, native/runtime roots,
-    /// active shared-VM frames or in-flight deliveries. It must NOT be
+    /// This scans scheduler-owned mailbox buffers but NOT their concurrent
+    /// queues; native/runtime roots, active shared-VM frames and in-flight
+    /// deliveries are also outside this partial view. It must NOT be
     /// interpreted as a complete root set for reclaiming local cycles.
     /// The caller must check heap provenance before treating a Value as a
     /// pointer into this actor's heap.
@@ -981,6 +982,7 @@ impl Actor {
         if let Some(suspended) = &self.suspended_execution {
             suspended.vm_state.visit_execution_values(visit);
         }
+        self.mailbox.visit_scheduler_owned_values(visit);
     }
 }
 
