@@ -101,3 +101,17 @@ fn standalone_module_and_test_generators_use_the_same_conventions() {
     assert!(generate(package.root(), "module", "invoice").is_err());
     assert!(generate(package.root(), "test", "invoice").is_err());
 }
+
+#[cfg(unix)]
+#[test]
+fn refuses_to_generate_through_symlinked_source_directories() {
+    use std::os::unix::fs::symlink;
+
+    let package = PackageFixture::new("symlink");
+    let outside = PackageFixture::new("outside");
+    symlink(outside.root(), package.root().join("src")).unwrap();
+
+    let err = generate(package.root(), "module", "customer").unwrap_err();
+    assert!(err.to_string().contains("symlink"));
+    assert!(!outside.root().join("customer.nula").exists());
+}
