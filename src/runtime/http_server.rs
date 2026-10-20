@@ -1363,6 +1363,54 @@ mod tests {
         assert!(!String::from_utf8_lossy(&unsupported.body).contains("secret"));
     }
 
+    #[test]
+    fn explicit_no_content_status_requires_an_empty_text_body() {
+        let context = RequestContext {
+            request: HttpRequest {
+                method: HttpMethod::Get,
+                path: "/test".into(),
+                headers: vec![],
+                body: vec![],
+            },
+            params: HashMap::new(),
+        };
+        with_request_context(context.clone(), || {
+            assert!(register_explicit_http_response(204, "", false));
+        });
+        let no_content = take_explicit_http_response().unwrap().unwrap();
+        assert_eq!(no_content.status, 204);
+        assert!(no_content.headers.is_empty());
+        assert!(no_content.body.is_empty());
+
+        with_request_context(context.clone(), || {
+            assert!(register_explicit_http_response(204, "forbidden body", false));
+        });
+        assert!(take_explicit_http_response().unwrap().is_err());
+
+        with_request_context(context, || {
+            assert!(register_explicit_http_response(204, "null", true));
+        });
+        assert!(take_explicit_http_response().unwrap().is_err());
+    }
+
+    #[test]
+    fn multiple_explicit_response_calls_fail_closed() {
+        let context = RequestContext {
+            request: HttpRequest {
+                method: HttpMethod::Get,
+                path: "/test".into(),
+                headers: vec![],
+                body: vec![],
+            },
+            params: HashMap::new(),
+        };
+        with_request_context(context, || {
+            assert!(register_explicit_http_response(200, "first", false));
+            assert!(register_explicit_http_response(200, "second", false));
+        });
+        assert!(take_explicit_http_response().unwrap().is_err());
+    }
+
     // A deterministic reader forces TCP-like fragmentation without sleeps.
     struct FixedChunkReader<'a> {
         remaining: &'a [u8],
