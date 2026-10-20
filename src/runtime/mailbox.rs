@@ -167,8 +167,9 @@ enum MatchLane {
 struct ReceiveLaneIndex {
     positions: FxHashMap<u16, Vec<usize>>,
     cursors: FxHashMap<u16, usize>,
-    /// Lazy correlation index for messages whose FIRST argument is an Int.
-    correlated_positions: FxHashMap<(u16, i64), Vec<usize>>,
+    /// Allocated only if the caller actually performs a reference-keyed
+    /// receive, so ordinary selective receive keeps its previous memory cost.
+    correlated_positions: Option<FxHashMap<(u16, i64), Vec<usize>>>,
     correlated_cursors: FxHashMap<(u16, i64), usize>,
     valid: bool,
 }
@@ -178,7 +179,7 @@ impl ReceiveLaneIndex {
         Self {
             positions: FxHashMap::default(),
             cursors: FxHashMap::default(),
-            correlated_positions: FxHashMap::default(),
+            correlated_positions: None,
             correlated_cursors: FxHashMap::default(),
             valid: true,
         }
@@ -188,11 +189,10 @@ impl ReceiveLaneIndex {
     fn append(&mut self, behavior_id: u16, index: usize, first_int: Option<i64>) {
         if self.valid {
             self.positions.entry(behavior_id).or_default().push(index);
-            if let Some(reference) = first_int {
-                self.correlated_positions
-                    .entry((behavior_id, reference))
-                    .or_default()
-                    .push(index);
+            if let (Some(reference), Some(positions)) =
+                (first_int, self.correlated_positions.as_mut())
+            {
+                positions.entry((behavior_id, reference)).or_default().push(index);
             }
         }
     }
@@ -200,7 +200,9 @@ impl ReceiveLaneIndex {
     fn invalidate(&mut self) {
         self.positions.clear();
         self.cursors.clear();
-        self.correlated_positions.clear();
+        if let Some(positions) = self.correlated_positions.as_mut() {
+            positions.clear();
+        }
         self.correlated_cursors.clear();
         self.valid = false;
     }
@@ -215,11 +217,16 @@ impl ReceiveLaneIndex {
             return;
         }
         self.positions.clear();
-        self.correlated_positions.clear();
+        if let Some(positions) = self.correlated_positions.as_mut() {
+            positions.clear();
+        }
         for (idx, (msg, _)) in buffer.iter().enumerate() {
             self.positions.entry(msg.behavior_id).or_default().push(idx);
-            if let Some(reference) = msg.payload.first().and_then(Value::as_int) {
-                self.correlated_positions
+            if let (Some(reference), Some(positions)) = (
+                msg.payload.first().and_then(Value::as_int),
+                self.correlated_positions.as_mut(),
+            ) {
+                positions
                     .entry((msg.behavior_id, reference))
                     .or_default()
                     .push(idx);
@@ -239,8 +246,20 @@ impl ReceiveLaneIndex {
         reference: i64,
     ) -> Option<usize> {
         self.ensure(buffer);
+        if self.correlated_positions.is_none() {
+            let mut positions: FxHashMap<(u16, i64), Vec<usize>> = FxHashMap::default();
+            for (idx, (message, _)) in buffer.iter().enumerate() {
+                if let Some(first_int) = message.payload.first().and_then(Value::as_int) {
+                    positions
+                        .entry((message.behavior_id, first_int))
+                        .or_default()
+                        .push(idx);
+                }
+            }
+            self.correlated_positions = Some(positions);
+        }
         let key = (behavior_id, reference);
-        let positions = self.correlated_positions.get(&key)?;
+        let positions = self.correlated_positions.as_ref()?.get(&key)?;
         let cursor = self.correlated_cursors.entry(key).or_insert(0);
         while *cursor < positions.len() {
             let idx = positions[*cursor];
