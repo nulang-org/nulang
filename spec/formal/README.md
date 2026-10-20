@@ -33,7 +33,7 @@ Two layers are formalized:
 | `capabilities.lean` | Capability lattice laws, `cap_sendable`, `discharge_sendable` | Proved (`linear_at_most_once` open) |
 | `effects.lean` | Effect rows; scoped `EffectTrace`/`Escapes`/`Unhandled` operational model | Scoped handler-safety proved; full expression soundness open |
 | `trace_effect_rows.lean` | Compositional static residual-effect predicate + exactness bridge to `Escapes` | Static/dynamic correspondence (scoped trace only) |
-| `effect_typing_counterexamples.lean` | Concrete type derivations exhibiting latent-function and handler-body effect gaps | Soundness counterexamples; must be inverted when typing rules are corrected |
+| `effect_typing_counterexamples.lean` | Derived `IO`/`Net` effects for former empty-row counterexamples | Positive effect-aware regression witnesses; non-derivability still to prove |
 
 ## Theorems
 
@@ -99,20 +99,28 @@ with incoming handlers prevents an unhandled operation. Regression examples
 check label subtraction, preservation of unrelated effects, and an unhandled
 operation outside the matching handler.
 
-Two compiled Lean examples in `effect_typing_counterexamples.lean` demonstrate
-that the **existing** `HasTypeEff` judgment permits empty effect rows for:
-(1) invoking a lambda whose body performs `IO`, and (2) an `IO` handler
-whose unchecked body performs `Net`. These examples are intentionally
-*positive* derivations of an unsound judgment, not tests that the language
-already rejects the programs. A sound redesign must replace them with
-non-derivability checks while adding latent function effects and typing
-handler bodies.
+### Effect-aware function and handler typing (restricted formal core)
+
+The formal `HasTypeEff` judgment now uses an `EffTy` function constructor
+whose arrow carries a latent `EffectRow`, and an `EffContext` that retains
+these latent rows for variable lookup and let bindings. A lambda remains pure
+at creation; `tApp` combines function evaluation, argument evaluation, and
+the latent arrow effects. `tHandle` now requires typing both the handled
+body and handler body, and only subtracts the handled label from the former.
+
+The two examples in `effect_typing_counterexamples.lean` now construct
+`IO`- and `Net`-bearing typing derivations for the same examples previously
+accepted with an empty row. **This is not yet a machine-checked proof of
+non-derivability of the empty-row judgments.** It is also not a complete
+formalization of Nulang's polymorphic type system. The formal core currently
+uses monomorphic contexts; higher-order type annotations, open-row
+unification, continuation resumptions, and preservation under reduction
+are still not modeled or proved.
 
 This is a static/dynamic correspondence proof for the **trace fragment**.
 It is not a proof that the production `EffectRow.union` implementation,
-`HasTypeEff` typing rules, or compiler inference are sound. That connection,
-particularly latent function effects and handler-body typing, remains a
-separate required validation.
+`HasTypeEff` typing rules, or production compiler inference are sound.
+Full expression-level preservation and operational soundness remain open.
 
 ## Build
 
