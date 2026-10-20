@@ -537,6 +537,20 @@ impl Mailbox {
         self.queued_count.load(Ordering::Relaxed)
     }
 
+    /// Queue depth for Fabric workload placement, not a delivery guarantee.
+    ///
+    /// Bounded mailboxes use occupied Normal/Bulk credits. Unbounded mailboxes
+    /// use total logical depth as a low-cost scheduling heuristic, preserving
+    /// the fast path without an additional atomic on each application send.
+    /// Both values are snapshots; actual admission is checked by `push`.
+    pub fn routing_depth(&self) -> usize {
+        if self.capacity == 0 {
+            self.queued_count.load(Ordering::Relaxed)
+        } else {
+            self.normal_count.load(Ordering::Relaxed)
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
