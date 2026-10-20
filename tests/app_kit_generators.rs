@@ -140,7 +140,16 @@ fn generated_feature_passes_the_real_nula_package_test_runner() {
         "fn main() { perform IO.print(\"ready\") }\n",
     )
     .unwrap();
-    generate(package.root(), "feature", "customer_profile").unwrap();
+    let generated = std::process::Command::new(env!("CARGO_BIN_EXE_nulang"))
+        .args(["nula", "make", "feature", "customer_profile"])
+        .current_dir(package.root())
+        .output()
+        .expect("run nulang nula make feature");
+    assert!(
+        generated.status.success(),
+        "CLI generator failed: {}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_nulang"))
         .args(["nula", "test", "--filter", "test_customer_profile"])
