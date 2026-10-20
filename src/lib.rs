@@ -93,6 +93,7 @@ pub mod runtime;
 pub mod semantic_identity;
 pub mod semantic_schema;
 pub mod stdlib;
+pub mod stream_pull;
 #[cfg(test)]
 pub mod stress_tests;
 pub mod tool_schema;
