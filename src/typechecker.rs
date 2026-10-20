@@ -4899,6 +4899,45 @@ mod tests {
     }
 
     #[test]
+    fn test_field_viewpoint_prevents_mutation_through_read_only_receiver() {
+        for receiver in [Capability::Box, Capability::Val] {
+            let mut tc = TypeChecker::new();
+            let ctx = ctx_with("holder", Type::Reference {
+                cap: receiver,
+                inner: Box::new(Type::Record(vec![(
+                    "value".into(),
+                    Type::Reference { cap: Capability::Ref, inner: Box::new(Type::int()) },
+                )])),
+            });
+            let assignment = Expr::Assign {
+                target: Box::new(field(var("holder"), "value")),
+                value: Box::new(int_lit(2)),
+                span: sp(),
+            };
+            assert!(
+                tc.infer_expr(&ctx, &assignment).is_err(),
+                "{receiver:?} receiver must not expose a writable reference"
+            );
+        }
+
+        // A ref receiver with a ref field retains ordinary mutable access.
+        let mut tc = TypeChecker::new();
+        let ctx = ctx_with("holder", Type::Reference {
+            cap: Capability::Ref,
+            inner: Box::new(Type::Record(vec![(
+                "value".into(),
+                Type::Reference { cap: Capability::Ref, inner: Box::new(Type::int()) },
+            )])),
+        });
+        let assignment = Expr::Assign {
+            target: Box::new(field(var("holder"), "value")),
+            value: Box::new(int_lit(2)),
+            span: sp(),
+        };
+        assert!(tc.infer_expr(&ctx, &assignment).is_ok());
+    }
+
+    #[test]
     fn test_field_viewpoint_rejects_tag_receiver_even_for_scalar_fields() {
         let mut tc = TypeChecker::new();
         let ctx = ctx_with("holder", Type::Reference {
