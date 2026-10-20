@@ -527,21 +527,41 @@ pub fn with_request_context<F, R>(ctx: RequestContext, f: F) -> R
 where
     F: FnOnce() -> R,
 {
-    // The same host thread can execute multiple injected requests. Restore its
-    // prior context on both normal completion and unwinding; otherwise a panic
-    // could expose one request's data to a later request on that thread.
-    struct RestoreRequestContext(Option<RequestContext>);
+    // Scoped requests must not leak ambient request/cookie state into later
+    // requests on the same host thread, including when handlers panic.
+    struct RestoreRequestContext {
+        previous: Option<RequestContext>,
+        previous_cookies: Vec<String>,
+    }
     impl Drop for RestoreRequestContext {
         fn drop(&mut self) {
+            let nested = self.previous.is_some();
             CURRENT_REQUEST.with(|current| {
-                *current.borrow_mut() = self.0.take();
+                *current.borrow_mut() = self.previous.take();
             });
+            if nested {
+                // Nested handler cookies belong to the nested response, not
+                // the caller's response. Restore the outer response state.
+                RESPONSE_COOKIES.with(|current| {
+                    *current.borrow_mut() = std::mem::take(&mut self.previous_cookies);
+                });
+            } else if std::thread::panicking() {
+                // Top-level response generation failed: never leave cookies
+                // queued for the next request on this reused worker thread.
+                RESPONSE_COOKIES.with(|current| current.borrow_mut().clear());
+            }
+            // Successful top-level requests deliberately retain their pending
+            // cookies for take_response_cookies() at the dispatch boundary.
         }
     }
 
     let previous = CURRENT_REQUEST.with(|current| current.replace(Some(ctx)));
-    let _restore = RestoreRequestContext(previous);
-    RESPONSE_COOKIES.with(|current| current.borrow_mut().clear());
+    let previous_cookies =
+        RESPONSE_COOKIES.with(|current| std::mem::take(&mut *current.borrow_mut()));
+    let _restore = RestoreRequestContext {
+        previous,
+        previous_cookies,
+    };
     f()
 }
 
