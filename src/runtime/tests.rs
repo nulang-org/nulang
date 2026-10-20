@@ -8819,7 +8819,7 @@ fn orca_diagnostic_root_audit_includes_actor_mailbox_and_pending_fetch_values() 
     );
 
     let mut observed = runtime
-        .orca_diagnostic_roots_at_quiescence(id)
+        .orca_diagnostic_roots_if_not_executing(id)
         .expect("quiescent unsharded snapshot");
     observed.sort_by_key(|value| value.as_int().unwrap_or(i64::MIN));
     assert_eq!(
@@ -8843,40 +8843,40 @@ fn orca_diagnostic_root_audit_fails_closed_around_execution_and_wakes() {
 
     runtime.vm_execution_depth = 1;
     assert!(matches!(
-        runtime.orca_diagnostic_roots_at_quiescence(id),
+        runtime.orca_diagnostic_roots_if_not_executing(id),
         Err(OrcaRootAuditBlocked::VmExecuting)
     ));
     runtime.vm_execution_depth = 0;
 
     runtime.current_actor = Some(id);
     assert!(matches!(
-        runtime.orca_diagnostic_roots_at_quiescence(id),
+        runtime.orca_diagnostic_roots_if_not_executing(id),
         Err(OrcaRootAuditBlocked::ActorExecuting)
     ));
     runtime.current_actor = None;
 
     runtime.draining_receive_wakes = true;
     assert!(matches!(
-        runtime.orca_diagnostic_roots_at_quiescence(id),
+        runtime.orca_diagnostic_roots_if_not_executing(id),
         Err(OrcaRootAuditBlocked::PendingReceiveWake)
     ));
     runtime.draining_receive_wakes = false;
 
     runtime.pending_receive_wakes.push(id);
     assert!(matches!(
-        runtime.orca_diagnostic_roots_at_quiescence(id),
+        runtime.orca_diagnostic_roots_if_not_executing(id),
         Err(OrcaRootAuditBlocked::PendingReceiveWake)
     ));
     runtime.pending_receive_wakes.clear();
 
     runtime.actors.get_mut(&id).unwrap().run_state = ActorRunState::Running;
     assert!(matches!(
-        runtime.orca_diagnostic_roots_at_quiescence(id),
+        runtime.orca_diagnostic_roots_if_not_executing(id),
         Err(OrcaRootAuditBlocked::ActorRunning)
     ));
     runtime.actors.get_mut(&id).unwrap().run_state = ActorRunState::Idle;
 
-    assert!(runtime.orca_diagnostic_roots_at_quiescence(id).is_ok());
+    assert!(runtime.orca_diagnostic_roots_if_not_executing(id).is_ok());
 }
 
 #[test]
@@ -8884,14 +8884,14 @@ fn orca_diagnostic_root_audit_rejects_shards_and_unknown_actors() {
     let mut runtime = Runtime::new();
     let id = runtime.spawn_actor(Box::new(Vec::new));
     assert!(matches!(
-        runtime.orca_diagnostic_roots_at_quiescence(u64::MAX),
+        runtime.orca_diagnostic_roots_if_not_executing(u64::MAX),
         Err(OrcaRootAuditBlocked::UnknownActor)
     ));
 
     let (_, receiver) = std::sync::mpsc::sync_channel::<CrossShardMsg>(2);
     runtime.cross_shard_rx = Some(receiver);
     assert!(matches!(
-        runtime.orca_diagnostic_roots_at_quiescence(id),
+        runtime.orca_diagnostic_roots_if_not_executing(id),
         Err(OrcaRootAuditBlocked::CrossShardChannels)
     ));
 }
