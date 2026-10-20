@@ -309,6 +309,33 @@ mod tests {
     }
 
     #[test]
+    fn queued_document_tasks_must_belong_to_requested_index() {
+        let client = MeilisearchClient::new(
+            "https://search.example.com", "test-key", "tenant-a"
+        ).unwrap();
+        let valid: MeilisearchTask = serde_json::from_str(
+            r#"{"taskUid":41,"status":"enqueued","indexUid":"nulang_tenant-a"}"#
+        ).unwrap();
+        assert!(client.validate_task_index(valid.index_uid.as_deref()).is_ok());
+
+        let foreign: MeilisearchTask = serde_json::from_str(
+            r#"{"taskUid":42,"status":"enqueued","indexUid":"nulang_tenant-b"}"#
+        ).unwrap();
+        assert!(matches!(
+            client.validate_task_index(foreign.index_uid.as_deref()),
+            Err(MeilisearchError::NamespaceMismatch)
+        ));
+
+        let global: MeilisearchTask = serde_json::from_str(
+            r#"{"taskUid":43,"status":"enqueued","indexUid":null}"#
+        ).unwrap();
+        assert!(matches!(
+            client.validate_task_index(global.index_uid.as_deref()),
+            Err(MeilisearchError::NamespaceMismatch)
+        ));
+    }
+
+    #[test]
     fn blank_queries_are_not_sent_as_match_everything_searches() {
         let client = MeilisearchClient::new(
             "https://search.example.com", "test-key", "tenant-a"
