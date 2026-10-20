@@ -86,10 +86,16 @@ fn g_counter_laws(operations: &[CounterOp]) -> bool {
 
     // Delta equivalence requires a causal base: current = base join b.
     let base = a.clone();
+    if base.delta_since(&base).is_some() {
+        return false;
+    }
     let current = ab.clone();
-    let mut via_full = base.clone();
+    // The receiver contains the base plus unrelated concurrent updates.
+    let mut receiver = base.clone();
+    receiver.merge(&c);
+    let mut via_full = receiver.clone();
     via_full.merge(&current);
-    let mut via_delta = base.clone();
+    let mut via_delta = receiver;
     match current.delta_since(&base) {
         Some(delta) => {
             via_delta.merge(&delta);
@@ -154,10 +160,15 @@ fn pn_counter_laws(operations: &[CounterOp]) -> bool {
     }
 
     let base = a.clone();
+    if base.delta_since(&base).is_some() {
+        return false;
+    }
     let current = ab;
-    let mut full = base.clone();
+    let mut receiver = base.clone();
+    receiver.merge(&c);
+    let mut full = receiver.clone();
     full.merge(&current);
-    let mut delta_applied = base.clone();
+    let mut delta_applied = receiver;
     if let Some(delta) = current.delta_since(&base) {
         delta_applied.merge(&delta);
         let once = delta_applied.clone();
@@ -208,10 +219,15 @@ fn g_set_laws(operations: &[SetOp]) -> bool {
     }
 
     let base = a.clone();
+    if base.delta_since(&base).is_some() {
+        return false;
+    }
     let current = ab;
-    let mut full = base.clone();
+    let mut receiver = base.clone();
+    receiver.merge(&c);
+    let mut full = receiver.clone();
     full.merge(&current);
-    let mut delta_applied = base.clone();
+    let mut delta_applied = receiver;
     if let Some(delta) = current.delta_since(&base) {
         delta_applied.merge(&delta);
         let once = delta_applied.clone();
