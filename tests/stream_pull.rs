@@ -20,10 +20,12 @@ fn fold_consumes_success_values_in_order() {
 fn fold_stops_on_first_error_without_reading_later_records() {
     let count = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&count);
-    let source = [Ok(2), Err("broken"), Ok(100)].into_iter().map(move |result| {
-        observed.fetch_add(1, Ordering::SeqCst);
-        result
-    });
+    let source = [Ok(2), Err("broken"), Ok(100)]
+        .into_iter()
+        .map(move |result| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            result
+        });
     let result = PullStream::new(source).try_fold_ok(0, |total, item| total + item);
     assert_eq!(result.unwrap_err(), "broken");
     assert_eq!(count.load(Ordering::SeqCst), 2);
@@ -76,8 +78,7 @@ fn rejects_zero_collection_limit_even_for_empty_input() {
 #[test]
 fn source_errors_are_not_swallowed_by_filtering() {
     let source = [Ok(1), Err("failed"), Ok(3)];
-    let stream = PullStream::new(source.into_iter())
-        .filter_ok(|value| *value > 10);
+    let stream = PullStream::new(source.into_iter()).filter_ok(|value| *value > 10);
     assert!(matches!(
         stream.try_collect_bounded(8),
         Err(StreamFailure::Source("failed"))
@@ -112,7 +113,10 @@ fn exact_line_limit_including_newline_is_accepted() {
 #[test]
 fn rejects_invalid_utf8_without_resuming() {
     let mut lines = BoundedLines::new(Cursor::new(vec![0xff, b'\n']), 16).unwrap();
-    assert_eq!(lines.next().unwrap().unwrap_err().kind(), ErrorKind::InvalidData);
+    assert_eq!(
+        lines.next().unwrap().unwrap_err().kind(),
+        ErrorKind::InvalidData
+    );
     assert!(lines.next().is_none());
 }
 
@@ -130,7 +134,10 @@ fn bounded_lines_are_pulled_one_record_at_a_time() {
         observed.fetch_add(1, Ordering::SeqCst);
         Ok::<_, &'static str>(format!("line{n}"))
     });
-    let collected = PullStream::new(data).take(2).try_collect_bounded(2).unwrap();
+    let collected = PullStream::new(data)
+        .take(2)
+        .try_collect_bounded(2)
+        .unwrap();
     assert_eq!(collected, ["line0", "line1"]);
     assert_eq!(reads.load(Ordering::SeqCst), 2);
 }
