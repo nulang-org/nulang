@@ -710,7 +710,10 @@ fn test_supervisor_global_restart_intensity_catches_alternating_crashes() {
         !rt.supervisors.contains_key(&sup_id),
         "the third crash must terminate the supervisor after two aggregate restarts"
     );
-    assert!(!rt.actors.contains_key(&b2), "remaining children must be shut down");
+    assert!(
+        !rt.actors.contains_key(&b2),
+        "remaining children must be shut down"
+    );
 }
 
 /// The shutdown protocol must stop later-started dependencies first and
