@@ -847,7 +847,11 @@ impl Runtime {
                     let owner_shard = (*actor_id % shard_count as u64) as u16;
                     if owner_shard == shard_idx {
                         let actor = actors.get(actor_id)?;
-                        let depth = actor.mailbox.len();
+                        // Only occupied Normal/Bulk credits count toward a
+                        // bounded actor's application capacity. Supervisor
+                        // messages bypass that capacity and must not exclude
+                        // an otherwise eligible consumer-group worker.
+                        let depth = actor.mailbox.routing_depth();
                         let capacity = actor.mailbox.capacity();
                         if capacity > 0 && depth >= capacity {
                             return None;
