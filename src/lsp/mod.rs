@@ -65,9 +65,12 @@ fn edit_position_to_byte_offset(source: &str, position: Position) -> Option<usiz
     let mut line_offset = 0usize;
     for (line_index, line) in source.split('\n').enumerate() {
         if line_index == position.line as usize {
+            // LSP character offsets exclude the line terminator. For CRLF,
+            // the CR belongs to the terminator, not to the logical line.
+            let logical_line = line.strip_suffix('\r').unwrap_or(line);
             let target = position.character as usize;
             let mut utf16_col = 0usize;
-            for (byte_offset, ch) in line.char_indices() {
+            for (byte_offset, ch) in logical_line.char_indices() {
                 if utf16_col == target {
                     return Some(line_offset + byte_offset);
                 }
@@ -76,7 +79,7 @@ fn edit_position_to_byte_offset(source: &str, position: Position) -> Option<usiz
                     return None;
                 }
             }
-            return (utf16_col == target).then_some(line_offset + line.len());
+            return (utf16_col == target).then_some(line_offset + logical_line.len());
         }
         line_offset += line.len() + 1;
     }
