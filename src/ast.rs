@@ -71,6 +71,14 @@ pub enum Expr {
     FString(Vec<Expr>, Span),
     /// Variable reference
     Var(String, Span),
+    /// Unresolved lexical module reference: `alias::symbol`.
+    /// Never lower this as an ordinary variable or serialize the local alias
+    /// into a runtime identity. Semantic resolution must bind it first.
+    QualifiedVar {
+        alias: String,
+        name: String,
+        span: Span,
+    },
     /// Lambda: fn(x: T) -> e
     Lambda {
         params: Vec<Param>,
@@ -1113,6 +1121,7 @@ impl Expr {
             Expr::Literal(_, s) => *s,
             Expr::FString(_, s) => *s,
             Expr::Var(_, s) => *s,
+            Expr::QualifiedVar { span, .. } => *span,
             Expr::Lambda { span, .. } => *span,
             Expr::App { span, .. } => *span,
             Expr::Let { span, .. } => *span,

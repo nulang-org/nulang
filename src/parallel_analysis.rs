@@ -169,6 +169,10 @@ fn summarize_expr(expr: &Expr, bound: &HashSet<String>, out: &mut ParallelBranch
                 out.reads.insert(name.clone());
             }
         }
+        Expr::QualifiedVar { alias, name, .. } => {
+            // Treat unresolved module reads as externally scoped names.
+            out.reads.insert(format!("{}::{}", alias, name));
+        }
         Expr::Lambda { .. } => {
             // Creating a closure does not execute its body. Reference-capability
             // checking governs whether captured values may later cross a task

@@ -281,6 +281,7 @@ impl<'a> MigrationPurityChecker<'a> {
             }
             Expr::Literal(..)
             | Expr::Var(..)
+            | Expr::QualifiedVar { .. }
             | Expr::SelfRef(..)
             | Expr::Return(None, _)
             | Expr::Break(None, _)

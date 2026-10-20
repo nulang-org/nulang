@@ -1287,6 +1287,14 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
             }
             hir::Operand::Var(name.clone(), Type::unit())
         }
+        Expr::QualifiedVar { alias, name, .. } => {
+            // This lowering API is infallible; fail explicitly instead of
+            // emitting a wrong unqualified runtime variable.
+            panic!(
+                "unresolved qualified reference '{}::{}' reached HIR lowering",
+                alias, name
+            )
+        }
         Expr::SelfRef(_) => hir::Operand::Var("self".to_string(), Type::unit()),
         Expr::CapAnnotate { expr, .. } => lower_expr(expr, body),
         Expr::Lambda {

@@ -3338,6 +3338,14 @@ impl Parser {
                     TokenKind::Ident(name) => {
                         let name = name.clone();
                         self.advance();
+                        if self.consume_if(&TokenKind::DoubleColon) {
+                            let symbol = self.expect_ident("qualified symbol")?;
+                            return Ok(Expr::QualifiedVar {
+                                alias: name,
+                                name: symbol,
+                                span,
+                            });
+                        }
                         // Check for assignment
                         if self.consume_if(&TokenKind::Assign) {
                             let val = self.parse_expr()?;
@@ -3354,6 +3362,14 @@ impl Parser {
                     TokenKind::UpperIdent(name) => {
                         let name = name.clone();
                         self.advance();
+                        if self.consume_if(&TokenKind::DoubleColon) {
+                            let symbol = self.expect_ident("qualified symbol")?;
+                            return Ok(Expr::QualifiedVar {
+                                alias: name,
+                                name: symbol,
+                                span,
+                            });
+                        }
                         Ok(Expr::Var(name, span))
                     }
 
@@ -7270,6 +7286,41 @@ mod tests {
             Decl::Import { alias, .. } => assert!(alias.is_none()),
             other => panic!("expected import, found {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_qualified_function_reference_as_distinct_expression() {
+        let ast = parse("fn call() = codec::encode(1)").unwrap();
+        let Decl::Function { body, .. } = &ast.decls[0] else {
+            panic!("expected function");
+        };
+        let Expr::App { func, .. } = body else {
+            panic!("expected call expression, got {body:?}");
+        };
+        assert!(matches!(
+            func.as_ref(),
+            Expr::QualifiedVar { alias, name, .. }
+                if alias == "codec" && name == "encode"
+        ));
+    }
+
+    #[test]
+    fn parses_uppercase_qualified_reference_without_name_flattening() {
+        let ast = parse("fn call() = IDs::Token").unwrap();
+        let Decl::Function { body, .. } = &ast.decls[0] else {
+            panic!("expected function");
+        };
+        assert!(matches!(
+            body,
+            Expr::QualifiedVar { alias, name, .. }
+                if alias == "IDs" && name == "Token"
+        ));
+    }
+
+    #[test]
+    fn missing_qualified_symbol_has_explicit_error() {
+        let err = parse("fn call() = codec::").unwrap_err();
+        assert!(format!("{err}").contains("qualified symbol"), "{err}");
     }
 
     #[test]

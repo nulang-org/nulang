@@ -517,6 +517,10 @@ fn annotate_expr(
 ) -> NuResult<()> {
     match expr {
         Expr::Literal(..) | Expr::Var(..) | Expr::SelfRef(..) | Expr::Panic(..) => Ok(()),
+        Expr::QualifiedVar { alias, name, span } => Err(crate::types::NuError::parse_error(
+            format!("unresolved qualified reference '{}::{}'", alias, name),
+            *span,
+        )),
         Expr::FString(parts, _) | Expr::Tuple(parts, _) | Expr::Array(parts, _) => {
             for part in parts {
                 annotate_expr(part, env, protocols)?;

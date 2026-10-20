@@ -656,6 +656,11 @@ fn fmt_expr(out: &mut String, expr: &Expr, indent: usize, had_unhandled: &mut bo
             Literal::Unit => out.push_str("unit"),
         },
         Expr::Var(name, _) => out.push_str(name),
+        Expr::QualifiedVar { alias, name, .. } => {
+            out.push_str(alias);
+            out.push_str("::");
+            out.push_str(name);
+        },
         Expr::SelfRef(_) => out.push_str("self"),
         Expr::Let {
             name, value, body, ..
@@ -1257,6 +1262,14 @@ mod tests {
         let src = "import stdlib::list as lists";
         let formatted = format_source(src).expect("alias import format");
         assert_eq!(formatted, "import stdlib::list as lists\n");
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn test_fmt_qualified_reference_round_trip() {
+        let src = "fn encode() = codec::run(1)";
+        let formatted = format_source(src).expect("qualified reference formatting");
+        assert!(formatted.contains("codec::run(1)"), "{formatted}");
         assert_idempotent(src);
     }
 

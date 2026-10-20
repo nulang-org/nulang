@@ -17,7 +17,21 @@ import stdlib::set as set
 let filtered = list::filter(numbers, is_positive)
 ```
 
-The `import ... as ...` declarations above now parse as AST and round-trip through the formatter, but are **deliberately rejected during semantic resolution**. The `alias::function` expression still requires future parser/name-lookup work. Existing `import stdlib::list` remains a legacy unqualified import for Nulang 1.x. Do not silently change its meaning without a versioned migration.
+The `import ... as ...` declarations above now parse as AST and round-trip through the formatter, but are **deliberately rejected during semantic resolution**. The `alias::function` expression is now represented by an explicit unresolved AST node, but name lookup and executable compilation are still unavailable. Existing `import stdlib::list` remains a legacy unqualified import for Nulang 1.x. Do not silently change its meaning without a versioned migration.
+
+## Qualified reference AST preflight
+
+`alias::symbol` now has its own `Expr::QualifiedVar { alias, name, span }`
+representation, separate from unqualified `Expr::Var`. The parser and
+formatter preserve both segments, and typechecking and capability/effect
+analysis reject unresolved references with an explicit diagnostic.
+HIR lowering has a defensive invariant against treating unresolved
+qualified names as runtime variable strings. AST visitors classify the
+new expression as a leaf without pretending it is a local capture.
+
+**Qualified imports remain non-executable.** This source syntax is preserved
+for the future symbol-binding pass; it is not an indication that alias
+lookups, nested reexports, or cross-backend execution are supported.
 
 ## Resolver symbol-index foundation
 
