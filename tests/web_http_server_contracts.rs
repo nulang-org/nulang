@@ -86,6 +86,20 @@ fn legacy_route() -> WebRoute {
     }
 }
 
+
+// A redirect is an HTTP response, not an HTML meta-refresh. Keep these as
+// network-level tests so we verify the status and headers written to the wire.
+fn redirect_route(method: HttpMethod, target: &str) -> WebRoute {
+    let source = format!("fn bounce() {{ perform Web.redirect({target:?}) }}");
+    let (module, function_index) = compile_handler(&source, "bounce");
+    WebRoute {
+        method,
+        path: "/redirect".to_string(),
+        handler_module: module,
+        handler_func_idx: function_index,
+    }
+}
+
 fn send_raw_request(port: u16, request: &str) -> String {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to WebDevServer");
     stream
@@ -164,4 +178,69 @@ fn legacy_route_still_falls_back_over_real_http() {
 
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
     assert!(response_body(&response).starts_with("legacy"), "{response}");
+}
+
+
+#[test]
+fn web_redirect_returns_real_http_location_for_get() {
+    let server = WebDevServer::bind(
+        0,
+        None,
+        None,
+        vec![redirect_route(HttpMethod::Get, "/dashboard?tab=recent")],
+    )
+    .expect("bind redirect route");
+
+    let response = send_raw_request(
+        server.port,
+        "GET /redirect HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+
+    assert!(response.starts_with("HTTP/1.1 302 Found\r\n"), "{response}");
+    assert!(response.contains("Location: /dashboard?tab=recent\r\n"), "{response}");
+    assert_eq!(response_body(&response), "");
+}
+
+#[test]
+fn web_redirect_after_post_uses_see_other() {
+    let server = WebDevServer::bind(
+        0,
+        None,
+        None,
+        vec![redirect_route(HttpMethod::Post, "/complete")],
+    )
+    .expect("bind redirect route");
+
+    let response = send_raw_request(
+        server.port,
+        "POST /redirect HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
+
+    assert!(response.starts_with("HTTP/1.1 303 See Other\r\n"), "{response}");
+    assert!(response.contains("Location: /complete\r\n"), "{response}");
+}
+
+#[test]
+fn web_redirect_rejects_external_and_header_injection_targets() {
+    for unsafe_target in ["//outside.example/login", "https://outside.example/", "/safe\r\nX-Injected: yes"] {
+        let server = WebDevServer::bind(
+            0,
+            None,
+            None,
+            vec![redirect_route(HttpMethod::Get, unsafe_target)],
+        )
+        .expect("bind redirect route");
+
+        let response = send_raw_request(
+            server.port,
+            "GET /redirect HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+            "target {unsafe_target:?}: {response}"
+        );
+        assert!(!response.contains("Location:"), "{response}");
+        assert!(!response.contains("X-Injected:"), "{response}");
+    }
 }
