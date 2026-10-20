@@ -4960,6 +4960,26 @@ mod tests {
     }
 
     #[test]
+    fn test_satisfies_retains_concrete_actor_protocol_type() {
+        // A contract check against ActorRef[P] must not attenuate the value
+        // into ActorRef[P]: the concrete actor type remains available.
+        let concrete = Type::Actor {
+            state: Box::new(Type::unit()),
+            behavior: Box::new(Type::Record(vec![])),
+        };
+        let ctx = ctx_with("worker", concrete.clone());
+        let expr = Expr::TypeAnnotate {
+            expr: Box::new(var("worker")),
+            ty: Type::actor_ref(Type::Record(vec![])),
+            preserve_inferred: true,
+            span: sp(),
+        };
+        let mut checker = TypeChecker::new();
+        let (subst, inferred) = checker.infer_expr(&ctx, &expr).unwrap();
+        assert_eq!(apply_subst(&inferred, &subst), concrete);
+    }
+
+    #[test]
     fn test_satisfies_rejects_non_assignable_contract() {
         let mut checker = TypeChecker::new();
         let ctx = TypeContext::new();
