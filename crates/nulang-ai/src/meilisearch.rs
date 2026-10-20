@@ -179,18 +179,30 @@ impl MeilisearchClient {
         Ok(task)
     }
 
-    /// Returns hits from the configured namespace only.
-    pub async fn search(&self, query: &SearchQuery)
-        -> Result<Vec<OwnedSearchHit>, MeilisearchError>
+    fn search_body(&self, query: &SearchQuery)
+        -> Result<Option<serde_json::Value>, MeilisearchError>
     {
-        if self.is_empty_query(query)? { return Ok(Vec::new()); }
+        if self.is_empty_query(query)? { return Ok(None); }
         let filters = filter_predicates(&query.filters)?;
+        // Search only the indexed text; IDs, tenant identifiers and facets are
+        // metadata, not additional lexical matches.
         let mut body = json!({
             "q": query.text,
+            "attributesToSearchOn": ["text"],
             "limit": query.limit.min(MAX_REMOTE_RESULTS),
             "showRankingScore": true
         });
         if !filters.is_empty() { body["filter"] = json!(filters); }
+        Ok(Some(body))
+    }
+
+    /// Returns hits from the configured namespace only.
+    pub async fn search(&self, query: &SearchQuery)
+        -> Result<Vec<OwnedSearchHit>, MeilisearchError>
+    {
+        let Some(body) = self.search_body(query)? else {
+            return Ok(Vec::new());
+        };
         let url = self.endpoint(&["indexes", &self.index_uid, "search"]);
         let response: MeilisearchSearchResponse =
             self.response(self.client.post(url).json(&body)).await?;
