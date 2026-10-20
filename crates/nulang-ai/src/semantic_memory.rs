@@ -507,4 +507,46 @@ mod tests {
         assert_eq!(restored.search_checked("database", 1).unwrap()[0].0.content, "database");
     }
 
+    #[test]
+    fn checked_search_rejects_wrong_embedding_dimensions() {
+        fn bad_provider(_: &str) -> Vec<f32> { vec![1.0] }
+        let mut memory = SemanticMemory::new(2, Some(bad_provider));
+        memory.store("sample", HashMap::new());
+        assert_eq!(
+            memory.search_checked("sample", 1).unwrap_err(),
+            SemanticMemoryError::EmbeddingDimensionMismatch {
+                expected: 2,
+                actual: 1,
+            }
+        );
+        assert!(memory.search("sample", 1).is_empty());
+    }
+
+    #[test]
+    fn checked_search_rejects_corrupted_cached_embedding_dimensions() {
+        let mut memory = SemanticMemory::new(2, None);
+        memory.store("sample", HashMap::new());
+        let mut value = serde_json::to_value(&memory).unwrap();
+        value["embeddings"][0] = serde_json::json!([1.0]);
+        let memory: SemanticMemory = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            memory.search_checked("sample", 1).unwrap_err(),
+            SemanticMemoryError::EmbeddingDimensionMismatch {
+                expected: 2,
+                actual: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn checked_search_rejects_nonfinite_custom_embeddings() {
+        fn nonfinite(_: &str) -> Vec<f32> { vec![f32::NAN, 0.0] }
+        let mut memory = SemanticMemory::new(2, Some(nonfinite));
+        memory.store("sample", HashMap::new());
+        assert_eq!(
+            memory.search_checked("sample", 1).unwrap_err(),
+            SemanticMemoryError::InvalidEmbeddingValue
+        );
+    }
+
 }
