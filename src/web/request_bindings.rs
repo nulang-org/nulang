@@ -4,7 +4,7 @@ use crate::bytecode::Constant;
 use crate::web::bindings::{RouteBindingContract, RouteBindingSource};
 use crate::web::runtime_bindings::BoundRouteArgument;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 #[derive(Debug)]
@@ -298,15 +298,31 @@ pub fn split_request_target(target: &str) -> (String, HashMap<String, String>) {
 }
 
 pub fn parse_urlencoded(input: &[u8]) -> HashMap<String, String> {
+    parse_urlencoded_with_duplicates(input).0
+}
+
+/// Decode URL-encoded scalar inputs while recording ambiguous repeated names.
+///
+/// Duplicate detection runs *after* percent decoding: `limit` and `%6cimit`
+/// identify the same logical parameter. Legacy consumers retain the last
+/// value in the map, while typed HTTP handlers can reject duplicates for
+/// precisely the parameters they bind.
+pub fn parse_urlencoded_with_duplicates(
+    input: &[u8],
+) -> (HashMap<String, String>, HashSet<String>) {
     let mut out = HashMap::new();
+    let mut duplicates = HashSet::new();
     for part in String::from_utf8_lossy(input).split('&') {
         if part.is_empty() {
             continue;
         }
         let (key, value) = part.split_once('=').unwrap_or((part, ""));
-        out.insert(percent_decode_form(key), percent_decode_form(value));
+        let name = percent_decode_form(key);
+        if out.insert(name.clone(), percent_decode_form(value)).is_some() {
+            duplicates.insert(name);
+        }
     }
-    out
+    (out, duplicates)
 }
 
 pub fn parse_cookie_header(header: &str) -> HashMap<String, String> {
@@ -491,6 +507,18 @@ mod tests {
         assert_eq!(err.kind, RequestDecodeErrorKind::Missing);
         assert_eq!(err.http_status(), 400);
         assert_eq!(err.problem_details()["source"], "header");
+    }
+
+    #[test]
+    fn urlencoded_duplicates_are_detected_after_percent_decoding() {
+        let (values, duplicates) =
+            parse_urlencoded_with_duplicates(b"limit=10&%6cimit=20&tag=a&tag=b&single=x");
+        assert_eq!(values.get("limit").map(String::as_str), Some("20"));
+        assert_eq!(values.get("tag").map(String::as_str), Some("b"));
+        assert_eq!(duplicates.len(), 2);
+        assert!(duplicates.contains("limit"));
+        assert!(duplicates.contains("tag"));
+        assert!(!duplicates.contains("single"));
     }
 
     #[test]
