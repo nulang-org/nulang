@@ -264,7 +264,7 @@ dependencies.
 
 ## Docs & Wiki
 
-The [nulang.org](https://nulang.org) documentation site is regenerated automatically on every push to `main` via the [Docs Sync workflow](.github/workflows/docs-sync.yml). When source files, examples, or docs content change, the workflow rebuilds generated docs and the browser playground, verifies the Astro site, and proposes the generated files through the `automation/docs-sync` pull request rather than pushing directly to protected `main`.
+The [Docs Sync workflow](.github/workflows/docs-sync.yml) rebuilds generated docs and the browser playground and validates the Astro site on relevant pushes to `main`. Generated outputs are retained as a downloadable `nulang-generated-docs` artifact for 30 days. Because repository rules reject direct writes to the protected automation branch, differing assets must be imported through a reviewed PR; successful generation is **not** an automatic docs publication. See [import instructions](docs/GENERATED_ASSET_SYNC.md).
 
 ---
 
