@@ -1,0 +1,53 @@
+name: Security dependency resolution probe
+
+# Temporary read-only diagnostic; remove before promotion.
+on:
+  push:
+    branches: [codex/security-audit-unified-20261020]
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    name: Resolve patched dependency graph
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Install pinned Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
+      - name: Start from validated libSQL TLS replacement dependency graph
+        run: |
+          git show e7d1da13041c7d8020327b7892a551473a54f428:Cargo.toml > Cargo.toml
+          git show e7d1da13041c7d8020327b7892a551473a54f428:Cargo.lock > Cargo.lock
+          sed -i 's/wasmtime = { version = "48.0.6"/wasmtime = { version = "48.0.7"/' Cargo.toml
+          grep '^wasmtime = ' Cargo.toml
+      - name: Identify legacy root trust dependencies
+        run: |
+          cargo tree --locked --all-features -i webpki-roots@0.26.11 || true
+          cargo tree --locked --all-features -i rustls-webpki@0.103.14 || true
+      - name: Resolve patched Wasmtime and certificate verifier versions
+        run: |
+          cargo update -p wasmtime --precise 48.0.7
+          cargo update -p rustls-webpki@0.103.14 --precise 0.103.16
+          cargo update -p webpki-roots@1.0.9 --precise 1.0.10
+          cargo metadata --locked --format-version 1 > /dev/null
+      - name: Report unresolved certificate root consumers
+        run: |
+          cargo tree --locked --all-features -i webpki-roots@0.26.11 || true
+          cargo tree --locked --all-features -i rustls-webpki@0.103.16 || true
+          git diff --stat -- Cargo.lock Cargo.toml
+          git diff -- Cargo.lock | tail -n 220
+      - name: Upload Cargo-resolved lockfile
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: security-resolved-lockfile
+          path: Cargo.lock
+          if-no-files-found: error
+          retention-days: 1
