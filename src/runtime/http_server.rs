@@ -362,6 +362,7 @@ impl HttpServerState {
             204 => "No Content",
             301 => "Moved Permanently",
             302 => "Found",
+            303 => "See Other",
             304 => "Not Modified",
             400 => "Bad Request",
             401 => "Unauthorized",
@@ -520,6 +521,9 @@ pub struct RequestContext {
 thread_local! {
     static CURRENT_REQUEST: RefCell<Option<RequestContext>> = const { RefCell::new(None) };
     static RESPONSE_COOKIES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    // A failed redirect validation is preserved as Err rather than silently
+    // falling back to an HTML 200 response.
+    static RESPONSE_REDIRECT: RefCell<Option<Result<String, ()>>> = const { RefCell::new(None) };
 }
 
 /// Set the request context for the current thread, run `f`, then clear it.
@@ -529,9 +533,57 @@ where
 {
     CURRENT_REQUEST.with(|c| *c.borrow_mut() = Some(ctx));
     RESPONSE_COOKIES.with(|c| c.borrow_mut().clear());
+    RESPONSE_REDIRECT.with(|c| *c.borrow_mut() = None);
     let result = f();
     CURRENT_REQUEST.with(|c| *c.borrow_mut() = None);
     result
+}
+
+/// Validate a Location header value without accepting controls, whitespace,
+/// protocol-relative URLs, backslashes, or executable URI schemes.
+///
+/// Relative paths and explicit HTTP(S) locations are supported. The application
+/// remains responsible for deciding whether an external destination is trusted.
+fn valid_http_redirect_location(location: &str) -> bool {
+    if location.is_empty()
+        || location.len() > 8192
+        || !location.bytes().all(|b| b.is_ascii_graphic() && b != b'\\')
+        || location.starts_with("//")
+    {
+        return false;
+    }
+    if location.starts_with("https://") {
+        return location.len() > "https://".len();
+    }
+    if location.starts_with("http://") {
+        return location.len() > "http://".len();
+    }
+    location.starts_with('/') || !location.contains(':')
+}
+
+/// Record a real HTTP redirect only while serving a routed request.
+///
+/// Outside a request, return false so the legacy non-HTTP HTML fragment
+/// behavior remains available to the standalone VM and static renderers.
+pub fn register_http_redirect(location: &str) -> bool {
+    CURRENT_REQUEST.with(|current| {
+        if current.borrow().is_none() {
+            return false;
+        }
+        let redirect = if valid_http_redirect_location(location) {
+            Ok(location.to_string())
+        } else {
+            Err(())
+        };
+        RESPONSE_REDIRECT.with(|c| *c.borrow_mut() = Some(redirect));
+        true
+    })
+}
+
+/// Consume redirect metadata after the route VM finishes. A completed or
+/// failed request must not leave a Location header for the next request.
+fn take_response_redirect() -> Option<Result<String, ()>> {
+    RESPONSE_REDIRECT.with(|c| c.borrow_mut().take())
 }
 
 /// Add a `Set-Cookie` header for the current response.
@@ -1055,18 +1107,29 @@ impl WebDevServer {
                         )),
                         Err(error) => Err(error),
                     });
-                match rendered {
-                    Ok(Some(html)) => HttpResponse {
+                let redirect = take_response_redirect();
+                match (rendered, redirect) {
+                    (Ok(Some(_)), Some(Ok(location))) => HttpResponse {
+                        status: 303,
+                        headers: vec![("Location".into(), location)],
+                        body: Vec::new(),
+                    },
+                    (Ok(Some(_)), Some(Err(()))) => HttpResponse {
+                        status: 500,
+                        headers: vec![("Content-Type".into(), "text/plain".into())],
+                        body: b"Invalid redirect target".to_vec(),
+                    },
+                    (Ok(Some(html)), None) => HttpResponse {
                         status: 200,
                         headers: vec![("Content-Type".into(), "text/html; charset=utf-8".into())],
                         body: inject_client_runtime_script(&html).into_bytes(),
                     },
-                    Ok(None) => HttpResponse {
+                    (Ok(None), _) => HttpResponse {
                         status: 500,
                         headers: vec![("Content-Type".into(), "text/plain".into())],
                         body: b"Internal server error".to_vec(),
                     },
-                    Err(DirectRequestRenderError::Decode(error)) => {
+                    (Err(DirectRequestRenderError::Decode(error)), _) => {
                         let problem = request_decode_problem_response(&error);
                         HttpResponse {
                             status: problem.status,
@@ -1074,7 +1137,7 @@ impl WebDevServer {
                             body: problem.body,
                         }
                     }
-                    Err(DirectRequestRenderError::Execution(error)) => {
+                    (Err(DirectRequestRenderError::Execution(error)), _) => {
                         eprintln!("typed route dispatch error: {error}");
                         HttpResponse {
                             status: 500,
