@@ -1062,10 +1062,19 @@ fn fmt_expr(out: &mut String, expr: &Expr, indent: usize, had_unhandled: &mut bo
             fmt_expr(out, expr, indent, had_unhandled);
             out.push_str(&format!(" :cap {:?})", cap));
         }
-        Expr::TypeAnnotate { expr, ty, .. } => {
+        Expr::TypeAnnotate {
+            expr,
+            ty,
+            preserve_inferred,
+            ..
+        } => {
             out.push_str("(");
             fmt_expr(out, expr, indent, had_unhandled);
-            out.push_str(&format!(": {})", fmt_type(ty)));
+            if *preserve_inferred {
+                out.push_str(&format!(" satisfies {})", fmt_type(ty)));
+            } else {
+                out.push_str(&format!(": {})", fmt_type(ty)));
+            }
         }
         Expr::Defer {
             expr, error_only, ..
