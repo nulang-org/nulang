@@ -6,9 +6,10 @@
 //! supply only compiler-validated immutable input names. This pass is not
 //! connected to MIR lowering or runtime scheduling.
 
-use crate::ast::Expr;
-use crate::effect_checker::{EffectChecker, EffectContext};
-use crate::types::EffectRow;
+use crate::ast::{AstModule, Decl, Expr};
+use crate::effect_checker::{CapContext, CapabilityAnalyzer, EffectChecker, EffectContext};
+use crate::typechecker::TypeChecker;
+use crate::types::{Capability, EffectRow};
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +56,80 @@ pub fn classify_pure_candidate(
         }
         _ => DataflowEligibility::Ineligible(IneligibleReason::NonPureOrUnknownEffect),
     }
+}
+
+/// Screen one module-level function using compiler-owned declaration metadata.
+///
+/// This diagnostic-only entrypoint derives input names from the source
+/// declaration rather than a caller-provided list, and runs the canonical
+/// type/effect/capability checkers before classifying. Explicit `val`
+/// annotations are required on fully typed parameters: a missing capability
+/// is *not* accepted via `CapContext`'s permissive default.
+///
+/// Even a `Candidate` is not permission to optimize: stable resolved
+/// binding IDs, source-language semantic equivalence, and backend parity
+/// remain unproved. No compiler or runtime execution path calls this method.
+pub fn classify_checked_function_candidate(
+    module: &AstModule,
+    function_name: &str,
+) -> DataflowEligibility {
+    let mut matches = module.decls.iter().filter(|decl| {
+        matches!(decl, Decl::Function { name, .. } if name == function_name)
+    });
+    let Some(decl) = matches.next() else {
+        return DataflowEligibility::Ineligible(IneligibleReason::UnsupportedShapeOrCapture);
+    };
+    if matches.next().is_some() {
+        return DataflowEligibility::Ineligible(IneligibleReason::UnsupportedShapeOrCapture);
+    }
+
+    let Decl::Function {
+        params,
+        body,
+        type_params,
+        using_params,
+        default_values,
+        requires,
+        ensures,
+        error_type,
+        ..
+    } = decl else {
+        return DataflowEligibility::Ineligible(IneligibleReason::UnsupportedShapeOrCapture);
+    };
+
+    // Do not guess immutable bindings from default capabilities, and do not
+    // admit implicit defaults/contracts/generics until their evaluation and
+    // capture semantics are explicitly included in the dataflow contract.
+    let mut names = BTreeSet::new();
+    if !type_params.is_empty()
+        || !using_params.is_empty()
+        || default_values.iter().any(Option::is_some)
+        || !requires.is_empty()
+        || !ensures.is_empty()
+        || error_type.is_some()
+        || params.iter().any(|param| {
+            param.cap != Some(Capability::Val)
+                || param.ty.is_none()
+                || !names.insert(param.name.as_str())
+        })
+    {
+        return DataflowEligibility::Ineligible(IneligibleReason::UnsupportedShapeOrCapture);
+    }
+
+    if TypeChecker::new().check_module(module).is_err() {
+        return DataflowEligibility::Ineligible(IneligibleReason::UnsupportedShapeOrCapture);
+    }
+    let mut effect_checker = EffectChecker::new();
+    if effect_checker.check_module(&module.decls).is_err() {
+        return DataflowEligibility::Ineligible(IneligibleReason::NonPureOrUnknownEffect);
+    }
+    let cap_context = CapContext::new().with_params(params);
+    if CapabilityAnalyzer::new().infer_cap(&cap_context, body).is_err() {
+        return DataflowEligibility::Ineligible(IneligibleReason::UnsupportedShapeOrCapture);
+    }
+
+    let immutable_inputs: Vec<&str> = params.iter().map(|param| param.name.as_str()).collect();
+    classify_pure_candidate(body, &immutable_inputs, &mut effect_checker)
 }
 
 fn supported_pure_shape(expr: &Expr, inputs: &BTreeSet<String>) -> bool {
