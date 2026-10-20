@@ -348,6 +348,30 @@ mod tests {
     }
 
     #[test]
+    fn remote_query_only_searches_document_text_and_caps_results() {
+        let client = MeilisearchClient::new(
+            "https://search.example.com", "test-key", "tenant-a"
+        ).unwrap();
+        let mut query = SearchQuery::new("tenant-a", "tenant-a");
+        query.limit = usize::MAX;
+        query.filters.insert("category".into(), "public".into());
+
+        let payload = client.search_body(&query).unwrap().unwrap();
+        assert_eq!(payload["q"], "tenant-a");
+        assert_eq!(payload["attributesToSearchOn"], serde_json::json!(["text"]));
+        assert_eq!(payload["limit"], 200);
+        assert_eq!(
+            payload["filter"], serde_json::json!(["attributes.category = \"public\""])
+        );
+
+        let mut mismatched = SearchQuery::new("tenant-b", "test");
+        mismatched.limit = 20;
+        assert!(matches!(
+            client.search_body(&mismatched), Err(MeilisearchError::NamespaceMismatch)
+        ));
+    }
+
+    #[test]
     fn blank_queries_are_not_sent_as_match_everything_searches() {
         let client = MeilisearchClient::new(
             "https://search.example.com", "test-key", "tenant-a"
