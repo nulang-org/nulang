@@ -574,6 +574,22 @@ impl StdLib {
                     description: "Wrap a raw string as an Html value without escaping.",
                 },
                 BuiltinOp {
+                    name: "Web.json_response",
+                    effect: "Web",
+                    op: "json_response",
+                    signature: "json_response(status: Int, json: String) -> Html",
+                    implemented_in: ImplSite::RuntimeHost,
+                    description: "Return a validated JSON HTTP response with an explicit status. The body must contain valid JSON.",
+                },
+                BuiltinOp {
+                    name: "Web.text_response",
+                    effect: "Web",
+                    op: "text_response",
+                    signature: "text_response(status: Int, body: String) -> Html",
+                    implemented_in: ImplSite::RuntimeHost,
+                    description: "Return a plain-text HTTP response with an explicit status, without HTML rendering.",
+                },
+                BuiltinOp {
                     name: "Web.redirect",
                     effect: "Web",
                     op: "redirect",
