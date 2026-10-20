@@ -8711,7 +8711,6 @@ fn confirmed_node_removal_forgets_crdt_receiver_knowledge() {
     );
 }
 
-
 #[test]
 fn orca_pending_fetch_root_visitor_observes_retained_message_payloads() {
     let mut runtime = Runtime::new();
