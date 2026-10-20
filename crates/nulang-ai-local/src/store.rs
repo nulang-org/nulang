@@ -5,6 +5,7 @@ use nulang_ai_core::{
     AcceptanceEvidence, ConversationState, Goal, GoalGraph, GoalStatus, ManagerKind, Task, TaskStatus,
 };
 use rusqlite::{params, Connection};
+use nulang_ai_worker::validate_evidence;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
@@ -168,11 +169,12 @@ impl SqliteStore {
     /// Atomically persist verified evidence and promote a running task to
     /// Completed. A process crash cannot leave a Completed row without proof.
     /// This method is called only after the host's verifier has accepted it.
-    pub fn complete_task_verified(
+    pub(crate) fn complete_task_verified(
         &self,
         task: &Task,
         evidence: &[AcceptanceEvidence],
     ) -> Result<(), StoreError> {
+        validate_evidence(task, evidence).map_err(StoreError::InvalidCompletion)?;
         if task.status != TaskStatus::Completed {
             return Err(StoreError::InvalidCompletion(
                 "verified completion requires Completed task status".into(),
@@ -204,14 +206,13 @@ impl SqliteStore {
         let mut stmt = conn.prepare(
             "SELECT criterion, artifact_ref FROM task_evidence WHERE task_id = ?1 ORDER BY criterion",
         )?;
-        stmt.query_map(params![task_id.to_string()], |row| {
+        let rows = stmt.query_map(params![task_id.to_string()], |row| {
             Ok(AcceptanceEvidence {
                 criterion: row.get(0)?,
                 artifact_ref: row.get(1)?,
             })
-        })?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(StoreError::from)
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
     }
 
     pub fn upsert_conversation(&self, conv: &ConversationState) -> Result<(), StoreError> {
