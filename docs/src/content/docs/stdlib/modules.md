@@ -24,6 +24,7 @@ registry cannot silently drift from the in-tree standard library.
 | `fs` | `stdlib::fs` | experimental | `src/stdlib/fs.nula` | — | Higher-level filesystem wrappers over the built-in FS effect. |
 | `json` | `stdlib::json` | experimental | `src/stdlib/json.nula` | `packages/json/src/lib.nula` | JSON parsing, serialization, and field accessors. |
 | `test` | `stdlib::test` | experimental | `src/stdlib/test.nula` | — | Testing assertions and helpers over the built-in Test effect. |
+| `finite_stream` | `stdlib::finite_stream` | experimental | `src/stdlib/finite_stream.nula` | — | Finite array-backed pull cursor reference; no linear ownership or external IO. |
 
 ## Contract
 
