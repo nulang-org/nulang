@@ -12126,11 +12126,16 @@ match { a: 2, b: 9 } with {
         assert_int(source, 42);
     }
 
-    /// errdefer: same as defer (error-only distinction not yet tracked in HIR).
+    /// An error-only defer must not silently execute on a successful exit.
+    /// It remains unavailable until VM error unwinding can guarantee cleanup.
     #[test]
     fn test_errdefer_basic() {
         let source = "{ errdefer 1; 42 }";
-        assert_int(source, 42);
+        let error = run_source(source).expect_err("errdefer must fail closed");
+        assert!(
+            matches!(error, NuError::NotYetImplemented { .. }),
+            "expected an unsupported error-only cleanup diagnostic, got {error:?}"
+        );
     }
 
     /// Defer with break: defers run on break path.
