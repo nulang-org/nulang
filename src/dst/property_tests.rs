@@ -87,7 +87,10 @@ fn failing_generated_trace_is_shrunk_to_ordered_counterexample() {
     assert_eq!(failure.case_index, 0);
     assert_eq!(failure.seed, 19);
     assert_eq!(failure.minimized.status, MinimizationStatus::OneMinimal);
-    assert_eq!(failure.minimized.trace, vec![Op::Send, Op::Crash, Op::Restart]);
+    assert_eq!(
+        failure.minimized.trace,
+        vec![Op::Send, Op::Crash, Op::Restart]
+    );
     assert!(has_ordered_failure(&failure.original));
 }
 
@@ -110,7 +113,10 @@ fn case_seed_replays_original_generation_independently() {
 
     let mut replay_rng = DeterministicRng::new(failure.case_seed);
     assert_eq!(failure.original, generate(&mut replay_rng));
-    assert_eq!(failure.minimized.status, MinimizationStatus::BudgetExhausted);
+    assert_eq!(
+        failure.minimized.status,
+        MinimizationStatus::BudgetExhausted
+    );
 }
 
 #[test]
@@ -149,7 +155,10 @@ fn zero_shrink_budget_never_claims_minimality() {
     )
     .expect_err("first case fails");
 
-    assert_eq!(failure.minimized.status, MinimizationStatus::BudgetExhausted);
+    assert_eq!(
+        failure.minimized.status,
+        MinimizationStatus::BudgetExhausted
+    );
     assert_eq!(failure.minimized.replays, 0);
     assert_eq!(failure.minimized.trace, failure.original);
 }

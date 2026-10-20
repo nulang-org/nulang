@@ -70,11 +70,10 @@ where
         if !property_holds(&original) {
             // Recheck the baseline. In particular, a stateful/flaky predicate
             // must not be presented as an independently reproduced failure.
-            let minimized = minimize_failing_trace(
-                &original,
-                config.max_shrink_replays,
-                |candidate| !property_holds(candidate),
-            );
+            let minimized =
+                minimize_failing_trace(&original, config.max_shrink_replays, |candidate| {
+                    !property_holds(candidate)
+                });
             return Err(TracePropertyFailure {
                 seed: config.seed,
                 case_index,

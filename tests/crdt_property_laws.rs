@@ -46,11 +46,7 @@ fn generate_set_ops(rng: &mut DeterministicRng) -> Vec<SetOp> {
 }
 
 fn g_counter_laws(operations: &[CounterOp]) -> bool {
-    let mut replicas = [
-        GCounter::new(1),
-        GCounter::new(2),
-        GCounter::new(3),
-    ];
+    let mut replicas = [GCounter::new(1), GCounter::new(2), GCounter::new(3)];
     for operation in operations {
         let CounterOp::Increment { replica, amount } = *operation else {
             // Shrinker may delete operations, but must not invent invalid ones.
@@ -112,11 +108,7 @@ fn g_counter_laws(operations: &[CounterOp]) -> bool {
 }
 
 fn pn_counter_laws(operations: &[CounterOp]) -> bool {
-    let mut replicas = [
-        PNCounter::new(1),
-        PNCounter::new(2),
-        PNCounter::new(3),
-    ];
+    let mut replicas = [PNCounter::new(1), PNCounter::new(2), PNCounter::new(3)];
     for operation in operations {
         match *operation {
             CounterOp::Increment { replica, amount } => {
