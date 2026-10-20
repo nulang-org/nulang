@@ -3420,7 +3420,7 @@ mod tests {
             arms: vec![(
                 "Msg".to_string(),
                 vec![Pattern::Var("value".to_string())],
-                Some(Expr::Literal(Literal::Bool(true), s())),
+                Some(Box::new(Expr::Literal(Literal::Bool(true), s()))),
                 Expr::CapAnnotate {
                     expr: Box::new(Expr::Literal(Literal::Int(1), s())),
                     cap: Capability::Iso,
