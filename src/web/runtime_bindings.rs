@@ -432,6 +432,7 @@ mod tests {
     fn compiles_and_matches_contract_route_once() {
         let plan = compile_runtime_route_plan(&contract("/users/{id: Int}")).unwrap();
         assert!(plan.direct_call);
+        assert_eq!(plan.response_type.as_deref(), Some("String"));
         assert_eq!(
             plan.segments,
             vec![
