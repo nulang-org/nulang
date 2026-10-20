@@ -1464,6 +1464,4 @@ mod tests {
             "object freed once the hold is released"
         );
     }
-
-
 }
