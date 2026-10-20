@@ -108,7 +108,6 @@ mod tests {
         assert_eq!(migrated, bytes, "identity migration must be byte-identical");
     }
 
-
     #[test]
     fn identity_migration_reports_bad_magic_not_truncation() {
         let mut bytes = CodeModule::new("t").to_nbc(None).unwrap();
