@@ -186,26 +186,28 @@ impl DockerDriver {
         .collect()
     }
 
-    fn remove_container(&self, name: &str) {
-        // Best effort: if docker run's controlling process is killed, the
-        // daemon-side container must also be force-removed.
-        if let Ok(mut child) = Command::new(&self.executable)
+    fn remove_container(&self, name: &str) -> Result<(), String> {
+        // A killed Docker CLI does not prove the daemon stopped the container.
+        let mut child = Command::new(&self.executable)
             .args(["rm", "-f", name])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-        {
-            let start = Instant::now();
-            loop {
-                match child.try_wait() {
-                    Ok(Some(_)) | Err(_) => break,
-                    Ok(None) if start.elapsed() >= Duration::from_secs(5) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        break;
-                    }
-                    Ok(None) => std::thread::sleep(POLL_INTERVAL),
+            .map_err(|e| e.to_string())?;
+        let start = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => return Ok(()),
+                Ok(Some(status)) => {
+                    return Err(format!("container cleanup returned {status}"));
                 }
+                Err(err) => return Err(err.to_string()),
+                Ok(None) if start.elapsed() >= Duration::from_secs(5) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("container cleanup timed out".into());
+                }
+                Ok(None) => std::thread::sleep(POLL_INTERVAL),
             }
         }
     }
@@ -241,12 +243,19 @@ impl ContainerDriver for DockerDriver {
                 }
             }
         };
-        if result.is_err() {
-            let _ = child.kill();
-            let _ = child.wait();
-            self.remove_container(&name);
-        }
-        let exit_code = result?;
+        let exit_code = match result {
+            Ok(code) => code,
+            Err(reason) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(match self.remove_container(&name) {
+                    Ok(()) => reason,
+                    Err(cleanup) => format!(
+                        "{reason}; cleanup unconfirmed for container {name}: {cleanup}"
+                    ),
+                });
+            }
+        };
         let total_bytes = stdout.metadata().map_err(|e| e.to_string())?.len()
             .saturating_add(stderr.metadata().map_err(|e| e.to_string())?.len());
         if total_bytes > OUTPUT_LIMIT {
