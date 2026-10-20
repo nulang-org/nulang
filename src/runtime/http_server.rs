@@ -166,11 +166,25 @@ fn read_http_request<R: Read>(reader: &mut R) -> Result<Option<HttpRequest>, Htt
         return Err(HttpReadError::BadRequest);
     }
 
+    let version = parsed.version.ok_or(HttpReadError::BadRequest)?;
+    if version != 0 && version != 1 {
+        return Err(HttpReadError::BadRequest);
+    }
+
     let method = parsed
         .method
         .and_then(HttpMethod::from_str)
         .ok_or(HttpReadError::NotImplemented)?;
-    let path = parsed.path.ok_or(HttpReadError::BadRequest)?.to_string();
+    // Nulang serves origin-form routes, not forward-proxy absolute-form,
+    // CONNECT authority-form, or server-wide asterisk-form request targets.
+    let path = parsed.path.ok_or(HttpReadError::BadRequest)?;
+    if !path.starts_with('/')
+        || path.contains('#')
+        || path.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
+    {
+        return Err(HttpReadError::BadRequest);
+    }
+    let path = path.to_string();
     let headers: Vec<(String, String)> = parsed
         .headers
         .iter()
@@ -185,8 +199,26 @@ fn read_http_request<R: Read>(reader: &mut R) -> Result<Option<HttpRequest>, Htt
     let mut content_length = None;
     let mut has_transfer_encoding = false;
     let mut has_expectation = false;
+    let mut has_host = false;
     for (name, value) in &headers {
-        if name.eq_ignore_ascii_case("content-length") {
+        if name.eq_ignore_ascii_case("host") {
+            // Duplicate or ambiguous authority can cause front-end/backend
+            // routing disagreement, even when both Host values are equal.
+            if has_host {
+                return Err(HttpReadError::BadRequest);
+            }
+            has_host = true;
+            let host = value.trim();
+            if host.is_empty()
+                || host.bytes().any(|byte| {
+                    byte <= 0x20
+                        || byte == 0x7f
+                        || matches!(byte, b',' | b'/' | b'\\' | b'@' | b'#' | b'?')
+                })
+            {
+                return Err(HttpReadError::BadRequest);
+            }
+        } else if name.eq_ignore_ascii_case("content-length") {
             // Reject even identical duplicates: this is a one-request server,
             // and accepting ambiguous lengths enables request desynchronization.
             let value = value.trim();
@@ -213,6 +245,11 @@ fn read_http_request<R: Read>(reader: &mut R) -> Result<Option<HttpRequest>, Htt
     }
     if has_transfer_encoding {
         return Err(HttpReadError::NotImplemented);
+    }
+    // RFC 9112 requires exactly one non-empty Host field for HTTP/1.1.
+    // HTTP/1.0 remains supported for legacy clients without Host.
+    if version == 1 && !has_host {
+        return Err(HttpReadError::BadRequest);
     }
 
     let content_length = content_length.unwrap_or(0);
@@ -1407,7 +1444,7 @@ mod tests {
 
     #[test]
     fn http_request_does_not_consume_pipelined_bytes_as_body() {
-        let raw = b"POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\nokGET / HTTP/1.1\r\n\r\n";
+        let raw = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\nokGET / HTTP/1.1\r\n\r\n";
         let request = read_http_request(&mut chunks(raw, 128)).unwrap().unwrap();
         assert_eq!(request.body, b"ok");
     }
