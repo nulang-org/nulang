@@ -106,9 +106,14 @@ fn provider(root: &Path, operation_id: DurableEffectId, request: &[u8]) -> Vec<u
 
     let identity = format!("{key}\n{}\n", String::from_utf8_lossy(request));
     let mutation_path = root.join("provider-mutation");
-    match OpenOptions::new().write(true).create_new(true).open(&mutation_path) {
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&mutation_path)
+    {
         Ok(mut file) => {
-            file.write_all(identity.as_bytes()).expect("write provider mutation");
+            file.write_all(identity.as_bytes())
+                .expect("write provider mutation");
             file.sync_all().expect("sync provider mutation");
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -123,10 +128,7 @@ fn provider(root: &Path, operation_id: DurableEffectId, request: &[u8]) -> Vec<u
     RECEIPT.to_vec()
 }
 
-fn expected_dispatch(
-    decision: DurableEffectDispatchDecision,
-    id: DurableEffectId,
-) {
+fn expected_dispatch(decision: DurableEffectDispatchDecision, id: DurableEffectId) {
     assert_eq!(
         decision,
         DurableEffectDispatchDecision::DispatchWithDeduplication { operation_id: id }
@@ -286,7 +288,10 @@ fn os_kill_restarts_all_three_receipt_crash_windows() {
         let fixture = Fixture::new(stage);
         kill_at_checkpoint(stage, &fixture);
         assert_eq!(fixture.provider_calls(), expected_calls_before);
-        assert_eq!(fixture.provider_mutations(), usize::from(expected_calls_before > 0));
+        assert_eq!(
+            fixture.provider_mutations(),
+            usize::from(expected_calls_before > 0),
+        );
         restart_worker("recover", &fixture);
 
         // Only a Prepared state re-dispatches; provider-side idempotency
