@@ -994,7 +994,6 @@ mod transactional_receive_tests {
     }
 }
 
-
 #[cfg(test)]
 mod orca_mailbox_root_visitor_tests {
     use super::*;
@@ -1012,15 +1011,21 @@ mod orca_mailbox_root_visitor_tests {
     #[test]
     fn staged_root_visit_preserves_active_match_and_lane_fifo() {
         let mut mailbox = Mailbox::new(0);
-        mailbox.push_local(message(101, MessagePriority::Normal)).unwrap();
-        mailbox.push_local(message(102, MessagePriority::System)).unwrap();
+        mailbox
+            .push_local(message(101, MessagePriority::Normal))
+            .unwrap();
+        mailbox
+            .push_local(message(102, MessagePriority::System))
+            .unwrap();
         mailbox.push(message(103, MessagePriority::Normal)).unwrap();
         mailbox.push(message(104, MessagePriority::System)).unwrap();
 
         let (arm, candidate) = mailbox.receive_match(&[7]).expect("system match");
         assert_eq!(arm, 0);
         assert_eq!(candidate[0].as_int(), Some(102));
-        mailbox.push_local(message(105, MessagePriority::Normal)).unwrap();
+        mailbox
+            .push_local(message(105, MessagePriority::Normal))
+            .unwrap();
         // This remains in concurrent SegQueue, which this partial visitor
         // deliberately does not pretend to enumerate.
         mailbox.push(message(106, MessagePriority::Normal)).unwrap();
@@ -1034,7 +1039,11 @@ mod orca_mailbox_root_visitor_tests {
         });
         seen.sort_unstable();
         assert_eq!(seen, vec![101, 102, 102, 103, 104, 105]);
-        assert_eq!(mailbox.len(), before, "observing must not dequeue messages");
+        assert_eq!(
+            mailbox.len(),
+            before,
+            "observing must not dequeue messages"
+        );
 
         let committed = mailbox.commit_receive_match().expect("existing match");
         assert_eq!(committed[0].as_int(), Some(102));
@@ -1067,8 +1076,15 @@ mod orca_mailbox_root_visitor_tests {
 
         let mut seen = Vec::new();
         mailbox.visit_scheduler_owned_values(&mut |value| seen.push(value));
-        assert_eq!(seen, values);
-        assert_eq!(mailbox.pop().expect("unchanged queued value").payload.as_slice(), values);
+        assert_eq!(seen, values.to_vec());
+        assert_eq!(
+            mailbox
+                .pop()
+                .expect("unchanged queued value")
+                .payload
+                .as_slice(),
+            values.as_slice()
+        );
         assert!(mailbox.is_empty());
     }
 
@@ -1080,7 +1096,10 @@ mod orca_mailbox_root_visitor_tests {
 
         let mut seen = Vec::new();
         mailbox.visit_scheduler_owned_values(&mut |value| seen.push(value));
-        assert!(seen.is_empty(), "SegQueues need a separate admission/root barrier");
+        assert!(
+            seen.is_empty(),
+            "SegQueues need a separate admission/root barrier"
+        );
         assert_eq!(mailbox.len(), 2);
         assert_eq!(mailbox.pop().unwrap().sender, 8);
         assert_eq!(mailbox.pop().unwrap().sender, 7);
