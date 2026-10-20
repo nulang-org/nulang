@@ -47,7 +47,7 @@ impl SandboxConfig {
         // Docker --mount uses comma-separated key=value fields. Reject paths
         // that could be reinterpreted as additional mount options.
         let mount_source = workspace.to_str().ok_or("workspace must be UTF-8")?;
-        if mount_source.contains([',', '\n', '\r']) {
+        if mount_source.chars().any(|ch| matches!(ch, ',' | '\n' | '\r')) {
             return Err("workspace contains unsafe Docker mount delimiters".into());
         }
         let image = image.into();
