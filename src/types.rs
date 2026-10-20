@@ -2447,8 +2447,14 @@ mod tests {
             EffectRow::Open(effects, tail) => {
                 assert!(effects.contains(&Effect::IO));
                 assert!(effects.contains(&Effect::FS));
-                assert_ne!(tail, left, "combining independent tails cannot reuse the left tail");
-                assert_ne!(tail, right, "combining independent tails cannot reuse the right tail");
+                assert_ne!(
+                    tail, left,
+                    "combining independent tails cannot reuse the left tail"
+                );
+                assert_ne!(
+                    tail, right,
+                    "combining independent tails cannot reuse the right tail"
+                );
             }
             other => panic!("unknown effects must remain open, got {other:?}"),
         }
