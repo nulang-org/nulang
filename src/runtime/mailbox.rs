@@ -885,6 +885,83 @@ mod transactional_receive_tests {
         assert_eq!(mb.pop().unwrap().sender, 3);
     }
     #[test]
+    fn correlated_receive_skips_unrelated_refs_without_consuming_or_reordering() {
+        let mut mailbox = Mailbox::new(8);
+        mailbox.push_local(msg(7, 1, MessagePriority::Normal)).unwrap();
+        mailbox.push_local(msg(7, 2, MessagePriority::Normal)).unwrap();
+        mailbox.push_local(msg(7, 3, MessagePriority::Normal)).unwrap();
+
+        let found = mailbox
+            .receive_match_ref(7, 2)
+            .expect("matching correlation found");
+        assert_eq!(found[0].as_int(), Some(2));
+        assert_eq!(mailbox.len(), 3, "lookup must not consume");
+        assert_eq!(
+            mailbox.commit_receive_match().unwrap()[0].as_int(),
+            Some(2)
+        );
+        assert_eq!(mailbox.pop().unwrap().sender, 1);
+        assert_eq!(mailbox.pop().unwrap().sender, 3);
+        assert!(mailbox.is_empty());
+    }
+
+    #[test]
+    fn correlated_receive_rebuilds_after_commit_reset_and_new_arrivals() {
+        let mut mailbox = Mailbox::new(8);
+        mailbox.push(msg(9, 1, MessagePriority::Normal)).unwrap();
+        assert!(mailbox.receive_match_ref(9, 5).is_none());
+        mailbox.push(msg(9, 5, MessagePriority::Normal)).unwrap();
+
+        assert_eq!(
+            mailbox.receive_match_ref(9, 5).unwrap()[0].as_int(),
+            Some(5)
+        );
+        mailbox.reset_receive_match();
+        assert_eq!(
+            mailbox.receive_match_ref(9, 5).unwrap()[0].as_int(),
+            Some(5)
+        );
+        mailbox.commit_receive_match().expect("matched new arrival");
+        assert_eq!(mailbox.pop().unwrap().sender, 1);
+        assert!(mailbox.is_empty());
+    }
+
+    #[test]
+    fn correlated_receive_retains_system_first_then_local_then_normal() {
+        let mut mailbox = Mailbox::new(8);
+        mailbox.push(msg(4, 6, MessagePriority::Normal)).unwrap();
+        mailbox.push(msg(4, 6, MessagePriority::System)).unwrap();
+        mailbox.push_local(msg(4, 6, MessagePriority::Normal)).unwrap();
+        let first = mailbox.receive_match_ref(4, 6).expect("system match");
+        assert_eq!(first[0].as_int(), Some(6));
+        mailbox.commit_receive_match().expect("system commit");
+        let second = mailbox.receive_match_ref(4, 6).expect("local match");
+        assert_eq!(second[0].as_int(), Some(6));
+        mailbox.commit_receive_match().expect("local commit");
+        let third = mailbox.receive_match_ref(4, 6).expect("normal match");
+        assert_eq!(third[0].as_int(), Some(6));
+        mailbox.commit_receive_match().expect("normal commit");
+        assert!(mailbox.is_empty());
+    }
+
+    #[test]
+    fn correlated_receive_preserves_guard_rejection_semantics() {
+        let mut mailbox = Mailbox::new(8);
+        mailbox.push_local(msg(7, 42, MessagePriority::Normal)).unwrap();
+        mailbox.push_local(msg(7, 42, MessagePriority::Normal)).unwrap();
+        let _first = mailbox.receive_match_ref(7, 42).expect("first");
+        let second = mailbox.receive_match_ref(7, 42).expect("second");
+        assert_eq!(second[0].as_int(), Some(42));
+        mailbox.commit_receive_match().unwrap();
+        assert_eq!(mailbox.len(), 1);
+        mailbox.reset_receive_match();
+        let remaining = mailbox.receive_match_ref(7, 42).expect("rejected candidate");
+        assert_eq!(remaining[0].as_int(), Some(42));
+        mailbox.commit_receive_match().unwrap();
+        assert!(mailbox.is_empty());
+    }
+
+    #[test]
     fn indexed_receive_preserves_fifo_across_arm_order() {
         let mut mb = Mailbox::new(8);
         mb.push_local(msg(20, 1, MessagePriority::Normal)).unwrap();
