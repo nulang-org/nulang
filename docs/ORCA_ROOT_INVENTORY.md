@@ -27,6 +27,7 @@ root snapshot at a scheduler safepoint and confirm object provenance.
 | Messages retained pending bytecode fetch | `Runtime::visit_pending_fetched_values` | Read-only; **excludes active channels** |
 | An individually owned cross-shard envelope (two delivery variants) | `CrossShardMsg::visit_payload_values` | Read-only; **does not enumerate channels** |
 | Exact live allocation identity in a single actor heap | `Actor::is_live_heap_payload_value` | Current address-provenance check only; **not generation-aware** |
+| Unsharded non-executing runtime diagnostic view | `Runtime::orca_diagnostic_roots_if_not_executing` | Actor, mailbox, VM and pending-fetch Values; **not complete**, never used for reclamation |
 
 These APIs emit **Values**, not verified heap addresses. A collector must
 check each pointer's allocation provenance and owner before dereferencing it.
@@ -70,6 +71,23 @@ may delay collection, but missing roots could free live data.
 **Fail-closed rule:** until all these paths are covered and asserted in
 integration tests, never use these visitor results to reclaim any object.
 
+## Runtime diagnostic audit, not a collector safepoint
+
+`Runtime::orca_diagnostic_roots_if_not_executing(actor_id)` is a
+`pub(crate)` inspection helper intended for tests and debugging. It refuses
+unknown actors, sharded runtimes or attached cross-shard channels, an active
+VM/scheduler actor, deferred receive wakes, or a running actor. For a permitted
+unsharded runtime it gathers Values from the shared VM, pending bytecode
+fetches, the target actor's state/suspensions and its exclusive mailbox
+snapshot. It does not mutate ORCA refcounts or free any object.
+
+A non-executing scheduler **is not** a global safepoint: the actor can have
+queued work, a JIT/native handle may be retained elsewhere, and runtime
+timers/foreign credits/channel lifetimes are not covered. The method does not
+report `safe_to_collect` or expose a reclamation decision. It must never be
+used to decide reachability or trigger local-cycle collection. A complete
+runtime handoff/root publication contract is required before any such use.
+
 ## Minimum follow-up test contract
 
 - Real bytecode self-cycle and mutual-cycle reproduction through untyped
@@ -105,6 +123,7 @@ cargo test --locked actor_heap_provenance_rejects_foreign_interior_and_freed_poi
 cargo test --locked orca_mailbox_root_visitor_tests
 cargo test --locked exclusive_root_snapshot
 cargo test --locked exclusive_actor_value_snapshot
+cargo test --locked orca_diagnostic_root_audit
 cargo test --locked orca_pending_fetch_root_visitor
 cargo test --locked orca_cross_shard_envelope_root_visitor
 cargo test --locked --lib

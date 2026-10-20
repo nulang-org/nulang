@@ -8773,3 +8773,132 @@ fn orca_cross_shard_envelope_root_visitor_observes_both_delivery_variants() {
         .visit_payload_values(&mut |value| values.push(value));
     assert!(values.is_empty());
 }
+
+#[test]
+fn orca_diagnostic_root_audit_includes_actor_mailbox_and_pending_fetch_values() {
+    let mut runtime = Runtime::new();
+    let id = runtime.spawn_actor(Box::new(Vec::new));
+    let actor = runtime.actors.get_mut(&id).expect("actor");
+    actor
+        .state_data
+        .insert("state".into(), Value::int(901));
+    actor
+        .mailbox
+        .push(Message {
+            behavior_id: 7,
+            payload: MessagePayload::from_slice(&[Value::int(902)]),
+            sender: 2,
+            priority: MessagePriority::System,
+            trace_id: None,
+        })
+        .expect("message");
+    actor
+        .mailbox
+        .push_local(Message {
+            behavior_id: 8,
+            payload: MessagePayload::from_slice(&[Value::int(903)]),
+            sender: 3,
+            priority: MessagePriority::Normal,
+            trace_id: None,
+        })
+        .expect("local message");
+    runtime.pending_fetched_messages.insert(
+        [0xCD; 32],
+        vec![(
+            id,
+            "test".into(),
+            Message {
+                behavior_id: 9,
+                payload: MessagePayload::from_slice(&[Value::int(904)]),
+                sender: 4,
+                priority: MessagePriority::Normal,
+                trace_id: None,
+            },
+            Vec::new(),
+            Vec::new(),
+        )],
+    );
+
+    let mut observed = runtime
+        .orca_diagnostic_roots_if_not_executing(id)
+        .expect("quiescent unsharded snapshot");
+    observed.sort_by_key(|value| value.as_int().unwrap_or(i64::MIN));
+    assert_eq!(
+        observed,
+        vec![
+            Value::int(901),
+            Value::int(902),
+            Value::int(903),
+            Value::int(904),
+        ]
+    );
+    assert_eq!(runtime.actors[&id].mailbox.len(), 2);
+    assert_eq!(
+        runtime.actors.get_mut(&id).unwrap().mailbox.pop().unwrap().sender,
+        2
+    );
+    assert_eq!(
+        runtime.actors.get_mut(&id).unwrap().mailbox.pop().unwrap().sender,
+        3
+    );
+}
+
+#[test]
+fn orca_diagnostic_root_audit_fails_closed_around_execution_and_wakes() {
+    let mut runtime = Runtime::new();
+    let id = runtime.spawn_actor(Box::new(Vec::new));
+
+    runtime.vm_execution_depth = 1;
+    assert!(matches!(
+        runtime.orca_diagnostic_roots_if_not_executing(id),
+        Err(OrcaRootAuditBlocked::VmExecuting)
+    ));
+    runtime.vm_execution_depth = 0;
+
+    runtime.current_actor = Some(id);
+    assert!(matches!(
+        runtime.orca_diagnostic_roots_if_not_executing(id),
+        Err(OrcaRootAuditBlocked::ActorExecuting)
+    ));
+    runtime.current_actor = None;
+
+    runtime.draining_receive_wakes = true;
+    assert!(matches!(
+        runtime.orca_diagnostic_roots_if_not_executing(id),
+        Err(OrcaRootAuditBlocked::PendingReceiveWake)
+    ));
+    runtime.draining_receive_wakes = false;
+
+    runtime.pending_receive_wakes.push(id);
+    assert!(matches!(
+        runtime.orca_diagnostic_roots_if_not_executing(id),
+        Err(OrcaRootAuditBlocked::PendingReceiveWake)
+    ));
+    runtime.pending_receive_wakes.clear();
+
+    runtime.actors.get_mut(&id).unwrap().run_state = ActorRunState::Running;
+    assert!(matches!(
+        runtime.orca_diagnostic_roots_if_not_executing(id),
+        Err(OrcaRootAuditBlocked::ActorRunning)
+    ));
+    runtime.actors.get_mut(&id).unwrap().run_state = ActorRunState::Idle;
+
+    assert!(runtime.orca_diagnostic_roots_if_not_executing(id).is_ok());
+}
+
+#[test]
+fn orca_diagnostic_root_audit_rejects_shards_and_unknown_actors() {
+    let mut runtime = Runtime::new();
+    let id = runtime.spawn_actor(Box::new(Vec::new));
+    assert!(matches!(
+        runtime.orca_diagnostic_roots_if_not_executing(u64::MAX),
+        Err(OrcaRootAuditBlocked::UnknownActor)
+    ));
+
+    let (_, receiver) = std::sync::mpsc::sync_channel::<CrossShardMsg>(2);
+    runtime.cross_shard_rx = Some(receiver);
+    assert!(matches!(
+        runtime.orca_diagnostic_roots_if_not_executing(id),
+        Err(OrcaRootAuditBlocked::CrossShardChannels)
+    ));
+}
