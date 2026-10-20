@@ -65,6 +65,30 @@ nulang nula new my-app --template lib
 | `ai-agent` | actor with LLM-backed conversation memory |
 | `web` | Nulang Web app with `[web]` manifest section and static assets |
 
+## Application generators (experimental)
+
+After creating a package, `nula make` scaffolds conventional application source and test files:
+
+```bash
+nulang nula new customer-app
+cd customer-app
+nulang nula make feature customer
+nulang nula test --filter test_customer
+```
+
+`feature` generates `src/customer.nula` with a public starter function and
+`tests/test_customer.nula` with a corresponding assertion. `module` and
+`test` generate those files independently. For an existing module, `nula make
+test customer` creates its test skeleton; adapt the example assertion to
+your domain behavior.
+
+Names are deliberately restricted to lowercase `snake_case` identifiers,
+without path separators. Generators require an existing valid `Nulang.toml`,
+refuse to overwrite files, and clean up newly created files on write failures.
+Generated code is intentionally **not** a persistence layer, authentication
+system, or production-ready CRUD endpoint. These developer-experience
+primitives precede the planned typed database and HTTP application stack.
+
 ## The `Nulang.toml` manifest
 
 Every package has a `Nulang.toml` at its root. All fields:

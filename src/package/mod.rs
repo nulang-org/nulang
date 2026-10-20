@@ -11,6 +11,7 @@
 //! argument is `nula`.
 
 pub mod commands;
+pub mod generators;
 pub mod identity;
 mod identity_verify;
 pub mod lockfile;
