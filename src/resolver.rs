@@ -111,6 +111,46 @@ impl QualifiedImportIndex {
 
     /// Resolve a public symbol without falling back to unrelated unqualified
     /// bindings. Overloads are preserved for subsequent type-directed lookup.
+    /// Select one explicitly exported symbol of the requested lexical kind.
+    ///
+    /// This is a fail-closed preparatory lookup, *not* overload selection:
+    /// two eligible candidates are ambiguous until the typechecker has
+    /// enough information to choose by their signatures. Returning owned
+    /// identity metadata avoids retaining a borrow of this lookup index.
+    pub fn resolve_unique(
+        &self,
+        alias: &str,
+        symbol: &str,
+        kind: QualifiedSymbolKind,
+        span: Span,
+    ) -> NuResult<QualifiedSymbol> {
+        let candidates = self.resolve(alias, symbol, span)?;
+        let kind_name = match kind {
+            QualifiedSymbolKind::Function => "function",
+            QualifiedSymbolKind::Type => "type",
+        };
+        let mut matching = candidates.iter().filter(|entry| entry.kind == kind);
+        let selected = matching.next().ok_or_else(|| {
+            NuError::parse_error(
+                format!(
+                    "'{}' is not exported as a {} by module alias '{}'",
+                    symbol, kind_name, alias
+                ),
+                span,
+            )
+        })?;
+        if matching.next().is_some() {
+            return Err(NuError::parse_error(
+                format!(
+                    "ambiguous qualified reference '{}::{}': more than one exported {} matches",
+                    alias, symbol, kind_name
+                ),
+                span,
+            ));
+        }
+        Ok(selected.clone())
+    }
+
     pub fn resolve(
         &self,
         alias: &str,
