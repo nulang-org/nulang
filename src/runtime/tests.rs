@@ -1818,6 +1818,78 @@ fn test_unlink_actors() {
 }
 
 #[test]
+fn monitor_ref_flush_removes_only_the_correlated_queued_down() {
+    let mut rt = Runtime::new();
+    let watcher = rt.spawn_actor(Box::new(Vec::new));
+    let target = rt.spawn_actor(Box::new(Vec::new));
+    let first = rt.monitor_ref(watcher, target).expect("first watch");
+    let second = rt.monitor_ref(watcher, target).expect("second watch");
+
+    rt.exit_actor(target, ExitReason::Error("failed".to_string()));
+    let removed = rt
+        .demonitor_ref_flush(watcher, first)
+        .expect("flush completed");
+    assert_eq!(removed, 1);
+
+    let mailbox = &mut rt.actors.get_mut(&watcher).unwrap().mailbox;
+    assert_eq!(mailbox.len(), 1, "only the unrelated DOWN survives");
+    let down = mailbox.pop().expect("second DOWN remains");
+    assert_eq!(down.payload.len(), 4);
+    assert_eq!(down.payload[3].as_int(), Some(second.0 as i64));
+    assert!(mailbox.pop().is_none());
+}
+
+#[test]
+fn monitor_ref_flush_preserves_selective_receive_staging_and_order() {
+    let mut rt = Runtime::new();
+    let watcher = rt.spawn_actor(Box::new(Vec::new));
+    let target = rt.spawn_actor(Box::new(Vec::new));
+    let first = rt.monitor_ref(watcher, target).expect("first watch");
+    let second = rt.monitor_ref(watcher, target).expect("second watch");
+    rt.exit_actor(target, ExitReason::Normal);
+
+    // A guard-rejected selective receive leaves both DOWN messages staged.
+    let mailbox = &mut rt.actors.get_mut(&watcher).unwrap().mailbox;
+    let _candidate = mailbox.receive_match(&[0]).expect("DOWN candidate");
+    mailbox.reset_receive_match();
+
+    assert_eq!(rt.demonitor_ref_flush(watcher, first), Ok(1));
+    let mailbox = &mut rt.actors.get_mut(&watcher).unwrap().mailbox;
+    assert_eq!(mailbox.len(), 1);
+    let (arm, payload) = mailbox
+        .receive_match(&[0])
+        .expect("other DOWN still visible");
+    assert_eq!(arm, 0);
+    assert_eq!(payload[3].as_int(), Some(second.0 as i64));
+    mailbox
+        .commit_receive_match()
+        .expect("commit surviving DOWN");
+    assert!(mailbox.is_empty());
+}
+
+#[test]
+fn monitor_ref_flush_cancels_live_watch_and_refuses_active_receive() {
+    let mut rt = Runtime::new();
+    let watcher = rt.spawn_actor(Box::new(Vec::new));
+    let target = rt.spawn_actor(Box::new(Vec::new));
+    let canceled = rt.monitor_ref(watcher, target).expect("watch");
+    assert_eq!(rt.demonitor_ref_flush(watcher, canceled), Ok(0));
+
+    let active = rt.monitor_ref(watcher, target).expect("second watch");
+    rt.exit_actor(target, ExitReason::Normal);
+    let mailbox = &mut rt.actors.get_mut(&watcher).unwrap().mailbox;
+    let _candidate = mailbox.receive_match(&[0]).expect("DOWN candidate");
+
+    assert_eq!(
+        rt.demonitor_ref_flush(watcher, active),
+        Err("monitor DOWN flush requires an idle selective receive")
+    );
+    let mailbox = &mut rt.actors.get_mut(&watcher).unwrap().mailbox;
+    assert!(mailbox.commit_receive_match().is_some());
+    assert!(mailbox.is_empty(), "canceled monitor never sent a DOWN");
+}
+
+#[test]
 fn monitor_references_distinguish_independent_watches_and_cancel_exactly_one() {
     let mut rt = Runtime::new();
     let watcher = rt.spawn_actor(Box::new(Vec::new));
