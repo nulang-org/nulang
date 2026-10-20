@@ -634,6 +634,26 @@ impl Parser {
         }
     }
 
+    /// Mark every nested closed record as closed in the JSON Schema too.
+    /// The shared @tool converter intentionally permits unknown properties,
+    /// which is not faithful to an explicitly closed Nulang record type.
+    fn strict_derived_schema(ty: &Type) -> serde_json::Value {
+        let mut schema = crate::tool_schema::type_to_json_schema(ty);
+        match ty {
+            Type::Record(fields) => {
+                schema["additionalProperties"] = serde_json::Value::Bool(false);
+                for (name, field_ty) in fields {
+                    schema["properties"][name.as_str()] = Self::strict_derived_schema(field_ty);
+                }
+            }
+            Type::Array(inner) => {
+                schema["items"] = Self::strict_derived_schema(inner);
+            }
+            _ => {}
+        }
+        schema
+    }
+
     /// Synthesize a pure, constant JSON Schema string. This is an inspection
     /// helper, NOT a runtime JSON codec or a durable wire-format contract.
     fn derive_schema_function(
@@ -654,7 +674,7 @@ impl Parser {
                 span,
             )
         })?;
-        let schema = crate::tool_schema::type_to_json_schema(&ty);
+        let schema = Self::strict_derived_schema(&ty);
         let json = serde_json::to_string(&schema).map_err(|error| {
             NuError::parse_error(
                 format!("cannot derive schema for '{record_name}': {error}"),
