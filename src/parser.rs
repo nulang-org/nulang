@@ -915,7 +915,7 @@ impl Parser {
                     TokenKind::Alias => self.parse_type_alias(public, false),
                     _ => self.parse_type_decl_variant_or_record(public, derives.clone()),
                 }?;
-                if !derives.is_empty() && !matches!(decl, Decl::RecordType { .. }) {
+                if !derives.is_empty() && !matches!(&decl, Decl::RecordType { .. }) {
                     return Err(NuError::parse_error(
                         "@derive is supported only on record types".to_string(),
                         self.current_span(),
@@ -9228,6 +9228,29 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{err:?}").contains("collides"), "{err:?}");
+    }
+
+    #[test]
+    fn derive_schema_and_eq_can_be_requested_together() {
+        let ast = parse("@derive(eq, schema)\ntype Payment = { amount: Int }").unwrap();
+        assert!(ast.decls.iter().any(
+            |d| matches!(d, Decl::Function { name, .. } if name == "payment_eq")
+        ));
+        assert!(ast.decls.iter().any(
+            |d| matches!(d, Decl::Function { name, .. } if name == "payment_schema")
+        ));
+    }
+
+    #[test]
+    fn derive_schema_rejects_duplicate_record_fields() {
+        let err = parse("@derive(schema)\ntype Payment = { amount: Int, amount: String }").unwrap_err();
+        assert!(format!("{err:?}").contains("cannot derive schema"), "{err:?}");
+    }
+
+    #[test]
+    fn derive_rejects_non_record_type_declarations() {
+        let err = parse("@derive(schema)\ntype Price = Int").unwrap_err();
+        assert!(format!("{err:?}").contains("only on record types"), "{err:?}");
     }
 
     #[test]
