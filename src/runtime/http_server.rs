@@ -4,6 +4,8 @@
 //! Handlers are non-capturing `fn(String) -> String` — no closures with env.
 //! Status is always 200; Content-Type is always text/plain.
 
+use rand_core::{OsRng, RngCore};
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -13,7 +15,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-use rand_core::{OsRng, RngCore};
 
 use crate::bytecode::CodeModule;
 use crate::value_layout::PAYLOAD_MASK;
