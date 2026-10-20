@@ -1362,15 +1362,32 @@ mod tests {
 
     #[test]
     fn http_request_preserves_absolute_form_and_empty_host_for_routing() {
-        // RFC 9112 permits absolute-form at origin servers, even when a proxy
-        // would normally send it. Parsing must not blanket-reject that form.
+        // RFC 9112: an origin host accepts absolute-form, routes its path,
+        // and uses request-target authority instead of a conflicting Host.
         let absolute = read_http_request(&mut chunks(
             b"GET http://example.test/resource?x=1 HTTP/1.1\r\nHost: mismatch.test\r\n\r\n",
             4,
         ))
         .unwrap()
         .unwrap();
-        assert_eq!(absolute.path, "http://example.test/resource?x=1");
+        assert_eq!(absolute.path, "/resource?x=1");
+        assert_eq!(
+            absolute.headers.iter().find(|(key, _)| key.eq_ignore_ascii_case("host")).map(|(_, value)| value.as_str()),
+            Some("example.test"),
+        );
+
+        // A URI with no explicit path still routes to '/'.
+        let no_path = read_http_request(&mut chunks(
+            b"GET HTTP://example.test?x=1 HTTP/1.1\r\nHost: ignored.test\r\n\r\n",
+            4,
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(no_path.path, "/?x=1");
+        assert_eq!(
+            no_path.headers.iter().find(|(key, _)| key.eq_ignore_ascii_case("host")).map(|(_, value)| value.as_str()),
+            Some("example.test"),
+        );
 
         // Empty Host is permitted when the target has no URI authority.
         let empty_host = read_http_request(&mut chunks(
@@ -1380,6 +1397,21 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(empty_host.path, "/resource");
+    }
+
+    #[test]
+    fn http_request_rejects_ambiguous_absolute_form_authorities() {
+        for raw in [
+            &b"GET http:///missing HTTP/1.1\r\nHost: localhost\r\n\r\n"[..],
+            &b"GET http://user@host.example/private HTTP/1.1\r\nHost: localhost\r\n\r\n"[..],
+            &b"GET http://bad\\host.example/private HTTP/1.1\r\nHost: localhost\r\n\r\n"[..],
+            &b"GET unknown://host.example/private HTTP/1.1\r\nHost: localhost\r\n\r\n"[..],
+        ] {
+            assert_eq!(
+                read_http_request(&mut chunks(raw, 4)).unwrap_err(),
+                HttpReadError::BadRequest,
+            );
+        }
     }
 
     #[test]
