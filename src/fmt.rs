@@ -1237,6 +1237,14 @@ mod tests {
     }
 
     #[test]
+    fn test_fmt_satisfies_roundtrips() {
+        let src = "fn main() { let value = (1 + 2) satisfies Int; value }";
+        let out = format_source(src).expect("satisfies expression formats");
+        assert!(out.contains("satisfies Int"), "contract syntax lost: {out}");
+        assert_idempotent(src);
+    }
+
+    #[test]
     fn test_fmt_effect_decl() {
         let src = r#"effect MyEffect {
     op: Int -> Bool
