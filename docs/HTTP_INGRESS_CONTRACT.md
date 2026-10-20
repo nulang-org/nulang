@@ -16,10 +16,13 @@ and `Expect: 100-continue` remain unsupported.
   by RFC 9112. HTTP/1.0 requests may omit Host.
 - Reject request targets containing URI fragments or ASCII control characters
   before route dispatch.
-- Preserve absolute-form request-targets at the framing layer. RFC 9112 says
-  origin servers must accept that form; **authority reconstruction, normalized
-  absolute-form routing, and consistency with downstream gateways are not yet
-  fully implemented**. Do not treat this as a fully conforming reverse proxy.
+- Accept HTTP(S) absolute-form request targets, normalize their path and query
+  for route dispatch, and use the absolute target's authority in preference
+  to a conflicting `Host` header, as required by RFC 9112.
+- Reject unsupported URI schemes and malformed or ambiguous authority values.
+  This bounded single-request host is not a forward proxy. URI validation,
+  full proxy semantics, persistent connections and advanced HTTP features
+  still require a mature production-grade transport.
 - Existing Content-Length, transfer-encoding, header-size, body-size and
   connection-limit safeguards remain in place.
 
