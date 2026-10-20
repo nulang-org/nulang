@@ -2761,7 +2761,6 @@ mod tests {
     use super::*;
     use crate::ast::{Param, Pattern};
 
-
     #[test]
     fn test_nested_defer_scopes_run_inner_first_in_lifo_order() {
         let span = Span::default();
@@ -2786,13 +2785,17 @@ mod tests {
             span,
         };
         let body = with_fresh_defer_stack(|| lower_body(&expr));
-        let cleanup_order: Vec<_> = body.stmts.iter().filter_map(|stmt| match stmt {
-            hir::Stmt::Let {
-                value: hir::RValue::Panic(message),
-                ..
-            } => Some(message.as_str()),
-            _ => None,
-        }).collect();
+        let cleanup_order: Vec<_> = body
+            .stmts
+            .iter()
+            .filter_map(|stmt| match stmt {
+                hir::Stmt::Let {
+                    value: hir::RValue::Panic(message),
+                    ..
+                } => Some(message.as_str()),
+                _ => None,
+            })
+            .collect();
         assert_eq!(cleanup_order, ["inner-last", "inner-first", "outer"]);
     }
 
@@ -2852,25 +2855,29 @@ mod tests {
         let capture_pos = body
             .stmts
             .iter()
-            .position(|stmt| matches!(
-                stmt,
-                hir::Stmt::Let {
-                    name,
-                    value: hir::RValue::Use(hir::Operand::Var(source, _)),
-                    ..
-                } if name == result && source == "x"
-            ))
+            .position(|stmt| {
+                matches!(
+                    stmt,
+                    hir::Stmt::Let {
+                        name,
+                        value: hir::RValue::Use(hir::Operand::Var(source, _)),
+                        ..
+                    } if name == result && source == "x"
+                )
+            })
             .expect("block value must be copied before deferred cleanup");
         let cleanup_pos = body
             .stmts
             .iter()
-            .position(|stmt| matches!(
-                stmt,
-                hir::Stmt::Let {
-                    value: hir::RValue::Panic(message),
-                    ..
-                } if message == "cleanup"
-            ))
+            .position(|stmt| {
+                matches!(
+                    stmt,
+                    hir::Stmt::Let {
+                        value: hir::RValue::Panic(message),
+                        ..
+                    } if message == "cleanup"
+                )
+            })
             .expect("deferred cleanup missing");
         assert!(capture_pos < cleanup_pos, "block value captured too late");
     }
@@ -2896,9 +2903,7 @@ mod tests {
         };
         let body = with_fresh_defer_stack(|| lower_body(&expr));
         let (returned, _) = match &body.terminator {
-            hir::Terminator::FnReturn(Some(hir::Operand::Var(name, ty))) => {
-                (name.as_str(), ty)
-            }
+            hir::Terminator::FnReturn(Some(hir::Operand::Var(name, ty))) => (name.as_str(), ty),
             other => panic!("expected variable-valued return, got {other:?}"),
         };
         let capture_pos = body
@@ -2918,15 +2923,20 @@ mod tests {
         let cleanup_pos = body
             .stmts
             .iter()
-            .position(|stmt| matches!(
-                stmt,
-                hir::Stmt::Let {
-                    value: hir::RValue::Panic(message),
-                    ..
-                } if message == "cleanup"
-            ))
+            .position(|stmt| {
+                matches!(
+                    stmt,
+                    hir::Stmt::Let {
+                        value: hir::RValue::Panic(message),
+                        ..
+                    } if message == "cleanup"
+                )
+            })
             .expect("ordinary defer must run before return");
-        assert!(capture_pos < cleanup_pos, "return value evaluated after cleanup");
+        assert!(
+            capture_pos < cleanup_pos,
+            "return value evaluated after cleanup"
+        );
         assert!(
             !body.stmts.iter().any(|stmt| matches!(
                 stmt,
@@ -2966,27 +2976,34 @@ mod tests {
         let capture_pos = body
             .stmts
             .iter()
-            .position(|stmt| matches!(
-                stmt,
-                hir::Stmt::Let {
-                    name,
-                    value: hir::RValue::Use(hir::Operand::Var(source, _)),
-                    ..
-                } if name == returned && source == "x"
-            ))
+            .position(|stmt| {
+                matches!(
+                    stmt,
+                    hir::Stmt::Let {
+                        name,
+                        value: hir::RValue::Use(hir::Operand::Var(source, _)),
+                        ..
+                    } if name == returned && source == "x"
+                )
+            })
             .expect("break value must be captured before cleanup");
         let cleanup_pos = body
             .stmts
             .iter()
-            .position(|stmt| matches!(
-                stmt,
-                hir::Stmt::Let {
-                    value: hir::RValue::Panic(message),
-                    ..
-                } if message == "cleanup"
-            ))
+            .position(|stmt| {
+                matches!(
+                    stmt,
+                    hir::Stmt::Let {
+                        value: hir::RValue::Panic(message),
+                        ..
+                    } if message == "cleanup"
+                )
+            })
             .expect("ordinary defer must run before break");
-        assert!(capture_pos < cleanup_pos, "break value evaluated after cleanup");
+        assert!(
+            capture_pos < cleanup_pos,
+            "break value evaluated after cleanup"
+        );
         assert!(
             !body.stmts.iter().any(|stmt| matches!(
                 stmt,
