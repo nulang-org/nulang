@@ -2793,6 +2793,46 @@ mod tests {
     }
 
     #[test]
+    fn test_db_plan_and_external_snapshot_verify_cli_are_read_only() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_db_readonly_cli_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        scaffold_package(&dir, "migration-cli-test", "default").unwrap();
+        let source = crate::package::migrations::generate_migration(&dir, "first").unwrap();
+        let plan = crate::package::migrations::read_migration_plan(&dir).unwrap();
+        let ledger = dir.join("trusted-export.json");
+        std::fs::write(
+            &ledger,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "applied": [plan[0]]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let contents_before = std::fs::read(&source).unwrap();
+        {
+            let _guard = ChangeDir::new(&dir);
+            run(&["db".into(), "plan".into(), "--json".into()])
+                .expect("db plan must work in a package without DB access");
+            run(&[
+                "db".into(),
+                "verify".into(),
+                "--ledger".into(),
+                "trusted-export.json".into(),
+            ])
+            .expect("external ledger comparison must succeed");
+            assert!(run(&["db".into(), "verify".into()]).is_err());
+        }
+        assert_eq!(std::fs::read(&source).unwrap(), contents_before);
+        assert!(!dir.join("db/schema_migrations").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn test_print_usage_does_not_panic() {
         print_usage();
     }
