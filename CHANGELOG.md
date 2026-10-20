@@ -1,6 +1,16 @@
 # Nulang Changelog
 ### Experimental structured `par` effect-scheduling metadata — 2026-10-19
 - **Compiler-owned safety metadata is available for future scoped execution.** Effects are classified separately from durable replay behavior; unknown calls and custom effects fail closed to sequential scheduling, while reference capability analysis remains an independent requirement. This does not enable parallel execution or alter runtime behavior.
+
+### Fabric on-demand mailbox scoring — 2026-10-18
+- **Fabric publish admission now reads mailbox pressure only for matching local subscribers**, instead of allocating and populating an all-actor mailbox snapshot on every publish.
+- **Ported the regression and exact-base matched-fixture A/B harness** from #1708 onto current main. Historical unmatched-publish microbenchmarks were favorable; new-head CI and measurements remain the promotion gate.
+
+### Bounded Nulang Web development-server connections — 2026-10-16
+- **The experimental Web development listener caps active connections at 64**, including SSE, and returns `503` with `Retry-After: 1` when full.
+- **Worker capacity is returned by a scoped RAII lease** after normal completion, panic, or thread-spawn failure. One shared `Arc` route table replaces per-connection clones of compiled route modules.
+- **Existing deterministic capacity and concurrent-admission regressions are preserved** from draft #1774; current-main static containment and bounded HTTP framing remain intact. Exact-head CI and real TCP saturation validation are required before promotion.
+
 ### Web static-root containment — 2026-10-15
 - **Experimental Web static file serving refuses parent traversal and symlinks escaping configured roots.** Canonical candidate paths must remain inside their canonicalized static or output root, and normal in-root files remain serveable.
 - **A filesystem regression verifies parent and symlink escape rejection.** This is a clean current-main successor to draft #1676; it does not change SSE or claim protection from malicious concurrent mutation of a trusted static root.
