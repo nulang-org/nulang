@@ -539,6 +539,33 @@ impl Mailbox {
         }
     }
 
+    /// Inspect every queued payload at an **exclusive mailbox safepoint**.
+    ///
+    /// Requires exclusive `&mut self`: no concurrent producer may retain a
+    /// shared reference to this Mailbox during the visit. We temporarily
+    /// remove and restore system/normal SegQueue entries via `drain`, so
+    /// callers must not use this method while producers are publishing.
+    /// The existing selective-receive candidate, lane FIFO and logical
+    /// capacity are preserved. The active candidate may appear twice; this
+    /// is an inspection visitor, not reference-credit accounting.
+    ///
+    /// This does NOT establish a full runtime safepoint: VM temporaries,
+    /// cross-shard channels, foreign holds and JIT/native roots are excluded.
+    /// Never use these values alone to prove an object unreachable.
+    pub fn visit_all_queued_values_exclusive(&mut self, visit: &mut impl FnMut(Value)) {
+        let snapshot = self.drain();
+        for message in &snapshot {
+            for &value in message.payload.as_slice() {
+                visit(value);
+            }
+        }
+        if let Some((_, _, payload)) = &self.active_match {
+            for &value in payload.as_slice() {
+                visit(value);
+            }
+        }
+    }
+
     /// Total logical message count. Safe to query concurrently.
     pub fn len(&self) -> usize {
         self.queued_count.load(Ordering::Relaxed)
