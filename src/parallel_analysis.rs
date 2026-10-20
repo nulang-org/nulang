@@ -27,6 +27,9 @@ pub struct ParallelBranchSummary {
     pub authorities: BTreeSet<String>,
     /// Control-flow escapes that cannot be scoped to one concurrent child yet.
     pub control_escapes: BTreeSet<String>,
+    /// Mutable lambda formals without proven unique argument ownership.
+    /// These are rejected until the scoped executor has alias provenance.
+    pub unproven_parameter_aliases: BTreeSet<String>,
     /// Deferred cleanup currently depends on sequential scope-exit ordering.
     pub uses_defer: bool,
 }
@@ -49,6 +52,21 @@ pub fn validate_parallel_branches(
                     branch.index,
                     branch
                         .control_escapes
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                span,
+            ));
+        }
+        if !branch.unproven_parameter_aliases.is_empty() {
+            return Err(par_error(
+                format!(
+                    "par branch {} mutates immediate lambda parameter(s) without an ownership proof ({}); aliasing of task arguments is not established",
+                    branch.index,
+                    branch
+                        .unproven_parameter_aliases
                         .iter()
                         .cloned()
                         .collect::<Vec<_>>()
@@ -198,10 +216,27 @@ fn summarize_expr(expr: &Expr, bound: &HashSet<String>, out: &mut ParallelBranch
             // actor-state mutations, and control effects instead of treating
             // the whole call as an opaque closure construction.
             //
-            // This is not a general call/alias proof: parameter-to-argument
-            // aliasing and indirect calls still require the separate scoped
-            // ownership/effect checks before `par` becomes concurrent.
+            // Without alias provenance, mutation of an aggregate rooted at
+            // a lambda parameter must fail closed: that formal can alias an
+            // argument simultaneously read by a sibling branch. Summarize
+            // once with the formal names considered free to reveal mutated
+            // roots, then normally with them bound to find captured effects.
+            // Indirect calls and rebinding aliases still require a separate
+            // compiler ownership/effect proof before `par` runs concurrently.
             if let Some((params, body)) = immediately_invoked_lambda(func) {
+                if !params.is_empty() {
+                    let mut alias_scope = bound.clone();
+                    for param in params {
+                        alias_scope.remove(&param.name);
+                    }
+                    let mut alias_check = ParallelBranchSummary::default();
+                    summarize_expr(body, &alias_scope, &mut alias_check);
+                    for param in params {
+                        if alias_check.heap_mutations.contains(&param.name) {
+                            out.unproven_parameter_aliases.insert(param.name.clone());
+                        }
+                    }
+                }
                 let mut lambda_bound = bound.clone();
                 lambda_bound.extend(params.iter().map(|param| param.name.clone()));
                 summarize_expr(body, &lambda_bound, out);
