@@ -1,7 +1,7 @@
 //! `nulang agent` subcommands.
 
 use crate::types::{NuError, NuResult, Span};
-use nulang_ai_local::{init_project, LocalRuntime};
+use nulang_ai_local::{init_project, GoalStatus, LocalRuntime};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -95,8 +95,16 @@ fn cmd_run(args: &[String]) -> NuResult<()> {
         message.unwrap_or_else(|| "Explore the repository and summarize architecture".into());
     let mut rt = LocalRuntime::open(dir).map_err(|e| agent_err(e.to_string()))?;
     let mut out = io::stdout();
-    rt.handle_user_message(&text, &mut out)
+    let goal_id = rt.handle_user_message(&text, &mut out)
         .map_err(|e| agent_err(e.to_string()))?;
+    let graph = rt.store().get_goal_graph(goal_id)
+        .map_err(|e| agent_err(e.to_string()))?;
+    if graph.goal.status != GoalStatus::Completed {
+        return Err(agent_err(format!(
+            "agent goal {} did not complete: {:?}",
+            goal_id, graph.goal.status
+        )));
+    }
     Ok(())
 }
 
