@@ -281,4 +281,52 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0.content, "alpha fact");
     }
+
+    #[test]
+    fn stored_embeddings_are_not_recomputed_for_every_query() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn counting_embedding(text: &str) -> Vec<f32> {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            if text.contains("rust") {
+                vec![1.0, 0.0]
+            } else {
+                vec![0.0, 1.0]
+            }
+        }
+
+        CALLS.store(0, Ordering::SeqCst);
+        let mut memory = SemanticMemory::new(2, Some(counting_embedding));
+        memory.store("rust", HashMap::new());
+        memory.store("database", HashMap::new());
+        assert_eq!(CALLS.load(Ordering::SeqCst), 2);
+
+        assert_eq!(memory.search("rust", 1)[0].0.content, "rust");
+        assert_eq!(memory.search("rust", 1)[0].0.content, "rust");
+        // Two writes and two query embeddings, not six total embeddings.
+        assert_eq!(CALLS.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn legacy_snapshots_without_cached_embeddings_still_search() {
+        let mut memory = SemanticMemory::new(16, None);
+        memory.store("recovery token", HashMap::new());
+
+        let mut legacy = serde_json::to_value(&memory).unwrap();
+        legacy.as_object_mut().unwrap().remove("embeddings");
+        let restored: SemanticMemory = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.search("recovery", 1)[0].0.content, "recovery token");
+    }
+
+    #[test]
+    fn deletions_keep_cached_embeddings_aligned_with_documents() {
+        let mut memory = SemanticMemory::new(32, None);
+        let old = memory.store("obsolete record", HashMap::new());
+        memory.store("remaining record", HashMap::new());
+        assert!(memory.delete(&old));
+        assert_eq!(memory.len(), 1);
+        assert_eq!(memory.search("remaining", 1)[0].0.content, "remaining record");
+    }
+
 }
