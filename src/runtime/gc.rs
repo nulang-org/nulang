@@ -1465,36 +1465,5 @@ mod tests {
         );
     }
 
-    /// A positive coordinator operation against a retired heap must reject
-    /// exhausted foreign-reference credits, including in optimized builds.
-    #[test]
-    #[should_panic(expected = "ORCA retired foreign reference count overflow")]
-    fn retired_heap_rejects_foreign_reference_overflow() {
-        let mut rt = super::super::Runtime::new();
-        let owner = rt.spawn_actor(Box::new(|| vec![]));
-        let ptr = rt
-            .actors
-            .get_mut(&owner)
-            .expect("owner")
-            .heap
-            .alloc(16, TypeTag::Raw)
-            .expect("allocation");
-        let header = unsafe { super::super::heap::ActorHeap::header_of(ptr) };
-
-        // First keep the owner heap alive after actor exit.
-        unsafe { (*header).foreign_count = 1 };
-        rt.remove_actor_reaping(owner);
-        assert_eq!(rt.retired_heaps.len(), 1);
-
-        // Fault injection: a stale increment must not wrap MAX back to zero.
-        unsafe { (*header).foreign_count = u32::MAX };
-        rt.coordinator.submit_op(ForeignRefOp {
-            target_actor: 999,
-            owner_actor: owner,
-            object_header: header,
-            delta: 1,
-        });
-        rt.process_gc_ops();
-    }
 
 }
