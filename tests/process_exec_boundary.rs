@@ -49,7 +49,7 @@ fn stdout_stderr_and_nonzero_exit_are_distinct() {
 
 #[test]
 fn does_not_inherit_host_environment_by_default() {
-    let command = shell("printf '%s' \"\$HOME\"");
+    let command = shell("printf '%s' \"$HOME\"");
     let mut policy = ProcessPolicy::new();
     policy.allow_exact(command.clone());
 
@@ -63,7 +63,7 @@ fn argument_vector_does_not_interpolate_metacharacters() {
     let command = ProcessSpec::new(
         "/bin/sh",
         std::env::current_dir().unwrap(),
-        ["-c", "printf '%s' \"\$1\"", "literal-arg", literal],
+        ["-c", "printf '%s' \"$1\"", "literal-arg", literal],
     )
     .unwrap();
     let mut policy = ProcessPolicy::new();
