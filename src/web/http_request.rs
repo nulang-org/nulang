@@ -4,11 +4,12 @@
 //! owns the HTTP-specific parsing needed to build those borrowed views without
 //! coupling the decoder to the runtime server implementation.
 
+use crate::web::bindings::{RouteBindingContract, RouteBindingSource};
 use crate::web::request_bindings::{
-    parse_cookie_header, parse_urlencoded, split_request_target, RequestBindingValues,
+    parse_cookie_header, parse_urlencoded_with_duplicates, RequestBindingValues,
 };
 use nulang_ui_protocol::{decode_host_message, ActionPlacement, HostToRuntimeMessage};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Why a renderer-neutral action envelope was rejected at the HTTP boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,9 +44,11 @@ impl std::fmt::Display for UiActionEnvelopeError {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HttpRequestBindingInputs {
     pub query: HashMap<String, String>,
+    pub duplicate_query_keys: HashSet<String>,
     pub cookies: HashMap<String, String>,
     pub body: Option<String>,
     pub form: HashMap<String, String>,
+    pub duplicate_form_keys: HashSet<String>,
     /// Validated renderer-neutral UI/action message carried alongside a
     /// compatibility form submission. Invalid or unsupported envelopes are
     /// ignored rather than becoming runtime authority.
@@ -62,7 +65,9 @@ impl HttpRequestBindingInputs {
     /// must not be reinterpreted as form data merely because a handler declares
     /// a form binding.
     pub fn capture(target: &str, headers: &[(String, String)], body: &[u8]) -> Self {
-        let (_, query) = split_request_target(target);
+        let query_text = target.split_once('?').map_or("", |(_, query)| query);
+        let (query, duplicate_query_keys) =
+            parse_urlencoded_with_duplicates(query_text.as_bytes());
 
         let mut cookies = HashMap::new();
         for (_, value) in headers
@@ -73,21 +78,50 @@ impl HttpRequestBindingInputs {
         }
 
         let body_text = (!body.is_empty()).then(|| String::from_utf8_lossy(body).into_owned());
-        let form = if is_urlencoded_form(headers) {
-            parse_urlencoded(body)
+        let (form, duplicate_form_keys) = if is_urlencoded_form(headers) {
+            parse_urlencoded_with_duplicates(body)
         } else {
-            HashMap::new()
+            (HashMap::new(), HashSet::new())
         };
-        let (ui_message, ui_message_error) = capture_ui_action_message(&form);
+        // A repeated action identifier is not a valid authorization envelope,
+        // even when the legacy form parser would otherwise keep its last value.
+        let (ui_message, ui_message_error) = if duplicate_form_keys
+            .contains("__nulang_ui_message")
+            || duplicate_form_keys.contains("__nulang_action")
+        {
+            (None, Some(UiActionEnvelopeError::Malformed))
+        } else {
+            capture_ui_action_message(&form)
+        };
 
         Self {
             query,
+            duplicate_query_keys,
             cookies,
             body: body_text,
             form,
+            duplicate_form_keys,
             ui_message,
             ui_message_error,
         }
+    }
+
+    /// Return a compiler-bound scalar input whose URL-encoded name occurred
+    /// multiple times. Unbound repeated inputs remain available to legacy
+    /// consumers until typed multi-value request contracts are introduced.
+    pub fn ambiguous_bound_input<'a>(
+        &self,
+        bindings: &'a [RouteBindingContract],
+    ) -> Option<&'a RouteBindingContract> {
+        bindings.iter().find(|binding| match binding.source {
+            RouteBindingSource::Query => {
+                self.duplicate_query_keys.contains(&binding.source_name)
+            }
+            RouteBindingSource::Form => {
+                self.duplicate_form_keys.contains(&binding.source_name)
+            }
+            _ => false,
+        })
     }
 
     /// Borrow all request sources in the shape consumed by the transport-neutral
