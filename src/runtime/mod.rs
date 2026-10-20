@@ -3413,9 +3413,17 @@ impl Runtime {
     ) -> DeterministicScheduleTrace {
         let mut rng = crate::dst::DeterministicRng::new(seed);
         let mut events = Vec::new();
-        let outcome =
-            self.run_scheduler_deterministic_with_rng_recording(&mut rng, max_steps, Some(&mut events));
-        DeterministicScheduleTrace { seed, max_steps, events, outcome }
+        let outcome = self.run_scheduler_deterministic_with_rng_recording(
+            &mut rng,
+            max_steps,
+            Some(&mut events),
+        );
+        DeterministicScheduleTrace {
+            seed,
+            max_steps,
+            events,
+            outcome,
+        }
     }
 
     /// Re-execute on a FRESH, equivalently initialized runtime with the
@@ -3429,8 +3437,7 @@ impl Runtime {
         &mut self,
         expected: &DeterministicScheduleTrace,
     ) -> Result<DeterministicRunResult, DeterministicTraceMismatch> {
-        let actual =
-            self.run_scheduler_deterministic_recorded(expected.seed, expected.max_steps);
+        let actual = self.run_scheduler_deterministic_recorded(expected.seed, expected.max_steps);
         for index in 0..expected.events.len().max(actual.events.len()) {
             let wanted = expected.events.get(index);
             let observed = actual.events.get(index);
@@ -3471,7 +3478,9 @@ impl Runtime {
             // Only allocate and sort a second ready set when trace recording
             // is requested. Production and cluster DST keep their old path.
             let ready_at_selection = if events.is_some() {
-                let mut ready: Vec<u64> = self.actors.iter()
+                let mut ready: Vec<u64> = self
+                    .actors
+                    .iter()
                     .filter(|(_, actor)| !actor.mailbox.is_empty())
                     .map(|(id, _)| *id)
                     .collect();
