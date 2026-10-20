@@ -212,3 +212,41 @@ fn oversized_execution_output_is_rejected_even_with_success_status() {
     let (worker, _) = harness.into_parts();
     assert!(matches!(worker.execute(&test_task()), WorkerExecution::Failed { .. }));
 }
+
+#[test]
+fn docker_mount_delimiters_in_workspace_path_are_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project,readonly=false");
+    std::fs::create_dir_all(&project).unwrap();
+    assert!(SandboxConfig::new(
+        &project,
+        tmp.path().join("receipts"),
+        format!("rust@sha256:{}", "a".repeat(64)),
+        vec!["cargo".into(), "test".into()],
+        "Tests pass",
+    ).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn existing_shared_receipt_directory_is_not_chmodded() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    let receipts = tmp.path().join("receipts");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&receipts).unwrap();
+    std::fs::set_permissions(&receipts, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let result = SandboxConfig::new(
+        &project,
+        &receipts,
+        format!("rust@sha256:{}", "a".repeat(64)),
+        vec!["cargo".into(), "test".into()],
+        "Tests pass",
+    );
+    assert!(result.is_err());
+    let mode = std::fs::metadata(&receipts).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o755);
+}
