@@ -322,6 +322,139 @@ mod tests {
         let _ = std::fs::remove_dir_all(tmp);
     }
 
+    #[derive(Clone)]
+    struct FakeWorker(WorkerExecution);
+
+    impl Worker for FakeWorker {
+        fn agent_id(&self) -> &str {
+            "test-worker"
+        }
+
+        fn execute(&self, _task: &nulang_ai_core::Task) -> WorkerExecution {
+            self.0.clone()
+        }
+    }
+
+    struct ArtifactVerifier;
+
+    impl EvidenceVerifier for ArtifactVerifier {
+        fn verify(
+            &self,
+            _task: &nulang_ai_core::Task,
+            evidence: &[nulang_ai_core::AcceptanceEvidence],
+        ) -> Result<(), String> {
+            if evidence.iter().all(|item| item.artifact_ref == "test://verified") {
+                Ok(())
+            } else {
+                Err("artifact did not pass independent validation".into())
+            }
+        }
+    }
+
+    fn fake_evidence(ref_value: &str) -> Vec<nulang_ai_core::AcceptanceEvidence> {
+        vec![nulang_ai_core::AcceptanceEvidence {
+            criterion: "Tests pass".into(),
+            artifact_ref: ref_value.into(),
+        }]
+    }
+
+    #[test]
+    fn executed_claim_without_host_verifier_stays_blocked() {
+        let tmp = std::env::temp_dir().join(format!("nulang-agent-no-verifier-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        init_project(&tmp).unwrap();
+        let worker = FakeWorker(WorkerExecution::Executed {
+            evidence: fake_evidence("test://verified"),
+        });
+        let mut rt = LocalRuntime::open_with_execution(
+            tmp.clone(),
+            Box::new(worker),
+            Box::new(RejectUnverified),
+        ).unwrap();
+        let mut out = Cursor::new(Vec::new());
+
+        let id = rt.handle_user_message("run tests", &mut out).unwrap();
+        let graph = rt.store().get_goal_graph(id).unwrap();
+        assert_eq!(graph.goal.status, GoalStatus::Blocked);
+        assert_eq!(graph.tasks[0].status, TaskStatus::Blocked);
+        assert!(rt.store().task_evidence(graph.tasks[0].id).unwrap().is_empty());
+        assert!(!String::from_utf8(out.into_inner()).unwrap().contains("task_completed"));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn independently_verified_execution_completes_and_persists_evidence() {
+        let tmp = std::env::temp_dir().join(format!("nulang-agent-verified-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        init_project(&tmp).unwrap();
+        let worker = FakeWorker(WorkerExecution::Executed {
+            evidence: fake_evidence("test://verified"),
+        });
+        let mut rt = LocalRuntime::open_with_execution(
+            tmp.clone(),
+            Box::new(worker),
+            Box::new(ArtifactVerifier),
+        ).unwrap();
+        let mut out = Cursor::new(Vec::new());
+
+        let id = rt.handle_user_message("run tests", &mut out).unwrap();
+        let graph = rt.store().get_goal_graph(id).unwrap();
+        assert_eq!(graph.goal.status, GoalStatus::Completed);
+        assert_eq!(graph.tasks[0].status, TaskStatus::Completed);
+        assert_eq!(
+            rt.store().task_evidence(graph.tasks[0].id).unwrap(),
+            fake_evidence("test://verified"),
+        );
+        let events = String::from_utf8(out.into_inner()).unwrap();
+        assert!(events.contains("task_verified"));
+        assert!(events.contains("task_completed"));
+        assert!(events.contains("goal_completed"));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn missing_evidence_cannot_bypass_a_permissive_verifier() {
+        let tmp = std::env::temp_dir().join(format!("nulang-agent-no-evidence-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        init_project(&tmp).unwrap();
+        let mut rt = LocalRuntime::open_with_execution(
+            tmp.clone(),
+            Box::new(FakeWorker(WorkerExecution::Executed { evidence: vec![] })),
+            Box::new(ArtifactVerifier),
+        ).unwrap();
+        let mut out = Cursor::new(Vec::new());
+
+        let id = rt.handle_user_message("run tests", &mut out).unwrap();
+        let graph = rt.store().get_goal_graph(id).unwrap();
+        assert_eq!(graph.goal.status, GoalStatus::Blocked);
+        assert_eq!(graph.tasks[0].status, TaskStatus::Blocked);
+        assert!(!String::from_utf8(out.into_inner()).unwrap().contains("task_completed"));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn failed_worker_does_not_complete_goal() {
+        let tmp = std::env::temp_dir().join(format!("nulang-agent-failed-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        init_project(&tmp).unwrap();
+        let mut rt = LocalRuntime::open_with_execution(
+            tmp.clone(),
+            Box::new(FakeWorker(WorkerExecution::Failed { reason: "test runner failed".into() })),
+            Box::new(ArtifactVerifier),
+        ).unwrap();
+        let mut out = Cursor::new(Vec::new());
+
+        let id = rt.handle_user_message("run tests", &mut out).unwrap();
+        let graph = rt.store().get_goal_graph(id).unwrap();
+        assert_eq!(graph.goal.status, GoalStatus::Blocked);
+        assert_eq!(graph.tasks[0].status, TaskStatus::Failed);
+        let events = String::from_utf8(out.into_inner()).unwrap();
+        assert!(events.contains("task_failed"));
+        assert!(events.contains("goal_blocked"));
+        assert!(!events.contains("task_completed"));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
     #[test]
     fn runtime_emits_nlap_events() {
         let tmp = std::env::temp_dir().join(format!("nulang-agent-test-{}", Uuid::new_v4()));
