@@ -82,12 +82,14 @@ let r = sqrt(25.0)       // ~5.0
 
 List/array operations over native arrays. Functions fall into two categories:
 
-- **Int-only** (annotated `[Int]`): `sum`, `fold`, `max_of`, `min_of`,
-  `sort`, `append`, `zip`, `enumerate`, and `uniq`.
+- **Int-only** (explicit integer signatures): `sum`, `fold`, `max_of`,
+  `min_of`, `sort`, `append`, `zip`, and `enumerate`.
+  `range` constructs an integer array from an integer count.
 
-- **Polymorphic** (no element-type annotation): `length`, `contains`, `index_of`,
-  `find`, `any`, `all`, `map`, `filter`, `reverse`, `take`, `drop`,
-  and `range`. These accept arrays of any compatible element type.
+- **Polymorphic** (type-inferred arrays): `length`, `contains`, `index_of`,
+  `find`, `any`, `all`, `count_if`, `min_by`, `max_by`,
+  `map`, `filter`, `reverse`, `take`, `drop`, and `uniq`.
+  Comparator and equality operations must be valid for the element type.
 
 ### Traversal functions
 
@@ -100,6 +102,9 @@ List/array operations over native arrays. Functions fall into two categories:
 | `find` | `fn find(pred, xs) -> Option[T]` | First matching element, or `None`. |
 | `any` | `fn any(pred, xs) -> Bool` | True if any element satisfies the predicate. |
 | `all` | `fn all(pred, xs) -> Bool` | True if all elements satisfy the predicate. |
+| `count_if` | `fn count_if(pred, xs) -> Int` | Number of elements matching `pred`, without allocating an intermediate array. |
+| `min_by` | `fn min_by(cmp, xs) -> Option[T]` | Minimum according to a strict comparator; keeps the first equivalent item. |
+| `max_by` | `fn max_by(cmp, xs) -> Option[T]` | Maximum according to a strict comparator; keeps the first equivalent item. |
 | `fold` | `fn fold(f, init: Int, xs: [Int]) -> Int` | Left fold: `fold(f, init, [a,b,c])` = `f(f(f(init, a), b), c)`. |
 | `max_of` | `fn max_of(xs: [Int]) -> Option[Int]` | Maximum element, or `None` for an empty array. |
 | `min_of` | `fn min_of(xs: [Int]) -> Option[Int]` | Minimum element, or `None` for an empty array. |
@@ -114,6 +119,7 @@ List/array operations over native arrays. Functions fall into two categories:
 | `take` | `fn take(n, xs)` | Take first `n` elements. |
 | `drop` | `fn drop(n, xs)` | Drop first `n` elements. |
 | `range` | `fn range(n)` | Array of `[0, 1, ..., n-1]`. |
+| `uniq` | `fn uniq(xs)` | Remove duplicates using equality, retaining first occurrence order. |
 
 ### Usage
 
@@ -127,6 +133,7 @@ let s = sum(xs)                // 15
 let c = contains(3, xs)        // true
 let i = index_of(4, xs)        // Some(3)
 let y = any(fn(x) { x > 3 }, xs)   // true
+let n = count_if(fn(x) { x > 3 }, xs) // 2
 let z = fold(fn(a, b) { a + b }, 0, xs)  // 15
 
 // Array-producing
@@ -146,6 +153,8 @@ import stdlib::list
 // String arrays work with polymorphic functions
 let excited = map(fn(s) { s + "!" }, ["a", "b", "c"])  // ["a!", "b!", "c!"]
 let short   = filter(fn(s) { perform String.length(s) <= 4 }, ["hi", "hello", "hey"])  // ["hi", "hey"]
+
+let unique = uniq(["a", "b", "a"])                         // ["a", "b"]
 
 // Int-only numerical/ordering operations still reject incompatible element types.
 ```

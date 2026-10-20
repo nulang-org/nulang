@@ -1,10 +1,10 @@
 // Nulang standard library — list/array operations over native arrays.
 // Language version: 2.0.0-alpha
 //
-// Polymorphic functions (map, filter, reverse, take, drop, range, length,
-// contains, index_of, find, any, all) work with any element type. Functions with explicit
-// [Int] annotations (sum, fold, max_of, min_of, sort, append, zip, enumerate,
-// uniq) are Int-only for now.
+// Polymorphic functions include map, filter, reverse, take, drop, length,
+// contains, index_of, find, any, all, count_if, min_by, max_by, and uniq.
+// sum, fold, max_of, min_of, sort, append, zip and enumerate retain their
+// current explicit Int-specific signatures where declared.
 //
 // Built on `perform Array.push` / `perform Array.new` / `perform Array.length`
 // primitives (added 2026-07-30).
@@ -66,6 +66,16 @@ pub fn find(pred, xs) {
         if pred(x) then { return Some(x) } else {}
     };
     None
+}
+
+/// Count matching elements in one traversal, without allocating a filtered array.
+/// The predicate runs exactly once per input element, left to right.
+pub fn count_if(pred, xs) -> Int {
+    var count = 0;
+    for x in xs {
+        if pred(x) then { count = count + 1 } else {}
+    };
+    count
 }
 
 /// Left fold: fold(f, init, [a, b, c]) = f(f(f(init, a), b), c).
@@ -212,27 +222,35 @@ pub fn sort_by(cmp, xs) {
 }
 
 /// Minimum element according to comparator cmp(a, b), or None for an empty array.
+/// Supports any element type accepted by cmp; equal elements retain the first.
 pub fn min_by(cmp, xs) {
-    var first = true;
-    var best = 0;
-    for x in xs {
-        if first then { best = x; first = false } else {
-            if cmp(x, best) then { best = x } else {}
-        }
-    };
-    if first then None else Some(best)
+    let len = perform Array.length(xs);
+    if len == 0 then { None } else {
+        var best = xs[0];
+        var i = 1;
+        while i < len {
+            let x = xs[i];
+            if cmp(x, best) then { best = x } else {};
+            i = i + 1
+        };
+        Some(best)
+    }
 }
 
 /// Maximum element according to comparator cmp(a, b), or None for an empty array.
+/// Supports any element type accepted by cmp; equal elements retain the first.
 pub fn max_by(cmp, xs) {
-    var first = true;
-    var best = 0;
-    for x in xs {
-        if first then { best = x; first = false } else {
-            if cmp(best, x) then { best = x } else {}
-        }
-    };
-    if first then None else Some(best)
+    let len = perform Array.length(xs);
+    if len == 0 then { None } else {
+        var best = xs[0];
+        var i = 1;
+        while i < len {
+            let x = xs[i];
+            if cmp(best, x) then { best = x } else {};
+            i = i + 1
+        };
+        Some(best)
+    }
 }
 
 /// Concatenate two arrays into a new array.  Original arrays unchanged.
@@ -270,7 +288,8 @@ pub fn enumerate(xs: [Int]) {
 }
 
 /// Remove duplicates, preserving first-occurrence order.
-pub fn uniq(xs: [Int]) -> [Int] {
+/// Works with any element type that supports equality.
+pub fn uniq(xs) {
     var result = [];
     for x in xs {
         if !contains(x, result) then { result = perform Array.push(result, x) } else {}

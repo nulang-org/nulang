@@ -335,33 +335,32 @@ f(10).1              // → 11
 
 ---
 
-### 17. List functions: some are Int-only, some are polymorphic
+### 17. List functions: distinguish type-general operations from integer helpers
 
-Stdlib `list` functions fall into two categories:
+The standard library already infers element types for functions such as
+`length`, `contains`, `index_of`, `find`, `any`, `all`,
+`map`, `filter`, `reverse`, `take`, and `drop`.
+`count_if` counts matches without producing an intermediate array.
+`min_by`, `max_by`, and `uniq` work with compatible non-integer elements.
+`range` creates an integer array, not an arbitrary element type.
 
-- **Polymorphic** (no `[Int]` annotation): `map`, `filter`, `reverse`,
-  `take`, `drop`, `range` — work with any element type (strings,
-  records, tuples, etc.).
-
-- **Int-only** (annotated `[Int]`): `length`, `sum`, `contains`,
-  `index_of`, `find`, `any`, `all`, `fold`, `max_of`, `min_of`,
-  `sort`, `append`, `zip`, `enumerate` — produce a type error when
-  passed non-Int arrays.
+Some older helpers retain explicit `Int` signatures: `sum`, `fold`,
+`max_of`, `min_of`, `sort`, `append`, `zip`, and `enumerate`.
+A separate Experimental change proposes making some of these polymorphic.
 
 ```nula
 import stdlib::list
 
-// ❌ length expects [Int]
-let n = length(["x", "y", "z"])
-// Error: Type mismatch: expected Int, found String
+// ✅ Counting, deduplication, and comparator selection can use strings.
+let labels = ["red", "blue", "red"]
+let unique_labels = uniq(labels)                     // ["red", "blue"]
+let long_labels = count_if(
+    fn(s) { perform String.length(s) > 3 },
+    labels
+)                                                    // 1
 
-// ❌ fold expects init: Int, xs: [Int]
-let r = fold(fn(acc, s) { acc + " " + s }, "hello", ["world"])
-// Error: Type mismatch: expected Int, found String
-
-// ✅ polymorphic functions work with any type
-let excited = map(fn(s) { s + "!" }, ["a", "b", "c"])  // ["a!", "b!", "c!"]
-let pos = filter(fn(r) { r.x > 0 }, [{x: 1}, {x: -1}, {x: 2}])  // [{x:1}, {x:2}]
+// ❌ This fold signature still requires an integer accumulator and elements.
+let words = fold(fn(acc, s) { acc + s }, "", ["a", "b"])
 ```
 
 ---

@@ -1,4 +1,10 @@
 # Nulang Changelog
+### Ruby-inspired collection ergonomics (Experimental) — 2026-10-20
+- **New `stdlib::list.count_if` counts predicate matches in one traversal** without allocating a filtered intermediate array.
+- **`min_by`, `max_by`, and `uniq` now accept compatible non-integer elements**, retaining existing empty-input, stable-tie, and first-occurrence semantics.
+- **The release smoke job explicitly executes `src/stdlib/list_test.nula`** to exercise new regressions in the actual Nulang language. Exact-head CI must pass before promotion.
+- This is a standard-library-only extension; it does not change stable syntax, actor ownership, bytecode, or frozen wire formats.
+
 ### Fabric on-demand mailbox scoring — 2026-10-18
 - **Fabric publish admission now reads mailbox pressure only for matching local subscribers**, instead of allocating and populating an all-actor mailbox snapshot on every publish.
 - **Ported the regression and exact-base matched-fixture A/B harness** from #1708 onto current main. Historical unmatched-publish microbenchmarks were favorable; new-head CI and measurements remain the promotion gate.
