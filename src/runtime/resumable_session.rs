@@ -262,12 +262,22 @@ impl SessionRegistry {
         if bytes.len() > self.max_bytes {
             return Err(SessionError::FrameTooLarge);
         }
-        let record = self.sessions.get_mut(session_id).ok_or(SessionError::NotFound)?;
-        let next = record.latest.0.checked_add(1).ok_or(SessionError::SequenceExhausted)?;
+        let record = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or(SessionError::NotFound)?;
+        let next = record
+            .latest
+            .0
+            .checked_add(1)
+            .ok_or(SessionError::SequenceExhausted)?;
         while record.history.len() >= self.max_frames
             || record.history_bytes > self.max_bytes - bytes.len()
         {
-            let discarded = record.history.pop_front().expect("bounded buffer has prior frames");
+            let discarded = record
+                .history
+                .pop_front()
+                .expect("bounded buffer has prior frames");
             record.history_bytes -= discarded.bytes.len();
         }
         record.history_bytes += bytes.len();
@@ -291,12 +301,16 @@ impl SessionRegistry {
         if after > record.latest {
             return Err(SessionError::CursorAhead);
         }
-        let next = record.epoch.0.checked_add(1).ok_or(SessionError::EpochExhausted)?;
+        let next = record
+            .epoch
+            .0
+            .checked_add(1)
+            .ok_or(SessionError::EpochExhausted)?;
         record.epoch = SessionCursor(next);
         record.served_through = SessionCursor(0);
         let result = Self::replay(record, after);
-        if let SessionReplay::Replayed { latest, .. } = result {
-            record.served_through = latest;
+        if let SessionReplay::Replayed { latest, .. } = &result {
+            record.served_through = *latest;
         }
         Ok(result)
     }
@@ -318,8 +332,8 @@ impl SessionRegistry {
             return Err(SessionError::CursorAhead);
         }
         let result = Self::replay(record, after);
-        if let SessionReplay::Replayed { latest, .. } = result {
-            record.served_through = record.served_through.max(latest);
+        if let SessionReplay::Replayed { latest, .. } = &result {
+            record.served_through = record.served_through.max(*latest);
         }
         Ok(result)
     }
@@ -401,7 +415,9 @@ impl SessionRegistry {
         SessionReplay::Replayed {
             epoch: record.epoch,
             latest: record.latest,
-            frames: record.history.iter()
+            frames: record
+                .history
+                .iter()
                 .filter(|entry| entry.sequence > after)
                 .cloned()
                 .collect(),
