@@ -1531,4 +1531,38 @@ mod tests {
         );
     }
 
+
+    #[test]
+    fn indirect_call_remains_sequential_only_after_alias_integration() {
+        let call = Expr::App {
+            func: Box::new(var("unknown_function")),
+            args: vec![int(1)],
+            span: sp(),
+        };
+        let summary = summarize_branch(0, &call);
+        assert!(summary.effects.contains("Call"));
+        assert_eq!(
+            summary.effect_constraint,
+            ParallelEffectConstraint::SequentialOnly,
+            "an indirect call has no proven effect or ownership summary"
+        );
+    }
+
+    #[test]
+    fn deferred_closure_retains_actor_thread_constraint_after_alias_integration() {
+        let closure = Expr::Lambda {
+            params: vec![],
+            ret_type: None,
+            body: Box::new(int(1)),
+            effect: None,
+            span: sp(),
+        };
+        let summary = summarize_branch(0, &closure);
+        assert!(summary.effects.contains("Closure.capture"));
+        assert_eq!(
+            summary.effect_constraint,
+            ParallelEffectConstraint::ActorThreadOnly,
+            "closure captures cannot be scheduled onto a worker without proof"
+        );
+    }
 }
