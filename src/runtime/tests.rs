@@ -1006,7 +1006,9 @@ fn test_supervisor_restart_refuses_unsupported_atomic_rekey() {
         before.sequence
     );
     assert!(
-        !rt.actors.values().any(|actor| actor.parent == Some(supervisor_id)),
+        !rt.actors
+            .values()
+            .any(|actor| actor.parent == Some(supervisor_id)),
         "unsupported history relocation must not publish a replacement"
     );
     std::fs::remove_dir_all(path).unwrap();
@@ -1018,10 +1020,7 @@ fn test_supervisor_restart_refuses_history_with_old_actor_self_reference() {
     let supervisor_id = rt.create_supervisor("self_ref_sup", RestartStrategy::OneForOne);
     let mut models = HashMap::new();
     models.insert("self_ref".to_string(), StateModel::Durable);
-    let child_id = rt.spawn_persistent_actor(
-        Box::new(Vec::new),
-        models,
-    );
+    let child_id = rt.spawn_persistent_actor(Box::new(Vec::new), models);
     rt.persistence
         .save_snapshot(ActorSnapshot {
             actor_id: child_id,
@@ -1039,7 +1038,9 @@ fn test_supervisor_restart_refuses_history_with_old_actor_self_reference() {
     rt.exit_actor(child_id, ExitReason::Error("simulated crash".to_string()));
     assert!(rt.persistence.load_snapshot(child_id).is_some());
     assert!(
-        !rt.actors.values().any(|actor| actor.parent == Some(supervisor_id)),
+        !rt.actors
+            .values()
+            .any(|actor| actor.parent == Some(supervisor_id)),
         "actor must not restart with a stale reference to its old identity"
     );
 }
@@ -1063,7 +1064,9 @@ fn test_supervisor_restart_refuses_missing_persistent_checkpoint() {
     rt.exit_actor(child_id, ExitReason::Error("simulated crash".to_string()));
 
     assert!(
-        !rt.actors.values().any(|actor| actor.parent == Some(supervisor_id)),
+        !rt.actors
+            .values()
+            .any(|actor| actor.parent == Some(supervisor_id)),
         "missing durable history must not silently reset an actor to its defaults"
     );
 }
@@ -1142,7 +1145,9 @@ fn test_supervisor_restart_rejects_malformed_authority_snapshot() {
     let supervisor_id = rt.create_supervisor("invalid_authority_sup", RestartStrategy::OneForOne);
     let child_id = rt.spawn_persistent_actor(Box::new(Vec::new), HashMap::new());
     let mut snapshot = rt.persistence.load_snapshot(child_id).unwrap();
-    snapshot.authority_tokens.insert("Secret::Read(".to_string());
+    snapshot
+        .authority_tokens
+        .insert("Secret::Read(".to_string());
     rt.persistence.save_snapshot(snapshot).unwrap();
     rt.supervise_child(
         supervisor_id,
@@ -1153,7 +1158,9 @@ fn test_supervisor_restart_rejects_malformed_authority_snapshot() {
 
     assert!(rt.persistence.load_snapshot(child_id).is_some());
     assert!(
-        !rt.actors.values().any(|actor| actor.parent == Some(supervisor_id)),
+        !rt.actors
+            .values()
+            .any(|actor| actor.parent == Some(supervisor_id)),
         "a malformed authority manifest must reject the entire restart"
     );
 }
