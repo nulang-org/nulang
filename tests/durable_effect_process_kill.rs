@@ -153,15 +153,22 @@ fn durability_crash_worker() {
                 if stage != "crash_prepared" {
                     let result = provider(&root, payment.id, REQUEST);
                     if stage == "crash_receipt" {
-                        assert_eq!(owner.complete(payment.id, REQUEST, result).unwrap(), RECEIPT);
+                        assert_eq!(
+                            owner.complete(payment.id, REQUEST, result).unwrap(),
+                            RECEIPT.to_vec(),
+                        );
                     }
                 }
             }
             let expected_sequence = if stage == "crash_receipt" { 2 } else { 1 };
             assert_eq!(store.latest_sequence(ACTOR_ID), expected_sequence);
-            let mut ready = File::create(root.join("ready")).expect("create crash marker");
+            // Publish only a fully written marker. Creating "ready" before
+            // writing it would race the parent's observation.
+            let pending_marker = root.join("ready.pending");
+            let mut ready = File::create(&pending_marker).expect("create crash marker");
             ready.write_all(stage.as_bytes()).expect("write crash marker");
             ready.sync_all().expect("sync crash marker");
+            fs::rename(pending_marker, root.join("ready")).expect("publish crash marker");
             // No graceful destructors: the parent sends a genuine OS kill
             // after observing the committed state marker.
             loop {
@@ -205,7 +212,7 @@ fn durability_crash_worker() {
                 }
                 other => panic!("unexpected recovery decision: {other:?}"),
             };
-            assert_eq!(result, RECEIPT);
+            assert_eq!(result, RECEIPT.to_vec());
             assert!(matches!(
                 store.load_durable_effect(ACTOR_ID, payment.id).unwrap().unwrap().effect(),
                 DurableEffectRecord::Completed { .. }
