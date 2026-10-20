@@ -18,6 +18,12 @@ impl LocalRequestRef {
     pub fn as_int(self) -> i64 {
         self.0 as i64
     }
+
+    /// Reject zero, signed negatives, and values outside the tagged-Int range.
+    pub(crate) fn from_positive_int(value: i64) -> Option<Self> {
+        (value > 0 && (value as u64) <= MAX_LOCAL_REQUEST_REF)
+            .then_some(Self(value as u64))
+    }
 }
 
 /// Address given to a trusted local reply producer. The reference is placed
@@ -173,6 +179,26 @@ impl Runtime {
                 LocalReplyStatus::Inactive
             }
         }
+    }
+
+    /// Trusted local source-effect bridge: route by reference to the owning
+    /// actor's named reply behavior, if it exists. An absent handler does not
+    /// consume a still-valid ticket, so a corrected handler can retry.
+    pub(crate) fn send_local_reply_by_reference(
+        &mut self,
+        reference: LocalRequestRef,
+        behavior: &str,
+        values: &[Value],
+    ) -> Option<LocalReplyStatus> {
+        let Some(pending) = self.local_reply_requests.pending.get(&reference).copied() else {
+            return Some(LocalReplyStatus::Inactive);
+        };
+        let behavior_id = self.behavior_id_for(pending.owner, behavior)?;
+        let ticket = LocalReplyTicket {
+            reference,
+            alias: pending.alias,
+        };
+        Some(self.send_local_reply(ticket, behavior_id, values))
     }
 
     /// Eagerly retire deadlines that are no longer valid. This is explicit:
