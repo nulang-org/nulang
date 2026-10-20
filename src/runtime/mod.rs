@@ -373,6 +373,22 @@ pub(crate) enum MessageAdmission {
     Rejected,
 }
 
+/// Why a diagnostic root audit could not establish a stable inspection point.
+///
+/// These are local gating checks, NOT a proof that the full runtime's roots
+/// have been captured. In particular, native/JIT/FFI and foreign-hold sources
+/// remain outside this audit.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OrcaRootAuditBlocked {
+    UnknownActor,
+    CrossShardChannels,
+    VmExecuting,
+    ActorExecuting,
+    PendingReceiveWake,
+    ActorRunning,
+}
+
 pub struct Runtime {
     pub actors: HashMap<u64, Actor>,
     pub supervisors: HashMap<u64, Supervisor>,
@@ -673,6 +689,61 @@ impl Runtime {
                 }
             }
         }
+    }
+
+    /// Conservatively collect observable Values for debugging ORCA roots
+    /// at a narrow, unsharded runtime inspection point.
+    ///
+    /// This is NOT a complete root snapshot, a global GC safepoint, or a
+    /// reachability proof. No object may be reclaimed based on its output:
+    /// native/JIT temporary registers, native/FFI handles, cross-shard
+    /// transfers, foreign holds and other runtime roots remain untracked.
+    ///
+    /// Rejects cross-shard channels, any active scheduler/VM execution and
+    /// pending receive-wake processing before temporarily draining mailbox
+    /// queues through their exclusive inspection visitor. A unique mutable
+    /// borrow protects the unsharded Runtime from safe Rust aliases; it does
+    /// not establish authority over independently managed native handles.
+    #[allow(dead_code)] // Future diagnostic only; no collector invokes it.
+    pub(crate) fn orca_diagnostic_roots_at_quiescence(
+        &mut self,
+        actor_id: u64,
+    ) -> Result<Vec<Value>, OrcaRootAuditBlocked> {
+        let run_state = self
+            .actors
+            .get(&actor_id)
+            .ok_or(OrcaRootAuditBlocked::UnknownActor)?
+            .run_state;
+        if self.shard_count != 1
+            || self.cross_shard_tx.is_some()
+            || self.cross_shard_rx.is_some()
+        {
+            return Err(OrcaRootAuditBlocked::CrossShardChannels);
+        }
+        if self.vm_execution_depth != 0 {
+            return Err(OrcaRootAuditBlocked::VmExecuting);
+        }
+        if self.current_actor.is_some() {
+            return Err(OrcaRootAuditBlocked::ActorExecuting);
+        }
+        if self.draining_receive_wakes || !self.pending_receive_wakes.is_empty() {
+            return Err(OrcaRootAuditBlocked::PendingReceiveWake);
+        }
+        if run_state == ActorRunState::Running {
+            return Err(OrcaRootAuditBlocked::ActorRunning);
+        }
+
+        let mut observed = Vec::new();
+        if let Some(vm) = &self.vm {
+            vm.visit_execution_values(&mut |value| observed.push(value));
+        }
+        self.visit_pending_fetched_values(&mut |value| observed.push(value));
+        let actor = self
+            .actors
+            .get_mut(&actor_id)
+            .expect("actor was validated and cannot disappear during exclusive borrow");
+        actor.visit_all_stored_values_exclusive(&mut |value| observed.push(value));
+        Ok(observed)
     }
 
     pub fn new() -> Self {
