@@ -12,6 +12,23 @@ rejected. The canonical `EffectChecker` additionally must infer a **closed
 empty** effect row. An empty row alone is never proof of purity because unresolved
 and indirect calls may not be represented in that row.
 
+## Canonically checked function entrypoint
+
+`classify_checked_function_candidate(module, name)` finds exactly one
+module-level function declaration, derives input names from its parameters,
+and runs the existing Nulang type, effect, and capability analyzers before
+screening the expression body. It requires each parameter to have an explicit
+type and `val` reference capability; missing annotations are **not**
+implicitly trusted. It also rejects default arguments, contracts, generic
+parameters, implicit `using` parameters, and declared error types.
+
+This improves over the low-level `classify_pure_candidate` API, whose
+immutable input-name list is supplied by its caller. **Neither API uses
+resolved symbol IDs or authorizes a rewrite.** The new entrypoint does
+not modify the compiler pipeline or become part of an executable backend.
+It screens only top-level function declarations and is intentionally
+incomplete for other source forms.
+
 ## Critical limitations
 
 - The input-name list is supplied by the caller. **This pass does not validate
