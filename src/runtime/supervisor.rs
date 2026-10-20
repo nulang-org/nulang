@@ -414,7 +414,10 @@ impl Supervisor {
                 );
                 return None;
             }
-            if let Err(error) = runtime.persistence.rekey_actor_history(old_actor_id, new_id) {
+            if let Err(error) = runtime
+                .persistence
+                .rekey_actor_history(old_actor_id, new_id)
+            {
                 warn!(
                     supervisor = %self.name,
                     child = %spec.id,
