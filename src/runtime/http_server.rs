@@ -1176,11 +1176,16 @@ impl WebDevServer {
                 let explicit_response = take_explicit_http_response();
                 match (rendered, explicit_response) {
                     (Ok(Some(_)), Some(Ok(response))) => response,
-                    (Ok(Some(_)), Some(Err(()))) => HttpResponse {
-                        status: 500,
-                        headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
-                        body: b"Invalid explicit response".to_vec(),
-                    },
+                    (Ok(Some(_)), Some(Err(()))) => {
+                        // Do not commit cookies when the response declaration
+                        // itself was rejected.
+                        take_response_cookies();
+                        HttpResponse {
+                            status: 500,
+                            headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
+                            body: b"Invalid explicit response".to_vec(),
+                        }
+                    }
                     (Ok(Some(body)), None) => response_from_rendered(
                         route.plan.as_ref().and_then(|plan| plan.response_type.as_deref()),
                         body,
