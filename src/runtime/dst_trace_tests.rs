@@ -126,3 +126,103 @@ fn step_bound_is_part_of_reproduction_contract() {
     let (mut fresh, _, _) = two_counters(3);
     assert_eq!(fresh.verify_deterministic_trace(&trace), Ok(trace.outcome));
 }
+
+
+#[test]
+fn forced_replay_uses_recorded_actor_choice_not_random_seed() {
+    let (mut source, _, _) = two_counters(2);
+    let mut trace = source.run_scheduler_deterministic_recorded(19, 1);
+    assert_eq!(trace.events.len(), 1);
+    let original = match trace.events[0] {
+        DeterministicScheduleEvent::ActorStep {
+            ready_count: 2,
+            selected_ready_index,
+        } => selected_ready_index,
+        ref event => panic!("expected two ready actors: {event:?}"),
+    };
+    let forced = 1 - original;
+    trace.events[0] = DeterministicScheduleEvent::ActorStep {
+        ready_count: 2,
+        selected_ready_index: forced,
+    };
+
+    let (mut fresh, first, second) = two_counters(2);
+    assert_eq!(
+        fresh.replay_deterministic_trace(&trace),
+        Ok(DeterministicRunResult::StepLimitExceeded { steps: 1 }),
+    );
+    assert_eq!(
+        fresh.actors[&first].get_state_field("count").and_then(|v| v.as_int()),
+        Some(i64::from(forced == 0)),
+    );
+    assert_eq!(
+        fresh.actors[&second].get_state_field("count").and_then(|v| v.as_int()),
+        Some(i64::from(forced == 1)),
+    );
+}
+
+#[test]
+fn forced_replay_rejects_wrong_ready_set_before_stepping_actor() {
+    let (mut source, _, _) = two_counters(2);
+    let mut trace = source.run_scheduler_deterministic_recorded(7, 100);
+    trace.events[0] = DeterministicScheduleEvent::ActorStep {
+        ready_count: 3,
+        selected_ready_index: 0,
+    };
+
+    let (mut fresh, first, second) = two_counters(2);
+    assert!(matches!(
+        fresh.replay_deterministic_trace(&trace),
+        Err(DeterministicTraceMismatch::Event { index: 0, .. })
+    ));
+    for id in [first, second] {
+        assert_eq!(
+            fresh.actors[&id].get_state_field("count").and_then(|v| v.as_int()),
+            Some(0),
+        );
+    }
+}
+
+#[test]
+fn forced_replay_rejects_truncated_trace_at_first_unrecorded_step() {
+    let (mut source, _, _) = two_counters(3);
+    let mut trace = source.run_scheduler_deterministic_recorded(7, 100);
+    trace.events.truncate(1);
+    let (mut fresh, first, second) = two_counters(3);
+
+    assert!(matches!(
+        fresh.replay_deterministic_trace(&trace),
+        Err(DeterministicTraceMismatch::Event { index: 1, expected: None, .. })
+    ));
+    let processed = [first, second]
+        .into_iter()
+        .map(|id| fresh.actors[&id].get_state_field("count").and_then(|v| v.as_int()).unwrap())
+        .sum::<i64>();
+    assert_eq!(processed, 1, "must stop immediately before unrecorded step");
+}
+
+#[test]
+fn timers_scheduled_after_virtual_clock_advance_use_logical_now() {
+    let mut rt = Runtime::new();
+    rt.install_virtual_clock();
+    rt.advance_time(Duration::from_secs(60));
+    let actor_id = rt.spawn_actor(Box::new(|| vec![("fired".to_string(), Value::int(0))]));
+    rt.actors.get_mut(&actor_id).unwrap().register_behavior("__timer_fired", |actor, _| {
+        actor.set_state_field("fired", Value::int(1));
+    });
+    let logical_now = rt.now();
+
+    // Durable recovery must re-arm relative to the installed clock rather
+    // than Instant::now(), which is now 60 seconds behind logical time.
+    rt.rearm_timer(actor_id, "wake", 5_000);
+    assert_eq!(
+        rt.timer_wheel.next_deadline(),
+        Some(logical_now + Duration::from_secs(5)),
+    );
+    rt.advance_time(Duration::from_secs(4));
+    rt.tick_timers();
+    assert_eq!(rt.actors[&actor_id].mailbox.len(), 0);
+    rt.advance_time(Duration::from_secs(1));
+    rt.tick_timers();
+    assert_eq!(rt.actors[&actor_id].mailbox.len(), 1);
+}
