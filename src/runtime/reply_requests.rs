@@ -82,8 +82,7 @@ impl Runtime {
         }
         let token = NEXT_LOCAL_REQUEST_REF
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                (current > 0 && current <= MAX_LOCAL_REQUEST_REF)
-                    .then_some(current + 1)
+                (current > 0 && current <= MAX_LOCAL_REQUEST_REF).then_some(current + 1)
             })
             .ok()?;
         let alias = self.create_local_alias(owner)?;
@@ -106,11 +105,7 @@ impl Runtime {
 
     /// Cancel exactly one request that belongs to owner; accepted replies
     /// already in the mailbox are not retracted.
-    pub fn cancel_local_reply_request(
-        &mut self,
-        owner: u64,
-        reference: LocalRequestRef,
-    ) -> bool {
+    pub fn cancel_local_reply_request(&mut self, owner: u64, reference: LocalRequestRef) -> bool {
         if self
             .local_reply_requests
             .pending
@@ -143,7 +138,12 @@ impl Runtime {
         values: &[Value],
         now: Instant,
     ) -> LocalReplyStatus {
-        let Some(pending) = self.local_reply_requests.pending.get(&ticket.reference).copied() else {
+        let Some(pending) = self
+            .local_reply_requests
+            .pending
+            .get(&ticket.reference)
+            .copied()
+        else {
             return LocalReplyStatus::Inactive;
         };
         if pending.alias != ticket.alias {
