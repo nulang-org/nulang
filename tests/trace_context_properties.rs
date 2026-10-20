@@ -20,8 +20,9 @@ fn traceparent_round_trip_preserves_identity_and_sampling_for_generated_inputs()
     let mut seed = 0x5D54_EA43_80BE_5AFEu64;
 
     for i in 0..CASES {
-        let trace_id = ((next_u64(&mut seed) as u128) << 64)
-            | (next_u64(&mut seed) as u128);
+        let high = next_u64(&mut seed);
+        let low = next_u64(&mut seed);
+        let trace_id = ((high as u128) << 64) | low as u128;
         let span_id = next_u64(&mut seed);
         // Zero identifiers are invalid by contract; skip those inputs.
         if trace_id == 0 || span_id == 0 {
@@ -73,8 +74,9 @@ fn trace_children_keep_causality_and_sampling_across_many_generations() {
 fn invalid_hex_bytes_in_trace_and_span_ids_are_always_rejected() {
     let mut seed = 0xE4C2_91A7_55D8_0FB3u64;
     for case in 0..128 {
-        let mut trace_id = ((next_u64(&mut seed) as u128) << 64)
-            | next_u64(&mut seed) as u128;
+        let high = next_u64(&mut seed);
+        let low = next_u64(&mut seed);
+        let mut trace_id = ((high as u128) << 64) | low as u128;
         let mut span_id = next_u64(&mut seed);
         if trace_id == 0 {
             trace_id = 1;
