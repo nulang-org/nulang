@@ -84,9 +84,12 @@ def command_output(
 
 
 def maybe_version(command: list[str]) -> str | None:
+    """Best-effort metadata probe: unavailable or hung tools must not block reports."""
     try:
-        return command_output(command, diagnostics_on_failure=False).strip()
-    except (FileNotFoundError, subprocess.CalledProcessError):
+        return command_output(
+            command, diagnostics_on_failure=False, timeout_seconds=5.0
+        ).strip()
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return None
 
 
