@@ -57,6 +57,20 @@ impl SemanticMemory {
         }
     }
 
+    /// Attach an embedding provider after restore, or change providers.
+    ///
+    /// Document vectors are rebuilt because provider functions are not
+    /// serialized. Call this before querying a restored memory that was
+    /// created with a custom embedding function.
+    pub fn set_embedding_fn(&mut self, embedding_fn: Option<EmbeddingFn>) {
+        self.embedding_fn = embedding_fn;
+        self.embeddings = self
+            .documents
+            .iter()
+            .map(|doc| self.embed(&doc.content))
+            .collect();
+    }
+
     /// Store a fact and return its deterministic document id.
     pub fn store(
         &mut self,
@@ -338,6 +352,26 @@ mod tests {
         assert_eq!(memory.search("rust", 1)[0].0.content, "rust");
         // Two writes and two query embeddings, not six total embeddings.
         assert_eq!(CALLS.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn restored_custom_memory_can_reattach_its_embedding_provider() {
+        fn embed(text: &str) -> Vec<f32> {
+            if text.contains("rust") {
+                vec![1.0, 0.0]
+            } else {
+                vec![0.0, 1.0]
+            }
+        }
+
+        let mut memory = SemanticMemory::new(2, Some(embed));
+        memory.store("rust", HashMap::new());
+        memory.store("database", HashMap::new());
+        let mut restored: SemanticMemory =
+            serde_json::from_str(&serde_json::to_string(&memory).unwrap()).unwrap();
+
+        restored.set_embedding_fn(Some(embed));
+        assert_eq!(restored.search("rust", 1)[0].0.content, "rust");
     }
 
     #[test]
