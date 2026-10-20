@@ -178,6 +178,117 @@
               "type": "string"
             }
           }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "goal_id",
+            "reason"
+          ],
+          "properties": {
+            "type": {
+              "const": "goal_blocked"
+            },
+            "goal_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "reason": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "task_id",
+            "agent_id",
+            "reason"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_blocked"
+            },
+            "task_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "agent_id": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "task_id",
+            "agent_id",
+            "reason"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_failed"
+            },
+            "task_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "agent_id": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "task_id",
+            "agent_id",
+            "evidence"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_verified"
+            },
+            "task_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "agent_id": {
+              "type": "string"
+            },
+            "evidence": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "required": [
+                  "criterion",
+                  "artifact_ref"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "criterion": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "artifact_ref": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              }
+            }
+          }
         }
       ]
     }
