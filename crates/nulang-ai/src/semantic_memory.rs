@@ -395,4 +395,49 @@ mod tests {
         assert_eq!(memory.search("remaining", 1)[0].0.content, "remaining record");
     }
 
+    #[test]
+    fn restored_custom_embeddings_fail_closed_until_provider_attached() {
+        fn custom(text: &str) -> Vec<f32> {
+            if text.contains("rust") {
+                vec![1.0, 0.0]
+            } else {
+                vec![0.0, 1.0]
+            }
+        }
+        let mut memory = SemanticMemory::new(2, Some(custom));
+        memory.store("rust fact", HashMap::new());
+        memory.store("database fact", HashMap::new());
+
+        let serialized = serde_json::to_string(&memory).unwrap();
+        let mut restored: SemanticMemory = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(
+            restored.search_checked("rust", 1).unwrap_err(),
+            SemanticMemoryError::MissingEmbeddingProvider
+        );
+        assert!(restored.search("rust", 1).is_empty());
+
+        restored.set_embedding_fn(Some(custom));
+        assert_eq!(restored.search_checked("rust", 1).unwrap()[0].0.content, "rust fact");
+    }
+
+    #[test]
+    fn custom_memory_after_restore_does_not_generate_mixed_vectors() {
+        fn custom(text: &str) -> Vec<f32> {
+            if text.contains("rust") { vec![1.0, 0.0] } else { vec![0.0, 1.0] }
+        }
+        let mut memory = SemanticMemory::new(2, Some(custom));
+        memory.store("rust", HashMap::new());
+
+        let mut restored: SemanticMemory =
+            serde_json::from_str(&serde_json::to_string(&memory).unwrap()).unwrap();
+        restored.store("database", HashMap::new());
+        assert_eq!(
+            restored.search_checked("rust", 1).unwrap_err(),
+            SemanticMemoryError::MissingEmbeddingProvider
+        );
+        restored.set_embedding_fn(Some(custom));
+        assert_eq!(restored.search_checked("database", 1).unwrap()[0].0.content, "database");
+    }
+
 }
