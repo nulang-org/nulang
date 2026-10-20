@@ -815,6 +815,34 @@ pub fn render_route_handler(
     }
 }
 
+/// Fail closed when a compiler-bound scalar query or form parameter has more
+/// than one decoded value. The legacy parser remains backward-compatible for
+/// repeated *unbound* keys, including future multi-value form controls.
+fn duplicate_bound_input_response(
+    captured: &HttpRequestBindingInputs,
+    route: &RuntimeWebRoute,
+) -> Option<HttpResponse> {
+    let binding = captured.ambiguous_bound_input(&route.plan.as_ref()?.bindings)?;
+    let source = match binding.source {
+        crate::web::bindings::RouteBindingSource::Query => "query",
+        crate::web::bindings::RouteBindingSource::Form => "form",
+        _ => return None,
+    };
+    let problem = serde_json::json!({
+        "type": "urn:nulang:web:ambiguous_request_input",
+        "title": "Ambiguous request input",
+        "status": 400,
+        "code": "ambiguous_request_input",
+        "source": source,
+        "source_name": binding.source_name,
+    });
+    Some(HttpResponse {
+        status: 400,
+        headers: vec![("Content-Type".into(), "application/problem+json".into())],
+        body: serde_json::to_vec(&problem).expect("fixed problem fields are serializable"),
+    })
+}
+
 fn invalid_ui_action_response(captured: &HttpRequestBindingInputs) -> Option<HttpResponse> {
     captured
         .ui_message_error
@@ -1037,7 +1065,9 @@ impl WebDevServer {
         {
             let captured =
                 HttpRequestBindingInputs::capture(&request.path, &request.headers, &request.body);
-            if let Some(response) = invalid_ui_action_response(&captured) {
+            if let Some(response) = duplicate_bound_input_response(&captured, route) {
+                response
+            } else if let Some(response) = invalid_ui_action_response(&captured) {
                 response
             } else {
                 let values = captured.values(&params, &request.headers);
