@@ -1,0 +1,7 @@
+[package]
+name = "typed-api"
+version = "0.1.0"
+
+[web]
+port = 3000
+output_dir = "dist"

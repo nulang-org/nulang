@@ -1415,8 +1415,32 @@ fn cmd_build_web() -> NuResult<()> {
         span: Span::default(),
     })?;
 
+    // Emit compile-time signal graph if the entry uses `signal` declarations.
+    let signals_path = output_dir.join("app.signals.json");
+    nulang_exe(&[
+        "--emit-signals",
+        &signals_path.to_string_lossy(),
+        &entry_str,
+    ])?;
+
+    // Generate deployment IR consumed by adapters and Nulang Cloud.
+    let ir = crate::web::ir::generate_deployment_ir(
+        &routes,
+        Some(&signals_path),
+        &src_root,
+        &manifest.budgets,
+        &validated_contracts,
+    );
     eprintln!("  Rendering {} route(s)...", routes.len());
-    for route in &routes {
+    // The compiler IR is authoritative for placement. A server route may
+    // require request arguments, persistent state or privileged effects;
+    // invoking it at build time is incorrect and can leak data into dist/.
+    debug_assert_eq!(routes.len(), ir.routes.len());
+    for (route, ir_route) in routes.iter().zip(&ir.routes) {
+        if ir_route.placement != "static" {
+            eprintln!("    {} {} -> server (not statically rendered)", route.method.as_str(), route.path);
+            continue;
+        }
         let html = render_route_handler(&route.handler_module, route.handler_func_idx, None)
             .ok_or_else(|| NuError::PackageError {
                 msg: format!("failed to render route {:?} {}", route.method, route.path),
@@ -1443,22 +1467,6 @@ fn cmd_build_web() -> NuResult<()> {
         copy_dir_contents(&static_dir, &output_dir)?;
     }
 
-    // Emit compile-time signal graph if the entry uses `signal` declarations.
-    let signals_path = output_dir.join("app.signals.json");
-    nulang_exe(&[
-        "--emit-signals",
-        &signals_path.to_string_lossy(),
-        &entry_str,
-    ])?;
-
-    // Generate deployment IR consumed by adapters and Nulang Cloud.
-    let ir = crate::web::ir::generate_deployment_ir(
-        &routes,
-        Some(&signals_path),
-        &src_root,
-        &manifest.budgets,
-        &validated_contracts,
-    );
     let ir_path = output_dir.join("nulang-app.ir.json");
     let ir_json = ir.to_json();
     std::fs::write(&ir_path, ir_json).map_err(|e| NuError::PackageError {
