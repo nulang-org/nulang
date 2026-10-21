@@ -1554,7 +1554,11 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                         .unwrap_or_default();
                     #[cfg(feature = "ureq")]
                     {
-                        match ureq::get(&url).call() {
+                        let agent = match crate::registry::client::verified_https_agent() {
+                            Ok(agent) => agent,
+                            Err(_) => return Some(Value::nil()),
+                        };
+                        match agent.get(&url).call() {
                             Ok(response) => match response.into_string() {
                                 Ok(body) => {
                                     let bytes = body.into_bytes();
@@ -1613,7 +1617,11 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                         .unwrap_or_default();
                     #[cfg(feature = "ureq")]
                     {
-                        match ureq::post(&url).send_string(&body) {
+                        let agent = match crate::registry::client::verified_https_agent() {
+                            Ok(agent) => agent,
+                            Err(_) => return Some(Value::nil()),
+                        };
+                        match agent.post(&url).send_string(&body) {
                             Ok(response) => match response.into_string() {
                                 Ok(body) => {
                                     let bytes = body.into_bytes();
