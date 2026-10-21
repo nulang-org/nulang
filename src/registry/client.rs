@@ -38,10 +38,10 @@ pub(crate) fn verified_https_agent(target_url: &str) -> Result<ureq::Agent, Stri
                     .is_ok_and(|ip| ip.is_loopback())
         } else {
             let (host, _) = authority.split_once(':').unwrap_or((authority, ""));
-            host.eq_ignore_ascii_case("localhost")
-                || host
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|ip| ip.is_loopback())
+            // A hostname is not proof of loopback: local DNS/NSS rules may
+            // resolve "localhost" to an external address. Require an IP literal.
+            host.parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
         };
         if !loopback {
             return Err(
@@ -243,6 +243,7 @@ mod tls_transport_tests {
             "http://registry.example.test/api/v1/packages",
             "http://203.0.113.2:8080/api/v1/deploy",
             "http://localhost.evil.test/api/v1/deploy",
+            "http://localhost:8080/api/v1/packages",
             "http://user@localhost:8080/api/v1/deploy",
             "http://localhost@evil.test/api/v1/deploy",
         ] {
@@ -252,7 +253,6 @@ mod tls_transport_tests {
             );
         }
         for url in [
-            "http://localhost:8080/api/v1/packages",
             "http://127.0.0.1:8080/api/v1/packages",
             "http://[::1]:8080/api/v1/packages",
         ] {
