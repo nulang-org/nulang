@@ -556,16 +556,28 @@ pub fn encode_runtime_message(message: &RuntimeToHostMessage) -> serde_json::Res
     serde_json::to_string(message)
 }
 
+/// Decode and validate a runtime message before it can cross a host boundary.
+/// JSON shape alone does not establish protocol or semantic-tree validity.
 pub fn decode_runtime_message(input: &str) -> serde_json::Result<RuntimeToHostMessage> {
-    serde_json::from_str(input)
+    let message: RuntimeToHostMessage = serde_json::from_str(input)?;
+    message
+        .validate()
+        .map_err(<serde_json::Error as serde::de::Error>::custom)?;
+    Ok(message)
 }
 
 pub fn encode_host_message(message: &HostToRuntimeMessage) -> serde_json::Result<String> {
     serde_json::to_string(message)
 }
 
+/// Decode and validate a host action envelope; decoding does not authorize
+/// action execution, which remains the responsibility of the runtime.
 pub fn decode_host_message(input: &str) -> serde_json::Result<HostToRuntimeMessage> {
-    serde_json::from_str(input)
+    let message: HostToRuntimeMessage = serde_json::from_str(input)?;
+    message
+        .validate()
+        .map_err(<serde_json::Error as serde::de::Error>::custom)?;
+    Ok(message)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
