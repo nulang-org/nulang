@@ -1,0 +1,15 @@
+[package]
+name = "nulang-numeric"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Experimental zero-copy read-only numeric views for Nulang"
+repository = "https://github.com/nulang-org/nulang"
+publish = false
+
+# Experimental Rust-side prototype, deliberately independent from the
+# language core and its workspace/lockfile.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
