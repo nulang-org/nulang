@@ -825,6 +825,11 @@ pub fn generate_client_runtime() -> String {
   const signals = Object.create(null);
   const signalBindings = Object.create(null);
   const attributeBindings = Object.create(null);
+  // Maps allow each DOM scope to be hydrated/disposed without retaining nodes
+  // through duplicate listener or signal registrations.
+  const mountedSignals = new WeakMap();
+  const mountedAttributes = new WeakMap();
+  const mountedActions = new WeakMap();
 
   function isBindableAttribute(attribute) {
     if (attribute === 'class' || attribute === 'title' || attribute === 'placeholder') {
@@ -838,7 +843,8 @@ pub fn generate_client_runtime() -> String {
     const bindings = signalBindings[name];
     if (bindings) {
       bindings.forEach(function (el) {
-        el.textContent = signals[name];
+        const value = String(signals[name] ?? '');
+        if (el.textContent !== value) el.textContent = value;
       });
     }
     const attrs = attributeBindings[name];
@@ -846,8 +852,10 @@ pub fn generate_client_runtime() -> String {
       attrs.forEach(function (binding) {
         const value = signals[name];
         if (value === null || value === undefined) {
-          binding.el.removeAttribute(binding.attribute);
-        } else {
+          if (binding.el.hasAttribute(binding.attribute)) {
+            binding.el.removeAttribute(binding.attribute);
+          }
+        } else if (binding.el.getAttribute(binding.attribute) !== String(value)) {
           binding.el.setAttribute(binding.attribute, String(value));
         }
       });
@@ -920,19 +928,30 @@ pub fn generate_client_runtime() -> String {
     window.location.reload();
   }
 
-  function hydrate() {
-    document.querySelectorAll('[data-signal]').forEach(function (el) {
+  function within(root, selector) {
+    const found = Array.from(root.querySelectorAll(selector));
+    if (root.matches && root.matches(selector)) found.unshift(root);
+    return found;
+  }
+
+  function hydrate(root) {
+    const scope = root || document;
+    const changed = new Set();
+
+    within(scope, '[data-signal]').forEach(function (el) {
+      if (mountedSignals.has(el)) return;
       const name = el.dataset.signal;
-      if (!(name in signals)) {
-        signals[name] = el.textContent;
-      }
-      if (!signalBindings[name]) {
-        signalBindings[name] = [];
-      }
+      if (!name) return;
+      if (!(name in signals)) signals[name] = el.textContent;
+      if (!signalBindings[name]) signalBindings[name] = [];
       signalBindings[name].push(el);
+      mountedSignals.set(el, name);
+      changed.add(name);
     });
 
-    document.querySelectorAll('[data-nulang-bind]').forEach(function (el) {
+    within(scope, '[data-nulang-bind]').forEach(function (el) {
+      if (mountedAttributes.has(el)) return;
+      const bindings = [];
       Array.from(el.attributes).forEach(function (attr) {
         const prefix = 'data-nulang-bind-';
         if (attr.name.indexOf(prefix) !== 0) return;
@@ -940,17 +959,21 @@ pub fn generate_client_runtime() -> String {
         if (!isBindableAttribute(attribute)) return;
         const name = attr.value;
         if (!name) return;
-        if (!(name in signals)) {
-          signals[name] = el.getAttribute(attribute);
-        }
+        if (!(name in signals)) signals[name] = el.getAttribute(attribute);
         if (!attributeBindings[name]) attributeBindings[name] = [];
-        attributeBindings[name].push({ el: el, attribute: attribute });
+        const binding = { el: el, attribute: attribute };
+        attributeBindings[name].push(binding);
+        bindings.push({ signal: name, binding: binding });
+        changed.add(name);
       });
+      mountedAttributes.set(el, bindings);
     });
 
-    document.querySelectorAll('[data-action]').forEach(function (el) {
+    within(scope, '[data-action]').forEach(function (el) {
+      if (mountedActions.has(el)) return;
       const handler = el.dataset.action;
       const placement = el.dataset.actionPlacement;
+      if (!handler) return;
       const listener = function (e) {
         e.preventDefault();
         if (placement === 'server') {
@@ -961,14 +984,54 @@ pub fn generate_client_runtime() -> String {
           runClientAction(handler);
         }
       };
-      el.addEventListener('click', listener);
-      if (el.tagName === 'FORM') {
-        el.addEventListener('submit', listener);
-      }
+      // A form must only invoke on submit, not on clicks that bubble from
+      // controls inside it. Standalone action elements remain click-driven.
+      const event = el.tagName === 'FORM' ? 'submit' : 'click';
+      el.addEventListener(event, listener);
+      mountedActions.set(el, { event: event, listener: listener });
+    });
+
+    // Newly mounted nodes must reflect the current signal value, not stale
+    // HTML left behind by an older server render or an asynchronous patch.
+    changed.forEach(refreshSignal);
+  }
+
+  function dispose(root) {
+    const scope = root || document;
+    within(scope, '[data-signal]').forEach(function (el) {
+      const name = mountedSignals.get(el);
+      if (!name) return;
+      signalBindings[name] = (signalBindings[name] || []).filter(function (node) {
+        return node !== el;
+      });
+      if (!signalBindings[name].length) delete signalBindings[name];
+      mountedSignals.delete(el);
+    });
+
+    within(scope, '[data-nulang-bind]').forEach(function (el) {
+      const bindings = mountedAttributes.get(el);
+      if (!bindings) return;
+      bindings.forEach(function (entry) {
+        const list = attributeBindings[entry.signal] || [];
+        attributeBindings[entry.signal] = list.filter(function (item) {
+          return item !== entry.binding;
+        });
+        if (!attributeBindings[entry.signal].length) delete attributeBindings[entry.signal];
+      });
+      mountedAttributes.delete(el);
+    });
+
+    within(scope, '[data-action]').forEach(function (el) {
+      const bound = mountedActions.get(el);
+      if (!bound) return;
+      el.removeEventListener(bound.event, bound.listener);
+      mountedActions.delete(el);
     });
   }
 
   window.nulang = {
+    hydrate: hydrate,
+    dispose: dispose,
     signal: function (name) {
       return {
         get: function () { return signals[name]; },
@@ -981,9 +1044,9 @@ pub fn generate_client_runtime() -> String {
   };
 
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', hydrate);
+    document.addEventListener('DOMContentLoaded', function () { hydrate(document); });
   } else {
-    hydrate();
+    hydrate(document);
   }
 })();"#
         .to_string()
