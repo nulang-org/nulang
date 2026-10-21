@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Renderer-neutral UI action event uniqueness — 2026-10-21
+- **A semantic UI node can no longer bind the same event to multiple action handlers.** The shared `nulang-ui/1` validator rejects ambiguous per-node events, avoiding divergent handler selection between DOM, SwiftUI, and future Compose hosts. Different events on one node and the same event on different nodes remain valid.
+- **Atomic UI patches preserve the last valid document and revision** when a `ReplaceActions` operation would introduce a duplicate binding. Public protocol regressions cover rejection, unchanged state, and accepted disjoint events. The wire format and protocol version remain unchanged.
+
 ### Bounded Nulang Web development-server connections — 2026-10-16
 - **The experimental Web development listener caps active connections at 64**, including SSE, and returns `503` with `Retry-After: 1` when full.
 - **Worker capacity is returned by a scoped RAII lease** after normal completion, panic, or thread-spawn failure. One shared `Arc` route table replaces per-connection clones of compiled route modules.
