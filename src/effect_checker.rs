@@ -973,7 +973,17 @@ impl EffectChecker {
         allowed: &EffectRow,
     ) -> NuResult<()> {
         let inferred = self.infer_effects(ctx, expr)?;
-        if !effect_row_subset(&inferred, allowed) {
+        // Known-effect inclusion is sufficient for the inference fixpoint,
+        // but it cannot prove a checked contract between *independent*
+        // unresolved row variables. Until Region substitution/unification is
+        // implemented, only the same tail variable can satisfy an open
+        // effect contract without losing information.
+        let unrelated_open_tails = matches!(
+            (&inferred, allowed),
+            (EffectRow::Open(_, inferred_tail), EffectRow::Open(_, allowed_tail))
+                if inferred_tail != allowed_tail
+        );
+        if unrelated_open_tails || !effect_row_subset(&inferred, allowed) {
             // Identify which effects are not allowed for a better error message.
             let offending: Vec<String> = inferred
                 .effects()
@@ -982,7 +992,13 @@ impl EffectChecker {
                 .map(|e| format!("{}", e))
                 .collect();
             let span = expr_span(expr);
-            let msg = if offending.is_empty() {
+            let msg = if unrelated_open_tails {
+                format!(
+                    "unrelated unresolved effect tails: effects {} cannot be proven within allowed effects {}; resolve the row variables before checking this contract",
+                    format_row(&inferred),
+                    format_row(allowed)
+                )
+            } else if offending.is_empty() {
                 format!(
                     "effects {} are not a subset of allowed effects {}",
                     format_row(&inferred),
@@ -3210,6 +3226,54 @@ mod tests {
         let row = checker.infer_effects(&ctx, &handle_expr).unwrap();
         // The IO effect should be handled (removed from the body row).
         assert!(!row.contains(&Effect::IO));
+    }
+
+    #[test]
+    fn test_check_effects_rejects_unrelated_open_effect_tails() {
+        // Identical known effects do not prove that two independent row
+        // variables denote the same additional effects.
+        let mut checker = EffectChecker::new();
+        checker.fn_rows.insert(
+            "unknown_effects".to_string(),
+            EffectRow::Open(vec![Effect::IO], Region::fresh()),
+        );
+        let allowed = EffectRow::Open(vec![Effect::IO], Region::fresh());
+        let ctx = EffectContext::with_allowed(allowed.clone());
+        let call = Expr::App {
+            func: Box::new(Expr::Var("unknown_effects".to_string(), s())),
+            args: vec![],
+            span: s(),
+        };
+        let error = checker.check_effects(&ctx, &call, &allowed).unwrap_err();
+        match error {
+            NuError::EffectError { msg, .. } => {
+                assert!(
+                    msg.contains("unrelated unresolved effect tails"),
+                    "diagnostic should explain the unsafe row variables: {msg}"
+                );
+            }
+            other => panic!("expected effect-contract error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_check_effects_accepts_shared_open_effect_tail() {
+        // A shared row variable denotes the same unknown effects on both
+        // sides; widening the known allowance remains safe.
+        let tail = Region::fresh();
+        let mut checker = EffectChecker::new();
+        checker.fn_rows.insert(
+            "shared_effects".to_string(),
+            EffectRow::Open(vec![Effect::IO], tail),
+        );
+        let allowed = EffectRow::Open(vec![Effect::IO, Effect::FS], tail);
+        let ctx = EffectContext::with_allowed(allowed.clone());
+        let call = Expr::App {
+            func: Box::new(Expr::Var("shared_effects".to_string(), s())),
+            args: vec![],
+            span: s(),
+        };
+        assert!(checker.check_effects(&ctx, &call, &allowed).is_ok());
     }
 
     #[test]
