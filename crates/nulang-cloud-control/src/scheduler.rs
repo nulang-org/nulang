@@ -3,7 +3,91 @@ use crate::model::{
     ObservedAllocation, PlacementPlan, PlanError, PlannedAllocation, Rejection, RejectionCode,
     ScoreBreakdown, SupersededAllocation, SupersededReason,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+/// Hard resource ceiling for one tenant across its deployments.
+///
+/// `None` means that accelerator capacity is governed only by node placement;
+/// CPU and memory limits are always explicit. The control plane must obtain
+/// `TenantResourceUsage` from trusted committed allocation state, rather than
+/// from a deployment request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantResourceBudget {
+    pub cpu_millis: u64,
+    pub memory_mib: u64,
+    pub accelerators: Option<u64>,
+}
+
+/// Aggregate active resources already charged to a tenant, excluding the
+/// deployment currently being evaluated.
+///
+/// Excluding the target deployment makes replacement and scale-down planning
+/// exact: its entire desired replica set is charged once, whether a replica is
+/// retained or newly placed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TenantResourceUsage {
+    pub cpu_millis: u64,
+    pub memory_mib: u64,
+    pub accelerators: u64,
+}
+
+impl TenantResourceUsage {
+    fn for_deployment(deployment: &DeploymentSpec) -> Result<Self, PlanError> {
+        let replicas = u64::from(deployment.replicas);
+        let cpu_millis = u64::from(deployment.resources.cpu_millis)
+            .checked_mul(replicas)
+            .ok_or(PlanError::TenantUsageOverflow {
+                resource: "CPU",
+            })?;
+        let memory_mib = deployment
+            .resources
+            .memory_mib
+            .checked_mul(replicas)
+            .ok_or(PlanError::TenantUsageOverflow {
+                resource: "memory",
+            })?;
+        let accelerators = deployment
+            .resources
+            .accelerator
+            .as_ref()
+            .map(|accelerator| u64::from(accelerator.count))
+            .unwrap_or(0)
+            .checked_mul(replicas)
+            .ok_or(PlanError::TenantUsageOverflow {
+                resource: "accelerators",
+            })?;
+
+        Ok(Self {
+            cpu_millis,
+            memory_mib,
+            accelerators,
+        })
+    }
+
+    fn checked_add(self, right: Self) -> Result<Self, PlanError> {
+        Ok(Self {
+            cpu_millis: self
+                .cpu_millis
+                .checked_add(right.cpu_millis)
+                .ok_or(PlanError::TenantUsageOverflow {
+                    resource: "CPU",
+                })?,
+            memory_mib: self
+                .memory_mib
+                .checked_add(right.memory_mib)
+                .ok_or(PlanError::TenantUsageOverflow {
+                    resource: "memory",
+                })?,
+            accelerators: self
+                .accelerators
+                .checked_add(right.accelerators)
+                .ok_or(PlanError::TenantUsageOverflow {
+                    resource: "accelerators",
+                })?,
+        })
+    }
+}
 
 /// Build a deterministic placement plan from desired state and an observed cluster snapshot.
 ///
@@ -242,6 +326,56 @@ pub fn plan_evaluation(
         superseded,
         blocked,
     })
+}
+
+/// Build a placement plan only if the tenant can afford the deployment's full
+/// desired resource footprint.
+///
+/// `usage_excluding_deployment` must be derived from committed active
+/// allocations for every other deployment owned by the tenant. This function
+/// intentionally charges all desired replicas, including retained ones, before
+/// placement. That prevents an existing allocation from becoming an uncharged
+/// escape hatch and makes scale-down release capacity deterministically.
+pub fn plan_evaluation_with_tenant_budget(
+    evaluation: &Evaluation,
+    deployment: &DeploymentSpec,
+    nodes: &[NodeDescriptor],
+    allocations: &[ObservedAllocation],
+    budget: TenantResourceBudget,
+    usage_excluding_deployment: TenantResourceUsage,
+) -> Result<PlacementPlan, PlanError> {
+    let desired = TenantResourceUsage::for_deployment(deployment)?;
+    let projected = usage_excluding_deployment.checked_add(desired)?;
+    enforce_tenant_budget(projected, budget)?;
+    plan_evaluation(evaluation, deployment, nodes, allocations)
+}
+
+fn enforce_tenant_budget(
+    usage: TenantResourceUsage,
+    budget: TenantResourceBudget,
+) -> Result<(), PlanError> {
+    for (resource, requested, limit) in [
+        ("CPU", usage.cpu_millis, budget.cpu_millis),
+        ("memory", usage.memory_mib, budget.memory_mib),
+    ] {
+        if requested > limit {
+            return Err(PlanError::TenantBudgetExceeded {
+                resource,
+                requested,
+                limit,
+            });
+        }
+    }
+    if let Some(limit) = budget.accelerators {
+        if usage.accelerators > limit {
+            return Err(PlanError::TenantBudgetExceeded {
+                resource: "accelerators",
+                requested: usage.accelerators,
+                limit,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn retention_rejections(deployment: &DeploymentSpec, node: &NodeDescriptor) -> Vec<Rejection> {
@@ -677,6 +811,94 @@ mod tests {
             Err(PlanError::RevisionMismatch {
                 evaluation: 99,
                 deployment: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn test_tenant_budget_rejects_full_desired_cpu_before_placement() {
+        let spec = deployment(2);
+        let budget = TenantResourceBudget {
+            cpu_millis: 1_500,
+            memory_mib: 4_096,
+            accelerators: None,
+        };
+
+        assert_eq!(
+            plan_evaluation_with_tenant_budget(
+                &evaluation(),
+                &spec,
+                &[node(1, "us-east", "a", 8_000, 8_192)],
+                &[],
+                budget,
+                TenantResourceUsage::default(),
+            ),
+            Err(PlanError::TenantBudgetExceeded {
+                resource: "CPU",
+                requested: 2_000,
+                limit: 1_500,
+            })
+        );
+    }
+
+    #[test]
+    fn test_tenant_budget_charges_retained_target_once() {
+        let spec = deployment(1);
+        let existing = ObservedAllocation {
+            deployment_id: "api".into(),
+            revision: 2,
+            replica: 0,
+            node_id: 1,
+            epoch: 4,
+            state: AllocationState::Running,
+        };
+        let budget = TenantResourceBudget {
+            cpu_millis: 1_000,
+            memory_mib: 512,
+            accelerators: None,
+        };
+
+        let plan = plan_evaluation_with_tenant_budget(
+            &evaluation(),
+            &spec,
+            &[node(1, "us-east", "a", 4_000, 4_096)],
+            &[existing],
+            budget,
+            TenantResourceUsage::default(),
+        )
+        .unwrap();
+
+        assert_eq!(plan.retained.len(), 1);
+        assert!(plan.placements.is_empty());
+    }
+
+    #[test]
+    fn test_tenant_budget_rejects_accelerator_overage() {
+        let mut spec = deployment(1);
+        spec.resources.accelerator = Some(crate::model::AcceleratorRequirement {
+            model: None,
+            count: 1,
+            min_vram_mib_each: 0,
+        });
+        let budget = TenantResourceBudget {
+            cpu_millis: 1_000,
+            memory_mib: 512,
+            accelerators: Some(0),
+        };
+
+        assert_eq!(
+            plan_evaluation_with_tenant_budget(
+                &evaluation(),
+                &spec,
+                &[],
+                &[],
+                budget,
+                TenantResourceUsage::default(),
+            ),
+            Err(PlanError::TenantBudgetExceeded {
+                resource: "accelerators",
+                requested: 1,
+                limit: 0,
             })
         );
     }
