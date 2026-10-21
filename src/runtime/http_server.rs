@@ -584,7 +584,7 @@ fn stage_explicit_http_response(response: Result<HttpResponse, ()>) {
 
 /// Admit root-relative redirects only. Reject cross-origin, CRLF, control
 /// bytes, and markup characters before constructing a Location header.
-fn valid_explicit_redirect_target(target: &str) -> bool {
+pub(crate) fn valid_explicit_redirect_target(target: &str) -> bool {
     let bytes = target.as_bytes();
     !bytes.is_empty()
         && bytes.len() <= 8192
