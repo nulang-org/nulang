@@ -159,7 +159,10 @@ fn try_spawn_actor_with_id(
     };
 
     let mut actor = if let Some(mut pooled) = rt.actor_pool.pop() {
-        pooled.reset(id, format!("actor_{}", id), 0);
+        // Reuse the pooled actor's name buffer rather than allocating a new
+        // formatted String on every recycle. The reset still clears all
+        // per-actor state before the new actor becomes observable.
+        pooled.reset_with_generated_name(id, 0);
         pooled
     } else {
         Actor::new(id, format!("actor_{}", id), 0)
@@ -617,6 +620,21 @@ mod authority_tests {
     use crate::authority::AuthorityGrant;
     use crate::bytecode::CodeModule;
     use crate::runtime::persistence::PersistenceStore;
+
+    #[test]
+    fn test_spawn_from_pool_reuses_default_name_buffer() {
+        let mut rt = Runtime::new();
+        let pooled = Actor::new(1, "actor_00000000000000000000", 0);
+        let name_ptr = pooled.name.as_ptr();
+        rt.actor_pool.push(pooled);
+
+        let id = rt.spawn_actor(Box::new(Vec::new));
+        let actor = rt.actors.get(&id).expect("spawned pooled actor");
+        assert_eq!(actor.name, format!("actor_{id}"));
+        assert_eq!(actor.name.as_ptr(), name_ptr);
+        assert_eq!(actor.id, id);
+        assert_eq!(actor.state, crate::runtime::ActorState::Running);
+    }
 
     fn secret_manifest(name: &str) -> AuthorityManifest {
         AuthorityManifest::from_tokens([format!("Secret::Read({name})")].iter().map(String::as_str))
