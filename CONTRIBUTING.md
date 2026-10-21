@@ -14,6 +14,28 @@ cargo build --release
 Requires Rust 1.95.0 (pinned by `rust-toolchain.toml`), Linux or macOS.
 Windows is unsupported; use WSL.
 
+## Verify the first-run developer workflow
+
+A native CLI build can exercise the end-user path without modifying the repository:
+
+```sh
+cargo build --locked --bin nulang
+python3 scripts/smoke_first_run.py --bin /tmp/cargo-target/debug/nulang
+```
+
+The smoke creates a disposable `lib` project and checks CLI version, inline
+evaluation, scaffolding, type checking, compilation to a **nonempty** bytecode
+artifact, execution, a nonempty passing test suite, and formatting idempotence.
+It does not publish, deploy, access remote registries, or leave a generated
+project behind. Use a path to the actual compiled binary: the source
+`.cargo/config.toml` redirects Cargo's default target directory.
+
+The same command runs in the CI **Nula Package Test** job against the exact
+release-profile binary produced by the Release Build job. It cannot run if
+that upstream job fails; a skipped smoke is not passing evidence. The Python
+fixture tests run through `python3 -m unittest discover -s scripts/tests
+-p 'test_*.py'`, but they do not replace a real binary smoke.
+
 ## Run the tests
 
 ```bash
