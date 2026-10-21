@@ -6,6 +6,11 @@ repositories {
     mavenCentral()
 }
 
+dependencies {
+    // Streaming parser only; no Jackson databind, reflection, or polymorphic DTOs.
+    implementation("com.fasterxml.jackson.core:jackson-core:2.22.3")
+}
+
 kotlin {
     jvmToolchain(17)
 }
@@ -20,6 +25,14 @@ tasks.register<JavaExec>("protocolConformance") {
     mainClass.set("org.nulang.ui.ProtocolConformanceTestsKt")
 }
 
+tasks.register<JavaExec>("jsonCodecConformance") {
+    group = "verification"
+    description = "Execute the strict Kotlin/JVM JSON ingress regression suite"
+    dependsOn(tasks.named("testClasses"))
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("org.nulang.ui.JsonCodecConformanceTestsKt")
+}
+
 tasks.named("check") {
-    dependsOn("protocolConformance")
+    dependsOn("protocolConformance", "jsonCodecConformance")
 }
