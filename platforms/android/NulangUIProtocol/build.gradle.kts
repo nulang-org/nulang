@@ -33,6 +33,16 @@ tasks.register<JavaExec>("jsonCodecConformance") {
     mainClass.set("org.nulang.ui.JsonCodecConformanceTestsKt")
 }
 
+tasks.register<JavaExec>("goldenWireConformance") {
+    group = "verification"
+    description = "Assert shared Rust/Kotlin v1 JSON fixtures and error behavior"
+    dependsOn(tasks.named("testClasses"))
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("org.nulang.ui.GoldenWireParityTestsKt")
+    // Shared fixtures live at repository root, three levels above projectDir.
+    workingDir = rootProject.projectDir
+}
+
 tasks.named("check") {
-    dependsOn("protocolConformance", "jsonCodecConformance")
+    dependsOn("protocolConformance", "jsonCodecConformance", "goldenWireConformance")
 }
