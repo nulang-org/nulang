@@ -140,6 +140,20 @@ threshold before timing and excludes enqueue time for both backends; it also
 emits a `[backend-bench]` AOT speedup line. The tiering probes preconstruct
 fresh VMs so their timed sections include interpreter execution and JIT
 compilation/native execution, but not source compilation or VM/module setup.
+The legacy `ab/enqueue_payload_0` probe intentionally keeps its historical
+setup behavior. Spawn-time actor dispatch may leave `Runtime::current_trace`
+set or unset depending on tracing policy, so it is not a controlled comparison
+of traced versus untraced admission across implementations. Two additional
+Nulang-only probes, `ab/enqueue_payload_0_explicit_untraced` and
+`ab/enqueue_payload_0_explicit_traced`, force the same trace state *after*
+spawn-time scheduler setup in both baseline and candidate builds. Each sends
+100,000 zero-argument messages, verifies exact admission and eventual drain,
+and excludes setup/drain/destruction from timing. Compare each matched probe
+against itself in the paired exact-base report; do not compare the two modes'
+absolute numbers as if they represented the same operation. A branch that
+introduces these probes will report them as candidate-only until the benchmark
+harness exists on both compared revisions.
+
 The mailbox-vs-runtime pair is diagnostic: it isolates how much local-send cost
 lives above message construction and mailbox admission before routing or
 scheduler changes are attempted. The warmed JIT pair is likewise diagnostic:
