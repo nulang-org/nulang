@@ -10,6 +10,7 @@
 
 use crate::ast::{BinOp, UnOp};
 use crate::bytecode::{ActorMeta, Constant};
+use crate::compiler_intrinsics::MirIntrinsic;
 use crate::types::{Capability, Type};
 
 // ---------------------------------------------------------------------------
@@ -49,7 +50,7 @@ pub struct Module {
     /// Saga compensation pairs: `(step_behavior_idx, compensation_behavior_idx)`,
     /// where `step_behavior_idx` is the step's ABSOLUTE (whole-module)
     /// index into `behaviors` — codegen matches it against each actor's
-    /// `ActorMeta::behavior_indices`, so an actor declared before a
+    /// `ActorMeta.behavior_indices`, so an actor declared before a
     /// workflow cannot hijack the workflow's compensations.
     /// `compensation_behavior_idx` is also an absolute index into
     /// `behaviors`. Compensation bodies are never dispatched by name —
@@ -210,6 +211,10 @@ pub enum RValue {
     ArrayLit(Vec<LocalId>),
     Unary(UnOp, LocalId),
     Binary(BinOp, LocalId, LocalId),
+    /// Pure compiler-owned operation with backend-neutral semantics.
+    /// Unlike `Perform`, intrinsics are not part of the user-visible effect
+    /// namespace and therefore cannot be intercepted by effect handlers.
+    Intrinsic(MirIntrinsic),
     /// String equality (variant tag tests).
     StringEq(LocalId, LocalId),
     /// String concatenation: `s1 + s2`.
@@ -576,6 +581,7 @@ mod tests {
     use super::*;
     use crate::ast::{BinOp, UnOp};
     use crate::bytecode::Constant;
+    use crate::compiler_intrinsics::{IntegerIntrinsic, MirIntrinsic};
 
     #[test]
     fn test_local_id() {
@@ -635,6 +641,9 @@ mod tests {
         let _ = RValue::ArrayLit(vec![LocalId(0)]);
         let _ = RValue::Unary(UnOp::Neg, LocalId(0));
         let _ = RValue::Binary(BinOp::Add, LocalId(0), LocalId(1));
+        let _ = RValue::Intrinsic(
+            MirIntrinsic::new(IntegerIntrinsic::Popcount, vec![LocalId(0)]).unwrap(),
+        );
         let _ = RValue::StringEq(LocalId(0), LocalId(1));
         let _ = RValue::Call {
             func: FuncRef::Index(0),
