@@ -1,7 +1,7 @@
 use nulang::bytecode::CodeModule;
 use nulang::lexer::Lexer;
 use nulang::parser::Parser;
-use nulang::runtime::{HttpMethod, WebDevServer, WebRoute};
+use nulang::runtime::{render_route_handler, HttpMethod, WebDevServer, WebRoute};
 use nulang::typechecker::TypeChecker;
 use nulang::web::contracts::compile_module_contracts;
 use nulang::web::runtime_bindings::{compile_runtime_route_plan, RuntimeWebRoute};
