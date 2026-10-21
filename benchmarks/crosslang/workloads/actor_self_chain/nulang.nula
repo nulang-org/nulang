@@ -1,0 +1,25 @@
+actor Chain {
+    state remaining: Int = 0
+    state turns: Int = 0
+
+    behavior start(n: Int) {
+        self.remaining = n
+        send self tick()
+    }
+
+    behavior tick() {
+        self.turns = self.turns + 1
+        self.remaining = self.remaining - 1
+        if self.remaining > 0 then {
+            send self tick()
+        } else {
+            perform IO.print(self.turns)
+        }
+    }
+}
+
+fn main() {
+    let chain = spawn Chain {}
+    send chain start(250000)
+    unit
+}
