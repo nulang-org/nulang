@@ -103,6 +103,6 @@ fn probe_remote_native_tls(certificate_san: &str, expect_bearer: bool) {
         .contains(&format!("authorization: bearer {SECRET}"));
     assert_eq!(
         bearer_arrived, expect_bearer,
-        "unexpected bearer delivery for certificate SAN {certificate_san}: expected {expect_bearer}"
+        "bearer delivery did not match the certificate validation expectation"
     );
 }
