@@ -1823,7 +1823,8 @@ impl NulangLanguageServer {
         };
 
         // Parse
-        let ast = match Parser::new(tokens).parse_module() {
+        let mut parser = Parser::new(tokens);
+        let ast = match parser.parse_module() {
             Ok(a) => a,
             Err(e) => {
                 diagnostics.extend(nu_error_to_diagnostic(e));
@@ -1836,6 +1837,15 @@ impl NulangLanguageServer {
                 };
             }
         };
+
+        // Parser warnings (including RFC 0015 deprecations) must not vanish
+        // in the editor; preserve the same codes the CLI already emits.
+        diagnostics.extend(
+            parser
+                .take_warnings()
+                .iter()
+                .map(|warning| warning_to_lsp_diagnostic(warning, source)),
+        );
 
         // Type check — collect all errors so we surface every problem,
         // not just the first. Downstream effect/capability checks still
@@ -2346,6 +2356,46 @@ impl NulangLanguageServer {
         }
         doc_lines.reverse();
         Some(doc_lines.join("\n"))
+    }
+}
+
+/// Map a parser warning to LSP's UTF-16 coordinates, using the current
+/// document's source rather than a thread-local source map.
+fn warning_to_lsp_diagnostic(warning: &crate::types::NuWarning, source: &str) -> Diagnostic {
+    fn position_at(source: &str, byte_offset: u32) -> Position {
+        let mut offset = (byte_offset as usize).min(source.len());
+        while !source.is_char_boundary(offset) {
+            offset -= 1;
+        }
+        let prefix = &source[..offset];
+        let line = prefix.as_bytes().iter().filter(|&&byte| byte == b'\n').count();
+        let column = prefix
+            .rsplit('\n')
+            .next()
+            .unwrap_or("")
+            .encode_utf16()
+            .count();
+        Position::new(line as u32, column as u32)
+    }
+
+    let message = match &warning.help {
+        Some(help) => format!("{}\nHelp: {}", warning.msg, help),
+        None => warning.msg.clone(),
+    };
+
+    Diagnostic {
+        range: Range::new(
+            position_at(source, warning.span.start),
+            position_at(source, warning.span.end),
+        ),
+        severity: Some(DiagnosticSeverity::WARNING),
+        code: Some(NumberOrString::String(warning.code.to_string())),
+        code_description: None,
+        source: Some("nulang".to_string()),
+        message,
+        related_information: None,
+        tags: None,
+        data: None,
     }
 }
 
@@ -3925,6 +3975,59 @@ mod lsp_tests {
         let engine = InlayHintEngine::new("fun foo) bar(");
         let hints = engine.generate_inlay_hints(None, None, None);
         assert!(hints.is_empty());
+    }
+
+    #[test]
+    fn test_deprecated_catch_warning_is_published_to_lsp() {
+        let source = "fn main() = catch Ok(1) 0";
+        let diagnostics = NulangLanguageServer::compute_diagnostics(source).diagnostics;
+        let warning = diagnostics
+            .iter()
+            .find(|d| matches!(&d.code, Some(NumberOrString::String(code)) if code == "W0101"))
+            .expect("the existing parser warning must reach the language server");
+        assert_eq!(warning.severity, Some(DiagnosticSeverity::WARNING));
+        assert!(warning.message.contains("deprecated `catch`"));
+        assert_eq!(warning.range.start, Position::new(0, 12));
+    }
+
+    #[test]
+    fn test_postfix_catch_warning_highlights_catch_keyword() {
+        let source = "fn main() { Ok(1) catch 0 }";
+        let diagnostics = NulangLanguageServer::compute_diagnostics(source).diagnostics;
+        let warning = diagnostics
+            .iter()
+            .find(|d| matches!(&d.code, Some(NumberOrString::String(code)) if code == "W0101"))
+            .expect("postfix catch should emit W0101");
+        let column = source.find("catch").unwrap() as u32;
+        assert_eq!(warning.range.start, Position::new(0, column));
+        assert_eq!(warning.range.end, Position::new(0, column + 5));
+    }
+
+    #[test]
+    fn test_fail_warning_is_published_to_lsp() {
+        let source = "fn main() { fail Error(\"oops\") }";
+        let diagnostics = NulangLanguageServer::compute_diagnostics(source).diagnostics;
+        assert!(
+            diagnostics.iter().any(|d| {
+                matches!(&d.code, Some(NumberOrString::String(code)) if code == "W0102")
+                    && d.severity == Some(DiagnosticSeverity::WARNING)
+            }),
+            "deprecated fail must produce a coded editor warning: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn test_warning_span_is_utf16_accurate_after_non_bmp_text() {
+        let source = "let symbol = \"😀\"; catch Ok(1) 0";
+        let start = source.find("catch").unwrap();
+        let warning = crate::types::NuWarning::deprecated_catch(
+            crate::types::Span::new(start as u32, (start + 5) as u32),
+        );
+        let diagnostic = warning_to_lsp_diagnostic(&warning, source);
+        let utf16_col = source[..start].encode_utf16().count() as u32;
+        assert_eq!(diagnostic.range.start, Position::new(0, utf16_col));
+        assert_eq!(diagnostic.range.end, Position::new(0, utf16_col + 5));
+        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
     }
 
     #[test]

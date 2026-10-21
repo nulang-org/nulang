@@ -3072,7 +3072,9 @@ impl Parser {
             // Catch expression: expr catch fallback_expr
             // Desugars to match expr { Ok(x) => x, Error(_) => fallback }
             if self.consume_if(&TokenKind::Catch) {
-                let span = self.current_span();
+                // `consume_if` advanced past the keyword. Retain the consumed
+                // token's location for diagnostics and desugared source maps.
+                let span = self.tokens[self.pos - 1].span;
                 self.warnings.push(NuWarning::deprecated_catch(span));
                 if self.consume_if(&TokenKind::LBrace) {
                     // Block form: expr catch { | pat => body, ... }
