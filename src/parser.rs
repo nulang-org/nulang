@@ -2578,7 +2578,38 @@ impl Parser {
                 self.current_span(),
             ));
         }
-        let items = Vec::new();
+        // Explicit selective import: import stdlib::math { abs, factorial }
+        // Unlike a full import, it does not inject unrelated names into scope.
+        let mut items = Vec::new();
+        if self.consume_if(&TokenKind::LBrace) {
+            self.skip_newlines();
+            if self.match_token(&TokenKind::RBrace) {
+                return Err(NuError::parse_error(
+                    "selective import must list at least one name".to_string(),
+                    self.current_span(),
+                ));
+            }
+            loop {
+                let item = self.expect_ident("imported name")?;
+                if items.contains(&item) {
+                    return Err(NuError::parse_error(
+                        format!("duplicate imported name '{item}'"),
+                        self.current_span(),
+                    ));
+                }
+                items.push(item);
+                self.skip_newlines();
+                if self.consume_if(&TokenKind::Comma) {
+                    self.skip_newlines();
+                    if self.match_token(&TokenKind::RBrace) {
+                        break; // trailing comma
+                    }
+                } else {
+                    break;
+                }
+            }
+            self.expect(TokenKind::RBrace)?;
+        }
         self.skip_newlines_semicolons();
         Ok(Decl::Import { path, items, span })
     }
@@ -8993,4 +9024,20 @@ mod tests {
         let result = parse_expr("par");
         assert!(result.is_err(), "bare 'par' must be a parse error");
     }
+    #[test]
+    fn test_parse_selective_imports() {
+        let ast = parse("import stdlib::math { abs, factorial, }").expect("selective import");
+        assert!(matches!(
+            &ast.decls[0],
+            Decl::Import { path, items, .. }
+                if path == "stdlib::math" && items == &vec!["abs".to_string(), "factorial".to_string()]
+        ));
+    }
+
+    #[test]
+    fn test_parse_selective_import_rejects_empty_or_duplicate_names() {
+        assert!(parse("import stdlib::math {}").is_err());
+        assert!(parse("import stdlib::math { abs, abs }").is_err());
+    }
+
 }

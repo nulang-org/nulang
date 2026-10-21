@@ -53,7 +53,9 @@ pub fn resolve_imports(
         // If the file has already been fully resolved in this compilation,
         // reuse its cached declarations.
         if let Some(cached) = IMPORT_CACHE.with(|c| c.borrow().get(&resolved_canonical).cloned()) {
-            merge_imported_decls(module, cached, import_path, true)?;
+            // Cache the *full* source module, not a previous importer's selection.
+            let selected = select_import_decls(cached, items, import_path)?;
+            merge_imported_decls(module, selected, import_path, true)?;
             continue;
         }
 
@@ -85,17 +87,15 @@ pub fn resolve_imports(
 
         resolve_imports(&mut imported, &resolved_canonical, stack)?;
 
-        let imported_decls = if items.is_empty() {
-            imported.decls
-        } else {
-            filter_decls(imported.decls, items)
-        };
-
+        // Store unfiltered exports. Multiple imports of the same module may
+        // request disjoint subsets, including on a cache hit.
+        let all_decls = imported.decls;
         IMPORT_CACHE.with(|c| {
             c.borrow_mut()
-                .insert(resolved_canonical, imported_decls.clone())
+                .insert(resolved_canonical, all_decls.clone())
         });
-        merge_imported_decls(module, imported_decls, import_path, false)?;
+        let selected = select_import_decls(all_decls, items, import_path)?;
+        merge_imported_decls(module, selected, import_path, false)?;
     }
     module.decls.retain(|d| !matches!(d, Decl::Import { .. }));
     stack.remove(&canonical_file);
@@ -276,6 +276,98 @@ fn decl_name(decl: &Decl) -> Option<&str> {
     }
 }
 
+/// Fail rather than silently omitting misspelled names from a selective import.
+fn select_import_decls(
+    decls: Vec<Decl>,
+    items: &[String],
+    import_path: &str,
+) -> NuResult<Vec<Decl>> {
+    if items.is_empty() {
+        return Ok(decls);
+    }
+    let available: HashSet<&str> = decls.iter().filter_map(decl_name).collect();
+    if let Some(missing) = items.iter().find(|item| !available.contains(item.as_str())) {
+        return Err(NuError::RuntimeError {
+            msg: format!("import '{}' has no declaration named '{}'", import_path, missing),
+            span: Span::default(),
+        });
+    }
+    // Import resolution currently flattens declarations into the caller. It
+    // cannot keep a private dependency closure: silently omitting a sibling
+    // helper or a type would create a broken program. Until module namespaces
+    // exist, allow only selections that are demonstrably self-contained.
+    let selected: HashSet<&str> = items.iter().map(String::as_str).collect();
+    let module_names: HashSet<&str> = decls.iter().filter_map(decl_name).collect();
+
+    // Type references may occur in signatures, constructors, and patterns;
+    // this pass does not yet track them all. Reject partial type namespaces
+    // rather than allowing a type-correctness bug to escape.
+    if let Some(name) = decls.iter().find_map(|decl| {
+        if matches!(decl, Decl::TypeAlias { .. } | Decl::RecordType { .. } | Decl::VariantType { .. })
+            && decl_name(decl).is_some_and(|n| !selected.contains(n))
+        {
+            decl_name(decl)
+        } else {
+            None
+        }
+    }) {
+        return Err(NuError::RuntimeError {
+            msg: format!(
+                "selective import from '{}' would omit type '{}'; import the complete module until namespace dependencies are supported",
+                import_path, name
+            ),
+            span: Span::default(),
+        });
+    }
+
+    for decl in &decls {
+        let Some(name) = decl_name(decl) else {
+            // Other declarations (including module-level lets, instances,
+            // effects and module declarations) may provide necessary state
+            // or authority. Restrict selection to independent function/type
+            // modules until their linkage is modeled explicitly.
+            return Err(NuError::RuntimeError {
+                msg: format!(
+                    "selective import from '{}' cannot safely omit non-function declarations; import the complete module",
+                    import_path
+                ),
+                span: Span::default(),
+            });
+        };
+        if !selected.contains(name) {
+            continue;
+        }
+        if let Decl::Function {
+            body, params, using_params, default_values, requires, ensures, ..
+        } = decl
+        {
+            let mut bound: Vec<String> = params.iter().chain(using_params.iter())
+                .map(|p| p.name.clone()).collect();
+            let mut referenced = Vec::new();
+            crate::effect_checker::free_vars(body, &mut bound, &mut referenced);
+            for default in default_values.iter().flatten() {
+                crate::effect_checker::free_vars(default, &mut bound, &mut referenced);
+            }
+            for contract in requires.iter().chain(ensures.iter()) {
+                crate::effect_checker::free_vars(contract, &mut bound, &mut referenced);
+            }
+            if let Some(missing) = referenced.iter().find(|candidate| {
+                module_names.contains(candidate.as_str())
+                    && !selected.contains(candidate.as_str())
+            }) {
+                return Err(NuError::RuntimeError {
+                    msg: format!(
+                        "selective import of '{}' from '{}' omits required module declaration '{}'; import it too or import the whole module",
+                        name, import_path, missing
+                    ),
+                    span: Span::default(),
+                });
+            }
+        }
+    }
+    Ok(filter_decls(decls, items))
+}
+
 fn filter_decls(decls: Vec<Decl>, items: &[String]) -> Vec<Decl> {
     if items.is_empty() {
         return decls;
@@ -390,4 +482,71 @@ mod tests {
         );
         std::env::remove_var("NULANG_MODULE_PATH");
     }
+    #[test]
+    fn test_resolve_cached_import_applies_each_selection() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("nulang-import-test-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("helpers.nula");
+        std::fs::write(&source, "fn alpha() = 1\nfn beta() = 2\n").unwrap();
+        let mut module = AstModule {
+            name: "test".into(),
+            decls: vec![
+                Decl::Import { path: "helpers".into(), items: vec!["alpha".into()], span: sp() },
+                Decl::Import { path: "helpers".into(), items: vec!["beta".into()], span: sp() },
+            ],
+        };
+        let result = resolve_imports(&mut module, &dir.join("main.nula"), &mut HashSet::new());
+        let _ = std::fs::remove_dir_all(&dir);
+        result.expect("both names should be imported after a cache hit");
+        assert_eq!(module.decls.iter().filter(|d| decl_name(d) == Some("alpha")).count(), 1);
+        assert_eq!(module.decls.iter().filter(|d| decl_name(d) == Some("beta")).count(), 1);
+    }
+
+    #[test]
+    fn test_selective_import_rejects_omitted_function_dependency() {
+        let mut parser = Parser::new(
+            Lexer::new("fn abs(x: Int) = if x < 0 then -x else x\nfn gcd(a: Int, b: Int) = abs(a)")
+                .lex()
+                .expect("valid source"),
+        );
+        let decls = parser.parse_module().expect("parse test module").decls;
+        let result = select_import_decls(decls, &["gcd".into()], "math");
+        assert!(result.is_err(), "selecting gcd must not silently discard abs");
+    }
+
+    #[test]
+    fn test_selective_import_accepts_standalone_function() {
+        let mut parser = Parser::new(
+            Lexer::new("fn abs(x: Int) = if x < 0 then -x else x\nfn gcd(a: Int, b: Int) = abs(a)")
+                .lex()
+                .expect("valid source"),
+        );
+        let decls = parser.parse_module().expect("parse test module").decls;
+        let selected = select_import_decls(decls, &["abs".into()], "math")
+            .expect("independent function should be selectable");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(decl_name(&selected[0]), Some("abs"));
+    }
+
+    #[test]
+    fn test_selective_import_rejects_omitted_module_type() {
+        let mut parser = Parser::new(
+            Lexer::new("type Id = Int\nfn use_id(id: Id) -> Id = id")
+                .lex()
+                .expect("valid source"),
+        );
+        let decls = parser.parse_module().expect("parse test module").decls;
+        let result = select_import_decls(decls, &["use_id".into()], "types");
+        assert!(result.is_err(), "type dependencies must not silently disappear");
+    }
+
+    #[test]
+    fn test_resolve_selective_import_rejects_unknown_name() {
+        let decls = vec![fn_decl("alpha")];
+        let result = select_import_decls(decls, &["missing".into()], "helpers");
+        assert!(result.is_err(), "unknown import names must not be ignored");
+    }
+
 }

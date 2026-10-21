@@ -49,6 +49,27 @@ test.assert_eq(40 + 2, 42)
 assert_eq(40 + 2, 42)
 ```
 
+To avoid collisions, you can import only the symbols you need:
+
+```nula
+import stdlib::math { abs, factorial }
+
+let magnitude = abs(-5)
+```
+
+The selected names remain **unqualified**. This does not add module aliases
+or permit `math.abs(-5)`. Unknown names and repeated names in a selection
+are errors; an empty selection is also an error. Full imports remain available.
+
+**Experimental limitation:** The module resolver still flattens imports. For
+safety, a selective import is rejected if it would omit a referenced sibling
+function or a type declaration; modules containing unhandled declarations
+(e.g. module-level bindings or instances) must also use full imports.
+For example, `import stdlib::math { gcd }` is rejected because `gcd` calls
+`abs`. Use `import stdlib::math { gcd, abs }` or import the whole module.
+Proper private dependency linkage without public name leakage still requires
+a module-aware resolver and is not yet implemented.
+
 > **Built-in effects don't need an import at all.**  You can write
 > `perform Test.assert_eq(a, b)` or `perform FS.read(path)` directly,
 > without any `import`.  The `Test`, `FS`, `IO`, `String`, and `Int`
