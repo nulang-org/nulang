@@ -7,7 +7,7 @@ use nulang_ui_protocol::{
 };
 use serde_json::{json, Value};
 
-fn test_action_message() -> Value {
+fn action_message() -> Value {
     json!({
         "type": "invoke_action",
         "protocol": "nulang-ui-msg/1",
@@ -23,7 +23,7 @@ fn test_action_message() -> Value {
     })
 }
 
-fn test_snapshot_message() -> Value {
+fn snapshot_message() -> Value {
     json!({
         "type": "snapshot",
         "protocol": "nulang-ui-msg/1",
