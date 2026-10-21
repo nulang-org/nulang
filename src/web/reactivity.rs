@@ -787,13 +787,19 @@ pub fn generate_client_runtime() -> String {
   // Object.prototype (e.g. constructor, toString, __proto__).
   const signals = Object.create(null);
   const signalBindings = Object.create(null);
+  const signalSubscribers = Object.create(null);
 
   function refreshSignal(name) {
     const bindings = signalBindings[name];
-    if (!bindings) return;
-    bindings.forEach(function (el) {
-      el.textContent = signals[name];
-    });
+    if (bindings) {
+      bindings.forEach(function (el) {
+        el.textContent = signals[name];
+      });
+    }
+    const subscribers = signalSubscribers[name];
+    if (subscribers) {
+      subscribers.forEach(function (listener) { listener(signals[name]); });
+    }
   }
 
   function runClientAction(handler) {
@@ -898,8 +904,18 @@ pub fn generate_client_runtime() -> String {
       return {
         get: function () { return signals[name]; },
         set: function (value) {
+          if (Object.is(signals[name], value)) return;
           signals[name] = value;
           refreshSignal(name);
+        },
+        subscribe: function (listener) {
+          if (typeof listener !== 'function') throw new TypeError('signal listener required');
+          if (!signalSubscribers[name]) signalSubscribers[name] = new Set();
+          signalSubscribers[name].add(listener);
+          return function () {
+            signalSubscribers[name].delete(listener);
+            if (signalSubscribers[name].size === 0) delete signalSubscribers[name];
+          };
         }
       };
     }
@@ -931,6 +947,15 @@ mod tests {
     use super::*;
     use crate::lexer::Lexer;
     use crate::parser::Parser;
+
+    #[test]
+    fn generated_runtime_exposes_disposable_signal_subscriptions() {
+        let javascript = generate_client_runtime();
+        assert!(javascript.contains("subscribe: function (listener)"));
+        assert!(javascript.contains("signalSubscribers[name].delete(listener)"));
+        assert!(javascript.contains("subscribers.forEach(function (listener)"));
+        assert!(javascript.contains("Object.is(signals[name], value)"));
+    }
 
     fn parse(source: &str) -> AstModule {
         let tokens = Lexer::new(source).lex().unwrap();
