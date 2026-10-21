@@ -4,7 +4,7 @@
 //!   nulang [OPTIONS] <FILE>
 //!   nulang --repl
 //!   nulang --eval <CODE>
-//!   nulang --check <FILE>
+//!   nulang --check <FILE> [--inspect-types]
 //!   nulang --lsp
 //!   nulang --dap [FILE]
 //!   nulang agent <init|run|chat|goals|graph>
@@ -15,6 +15,7 @@
 //!   -r, --repl               Start interactive REPL
 //!   -e, --eval <CODE>        Evaluate a code string
 //!   -c, --check <FILE>       Type-check a file (don't run)
+//!   --inspect-types          Print inferred declaration types with --check
 //!   --doc                    Generate Markdown API docs (docs/api.md)
 //!   --emit-stdlib-docs <dir> Generate per-effect stdlib docs into <dir>
 //!   --lsp                    Start Language Server (stdio)
@@ -442,6 +443,7 @@ fn main() {
             }
             "-v" | "--verbose" => opts.verbose = true,
             "--all-errors" => opts.all_errors = true,
+            "--inspect-types" => opts.inspect_types = true,
             "--json" => opts.json = true,
             "--deny-warnings" => opts.deny_warnings = true,
             "--metrics-port" => {
@@ -532,6 +534,7 @@ fn main() {
                     "--repl",
                     "--eval",
                     "--check",
+                    "--inspect-types",
                     "--lsp",
                     "--dap",
                     "--doc",
@@ -578,6 +581,39 @@ fn main() {
 
     if opts.emit_behavior_manifest.is_some() && !opts.emit_nbc {
         eprintln!("Error: --emit-behavior-manifest currently requires --emit-nbc");
+        std::process::exit(1);
+    }
+
+    // Type inspection is a read-only companion to --check. Keep the existing
+    // --json diagnostics schema unchanged until introspection has its own
+    // versioned machine-readable contract.
+    if opts.inspect_types && opts.check_file.is_none() {
+        eprintln!("Error: --inspect-types requires --check <FILE>");
+        std::process::exit(1);
+    }
+    if opts.inspect_types && opts.json {
+        eprintln!("Error: --inspect-types cannot be combined with --json");
+        std::process::exit(1);
+    }
+    // Reject all alternative execution/compilation modes before their
+    // dispatch paths. An inspection request must never evaluate user code.
+    if opts.inspect_types
+        && (opts.eval_code.is_some()
+            || opts.watch.is_some()
+            || opts.init.is_some()
+            || opts.repl
+            || opts.lsp
+            || opts.dap
+            || opts.doc
+            || opts.explain.is_some()
+            || opts.emit_nbc
+            || opts.emit_stdlib_docs.is_some()
+            || opts.emit_signals.is_some()
+            || opts.rewrite_signals.is_some()
+            || opts.bench_count.is_some()
+            || !positional.is_empty())
+    {
+        eprintln!("Error: --inspect-types cannot be combined with another command mode");
         std::process::exit(1);
     }
 
@@ -808,6 +844,24 @@ fn main() {
                 std::process::exit(1);
             }
         };
+        if opts.inspect_types {
+            match run_frontend(
+                &source,
+                Some(&path),
+                false,
+                &opts.with_capabilities,
+                opts.deny_warnings,
+            ) {
+                Ok((_, checker)) => {
+                    print!("{}", format_inferred_decl_types(&checker));
+                    return;
+                }
+                Err(e) => {
+                    print_error(&e, use_color);
+                    std::process::exit(exit_code(&e));
+                }
+            }
+        }
         if let Err(e) = check_source(
             &source,
             Some(&path),
@@ -1027,6 +1081,7 @@ struct Options {
     dap: bool,
     doc: bool,
     verbose: bool,
+    inspect_types: bool,
     backend: String,
     out_file: Option<String>,
     /// Compile the input to a `.nbc` artifact and write it, don't run.
@@ -1090,6 +1145,7 @@ impl Default for Options {
             dap: false,
             doc: false,
             verbose: false,
+            inspect_types: false,
             backend: "bytecode".to_string(),
             out_file: None,
             emit_nbc: false,
@@ -1133,6 +1189,7 @@ fn print_help() {
     println!("  -r, --repl       Start interactive REPL");
     println!("  -e, --eval       Evaluate a code string");
     println!("  -c, --check      Type-check a file (don't run)");
+    println!("  --inspect-types   Print inferred declaration types with --check (no execution)");
     println!("  --doc            Generate Markdown API docs (docs/api.md)");
     println!("  --emit-stdlib-docs <dir>  Generate per-effect stdlib Markdown docs into <dir>");
     println!("  --lsp            Start Language Server (stdio)");
@@ -2669,6 +2726,20 @@ fn run_nbc_module(
         vm.load_module(module);
         Ok((vm.run()?, None))
     }
+}
+
+/// Render existing frontend type facts without changing compilation or execution.
+/// Sorted output makes it easy to diff type changes between compiler revisions.
+/// This reports top-level inferred types, not allocation behavior, JIT
+/// specialization decisions, or a complete interprocedural effect analysis.
+fn format_inferred_decl_types(checker: &TypeChecker) -> String {
+    let mut declarations: Vec<_> = checker.inferred_decl_types.iter().collect();
+    declarations.sort_unstable_by(|(name_a, _), (name_b, _)| name_a.cmp(name_b));
+    let mut output = String::from("=== Inferred Declaration Types ===\n");
+    for (name, ty) in declarations {
+        output.push_str(&format!("{}: {}\n", name, type_to_string(ty)));
+    }
+    output
 }
 
 fn type_to_string(ty: &Type) -> String {
