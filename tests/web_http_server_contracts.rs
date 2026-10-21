@@ -525,3 +525,18 @@ fn response_endpoint() {
     assert!(!response.contains("\r\nSet-Cookie:"), "{response}");
     assert!(!response_body(&response).contains("not-committed"), "{response}");
 }
+
+#[test]
+fn non_http_redirect_fallback_does_not_emit_scriptable_refresh_targets() {
+    let source = r#"fn response_endpoint() { perform Web.redirect("javascript:alert(1)") }"#;
+    let (module, function_index) = compile_handler(source, "response_endpoint");
+    let html = render_route_handler(&module, function_index, None).expect("render fallback");
+    assert!(!html.contains("javascript:"), "{html}");
+    assert!(!html.contains("http-equiv=\"refresh\""), "{html}");
+
+    let safe_source = r#"fn response_endpoint() { perform Web.redirect("/safe?tab=2") }"#;
+    let (module, function_index) = compile_handler(safe_source, "response_endpoint");
+    let safe_html = render_route_handler(&module, function_index, None).expect("render fallback");
+    assert!(safe_html.contains("http-equiv=\"refresh\""), "{safe_html}");
+    assert!(safe_html.contains("/safe?tab=2"), "{safe_html}");
+}
