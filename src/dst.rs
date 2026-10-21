@@ -7,9 +7,10 @@
 //!
 //! Usage:
 //!   let mut sim = Simulator::new(42); // seed = 42
-//!   sim.load_program("examples/pingpong.nula");
+//!   sim.register_actor(1, "worker");
+//!   sim.send(0, 1, "work", vec![]);
 //!   sim.run_until_quiescence();
-//!   assert!(!sim.has_deadlock());
+//!   assert!(sim.undeliverable_messages().is_empty());
 
 pub mod shrink;
 
@@ -129,6 +130,9 @@ pub struct Simulator {
     pub rng: DeterministicRng,
     pub actors: HashMap<u64, SimActor>,
     pub pending_messages: VecDeque<SimMessage>,
+    /// Messages targeting an unregistered actor; retained for post-run
+    /// diagnostics rather than silently discarded by the test harness.
+    undeliverable: Vec<SimMessage>,
     pub step_count: u64,
     pub max_steps: u64,
     pub clock_ms: u64,
@@ -142,6 +146,7 @@ impl Simulator {
             rng: DeterministicRng::new(seed),
             actors: HashMap::new(),
             pending_messages: VecDeque::new(),
+            undeliverable: Vec::new(),
             step_count: 0,
             max_steps: 1_000_000,
             clock_ms: 0,
@@ -189,6 +194,8 @@ impl Simulator {
         while let Some(msg) = self.pending_messages.pop_front() {
             if let Some(actor) = self.actors.get_mut(&msg.target) {
                 actor.mailbox.push_back(msg);
+            } else {
+                self.undeliverable.push(msg);
             }
         }
 
@@ -210,6 +217,8 @@ impl Simulator {
             for (actor_id, msg) in fired {
                 if let Some(actor) = self.actors.get_mut(&actor_id) {
                     actor.mailbox.push_back(msg);
+                } else {
+                    self.undeliverable.push(msg);
                 }
             }
 
@@ -262,6 +271,13 @@ impl Simulator {
     /// Check if any actors have non-empty mailboxes (potential deadlock).
     pub fn has_deadlock(&self) -> bool {
         self.actors.values().any(|a| !a.mailbox.is_empty())
+    }
+
+    /// Messages dropped by the simulated transport because the target actor
+    /// was not registered at delivery time. This is a diagnostic for DST;
+    /// ordinary production actor-send semantics are unchanged.
+    pub fn undeliverable_messages(&self) -> &[SimMessage] {
+        &self.undeliverable
     }
 
     /// Returns the number of steps executed.
@@ -402,6 +418,50 @@ mod tests {
         sim.run_until_quiescence();
         assert!(sim.timers.is_empty());
         assert_eq!(sim.clock_ms(), 100);
+    }
+
+    #[test]
+    fn test_dst_records_messages_to_unregistered_actors() {
+        let mut sim = Simulator::new(7);
+        sim.register_actor(1, "registered");
+        sim.send(1, 99, "missing", vec![SimValue::Int(42)]);
+        sim.run_until_quiescence();
+
+        let undeliverable = sim.undeliverable_messages();
+        assert_eq!(undeliverable.len(), 1);
+        assert_eq!(undeliverable[0].sender, 1);
+        assert_eq!(undeliverable[0].target, 99);
+        assert_eq!(undeliverable[0].behavior, "missing");
+        assert_eq!(undeliverable[0].payload, vec![SimValue::Int(42)]);
+        assert!(!sim.has_deadlock());
+    }
+
+    #[test]
+    fn test_dst_timer_to_unregistered_actor_is_diagnosed() {
+        let mut sim = Simulator::new(1);
+        sim.timers.push((
+            25,
+            7,
+            SimMessage {
+                sender: 0,
+                target: 7,
+                behavior: "wake".into(),
+                payload: vec![],
+            },
+        ));
+        sim.run_until_quiescence();
+        assert_eq!(sim.clock_ms(), 25);
+        assert_eq!(sim.undeliverable_messages().len(), 1);
+        assert_eq!(sim.undeliverable_messages()[0].behavior, "wake");
+    }
+
+    #[test]
+    fn test_dst_registered_actor_keeps_clean_delivery_diagnostics() {
+        let mut sim = Simulator::new(1);
+        sim.send(0, 5, "work", vec![]);
+        sim.register_actor(5, "worker");
+        sim.run_until_quiescence();
+        assert!(sim.undeliverable_messages().is_empty());
     }
 
     #[test]
