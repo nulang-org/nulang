@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "routes": [
+    {
+      "method": "GET",
+      "path": "/users/{id: Int}",
+      "placement": "server",
+      "artifact": null,
+      "handler": "show_user",
+      "params": [
+        {
+          "name": "id",
+          "ty": "Int"
+        }
+      ],
+      "handler_params": [
+        {
+          "name": "id",
+          "ty": "Int",
+          "capability": null
+        }
+      ],
+      "bindings": [
+        {
+          "source": "path",
+          "source_name": "id",
+          "handler_param": "id",
+          "handler_index": 0,
+          "ty": "Int"
+        }
+      ],
+      "response_type": "Html"
+    }
+  ],
+  "signals": {},
+  "capabilities": [],
+  "budgets": {
+    "initial_js_max_bytes": null,
+    "lcp_seconds": null
+  },
+  "middleware": [
+    "security_headers",
+    "request_log",
+    "csrf"
+  ],
+  "cloud_config": []
+}

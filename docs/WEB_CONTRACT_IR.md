@@ -237,6 +237,27 @@ the binding plan is equivalent to:
 ]
 ```
 
+## Cloud Web IR v1 handoff
+
+`nula build --web` emits `dist/nulang-app.ir.json` version 1. Nulang
+owns the typed bindings, route semantics, and placement decisions in this
+compiler artifact; Cloud may consume them but must not reparse source or
+invent authorization from the fields.
+
+The serialized shape is covered by
+`src/web/ir.rs::tests::deployment_ir_and_runtime_use_the_same_validated_contract`.
+An additive, read-only Nulang Cloud preflight in
+`dporkka/nulang-cloud/nlc-deploy/src/web_ir.rs` checks the structural v1
+envelope, route identities and static artifact path safety. It ignores
+additional typed contract fields rather than treating them as grants.
+
+**A valid Web IR is not a deployable or authorized artifact.** The current
+Web IR v1 does not bind its JSON to the exact WASM/native executable digest
+or authenticated compiler provenance. Production Cloud admission must
+independently enforce trusted tenant policy and a cryptographically verified
+artifact binding, and production ingress must satisfy the Web HTTP/security
+hardening gates. The read-only preflight does not change runtime behavior.
+
 ## Architectural direction
 
 The Web Contract IR is intended to be the stable seam between language semantics and transports:
