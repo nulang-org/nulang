@@ -378,10 +378,15 @@ impl EffectRow {
                 a.extend(b);
                 EffectRow::Open(a, r)
             }
-            (EffectRow::Open(mut a, r1), EffectRow::Open(b, _)) => {
-                // Open rows share the same row variable convention
+            (EffectRow::Open(mut a, r1), EffectRow::Open(b, r2)) => {
                 a.extend(b);
-                EffectRow::Open(a, r1)
+                // Independent unresolved tails cannot be represented by a
+                // single source region. Use a fresh opaque tail rather than
+                // falsely claiming that the union retains either origin's
+                // exact unknown effects. A later checked boundary must not
+                // treat the synthetic tail as an existing allowed tail.
+                let tail = if r1 == r2 { r1 } else { Region::fresh() };
+                EffectRow::Open(a, tail)
             }
         }
     }
@@ -2429,6 +2434,46 @@ impl ExitReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_combining_distinct_open_effect_tails_never_aliases_either_tail() {
+        // If only the first region survives, a later checked boundary can
+        // mistake two independent sources of unknown effects for one.
+        let left = Region::fresh();
+        let right = Region::fresh();
+        let combined = EffectRow::Open(vec![Effect::IO], left)
+            .combine(EffectRow::Open(vec![Effect::FS], right));
+        match combined {
+            EffectRow::Open(effects, tail) => {
+                assert!(effects.contains(&Effect::IO));
+                assert!(effects.contains(&Effect::FS));
+                assert_ne!(
+                    tail, left,
+                    "combining independent tails cannot reuse the left tail"
+                );
+                assert_ne!(
+                    tail, right,
+                    "combining independent tails cannot reuse the right tail"
+                );
+            }
+            other => panic!("unknown effects must remain open, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_combining_identical_open_effect_tails_preserves_tail() {
+        let tail = Region::fresh();
+        let combined = EffectRow::Open(vec![Effect::IO], tail)
+            .combine(EffectRow::Open(vec![Effect::FS], tail));
+        match combined {
+            EffectRow::Open(effects, actual) => {
+                assert_eq!(actual, tail);
+                assert!(effects.contains(&Effect::IO));
+                assert!(effects.contains(&Effect::FS));
+            }
+            other => panic!("expected an open effect row, got {other:?}"),
+        }
+    }
 
     // -----------------------------------------------------------------
     // Structured error diagnostics (PLAN.md Phase 1 bullet 7): verify
