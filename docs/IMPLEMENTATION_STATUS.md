@@ -127,13 +127,17 @@ silently emulate it with a sequence of individually visible writes.
 Important boundaries:
 
 - atomic relocation of legacy snapshot, message journal, workflow-event and
-  domain-event records is implemented for in-memory `MemoryStore` and
-  transactional `LibsqlStore` (under the `sqlite` feature). It is not yet
-  wired into supervisor restart; other backends return `Unsupported`.
-  Identity-bound atomic transitions and workflow activation/replay receipts
-  are deliberately not re-keyed. MemoryStore is ephemeral, and the relocation
-  contract alone does not establish end-to-end process-crash recovery or
-  stable logical actor identity;
+  domain-event records is implemented for in-memory `MemoryStore`,
+  transactional `LibsqlStore` (under the `sqlite` feature), and
+  `PostgresStore` (under the `postgres` feature). The PostgreSQL move
+  serializes legacy writes under table locks and commits the four record types
+  together. JSON-file/RocksDB backends still return `Unsupported`.
+  Identity-bound atomic transitions, CRDT state, embedded actor self-references
+  and workflow activation/replay receipts are deliberately not re-keyed.
+  Supervisor restart integration is proposed separately in PR #2010 and is
+  not part of this storage-only branch. MemoryStore is ephemeral, and the
+  relocation contract alone does not establish end-to-end process-crash
+  recovery or stable logical actor identity;
 - persistent actors/entities/workflows are implemented and recoverable, but
   the higher-level durable semantic model is still being stabilized;
 - deterministic replay requires effect results and identity to be preserved
