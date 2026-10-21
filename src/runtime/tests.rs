@@ -204,6 +204,41 @@ fn test_spawn_send_step_sequence() {
 }
 
 #[test]
+fn actor_dispatch_diagnostics_report_trace_without_message_payload() {
+    let mut rt = Runtime::new();
+    let subscription = rt
+        .subscribe_diagnostics(2)
+        .expect("diagnostic subscription");
+    let actor_id = rt.spawn_actor(Box::new(|| vec![]));
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("handle", |_actor, _args| {});
+
+    rt.send_message_by_id(actor_id, 0, &[Value::int(424242)]);
+    run_ready_actor_turn(&mut rt, actor_id);
+
+    let event = subscription.try_recv().expect("actor dispatch event");
+    match event {
+        DiagnosticEvent::ActorDispatch {
+            actor_id: reported_actor,
+            behavior_id,
+            trace_id,
+            span_id,
+        } => {
+            assert_eq!(reported_actor, actor_id);
+            assert_eq!(behavior_id, 0);
+            assert_ne!(trace_id, 0);
+            assert_ne!(span_id, 0);
+        }
+    }
+    assert!(
+        subscription.try_recv().is_err(),
+        "one event per dispatched message"
+    );
+}
+
+#[test]
 fn burst_send_has_single_ready_queue_entry() {
     let mut rt = Runtime::new();
     let actor_id = rt.spawn_actor(Box::new(|| vec![]));
