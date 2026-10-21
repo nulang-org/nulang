@@ -11,7 +11,7 @@
 //! | Float (non-NaN) | `float` | IEEE 754 double |
 //! | `TAG_SPECIAL` (true/false) | `bool` | Direct mapping |
 //! | `TAG_SPECIAL` (unit) | `None` | Nulang `()` → Python `None` |
-//! | `TAG_STRING` | `str` | Interned string (ID → string lookup) |
+//! | `TAG_STRING` | error | Direct conversion lacks the module-local string pool; owned calls resolve it |
 //! | `TAG_PYTHON` | opaque Py<PyAny> | Direct registry lookup |
 //! | `TAG_PTR` | `None` | Heap pointers are opaque |
 //! | Python `str` | `TAG_PYTHON` | Stored as opaque Python object |
@@ -54,7 +54,7 @@ use crate::value_layout::{TAG_ACTOR, TAG_MASK, TAG_PTR, TAG_STRING};
 /// | Float | `float` |
 /// | `TAG_SPECIAL` (true/false) | `bool` |
 /// | `TAG_SPECIAL` (unit/nil) | `None` |
-/// | `TAG_STRING` | `str` (via interned string ID) |
+/// | `TAG_STRING` | error (requires source module's string pool) |
 /// | `TAG_PYTHON` | opaque `Py<PyAny>` (registry lookup) |
 /// | `TAG_PTR` | `None` (opaque heap pointer) |
 /// | `TAG_ACTOR` | `None` (opaque actor reference) |
@@ -90,20 +90,14 @@ pub fn nulang_to_python(value: Value) -> Result<Py<PyAny>, String> {
 
     let tag = value.as_raw() & TAG_MASK;
     if tag == TAG_STRING {
-        // TAG_STRING → Python str
-        // Nulang strings are interned; the payload is a u32 string pool ID.
-        // Since we don't have the string pool here, we represent it as a
-        // descriptive string. A future optimization will resolve the ID
-        // through the string interner.
-        let string_id = (value.as_raw() & 0x0000_FFFF_FFFF_FFFF) as u32;
-        let repr = format!("<nulang_string:{}>", string_id);
-        Python::attach(|py| -> Result<Py<PyAny>, String> {
-            Ok(repr
-                .into_pyobject(py)
-                .map_err(|e| e.to_string())?
-                .unbind()
-                .into_any())
-        })
+        // A Value stores a string-pool ID, not the string contents. This API
+        // has no module/VM pool; fabricating a placeholder would silently send
+        // incorrect data to Python. Use the owned foreign-call boundary, which
+        // resolves strings before they leave their source module.
+        let string_id = value.as_string_id().expect("TAG_STRING contains string ID");
+        Err(format!(
+            "Nulang string pool entry {string_id} cannot be marshalled without its source module; use the owned foreign-call boundary"
+        ))
     } else if tag == TAG_PYTHON {
         // TAG_PYTHON → look up in registry and return the Py<PyAny>
         let obj_id = (value.as_raw() & 0x0000_FFFF_FFFF_FFFF) as u64;
@@ -134,13 +128,26 @@ pub fn nulang_to_python(value: Value) -> Result<Py<PyAny>, String> {
 /// |-------------|-------------|-------|
 /// | `None` | `Value::unit()` | |
 /// | `bool` | `Value::bool()` | |
-/// | `int` | `Value::int()` | Clamped to i64 range |
+/// | `int` | `Value::int()` | Checked against Nulang's signed 48-bit range |
 /// | `float` | `Value::float()` | |
 /// | `str` | `TAG_PYTHON` | Stored as opaque Python object |
 /// | `list` | `TAG_PYTHON` | Stored as opaque Python object |
 /// | `tuple` | `TAG_PYTHON` | Stored as opaque Python object |
 /// | `dict` | `TAG_PYTHON` | Stored as opaque Python object |
 /// | Other | `TAG_PYTHON` | Stored as opaque Python object |
+/// Nulang's tagged `Int` retains only 48 signed bits. Reject values that
+/// would silently wrap rather than changing their numerical meaning.
+fn vm_int_checked(value: i64) -> Result<Value, String> {
+    const MIN: i64 = -(1_i64 << 47);
+    const MAX: i64 = (1_i64 << 47) - 1;
+    if !(MIN..=MAX).contains(&value) {
+        return Err(format!(
+            "Python integer {value} is outside Nulang's signed 48-bit Int range"
+        ));
+    }
+    Ok(Value::int(value))
+}
+
 pub fn python_to_nulang(obj: &pyo3::Bound<'_, pyo3::PyAny>) -> Result<Value, String> {
     // Check for None first
     if obj.is_none() {
@@ -157,14 +164,10 @@ pub fn python_to_nulang(obj: &pyo3::Bound<'_, pyo3::PyAny>) -> Result<Value, Str
 
     // Check for int
     if let Ok(i) = obj.cast::<PyInt>() {
-        let val: i64 = i.extract().unwrap_or_else(|_| {
-            // Big int — try to extract and clamp
-            Python::attach(|_py| {
-                let big_int_str = i.str().map(|s| s.to_string()).unwrap_or_default();
-                big_int_str.parse::<i64>().unwrap_or(i64::MAX)
-            })
-        });
-        return Ok(Value::int(val));
+        let val: i64 = i.extract().map_err(|e| {
+            format!("Python integer cannot be represented as signed 64-bit value: {e}")
+        })?;
+        return vm_int_checked(val);
     }
 
     // Check for float
@@ -334,14 +337,9 @@ pub fn python_object_id_to_owned_foreign(
             return Ok(OwnedForeignValue::Bool(value));
         }
         if let Ok(value) = obj.cast::<PyInt>() {
-            let value = value.extract::<i64>().unwrap_or_else(|_| {
-                let text = value.str().map(|s| s.to_string()).unwrap_or_default();
-                if text.starts_with('-') {
-                    i64::MIN
-                } else {
-                    i64::MAX
-                }
-            });
+            let value = value.extract::<i64>().map_err(|e| {
+                format!("Python integer cannot be represented as signed 64-bit value: {e}")
+            })?;
             return Ok(OwnedForeignValue::Int(value));
         }
         if let Ok(value) = obj.cast::<PyFloat>() {
@@ -358,6 +356,29 @@ pub fn python_object_id_to_owned_foreign(
             id: obj_id.0,
         })
     })
+}
+
+/// Materialize an owned Python call result into a Nulang VM value.
+///
+/// Primitive values do not need a Python handle. A Python `str` result is
+/// deliberately kept as an opaque Python object: allocating a native Nulang
+/// string requires an active module's string pool, which this function does
+/// not own. Such handles remain valid inputs to subsequent Python calls.
+pub fn owned_foreign_to_vm_value(
+    value: &crate::runtime::OwnedForeignValue,
+) -> Result<Value, String> {
+    use crate::runtime::OwnedForeignValue;
+    match value {
+        OwnedForeignValue::Int(value) => vm_int_checked(*value),
+        OwnedForeignValue::Float(value) => Ok(Value::float(*value)),
+        OwnedForeignValue::Bool(value) => Ok(Value::bool(*value)),
+        OwnedForeignValue::Unit => Ok(Value::unit()),
+        OwnedForeignValue::Nil => Ok(Value::nil()),
+        OwnedForeignValue::String(_) | OwnedForeignValue::OpaqueHandle { .. } => {
+            let id = owned_foreign_to_python_object_id(value)?;
+            Ok(unsafe { Value::from_raw(TAG_PYTHON | id.0) })
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -392,6 +413,47 @@ mod tests {
     // Helper: ensure Python is initialized
     fn ensure_python() {
         let _ = Python::attach(|_py| ());
+    }
+
+    #[test]
+    fn test_python_integer_roundtrips_at_signed_48_bit_limits() {
+        let min = -(1_i64 << 47);
+        let max = (1_i64 << 47) - 1;
+        assert_eq!(vm_int_checked(min).unwrap().as_int(), Some(min));
+        assert_eq!(vm_int_checked(max).unwrap().as_int(), Some(max));
+    }
+
+    #[test]
+    fn test_python_integer_conversion_rejects_48_bit_overflow() {
+        let error = vm_int_checked(1_i64 << 47).unwrap_err();
+        assert!(error.contains("48-bit"), "{error}");
+        assert!(vm_int_checked(-(1_i64 << 47) - 1).is_err());
+        let error = owned_foreign_to_vm_value(&crate::runtime::OwnedForeignValue::Int(i64::MAX))
+            .unwrap_err();
+        assert!(error.contains("48-bit"), "{error}");
+    }
+
+    #[test]
+    fn test_python_integer_conversion_rejects_unbounded_bigints() {
+        let value = Python::attach(|py| {
+            let builtins = py.import("builtins").unwrap();
+            let large = builtins
+                .call_method1("int", ("999999999999999999999999999999",))
+                .unwrap();
+            python_to_nulang(&large)
+        });
+        assert!(value.unwrap_err().contains("64-bit"));
+    }
+
+    #[test]
+    fn test_unresolved_vm_string_never_becomes_a_python_placeholder() {
+        let error = nulang_to_python(Value::string(42))
+            .err()
+            .expect("unresolved Nulang string must fail closed");
+        assert!(
+            error.contains("string pool"),
+            "expected a string-pool diagnostic, got: {error}"
+        );
     }
 
     #[test]

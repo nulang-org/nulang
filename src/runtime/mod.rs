@@ -6810,11 +6810,43 @@ impl Runtime {
             Some("call") => {
                 let module = string_arg(0)?;
                 let function = string_arg(1)?;
-                let args: Vec<Value> = regs.iter().skip(2).copied().collect();
-                match fi.call(&module, &function, &args) {
+                // The VM passes the entire register frame to builtin effects.
+                // Python.call is variadic: reading regs[2..] would treat stale
+                // frame values (including actor references) as arguments.
+                // MIR stages the exact count in the reserved r14 scratch slot.
+                let max_staged = crate::mir_codegen::MAX_STAGED_ARGS as i64;
+                let arg_count = match regs
+                    .get(crate::mir_codegen::SPILL_TEMP3 as usize)
+                    .and_then(|value| value.as_int())
+                {
+                    Some(count) if (2..=max_staged).contains(&count) => count as usize,
+                    _ => {
+                        eprintln!("Python call error: missing or invalid staged argument count");
+                        return Some(Value::nil());
+                    }
+                };
+                let Some(args) = regs.get(2..arg_count) else {
+                    eprintln!("Python call error: truncated argument register frame");
+                    return Some(Value::nil());
+                };
+                // Resolve only the staged arguments. Never capture VM-local
+                // indices, stale registers, or actor references by guessing.
+                let result = crate::runtime::ForeignCallRequest::from_vm_args(
+                    &module,
+                    &function,
+                    args,
+                    |id| match constants.get(id as usize) {
+                        Some(crate::bytecode::Constant::String(value)) => Some(value.clone()),
+                        _ => None,
+                    },
+                )
+                .map_err(|error| error.to_string())
+                .and_then(|request| fi.call_owned(&request))
+                .and_then(|owned| crate::python::owned_foreign_to_vm_value(&owned));
+                match result {
                     Ok(result) => Some(result),
-                    Err(e) => {
-                        eprintln!("Python call error: {}", e);
+                    Err(error) => {
+                        eprintln!("Python call error: {}", error);
                         Some(Value::nil())
                     }
                 }
@@ -6822,8 +6854,7 @@ impl Runtime {
             Some("get_attr") => {
                 let module = string_arg(0)?;
                 let attr = string_arg(1)?;
-                let args: Vec<Value> = vec![];
-                match fi.call(&module, &attr, &args) {
+                match fi.get_attr(&module, &attr) {
                     Ok(result) => Some(result),
                     Err(e) => {
                         eprintln!("Python get_attr error: {}", e);

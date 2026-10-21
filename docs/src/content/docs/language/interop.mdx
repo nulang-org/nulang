@@ -65,21 +65,21 @@ Marshalling (`src/python/marshal.rs`) converts primitives directly and keeps eve
 | `Float` | `float` |
 | `Bool` | `bool` |
 | `()` / `nil` | `None` |
-| `String` | placeholder descriptor (see caveat below) |
+| `String` | actual text through the owned foreign-call boundary; the direct VM converter rejects unresolved string IDs |
 | Python object handle | the object itself |
 
 | Python object | Nulang value |
 |---------------|--------------|
 | `None` | `()` |
 | `bool` | `Bool` |
-| `int` | `Int` (clamped to i64) |
+| `int` | `Int` (signed 48-bit range; overflow is rejected) |
 | `float` | `Float` |
 | `str`, `list`, `tuple`, `dict`, anything else | opaque Python object handle |
 
 Complex Python values arrive as opaque handles tagged `TAG_PYTHON` — cheap `Copy` ids into the registry, not ORCA-managed heap objects. There are no `iso`/linear capability requirements on values crossing the boundary; the gates are the compile-time `os` capability and, for code running inside an actor behavior, an explicit authority grant (e.g. `spawn Worker {} with [Python::call]`).
 
 :::caution
-Two marshalling sharp edges, both verified against the implementation: Nulang strings passed as call arguments currently arrive in Python as placeholder descriptors (`<nulang_string:ID>`), not real `str` values, and Python `str` results come back as opaque handles that cannot be concatenated with Nulang strings directly. Numeric arguments and results round-trip cleanly.
+Runtime-host `Python.call` now resolves Nulang string arguments by content through the owned foreign-call boundary. Returned Python `str` values cross the worker-safe bridge as owned strings, then become **opaque Python object handles** in the VM: they can be passed to another `Python.call`, but cannot yet be concatenated or used as native Nulang `String` values. The legacy direct VM-value converter still requires a source-module string pool and rejects unresolved string IDs rather than silently substituting placeholder text.
 :::
 
 ### Where Python effects run
@@ -91,20 +91,21 @@ Two marshalling sharp edges, both verified against the implementation: Nulang st
 // Requires a host Python 3 runtime.
 actor PyCaller {
     behavior run() {
+        perform Python.import("math")
         let root = perform Python.call("math", "sqrt", 16)
         perform IO.println("sqrt(16) = " + perform Int.to_string(root))
     }
 }
 
 fn main() {
-    let worker = spawn PyCaller {} with [Python::call]
+    let worker = spawn PyCaller {} with [Python::import, Python::call]
     worker ! run()
     0
 }
 ```
 
 :::note
-Current state of this surface, verified with the compiler binary: `perform Python.import(...)` does not parse today — `import` is a reserved keyword and the parser does not exempt it as an effect operation name (error `E0102`). Until that is fixed there is no way to import a module from pure Nulang source, so `Python.call`/`Python.get_attr` compile and dispatch but return `nil` with a `module '<name>' not imported` diagnostic for never-imported modules, and performing `Python.*` from inside a behavior traps the behavior silently. The bridge itself (import, call, attribute access, marshalling) is implemented and unit-tested at the Rust level; driving it end-to-end from source is blocked on the import syntax gap.
+The parser now accepts both `perform Python.import("math")` and its explicit actor-grant counterpart `Python::import`. The runtime-host `Python.call` resolves owned string arguments and `Python.get_attr` reads attributes without attempting to invoke them. The actor-runtime host and a binary built with the `python` feature are still required, along with the appropriate OS and actor authority grants. Import the Python module explicitly before accessing its exports. Import/call/get-attribute failures currently emit diagnostics and return `nil`; Python strings returned to the VM remain opaque handles. Source-to-actor execution requires separate Python-enabled integration validation before production use.
 :::
 
 ## The C FFI
