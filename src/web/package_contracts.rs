@@ -65,6 +65,23 @@ pub fn compile_modules_contracts(modules: &[AstModule]) -> ContractCompilation {
     compiled
         .routes
         .sort_by(|a, b| (&a.method, &a.path).cmp(&(&b.method, &b.path)));
+    // Keep the historical idempotent registration behavior, but never discard
+    // a different handler contract for the same method/path without a
+    // diagnostic. Otherwise runtime dispatch and generated OpenAPI can silently
+    // disagree about which endpoint owns the route.
+    for pair in compiled.routes.windows(2) {
+        let first = &pair[0];
+        let second = &pair[1];
+        if first.method == second.method && first.path == second.path && first != second {
+            compiled.diagnostics.push(format!(
+                "{} {}: conflicting route declarations for handlers '{}' and '{}'",
+                first.method,
+                first.path,
+                first.handler.as_deref().unwrap_or("<unknown>"),
+                second.handler.as_deref().unwrap_or("<unknown>")
+            ));
+        }
+    }
     compiled
         .routes
         .dedup_by(|a, b| a.method == b.method && a.path == b.path);
@@ -403,6 +420,50 @@ fn web_main() {
         assert_eq!(route.handler_params[0].name, "id");
         assert_eq!(route.response_type.as_deref(), Some("String"));
         assert!(route.effects.contains(&"Request".to_string()));
+    }
+
+    #[test]
+    fn conflicting_registrations_fail_contract_extraction() {
+        let module = parse(
+            r#"
+fn first() -> String { "first" }
+fn second() -> String { "second" }
+fn web_main() {
+    perform Web.route("GET", "/status", first)
+    perform Web.route("GET", "/status", second)
+}
+"#,
+        );
+
+        let compiled = compile_modules_contracts(&[module]);
+        assert_eq!(compiled.routes.len(), 1);
+        assert!(
+            compiled.diagnostics.iter().any(|diagnostic| {
+                diagnostic.contains("GET /status")
+                    && diagnostic.contains("conflicting route declarations")
+            }),
+            "conflicting duplicate route was silently discarded: {:?}",
+            compiled.diagnostics
+        );
+        let errors = crate::web::validation::validate_compilation(compiled).unwrap_err();
+        assert!(errors.iter().any(|error| error.contains("conflicting route declarations")));
+    }
+
+    #[test]
+    fn identical_registrations_can_still_be_deduplicated() {
+        let module = parse(
+            r#"
+fn status() -> String { "ok" }
+fn web_main() {
+    perform Web.route("GET", "/status", status)
+    perform Web.route("GET", "/status", status)
+}
+"#,
+        );
+
+        let compiled = compile_modules_contracts(&[module]);
+        assert_eq!(compiled.routes.len(), 1);
+        assert!(compiled.diagnostics.is_empty());
     }
 
     #[test]
