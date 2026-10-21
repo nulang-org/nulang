@@ -4351,6 +4351,112 @@ mod libsql_atomic_transition_tests {
     }
 
     #[test]
+    fn libsql_atomic_mid_commit_failure_recovers_cleanly_after_reopen() {
+        // A persistent SQL trigger injects an error after earlier transition
+        // records have been written in the same SQL transaction. Reopening
+        // exercises recovery of the rolled-back on-disk state; this is not a
+        // substitute for process-kill or power-loss testing.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_atomic_failure_reopen_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store.db");
+        let actor_id = 88;
+
+        {
+            let mut store = LibsqlStore::new(&path).unwrap();
+            {
+                let conn = store.conn();
+                store
+                    .rt
+                    .block_on(async {
+                        conn.execute(
+                            "CREATE TRIGGER reject_atomic_outbox
+                             BEFORE INSERT ON durable_outbox
+                             BEGIN
+                                 SELECT RAISE(ABORT, 'injected outbox failure');
+                             END",
+                            libsql::params![],
+                        )
+                        .await
+                    })
+                    .unwrap();
+            }
+
+            let error = store
+                .commit_transition(transition(actor_id, 4, 1))
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Other);
+            assert!(store.load_snapshot(actor_id).is_none());
+            assert!(store.read_journal(actor_id).is_empty());
+            assert!(store.read_workflow_events(actor_id).is_empty());
+            assert!(store.read_events(actor_id).is_empty());
+        }
+
+        {
+            let mut store = LibsqlStore::new(&path).unwrap();
+            assert_eq!(store.latest_sequence(actor_id), 0);
+            assert_eq!(store.load_durable_tail_position(actor_id).unwrap(), None);
+            assert!(store.load_snapshot(actor_id).is_none());
+            assert!(store.read_journal(actor_id).is_empty());
+            assert!(store.read_workflow_events(actor_id).is_empty());
+            assert!(store.read_events(actor_id).is_empty());
+            for table in ["durable_transitions", "durable_tails", "durable_outbox"] {
+                let rows = store
+                    .query(
+                        &format!("SELECT COUNT(*) FROM {table} WHERE actor_id = 88"),
+                        &[],
+                    )
+                    .unwrap();
+                assert_eq!(rows, vec!["[0]".to_string()], "{table} must roll back");
+            }
+
+            {
+                let conn = store.conn();
+                store
+                    .rt
+                    .block_on(async {
+                        conn.execute("DROP TRIGGER reject_atomic_outbox", libsql::params![])
+                            .await
+                    })
+                    .unwrap();
+            }
+            let first = store
+                .commit_transition(transition(actor_id, 4, 1))
+                .unwrap();
+            let retry = store
+                .commit_transition(transition(actor_id, 4, 1))
+                .unwrap();
+            assert_eq!(first, retry, "same logical commit must be idempotent");
+        }
+
+        {
+            let store = LibsqlStore::new(&path).unwrap();
+            assert_eq!(store.latest_sequence(actor_id), 1);
+            assert_eq!(store.load_snapshot(actor_id).unwrap().sequence, 1);
+            assert_eq!(store.read_journal(actor_id).len(), 1);
+            assert_eq!(store.read_workflow_events(actor_id).len(), 2);
+            assert_eq!(store.read_events(actor_id).len(), 2);
+            for table in ["durable_transitions", "durable_tails", "durable_outbox"] {
+                let rows = store
+                    .query(
+                        &format!("SELECT COUNT(*) FROM {table} WHERE actor_id = 88"),
+                        &[],
+                    )
+                    .unwrap();
+                assert_eq!(rows, vec!["[1]".to_string()], "{table} duplicated");
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn libsql_atomic_transition_survives_reopen() {
         let path = std::env::temp_dir().join(format!(
             "nulang_atomic_transition_{}_reopen.db",
