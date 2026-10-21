@@ -81,17 +81,38 @@ pub fn run(args: &[String]) -> NuResult<()> {
             if web {
                 cmd_build_web()
             } else {
-                let json = args[1..].iter().any(|a| a == "--json");
-                if args.len() > 1 && !json {
-                    return Err(NuError::PackageError {
-                        msg: format!("unknown flag '{}' for nula build", args[1]),
-                        span: Span::default(),
-                    });
+                let mut json = false;
+                let mut locked = false;
+                for flag in &args[1..] {
+                    match flag.as_str() {
+                        "--json" => json = true,
+                        "--locked" => locked = true,
+                        other => {
+                            return Err(NuError::PackageError {
+                                msg: format!("unknown flag '{}' for nula build", other),
+                                span: Span::default(),
+                            });
+                        }
+                    }
                 }
-                cmd_build(json)
+                cmd_build(json, locked)
             }
         }
-        Some("build-wasm") => cmd_build_wasm(),
+        Some("build-wasm") => {
+            let mut locked = false;
+            for flag in &args[1..] {
+                match flag.as_str() {
+                    "--locked" => locked = true,
+                    other => {
+                        return Err(NuError::PackageError {
+                            msg: format!("unknown flag '{}' for nula build-wasm", other),
+                            span: Span::default(),
+                        });
+                    }
+                }
+            }
+            cmd_build_wasm(locked)
+        },
         Some("test") => {
             let mut filter: Option<&str> = None;
             let mut verbose = false;
@@ -766,6 +787,12 @@ button {
 /// Resolve the package in the current directory, write `Nulang.lock`, and
 /// return the entry point path.
 fn prepare_package() -> NuResult<PathBuf> {
+    prepare_package_with_lock_mode(false)
+}
+
+/// In locked mode verify the resolved package closure without rewriting the lockfile.
+/// This is not an offline or sandboxed build: remote source resolution can still occur.
+fn prepare_package_with_lock_mode(locked: bool) -> NuResult<PathBuf> {
     let root = package_root()?;
     let manifest_path = root.join(MANIFEST_FILE);
     let manifest = Manifest::load(&root).map_err(|e| NuError::PackageError {
@@ -832,13 +859,58 @@ fn prepare_package() -> NuResult<PathBuf> {
     })?;
 
     let lock_path = root.join(LOCKFILE_FILE);
-    resolution
-        .to_lockfile()
-        .save(&root)
-        .map_err(|e| NuError::PackageError {
+    let resolved = resolution.to_lockfile();
+    if locked {
+        let existing = Lockfile::load(&root).map_err(|e| NuError::PackageError {
+            msg: format!(
+                "nula build --locked requires an existing {}: {}",
+                LOCKFILE_FILE, e
+            ),
+            span: Span::default(),
+        })?;
+        if existing.package != resolved.package {
+            return Err(NuError::PackageError {
+                msg: format!(
+                    "{} is out of date; run 'nulang nula build' to refresh it",
+                    LOCKFILE_FILE
+                ),
+                span: Span::default(),
+            });
+        }
+        // Legacy source hashes only cover direct .nula files. Check canonical
+        // source identities too, so changes to nested modules and manifests
+        // cannot silently reuse a locked local dependency.
+        let canonical = resolved.with_available_source_identities()?;
+        for package in &existing.package {
+            if !package.source.starts_with("path+") {
+                continue;
+            }
+            let previous = existing
+                .package_identity(&package.name, &package.version, &package.source)
+                .map(|entry| entry.parsed_source_id())
+                .transpose()?
+                .flatten();
+            let current = canonical
+                .package_identity(&package.name, &package.version, &package.source)
+                .map(|entry| entry.parsed_source_id())
+                .transpose()?
+                .flatten();
+            if previous.is_none() || previous != current {
+                return Err(NuError::PackageError {
+                    msg: format!(
+                        "{} is out of date: local dependency '{}' lacks a matching strong source identity",
+                        LOCKFILE_FILE, package.name
+                    ),
+                    span: Span::default(),
+                });
+            }
+        }
+    } else {
+        resolved.save(&root).map_err(|e| NuError::PackageError {
             msg: format!("failed to write {}: {}", lock_path.display(), e),
             span: Span::default(),
         })?;
+    }
 
     let entry = root.join(&manifest.package.entry);
     if !entry.exists() {
@@ -1064,7 +1136,7 @@ fn build_module_path() -> Option<String> {
 /// `nula build`: resolve dependencies, write the lockfile, type-check entry.
 /// `nula build`: resolve dependencies, write the lockfile, type-check and
 /// compile to a .nbc artifact in .nula/dist/.
-fn cmd_build(json: bool) -> NuResult<()> {
+fn cmd_build(json: bool, locked: bool) -> NuResult<()> {
     let root = package_root()?;
     let manifest_path = root.join(MANIFEST_FILE);
     let manifest = Manifest::load(&root).map_err(|e| NuError::PackageError {
@@ -1074,7 +1146,7 @@ fn cmd_build(json: bool) -> NuResult<()> {
     let name = manifest.package.name.clone();
     let version = manifest.package.version.clone();
 
-    let entry = prepare_package()?;
+    let entry = prepare_package_with_lock_mode(locked)?;
     let entry_str = entry.to_string_lossy().into_owned();
 
     if json {
@@ -1238,7 +1310,7 @@ fn nulang_exe_output(args: &[&str]) -> NuResult<std::process::Output> {
 
 /// `nula build-wasm`: compile package to .wasm + AOT .cwasm.
 /// `nula build-wasm`: compile package to .wasm + AOT .cwasm in .nula/dist/.
-fn cmd_build_wasm() -> NuResult<()> {
+fn cmd_build_wasm(locked: bool) -> NuResult<()> {
     let root = package_root()?;
     let manifest_path = root.join(MANIFEST_FILE);
     let manifest = Manifest::load(&root).map_err(|e| NuError::PackageError {
@@ -1247,7 +1319,7 @@ fn cmd_build_wasm() -> NuResult<()> {
     })?;
     let name = manifest.package.name.clone();
 
-    let entry = prepare_package()?;
+    let entry = prepare_package_with_lock_mode(locked)?;
     let entry_str = entry.to_string_lossy().into_owned();
 
     let dist_dir = root.join(".nula").join("dist");
@@ -2606,6 +2678,120 @@ fn cmd_remove(name: Option<&str>) -> NuResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_build_locked_flag_dispatches_before_compilation() {
+        let dir = std::env::temp_dir().join(format!("nula_locked_cli_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = ChangeDir::new(&dir);
+        scaffold_package(&dir, "locked-app", "default").unwrap();
+
+        let args = vec![
+            "build".to_string(),
+            "--locked".to_string(),
+            "--json".to_string(),
+        ];
+        let err = run(&args).expect_err("missing lock must fail before compiler invocation");
+        assert!(err.to_string().contains("requires an existing Nulang.lock"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_build_wasm_locked_flag_dispatches_before_compiler_invocation() {
+        let dir = std::env::temp_dir().join(format!("nula_wasm_locked_cli_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = ChangeDir::new(&dir);
+        scaffold_package(&dir, "wasm-app", "default").unwrap();
+
+        let args = vec!["build-wasm".to_string(), "--locked".to_string()];
+        let err = run(&args).expect_err("missing lock must fail before invoking wasm compiler");
+        assert!(err.to_string().contains("requires an existing Nulang.lock"));
+        assert!(!dir.join(LOCKFILE_FILE).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_build_rejects_unknown_flag_even_with_json_enabled() {
+        let args = vec![
+            "build".to_string(),
+            "--json".to_string(),
+            "--surprise".to_string(),
+        ];
+        let err = run(&args).expect_err("unknown flags must not be bypassed by --json");
+        assert!(err.to_string().contains("unknown flag '--surprise'"));
+    }
+
+    #[test]
+    fn test_locked_build_requires_existing_lockfile_without_creating_it() {
+        let dir = std::env::temp_dir().join(format!("nula_locked_missing_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = ChangeDir::new(&dir);
+        scaffold_package(&dir, "locked-app", "default").unwrap();
+
+        let err = prepare_package_with_lock_mode(true).expect_err("missing lockfile must fail");
+        assert!(err.to_string().contains("requires an existing Nulang.lock"));
+        assert!(!dir.join(LOCKFILE_FILE).exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_locked_build_preserves_existing_lockfile_bytes() {
+        let dir =
+            std::env::temp_dir().join(format!("nula_locked_unchanged_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = ChangeDir::new(&dir);
+        scaffold_package(&dir, "locked-app", "default").unwrap();
+
+        prepare_package().unwrap();
+        let lock_path = dir.join(LOCKFILE_FILE);
+        let original = std::fs::read(&lock_path).unwrap();
+        prepare_package_with_lock_mode(true).expect("unchanged lockfile must be accepted");
+        assert_eq!(std::fs::read(&lock_path).unwrap(), original);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_locked_build_rejects_dependency_changes_without_rewriting_lockfile() {
+        let dir = std::env::temp_dir().join(format!("nula_locked_drift_{}", std::process::id()));
+        let app = dir.join("app");
+        let util = dir.join("util");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::create_dir_all(&util).unwrap();
+        scaffold_package(&app, "locked-app", "default").unwrap();
+        scaffold_package(&util, "util", "lib").unwrap();
+        // The legacy content_hash does not cover nested src/ modules.
+        std::fs::write(util.join("src/lib.nula"), "fn value() -> Int { 1 }\n").unwrap();
+
+        let _guard = ChangeDir::new(&app);
+        let mut manifest = Manifest::load(&app).unwrap();
+        manifest.dependencies.insert(
+            "util".to_string(),
+            Dependency::Detailed(DependencyDetail {
+                path: Some("../util".to_string()),
+                ..Default::default()
+            }),
+        );
+        manifest.save(&app).unwrap();
+
+        prepare_package().unwrap();
+        let lock_path = app.join(LOCKFILE_FILE);
+        let original = std::fs::read(&lock_path).unwrap();
+        std::fs::write(util.join("src/lib.nula"), "fn value() -> Int { 2 }\n").unwrap();
+
+        let err = prepare_package_with_lock_mode(true).expect_err("changed dependency must fail");
+        assert!(err.to_string().contains("Nulang.lock is out of date"));
+        assert_eq!(std::fs::read(&lock_path).unwrap(), original);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_manifest_language_pin() {

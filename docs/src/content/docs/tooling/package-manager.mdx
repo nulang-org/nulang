@@ -181,6 +181,29 @@ Locked dependencies (from /home/david/projects/my-app/Nulang.lock):
   util v0.1.0 — path+/home/david/projects/util
 ```
 
+### Locked builds in CI
+
+Use `nulang nula build --locked` when CI must reject dependency drift:
+
+```bash
+nulang nula build          # Explicitly resolve and update Nulang.lock
+nulang nula build --locked # Fail if the lockfile is missing or out of date
+nulang nula build-wasm --locked # Apply the same pin check to WASM compilation
+```
+
+`--locked` leaves the existing lockfile untouched. It compares resolved
+dependency pins and checks canonical source identities for local path
+dependencies, including nested `.nula` files and their manifests. Old
+local-path lockfiles without strong source identities must be regenerated
+with a normal `nula build` before locked builds can succeed.
+
+**Scope:** `--locked` is lockfile enforcement, **not** an offline or hermetic
+build. Resolving git/registry dependencies may still access the network or
+write to local dependency caches. It does not yet guarantee deterministic
+compiler output or sandbox filesystem access. `--json` can be combined
+with `--locked` for ordinary `build`. The `build-wasm` command also accepts
+`--locked` (but not `--json`).
+
 ### Using a dependency
 
 `nula build`, `nula run`, and `nula test` build a module path from the
