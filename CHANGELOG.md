@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Strict Android runtime-to-host JSON ingress — 2026-10-21
+- **The Kotlin/JVM host now decodes `nulang-ui-msg/1` snapshots and ordered patches through bounded JSON streaming** with duplicate-key rejection, tagged lossless values, mandatory version/identity checks, and atomic document publication.
+- **A dedicated executable JSON conformance suite runs in the Android UI protocol CI job** alongside the state-machine suite; this does not yet implement host action authorization, Compose rendering, a portable AAR, or Rust/Kotlin golden fixtures.
+
 ### Kotlin/JVM renderer-neutral mobile protocol foundation — 2026-10-21
 - **Added a dependency-light Android-side reference state machine for `nulang-ui/1` and `nulang-ui-msg/1`.** It validates semantic UI trees without recursion, enforces per-node action event uniqueness, rejects invalid protocol/revision transitions, and applies ordered patches atomically without publishing malformed state.
 - **Added ten executable Kotlin conformance cases and a dedicated Gradle/Java 17 CI gate.** This is a correctness and host-integration foundation only: untrusted JSON decoding, native AAR packaging, the Compose renderer, action authorization, and device testing are not yet implemented.
