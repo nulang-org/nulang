@@ -98,7 +98,7 @@ pub fn generate_deployment_ir(
     src_root: &Path,
     budgets: &BudgetsSection,
     contracts: &ContractCompilation,
-) -> DeploymentIr {
+) -> Result<DeploymentIr, String> {
     let contract_index: HashMap<(String, String), &RouteContract> = contracts
         .routes
         .iter()
@@ -106,6 +106,7 @@ pub fn generate_deployment_ir(
         .collect();
 
     let mut ir_routes = Vec::new();
+    let mut emitted_artifacts = HashSet::new();
     for route in routes {
         let method = route.method.as_str().to_string();
         let contract = contract_index
@@ -115,11 +116,14 @@ pub fn generate_deployment_ir(
         let placement = contract
             .and_then(|contract| contract.placement.clone())
             .unwrap_or_else(|| default_route_placement(&method, &route.path));
-        let artifact = if placement == "static" {
-            Some(route_path_to_artifact(&route.path))
-        } else {
-            None
-        };
+        let artifact = static_artifact_for_route(&method, &route.path, &placement)?;
+        if let Some(file) = &artifact {
+            if !emitted_artifacts.insert(file.clone()) {
+                return Err(format!(
+                    "multiple static routes emit the same artifact {file:?}; assign distinct paths"
+                ));
+            }
+        }
 
         ir_routes.push(IrRoute {
             method,
@@ -164,7 +168,7 @@ pub fn generate_deployment_ir(
     let cloud_config = infer_module_cloud_config(&source_text);
     let middleware = infer_middleware(&source_text);
 
-    DeploymentIr {
+    Ok(DeploymentIr {
         // This is an additive v1 extension: every new per-route field is
         // serde-defaulted/optional, so existing v1 consumers remain valid and
         // may ignore the additional contract metadata.
@@ -175,25 +179,59 @@ pub fn generate_deployment_ir(
         budgets: budgets_ir,
         middleware,
         cloud_config,
-    }
+    })
 }
 
 fn default_route_placement(method: &str, path: &str) -> String {
     let dynamic_path = path.contains(':') || (path.contains('{') && path.contains('}'));
-    if dynamic_path || !matches!(method, "GET" | "HEAD") {
+    if dynamic_path || method != "GET" {
         "server".to_string()
     } else {
         "static".to_string()
     }
 }
 
-fn route_path_to_artifact(path: &str) -> String {
-    let trimmed = path.trim_start_matches('/');
-    if trimmed.is_empty() {
-        "index.html".to_string()
-    } else {
-        format!("{}/index.html", trimmed)
+/// Return the sole safe build artifact path for a route, or None when it is
+/// server-side only. A static route that cannot be materialized is an error:
+/// silently rendering dynamic parameters into literal directories produces
+/// misleading deployment outputs and can escape the output root.
+pub fn static_artifact_for_route(
+    method: &str,
+    path: &str,
+    placement: &str,
+) -> Result<Option<String>, String> {
+    if placement != "static" {
+        return Ok(None);
     }
+    if method != "GET" {
+        return Err(format!(
+            "static route {method} {path:?} must be GET; HEAD and mutations require a server"
+        ));
+    }
+    if !path.starts_with('/') {
+        return Err(format!("static route path {path:?} must begin with '/'"));
+    }
+    if path == "/" {
+        return Ok(Some("index.html".to_string()));
+    }
+
+    // Keep static artifact paths in the URL-safe, unreserved character set.
+    // This disallows capture placeholders, percent-encoded traversal, query
+    // strings, path separators on Windows, and filesystem parent components.
+    let segments: Vec<&str> = path[1..].split('/').collect();
+    if segments.iter().any(|segment| {
+        segment.is_empty()
+            || *segment == "."
+            || *segment == ".."
+            || !segment
+                .bytes()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, b'-' | b'_' | b'.' | b'~'))
+    }) {
+        return Err(format!(
+            "static route path {path:?} is not a safe literal URL path; use server placement for dynamic routes"
+        ));
+    }
+    Ok(Some(format!("{}/index.html", segments.join("/"))))
 }
 
 /// Concatenate all `.nula` source files under `src_root` into a single string
@@ -361,7 +399,8 @@ mod tests {
             &missing_source,
             &BudgetsSection::default(),
             &validated,
-        );
+        )
+        .expect("validated server route should produce deployment IR");
 
         assert_eq!(ir.routes.len(), 1);
         assert_eq!(ir.routes[0].handler.as_deref(), Some("show_user"));
@@ -377,13 +416,47 @@ mod tests {
     }
 
     #[test]
-    fn test_route_path_to_artifact() {
-        assert_eq!(route_path_to_artifact("/"), "index.html");
-        assert_eq!(route_path_to_artifact("/about"), "about/index.html");
+    fn only_static_get_routes_produce_safe_html_artifacts() {
         assert_eq!(
-            route_path_to_artifact("/blog/:slug"),
-            "blog/:slug/index.html"
+            static_artifact_for_route("GET", "/", "static").unwrap(),
+            Some("index.html".to_string())
         );
+        assert_eq!(
+            static_artifact_for_route("GET", "/about/team", "static").unwrap(),
+            Some("about/team/index.html".to_string())
+        );
+        assert_eq!(
+            static_artifact_for_route("GET", "/blog/:slug", "server").unwrap(),
+            None
+        );
+        assert_eq!(
+            static_artifact_for_route("POST", "/submit", "server").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn static_artifact_generation_rejects_unsafe_paths_and_dynamic_routes() {
+        for path in [
+            "/blog/:slug",
+            "/users/{id}",
+            "/../outside",
+            "/./inside",
+            "//external",
+            "/double//slash",
+            "/x\\unsafe",
+            "/file?query=1",
+            "/file#fragment",
+            "/encoded/%2e%2e",
+            "/path\r\nheader",
+        ] {
+            assert!(
+                static_artifact_for_route("GET", path, "static").is_err(),
+                "accepted unsafe static route: {path:?}"
+            );
+        }
+        assert!(static_artifact_for_route("POST", "/submit", "static").is_err());
+        assert!(static_artifact_for_route("HEAD", "/about", "static").is_err());
     }
 
     #[test]
@@ -395,6 +468,7 @@ mod tests {
             "server"
         );
         assert_eq!(default_route_placement("POST", "/users"), "server");
+        assert_eq!(default_route_placement("HEAD", "/users"), "server");
     }
 
     #[test]
