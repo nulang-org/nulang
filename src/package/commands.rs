@@ -2377,7 +2377,7 @@ fn cmd_deploy(
     eprintln!("Deploying {} to {} ...", name, cloud_url);
 
     let url = format!("{}/api/v1/deploy", cloud_url.trim_end_matches('/'));
-    let agent = crate::registry::client::verified_https_agent().map_err(|message| {
+    let agent = crate::registry::client::verified_https_agent(&url).map_err(|message| {
         NuError::PackageError {
             msg: format!("system TLS initialization failed: {}", message),
             span: Span::default(),
