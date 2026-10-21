@@ -19,8 +19,8 @@ pub enum CType {
     Unit,
     /// A raw Nulang value passed as an opaque i64-tagged value. This is only
     /// usable via the C registration API; it has no language-level syntax.
-    /// Raw host-pointer tags returned by C are rejected because the ABI cannot
-    /// establish that they point into a live Nulang heap.
+    /// Pointer-tagged values are rejected in either direction because this raw
+    /// numeric ABI cannot establish a Nulang heap borrow or its lifetime.
     Value,
 }
 
@@ -292,7 +292,17 @@ pub unsafe fn call_native(func: &NativeFunction, args: &[Value]) -> Result<Value
                 arg_slots.push(ArgSlot::U8(u8_storage.len() - 1));
             }
             CType::Value => {
-                u64_storage.push(val.to_bits());
+                let raw = val.to_bits();
+                // A raw u64 ABI cannot carry a Nulang heap borrow or prove
+                // that the callee will not retain a pointer past this call.
+                // Pointer arguments require an explicitly unsafe pointer ABI.
+                if crate::value_layout::is_ptr_raw(raw) {
+                    return Err(format!(
+                        "FFI argument {} for {}: CType::Value cannot pass pointer-tagged values without heap provenance and a lifetime contract",
+                        i, func.symbol
+                    ));
+                }
+                u64_storage.push(raw);
                 ffi_types.push(Type::u64());
                 arg_slots.push(ArgSlot::U64(u64_storage.len() - 1));
             }
@@ -696,6 +706,11 @@ mod tests {
     }
 
     #[cfg(feature = "ffi")]
+    extern "C" fn accept_opaque_value(_bits: u64) -> i64 {
+        1
+    }
+
+    #[cfg(feature = "ffi")]
     extern "C" fn make_greeting() -> *const c_char {
         let s = std::ffi::CString::new("hello ffi").unwrap();
         s.into_raw()
@@ -756,6 +771,21 @@ mod tests {
         );
         let err = unsafe { call_native(&func, &[]) }.unwrap_err();
         assert!(err.contains("pointer-tagged"));
+    }
+
+    #[test]
+    #[cfg(feature = "ffi")]
+    fn test_call_native_value_rejects_borrowed_pointer_argument() {
+        let func = make_func(
+            accept_opaque_value as *const c_void,
+            Signature::new(vec![CType::Value], CType::I64),
+        );
+        let mut byte = 7u8;
+        // SAFETY: byte remains allocated for the entire call, but CType::Value
+        // has no provenance or lifetime contract for exposing its pointer.
+        let pointer_value = unsafe { Value::ptr(&mut byte as *mut u8) };
+        let err = unsafe { call_native(&func, &[pointer_value]) }.unwrap_err();
+        assert!(err.contains("pointer-tagged"), "{err}");
     }
 
     #[test]
