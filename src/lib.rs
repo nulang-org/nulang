@@ -12,6 +12,7 @@ pub mod agent;
 #[cfg(feature = "native-codegen")]
 pub mod aot;
 pub mod artifact_identity;
+pub mod artifact_store;
 pub mod ast;
 pub mod authority;
 pub mod authority_host;
