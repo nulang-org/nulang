@@ -7,7 +7,13 @@ const rust = readFileSync(new URL('../../src/web/reactivity.rs', import.meta.url
 const start = rust.indexOf('pub fn generate_client_runtime() -> String {');
 assert.notEqual(start, -1, 'generate_client_runtime must be defined');
 const match = rust.slice(start).match(/r#"([\s\S]*?)"#\s*\.to_string\(\)/);
-assert.ok(match, 'find emitted client runtime JavaScript in Rust');
+const extracted = rust.slice(start, start + 200).includes('include_str!("client_runtime.js")');
+const runtime = extracted
+  ? readFileSync(new URL('../../src/web/client_runtime.js', import.meta.url), 'utf8')
+  : (() => {
+      assert.ok(match, 'find emitted client runtime JavaScript in Rust');
+      return match[1];
+    })();
 
 function mount(values, readyState = 'complete') {
   const elements = values.map(([signal, content]) => ({
@@ -24,7 +30,7 @@ function mount(values, readyState = 'complete') {
     addEventListener(name, listener) { listeners.set(name, listener); },
   };
   const window = {};
-  runInNewContext(match[1], { window, document, console, URLSearchParams });
+  runInNewContext(runtime, { window, document, console, URLSearchParams });
   return { elements, listeners, api: window.nulang };
 }
 

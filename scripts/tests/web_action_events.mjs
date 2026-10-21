@@ -8,7 +8,12 @@ import { runInNewContext } from 'node:vm';
 
 const source = readFileSync(new URL('../../src/web/reactivity.rs', import.meta.url), 'utf8');
 const match = source.match(/pub fn generate_client_runtime\(\) -> String \{\s*r#"(.*?)"#\s*\.to_string\(\)/s);
-assert.ok(match, 'expected compiler-generated client runtime');
+// Newer compiler revisions own the runtime in a sibling file via include_str!.
+// Test exactly the content returned by generate_client_runtime in either form.
+const runtime = match ? match[1] : (() => {
+  assert.match(source, /include_str!\("client_runtime\.js"\)/, 'expected compiler-owned client runtime');
+  return readFileSync(new URL('../../src/web/client_runtime.js', import.meta.url), 'utf8');
+})();
 
 function element(tagName, action) {
   const listeners = new Map();
@@ -41,7 +46,7 @@ const window = {
     increment() { invoked.push('increment'); },
   },
 };
-runInNewContext(match[1], { document, window }, { timeout: 1000 });
+runInNewContext(runtime, { document, window }, { timeout: 1000 });
 
 assert.deepEqual(form.events(), ['submit'], 'a form must not listen for bubbling clicks');
 assert.equal(form.dispatch('click'), false, 'clicking a form input is not an action');

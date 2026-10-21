@@ -51,6 +51,9 @@ jobs:
       - name: Smoke test Nulang Web action events
         run: node scripts/tests/web_action_events.mjs
 
+      - name: Test canonical Web UI runtime and action protocol
+        run: node --test tests/web_ui_runtime.test.cjs
+
       - name: Install docs dependencies
         run: |
           cd docs
