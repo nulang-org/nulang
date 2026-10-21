@@ -123,6 +123,21 @@ impl CoreVM {
         Ok(module_idx)
     }
 
+    /// Opt-in structural admission for an NBC artifact before publishing it.
+    ///
+    /// This checks bytecode references, not type safety, sandboxing, or
+    /// resource limits. Untrusted code must still run in a sandboxed host.
+    pub fn load_nbc_with_structural_verification(
+        &mut self,
+        data: &[u8],
+    ) -> Result<usize, String> {
+        let artifact = CodeModule::from_nbc_with_structural_verification(data)
+            .map_err(|e| format!("Failed structural verification of .nbc: {e}"))?;
+        let module_idx = self.modules.len();
+        self.modules.push(artifact.module);
+        Ok(module_idx)
+    }
+
     pub fn load_module_from_code(&mut self, module: &CodeModule) -> Result<usize, String> {
         let module_idx = self.modules.len();
         self.modules.push(module.clone());
