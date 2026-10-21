@@ -262,6 +262,7 @@ public enum NulangUIProtocolError: Error, Equatable, Sendable {
     case emptyIdentifier(String)
     case emptyNodeKind(String)
     case emptyActionEvent(String)
+    case duplicateActionEvent(node: String, event: String)
     case duplicateNode(String)
     case missingNode(String)
     case danglingChild(parent: String, child: String)
@@ -286,6 +287,8 @@ extension NulangUIProtocolError: LocalizedError {
             return "node \(node) has an empty kind"
         case .emptyActionEvent(let node):
             return "node \(node) has an empty action event"
+        case .duplicateActionEvent(let node, let event):
+            return "node \(node) binds action event \(event) more than once"
         case .duplicateNode(let node):
             return "duplicate node id \(node)"
         case .missingNode(let node):
@@ -364,10 +367,17 @@ public struct UiDocument: Codable, Equatable, Sendable {
             guard !node.kind.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw NulangUIProtocolError.emptyNodeKind(node.id)
             }
+            var boundEvents = Set<String>()
             for binding in node.actions {
                 try requireIdentifier("action_id", binding.actionId)
                 guard !binding.event.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                     throw NulangUIProtocolError.emptyActionEvent(node.id)
+                }
+                guard boundEvents.insert(binding.event).inserted else {
+                    throw NulangUIProtocolError.duplicateActionEvent(
+                        node: node.id,
+                        event: binding.event
+                    )
                 }
             }
             guard byId[node.id] == nil else {
@@ -786,7 +796,9 @@ public enum HostToRuntimeMessage: Equatable, Sendable, Codable {
 
 public enum NulangUICodec {
     public static func decodeRuntimeMessage(_ data: Data) throws -> RuntimeToHostMessage {
-        try JSONDecoder().decode(RuntimeToHostMessage.self, from: data)
+        let message = try JSONDecoder().decode(RuntimeToHostMessage.self, from: data)
+        try message.validate()
+        return message
     }
 
     public static func decodeRuntimeMessage(_ json: String) throws -> RuntimeToHostMessage {
