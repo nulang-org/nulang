@@ -6019,9 +6019,46 @@ fn test_five_node_cluster_split_brain_detects_and_heals() {
         }
         sleep(Duration::from_millis(50));
     };
+    // A tracked heartbeat roundtrip passed before the one-shot actor send.
+    // On failure, distinguish a stale route/connection from a message stuck
+    // in the receiver mailbox or a missing behavior dispatch contract. Keep
+    // this diagnostic read-only: the recovery assertion must not gain retries,
+    // longer deadlines, or a modified network/scheduler execution path.
+    let sender_peer = nodes[4]
+        .distributed
+        .cluster
+        .as_ref()
+        .and_then(|cluster| cluster.get_node(ids[0]))
+        .map(|info| (info.status, info.address));
+    let sender_connection = nodes[4]
+        .distributed
+        .transport
+        .as_ref()
+        .and_then(|transport| transport.connection_addr(ids[0]));
+    let receiver_peer = nodes[0]
+        .distributed
+        .cluster
+        .as_ref()
+        .and_then(|cluster| cluster.get_node(ids[4]))
+        .map(|info| (info.status, info.address));
+    let receiver_connection = nodes[0]
+        .distributed
+        .transport
+        .as_ref()
+        .and_then(|transport| transport.connection_addr(ids[4]));
+    let receiver_actor = nodes[0].actors.get(&actor_id).map(|actor| {
+        (
+            actor.state,
+            actor.mailbox.len(),
+            actor
+                .get_state_field("received")
+                .and_then(|value| value.as_int()),
+        )
+    });
+    let receiver_behavior = nodes[0].behavior_id_for(actor_id, "store");
     assert!(
         delivered,
-        "remote delivery across the healed 5-node split-brain boundary failed"
+        "remote delivery across the healed 5-node split-brain boundary failed: sender_peer={sender_peer:?}, sender_connection={sender_connection:?}, receiver_peer={receiver_peer:?}, receiver_connection={receiver_connection:?}, receiver_actor={receiver_actor:?}, receiver_behavior={receiver_behavior:?}"
     );
 
     shutdown_nodes(&mut nodes.iter_mut().collect::<Vec<_>>());
