@@ -276,17 +276,17 @@ pub fn decode_scalar_constant(raw: &str, ty: Option<&str>) -> Result<Constant, S
         Some("Int") => raw
             .parse::<i64>()
             .map(Constant::Int)
-            .map_err(|_| format!("expected Int, got '{raw}'")),
+            .map_err(|_| "expected Int".to_string()),
         Some("Float") => raw
             .parse::<f64>()
             .ok()
             .filter(|value| value.is_finite())
             .map(Constant::Float)
-            .ok_or_else(|| format!("expected finite Float, got '{raw}'")),
+            .ok_or_else(|| "expected finite Float".to_string()),
         Some("Bool") => match raw {
             "true" => Ok(Constant::Bool(true)),
             "false" => Ok(Constant::Bool(false)),
-            _ => Err(format!("expected Bool ('true' or 'false'), got '{raw}'")),
+            _ => Err("expected Bool ('true' or 'false')".to_string()),
         },
         _ => Ok(Constant::String(raw.to_string())),
     }
@@ -448,6 +448,48 @@ mod tests {
         // clients for request-originated failures.
         assert!(problem.get("handler_param").is_none());
         assert!(problem.get("handler_index").is_none());
+    }
+
+    #[test]
+    fn scalar_decode_errors_do_not_reflect_submitted_values() {
+        // Typed request inputs can include tokens, email addresses or long
+        // attacker-controlled strings. Diagnostics must describe the type,
+        // not echo the value into problem responses or logs.
+        let submitted = "PRIVATE-CREDENTIAL-invalid-for-int-float-bool";
+        for expected in ["Int", "Float", "Bool"] {
+            let error = decode_scalar_constant(submitted, Some(expected)).unwrap_err();
+            assert!(
+                !error.contains(submitted),
+                "{expected} decode error reflected submitted input"
+            );
+            assert!(
+                error.len() < 128,
+                "{expected} decode error should remain bounded"
+            );
+        }
+
+        let empty = HashMap::new();
+        let form = HashMap::from([("account_id".into(), submitted.into())]);
+        let headers = Vec::new();
+        let values = RequestBindingValues {
+            path: &empty,
+            query: &empty,
+            headers: &headers,
+            cookies: &empty,
+            body: None,
+            form: &form,
+        };
+        let error = bind_request_arguments(
+            &[binding(RouteBindingSource::Form, "account_id", 0, "Int")],
+            1,
+            &values,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.http_status(), 400);
+        assert_eq!(error.problem_details()["expected_type"], "Int");
+        assert!(!error.message.contains(submitted));
+        assert!(!error.problem_details().to_string().contains(submitted));
     }
 
     #[test]

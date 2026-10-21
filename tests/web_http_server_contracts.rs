@@ -153,6 +153,27 @@ fn invalid_typed_query_is_problem_json_over_real_http() {
 }
 
 #[test]
+fn invalid_typed_query_does_not_reflect_untrusted_value_over_real_http() {
+    let server = WebDevServer::bind_runtime(0, None, None, vec![typed_query_route()])
+        .expect("bind typed WebDevServer");
+    let sensitive_value = "PRIVATE_CREDENTIAL_INVALID_INT";
+    let request = format!(
+        "GET /users?limit={sensitive_value} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    );
+    let response = send_raw_request(server.port, &request);
+
+    assert!(
+        response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+        "{response}"
+    );
+    let problem: serde_json::Value =
+        serde_json::from_str(response_body(&response)).expect("parse problem JSON");
+    assert_eq!(problem["code"], "invalid_request_input");
+    assert_eq!(problem["expected_type"], "Int");
+    assert!(!response.contains(sensitive_value));
+}
+
+#[test]
 fn legacy_route_still_falls_back_over_real_http() {
     let server =
         WebDevServer::bind(0, None, None, vec![legacy_route()]).expect("bind legacy WebDevServer");
