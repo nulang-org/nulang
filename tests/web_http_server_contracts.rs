@@ -165,3 +165,54 @@ fn legacy_route_still_falls_back_over_real_http() {
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
     assert!(response_body(&response).starts_with("legacy"), "{response}");
 }
+
+fn typed_string_route() -> RuntimeWebRoute {
+    let source = "fn text_endpoint() -> String { \"plain text\" }";
+    let (module, function_index) = compile_handler(source, "text_endpoint");
+
+    let contract_source = r#"
+fn text_endpoint() -> String { "plain text" }
+
+fn web_main() {
+    perform Web.route("GET", "/text", text_endpoint)
+}
+"#;
+    let tokens = Lexer::new(contract_source).lex().expect("lex text route");
+    let ast = Parser::new(tokens)
+        .parse_module()
+        .expect("parse text route");
+    let contracts = compile_module_contracts(&ast);
+    assert!(
+        contracts.diagnostics.is_empty(),
+        "{:?}",
+        contracts.diagnostics
+    );
+    let plan =
+        compile_runtime_route_plan(&contracts.routes[0]).expect("compile text response route");
+    assert_eq!(plan.response_type.as_deref(), Some("String"));
+    RuntimeWebRoute {
+        route: WebRoute {
+            method: HttpMethod::Get,
+            path: "/text".to_string(),
+            handler_module: module,
+            handler_func_idx: function_index,
+        },
+        plan: Some(plan),
+    }
+}
+
+#[test]
+fn compiled_string_response_is_plain_text_over_http() {
+    let server = WebDevServer::bind_runtime(0, None, None, vec![typed_string_route()])
+        .expect("bind text WebDevServer");
+    let response = send_raw_request(
+        server.port,
+        "GET /text HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert!(
+        response.contains("\r\nContent-Type: text/plain; charset=utf-8\r\n"),
+        "{response}"
+    );
+    assert_eq!(response_body(&response), "plain text");
+}
