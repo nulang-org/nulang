@@ -202,6 +202,20 @@ jobs:
       - name: Smoke test (eval)
         run: ./target/release/nulang --eval 'perform IO.print("hello")'
 
+      # Regression gate for the production CLI + file-backed persistence path.
+      # A clean restart is not equivalent to SIGKILL; do not market it as one.
+      - name: Verify durable actor state across CLI process restart
+        run: |
+          python3 scripts/verify_cli_persistent_restart.py \
+            --binary ./target/release/nulang
+
+      # SIGKILL only after observing an acknowledged durable update; the
+      # same JSON store must restore the actor in a completely new CLI process.
+      - name: Verify persistent actor state after SIGKILL
+        run: |
+          python3 scripts/verify_cli_sigkill_recovery.py \
+            --binary ./target/release/nulang
+
       - name: Scaffold test package
         run: ./target/release/nulang nula new test-pkg
 
