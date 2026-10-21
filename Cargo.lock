@@ -2437,6 +2437,7 @@ dependencies = [
  "futures",
  "hex",
  "httparse",
+ "hyper 0.14.32",
  "hyper-tls 0.5.0",
  "libc",
  "libffi",

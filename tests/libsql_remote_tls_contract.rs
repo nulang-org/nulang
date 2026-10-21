@@ -86,7 +86,7 @@ fn remote_https_rejects_untrusted_certificates() {
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
     use std::sync::Arc;
 
-    let identity = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let identity = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
     let key: PrivateKeyDer<'static> =
         PrivatePkcs8KeyDer::from(identity.signing_key.serialize_der()).into();
     let server_config = rustls::ServerConfig::builder()
@@ -149,6 +149,7 @@ fn remote_url_rejects_non_loopback_plaintext_and_credential_authorities() {
     let cases = [
         "http://0.0.0.0:0",
         "http://192.0.2.10:0",
+        "http://localhost:0",
         "http://localhost.evil.invalid:0",
         "http://127.0.0.1.evil.invalid:0",
         "http://127.0.0.1@192.0.2.10:0",

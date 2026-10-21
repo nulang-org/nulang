@@ -61,7 +61,7 @@ mobile-runtime = []
 # Enables the standalone Savina-style actor benchmark runner without pulling optional subsystems.
 savina-bench = []
 python = ["dep:pyo3"]
-sqlite = ["dep:libsql", "dep:tokio", "dep:hyper-tls", "dep:url"]
+sqlite = ["dep:libsql", "dep:tokio", "dep:hyper-tls", "dep:url", "dep:hyper"]
 lsp = ["dep:tower-lsp", "dep:tokio", "dep:futures", "dep:tower-service"]
 ai-runtime = ["dep:nulang-ai", "dep:nulang-ai-local", "dep:uuid", "dep:reqwest", "dep:tokio"]
 wasm-backend = ["native-codegen", "dep:wasm-encoder", "dep:wasmtime", "dep:wat", "dep:borsh"]
@@ -162,6 +162,7 @@ hyper-tls = { version = "0.5", optional = true }
 # Parse remote database URLs with normalized host/authority semantics before
 # handing their bearer tokens to the HTTP transport. Already in lock via HTTP.
 url = { version = "2", optional = true }
+hyper = { version = "0.14", features = ["client", "tcp"], optional = true }
 # RocksDB persistence backend (feature `rocksdb`).
 rocksdb = { version = "0.21", optional = true, default-features = false }
 # PostgreSQL persistence backend (feature `postgres`). Sync wrapper over tokio-postgres.

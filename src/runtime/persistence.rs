@@ -1353,7 +1353,9 @@ fn validate_libsql_remote_url(raw: &str) -> io::Result<()> {
     }
 
     let loopback = match host {
-        url::Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
+        // DNS/NSS can resolve a seemingly local name to a remote server.
+        // Never send bearer credentials over plaintext on a hostname.
+        url::Host::Domain(_) => false,
         url::Host::Ipv4(ip) => ip.is_loopback(),
         url::Host::Ipv6(ip) => ip.is_loopback(),
     };
@@ -1374,7 +1376,6 @@ mod libsql_remote_url_validation_tests {
             "https://database.turso.io",
             "libsql://database.turso.io",
             "database.turso.io",
-            "http://localhost:8080",
             "http://127.0.0.1:8080",
             "http://127.2.3.4:8080",
             "http://[::1]:8080",
@@ -1388,6 +1389,8 @@ mod libsql_remote_url_validation_tests {
         for url in [
             "http://0.0.0.0:80",
             "http://192.0.2.10",
+            "http://localhost",
+            "http://localhost:8080",
             "http://localhost.evil.invalid",
             "http://127.0.0.1.evil.invalid",
             "http://127.0.0.1@192.0.2.10",
@@ -1403,6 +1406,19 @@ mod libsql_remote_url_validation_tests {
             assert!(!error.to_string().contains("password"));
         }
     }
+}
+
+#[cfg(feature = "sqlite")]
+fn remote_native_tls_connector_from<F>(
+    factory: F,
+) -> io::Result<hyper_tls::HttpsConnector<hyper::client::HttpConnector>>
+where
+    F: FnOnce() -> io::Result<hyper_tls::native_tls::TlsConnector>,
+{
+    let tls = factory()?;
+    let mut http = hyper::client::HttpConnector::new();
+    http.enforce_http(false);
+    Ok(hyper_tls::HttpsConnector::from((http, tls.into())))
 }
 
 #[cfg(feature = "sqlite")]
@@ -1465,6 +1481,10 @@ impl LibsqlStore {
     pub fn new_remote(url: &str, auth_token: &str) -> io::Result<Self> {
         // Validate transport authority before allocating resources or using the token.
         validate_libsql_remote_url(url)?;
+        // Fail rather than panic when native system trust cannot initialize.
+        let connector = remote_native_tls_connector_from(|| {
+            hyper_tls::native_tls::TlsConnector::new().map_err(io::Error::other)
+        })?;
         let rt =
             tokio::runtime::Runtime::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let db = rt.block_on(async {
@@ -1472,7 +1492,7 @@ impl LibsqlStore {
                 // libSQL's built-in TLS uses unmaintained rustls 0.22 through
                 // hyper-rustls 0.25. Supply a Hyper 0.14-compatible native
                 // TLS connector with system certificate verification instead.
-                .connector(hyper_tls::HttpsConnector::new())
+                .connector(connector)
                 .build()
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
@@ -4503,5 +4523,23 @@ mod libsql_atomic_transition_tests {
 
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(store.latest_sequence(42), 1);
+    }
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod remote_tls_init_error_tests {
+    use super::remote_native_tls_connector_from;
+    use std::io;
+
+    #[test]
+    fn test_remote_tls_context_initialization_failure_returns_error() {
+        let result = remote_native_tls_connector_from(|| {
+            Err(io::Error::other(
+                "simulated native trust initialization failure",
+            ))
+        });
+        let error = result.expect_err("TLS initialization error must not panic");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("simulated native trust"));
     }
 }
