@@ -18,7 +18,7 @@ fn binding(event: &str, action_id: &str) -> ActionBinding {
 }
 
 #[test]
-fn duplicate_event_on_one_node_is_rejected() {
+fn test_duplicate_event_on_one_node_is_rejected() {
     let mut button = UiNode::new("submit", "button");
     button.actions = vec![binding("activate", "save"), binding("activate", "delete")];
     let document = UiDocument::new("form", Revision(1), "submit", vec![button]);
@@ -33,7 +33,7 @@ fn duplicate_event_on_one_node_is_rejected() {
 }
 
 #[test]
-fn patch_cannot_install_ambiguous_actions_or_mutate_the_document() {
+fn test_patch_cannot_install_ambiguous_actions_or_mutate_the_document() {
     let mut button = UiNode::new("submit", "button");
     button.actions.push(binding("activate", "save"));
     let mut document = UiDocument::new("form", Revision(1), "submit", vec![button]);
@@ -54,7 +54,7 @@ fn patch_cannot_install_ambiguous_actions_or_mutate_the_document() {
 }
 
 #[test]
-fn different_events_and_different_nodes_are_independent() {
+fn test_different_events_and_different_nodes_are_independent() {
     let mut root = UiNode::new("root", "column");
     root.children = vec![NodeId::from("save"), NodeId::from("cancel")];
 
