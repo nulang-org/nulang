@@ -71,6 +71,17 @@ const WORKLOADS: &[Workload] = &[
         name: "call_loop",
         source: "fn add(x: Int, y: Int) -> Int { x + y }; var sum = 0; var i = 0; while i < 50000 { sum = add(sum, i); i = i + 1; }; sum",
     },
+    // Same loop and identity call, with concrete versus erased generic
+    // signatures. A specialization change must prove its benefit on identical
+    // work and retain interpreter parity for both variants.
+    Workload {
+        name: "concrete_identity_call_loop",
+        source: "fn identity(x: Int) -> Int { x }; var sum = 0; var i = 0; while i < 50000 { sum = identity(sum + i); i = i + 1; }; sum",
+    },
+    Workload {
+        name: "generic_identity_call_loop",
+        source: "fn identity[T](x: T) -> T { x }; var sum = 0; var i = 0; while i < 50000 { sum = identity(sum + i); i = i + 1; }; sum",
+    },
     Workload {
         name: "branch_loop",
         source: "var sum = 0; var i = 0; while i < 100000 { if i < 50000 then { sum = sum + i } else { sum = sum - 1 }; i = i + 1; }; sum",
@@ -334,6 +345,43 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generic_and_concrete_identity_calls_have_matched_workloads() {
+        let concrete = WORKLOADS
+            .iter()
+            .find(|workload| workload.name == "concrete_identity_call_loop")
+            .expect("missing concrete call baseline");
+        let generic = WORKLOADS
+            .iter()
+            .find(|workload| workload.name == "generic_identity_call_loop")
+            .expect("missing generic call comparison");
+        assert!(concrete.source.contains("fn identity(x: Int) -> Int"));
+        assert!(generic.source.contains("fn identity[T](x: T) -> T"));
+        for workload in [concrete, generic] {
+            assert!(workload.source.contains("while i < 50000"));
+            assert!(workload.source.contains("sum = identity(sum + i)"));
+        }
+    }
+
+    #[test]
+    fn generic_and_concrete_identity_calls_agree_in_reference_interpreter() {
+        let concrete = WORKLOADS
+            .iter()
+            .find(|workload| workload.name == "concrete_identity_call_loop")
+            .expect("concrete identity workload");
+        let generic = WORKLOADS
+            .iter()
+            .find(|workload| workload.name == "generic_identity_call_loop")
+            .expect("generic identity workload");
+
+        let (concrete_result, _) = run_interpreter(&compile(concrete.source));
+        let (generic_result, _) = run_interpreter(&compile(generic.source));
+        assert_eq!(
+            generic_result, concrete_result,
+            "generic and concrete fixtures must have identical semantics"
+        );
+    }
 
     #[test]
     fn crossover_workloads_cover_current_threshold_window() {
