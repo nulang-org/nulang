@@ -146,6 +146,27 @@ use nulang_ai::{
 
 static ACTOR_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// Opaque, process-local address for best-effort replies to a live actor.
+///
+/// A caller can deliver through an alias until its owner deactivates it.
+/// Aliases are deliberately not NUL0 wire addresses, durable identities, or
+/// authorization credentials: Rust callers must control who learns a token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ActorAlias(u64);
+
+/// Outcome of an attempt to deliver through a local process alias.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AliasSendStatus {
+    Accepted,
+    Backpressured,
+    /// Alias was canceled, never existed, or its owner has exited.
+    Inactive,
+}
+
+static ACTOR_ALIAS_COUNTER: AtomicU64 = AtomicU64::new(1);
+/// Safety bound for live reply addresses held by a single actor.
+const MAX_LOCAL_ALIASES_PER_ACTOR: usize = 4096;
+
 /// Generate a fresh, globally unique actor ID.
 pub fn fresh_actor_id() -> u64 {
     ACTOR_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -355,6 +376,10 @@ pub(crate) enum MessageAdmission {
 pub struct Runtime {
     pub actors: HashMap<u64, Actor>,
     pub supervisors: HashMap<u64, Supervisor>,
+    /// Active process-local reply aliases; not synchronized across shards.
+    local_aliases: HashMap<ActorAlias, u64>,
+    /// Reverse ownership index keeps actor-exit cleanup O(aliases of actor).
+    local_aliases_by_owner: HashMap<u64, HashSet<ActorAlias>>,
     pub scheduler: Scheduler,
     pub next_run_slot: Option<u64>,
     pub actor_pool: Vec<Actor>,
@@ -644,6 +669,8 @@ impl Runtime {
         Runtime {
             actors: HashMap::new(),
             supervisors: HashMap::new(),
+            local_aliases: HashMap::new(),
+            local_aliases_by_owner: HashMap::new(),
             scheduler: Scheduler::new(4),
             next_run_slot: None,
             actor_pool: Vec::new(),
@@ -3818,12 +3845,109 @@ impl Runtime {
         outstanding
     }
 
+    /// Create a cancelable, node-and-shard-local reply address for a live actor.
+    ///
+    /// Distinct aliases never share an identifier within a process lifetime,
+    /// including across independent Runtime instances. No wire or persistent
+    /// representation is provided. An alias may receive multiple replies until
+    /// deactivated; this is NOT an exactly-once or single-response primitive.
+    pub fn create_local_alias(&mut self, owner: u64) -> Option<ActorAlias> {
+        if !self
+            .actors
+            .get(&owner)
+            .is_some_and(|actor| actor.state != ActorState::Terminated)
+        {
+            return None;
+        }
+        if self
+            .local_aliases_by_owner
+            .get(&owner)
+            .is_some_and(|aliases| aliases.len() >= MAX_LOCAL_ALIASES_PER_ACTOR)
+        {
+            return None;
+        }
+        let token = ACTOR_ALIAS_COUNTER
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .ok()?;
+        let alias = ActorAlias(token);
+        self.local_aliases.insert(alias, owner);
+        self.local_aliases_by_owner
+            .entry(owner)
+            .or_default()
+            .insert(alias);
+        Some(alias)
+    }
+
+    /// Deactivate only an alias owned by `owner`. Does not retract messages
+    /// that were already admitted to the owner's mailbox.
+    pub fn deactivate_local_alias(&mut self, owner: u64, alias: ActorAlias) -> bool {
+        if self.local_aliases.get(&alias).copied() != Some(owner) {
+            return false;
+        }
+        self.local_aliases.remove(&alias);
+        if let Some(aliases) = self.local_aliases_by_owner.get_mut(&owner) {
+            aliases.remove(&alias);
+            if aliases.is_empty() {
+                self.local_aliases_by_owner.remove(&owner);
+            }
+        }
+        true
+    }
+
+    /// Route a reply only to the live local owner of an active alias.
+    ///
+    /// Alias lookup and admission are serialized by the owning Runtime's
+    /// mutable access. Deactivation wins over any *subsequent* send, but
+    /// cannot revoke previously admitted mailbox messages. Backpressure
+    /// is reported explicitly and does not deactivate the alias.
+    pub fn send_to_local_alias(
+        &mut self,
+        alias: ActorAlias,
+        behavior_id: u16,
+        args: &[Value],
+    ) -> AliasSendStatus {
+        let Some(owner) = self.local_aliases.get(&alias).copied() else {
+            return AliasSendStatus::Inactive;
+        };
+        if !self
+            .actors
+            .get(&owner)
+            .is_some_and(|actor| actor.state != ActorState::Terminated)
+        {
+            self.deactivate_local_alias(owner, alias);
+            return AliasSendStatus::Inactive;
+        }
+
+        let trace = self.current_trace.as_ref().map(|ctx| ctx.to_traceparent());
+        match self.deliver_local_message(owner, behavior_id, args, trace) {
+            MessageAdmission::Accepted => AliasSendStatus::Accepted,
+            MessageAdmission::Backpressured => AliasSendStatus::Backpressured,
+            MessageAdmission::Rejected => {
+                self.deactivate_local_alias(owner, alias);
+                AliasSendStatus::Inactive
+            }
+        }
+    }
+
+    /// Remove all aliases owned by a terminating actor without scanning the
+    /// whole registry. Called from the canonical actor reaping path.
+    fn retire_local_aliases(&mut self, actor_id: u64) {
+        if let Some(aliases) = self.local_aliases_by_owner.remove(&actor_id) {
+            for alias in aliases {
+                self.local_aliases.remove(&alias);
+            }
+        }
+    }
+
     /// Remove an actor from the runtime, releasing its receiver holds and
     /// deferring heap destruction while other actors still reference its
     /// objects.  A heap with outstanding foreign refs is moved into
     /// `retired_heaps` instead of being dropped, so in-flight ops and
     /// receiver holds held elsewhere never dangle.
     pub(crate) fn remove_actor_reaping(&mut self, actor_id: u64) {
+        self.retire_local_aliases(actor_id);
         self.release_held_foreign_refs(actor_id);
         if let Some(mut actor) = self.actors.remove(&actor_id) {
             if Self::heap_has_outstanding_foreign_refs(&actor.heap) {

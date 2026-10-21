@@ -22,6 +22,153 @@ fn declare_test_behavior(rt: &mut Runtime, actor_id: u64, name: &str) {
 }
 
 #[test]
+fn local_reply_alias_deactivation_rejects_late_replies_without_affecting_other_aliases() {
+    let mut runtime = Runtime::new();
+    let receiver = runtime.spawn_actor(Box::new(Vec::new));
+    let first = runtime.create_local_alias(receiver).expect("first alias");
+    let second = runtime.create_local_alias(receiver).expect("second alias");
+    assert_ne!(first, second);
+
+    assert_eq!(
+        runtime.send_to_local_alias(first, 7, &[Value::int(11)]),
+        AliasSendStatus::Accepted
+    );
+    assert!(runtime.deactivate_local_alias(receiver, first));
+    assert!(!runtime.deactivate_local_alias(receiver, first));
+    assert_eq!(
+        runtime.send_to_local_alias(first, 7, &[Value::int(99)]),
+        AliasSendStatus::Inactive
+    );
+    assert_eq!(
+        runtime.send_to_local_alias(second, 7, &[Value::int(22)]),
+        AliasSendStatus::Accepted
+    );
+
+    let mailbox = &mut runtime.actors.get_mut(&receiver).unwrap().mailbox;
+    let first_reply = mailbox.pop().expect("already accepted reply remains");
+    let second_reply = mailbox.pop().expect("other alias remains usable");
+    assert_eq!(first_reply.behavior_id, 7);
+    assert_eq!(first_reply.payload[0].as_int(), Some(11));
+    assert_eq!(second_reply.payload[0].as_int(), Some(22));
+    assert!(mailbox.pop().is_none(), "late reply was never admitted");
+}
+
+#[test]
+fn local_reply_alias_only_owner_can_deactivate_and_unknown_alias_is_inactive() {
+    let mut runtime = Runtime::new();
+    let receiver = runtime.spawn_actor(Box::new(Vec::new));
+    let stranger = runtime.spawn_actor(Box::new(Vec::new));
+    let alias = runtime.create_local_alias(receiver).expect("valid alias");
+
+    assert!(!runtime.deactivate_local_alias(stranger, alias));
+    assert_eq!(
+        runtime.send_to_local_alias(alias, 0, &[Value::int(1)]),
+        AliasSendStatus::Accepted
+    );
+    assert!(runtime.deactivate_local_alias(receiver, alias));
+    assert_eq!(
+        runtime.send_to_local_alias(alias, 0, &[Value::int(2)]),
+        AliasSendStatus::Inactive
+    );
+    assert_eq!(
+        runtime.send_to_local_alias(ActorAlias(u64::MAX), 0, &[]),
+        AliasSendStatus::Inactive
+    );
+    assert_eq!(runtime.actors.get(&receiver).unwrap().mailbox.len(), 1);
+}
+
+#[test]
+fn local_reply_alias_retires_on_actor_exit_and_rejects_dead_owners() {
+    let mut runtime = Runtime::new();
+    let receiver = runtime.spawn_actor(Box::new(Vec::new));
+    let alias = runtime.create_local_alias(receiver).expect("alias");
+    runtime.exit_actor(receiver, ExitReason::Normal);
+
+    assert!(!runtime.local_aliases.contains_key(&alias));
+    assert_eq!(
+        runtime.send_to_local_alias(alias, 0, &[Value::int(1)]),
+        AliasSendStatus::Inactive
+    );
+    assert!(runtime.create_local_alias(receiver).is_none());
+    assert_eq!(runtime.local_aliases.len(), 0);
+}
+
+#[test]
+fn local_reply_aliases_are_not_valid_in_other_runtime_instances() {
+    let mut first_runtime = Runtime::new();
+    let mut second_runtime = Runtime::new();
+    let owner_a = first_runtime.spawn_actor(Box::new(Vec::new));
+    let owner_b = second_runtime.spawn_actor(Box::new(Vec::new));
+    let alias_a = first_runtime.create_local_alias(owner_a).unwrap();
+    let alias_b = second_runtime.create_local_alias(owner_b).unwrap();
+
+    assert_ne!(alias_a, alias_b, "tokens must not collide between runtimes");
+    assert_eq!(
+        second_runtime.send_to_local_alias(alias_a, 0, &[Value::int(1)]),
+        AliasSendStatus::Inactive
+    );
+    assert_eq!(
+        second_runtime.actors.get(&owner_b).unwrap().mailbox.len(),
+        0
+    );
+}
+
+#[test]
+fn local_reply_alias_registry_caps_outstanding_aliases_per_actor() {
+    let mut runtime = Runtime::new();
+    let owner = runtime.spawn_actor(Box::new(Vec::new));
+    let mut aliases = Vec::new();
+    for _ in 0..MAX_LOCAL_ALIASES_PER_ACTOR {
+        aliases.push(runtime.create_local_alias(owner).expect("under alias cap"));
+    }
+    assert!(
+        runtime.create_local_alias(owner).is_none(),
+        "cap rejects more aliases"
+    );
+    let old = aliases.pop().unwrap();
+    assert!(runtime.deactivate_local_alias(owner, old));
+    assert!(
+        runtime.create_local_alias(owner).is_some(),
+        "released slot is reusable"
+    );
+}
+
+#[test]
+fn local_reply_alias_reports_backpressure_and_remains_active_for_retry() {
+    let mut runtime = Runtime::new();
+    let receiver = runtime.spawn_actor(Box::new(Vec::new));
+    runtime.actors.get_mut(&receiver).unwrap().mailbox = Mailbox::new(1);
+    let alias = runtime.create_local_alias(receiver).expect("alias");
+    assert_eq!(
+        runtime.send_to_local_alias(alias, 0, &[Value::int(1)]),
+        AliasSendStatus::Accepted
+    );
+    assert_eq!(
+        runtime.send_to_local_alias(alias, 0, &[Value::int(2)]),
+        AliasSendStatus::Backpressured
+    );
+    let mailbox = &mut runtime.actors.get_mut(&receiver).unwrap().mailbox;
+    assert_eq!(mailbox.len(), 1);
+    assert_eq!(mailbox.pop().unwrap().payload[0].as_int(), Some(1));
+    assert_eq!(
+        runtime.send_to_local_alias(alias, 0, &[Value::int(3)]),
+        AliasSendStatus::Accepted
+    );
+    assert_eq!(
+        runtime
+            .actors
+            .get_mut(&receiver)
+            .unwrap()
+            .mailbox
+            .pop()
+            .unwrap()
+            .payload[0]
+            .as_int(),
+        Some(3)
+    );
+}
+
+#[test]
 fn test_actor_module_hash_uses_exact_runtime_schema() {
     let mut module = CodeModule::new("multi-schema-hash");
     for (name, hash) in [("First", [1u8; 32]), ("Second", [2u8; 32])] {
