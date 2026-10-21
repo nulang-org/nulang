@@ -65,6 +65,7 @@ pub mod lexer;
 pub mod lsp;
 pub mod migration_purity;
 pub mod mir;
+pub mod mir_access;
 pub mod mir_codegen;
 pub mod mir_inline;
 pub mod mir_lower;
