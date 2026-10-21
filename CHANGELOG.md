@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Kotlin/JVM renderer-neutral mobile protocol foundation — 2026-10-21
+- **Added a dependency-light Android-side reference state machine for `nulang-ui/1` and `nulang-ui-msg/1`.** It validates semantic UI trees without recursion, enforces per-node action event uniqueness, rejects invalid protocol/revision transitions, and applies ordered patches atomically without publishing malformed state.
+- **Added ten executable Kotlin conformance cases and a dedicated Gradle/Java 17 CI gate.** This is a correctness and host-integration foundation only: untrusted JSON decoding, native AAR packaging, the Compose renderer, action authorization, and device testing are not yet implemented.
+
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.
 - **Two focused regressions pin chained division, modulo, nil operands and signed zero.** This does not fix unrelated loop JIT parity, effects error categorization or direct-call error formatting; exact-head differential tests and CI remain required before promotion.
