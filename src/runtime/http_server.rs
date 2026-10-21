@@ -568,6 +568,60 @@ fn supported_explicit_response_status(status: u16) -> bool {
     )
 }
 
+/// Route all explicit HTTP outcomes through one request-scoped slot.
+/// Multiple declarations are an error, including a redirect after JSON.
+fn stage_explicit_http_response(response: Result<HttpResponse, ()>) {
+    RESPONSE_OVERRIDE.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        if cell.is_some() {
+            *cell = Some(Err(()));
+        } else {
+            *cell = Some(response);
+        }
+    });
+}
+
+/// Admit root-relative redirects only. Reject cross-origin, CRLF, control
+/// bytes, and markup characters before constructing a Location header.
+fn valid_explicit_redirect_target(target: &str) -> bool {
+    let bytes = target.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 8192
+        && bytes[0] == b'/'
+        && bytes.get(1) != Some(&b'/')
+        && bytes
+            .iter()
+            .all(|b| (0x21..=0x7e).contains(b) && !matches!(*b, b'\\' | b'"' | b'<' | b'>'))
+}
+
+/// Register a wire-level redirect in the same slot as JSON/text responses.
+/// A GET redirects with 302, and POST redirects with 303 to avoid replay.
+pub fn register_explicit_http_redirect(target: &str) -> bool {
+    let is_post = CURRENT_REQUEST.with(|current| {
+        current
+            .borrow()
+            .as_ref()
+            .map(|ctx| ctx.request.method == HttpMethod::Post)
+    });
+    let Some(is_post) = is_post else {
+        return false;
+    };
+    let response = if valid_explicit_redirect_target(target) {
+        Ok(HttpResponse {
+            status: if is_post { 303 } else { 302 },
+            headers: vec![
+                ("Location".into(), target.to_string()),
+                ("Cache-Control".into(), "no-store".into()),
+            ],
+            body: Vec::new(),
+        })
+    } else {
+        Err(())
+    };
+    stage_explicit_http_response(response);
+    true
+}
+
 /// Stage one HTTP response from a Nulang route handler. This is a transport
 /// adapter rather than a new source-language response type. Json bodies are
 /// parsed and reserialized so malformed JSON is never served as JSON.
@@ -604,16 +658,7 @@ pub fn register_explicit_http_response(status: u16, body: &str, json: bool) -> b
                 body: body.as_bytes().to_vec(),
             })
         };
-        RESPONSE_OVERRIDE.with(|cell| {
-            let mut cell = cell.borrow_mut();
-            // A second response declaration is a handler error, never
-            // last-writer-wins. Keep the failure even after later calls.
-            if cell.is_some() {
-                *cell = Some(Err(()));
-            } else {
-                *cell = Some(response);
-            }
-        });
+        stage_explicit_http_response(response);
         true
     })
 }
