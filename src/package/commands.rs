@@ -79,16 +79,29 @@ pub fn run(args: &[String]) -> NuResult<()> {
         Some("build") => {
             let web = args.get(1).map(String::as_str) == Some("--web");
             if web {
-                cmd_build_web()
-            } else {
-                let json = args[1..].iter().any(|a| a == "--json");
-                if args.len() > 1 && !json {
+                if args.len() != 2 {
                     return Err(NuError::PackageError {
-                        msg: format!("unknown flag '{}' for nula build", args[1]),
+                        msg: format!("unsupported flag '{}' for nula build --web", args[2]),
                         span: Span::default(),
                     });
                 }
-                cmd_build(json)
+                cmd_build_web()
+            } else {
+                let mut json = false;
+                let mut locked = false;
+                for arg in args.iter().skip(1) {
+                    match arg.as_str() {
+                        "--json" => json = true,
+                        "--locked" => locked = true,
+                        other => {
+                            return Err(NuError::PackageError {
+                                msg: format!("unknown flag '{}' for nula build", other),
+                                span: Span::default(),
+                            });
+                        }
+                    }
+                }
+                cmd_build_with_lock(json, locked)
             }
         }
         Some("build-wasm") => cmd_build_wasm(),
@@ -288,7 +301,7 @@ fn print_usage() {
     println!("                Scaffold a new package directory");
     println!("                Templates: default, cli, lib, full");
     println!("  init          Scaffold a new package in the current directory");
-    println!("  build         Build .nbc + RFC 0020 behavior sidecar in .nula/dist/");
+    println!("  build [--locked] [--json]  Build .nbc + behavior sidecar in .nula/dist/");
     println!("  build-wasm    Build package to .wasm + .cwasm in .nula/dist/");
     println!("  test [--filter <substr>] [--verbose|-v] [--watch|-w]  Run .nula test files");
     println!("  run           Build and run the package entry point");
@@ -766,6 +779,13 @@ button {
 /// Resolve the package in the current directory, write `Nulang.lock`, and
 /// return the entry point path.
 fn prepare_package() -> NuResult<PathBuf> {
+    prepare_package_with_lock(false)
+}
+
+/// In locked mode, compare the resolved package pins to an existing lockfile
+/// without changing that file. This mode is not offline: remote dependencies
+/// may still need to be fetched by the resolver.
+fn prepare_package_with_lock(locked: bool) -> NuResult<PathBuf> {
     let root = package_root()?;
     let manifest_path = root.join(MANIFEST_FILE);
     let manifest = Manifest::load(&root).map_err(|e| NuError::PackageError {
@@ -820,6 +840,22 @@ fn prepare_package() -> NuResult<PathBuf> {
         }
     }
 
+    // A missing or invalid lockfile must fail before the resolver can touch
+    // any local dependency cache or make a remote network request.
+    let existing_lock = if locked {
+        let lock_path = root.join(LOCKFILE_FILE);
+        Some(Lockfile::load(&root).map_err(|e| NuError::PackageError {
+            msg: format!(
+                "--locked requires a readable, valid {}: {}",
+                lock_path.display(),
+                e
+            ),
+            span: Span::default(),
+        })?)
+    } else {
+        None
+    };
+
     eprintln!("  Resolving dependencies...");
     let resolution = resolve(&root, &manifest).map_err(|e| NuError::PackageError {
         msg: format!(
@@ -832,13 +868,25 @@ fn prepare_package() -> NuResult<PathBuf> {
     })?;
 
     let lock_path = root.join(LOCKFILE_FILE);
-    resolution
-        .to_lockfile()
-        .save(&root)
-        .map_err(|e| NuError::PackageError {
-            msg: format!("failed to write {}: {}", lock_path.display(), e),
-            span: Span::default(),
-        })?;
+    let resolved_lock = resolution.to_lockfile();
+    if let Some(existing_lock) = existing_lock {
+        if existing_lock.package != resolved_lock.package {
+            return Err(NuError::PackageError {
+                msg: format!(
+                    "--locked lockfile is out of date: {} does not match resolved dependencies; run 'nulang nula build' to update it",
+                    lock_path.display()
+                ),
+                span: Span::default(),
+            });
+        }
+    } else {
+        resolved_lock
+            .save(&root)
+            .map_err(|e| NuError::PackageError {
+                msg: format!("failed to write {}: {}", lock_path.display(), e),
+                span: Span::default(),
+            })?;
+    }
 
     let entry = root.join(&manifest.package.entry);
     if !entry.exists() {
@@ -1064,7 +1112,7 @@ fn build_module_path() -> Option<String> {
 /// `nula build`: resolve dependencies, write the lockfile, type-check entry.
 /// `nula build`: resolve dependencies, write the lockfile, type-check and
 /// compile to a .nbc artifact in .nula/dist/.
-fn cmd_build(json: bool) -> NuResult<()> {
+fn cmd_build_with_lock(json: bool, locked: bool) -> NuResult<()> {
     let root = package_root()?;
     let manifest_path = root.join(MANIFEST_FILE);
     let manifest = Manifest::load(&root).map_err(|e| NuError::PackageError {
@@ -1074,7 +1122,7 @@ fn cmd_build(json: bool) -> NuResult<()> {
     let name = manifest.package.name.clone();
     let version = manifest.package.version.clone();
 
-    let entry = prepare_package()?;
+    let entry = prepare_package_with_lock(locked)?;
     let entry_str = entry.to_string_lossy().into_owned();
 
     if json {
@@ -2606,6 +2654,67 @@ fn cmd_remove(name: Option<&str>) -> NuResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn locked_build_requires_existing_lockfile() {
+        let dir =
+            std::env::temp_dir().join(format!("nulang_locked_missing_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = ChangeDir::new(&dir);
+        scaffold_package(&dir, "locked-missing", "default").unwrap();
+        // Even an unresolvable dependency must not be visited before a
+        // missing lockfile is rejected (important for remote dependencies).
+        let mut manifest = Manifest::load(&dir).unwrap();
+        manifest.dependencies.insert(
+            "missing".to_string(),
+            Dependency::Detailed(DependencyDetail {
+                path: Some("nonexistent".to_string()),
+                ..Default::default()
+            }),
+        );
+        manifest.save(&dir).unwrap();
+
+        let err =
+            prepare_package_with_lock(true).expect_err("locked build must require Nulang.lock");
+        assert!(err.to_string().contains("Nulang.lock"), "{err}");
+        assert!(!dir.join(LOCKFILE_FILE).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn locked_build_preserves_lockfile_and_rejects_dependency_drift() {
+        let dir = std::env::temp_dir().join(format!("nulang_locked_drift_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = ChangeDir::new(&dir);
+        scaffold_package(&dir, "locked-drift", "default").unwrap();
+        prepare_package().unwrap();
+
+        let lock_path = dir.join(LOCKFILE_FILE);
+        let original = std::fs::read_to_string(&lock_path).unwrap();
+        let marked = format!("{original}\n# preserved by --locked\n");
+        std::fs::write(&lock_path, &marked).unwrap();
+        prepare_package_with_lock(true).expect("matching lock must work");
+        assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), marked);
+
+        let dependency_dir = dir.join("extra");
+        scaffold_package(&dependency_dir, "extra", "lib").unwrap();
+        let mut manifest = Manifest::load(&dir).unwrap();
+        manifest.dependencies.insert(
+            "extra".to_string(),
+            Dependency::Detailed(DependencyDetail {
+                path: Some("extra".to_string()),
+                ..Default::default()
+            }),
+        );
+        manifest.save(&dir).unwrap();
+
+        let err = prepare_package_with_lock(true).expect_err("drift must fail closed");
+        assert!(err.to_string().contains("lockfile"), "{err}");
+        assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), marked);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_manifest_language_pin() {

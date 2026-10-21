@@ -147,7 +147,7 @@ version must match too, mirroring Cargo's caret semantics.
 
 ### The `Nulang.lock` lockfile
 
-Every build re-resolves the dependency graph and writes `Nulang.lock` next
+By default, every build re-resolves the dependency graph and writes `Nulang.lock` next
 to the manifest, pinning each dependency's exact source so builds are
 reproducible. Packages appear in topological order (dependencies before
 dependents).
@@ -167,6 +167,19 @@ version = "0.2.0"
 source = "git+https://github.com/example/json.nu.git#v0.2.0"
 commit = "1ea88549599b9950c0e084bf6068ed91d126db03"
 ```
+
+### Locked builds
+
+`nulang nula build --locked` requires an existing, valid `Nulang.lock`.
+It resolves dependencies and verifies that the resolved package versions, sources,
+local source hashes, and git commits match the locked package pins. A missing
+or out-of-date lockfile fails the build **without rewriting it**. Use a normal
+`nulang nula build` to intentionally update the lockfile.
+
+`--locked` does **not** imply offline or hermetic execution: git and registry
+dependencies can still require network resolution, and the compiler toolchain
+and filesystem environment are not yet pinned by this flag. Use this command
+for lockfile-drift detection, not as proof of a fully reproducible Cloud build.
 
 The `source` prefix records where the package came from: `path+<dir>` for
 local dependencies, `git+<url>#<rev>` for git ones (with the full commit
