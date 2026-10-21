@@ -3158,12 +3158,15 @@ impl VM {
         if value.is_nil() {
             return Ok(value);
         }
-        let ptr = value.as_ptr().ok_or_else(|| NuError::VMError {
-            msg: "FFI C string return was not a pointer".to_string(),
-            span: Span::default(),
-        })?;
-        // SAFETY: ptr is a valid null-terminated C string from cstr_to_value.
-        let bytes = unsafe { CStr::from_ptr(ptr as *const c_char).to_bytes() };
+        // SAFETY: FFICall passed the temporary allocation created by
+        // cstr_to_value; taking ownership makes every subsequent error path
+        // drop the CString instead of leaking it.
+        let owned_cstr = unsafe { crate::ffi::marshal::take_cstr_value(value) }
+            .ok_or_else(|| NuError::VMError {
+                msg: "FFI C string return was not a pointer".to_string(),
+                span: Span::default(),
+            })?;
+        let bytes = owned_cstr.as_bytes();
         let len = bytes.len();
         let heap_ptr = self
             .actor_callbacks
@@ -3177,10 +3180,7 @@ impl VM {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), heap_ptr, len);
             *heap_ptr.add(len) = 0;
         }
-        // SAFETY: value was produced by cstr_to_value.
-        unsafe {
-            crate::ffi::marshal::free_cstr_value(value);
-        }
+        // owned_cstr is released here even if the actor allocation fails.
         Ok(unsafe {
             /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
             Value::ptr(heap_ptr)
@@ -6390,6 +6390,45 @@ mod vm_tests {
             result.err()
         );
         assert!(result.unwrap().is_nil());
+    }
+
+    /// Actor heap failure must not strand the separately allocated temporary
+    /// native C string. Run under Miri/leak checking when available.
+    #[test]
+    fn test_copy_cstr_return_allocation_failure_releases_native_temporary() {
+        #[derive(Debug)]
+        struct RejectAllocation;
+
+        impl ActorVmCallbacks for RejectAllocation {
+            fn alloc(&mut self, _size: usize, _tag: HeapTypeTag) -> Option<*mut u8> {
+                None
+            }
+            fn drop_ref(&mut self, _ptr: *mut u8) {}
+            fn retain_ref(&mut self, _ptr: *mut u8) {}
+            fn array_len(&self, _ptr: *mut u8) -> Option<usize> {
+                None
+            }
+            fn spawn_actor(
+                &mut self,
+                _module: &CodeModule,
+                _spawn_pc: usize,
+                _behavior_idx: usize,
+                _init: Vec<(String, Value)>,
+            ) -> Value {
+                Value::nil()
+            }
+            fn send_message(&mut self, _target: Value, _behavior_id: u16, _args: &[Value]) {}
+        }
+
+        let mut vm = VM::new();
+        vm.set_actor_callbacks(Box::new(RejectAllocation));
+        // SAFETY: this borrowed literal remains valid during conversion.
+        let temporary = unsafe { crate::ffi::marshal::cstr_to_value(c"ffi cleanup".as_ptr()) };
+        let err = vm.copy_cstr_return(temporary).expect_err("allocation must fail");
+        assert!(
+            format!("{err:?}").contains("FFI C string heap allocation failed"),
+            "{err:?}"
+        );
     }
 
     /// A non-NULL C string return is still copied into the actor heap.

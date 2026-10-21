@@ -140,33 +140,70 @@ fn ptr_to_value_checked(p: *mut u8) -> Value {
     }
 }
 
+/// Copy a lifetime-checked borrowed C string into an owned Nulang FFI value.
+///
+/// The input borrow ends at this call: it is copied into a separate `CString`
+/// allocation, so the original C string may be released independently.
+/// The caller must free the returned pointer with `free_cstr_value` after the
+/// VM has copied it to actor-owned storage.
+///
+/// Address representability is checked *before* `CString::into_raw` transfers
+/// ownership. If a target cannot encode the allocated pointer, the CString is
+/// automatically dropped and `nil` is returned rather than leaking it.
+/// This is an internal host-side borrow boundary, not a source-language
+/// lifetime checker for arbitrary tagged `Value` pointers.
+pub fn borrowed_cstr_to_value(borrowed: &CStr) -> Value {
+    let owned = borrowed.to_owned();
+    let ptr = owned.as_ptr() as *mut u8;
+    if !crate::value_layout::ptr_fits_payload(ptr as u64) {
+        return Value::nil();
+    }
+    // SAFETY: the checked pointer is from the same owned CString allocation
+    // that we now transfer into the VM's explicitly managed FFI value.
+    unsafe { Value::ptr(owned.into_raw() as *mut u8) }
+}
+
 /// Marshal a C string return value into a Nulang pointer value.
 ///
-/// The string is copied into a `CString` and the pointer is leaked to the VM
-/// heap model. The caller is responsible for freeing the returned pointer with
-/// `free_cstr_value` once it is copied into the actor heap.
+/// The result owns an independent copy; native code retains ownership of `s`.
+/// Call `free_cstr_value` once the VM has copied the result into actor storage.
 ///
 /// # Safety
-/// `s` must be a valid, null-terminated C string.
+/// `s` must be null or point to a valid null-terminated C string for the
+/// duration of this call. Native pointer validity cannot be verified here.
 pub unsafe fn cstr_to_value(s: *const c_char) -> Value {
     if s.is_null() {
         return Value::nil();
     }
     // SAFETY: caller guarantees `s` is a valid, null-terminated C string.
-    let cstr = CStr::from_ptr(s);
-    let cstring = CString::new(cstr.to_bytes()).unwrap_or_else(|_| CString::default());
-    ptr_to_value_checked(cstring.into_raw() as *mut u8)
+    borrowed_cstr_to_value(CStr::from_ptr(s))
+}
+
+/// Take ownership of a temporary C string produced by an FFI conversion.
+///
+/// The resulting `CString` automatically releases its allocation when
+/// dropped, including on early-return and error paths. The source `Value`
+/// must never be used to reclaim that allocation again.
+///
+/// # Safety
+/// For a non-nil value, its pointer must come from `cstr_to_value` or
+/// `borrowed_cstr_to_value` and must not already have been reclaimed.
+/// This consumes the allocation's ownership, not merely a pointer borrow.
+pub unsafe fn take_cstr_value(v: Value) -> Option<CString> {
+    let ptr = v.as_ptr()?;
+    // SAFETY: caller guarantees this pointer uniquely owns a CString::into_raw
+    // allocation created by the FFI conversion and not previously reclaimed.
+    Some(unsafe { CString::from_raw(ptr as *mut c_char) })
 }
 
 /// Free a pointer value previously created by `cstr_to_value`.
 ///
 /// # Safety
-/// `v` must be a pointer value whose payload was returned by `CString::into_raw`.
+/// `v` must hold a currently owned FFI CString pointer (or be nil). It must
+/// not be freed twice or used after this call.
 pub unsafe fn free_cstr_value(v: Value) {
-    if let Some(ptr) = v.as_ptr() {
-        // SAFETY: ptr came from CString::into_raw in cstr_to_value.
-        let _ = CString::from_raw(ptr as *mut c_char);
-    }
+    // SAFETY: caller supplies a unique FFI CString allocation or nil.
+    let _ = unsafe { take_cstr_value(v) };
 }
 
 /// Marshal a C void pointer return value into a Nulang pointer value.
@@ -661,6 +698,63 @@ mod tests {
             unsafe { CStr::from_ptr(round_ptr).to_str().unwrap() },
             "hello ffi"
         );
+        // SAFETY: round is the owned copy created by cstr_to_value.
+        unsafe { free_cstr_value(round) };
+    }
+
+    #[test]
+    fn test_take_cstr_value_owns_cleanup_after_return() {
+        let source = CString::new("temporary native return").unwrap();
+        // SAFETY: source is live and null-terminated for the copy.
+        let value = unsafe { cstr_to_value(source.as_ptr()) };
+        // SAFETY: value is a copied CString owned by the FFI conversion.
+        let reclaimed = unsafe { take_cstr_value(value) }.expect("owned C string");
+        drop(source);
+        assert_eq!(reclaimed.to_bytes(), b"temporary native return");
+        // Dropping reclaimed releases the temporary even on an early return.
+    }
+
+    #[test]
+    fn test_take_cstr_value_nil_is_not_owned() {
+        // SAFETY: nil is explicitly rejected without reconstructing a CString.
+        assert!(unsafe { take_cstr_value(Value::nil()) }.is_none());
+    }
+
+    #[test]
+    fn test_borrowed_cstr_copy_outlives_borrowed_source() {
+        let copy = {
+            let source = CString::new("borrowed source").unwrap();
+            borrowed_cstr_to_value(source.as_c_str())
+        };
+
+        let ptr = copy.as_ptr().expect("copied string pointer");
+        // SAFETY: borrowed_cstr_to_value owns an independent CString allocation.
+        assert_eq!(
+            unsafe { CStr::from_ptr(ptr as *const c_char) }.to_bytes(),
+            b"borrowed source"
+        );
+        // SAFETY: pointer was returned by borrowed_cstr_to_value.
+        unsafe { free_cstr_value(copy) };
+    }
+
+    #[test]
+    fn test_borrowed_cstr_copy_does_not_take_input_ownership() {
+        let source = CString::new("still owned by caller").unwrap();
+        let copy = borrowed_cstr_to_value(source.as_c_str());
+        assert_eq!(source.as_c_str().to_bytes(), b"still owned by caller");
+        assert_ne!(
+            copy.as_ptr().expect("copy pointer") as *const c_char,
+            source.as_ptr(),
+            "copy must not reuse the source allocation"
+        );
+        // SAFETY: pointer was returned by borrowed_cstr_to_value.
+        unsafe { free_cstr_value(copy) };
+    }
+
+    #[test]
+    fn test_null_native_cstr_returns_nil() {
+        // SAFETY: null is explicitly supported by cstr_to_value.
+        assert!(unsafe { cstr_to_value(std::ptr::null()) }.is_nil());
     }
 
     #[test]
