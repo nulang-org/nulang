@@ -1,0 +1,37 @@
+{
+  "type": "patch",
+  "protocol": "nulang-ui-msg/1",
+  "patch": {
+    "protocol": "nulang-ui/1",
+    "document_id": "tasks",
+    "base_revision": "18446744073709551613",
+    "revision": "18446744073709551614",
+    "operations": [
+      {
+        "op": "set_property",
+        "node_id": "button",
+        "name": "title",
+        "value": {
+          "type": "string",
+          "value": "saved"
+        }
+      },
+      {
+        "op": "replace_actions",
+        "node_id": "button",
+        "actions": [
+          {
+            "event": "press",
+            "action_id": "save",
+            "placement": "client"
+          },
+          {
+            "event": "focus",
+            "action_id": "audit",
+            "placement": "server"
+          }
+        ]
+      }
+    ]
+  }
+}

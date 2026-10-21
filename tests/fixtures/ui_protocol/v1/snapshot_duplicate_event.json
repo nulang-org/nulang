@@ -1,0 +1,28 @@
+{
+  "type": "snapshot",
+  "protocol": "nulang-ui-msg/1",
+  "document": {
+    "protocol": "nulang-ui/1",
+    "document_id": "tasks",
+    "revision": "1",
+    "root": "root",
+    "nodes": [
+      {
+        "id": "root",
+        "kind": "button",
+        "actions": [
+          {
+            "event": "press",
+            "action_id": "one",
+            "placement": "client"
+          },
+          {
+            "event": "press",
+            "action_id": "two",
+            "placement": "server"
+          }
+        ]
+      }
+    ]
+  }
+}

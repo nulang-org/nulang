@@ -1,0 +1,11 @@
+{
+  "type": "patch",
+  "protocol": "nulang-ui-msg/1",
+  "patch": {
+    "protocol": "nulang-ui/1",
+    "document_id": "tasks",
+    "base_revision": "7",
+    "revision": "7",
+    "operations": []
+  }
+}

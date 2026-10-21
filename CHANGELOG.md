@@ -1,4 +1,14 @@
 # Nulang Changelog
+
+### Rust/Kotlin UI wire ingress parity — 2026-10-21
+- Rust's public UI message decoders now validate protocol semantics before admitting host/runtime JSON, instead of relying on test-only validators.
+- Reject duplicate JSON map keys in node properties and nested tagged objects rather than silently overwriting the first value; shared Rust/Kotlin fixtures exercise both cases.
+- Golden-wire conformance now calls Rust's actual public decoder. This change does not establish full platform parity for size limits, Swift native hosts, or runtime action authorization.
+
+### Rust/Kotlin mobile UI golden-wire conformance — 2026-10-21
+- **Both protocol hosts consume the same eight checked-in `nulang-ui/1` JSON fixtures**, covering full-width revisions, signed integer extrema, bit-precise floats, Unicode and nested tagged values, ordered patches, duplicate action events, malformed collections, and rejected revisions.
+- **The Kotlin Gradle check and Rust crate test both assert acceptance/rejection and atomic patch semantics.** This locks down the snapshot/patch subset without claiming byte-for-byte JSON encoding parity, native packaging, or host-action authorization.
+
 ### Strict Android runtime-to-host JSON ingress — 2026-10-21
 - **The Kotlin/JVM host now decodes `nulang-ui-msg/1` snapshots and ordered patches through bounded JSON streaming** with duplicate-key rejection, tagged lossless values, mandatory version/identity checks, and atomic document publication.
 - **A dedicated executable JSON conformance suite runs in the Android UI protocol CI job** alongside the state-machine suite; this does not yet implement host action authorization, Compose rendering, a portable AAR, or Rust/Kotlin golden fixtures.
@@ -6,6 +16,11 @@
 ### Kotlin/JVM renderer-neutral mobile protocol foundation — 2026-10-21
 - **Added a dependency-light Android-side reference state machine for `nulang-ui/1` and `nulang-ui-msg/1`.** It validates semantic UI trees without recursion, enforces per-node action event uniqueness, rejects invalid protocol/revision transitions, and applies ordered patches atomically without publishing malformed state.
 - **Added ten executable Kotlin conformance cases and a dedicated Gradle/Java 17 CI gate.** This is a correctness and host-integration foundation only: untrusted JSON decoding, native AAR packaging, the Compose renderer, action authorization, and device testing are not yet implemented.
+
+### October 2026 dependency-security remediation candidate
+- Use verified system TLS for legacy libSQL remote connections (#1900) and explicitly configure ureq registry/deploy HTTPS rather than using obsolete bundled root certificates.
+- Update Wasmtime to 48.0.7, rustls-webpki to 0.103.16 and webpki-roots to 1.0.10 with a Cargo-generated lockfile; preserve blocking cargo-audit and restore trustworthy certificate chains.
+- This draft still requires exact-head CI, trusted-HTTPS positive/negative integration validation, independent review and release certification.
 
 ### Native float division/modulo nil parity — 2026-10-19
 - **Native JIT/AOT `FDiv` and `FMod` helpers now implement bytecode VM coercion for tagged inputs.** Tagged numerator values become `0.0`; tagged divisor values become `1.0`; true floating-point zero divisors still produce `nil`.

@@ -51,3 +51,18 @@ java -jar /tmp/nulang-ui-protocol-tests.jar
 Passing both suites proves the Kotlin reference state machine and validated JSON ingress only.
 It does **not** certify Android devices, Java/Kotlin packaging, Nulang bytecode,
 or SwiftUI/Compose rendering parity.
+
+
+## Shared Rust/Kotlin wire fixtures
+
+The `tests/fixtures/ui_protocol/v1/` directory holds eight checked-in
+snapshot/patch JSON cases. Both Rust and Kotlin conformance tests load
+these exact files and assert the same accept/reject behavior. Run:
+
+```sh
+gradle -p platforms/android/NulangUIProtocol check
+cargo test -p nulang-ui-protocol --test golden_wire_parity --locked
+```
+
+This adds wire-level regression coverage but **not** a Compose renderer,
+Android SDK/AAR integration, or native action authorization.

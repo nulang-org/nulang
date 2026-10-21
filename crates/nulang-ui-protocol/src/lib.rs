@@ -3,7 +3,10 @@
 //! `nulang-ui/1` defines semantic UI documents and patches.
 //! `nulang-ui-msg/1` defines runtime/host message envelopes.
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{
+    de::{MapAccess, Visitor},
+    Deserialize, Deserializer, Serialize, Serializer,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -161,7 +164,44 @@ pub enum WireValue {
     String(String),
     Bytes(Vec<u8>),
     Array(Vec<WireValue>),
-    Object(BTreeMap<String, WireValue>),
+    Object(#[serde(deserialize_with = "deserialize_unique_wire_map")] BTreeMap<String, WireValue>),
+}
+
+// Serde's default BTreeMap decoder silently overwrites duplicate JSON
+// keys. Reject them recursively at every wire-value map boundary so Rust
+// and strict Kotlin/Jackson decode exactly the same untrusted payloads.
+fn deserialize_unique_wire_map<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, WireValue>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct UniqueWireMap;
+
+    impl<'de> Visitor<'de> for UniqueWireMap {
+        type Value = BTreeMap<String, WireValue>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a JSON object with distinct property keys")
+        }
+
+        fn visit_map<M>(self, mut input: M) -> Result<Self::Value, M::Error>
+        where
+            M: MapAccess<'de>,
+        {
+            let mut result = BTreeMap::new();
+            while let Some((name, value)) = input.next_entry::<String, WireValue>()? {
+                if result.insert(name.clone(), value).is_some() {
+                    return Err(serde::de::Error::custom(format!(
+                        "duplicate wire property key: {name}"
+                    )));
+                }
+            }
+            Ok(result)
+        }
+    }
+
+    deserializer.deserialize_map(UniqueWireMap)
 }
 
 impl From<i64> for WireValue {
@@ -206,7 +246,11 @@ pub struct ActionBinding {
 pub struct UiNode {
     pub id: NodeId,
     pub kind: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "deserialize_unique_wire_map"
+    )]
     pub properties: BTreeMap<String, WireValue>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<NodeId>,
@@ -263,10 +307,19 @@ impl UiDocument {
             if node.kind.trim().is_empty() {
                 return Err(ProtocolError::EmptyNodeKind(node.id.clone()));
             }
+            // Same semantic constraint as parent UI correctness PR #1950:
+            // a native host must not resolve ambiguous per-node action events.
+            let mut action_events = BTreeSet::new();
             for binding in &node.actions {
                 require_id("action_id", binding.action_id.as_str())?;
                 if binding.event.trim().is_empty() {
                     return Err(ProtocolError::EmptyActionEvent(node.id.clone()));
+                }
+                if !action_events.insert(binding.event.as_str()) {
+                    return Err(ProtocolError::DuplicateActionEvent {
+                        node: node.id.clone(),
+                        event: binding.event.clone(),
+                    });
                 }
             }
             if nodes.insert(node.id.clone(), node).is_some() {
@@ -547,7 +600,11 @@ pub fn encode_runtime_message(message: &RuntimeToHostMessage) -> serde_json::Res
 }
 
 pub fn decode_runtime_message(input: &str) -> serde_json::Result<RuntimeToHostMessage> {
-    serde_json::from_str(input)
+    let message: RuntimeToHostMessage = serde_json::from_str(input)?;
+    message
+        .validate()
+        .map_err(<serde_json::Error as serde::de::Error>::custom)?;
+    Ok(message)
 }
 
 pub fn encode_host_message(message: &HostToRuntimeMessage) -> serde_json::Result<String> {
@@ -555,7 +612,11 @@ pub fn encode_host_message(message: &HostToRuntimeMessage) -> serde_json::Result
 }
 
 pub fn decode_host_message(input: &str) -> serde_json::Result<HostToRuntimeMessage> {
-    serde_json::from_str(input)
+    let message: HostToRuntimeMessage = serde_json::from_str(input)?;
+    message
+        .validate()
+        .map_err(<serde_json::Error as serde::de::Error>::custom)?;
+    Ok(message)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -567,6 +628,10 @@ pub enum ProtocolError {
     EmptyIdentifier(&'static str),
     EmptyNodeKind(NodeId),
     EmptyActionEvent(NodeId),
+    DuplicateActionEvent {
+        node: NodeId,
+        event: String,
+    },
     DuplicateNode(NodeId),
     MissingNode(NodeId),
     DanglingChild {
@@ -603,6 +668,9 @@ impl fmt::Display for ProtocolError {
             Self::EmptyIdentifier(field) => write!(f, "{field} must not be empty"),
             Self::EmptyNodeKind(node) => write!(f, "node {node} has an empty kind"),
             Self::EmptyActionEvent(node) => write!(f, "node {node} has an empty action event"),
+            Self::DuplicateActionEvent { node, event } => {
+                write!(f, "node {node} has duplicate action event {event:?}")
+            }
             Self::DuplicateNode(node) => write!(f, "duplicate node id {node}"),
             Self::MissingNode(node) => write!(f, "node {node} does not exist"),
             Self::DanglingChild { parent, child } => {
@@ -788,6 +856,18 @@ mod tests {
         message.validate().unwrap();
         let json = encode_host_message(&message).unwrap();
         assert_eq!(decode_host_message(&json).unwrap(), message);
+
+        // A JSON-shaped action is not necessarily a valid actionable request.
+        // The public entrypoint must enforce the same IDs as validate().
+        let mut invalid = message.clone();
+        let HostToRuntimeMessage::InvokeAction { request, .. } = &mut invalid;
+        request.action_id = ActionId::from("");
+        assert!(decode_host_message(&encode_host_message(&invalid).unwrap()).is_err());
+
+        let mut invalid_protocol = message.clone();
+        let HostToRuntimeMessage::InvokeAction { protocol, .. } = &mut invalid_protocol;
+        *protocol = "nulang-ui-msg/unsupported".to_owned();
+        assert!(decode_host_message(&encode_host_message(&invalid_protocol).unwrap()).is_err());
     }
 
     #[test]
