@@ -425,6 +425,22 @@ pub(crate) fn perform_web_builtin(
             );
             Some(callbacks.alloc_string(&out))
         }
+        Some("respond_json") | Some("respond_text") => {
+            let status = regs
+                .first()
+                .and_then(|value| value.as_int())
+                .and_then(|value| u16::try_from(value).ok())
+                .unwrap_or(0);
+            let body = resolve(constants, *regs.get(1)?);
+            let is_json = op_name == Some("respond_json");
+            if crate::runtime::http_server::register_explicit_http_response(status, &body, is_json)
+            {
+                Some(callbacks.alloc_string(""))
+            } else {
+                // A response has no meaning outside a routed HTTP request.
+                Some(crate::vm::Value::nil())
+            }
+        }
         Some("serve_static") => {
             let path = resolve(constants, *regs.first()?);
             match std::fs::read_to_string(&path) {

@@ -216,3 +216,194 @@ fn compiled_string_response_is_plain_text_over_http() {
     );
     assert_eq!(response_body(&response), "plain text");
 }
+
+fn explicit_response_route(
+    path: &str,
+    method: HttpMethod,
+    effect: &str,
+    status: u16,
+    body_source: &str,
+) -> WebRoute {
+    let source =
+        format!("fn response_endpoint() {{ perform Web.{effect}({status}, {body_source}) }}");
+    let (module, function_index) = compile_handler(&source, "response_endpoint");
+    WebRoute {
+        method,
+        path: path.to_string(),
+        handler_module: module,
+        handler_func_idx: function_index,
+    }
+}
+
+#[test]
+fn explicit_json_response_uses_201_and_canonical_json_over_http() {
+    let server = WebDevServer::bind(
+        0,
+        None,
+        None,
+        vec![explicit_response_route(
+            "/created",
+            HttpMethod::Post,
+            "respond_json",
+            201,
+            r#""{\"ok\": true, \"id\": 7}""#,
+        )],
+    )
+    .expect("bind explicit JSON WebDevServer");
+    let response = send_raw_request(
+        server.port,
+        "POST /created HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 201 Created\r\n"),
+        "{response}"
+    );
+    assert!(
+        response.contains("\r\nContent-Type: application/json\r\n"),
+        "{response}"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(response_body(&response)).unwrap(),
+        serde_json::json!({"ok": true, "id": 7})
+    );
+    assert!(!response_body(&response).contains("app.client.js"));
+}
+
+#[test]
+fn explicit_text_response_can_return_non_default_status() {
+    let server = WebDevServer::bind(
+        0,
+        None,
+        None,
+        vec![explicit_response_route(
+            "/invalid",
+            HttpMethod::Get,
+            "respond_text",
+            422,
+            r#""validation failed""#,
+        )],
+    )
+    .expect("bind explicit text WebDevServer");
+    let response = send_raw_request(
+        server.port,
+        "GET /invalid HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 422 Unprocessable Entity\r\n"),
+        "{response}"
+    );
+    assert!(
+        response.contains("\r\nContent-Type: text/plain; charset=utf-8\r\n"),
+        "{response}"
+    );
+    assert_eq!(response_body(&response), "validation failed");
+}
+
+#[test]
+fn invalid_explicit_json_and_unsupported_status_fail_closed() {
+    let server = WebDevServer::bind(
+        0,
+        None,
+        None,
+        vec![
+            explicit_response_route(
+                "/invalid-json",
+                HttpMethod::Get,
+                "respond_json",
+                200,
+                r#""{not valid json}""#,
+            ),
+            explicit_response_route(
+                "/invalid-status",
+                HttpMethod::Get,
+                "respond_text",
+                601,
+                r#""private error details""#,
+            ),
+        ],
+    )
+    .expect("bind invalid response routes");
+    for (path, rejected_body) in [
+        ("/invalid-json", "{not valid json}"),
+        ("/invalid-status", "private error details"),
+    ] {
+        let response = send_raw_request(
+            server.port,
+            &format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+            "{response}"
+        );
+        assert!(
+            !response_body(&response).contains(rejected_body),
+            "{response}"
+        );
+        assert!(!response.contains("\r\nLocation:"), "{response}");
+    }
+}
+
+#[test]
+fn explicit_response_metadata_does_not_escape_its_request() {
+    let server = WebDevServer::bind(
+        0,
+        None,
+        None,
+        vec![
+            explicit_response_route(
+                "/json",
+                HttpMethod::Get,
+                "respond_json",
+                201,
+                r#""{\"saved\":true}""#,
+            ),
+            legacy_route(),
+        ],
+    )
+    .expect("bind response and legacy routes");
+    let first = send_raw_request(
+        server.port,
+        "GET /json HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(first.starts_with("HTTP/1.1 201 Created\r\n"), "{first}");
+
+    let second = send_raw_request(
+        server.port,
+        "GET /legacy HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(second.starts_with("HTTP/1.1 200 OK\r\n"), "{second}");
+    assert!(
+        second.contains("\r\nContent-Type: text/html; charset=utf-8\r\n"),
+        "{second}"
+    );
+    assert!(response_body(&second).starts_with("legacy"), "{second}");
+}
+
+#[test]
+fn rejected_explicit_response_does_not_commit_session_cookies() {
+    let source = r#"
+fn response_endpoint() {
+    perform Web.set_cookie("session", "do-not-commit")
+    perform Web.respond_json(201, "{invalid json}")
+}
+"#;
+    let (module, function_index) = compile_handler(source, "response_endpoint");
+    let route = WebRoute {
+        method: HttpMethod::Get,
+        path: "/invalid-cookie".to_string(),
+        handler_module: module,
+        handler_func_idx: function_index,
+    };
+    let server =
+        WebDevServer::bind(0, None, None, vec![route]).expect("bind explicit response with cookie");
+    let response = send_raw_request(
+        server.port,
+        "GET /invalid-cookie HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+        "{response}"
+    );
+    assert!(!response.contains("\r\nSet-Cookie:"), "{response}");
+    assert!(!response_body(&response).contains("do-not-commit"));
+}

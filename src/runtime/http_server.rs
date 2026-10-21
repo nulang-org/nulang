@@ -359,6 +359,7 @@ impl HttpServerState {
         let status_text = match response.status {
             200 => "OK",
             201 => "Created",
+            202 => "Accepted",
             204 => "No Content",
             301 => "Moved Permanently",
             302 => "Found",
@@ -369,6 +370,7 @@ impl HttpServerState {
             404 => "Not Found",
             405 => "Method Not Allowed",
             408 => "Request Timeout",
+            409 => "Conflict",
             413 => "Payload Too Large",
             417 => "Expectation Failed",
             422 => "Unprocessable Entity",
@@ -520,6 +522,9 @@ pub struct RequestContext {
 thread_local! {
     static CURRENT_REQUEST: RefCell<Option<RequestContext>> = const { RefCell::new(None) };
     static RESPONSE_COOKIES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    // Explicit Web.respond_* outcomes are scoped to one route invocation.
+    // Err records invalid response metadata without leaking the requested body.
+    static RESPONSE_OVERRIDE: RefCell<Option<Result<HttpResponse, ()>>> = const { RefCell::new(None) };
 }
 
 /// Set the request context for the current thread, run `f`, then clear it.
@@ -529,9 +534,92 @@ where
 {
     CURRENT_REQUEST.with(|c| *c.borrow_mut() = Some(ctx));
     RESPONSE_COOKIES.with(|c| c.borrow_mut().clear());
+    RESPONSE_OVERRIDE.with(|c| *c.borrow_mut() = None);
     let result = f();
     CURRENT_REQUEST.with(|c| *c.borrow_mut() = None);
     result
+}
+
+/// Explicit response statuses must have a known HTTP reason phrase and a
+/// supported body policy. Redirects use Web.redirect rather than synthesizing
+/// 3xx responses without a Location header.
+fn supported_explicit_response_status(status: u16) -> bool {
+    matches!(
+        status,
+        200 | 201
+            | 202
+            | 204
+            | 400
+            | 401
+            | 403
+            | 404
+            | 405
+            | 408
+            | 409
+            | 413
+            | 417
+            | 422
+            | 429
+            | 431
+            | 500
+            | 501
+            | 502
+            | 503
+    )
+}
+
+/// Stage one HTTP response from a Nulang route handler. This is a transport
+/// adapter rather than a new source-language response type. Json bodies are
+/// parsed and reserialized so malformed JSON is never served as JSON.
+pub fn register_explicit_http_response(status: u16, body: &str, json: bool) -> bool {
+    CURRENT_REQUEST.with(|current| {
+        if current.borrow().is_none() {
+            return false;
+        }
+        let response = if !supported_explicit_response_status(status)
+            || body.len() > MAX_HTTP_BODY_SIZE
+            || (status == 204 && (!body.is_empty() || json))
+        {
+            Err(())
+        } else if status == 204 {
+            Ok(HttpResponse {
+                status,
+                headers: Vec::new(),
+                body: Vec::new(),
+            })
+        } else if json {
+            serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|value| serde_json::to_vec(&value).ok())
+                .map(|bytes| HttpResponse {
+                    status,
+                    headers: vec![("Content-Type".into(), "application/json".into())],
+                    body: bytes,
+                })
+                .ok_or(())
+        } else {
+            Ok(HttpResponse {
+                status,
+                headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
+                body: body.as_bytes().to_vec(),
+            })
+        };
+        RESPONSE_OVERRIDE.with(|cell| {
+            let mut cell = cell.borrow_mut();
+            // A second response declaration is a handler error, never
+            // last-writer-wins. Keep the failure even after later calls.
+            if cell.is_some() {
+                *cell = Some(Err(()));
+            } else {
+                *cell = Some(response);
+            }
+        });
+        true
+    })
+}
+
+fn take_explicit_http_response() -> Option<Result<HttpResponse, ()>> {
+    RESPONSE_OVERRIDE.with(|cell| cell.borrow_mut().take())
 }
 
 /// Add a `Set-Cookie` header for the current response.
@@ -1085,20 +1173,35 @@ impl WebDevServer {
                         )),
                         Err(error) => Err(error),
                     });
-                match rendered {
-                    Ok(Some(body)) => response_from_rendered(
+                let explicit_response = take_explicit_http_response();
+                match (rendered, explicit_response) {
+                    (Ok(Some(_)), Some(Ok(response))) => response,
+                    (Ok(Some(_)), Some(Err(()))) => {
+                        // Do not commit cookies when the response declaration
+                        // itself was rejected.
+                        take_response_cookies();
+                        HttpResponse {
+                            status: 500,
+                            headers: vec![(
+                                "Content-Type".into(),
+                                "text/plain; charset=utf-8".into(),
+                            )],
+                            body: b"Invalid explicit response".to_vec(),
+                        }
+                    }
+                    (Ok(Some(body)), None) => response_from_rendered(
                         route
                             .plan
                             .as_ref()
                             .and_then(|plan| plan.response_type.as_deref()),
                         body,
                     ),
-                    Ok(None) => HttpResponse {
+                    (Ok(None), _) => HttpResponse {
                         status: 500,
                         headers: vec![("Content-Type".into(), "text/plain".into())],
                         body: b"Internal server error".to_vec(),
                     },
-                    Err(DirectRequestRenderError::Decode(error)) => {
+                    (Err(DirectRequestRenderError::Decode(error)), _) => {
                         let problem = request_decode_problem_response(&error);
                         HttpResponse {
                             status: problem.status,
@@ -1106,7 +1209,7 @@ impl WebDevServer {
                             body: problem.body,
                         }
                     }
-                    Err(DirectRequestRenderError::Execution(error)) => {
+                    (Err(DirectRequestRenderError::Execution(error)), _) => {
                         eprintln!("typed route dispatch error: {error}");
                         HttpResponse {
                             status: 500,
@@ -1271,6 +1374,58 @@ mod tests {
         let unsupported = response_from_rendered(Some("CustomRecord"), "secret".into());
         assert_eq!(unsupported.status, 500);
         assert!(!String::from_utf8_lossy(&unsupported.body).contains("secret"));
+    }
+
+    #[test]
+    fn explicit_no_content_status_requires_an_empty_text_body() {
+        let context = RequestContext {
+            request: HttpRequest {
+                method: HttpMethod::Get,
+                path: "/test".into(),
+                headers: vec![],
+                body: vec![],
+            },
+            params: HashMap::new(),
+        };
+        with_request_context(context.clone(), || {
+            assert!(register_explicit_http_response(204, "", false));
+        });
+        let no_content = take_explicit_http_response().unwrap().unwrap();
+        assert_eq!(no_content.status, 204);
+        assert!(no_content.headers.is_empty());
+        assert!(no_content.body.is_empty());
+
+        with_request_context(context.clone(), || {
+            assert!(register_explicit_http_response(
+                204,
+                "forbidden body",
+                false
+            ));
+        });
+        assert!(take_explicit_http_response().unwrap().is_err());
+
+        with_request_context(context, || {
+            assert!(register_explicit_http_response(204, "null", true));
+        });
+        assert!(take_explicit_http_response().unwrap().is_err());
+    }
+
+    #[test]
+    fn multiple_explicit_response_calls_fail_closed() {
+        let context = RequestContext {
+            request: HttpRequest {
+                method: HttpMethod::Get,
+                path: "/test".into(),
+                headers: vec![],
+                body: vec![],
+            },
+            params: HashMap::new(),
+        };
+        with_request_context(context, || {
+            assert!(register_explicit_http_response(200, "first", false));
+            assert!(register_explicit_http_response(200, "second", false));
+        });
+        assert!(take_explicit_http_response().unwrap().is_err());
     }
 
     // A deterministic reader forces TCP-like fragmentation without sleeps.
