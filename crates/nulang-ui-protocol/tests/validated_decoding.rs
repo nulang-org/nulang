@@ -7,7 +7,7 @@ use nulang_ui_protocol::{
 };
 use serde_json::{json, Value};
 
-fn action_message() -> Value {
+fn test_action_message() -> Value {
     json!({
         "type": "invoke_action",
         "protocol": "nulang-ui-msg/1",
@@ -23,7 +23,7 @@ fn action_message() -> Value {
     })
 }
 
-fn snapshot_message() -> Value {
+fn test_snapshot_message() -> Value {
     json!({
         "type": "snapshot",
         "protocol": "nulang-ui-msg/1",
@@ -41,21 +41,21 @@ fn snapshot_message() -> Value {
 }
 
 #[test]
-fn host_decoder_rejects_unsupported_envelope_version() {
+fn test_host_decoder_rejects_unsupported_envelope_version() {
     let mut message = action_message();
     message["protocol"] = json!("nulang-ui-msg/999");
     assert!(decode_host_message(&message.to_string()).is_err());
 }
 
 #[test]
-fn host_decoder_rejects_blank_action_identity() {
+fn test_host_decoder_rejects_blank_action_identity() {
     let mut message = action_message();
     message["request"]["action_id"] = json!(" ");
     assert!(decode_host_message(&message.to_string()).is_err());
 }
 
 #[test]
-fn host_decoder_preserves_authorized_shape_and_lossless_payload() {
+fn test_host_decoder_preserves_authorized_shape_and_lossless_payload() {
     let message = action_message();
     let decoded = decode_host_message(&message.to_string()).unwrap();
     decoded.validate().unwrap();
@@ -68,7 +68,7 @@ fn host_decoder_preserves_authorized_shape_and_lossless_payload() {
 }
 
 #[test]
-fn runtime_decoder_rejects_unreachable_snapshot_nodes() {
+fn test_runtime_decoder_rejects_unreachable_snapshot_nodes() {
     let mut message = snapshot_message();
     message["document"]["nodes"]
         .as_array_mut()
@@ -78,7 +78,7 @@ fn runtime_decoder_rejects_unreachable_snapshot_nodes() {
 }
 
 #[test]
-fn runtime_decoder_rejects_non_increasing_patch_revision() {
+fn test_runtime_decoder_rejects_non_increasing_patch_revision() {
     let message = json!({
         "type": "patch",
         "protocol": "nulang-ui-msg/1",
@@ -94,7 +94,7 @@ fn runtime_decoder_rejects_non_increasing_patch_revision() {
 }
 
 #[test]
-fn runtime_decoder_rejects_ambiguous_per_node_event_bindings() {
+fn test_runtime_decoder_rejects_ambiguous_per_node_event_bindings() {
     let mut message = snapshot_message();
     message["document"]["nodes"][0]["actions"] = json!([
         { "event": "press", "action_id": "task.one", "placement": "client" },
@@ -104,7 +104,7 @@ fn runtime_decoder_rejects_ambiguous_per_node_event_bindings() {
 }
 
 #[test]
-fn runtime_decoder_accepts_a_valid_snapshot() {
+fn test_runtime_decoder_accepts_a_valid_snapshot() {
     let message = snapshot_message();
     let decoded = decode_runtime_message(&message.to_string()).unwrap();
     let RuntimeToHostMessage::Snapshot { document, .. } = decoded else {
