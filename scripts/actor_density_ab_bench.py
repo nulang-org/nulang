@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import platform
 import random
@@ -53,9 +54,12 @@ def _optional_float(fields: dict[str, str], key: str) -> float | None:
     if value == "unavailable":
         return None
     try:
-        return float(value)
+        number = float(value)
     except ValueError as exc:
         raise RuntimeError(f"invalid {key}: {value}") from exc
+    if not math.isfinite(number):
+        raise RuntimeError(f"invalid {key}: {value}")
+    return number
 
 
 def parse_probe(output: str, expected_mode: str) -> dict[str, float | int | None | str]:
@@ -90,12 +94,16 @@ def parse_probe(output: str, expected_mode: str) -> dict[str, float | int | None
         ns_per_actor = float(_required(fields, ns_key))
     except ValueError as exc:
         raise RuntimeError(f"invalid {ns_key}") from exc
-    if ns_per_actor <= 0:
-        raise RuntimeError(f"{ns_key} must be positive")
+    if not math.isfinite(ns_per_actor) or ns_per_actor <= 0:
+        raise RuntimeError(f"{ns_key} must be positive and finite")
 
     rss_bytes_per_actor = _optional_float(fields, rss_key)
     if rss_bytes_per_actor is not None and rss_bytes_per_actor < 0:
         raise RuntimeError(f"{rss_key} must be non-negative")
+    if settle_seconds is not None and settle_seconds < 0:
+        raise RuntimeError("scheduler_settle_seconds must be non-negative")
+    if heap_used is not None and heap_used < 0:
+        raise RuntimeError("actor_heap_used_bytes_per_actor must be non-negative")
 
     return {
         "mode": mode,
@@ -106,6 +114,21 @@ def parse_probe(output: str, expected_mode: str) -> dict[str, float | int | None
         "scheduler_settle_seconds": settle_seconds,
         "actor_heap_used_bytes_per_actor": heap_used,
     }
+
+
+def require_probe_actor_count(
+    row: dict[str, float | int | None | str],
+    requested: int,
+    *,
+    variant: str,
+    mode: str,
+) -> None:
+    """Reject timings produced for a workload other than the requested one."""
+    observed = row["actor_count"]
+    if observed != requested:
+        raise RuntimeError(
+            f"{variant}/{mode}: probe reported {observed} actors; requested {requested}"
+        )
 
 
 def _bootstrap_median_ci(values: list[float], iterations: int = 4_000) -> tuple[float, float]:
@@ -137,8 +160,13 @@ def paired_lower_is_better(base: list[float], candidate: list[float]) -> dict[st
     improvements: list[float] = []
     reductions: list[float] = []
     for index, (base_value, candidate_value) in enumerate(zip(base, candidate)):
-        if base_value <= 0 or candidate_value <= 0:
-            raise RuntimeError(f"pair {index}: values must be positive")
+        if (
+            not math.isfinite(base_value)
+            or not math.isfinite(candidate_value)
+            or base_value <= 0
+            or candidate_value <= 0
+        ):
+            raise RuntimeError(f"pair {index}: values must be positive and finite")
         improvement = base_value / candidate_value
         improvements.append(improvement)
         reductions.append((1.0 - candidate_value / base_value) * 100.0)
@@ -398,6 +426,9 @@ def main() -> int:
                     cpu_affinity=affinity,
                 )
                 row = parse_probe(output, mode)
+                require_probe_actor_count(
+                    row, args.actors, variant=variant, mode=mode
+                )
                 if measured:
                     samples[variant][mode].append(row)
 
