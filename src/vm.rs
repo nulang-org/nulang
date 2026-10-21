@@ -3968,6 +3968,31 @@ impl VM {
         }
         status
     }
+    /// Produce an assertion error with the compiler's source-line metadata.
+    ///
+    /// The VM advances the frame PC before dispatching Perform, so look up
+    /// pc - 1. The information comes from the module's existing debug table:
+    /// no source parsing, new bytecode fields or test-specific ABI required.
+    /// Old/minimal artifacts without line data keep the historic message.
+    fn assertion_failure(
+        &self,
+        frame_idx: usize,
+        module_idx: usize,
+        message: String,
+    ) -> NuError {
+        let source_line = self
+            .frames
+            .get(frame_idx)
+            .and_then(|frame| frame.pc.checked_sub(1))
+            .and_then(|pc| self.modules.get(module_idx)?.line_at(pc))
+            .filter(|line| *line > 0);
+        let message = match source_line {
+            Some(line) => format!("{message} (source line {line})"),
+            None => message,
+        };
+        NuError::runtime_error(message, Span::default())
+    }
+
     fn step_perform(
         &mut self,
         instr: Instruction,
@@ -4005,9 +4030,10 @@ impl VM {
                         self.value_to_string(module_idx, msg_val)
                     };
                     if !cond {
-                        return Err(NuError::runtime_error(
+                        return Err(self.assertion_failure(
+                            frame_idx,
+                            module_idx,
                             format!("assertion failed: {}", msg),
-                            Span::default(),
                         ));
                     }
                     self.frames[frame_idx].regs[dst_reg as usize] = Value::unit();
@@ -4025,9 +4051,10 @@ impl VM {
                         .and_then(|v| v.as_int())
                         .unwrap_or(0);
                     if a != b {
-                        return Err(NuError::runtime_error(
+                        return Err(self.assertion_failure(
+                            frame_idx,
+                            module_idx,
                             format!("assertion failed: expected {}, got {}", b, a),
-                            Span::default(),
                         ));
                     }
                     self.frames[frame_idx].regs[dst_reg as usize] = Value::unit();
@@ -4040,9 +4067,10 @@ impl VM {
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
                     if !cond {
-                        return Err(NuError::runtime_error(
+                        return Err(self.assertion_failure(
+                            frame_idx,
+                            module_idx,
                             "assertion failed".to_string(),
-                            Span::default(),
                         ));
                     }
                     self.frames[frame_idx].regs[dst_reg as usize] = Value::unit();
@@ -6376,6 +6404,94 @@ mod vm_tests {
 
         assert_eq!(vm.frames[0].regs[7].as_int(), Some(73));
         assert_eq!(vm.frames[0].pc, 1, "ReadyValue must not rewind the PC");
+    }
+
+    #[test]
+    fn test_assert_eq_failure_includes_compiler_debug_source_line() {
+        let mut module = CodeModule::new("assert_line");
+        let effect_idx = module.add_string_constant("Test.assert_eq");
+        module.line_table.push((0, 12));
+        let mut vm = VM::new_without_jit();
+        vm.load_module(module);
+        let mut frame = Frame::new(None, 0);
+        frame.pc = 1; // step() advances beyond Perform before step_perform().
+        frame.regs[0] = Value::int(41);
+        frame.regs[1] = Value::int(42);
+        vm.frames.push(frame);
+        vm.current_frame_idx = Some(0);
+
+        let instr = Instruction::new3(
+            OpCode::Perform,
+            ((effect_idx >> 8) & 0xff) as u8,
+            (effect_idx & 0xff) as u8,
+            2,
+        );
+        let error = vm.step_perform(instr, 0, 0).expect_err("assert must fail");
+        match error {
+            NuError::RuntimeError { msg, .. } => {
+                assert!(msg.contains("expected 42, got 41"), "{msg}");
+                assert!(msg.contains("source line 12"), "{msg}");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_assert_message_preserved_with_source_line() {
+        let mut module = CodeModule::new("assert_with_message");
+        let effect_idx = module.add_string_constant("Test.assert");
+        let message_idx = module.add_string_constant("balance must be positive");
+        module.line_table.push((0, 27));
+        let mut vm = VM::new_without_jit();
+        vm.load_module(module);
+        let mut frame = Frame::new(None, 0);
+        frame.pc = 1;
+        frame.regs[0] = Value::bool(false);
+        frame.regs[1] = Value::string(message_idx as u32);
+        vm.frames.push(frame);
+        vm.current_frame_idx = Some(0);
+
+        let instr = Instruction::new3(
+            OpCode::Perform,
+            ((effect_idx >> 8) & 0xff) as u8,
+            (effect_idx & 0xff) as u8,
+            2,
+        );
+        let error = vm.step_perform(instr, 0, 0).expect_err("assert must fail");
+        match error {
+            NuError::RuntimeError { msg, .. } => {
+                assert!(
+                    msg.contains("assertion failed: balance must be positive"),
+                    "{msg}"
+                );
+                assert!(msg.contains("source line 27"), "{msg}");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_assert_without_line_table_does_not_invent_source_location() {
+        let mut module = CodeModule::new("assert_no_line");
+        let effect_idx = module.add_string_constant("Test.assert_true");
+        let mut vm = VM::new_without_jit();
+        vm.load_module(module);
+        let mut frame = Frame::new(None, 0);
+        frame.pc = 1;
+        frame.regs[0] = Value::bool(false);
+        vm.frames.push(frame);
+        vm.current_frame_idx = Some(0);
+        let instr = Instruction::new3(
+            OpCode::Perform,
+            ((effect_idx >> 8) & 0xff) as u8,
+            (effect_idx & 0xff) as u8,
+            2,
+        );
+        let error = vm.step_perform(instr, 0, 0).expect_err("assert must fail");
+        match error {
+            NuError::RuntimeError { msg, .. } => assert_eq!(msg, "assertion failed"),
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     /// A NULL C string return (nil from cstr_to_value) must pass through

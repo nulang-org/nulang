@@ -23,6 +23,13 @@ Note that `assert_eq` compares integers only — for strings, booleans, and
 floats use `Test.assert` with an explicit condition (or the
 [test-utils](#the-test-utils-package) helpers).
 
+On the standalone bytecode VM, an assertion failure also includes
+`(source line N)` when the compiled module has a debugger line-table entry
+for the executing `Test` operation. Older artifacts without line metadata
+retain the original failure message. This reports a compiler-recorded line,
+not an automatically captured argument expression; it does not evaluate
+assertion operands again.
+
 The standard library also ships a thin wrapper module,
 `src/stdlib/test.nula`, that re-exports the same primitives plus
 `fail_with(message)` (an unconditional failure). Importing it brings the
