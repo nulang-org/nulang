@@ -7395,6 +7395,53 @@ fn test_dst_deterministic_network_transport_delivers() {
     t_b.shutdown();
 }
 
+/// Timer scheduling must use the same logical clock as deadline evaluation.
+/// A virtual clock advanced far beyond wall time exposes accidental Instant::now().
+#[test]
+fn test_runtime_receive_wait_and_workflow_rearm_use_virtual_time() {
+    use std::time::Duration;
+
+    let mut rt = Runtime::new();
+    rt.install_virtual_clock();
+    rt.advance_time(Duration::from_secs(30));
+    let actor_id = rt.spawn_actor(Box::new(|| vec![]));
+    let timer_behavior = {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.register_behavior("__timer_fired", |_actor, _args| {});
+        actor.behavior_table.len() as u16 - 1
+    };
+    assert_eq!(rt.behavior_id_for(actor_id, "__timer_fired"), Some(timer_behavior));
+    let start = rt.now();
+
+    rt.maybe_schedule_receive_wait(actor_id, Some(50));
+    assert_eq!(
+        rt.timer_wheel.next_deadline(),
+        Some(start + Duration::from_millis(50)),
+        "receive-after must not consult real wall time"
+    );
+
+    rt.rearm_timer(actor_id, "durable-test", 100);
+    rt.advance_time(Duration::from_millis(49));
+    assert_eq!(rt.timer_wheel.tick(rt.now()).len(), 0);
+    rt.advance_time(Duration::from_millis(1));
+    assert_eq!(
+        rt.timer_wheel.tick(rt.now()),
+        vec![(actor_id, TimerMessage::ReceiveWaitTimeout)]
+    );
+    rt.advance_time(Duration::from_millis(50));
+    assert_eq!(
+        rt.timer_wheel.tick(rt.now()),
+        vec![(
+            actor_id,
+            TimerMessage::SendWithContext {
+                behavior_id: timer_behavior,
+                payload: vec![],
+                context: "durable-test".to_owned(),
+            },
+        )]
+    );
+}
+
 /// PLAN.md Phase 1 bullet 2 (DST): timer determinism. A program whose
 /// actor arms a timer (via the runtime timer wheel) must make progress
 /// under `run_scheduler_deterministic` when a virtual clock is
