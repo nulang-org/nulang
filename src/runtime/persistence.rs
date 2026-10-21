@@ -1313,6 +1313,19 @@ pub enum SqliteSyncMode {
 }
 
 #[cfg(feature = "sqlite")]
+fn remote_native_tls_connector_from<F>(
+    factory: F,
+) -> io::Result<hyper_tls::HttpsConnector<hyper::client::HttpConnector>>
+where
+    F: FnOnce() -> io::Result<hyper_tls::native_tls::TlsConnector>,
+{
+    let tls = factory()?;
+    let mut http = hyper::client::HttpConnector::new();
+    http.enforce_http(false);
+    Ok(hyper_tls::HttpsConnector::from((http, tls.into())))
+}
+
+#[cfg(feature = "sqlite")]
 pub struct LibsqlStore {
     conn: std::sync::Mutex<libsql::Connection>,
     rt: tokio::runtime::Runtime,
@@ -1370,6 +1383,11 @@ impl LibsqlStore {
     /// skipped: a Turso server manages its own journal and durability
     /// policy.
     pub fn new_remote(url: &str, auth_token: &str) -> io::Result<Self> {
+        // A fallible connector preserves the public io::Result contract.
+        // HttpsConnector::new() panics if host TLS initialization fails.
+        let connector = remote_native_tls_connector_from(|| {
+            hyper_tls::native_tls::TlsConnector::new().map_err(io::Error::other)
+        })?;
         let rt =
             tokio::runtime::Runtime::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let db = rt.block_on(async {
@@ -1377,7 +1395,7 @@ impl LibsqlStore {
                 // libSQL's built-in TLS uses unmaintained rustls 0.22 through
                 // hyper-rustls 0.25. Supply a Hyper 0.14-compatible native
                 // TLS connector with system certificate verification instead.
-                .connector(hyper_tls::HttpsConnector::new())
+                .connector(connector)
                 .build()
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
@@ -4408,5 +4426,23 @@ mod libsql_atomic_transition_tests {
 
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(store.latest_sequence(42), 1);
+    }
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod remote_tls_init_error_tests {
+    use super::remote_native_tls_connector_from;
+    use std::io;
+
+    #[test]
+    fn test_remote_tls_context_initialization_failure_returns_error() {
+        let result = remote_native_tls_connector_from(|| {
+            Err(io::Error::other(
+                "simulated native trust initialization failure",
+            ))
+        });
+        let error = result.expect_err("TLS initialization error must not panic");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("simulated native trust"));
     }
 }
