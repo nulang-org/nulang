@@ -956,6 +956,34 @@ mod tests {
     }
 }
 
+
+impl Actor {
+    /// Observe Values kept by actor-owned state, event records, registered
+    /// query handlers, and a suspended workflow's execution frames.
+    ///
+    /// This deliberately does not scan mailboxes, native/runtime roots,
+    /// active shared-VM frames or in-flight deliveries. It must NOT be
+    /// interpreted as a complete root set for reclaiming local cycles.
+    /// The caller must check heap provenance before treating a Value as a
+    /// pointer into this actor's heap.
+    pub fn visit_stored_values(&self, visit: &mut impl FnMut(Value)) {
+        for &value in self.state_data.values() {
+            visit(value);
+        }
+        for (_, payload) in &self.event_log {
+            for &value in payload {
+                visit(value);
+            }
+        }
+        for &value in self.query_handlers.values() {
+            visit(value);
+        }
+        if let Some(suspended) = &self.suspended_execution {
+            suspended.vm_state.visit_execution_values(visit);
+        }
+    }
+}
+
 impl Drop for Actor {
     fn drop(&mut self) {
         let Some(store) = self.held_object_store.take() else {
@@ -963,5 +991,57 @@ impl Drop for Actor {
         };
         let held = std::mem::take(&mut self.held_objects);
         store.drop_refs(&held);
+    }
+}
+
+#[cfg(test)]
+mod orca_actor_stored_root_visitor_tests {
+    use super::*;
+
+    #[test]
+    fn stored_actor_root_visitor_covers_state_events_queries_and_suspension() {
+        let mut actor = Actor::new(1, "root-observer", 0);
+        actor.state_data.insert("field".to_string(), Value::int(31));
+        actor.event_log.push(("event".to_string(), vec![Value::int(32)]));
+        actor.query_handlers.insert("query".to_string(), Value::int(33));
+
+        let mut frame = crate::vm::Frame::new(None, 0);
+        frame.regs[9] = Value::int(34);
+        actor.suspended_execution = Some(SuspendedExecution {
+            vm_state: crate::vm::SuspendedVmState {
+                frames: vec![frame],
+                current_frame_idx: Some(0),
+                handler_stack: Vec::new(),
+                step_count: 0,
+            },
+            behavior_idx: 0,
+            activation: None,
+            step_name: "suspended".to_string(),
+        });
+
+        let mut observed = Vec::new();
+        actor.visit_stored_values(&mut |value| {
+            if let Some(value) = value.as_int() {
+                observed.push(value);
+            }
+        });
+        observed.sort_unstable();
+        assert_eq!(observed, vec![31, 32, 33, 34]);
+    }
+
+    #[test]
+    fn stored_actor_root_visitor_preserves_actor_heap_pointer_identity() {
+        let mut actor = Actor::new(1, "heap-root-observer", 0);
+        let heap_pointer = actor.allocate_string("still reachable");
+        let expected = heap_pointer.as_ptr().expect("actor heap allocation");
+        actor.state_data.insert("heap_pointer".to_string(), heap_pointer);
+
+        let mut found = false;
+        actor.visit_stored_values(&mut |value| {
+            if value.as_ptr() == Some(expected) {
+                found = true;
+            }
+        });
+        assert!(found, "visitor must retain the exact live heap pointer");
     }
 }

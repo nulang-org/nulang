@@ -8981,3 +8981,147 @@ mod vm_tests {
         }
     }
 }
+
+/// Visit values retained by live frames and algebraic-effect snapshots.
+///
+/// This is deliberately a *value* visitor rather than a collector root set:
+/// callers must independently validate pointer provenance and account for
+/// actor state, mailboxes, in-flight messages, JIT/native roots, and foreign
+/// holds before deciding anything is unreachable. No reclamation occurs here.
+fn visit_execution_frame_values(frame: &Frame, visit: &mut impl FnMut(Value)) {
+    for &value in &frame.regs {
+        visit(value);
+    }
+    for &value in &frame.spilled {
+        visit(value);
+    }
+    if let Some(value) = frame.closure_env {
+        visit(value);
+    }
+}
+
+/// Iterative traversal avoids host-stack recursion on deeply nested, possibly
+/// untrusted continuation snapshots. Scan all retained frames (not just the
+/// active frame): stale slots can produce false positives, never false negatives.
+fn visit_execution_values(
+    frames: &[Frame],
+    handlers: &[HandlerFrame],
+    visit: &mut impl FnMut(Value),
+) {
+    for frame in frames {
+        visit_execution_frame_values(frame, visit);
+    }
+
+    let mut pending: Vec<&HandlerFrame> = handlers.iter().collect();
+    while let Some(handler) = pending.pop() {
+        if let Some(single_shot) = &handler.single_shot_state {
+            for &value in &single_shot.regs {
+                visit(value);
+            }
+        }
+        if let Some(continuation) = &handler.captured_continuation {
+            for frame in &continuation.frames {
+                visit_execution_frame_values(frame, visit);
+            }
+            pending.extend(continuation.handler_stack_snapshot.iter());
+        }
+    }
+}
+
+impl VM {
+    /// Observe Values held in the VM's active/cached frames and effect handler
+    /// snapshots, including spills and closure environments.
+    ///
+    /// Read-only diagnostic building block for ORCA root accounting; this is
+    /// NOT a complete, safe-to-collect heap-root visitor.
+    pub fn visit_execution_values(&self, visit: &mut impl FnMut(Value)) {
+        visit_execution_values(&self.frames, &self.handler_stack, visit);
+    }
+}
+
+impl SuspendedVmState {
+    /// Observe Values held by a suspended workflow continuation, without
+    /// resuming it or mutating reference counts.
+    pub fn visit_execution_values(&self, visit: &mut impl FnMut(Value)) {
+        visit_execution_values(&self.frames, &self.handler_stack, visit);
+    }
+}
+
+#[cfg(test)]
+mod orca_execution_root_visitor_tests {
+    use super::*;
+
+    #[test]
+    fn active_vm_root_visitor_includes_spills_closure_and_nested_effect_handlers() {
+        let mut vm = VM::new();
+        let mut frame = Frame::new(None, 0);
+        frame.regs[4] = Value::int(11);
+        frame.spilled.push(Value::int(12));
+        frame.closure_env = Some(Value::int(13));
+        vm.frames.push(frame);
+        vm.current_frame_idx = Some(0);
+
+        let mut captured = Frame::new(None, 0);
+        captured.regs[5] = Value::int(14);
+        let mut nested = HandlerFrame::new(0, 0, 0, 0);
+        let mut single_shot_regs = [Value::nil(); 256];
+        single_shot_regs[6] = Value::int(15);
+        nested.single_shot_state = Some(SingleShotState {
+            resume_pc: 0,
+            resume_dst: 0,
+            step_count: 0,
+            regs: single_shot_regs,
+        });
+        let mut handler = HandlerFrame::new(0, 0, 0, 0);
+        handler.captured_continuation = Some(Continuation {
+            frames: vec![captured],
+            current_frame_idx: 0,
+            resume_pc: 0,
+            resume_dst: 0,
+            step_count: 0,
+            handler_stack_snapshot: vec![nested],
+        });
+        vm.handler_stack.push(handler);
+
+        let mut observed = Vec::new();
+        vm.visit_execution_values(&mut |value| {
+            if let Some(value) = value.as_int() {
+                observed.push(value);
+            }
+        });
+        observed.sort_unstable();
+        assert_eq!(observed, vec![11, 12, 13, 14, 15]);
+    }
+
+    #[test]
+    fn suspended_vm_root_visitor_includes_register_spills_and_single_shot_state() {
+        let mut frame = Frame::new(None, 0);
+        frame.regs[3] = Value::int(21);
+        frame.spilled.push(Value::int(22));
+        frame.closure_env = Some(Value::int(23));
+        let mut regs = [Value::nil(); 256];
+        regs[0] = Value::int(24);
+        let mut handler = HandlerFrame::new(0, 0, 0, 0);
+        handler.single_shot_state = Some(SingleShotState {
+            resume_pc: 0,
+            resume_dst: 0,
+            step_count: 0,
+            regs,
+        });
+        let suspended = SuspendedVmState {
+            frames: vec![frame],
+            current_frame_idx: Some(0),
+            handler_stack: vec![handler],
+            step_count: 0,
+        };
+
+        let mut observed = Vec::new();
+        suspended.visit_execution_values(&mut |value| {
+            if let Some(value) = value.as_int() {
+                observed.push(value);
+            }
+        });
+        observed.sort_unstable();
+        assert_eq!(observed, vec![21, 22, 23, 24]);
+    }
+}
