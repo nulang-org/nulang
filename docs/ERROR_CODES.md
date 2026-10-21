@@ -102,11 +102,22 @@ by `render_warning`/`format_warning` (src/diagnostic.rs) with a
 | Range   | Category                                  |
 |---------|-------------------------------------------|
 | `W01xx` | Deprecations                              |
+| `W02xx` | Conservative pattern match coverage     |
 
 | Code    | Meaning                                   | Replacement (RFC)        |
 |---------|-------------------------------------------|--------------------------|
 | `W0101` | Deprecated `catch` expression (all forms) | `match` on `Ok`/`Error`, `?` under `T ! E` (RFC 0015) |
 | `W0102` | Deprecated `fail` expression              | `return Error(...)` under `T ! E` (RFC 0015) |
+
+| `W0201` | Provably non-exhaustive finite-domain `match` | Add an unguarded case or wildcard |
+| `W0202` | Provably unreachable `match` arm | Remove redundant arm or narrow an earlier pattern |
+
+In 1.x these are compatibility-preserving warnings, not errors by default.
+The existing `--deny-warnings` flag rejects both codes. Coverage currently
+handles Boolean types and closed variant constructors, counting payload arms
+only when their payload patterns are irrefutable. Guarded arms never establish
+coverage; open/infinite domains are intentionally not classified. Until patterns
+carry individual source spans, W0202 points to the enclosing match expression.
 
 See `docs/MIGRATION_RFC_0015.md` for the `catch`/`fail` migration guide.
 
