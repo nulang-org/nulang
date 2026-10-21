@@ -209,6 +209,56 @@ mod tls_transport_tests {
     }
 
     #[test]
+    fn test_registry_and_deploy_reject_remote_plaintext_and_userinfo() {
+        // A configured package/deploy endpoint can send bearer tokens.
+        // Only exact loopback authorities may use plaintext for local dev.
+        for url in [
+            "http://registry.example.test/api/v1/packages",
+            "http://203.0.113.2:8080/api/v1/deploy",
+            "http://localhost.evil.test/api/v1/deploy",
+            "http://user@localhost:8080/api/v1/deploy",
+            "http://localhost@evil.test/api/v1/deploy",
+        ] {
+            assert!(
+                verified_https_agent(url).is_err(),
+                "must reject plaintext remote or userinfo destination: {url}"
+            );
+        }
+        for url in [
+            "http://localhost:8080/api/v1/packages",
+            "http://127.0.0.1:8080/api/v1/packages",
+            "http://[::1]:8080/api/v1/packages",
+        ] {
+            assert!(
+                verified_https_agent(url).is_ok(),
+                "explicit loopback dev transport must remain supported: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_loopback_http_does_not_follow_redirects() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut buf = [0u8; 2048];
+            assert!(stream.read(&mut buf).unwrap() > 0);
+            stream
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: http://example.test/not-loopback\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+        });
+        let response = verified_https_agent(&url).unwrap().get(&url).call().unwrap();
+        assert_eq!(response.status(), 302, "local redirect must not be followed");
+        server.join().unwrap();
+    }
+
+    #[test]
     fn transport_rejects_unsupported_or_missing_url_schemes() {
         for target in ["registry.example.test", "ftp://registry.example.test"] {
             assert!(
