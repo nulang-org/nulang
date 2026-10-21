@@ -8,9 +8,10 @@
 > lattice laws (`join` assoc/comm/idem) and `cap_sendable`/
 > `discharge_sendable` are proved. Two items remain open:
 > `linear_at_most_once` (requires the split-context refinement of
-> `HasTypeCap`, documented in `capabilities.lean`) and the effect-safety
-> theorems (`effects.lean`), which are still vacuous `True` stubs, not
-> proofs (deferred to the `combined.lean` handler-stack model).
+> `HasTypeCap`, documented in `capabilities.lean`) and complete effect
+> safety for the full expression language (latent function effects,
+> resumption, and handler-body effects). The scoped trace submodel now proves
+> the absence of unhandled effects when residual effects are covered.
 
 ## Purpose
 
@@ -30,7 +31,7 @@ Two layers are formalized:
 | `Nulang/Effects.lean` | Effect rows, `subrow`, `union` | Formalized |
 | `types.lean` | HM `HasType`, small-step semantics, `progress`/`preservation`/`type_soundness` | **Proved** |
 | `capabilities.lean` | Capability lattice laws, `cap_sendable`, `discharge_sendable` | Proved (`linear_at_most_once` open) |
-| `effects.lean` | Effect rows, `effect_safety`, `effect_safety_static` | `True` stubs (not proved) |
+| `effects.lean` | Effect rows; scoped `EffectTrace`/`Escapes`/`Unhandled` operational model | Scoped handler-safety proved; full expression soundness open |
 
 ## Theorems
 
@@ -63,16 +64,26 @@ requires the split-context refinement `Γ ⊢ e : τ / Γ'`, which is out of sco
 for the current formalization and stated as a conjecture per the RFC 0003
 Item 2 contingency.
 
-### Effect Safety — stubbed (not proved)
-```
-Theorem effect_safety:
-  A program with closed effect row {} cannot perform an unhandled effect
-```
-The intended statement: if a function's effect row is empty, every `perform`
-in its body is statically handled — no runtime "unhandled effect" errors.
-The current `effect_safety`/`effect_safety_static` bodies in `effects.lean`
-are vacuous `True` stubs (`by trivial`), not proofs — the real proof requires
-modeling the handler-stack push/pop dynamics, deferred to `combined.lean`.
+### Scoped Effect Safety — proved for the trace submodel
+
+`effect_safety` establishes that an effect cannot be dynamically unhandled
+when every statically escaping effect is present in the incoming handler
+stack. `effect_safety_static` is the special case in which no effect escapes
+the trace and the initial handler stack is empty.
+
+The model makes **real, non-vacuous propositions** about `Unhandled` and
+`Escapes`. It includes perform, sequence, and handler-scope push/pop
+(the pop is implicit upon exiting the nested scope). It includes regression
+witnesses for both an unhandled `perform IO` and a lexically handled one.
+
+**Important limitation:** this does **not** yet prove
+`HasTypeEff Γ e τ EffectRow.empty →` runtime effect safety for all
+`EffExpr` terms. `HasTypeEff` does not yet record latent function effects
+in function types, and its `tHandle` rule assumes an unconstrained handler
+body. The submodel also excludes continuations and resumption. Bridging
+this proof to the complete typed operational semantics is still open; the
+formal trace theorem must not be presented as production-wide effect
+soundness or a guarantee about external side effects.
 
 ## Build
 
