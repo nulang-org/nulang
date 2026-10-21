@@ -155,6 +155,43 @@ impl Capability {
         self.join(other) == other
     }
 
+    /// Conservative read projection of a field through a receiver.
+    ///
+    /// This models the receiver-dependent part of Pony-style viewpoint
+    /// adaptation without requiring ephemeral alias/ownership recovery.
+    /// In particular, extracting an `iso` field never returns a new `iso`
+    /// alias: the compiler needs explicit consume/move-out semantics first.
+    ///
+    /// `None` means the receiver is opaque and cannot be dereferenced.
+    /// Linear receivers borrow as `iso`/`val` for reads, but linear *fields*
+    /// are opaque until a separate move-out discharges their obligation.
+    pub fn viewpoint_read(self, field: Capability) -> Option<Capability> {
+        use Capability::*;
+        let origin = match self {
+            Tag => return None,
+            LinearIso => Iso,
+            Linear => Val,
+            other => other,
+        };
+        // A field-level linear resource cannot be borrowed as a reusable
+        // reference: move-out/consume must discharge its obligation first.
+        let inner = match field {
+            LinearIso | Linear => return Some(Tag),
+            other => other,
+        };
+        Some(match (origin, inner) {
+            (_, Tag) => Tag,
+            (Val, _) | (_, Val) => Val,
+            (Box, Iso) | (Ref, Iso) | (Trn, Iso) => Tag,
+            (Box, _) | (Trn, _) => Box,
+            (Ref, Trn) => Box,
+            (Ref, other) => other,
+            (Iso, _) => Tag,
+            // `origin` is never Tag/LinearIso/Linear here.
+            _ => unreachable!("normalized receiver capability"),
+        })
+    }
+
     /// Can this capability be sent to another actor?
     pub fn is_sendable(self) -> bool {
         matches!(
@@ -2585,6 +2622,44 @@ mod tests {
     fn test_linear_join_box() {
         assert_eq!(Capability::Linear.join(Capability::Box), Capability::Box);
         assert_eq!(Capability::Box.join(Capability::Linear), Capability::Box);
+    }
+
+    #[test]
+    fn test_viewpoint_read_matrix_has_no_authority_upgrades() {
+        use Capability::*;
+        // Columns are iso, trn, ref, val, box, tag. Isolated fields do not
+        // support move-out/ephemeral recovery yet and are deliberately Tag.
+        let fields = [Iso, Trn, Ref, Val, Box, Tag];
+        let rows = [
+            (Iso, [Tag, Tag, Tag, Val, Tag, Tag]),
+            (Trn, [Tag, Box, Box, Val, Box, Tag]),
+            (Ref, [Tag, Box, Ref, Val, Box, Tag]),
+            (Val, [Val, Val, Val, Val, Val, Tag]),
+            (Box, [Tag, Box, Box, Val, Box, Tag]),
+        ];
+        for (receiver, expected) in rows {
+            for (field, want) in fields.into_iter().zip(expected) {
+                assert_eq!(
+                    receiver.viewpoint_read(field),
+                    Some(want),
+                    "receiver {receiver:?}, field {field:?}"
+                );
+            }
+        }
+        for field in [LinearIso, Linear, Iso, Trn, Ref, Val, Box, Tag] {
+            assert_eq!(Tag.viewpoint_read(field), None, "opaque receiver");
+        }
+    }
+
+    #[test]
+    fn test_viewpoint_read_linear_extends_non_linear_guarantees() {
+        use Capability::*;
+        assert_eq!(LinearIso.viewpoint_read(Ref), Iso.viewpoint_read(Ref));
+        assert_eq!(Linear.viewpoint_read(Ref), Val.viewpoint_read(Ref));
+        // A field read must not discharge the linear obligation on its owner.
+        assert_eq!(LinearIso.viewpoint_read(LinearIso), Some(Tag));
+        assert_eq!(Ref.viewpoint_read(Linear), Some(Tag));
+        assert_eq!(Val.viewpoint_read(LinearIso), Some(Tag));
     }
 
     #[test]

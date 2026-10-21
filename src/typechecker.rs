@@ -2959,6 +2959,36 @@ impl TypeChecker {
     }
 
     /// Infer the type of a field access expression.
+    /// Apply a read-only receiver's viewpoint to reference-typed fields.
+    /// Plain records, tuples, and arrays are projected recursively so a
+    /// nested record cannot expose an unprojected mutable reference.
+    /// Generic applications and opaque nominals require future constraint
+    /// propagation; this helper does not grant capabilities through them.
+    fn project_field_viewpoint(ty: Type, receiver: Capability) -> Type {
+        match ty {
+            Type::Reference { cap, inner } => Type::Reference {
+                cap: receiver.viewpoint_read(cap).unwrap_or(Capability::Tag),
+                inner,
+            },
+            Type::Record(fields) => Type::Record(
+                fields
+                    .into_iter()
+                    .map(|(name, ty)| (name, Self::project_field_viewpoint(ty, receiver)))
+                    .collect(),
+            ),
+            Type::Tuple(items) => Type::Tuple(
+                items
+                    .into_iter()
+                    .map(|ty| Self::project_field_viewpoint(ty, receiver))
+                    .collect(),
+            ),
+            Type::Array(item) => {
+                Type::Array(Box::new(Self::project_field_viewpoint(*item, receiver)))
+            }
+            other => other,
+        }
+    }
+
     fn infer_field_access(
         &mut self,
         ctx: &TypeContext,
@@ -3093,11 +3123,25 @@ impl TypeChecker {
         let (s1, record_ty) = self.infer_expr(ctx, expr)?;
         let mut current_ty = apply_subst(&record_ty, &s1);
 
-        // Peel reference wrappers so field access works through
-        // &ref / &val / &iso etc.  x.field where x : &ref {field: T} => T.
+        // Follow reference wrappers, preserving the effective receiver
+        // viewpoint rather than discarding each capability. An opaque tag
+        // cannot be used to inspect fields, even if they are scalars.
+        let mut receiver_cap: Option<Capability> = None;
         loop {
             match current_ty {
-                Type::Reference { inner, .. } => {
+                Type::Reference { cap, inner } => {
+                    let visible = match receiver_cap {
+                        Some(view) => view.viewpoint_read(cap),
+                        None if cap.is_readable() => Some(cap),
+                        None => None,
+                    };
+                    let Some(visible) = visible.filter(|c| c.is_readable()) else {
+                        return Err(NuError::cap_error(
+                            "cannot access fields through an opaque tag reference".to_string(),
+                            span,
+                        ));
+                    };
+                    receiver_cap = Some(visible);
                     current_ty = apply_subst(&inner, &s1);
                 }
                 _ => break,
@@ -3108,7 +3152,11 @@ impl TypeChecker {
             Type::Record(ref fs) => {
                 let (fields, tail) = split_record(fs);
                 if let Some((_, field_ty)) = fields.iter().find(|(name, _)| name == field) {
-                    return Ok((s1, field_ty.clone()));
+                    let projected = match receiver_cap {
+                        Some(view) => Self::project_field_viewpoint(field_ty.clone(), view),
+                        None => field_ty.clone(),
+                    };
+                    return Ok((s1, projected));
                 }
                 // An open record absorbs the access: extend its row variable
                 // with the demanded field, so multiple accesses on the same
@@ -3129,7 +3177,11 @@ impl TypeChecker {
                 // Numeric field access on a tuple: t.0, t.1, etc.
                 if let Ok(idx) = field.parse::<usize>() {
                     if idx < elems.len() {
-                        return Ok((s1, elems[idx].clone()));
+                        let projected = match receiver_cap {
+                            Some(view) => Self::project_field_viewpoint(elems[idx].clone(), view),
+                            None => elems[idx].clone(),
+                        };
+                        return Ok((s1, projected));
                     }
                     return Err(NuError::TypeError {
                         msg: format!(
@@ -4788,6 +4840,132 @@ mod tests {
         let expr = field(rec, "x");
         let (s, ty) = tc.infer_expr(&ctx, &expr).unwrap();
         assert_eq!(apply_subst(&ty, &s), Type::int());
+    }
+
+    #[test]
+    fn test_field_viewpoint_preserves_receiver_read_restrictions() {
+        // A mutable field reached through a box/val receiver must never
+        // regain ref write authority.
+        for (receiver, expected) in [
+            (Capability::Ref, Capability::Ref),
+            (Capability::Box, Capability::Box),
+            (Capability::Val, Capability::Val),
+            (Capability::Trn, Capability::Box),
+        ] {
+            let mut tc = TypeChecker::new();
+            let ty = Type::Reference {
+                cap: receiver,
+                inner: Box::new(Type::Record(vec![(
+                    "value".into(),
+                    Type::Reference {
+                        cap: Capability::Ref,
+                        inner: Box::new(Type::int()),
+                    },
+                )])),
+            };
+            let ctx = ctx_with("holder", ty);
+            let (s, projected) = tc.infer_expr(&ctx, &field(var("holder"), "value")).unwrap();
+            assert_eq!(
+                apply_subst(&projected, &s),
+                Type::Reference { cap: expected, inner: Box::new(Type::int()) },
+                "receiver {receiver:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_field_viewpoint_preserves_immutable_field_and_hides_iso_aliases() {
+        for (receiver, field_cap, expected) in [
+            (Capability::Box, Capability::Val, Capability::Val),
+            (Capability::Box, Capability::Iso, Capability::Tag),
+            (Capability::Val, Capability::Ref, Capability::Val),
+            (Capability::Box, Capability::Tag, Capability::Tag),
+        ] {
+            let mut tc = TypeChecker::new();
+            let ctx = ctx_with("holder", Type::Reference {
+                cap: receiver,
+                inner: Box::new(Type::Record(vec![(
+                    "child".into(),
+                    Type::Reference { cap: field_cap, inner: Box::new(Type::int()) },
+                )])),
+            });
+            let (s, projected) = tc.infer_expr(&ctx, &field(var("holder"), "child")).unwrap();
+            assert_eq!(
+                apply_subst(&projected, &s),
+                Type::Reference { cap: expected, inner: Box::new(Type::int()) },
+                "receiver {receiver:?}, field {field_cap:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_field_viewpoint_prevents_mutation_through_read_only_receiver() {
+        for receiver in [Capability::Box, Capability::Val] {
+            let mut tc = TypeChecker::new();
+            let ctx = ctx_with("holder", Type::Reference {
+                cap: receiver,
+                inner: Box::new(Type::Record(vec![(
+                    "value".into(),
+                    Type::Reference { cap: Capability::Ref, inner: Box::new(Type::int()) },
+                )])),
+            });
+            let assignment = Expr::Assign {
+                target: Box::new(field(var("holder"), "value")),
+                value: Box::new(int_lit(2)),
+                span: sp(),
+            };
+            assert!(
+                tc.infer_expr(&ctx, &assignment).is_err(),
+                "{receiver:?} receiver must not expose a writable reference"
+            );
+        }
+
+        // A ref receiver with a ref field retains ordinary mutable access.
+        let mut tc = TypeChecker::new();
+        let ctx = ctx_with("holder", Type::Reference {
+            cap: Capability::Ref,
+            inner: Box::new(Type::Record(vec![(
+                "value".into(),
+                Type::Reference { cap: Capability::Ref, inner: Box::new(Type::int()) },
+            )])),
+        });
+        let assignment = Expr::Assign {
+            target: Box::new(field(var("holder"), "value")),
+            value: Box::new(int_lit(2)),
+            span: sp(),
+        };
+        assert!(tc.infer_expr(&ctx, &assignment).is_ok());
+    }
+
+    #[test]
+    fn test_field_viewpoint_rejects_tag_receiver_even_for_scalar_fields() {
+        let mut tc = TypeChecker::new();
+        let ctx = ctx_with("holder", Type::Reference {
+            cap: Capability::Tag,
+            inner: Box::new(Type::Record(vec![("count".into(), Type::int())])),
+        });
+        assert!(tc.infer_expr(&ctx, &field(var("holder"), "count")).is_err());
+    }
+
+    #[test]
+    fn test_field_viewpoint_propagates_into_nested_record_values() {
+        let mut tc = TypeChecker::new();
+        let ctx = ctx_with("holder", Type::Reference {
+            cap: Capability::Box,
+            inner: Box::new(Type::Record(vec![(
+                "child".into(),
+                Type::Record(vec![(
+                    "value".into(),
+                    Type::Reference { cap: Capability::Ref, inner: Box::new(Type::int()) },
+                )]),
+            )])),
+        });
+        let expr = field(field(var("holder"), "child"), "value");
+        let (s, projected) = tc.infer_expr(&ctx, &expr).unwrap();
+        assert_eq!(
+            apply_subst(&projected, &s),
+            Type::Reference { cap: Capability::Box, inner: Box::new(Type::int()) },
+        );
     }
 
     // -----------------------------------------------------------------------
