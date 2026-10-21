@@ -1,53 +1,125 @@
+import * as fs from 'fs';
+import * as path from 'path';
 import * as vscode from 'vscode';
 import { LanguageClient, LanguageClientOptions, ServerOptions } from 'vscode-languageclient/node';
 
 let client: LanguageClient | undefined;
 
-/**
- * Resolve the nulang binary: explicit `nulang.path` setting first, then the
- * `NULANG_PATH` environment variable, then `nulang` on PATH.
- */
-function nulangBinary(): string {
-  const config = vscode.workspace.getConfiguration('nulang');
-  const inspected = config.inspect<string>('path');
-  const explicit = inspected?.globalValue ?? inspected?.workspaceValue;
-  if (explicit && explicit.trim() !== '') {
-    return explicit.trim();
-  }
-  const envPath = process.env.NULANG_PATH;
-  if (envPath && envPath.trim() !== '') {
-    return envPath.trim();
+/** Choose an explicitly configured binary before consulting the environment. */
+export function selectNulangBinary(
+  folderValue?: string, workspaceValue?: string, globalValue?: string, envValue?: string
+): string {
+  for (const value of [folderValue, workspaceValue, globalValue, envValue]) {
+    if (value?.trim()) {
+      return value.trim();
+    }
   }
   return 'nulang';
 }
 
-/** The active editor's file, but only when it is a Nulang document. */
-function activeNulaFile(): string | undefined {
-  const editor = vscode.window.activeTextEditor;
-  if (editor && editor.document.languageId === 'nulang') {
-    return editor.document.fileName;
-  }
-  return undefined;
+/** VS Code settings are scoped to the active source file. */
+function nulangBinary(uri?: vscode.Uri): string {
+  const config = vscode.workspace.getConfiguration('nulang', uri);
+  const inspected = config.inspect<string>('path');
+  return selectNulangBinary(
+    inspected?.workspaceFolderValue,
+    inspected?.workspaceValue,
+    inspected?.globalValue,
+    process.env.NULANG_PATH
+  );
 }
 
-/** Run the nulang CLI on the active .nula file in a terminal. */
-function runNulang(args: string[]): void {
-  const file = activeNulaFile();
-  if (!file) {
-    vscode.window.showWarningMessage('Open a .nula file first.');
+/** Prefer the nearest Nulang.toml; standalone files run from their own folder. */
+function packageDirectory(file: string): string {
+  const sourceDirectory = path.dirname(path.resolve(file));
+  let directory = sourceDirectory;
+  for (;;) {
+    if (fs.existsSync(path.join(directory, 'Nulang.toml'))) {
+      return directory;
+    }
+    const parent = path.dirname(directory);
+    if (parent === directory) {
+      return sourceDirectory;
+    }
+    directory = parent;
+  }
+}
+
+/**
+ * Run as a process, not a shell command. File names and configured executable
+ * paths can contain whitespace or shell metacharacters without interpretation.
+ */
+export function createNulangTask(
+  command: string, args: string[], file: string, binary: string
+): vscode.Task {
+  const execution = new vscode.ProcessExecution(binary, [...args, file], {
+    cwd: packageDirectory(file),
+  });
+  const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(file));
+  const task = new vscode.Task(
+    { type: 'nulang', command, file: path.resolve(file) },
+    folder ?? vscode.TaskScope.Workspace,
+    `Nulang: ${command}`,
+    'nulang',
+    execution
+  );
+  task.presentationOptions = {
+    reveal: vscode.TaskRevealKind.Always,
+    panel: vscode.TaskPanelKind.Dedicated,
+  };
+  return task;
+}
+
+/**
+ * VS Code tasks require an open workspace. In a single-file window, launch the
+ * binary as the terminal process with a separate argv array instead of
+ * interpolating arguments into a shell command. No cwd override: recent VS Code
+ * versions block custom terminal cwd outside userHome in empty workspaces.
+ */
+export function createStandaloneNulangTerminalOptions(
+  command: string, args: string[], file: string, binary: string
+): vscode.TerminalOptions {
+  return {
+    name: `Nulang: ${command}`,
+    shellPath: binary,
+    shellArgs: [...args, file],
+  };
+}
+
+/** Run the active .nula file in a managed task with visible terminal output. */
+async function runNulang(command: string, args: string[]): Promise<void> {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor || editor.document.languageId !== 'nulang' || editor.document.uri.scheme !== 'file') {
+    vscode.window.showWarningMessage('Open a local .nula file first.');
     return;
   }
-  const terminal = vscode.window.createTerminal({ name: 'Nulang' });
-  terminal.sendText(`"${nulangBinary()}" ${args.join(' ')} "${file}"`);
-  terminal.show();
+  const file = editor.document.fileName;
+  const binary = nulangBinary(editor.document.uri);
+  if (!vscode.workspace.workspaceFolders?.length) {
+    // Task support is unavailable in single-file VS Code windows.
+    const terminal = vscode.window.createTerminal(
+      createStandaloneNulangTerminalOptions(command, args, file, binary)
+    );
+    terminal.show();
+    return;
+  }
+  const task = createNulangTask(command, args, file, binary);
+  try {
+    await vscode.tasks.executeTask(task);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    vscode.window.showErrorMessage(`Could not start Nulang ${command}: ${message}`);
+  }
 }
 
 export function activate(context: vscode.ExtensionContext): void {
   // No `transport` field: with TransportKind.stdio the client appends
   // `--stdio` to the args (a node-server convention), which nulang rejects.
   // Undefined transport still uses stdio pipes, without the extra flag.
+  const uri = vscode.window.activeTextEditor?.document.uri;
+  const lspCommand = nulangBinary(uri);
   const serverOptions: ServerOptions = {
-    command: nulangBinary(),
+    command: lspCommand,
     args: ['--lsp'],
   };
 
@@ -59,16 +131,16 @@ export function activate(context: vscode.ExtensionContext): void {
 
   client = new LanguageClient('nulang', 'Nulang Language Server', serverOptions, clientOptions);
   client.start().catch((err) => {
-    console.error(`[nulang] language server failed to start (binary: ${nulangBinary()}):`, err);
+    console.error(`[nulang] language server failed to start (binary: ${lspCommand}):`, err);
   });
 
   context.subscriptions.push(
     vscode.commands.registerCommand('nulang.restartServer', async () => {
       await client?.restart();
     }),
-    vscode.commands.registerCommand('nulang.compile', () => runNulang(['--emit-nbc'])),
-    vscode.commands.registerCommand('nulang.run', () => runNulang([])),
-    vscode.commands.registerCommand('nulang.typeCheck', () => runNulang(['--check']))
+    vscode.commands.registerCommand('nulang.compile', () => runNulang('Compile', ['--emit-nbc'])),
+    vscode.commands.registerCommand('nulang.run', () => runNulang('Run', [])),
+    vscode.commands.registerCommand('nulang.typeCheck', () => runNulang('Type Check', ['--check']))
   );
 }
 

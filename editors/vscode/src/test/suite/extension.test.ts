@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { createNulangTask, createStandaloneNulangTerminalOptions, selectNulangBinary } from '../../extension';
 
 const GOOD_SOURCE = `fn add(a: Int, b: Int) -> Int {
   a + b
@@ -81,5 +82,58 @@ suite('Nulang extension', () => {
       .map((c) => (typeof c === 'string' ? c : c.value))
       .join('\n');
     assert.ok(contents.includes('add'), `hover should mention add: ${contents}`);
+  });
+
+  test('binary selection respects folder, workspace, global, then environment precedence', () => {
+    assert.strictEqual(selectNulangBinary('/folder/tool', '/workspace/tool', '/global/tool', '/env/tool'), '/folder/tool');
+    assert.strictEqual(selectNulangBinary(undefined, ' /workspace/tool ', '/global/tool', '/env/tool'), '/workspace/tool');
+    assert.strictEqual(selectNulangBinary(undefined, undefined, '/global/tool', '/env/tool'), '/global/tool');
+    assert.strictEqual(selectNulangBinary(undefined, undefined, undefined, ' /env/tool '), '/env/tool');
+    assert.strictEqual(selectNulangBinary(undefined, undefined, undefined, undefined), 'nulang');
+  });
+
+  test('Run task passes shell-metacharacter paths literally and uses package root', () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'nulang-task-'));
+    try {
+      const sourceDir = path.join(workspace, 'src');
+      fs.mkdirSync(sourceDir);
+      fs.writeFileSync(path.join(workspace, 'Nulang.toml'), '[package]\nname="task-smoke"\nversion="0.1.0"\n');
+      const file = path.join(sourceDir, "it's a $literal; space.nula");
+      fs.writeFileSync(file, GOOD_SOURCE);
+      const binary = path.join(workspace, 'tools with spaces', 'nulang');
+      const task = createNulangTask('Run', [], file, binary);
+      assert.ok(task.execution instanceof vscode.ProcessExecution, 'file execution must bypass a shell');
+      assert.strictEqual(task.execution.process, binary);
+      assert.deepStrictEqual(task.execution.args, [file]);
+      assert.strictEqual(task.execution.options?.cwd, workspace);
+      assert.strictEqual(task.definition.command, 'Run');
+      assert.notStrictEqual(task.scope, vscode.TaskScope.Global, 'VS Code does not support global tasks');
+    } finally {
+      fs.rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  test('single-file mode preserves literal process args without task support', () => {
+    const filename = "/tmp/it's $literal; project.nula";
+    const options = createStandaloneNulangTerminalOptions(
+      'Run', [], filename, '/toolchain with spaces/nulang'
+    );
+    assert.strictEqual(options.shellPath, '/toolchain with spaces/nulang');
+    assert.deepStrictEqual(options.shellArgs, [filename]);
+    assert.strictEqual(options.cwd, undefined, 'empty workspaces cannot set arbitrary terminal cwd');
+  });
+
+  test('Type Check task uses standalone file directory without a manifest', () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'nulang-task-'));
+    try {
+      const file = path.join(workspace, 'standalone file.nula');
+      fs.writeFileSync(file, BAD_SOURCE);
+      const task = createNulangTask('Type Check', ['--check'], file, 'nulang');
+      assert.ok(task.execution instanceof vscode.ProcessExecution);
+      assert.deepStrictEqual(task.execution.args, ['--check', file]);
+      assert.strictEqual(task.execution.options?.cwd, workspace);
+    } finally {
+      fs.rmSync(workspace, { recursive: true, force: true });
+    }
   });
 });
