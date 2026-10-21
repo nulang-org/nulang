@@ -1,0 +1,80 @@
+{
+  "type": "snapshot",
+  "protocol": "nulang-ui-msg/1",
+  "document": {
+    "protocol": "nulang-ui/1",
+    "document_id": "tasks",
+    "revision": "18446744073709551613",
+    "root": "root",
+    "nodes": [
+      {
+        "id": "root",
+        "kind": "column",
+        "children": [
+          "button"
+        ]
+      },
+      {
+        "id": "button",
+        "kind": "button",
+        "properties": {
+          "count": {
+            "type": "i64",
+            "value": "-9223372036854775808"
+          },
+          "top": {
+            "type": "i64",
+            "value": "9223372036854775807"
+          },
+          "bits": {
+            "type": "f64",
+            "value": "7ff8000000000042"
+          },
+          "raw": {
+            "type": "bytes",
+            "value": [
+              0,
+              1,
+              127,
+              128,
+              255
+            ]
+          },
+          "title": {
+            "type": "string",
+            "value": "héllo 🌍"
+          },
+          "nested": {
+            "type": "array",
+            "value": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "object",
+                "value": {
+                  "saved": {
+                    "type": "bool",
+                    "value": true
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "actions": [
+          {
+            "event": "press",
+            "action_id": "save",
+            "placement": "client"
+          },
+          {
+            "event": "focus",
+            "action_id": "audit",
+            "placement": "server"
+          }
+        ]
+      }
+    ]
+  }
+}
