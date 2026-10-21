@@ -22,7 +22,7 @@ fn patched_transport_dependencies_exclude_vulnerable_locked_versions() {
     }
 }
 
- 
+
 // Fail closed for both language-level HTTP effects when ureq's bundled TLS
 // defaults are disabled. A regression must not silently reintroduce the
 // default transport instead of the explicitly OS-verified native TLS agent.
@@ -34,9 +34,7 @@ fn vm_http_builtins_use_explicit_verified_tls_agent() {
         "VM Http effects must not use ureq's implicit transport"
     );
     assert!(
-        vm.matches("crate::registry::client::verified_https_agent()")
-            .count()
-            >= 2,
+        vm.matches("crate::registry::client::verified_https_agent()").count() >= 2,
         "Http.get and Http.post must independently select verified native TLS"
     );
 }
