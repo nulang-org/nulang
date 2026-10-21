@@ -86,7 +86,6 @@ fn legacy_route() -> WebRoute {
     }
 }
 
-
 // A redirect is an HTTP response, not an HTML meta-refresh. Keep these as
 // network-level tests so we verify the status and headers written to the wire.
 fn redirect_route(method: HttpMethod, target: &str) -> WebRoute {
@@ -196,7 +195,10 @@ fn web_redirect_returns_real_http_location_for_get() {
     );
 
     assert!(response.starts_with("HTTP/1.1 302 Found\r\n"), "{response}");
-    assert!(response.contains("Location: /dashboard?tab=recent\r\n"), "{response}");
+    assert!(
+        response.contains("Location: /dashboard?tab=recent\r\n"),
+        "{response}"
+    );
     assert_eq!(response_body(&response), "");
 }
 
@@ -215,7 +217,10 @@ fn web_redirect_after_post_uses_see_other() {
         "POST /redirect HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
     );
 
-    assert!(response.starts_with("HTTP/1.1 303 See Other\r\n"), "{response}");
+    assert!(
+        response.starts_with("HTTP/1.1 303 See Other\r\n"),
+        "{response}"
+    );
     assert!(response.contains("Location: /complete\r\n"), "{response}");
 }
 
