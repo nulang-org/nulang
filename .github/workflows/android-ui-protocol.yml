@@ -4,11 +4,13 @@ on:
   pull_request:
     paths:
       - 'platforms/android/NulangUIProtocol/**'
+      - 'tests/fixtures/ui_protocol/v1/**'
       - '.github/workflows/android-ui-protocol.yml'
   push:
     branches: [main]
     paths:
       - 'platforms/android/NulangUIProtocol/**'
+      - 'tests/fixtures/ui_protocol/v1/**'
       - '.github/workflows/android-ui-protocol.yml'
 
 permissions:
