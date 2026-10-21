@@ -136,6 +136,13 @@ HTTP request
 
 `Int`, `Float`, and `Bool` request values are decoded explicitly. `String`, untyped values, and custom/opaque identifier types remain string-backed until Web Contract IR carries a richer runtime representation.
 
+Both the multi-source request binder and the legacy path-only binder validate their
+complete handler-slot plan (allowed source, slot range, uniqueness, and coverage)
+**before reading client-controlled request values**. Invalid compiler/runtime
+plans must not be masked by missing or malformed input and reported as a
+client-originated failure. The general binder preserves structured `500`
+problem classification for such invariant violations.
+
 The source-agnostic VM call seam validates that handler slots are complete, unique, and in range before execution. A complete compiler binding plan can therefore invoke a handler regardless of whether its arguments came from path, query, header, cookie, body, or form.
 
 The transport-facing dispatch seam includes:
