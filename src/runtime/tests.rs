@@ -5059,6 +5059,56 @@ fn test_actor_migration_between_two_nodes() {
 /// `DEFAULT_SUSPICION_DURATION` (2s + 5s at the time of writing) plus
 /// margin.
 #[cfg(feature = "tcp")]
+#[test]
+fn test_peer_failure_evidence_identifies_watched_healthy_peer() {
+    let mut rt = start_distributed_node();
+    let dead = NodeId(u64::MAX - 1);
+    let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 15001);
+    rt.distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(dead, peer_addr);
+
+    let detail = describe_failed_peer_observations(&[&mut rt], dead);
+    assert!(detail.contains("status=Some(Healthy)"), "{detail}");
+    assert!(detail.contains("active=true"), "{detail}");
+    assert!(detail.contains("passive=false"), "{detail}");
+    assert!(detail.contains("probationary=false"), "{detail}");
+    assert!(detail.contains("last_heartbeat_age="), "{detail}");
+    assert!(detail.contains("incarnation="), "{detail}");
+    shutdown_nodes(&mut [&mut rt]);
+}
+
+/// Failure-only evidence for peer-failure timeouts. Membership convergence
+/// does not prove the peer entered each observer's directly watched view;
+/// include that distinction without changing the failure detector or polling.
+#[cfg(feature = "tcp")]
+fn describe_failed_peer_observations(nodes: &[&mut Runtime], dead: NodeId) -> String {
+    let now = Instant::now();
+    nodes
+        .iter()
+        .map(|rt| {
+            let cluster = rt.distributed.cluster.as_ref().unwrap();
+            let peer = cluster.get_node(dead);
+            let probationary = cluster.probationary().iter().any(|(id, _)| *id == dead);
+            format!(
+                "observer={:?} status={:?} active={} passive={} probationary={} address={:?} last_heartbeat_age={:?} incarnation={:?}",
+                rt.distributed.node_id,
+                peer.map(|info| info.status),
+                cluster.active_view().contains(&dead),
+                cluster.passive_view().contains(&dead),
+                probationary,
+                peer.map(|info| info.address),
+                peer.map(|info| now.saturating_duration_since(info.last_heartbeat)),
+                peer.and_then(|info| info.metadata.get("_incarnation")),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+#[cfg(feature = "tcp")]
 fn pump_until_peer_failed(nodes: &mut [&mut Runtime], dead: NodeId, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
@@ -5079,11 +5129,14 @@ fn pump_until_peer_failed(nodes: &mut [&mut Runtime], dead: NodeId, timeout: Dur
         if all_failed {
             return;
         }
-        assert!(
-            Instant::now() < deadline,
-            "peer {:?} was not marked Failed within the timeout",
-            dead
-        );
+        if Instant::now() >= deadline {
+            panic!(
+                "peer {:?} was not marked Failed within {:?}; {}",
+                dead,
+                timeout,
+                describe_failed_peer_observations(nodes, dead),
+            );
+        }
         sleep(Duration::from_millis(100));
     }
 }
