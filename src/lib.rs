@@ -82,6 +82,7 @@ pub mod parallel_marker;
 pub mod parser;
 pub mod prelude_source;
 pub mod primitives;
+pub mod process_exec;
 pub mod protocol;
 pub mod protocol_wire;
 #[cfg(feature = "python")]
