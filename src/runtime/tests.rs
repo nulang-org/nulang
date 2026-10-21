@@ -5132,10 +5132,34 @@ fn pump_until_addresses_converge(
         if converged {
             return;
         }
-        assert!(
-            Instant::now() < deadline,
-            "cluster addresses did not converge to real listen addresses within the timeout"
-        );
+        if Instant::now() >= deadline {
+            // Failure-only snapshot: report every unresolved observer/peer
+            // address pair. Membership can be Healthy while its advertised
+            // address still points at an ephemeral heartbeat source port.
+            let mut unresolved = Vec::new();
+            for rt in nodes.iter() {
+                let observer = rt.distributed.node_id.unwrap();
+                let cluster = rt.distributed.cluster.as_ref().unwrap();
+                for &(peer_id, expected) in listen {
+                    if peer_id == observer {
+                        continue;
+                    }
+                    let observed = cluster
+                        .get_node(peer_id)
+                        .map(|peer| (peer.address, peer.status));
+                    if observed.map(|(address, _)| address) != Some(expected) {
+                        unresolved.push(format!(
+                            "observer={:?} peer={:?} expected={} observed={:?}",
+                            observer, peer_id, expected, observed
+                        ));
+                    }
+                }
+            }
+            panic!(
+                "cluster addresses did not converge to real listen addresses within the timeout: {}",
+                unresolved.join("; ")
+            );
+        }
         sleep(Duration::from_millis(50));
     }
 }
@@ -6000,7 +6024,21 @@ fn test_five_node_cluster_split_brain_detects_and_heals() {
         });
     }
     let target = ActorAddress::remote(ids[0], actor_id);
+    // Capture the admission boundary at the actual send. The membership
+    // snapshot at timeout alone cannot tell whether the sender rejected the
+    // message before enqueue, or whether the peer later became Failed.
+    let e_status_at_send = cluster_status(&nodes[4], ids[0]);
+    let resolver_before = nodes[4]
+        .distributed
+        .resolver
+        .as_ref()
+        .map(|resolver| resolver.stats());
     nodes[4].send_distributed(target, "store", &[Value::int(44)]);
+    let resolver_after = nodes[4]
+        .distributed
+        .resolver
+        .as_ref()
+        .map(|resolver| resolver.stats());
     let deadline = Instant::now() + Duration::from_secs(20);
     let delivered = loop {
         nodes[0].process_network();
@@ -6021,7 +6059,40 @@ fn test_five_node_cluster_split_brain_detects_and_heals() {
     };
     assert!(
         delivered,
-        "remote delivery across the healed 5-node split-brain boundary failed"
+        "remote delivery across healed 5-node boundary failed: E_status_at_send={:?}, E_resolver_before={:?}, E_resolver_after={:?}, E_sees_A={:?}, A_sees_E={:?}, E_cluster_addr_for_A={:?}, A_cluster_addr_for_E={:?}, E_connection_to_A={:?}, A_connection_to_E={:?}, actor_mailbox_depth={:?}, actor_received={:?}",
+        e_status_at_send,
+        resolver_before,
+        resolver_after,
+        cluster_status(&nodes[4], ids[0]),
+        cluster_status(&nodes[0], ids[4]),
+        nodes[4]
+            .distributed
+            .cluster
+            .as_ref()
+            .and_then(|cluster| cluster.get_node(ids[0]))
+            .map(|member| member.address),
+        nodes[0]
+            .distributed
+            .cluster
+            .as_ref()
+            .and_then(|cluster| cluster.get_node(ids[4]))
+            .map(|member| member.address),
+        nodes[4]
+            .distributed
+            .transport
+            .as_ref()
+            .and_then(|transport| transport.connection_addr(ids[0])),
+        nodes[0]
+            .distributed
+            .transport
+            .as_ref()
+            .and_then(|transport| transport.connection_addr(ids[4])),
+        nodes[0].actors.get(&actor_id).map(|actor| actor.mailbox.len()),
+        nodes[0]
+            .actors
+            .get(&actor_id)
+            .and_then(|actor| actor.get_state_field("received"))
+            .and_then(|value| value.as_int()),
     );
 
     shutdown_nodes(&mut nodes.iter_mut().collect::<Vec<_>>());
