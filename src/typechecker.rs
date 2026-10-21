@@ -1774,12 +1774,24 @@ impl TypeChecker {
             Decl::Import { .. } => Ok((vec![], Type::unit())),
             Decl::Database { .. } => Ok((vec![], Type::unit())),
             Decl::Given {
-                name, ty, value, ..
+                name,
+                ty,
+                value,
+                span,
             } => {
                 let (s_val, val_ty) = self.infer_expr(ctx, value)?;
+                // Contextual bindings must obey their declared types before
+                // they can become candidates for implicit using arguments.
+                let subst = if let Some(annotation) = ty {
+                    let s_ann = mgu(&apply_subst(&val_ty, &s_val), annotation, *span)?;
+                    compose_subst(&s_ann, &s_val)
+                } else {
+                    s_val
+                };
+                let final_ty = apply_subst(&val_ty, &subst);
                 self.given_bindings
                     .insert(name.clone(), (ty.clone(), value.clone()));
-                Ok((s_val, val_ty))
+                Ok((subst, final_ty))
             }
             Decl::Class { .. } => Ok((vec![], Type::unit())),
             Decl::Impl {
@@ -5530,6 +5542,49 @@ mod tests {
         let module = parser.parse_module()?;
         let mut tc = TypeChecker::new();
         tc.check_module(&module)
+    }
+
+    #[test]
+    fn test_given_annotation_rejects_mismatched_initializer() {
+        // Contextual values are ordinary typed values, not an escape hatch
+        // around the annotation checks performed for top-level let bindings.
+        let error = check_src("given retries: Int = \"not an int\"")
+            .expect_err("given must reject an initializer of the wrong type");
+        let message = error.to_string();
+        assert!(message.contains("Int") && message.contains("String"), "{message}");
+
+        assert!(
+            check_src("given enabled: Bool = 42").is_err(),
+            "given must check primitive annotations independently of names"
+        );
+    }
+
+    #[test]
+    fn test_given_mismatch_does_not_register_contextual_binding() {
+        let mut tc = TypeChecker::new();
+        let declaration = Decl::Given {
+            name: "config".to_string(),
+            ty: Some(Type::int()),
+            value: string_lit("invalid"),
+            span: sp(),
+        };
+        assert!(tc.infer_decl(&TypeContext::new(), &declaration).is_err());
+        assert!(
+            !tc.given_bindings.contains_key("config"),
+            "a rejected given must not leak into contextual resolution"
+        );
+    }
+
+    #[test]
+    fn test_given_annotation_accepts_valid_and_inferred_initializers() {
+        assert!(
+            check_src("given retries: Int = 3").is_ok(),
+            "a compatible contextual annotation must be accepted"
+        );
+        assert!(
+            check_src("given enabled = true").is_ok(),
+            "unannotated given values must retain type inference"
+        );
     }
 
     #[test]
