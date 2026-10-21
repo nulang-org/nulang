@@ -243,8 +243,10 @@ fn compose_subst(s2: &Substitution, s1: &Substitution) -> Substitution {
 // ---------------------------------------------------------------------------
 
 /// Check if two effect rows are compatible (can be unified).
-/// For closed rows, they must have exactly the same effects.
-/// For open rows, we check that the fixed effects are compatible.
+/// Closed rows must have exactly the same effects. For an open row and a
+/// closed row, the open row's known effects must be present in the closed
+/// row; its unresolved tail could account for the remaining closed effects.
+/// This is a compatibility predicate, not full row-variable unification.
 fn effect_row_compatible(e1: &EffectRow, e2: &EffectRow) -> bool {
     match (e1, e2) {
         (EffectRow::Closed(a), EffectRow::Closed(b)) => {
@@ -255,7 +257,7 @@ fn effect_row_compatible(e1: &EffectRow, e2: &EffectRow) -> bool {
             a_sorted == b_sorted
         }
         (EffectRow::Open(a, _), EffectRow::Closed(b))
-        | (EffectRow::Closed(b), EffectRow::Open(a, _)) => b.iter().all(|e| a.contains(e)),
+        | (EffectRow::Closed(b), EffectRow::Open(a, _)) => a.iter().all(|e| b.contains(e)),
         (EffectRow::Open(a, _), EffectRow::Open(b, _)) => {
             // Both sides must agree on fixed effects; row variables are
             // assumed compatible (full row unification requires Region
@@ -449,17 +451,11 @@ fn mgu(t1: &Type, t2: &Type, span: Span) -> NuResult<Substitution> {
     if t1 == t2 {
         return Ok(vec![]);
     }
-    // NTIR erases opaque nominal wrappers to their underlying type, so two
-    // ground types that differ only by opacity must not short-circuit here.
-    // Let the Type::Nominal cases below enforce the opacity contract.
-    if !matches!(t1, Type::Nominal { .. })
-        && !matches!(t2, Type::Nominal { .. })
-        && t1.is_ground()
-        && t2.is_ground()
-        && t1.to_ntir().hash() == t2.to_ntir().hash()
-    {
-        return Ok(vec![]);
-    }
+    // NTIR is a content-addressing representation, not an injective encoding
+    // of type equality: it erases function effect rows and opaque nominal
+    // wrappers, and represents arrays with tuple nodes. Matching NTIR hashes
+    // therefore cannot bypass the semantic cases below, even for ground types.
+    // Exact type equality has already been handled above.
 
     match (t1, t2) {
         // Identical primitives unify trivially
@@ -4281,6 +4277,71 @@ impl Default for TypeChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_effect_row_compatible_open_requires_known_effects_in_closed_row() {
+        let open = EffectRow::Open(vec![Effect::IO], Region::fresh());
+        let pure = EffectRow::empty();
+        assert!(!effect_row_compatible(&open, &pure));
+        assert!(!effect_row_compatible(&pure, &open));
+    }
+
+    #[test]
+    fn test_effect_row_compatible_open_may_instantiate_tail_from_closed_row() {
+        let open = EffectRow::Open(vec![Effect::IO], Region::fresh());
+        let closed = EffectRow::Closed(vec![Effect::IO, Effect::FS]);
+        assert!(effect_row_compatible(&open, &closed));
+        assert!(effect_row_compatible(&closed, &open));
+    }
+
+    #[test]
+    fn test_mgu_rejects_nested_function_effect_difference_even_with_same_ntir_hash() {
+        // NTIR represents function param, result and capability but erases
+        // the effect row, so hash equality is not a proof of type unification.
+        let pure = Type::Function {
+            param: Box::new(Type::int()),
+            ret: Box::new(Type::int()),
+            effect: EffectRow::empty(),
+            cap: Capability::Ref,
+        };
+        let io = Type::Function {
+            param: Box::new(Type::int()),
+            ret: Box::new(Type::int()),
+            effect: EffectRow::Closed(vec![Effect::IO]),
+            cap: Capability::Ref,
+        };
+        let a = Type::Tuple(vec![pure]);
+        let b = Type::Tuple(vec![io]);
+        assert_eq!(a.to_ntir().hash(), b.to_ntir().hash());
+        assert!(mgu(&a, &b, sp()).is_err());
+    }
+
+    #[test]
+    fn test_mgu_rejects_array_vs_singleton_tuple_with_same_ntir_hash() {
+        // The content-addressed NTIR representation is intentionally
+        // lossy: array and tuple constructors can share its encoding.
+        let arr = Type::Array(Box::new(Type::int()));
+        let tuple = Type::Tuple(vec![Type::int()]);
+        assert_eq!(arr.to_ntir().hash(), tuple.to_ntir().hash());
+        assert!(mgu(&arr, &tuple, sp()).is_err());
+    }
+
+    #[test]
+    fn test_mgu_rejects_function_with_unaccounted_known_effect() {
+        let open_fn = Type::Function {
+            param: Box::new(Type::int()),
+            ret: Box::new(Type::int()),
+            effect: EffectRow::Open(vec![Effect::IO], Region::fresh()),
+            cap: Capability::Ref,
+        };
+        let pure_fn = Type::Function {
+            param: Box::new(Type::int()),
+            ret: Box::new(Type::int()),
+            effect: EffectRow::empty(),
+            cap: Capability::Ref,
+        };
+        assert!(mgu(&open_fn, &pure_fn, sp()).is_err());
+    }
 
     // Helper to create a span
     fn sp() -> Span {
