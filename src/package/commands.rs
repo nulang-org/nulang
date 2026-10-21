@@ -1415,16 +1415,44 @@ fn cmd_build_web() -> NuResult<()> {
         span: Span::default(),
     })?;
 
-    eprintln!("  Rendering {} route(s)...", routes.len());
-    for route in &routes {
+    // Materialize the signal graph before IR extraction so one validated IR
+    // drives both the filesystem artifacts and the deployment manifest.
+    let signals_path = output_dir.join("app.signals.json");
+    nulang_exe(&[
+        "--emit-signals",
+        &signals_path.to_string_lossy(),
+        &entry_str,
+    ])?;
+    let ir = crate::web::ir::generate_deployment_ir(
+        &routes,
+        Some(&signals_path),
+        &src_root,
+        &manifest.budgets,
+        &validated_contracts,
+    )
+    .map_err(|msg| NuError::PackageError {
+        msg: format!("cannot build static web artifacts: {msg}"),
+        span: Span::default(),
+    })?;
+
+    let static_count = ir
+        .routes
+        .iter()
+        .filter(|route| route.artifact.is_some())
+        .count();
+    eprintln!("  Rendering {static_count} static route(s)...");
+    for (route, ir_route) in routes.iter().zip(&ir.routes) {
+        let Some(out_file) = ir_route.artifact.as_deref() else {
+            // Dynamic routes remain in deployment IR for a server/Cloud adapter.
+            continue;
+        };
         let html = render_route_handler(&route.handler_module, route.handler_func_idx, None)
             .ok_or_else(|| NuError::PackageError {
                 msg: format!("failed to render route {:?} {}", route.method, route.path),
                 span: Span::default(),
             })?;
         let html = crate::web::reactivity::inject_client_runtime_script(&html);
-        let out_file = route_path_to_output_file(&route.path);
-        let dest = output_dir.join(&out_file);
+        let dest = output_dir.join(out_file);
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|e| NuError::PackageError {
                 msg: format!("cannot create {}: {}", parent.display(), e),
@@ -1443,22 +1471,8 @@ fn cmd_build_web() -> NuResult<()> {
         copy_dir_contents(&static_dir, &output_dir)?;
     }
 
-    // Emit compile-time signal graph if the entry uses `signal` declarations.
-    let signals_path = output_dir.join("app.signals.json");
-    nulang_exe(&[
-        "--emit-signals",
-        &signals_path.to_string_lossy(),
-        &entry_str,
-    ])?;
-
-    // Generate deployment IR consumed by adapters and Nulang Cloud.
-    let ir = crate::web::ir::generate_deployment_ir(
-        &routes,
-        Some(&signals_path),
-        &src_root,
-        &manifest.budgets,
-        &validated_contracts,
-    );
+    // The exact same validated IR that chose filesystem writes is serialized
+    // for adapters. Do not recompute artifact paths from raw source strings.
     let ir_path = output_dir.join("nulang-app.ir.json");
     let ir_json = ir.to_json();
     std::fs::write(&ir_path, ir_json).map_err(|e| NuError::PackageError {
@@ -1487,15 +1501,6 @@ fn cmd_build_web() -> NuResult<()> {
 
     println!("Web build succeeded: {}", output_dir.display());
     Ok(())
-}
-
-fn route_path_to_output_file(path: &str) -> PathBuf {
-    let trimmed = path.trim_start_matches('/');
-    if trimmed.is_empty() {
-        PathBuf::from("index.html")
-    } else {
-        PathBuf::from(trimmed).join("index.html")
-    }
 }
 
 fn copy_dir_contents(src: &Path, dst: &Path) -> NuResult<()> {
@@ -3120,6 +3125,67 @@ app "counter" {
             .expect("app.client.js should exist");
         assert!(js.contains("window.nulang"), "nulang global missing");
         assert!(js.contains("hydrate"), "hydrate missing");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn web_build_emits_only_static_get_routes_but_retains_server_contracts() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_build_web_mixed_routes_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        scaffold_package(&dir, "mixed-app", "web").expect("web scaffold should succeed");
+        std::fs::write(
+            dir.join("src/main.nula"),
+            r#"import stdlib::web::html
+import stdlib::web::types
+
+fn home() -> Html { text("home") }
+fn user() -> Html {
+    let name = perform Web.param("name")
+    text(name)
+}
+fn submit() -> Html { text("submitted") }
+
+app "mixed" {
+    route "GET" "/" -> home
+    route "GET" "/users/:name" -> user
+    route "POST" "/submit" -> submit
+}
+"#,
+        )
+        .unwrap();
+
+        let _guard = ChangeDir::new(&dir);
+        cmd_build_web().expect("mixed web build should succeed");
+
+        assert!(dir.join("dist/index.html").exists());
+        assert!(!dir.join("dist/users/:name/index.html").exists());
+        assert!(!dir.join("dist/submit/index.html").exists());
+
+        let ir: crate::web::ir::DeploymentIr = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("dist/nulang-app.ir.json")).unwrap(),
+        )
+        .unwrap();
+        let home = ir.routes.iter().find(|route| route.path == "/").unwrap();
+        assert_eq!(home.artifact.as_deref(), Some("index.html"));
+        let dynamic = ir
+            .routes
+            .iter()
+            .find(|route| route.path == "/users/:name")
+            .unwrap();
+        assert_eq!(dynamic.placement, "server");
+        assert!(dynamic.artifact.is_none());
+        let post = ir
+            .routes
+            .iter()
+            .find(|route| route.path == "/submit")
+            .unwrap();
+        assert_eq!(post.placement, "server");
+        assert!(post.artifact.is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
