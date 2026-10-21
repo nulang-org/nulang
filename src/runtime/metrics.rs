@@ -86,7 +86,12 @@ impl MetricsSnapshot {
         out.push_str("# HELP nulang_actor_mailbox_depth Per-actor mailbox depth\n");
         out.push_str("# TYPE nulang_actor_mailbox_depth gauge\n");
         let mut sorted: Vec<_> = self.actors_mailboxes.clone();
-        sorted.sort_by_key(|m| -(m.depth as i64));
+        sorted.sort_unstable_by(|left, right| {
+            right
+                .depth
+                .cmp(&left.depth)
+                .then_with(|| left.actor_id.cmp(&right.actor_id))
+        });
         for m in sorted.iter().take(50) {
             out.push_str(&format!(
                 "nulang_actor_mailbox_depth{{actor_id=\"{}\"}} {}\n",
@@ -258,11 +263,19 @@ impl MetricsSnapshot {
             .filter(|s| !child_sup_ids.contains(&s.id))
             .collect();
 
-        if roots.is_empty() {
+        if self.supervisors.is_empty() {
             out.push_str("  (no supervisors)\n");
         }
+        let mut visited = std::collections::HashSet::new();
         for root in roots {
-            Self::render_supervisor_node(root, 0, &sup_by_id, &mut out);
+            Self::render_supervisor_node(root, 0, &sup_by_id, &mut visited, &mut out);
+        }
+        // Malformed snapshots can contain disconnected cycles with no roots.
+        // Include those components without repeatedly visiting their nodes.
+        for supervisor in &self.supervisors {
+            if !visited.contains(&supervisor.id) {
+                Self::render_supervisor_node(supervisor, 0, &sup_by_id, &mut visited, &mut out);
+            }
         }
         out
     }
@@ -271,9 +284,17 @@ impl MetricsSnapshot {
         sup: &super::SupervisorMetric,
         depth: usize,
         sup_by_id: &HashMap<u64, &super::SupervisorMetric>,
+        visited: &mut std::collections::HashSet<u64>,
         out: &mut String,
     ) {
         let indent = "  ".repeat(depth);
+        if !visited.insert(sup.id) {
+            out.push_str(&format!(
+                "{indent}(cycle/repeated supervisor id: {})\n",
+                sup.id
+            ));
+            return;
+        }
         out.push_str(&format!(
             "{}supervisor {} [{}]\n",
             indent, sup.name, sup.strategy
@@ -281,7 +302,7 @@ impl MetricsSnapshot {
         for child in &sup.children {
             match sup_by_id.get(&child.actor_id) {
                 Some(child_sup) => {
-                    Self::render_supervisor_node(child_sup, depth + 1, sup_by_id, out)
+                    Self::render_supervisor_node(child_sup, depth + 1, sup_by_id, visited, out)
                 }
                 None => {
                     out.push_str(&format!(
@@ -293,5 +314,140 @@ impl MetricsSnapshot {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{ActorMailboxMetric, Runtime, SupervisorChildMetric, SupervisorMetric};
+
+    #[test]
+    fn test_mailbox_depth_export_handles_large_counts_and_ties() {
+        let mut snapshot = Runtime::new().metrics_snapshot();
+        snapshot.actors_mailboxes = vec![
+            ActorMailboxMetric {
+                actor_id: 9,
+                depth: 7,
+            },
+            ActorMailboxMetric {
+                actor_id: 3,
+                depth: usize::MAX,
+            },
+            ActorMailboxMetric {
+                actor_id: 2,
+                depth: usize::MAX / 2 + 1,
+            },
+            ActorMailboxMetric {
+                actor_id: 1,
+                depth: 7,
+            },
+        ];
+
+        let output = snapshot.to_prometheus_text();
+        let lines: Vec<&str> = output
+            .lines()
+            .filter(|line| line.starts_with("nulang_actor_mailbox_depth{"))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                format!(
+                    "nulang_actor_mailbox_depth{{actor_id=\"3\"}} {}",
+                    usize::MAX
+                ),
+                format!(
+                    "nulang_actor_mailbox_depth{{actor_id=\"2\"}} {}",
+                    usize::MAX / 2 + 1
+                ),
+                "nulang_actor_mailbox_depth{actor_id=\"1\"} 7".to_string(),
+                "nulang_actor_mailbox_depth{actor_id=\"9\"} 7".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_mailbox_depth_export_selects_deepest_fifty() {
+        let mut snapshot = Runtime::new().metrics_snapshot();
+        snapshot.actors_mailboxes = (1..=75)
+            .rev()
+            .map(|id| ActorMailboxMetric {
+                actor_id: id,
+                depth: id as usize,
+            })
+            .collect();
+
+        let output = snapshot.to_prometheus_text();
+        let lines: Vec<&str> = output
+            .lines()
+            .filter(|line| line.starts_with("nulang_actor_mailbox_depth{"))
+            .collect();
+        assert_eq!(lines.len(), 50);
+        assert_eq!(lines[0], "nulang_actor_mailbox_depth{actor_id=\"75\"} 75");
+        assert_eq!(lines[49], "nulang_actor_mailbox_depth{actor_id=\"26\"} 26");
+    }
+
+    #[test]
+    fn test_topology_renders_rootless_cycle_instead_of_claiming_no_supervisors() {
+        let mut snapshot = Runtime::new().metrics_snapshot();
+        snapshot.supervisors = vec![
+            SupervisorMetric {
+                id: 11,
+                name: "alpha".to_string(),
+                strategy: "OneForOne".to_string(),
+                parent: Some(12),
+                children: vec![SupervisorChildMetric {
+                    actor_id: 12,
+                    spec_id: "beta-link".to_string(),
+                }],
+            },
+            SupervisorMetric {
+                id: 12,
+                name: "beta".to_string(),
+                strategy: "OneForOne".to_string(),
+                parent: Some(11),
+                children: vec![SupervisorChildMetric {
+                    actor_id: 11,
+                    spec_id: "alpha-link".to_string(),
+                }],
+            },
+        ];
+
+        let output = snapshot.render_topology_text();
+        assert!(!output.contains("(no supervisors)"));
+        assert_eq!(output.matches("supervisor alpha [").count(), 1);
+        assert_eq!(output.matches("supervisor beta [").count(), 1);
+        assert!(output.contains("(cycle/repeated supervisor id: 11)"));
+    }
+
+    #[test]
+    fn test_supervision_topology_handles_cycle_without_recursion() {
+        let mut snapshot = Runtime::new().metrics_snapshot();
+        snapshot.supervisors = vec![
+            SupervisorMetric {
+                id: 1,
+                name: "root".to_string(),
+                strategy: "OneForOne".to_string(),
+                parent: None,
+                children: vec![SupervisorChildMetric {
+                    actor_id: 2,
+                    spec_id: "worker".to_string(),
+                }],
+            },
+            SupervisorMetric {
+                id: 2,
+                name: "child".to_string(),
+                strategy: "OneForOne".to_string(),
+                parent: Some(1),
+                children: vec![SupervisorChildMetric {
+                    actor_id: 2,
+                    spec_id: "self-reference".to_string(),
+                }],
+            },
+        ];
+
+        let output = snapshot.render_topology_text();
+        assert_eq!(output.matches("supervisor root [").count(), 1);
+        assert_eq!(output.matches("supervisor child [").count(), 1);
+        assert!(output.contains("(cycle/repeated supervisor id: 2)"));
     }
 }
