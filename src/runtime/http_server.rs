@@ -362,6 +362,7 @@ impl HttpServerState {
             204 => "No Content",
             301 => "Moved Permanently",
             302 => "Found",
+            303 => "See Other",
             304 => "Not Modified",
             400 => "Bad Request",
             401 => "Unauthorized",
@@ -520,6 +521,7 @@ pub struct RequestContext {
 thread_local! {
     static CURRENT_REQUEST: RefCell<Option<RequestContext>> = const { RefCell::new(None) };
     static RESPONSE_COOKIES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    static RESPONSE_REDIRECT: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 /// Set the request context for the current thread, run `f`, then clear it.
@@ -529,6 +531,7 @@ where
 {
     CURRENT_REQUEST.with(|c| *c.borrow_mut() = Some(ctx));
     RESPONSE_COOKIES.with(|c| c.borrow_mut().clear());
+    RESPONSE_REDIRECT.with(|c| *c.borrow_mut() = None);
     let result = f();
     CURRENT_REQUEST.with(|c| *c.borrow_mut() = None);
     result
@@ -549,6 +552,35 @@ pub fn clear_cookie(name: &str) {
 /// Take all cookies queued for the current response and clear the queue.
 pub fn take_response_cookies() -> Vec<String> {
     RESPONSE_COOKIES.with(|c| c.borrow_mut().drain(..).collect())
+}
+
+/// Record the redirect requested by `Web.redirect` for the current HTTP request.
+/// Outside an HTTP request the operation keeps its legacy HTML fallback.
+pub fn set_response_redirect(location: &str) {
+    if CURRENT_REQUEST.with(|c| c.borrow().is_some()) {
+        RESPONSE_REDIRECT.with(|c| *c.borrow_mut() = Some(location.to_owned()));
+    }
+}
+
+/// Retrieve (and clear) the redirect requested during the just-rendered request.
+fn take_response_redirect() -> Option<String> {
+    RESPONSE_REDIRECT.with(|c| c.borrow_mut().take())
+}
+
+/// Only same-origin, root-relative redirect targets are accepted. Disallow
+/// protocol-relative URLs, backslashes, whitespace/control bytes and non-ASCII
+/// bytes to prevent open redirects and header injection. Unicode URLs must
+/// be percent-encoded by the caller.
+pub(crate) fn safe_local_redirect_target(target: &str) -> bool {
+    let bytes = target.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 8192
+        && bytes[0] == b'/'
+        && bytes.get(1) != Some(&b'/')
+        && bytes.iter().all(|b| {
+            (0x21..=0x7e).contains(b)
+                && !matches!(*b, b'\\' | b'"' | b'<' | b'>')
+        })
 }
 
 /// Look up a captured route parameter for the current request.
@@ -1045,8 +1077,8 @@ impl WebDevServer {
                     request: request.clone(),
                     params: params.clone(),
                 };
-                let rendered =
-                    with_request_context(ctx, || match render_direct_request(route, &values) {
+                let (rendered, redirect) = with_request_context(ctx, || {
+                    let result = match render_direct_request(route, &values) {
                         Ok(Some(rendered)) => Ok(Some(rendered)),
                         Ok(None) => Ok(render_route_handler(
                             &route.route.handler_module,
@@ -1054,12 +1086,36 @@ impl WebDevServer {
                             None,
                         )),
                         Err(error) => Err(error),
-                    });
+                    };
+                    (result, take_response_redirect())
+                });
                 match rendered {
-                    Ok(Some(html)) => HttpResponse {
-                        status: 200,
-                        headers: vec![("Content-Type".into(), "text/html; charset=utf-8".into())],
-                        body: inject_client_runtime_script(&html).into_bytes(),
+                    Ok(Some(html)) => match redirect {
+                        Some(location) if safe_local_redirect_target(&location) => HttpResponse {
+                            // POST/redirect/GET avoids inadvertently replaying form submission.
+                            status: if request.method == HttpMethod::Post { 303 } else { 302 },
+                            headers: vec![
+                                ("Location".into(), location),
+                                ("Cache-Control".into(), "no-store".into()),
+                            ],
+                            body: Vec::new(),
+                        },
+                        Some(_) => HttpResponse {
+                            status: 400,
+                            headers: vec![(
+                                "Content-Type".into(),
+                                "text/plain; charset=utf-8".into(),
+                            )],
+                            body: b"Invalid redirect target".to_vec(),
+                        },
+                        None => HttpResponse {
+                            status: 200,
+                            headers: vec![(
+                                "Content-Type".into(),
+                                "text/html; charset=utf-8".into(),
+                            )],
+                            body: inject_client_runtime_script(&html).into_bytes(),
+                        },
                     },
                     Ok(None) => HttpResponse {
                         status: 500,
