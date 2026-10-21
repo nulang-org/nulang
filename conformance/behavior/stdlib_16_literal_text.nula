@@ -1,0 +1,26 @@
+// Literal text processing: non-overlapping delimiters, typed first-match
+// captures, byte offsets, empty delimiters, and UTF-8 preservation.
+import stdlib::string
+
+fn main() {
+    perform Test.assert_eq(index_of_from("banana", "na", 3), 4, "start offset")
+    perform Test.assert_eq(index_of_from("a", "", 2), -1, "out of range")
+    perform Test.assert(join(split_literal("::a::::b::", "::"), "|") == "|a||b|", "empty fields")
+    perform Test.assert(join(split_literal("é::世界", "::"), "|") == "é|世界", "UTF-8 boundary")
+    perform Test.assert(join(split_literal("plain", ""), "|") == "plain", "empty delimiter")
+    perform Test.assert_eq(perform Array.length(split_literal("", "::")), 1, "empty input")
+
+    let captured = split_once("left::right::tail", "::")
+    perform Test.assert(match captured {
+        Some((before, after)) => before == "left" && after == "right::tail",
+        None => false,
+    }, "first capture")
+
+    let missing = split_once("plain", "::")
+    perform Test.assert(match missing {
+        Some(_) => false,
+        None => true,
+    }, "missing delimiter")
+
+    perform IO.print("literal text ok")
+}
