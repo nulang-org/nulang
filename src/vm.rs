@@ -1554,7 +1554,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                         .unwrap_or_default();
                     #[cfg(feature = "ureq")]
                     {
-                        let agent = match crate::registry::client::verified_https_agent() {
+                        let agent = match crate::registry::client::verified_https_agent(&url) {
                             Ok(agent) => agent,
                             Err(_) => return Some(Value::nil()),
                         };
@@ -1617,7 +1617,7 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                         .unwrap_or_default();
                     #[cfg(feature = "ureq")]
                     {
-                        let agent = match crate::registry::client::verified_https_agent() {
+                        let agent = match crate::registry::client::verified_https_agent(&url) {
                             Ok(agent) => agent,
                             Err(_) => return Some(Value::nil()),
                         };
