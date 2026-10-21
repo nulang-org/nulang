@@ -47,7 +47,7 @@ use nulang::parser::Parser;
 use nulang::repl::Repl;
 use nulang::stdlib::StdLib;
 use nulang::typechecker::TypeChecker;
-use nulang::types::{NuError, NuResult, Span, Type};
+use nulang::types::{NuError, NuResult, NuWarning, Span, Type};
 use nulang::vm::VM;
 use std::io::IsTerminal;
 use std::io::Read;
@@ -808,7 +808,7 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        if let Err(e) = check_source(
+        let warnings = match check_source(
             &source,
             Some(&path),
             opts.verbose,
@@ -816,42 +816,52 @@ fn main() {
             &opts.with_capabilities,
             opts.deny_warnings,
         ) {
-            let code = exit_code(&e);
-            if opts.json {
-                // Machine-readable mode: the JSON report is the ONLY output on
-                // stdout; nothing human-rendered is printed.
-                let diags = if opts.all_errors {
+            Ok(warnings) => warnings,
+            Err(e) => {
+                let code = exit_code(&e);
+                if opts.json {
+                    // Machine-readable mode: the JSON report is the ONLY output on
+                    // stdout; nothing human-rendered is printed.
+                    let diags = if opts.all_errors {
+                        let all = collect_all_frontend_errors(&source, Some(&path));
+                        if all.is_empty() {
+                            nulang::json_diagnostics::diagnostics_from_error(&e)
+                        } else {
+                            all.iter()
+                                .flat_map(nulang::json_diagnostics::diagnostics_from_error)
+                                .collect()
+                        }
+                    } else {
+                        nulang::json_diagnostics::diagnostics_from_error(&e)
+                    };
+                    let report = nulang::json_diagnostics::JsonReport::new(
+                        "check",
+                        Some(path.clone()),
+                        diags,
+                    );
+                    print!("{}", report.to_json_string());
+                } else if opts.all_errors {
                     let all = collect_all_frontend_errors(&source, Some(&path));
                     if all.is_empty() {
-                        nulang::json_diagnostics::diagnostics_from_error(&e)
+                        print_error(&e, use_color);
                     } else {
-                        all.iter()
-                            .flat_map(nulang::json_diagnostics::diagnostics_from_error)
-                            .collect()
+                        for err in &all {
+                            print_error(err, use_color);
+                        }
                     }
                 } else {
-                    nulang::json_diagnostics::diagnostics_from_error(&e)
-                };
-                let report =
-                    nulang::json_diagnostics::JsonReport::new("check", Some(path.clone()), diags);
-                print!("{}", report.to_json_string());
-            } else if opts.all_errors {
-                let all = collect_all_frontend_errors(&source, Some(&path));
-                if all.is_empty() {
                     print_error(&e, use_color);
-                } else {
-                    for err in &all {
-                        print_error(err, use_color);
-                    }
                 }
-            } else {
-                print_error(&e, use_color);
+                std::process::exit(code);
             }
-            std::process::exit(code);
-        }
+        };
         if opts.json {
+            let diags = warnings
+                .iter()
+                .map(nulang::json_diagnostics::diagnostic_from_warning)
+                .collect();
             let report =
-                nulang::json_diagnostics::JsonReport::new("check", Some(path.clone()), Vec::new());
+                nulang::json_diagnostics::JsonReport::new("check", Some(path.clone()), diags);
             print!("{}", report.to_json_string());
         } else {
             println!("Type check passed.");
@@ -895,7 +905,7 @@ fn main() {
                 &opts.with_capabilities,
                 opts.deny_warnings,
             ) {
-                Ok((ast, _)) => {
+                Ok(FrontendResult { ast, .. }) => {
                     let mut checker = nulang::effect_checker::EffectChecker::new();
                     checker.set_resource_grants(&opts.with_capabilities);
                     let _ = checker.check_module(&ast.decls);
@@ -1603,8 +1613,14 @@ fn run_bench<F: FnMut() -> NuResult<()>>(mut run: F, n: usize) -> NuResult<()> {
     Ok(())
 }
 
-/// Shared frontend: lex -> parse -> typecheck -> effect check -> capability
-/// analysis. Returns the parsed module ready for compilation.
+struct FrontendResult {
+    ast: nulang::ast::AstModule,
+    type_checker: TypeChecker,
+    warnings: Vec<NuWarning>,
+}
+
+/// analysis. Returns the parsed module, type-checker state, and non-fatal
+/// parser warnings.
 ///
 /// `file_path` is an optional display name for diagnostics (e.g. "main.nula").
 #[instrument(level = "debug", skip(source))]
@@ -1614,7 +1630,7 @@ fn run_frontend(
     verbose: bool,
     with_capabilities: &[String],
     deny_warnings: bool,
-) -> NuResult<(nulang::ast::AstModule, nulang::typechecker::TypeChecker)> {
+) -> NuResult<FrontendResult> {
     let ps = nulang::prelude_source::PRELUDE_SOURCE;
     let mut pl = Lexer::new(ps);
     nulang::types::set_source_map_with_file(ps, Some("<prelude>"));
@@ -1784,7 +1800,11 @@ fn run_frontend(
         }
     }
 
-    Ok((ast, type_checker))
+    Ok(FrontendResult {
+        ast,
+        type_checker,
+        warnings,
+    })
 }
 
 #[cfg_attr(not(feature = "wasm-backend"), allow(unused_variables))]
@@ -1800,8 +1820,9 @@ fn run_source(
     store_path: Option<&str>,
     deny_warnings: bool,
 ) -> NuResult<()> {
-    let (ast, type_checker) =
-        run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
+    let FrontendResult {
+        ast, type_checker, ..
+    } = run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
     match backend {
         #[cfg(feature = "wasm-backend")]
         "wasm" => {
@@ -2353,15 +2374,16 @@ fn check_source(
     _all_errors: bool,
     with_capabilities: &[String],
     deny_warnings: bool,
-) -> NuResult<()> {
-    let (_ast, _tc) = run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
+) -> NuResult<Vec<NuWarning>> {
+    let FrontendResult { warnings, .. } =
+        run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
 
     if verbose {
         println!("Effect check passed.");
         println!("Capability analysis passed.");
     }
 
-    Ok(())
+    Ok(warnings)
 }
 
 /// Run the full frontend in multi-error mode and return every collected
@@ -2448,8 +2470,11 @@ fn compile_source_to_nbc(
     behavior_package_name: Option<&str>,
     behavior_package_version: Option<&str>,
 ) -> NuResult<()> {
-    let (mut ast, type_checker) =
-        run_frontend(source, None, false, with_capabilities, deny_warnings)?;
+    let FrontendResult {
+        mut ast,
+        type_checker,
+        ..
+    } = run_frontend(source, None, false, with_capabilities, deny_warnings)?;
 
     // Optional web-framework pass: rewrite HTML for signals/actions and emit the
     // generic client-side micro-runtime. This runs after effect checking so
@@ -2808,6 +2833,21 @@ fn levenshtein_distance(a: &str, b: &str) -> usize {
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_check_source_returns_parser_warnings() {
+        let source = r#"
+            fn ok_val() -> Result[Int, String] { Ok(42) }
+            ok_val() catch 0
+        "#;
+
+        let warnings = check_source(source, Some("deprecated.nula"), false, false, &[], false)
+            .expect("deprecated catch program should typecheck");
+
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "W0101");
+        assert_eq!(warnings[0].msg, "use of deprecated `catch` expression");
+    }
+
     /// An actor program run through the CLI path must create real actors
     /// and deliver sent messages: with the bare standalone VM the stub
     /// spawn/send callbacks would leave the counter at 0.
@@ -2825,7 +2865,9 @@ mod tests {
             }
         "#;
 
-        let (ast, type_checker) = run_frontend(source, None, false, &[], false)
+        let FrontendResult {
+            ast, type_checker, ..
+        } = run_frontend(source, None, false, &[], false)
             .expect("frontend should accept the actor program");
         let module = compile_with_new_pipeline(&ast, "test", &type_checker)
             .expect("actor program should compile");
@@ -2861,7 +2903,9 @@ mod tests {
             }
         "#;
 
-        let (ast, type_checker) = run_frontend(source, None, false, &[], false)
+        let FrontendResult {
+            ast, type_checker, ..
+        } = run_frontend(source, None, false, &[], false)
             .expect("frontend should accept persistent actor program");
         let module = compile_with_new_pipeline(&ast, "test", &type_checker)
             .expect("persistent actor program should compile");
@@ -2915,7 +2959,9 @@ mod tests {
                 c
             }
         "#;
-        let (ast, type_checker) = run_frontend(source, None, false, &[], false)
+        let FrontendResult {
+            ast, type_checker, ..
+        } = run_frontend(source, None, false, &[], false)
             .expect("frontend should accept the actor program");
         let module = compile_with_new_pipeline(&ast, "test", &type_checker)
             .expect("actor program should compile");

@@ -259,6 +259,13 @@ version + migration.*
 
 ## Stable tier
 
+### Diagnostic warning baseline gate — 2026-10-18
+- **A new standalone stdlib-only tool `scripts/diagnostic_baseline.py` provides a PHPStan-style count-aware warning baseline gate for JSON diagnostics.** It reads the compiler's schema-v1 JSON output (`nulang --check --json`) and enforces a checked-in baseline of coded warnings only.
+- **`--update` creates deterministic baselines** containing file, code, message, and count per diagnostic; compiler/type/effect/capability errors remain fatal even under `--update`. Invalid JSON, non-integer schema versions, uncoded warnings, and source paths outside `--root` fail closed.
+- **Normal checks fail on new warnings, increased duplicate counts, and stale baseline suppressions.** Baseline identity excludes line/column so unrelated source edits do not invalidate it; relative symlinks inside the project root are canonicalized.
+- **Unit tests cover schema validation, baseline creation/update, stale detection, path canonicalization, and reject/allow logic** (11 tests in `scripts/tests/test_diagnostic_baseline.py`).
+
+
 ### Preserve observable MIR panic through DCE — 2026-09-24
 - **MIR dead-store elimination now treats `RValue::Panic` as observable/divergent** (`src/mir_codegen.rs`), so an unused panic result cannot cause a reachable contract/precondition failure to be optimized away. A focused optimizer regression pins the behavior.
 ### Zero-copy non-reentrant JIT register entry — 2026-09-24
