@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Rust/Kotlin mobile UI golden-wire conformance — 2026-10-21
+- **Both protocol hosts consume the same eight checked-in `nulang-ui/1` JSON fixtures**, covering full-width revisions, signed integer extrema, bit-precise floats, Unicode and nested tagged values, ordered patches, duplicate action events, malformed collections, and rejected revisions.
+- **The Kotlin Gradle check and Rust crate test both assert acceptance/rejection and atomic patch semantics.** This locks down the snapshot/patch subset without claiming byte-for-byte JSON encoding parity, native packaging, or host-action authorization.
+
 ### Strict Android runtime-to-host JSON ingress — 2026-10-21
 - **The Kotlin/JVM host now decodes `nulang-ui-msg/1` snapshots and ordered patches through bounded JSON streaming** with duplicate-key rejection, tagged lossless values, mandatory version/identity checks, and atomic document publication.
 - **A dedicated executable JSON conformance suite runs in the Android UI protocol CI job** alongside the state-machine suite; this does not yet implement host action authorization, Compose rendering, a portable AAR, or Rust/Kotlin golden fixtures.
