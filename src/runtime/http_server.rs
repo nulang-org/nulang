@@ -527,11 +527,42 @@ pub fn with_request_context<F, R>(ctx: RequestContext, f: F) -> R
 where
     F: FnOnce() -> R,
 {
-    CURRENT_REQUEST.with(|c| *c.borrow_mut() = Some(ctx));
-    RESPONSE_COOKIES.with(|c| c.borrow_mut().clear());
-    let result = f();
-    CURRENT_REQUEST.with(|c| *c.borrow_mut() = None);
-    result
+    // Scoped requests must not leak ambient request/cookie state into later
+    // requests on the same host thread, including when handlers panic.
+    struct RestoreRequestContext {
+        previous: Option<RequestContext>,
+        previous_cookies: Vec<String>,
+    }
+    impl Drop for RestoreRequestContext {
+        fn drop(&mut self) {
+            let nested = self.previous.is_some();
+            CURRENT_REQUEST.with(|current| {
+                *current.borrow_mut() = self.previous.take();
+            });
+            if nested {
+                // Nested handler cookies belong to the nested response, not
+                // the caller's response. Restore the outer response state.
+                RESPONSE_COOKIES.with(|current| {
+                    *current.borrow_mut() = std::mem::take(&mut self.previous_cookies);
+                });
+            } else if std::thread::panicking() {
+                // Top-level response generation failed: never leave cookies
+                // queued for the next request on this reused worker thread.
+                RESPONSE_COOKIES.with(|current| current.borrow_mut().clear());
+            }
+            // Successful top-level requests deliberately retain their pending
+            // cookies for take_response_cookies() at the dispatch boundary.
+        }
+    }
+
+    let previous = CURRENT_REQUEST.with(|current| current.replace(Some(ctx)));
+    let previous_cookies =
+        RESPONSE_COOKIES.with(|current| std::mem::take(&mut *current.borrow_mut()));
+    let _restore = RestoreRequestContext {
+        previous,
+        previous_cookies,
+    };
+    f()
 }
 
 /// Add a `Set-Cookie` header for the current response.
@@ -1022,12 +1053,44 @@ impl WebDevServer {
                 return;
             }
         };
-        let path = request.path.clone();
 
-        let mut response = if path.starts_with(Self::SSE_PATH_PREFIX) {
-            let room = &path[Self::SSE_PATH_PREFIX.len()..];
-            Self::serve_sse(room, &mut stream, shutdown.clone());
+        // Streaming keeps its own socket lifetime; only finite HTTP responses
+        // go through the shared injectable dispatch pipeline.
+        if request.path.starts_with(Self::SSE_PATH_PREFIX) {
+            let room = &request.path[Self::SSE_PATH_PREFIX.len()..];
+            Self::serve_sse(room, &mut stream, shutdown);
             return;
+        }
+        let response = Self::inject(
+            routes.as_slice(),
+            request,
+            static_dir.as_deref(),
+            output_dir.as_deref(),
+        );
+        HttpServerState::write_response(&mut stream, &response);
+    }
+
+    /// Execute a structured HTTP request without binding a TCP socket.
+    ///
+    /// This shares routing, typed request binding, legacy fallback, static
+    /// containment, cookie handling and middleware with real HTTP connections.
+    /// It intentionally does not exercise wire framing, transfer encodings or
+    /// long-lived SSE streams; retain socket-level tests for those behaviors.
+    pub fn inject(
+        routes: &[RuntimeWebRoute],
+        request: HttpRequest,
+        static_dir: Option<&Path>,
+        output_dir: Option<&Path>,
+    ) -> HttpResponse {
+        // Injection may reuse a calling thread: no response state can cross
+        // synthetic request boundaries (including unmatched static requests).
+        let _ = take_response_cookies();
+        let mut response = if request.path.starts_with(Self::SSE_PATH_PREFIX) {
+            HttpResponse {
+                status: 501,
+                headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
+                body: b"Streaming is not supported by request injection".to_vec(),
+            }
         } else if let Some((route, params)) = routes
             .iter()
             .filter(|r| r.route.method == request.method)
@@ -1085,7 +1148,7 @@ impl WebDevServer {
                 }
             }
         } else {
-            Self::serve_static(static_dir.as_deref(), output_dir.as_deref(), &request.path)
+            Self::serve_static(static_dir, output_dir, &request.path)
         };
         for cookie in take_response_cookies() {
             response.headers.push(("Set-Cookie".into(), cookie));
@@ -1094,7 +1157,7 @@ impl WebDevServer {
         for m in &middlewares {
             m.apply(&request, &mut response);
         }
-        HttpServerState::write_response(&mut stream, &response);
+        response
     }
 
     fn serve_sse(room: &str, stream: &mut TcpStream, shutdown: Arc<AtomicBool>) {
@@ -1501,6 +1564,97 @@ mod tests {
                 assert_eq!(current_request_method(), Some("POST".to_string()));
             },
         );
+    }
+
+    #[test]
+    fn request_context_is_restored_after_handler_panics() {
+        assert_eq!(current_request_method(), None);
+        let result = std::panic::catch_unwind(|| {
+            with_request_context(
+                RequestContext {
+                    request: HttpRequest {
+                        method: HttpMethod::Post,
+                        path: "/test".into(),
+                        headers: vec![],
+                        body: vec![],
+                    },
+                    params: HashMap::new(),
+                },
+                || panic!("simulate a handler panic"),
+            );
+        });
+        assert!(result.is_err());
+        assert_eq!(current_request_method(), None, "panic must not leak request context");
+    }
+
+    #[test]
+    fn nested_request_context_restores_the_outer_request() {
+        let request = |method| RequestContext {
+            request: HttpRequest {
+                method,
+                path: "/test".into(),
+                headers: vec![],
+                body: vec![],
+            },
+            params: HashMap::new(),
+        };
+        with_request_context(request(HttpMethod::Get), || {
+            with_request_context(request(HttpMethod::Post), || {
+                assert_eq!(current_request_method().as_deref(), Some("POST"));
+            });
+            assert_eq!(current_request_method().as_deref(), Some("GET"));
+        });
+        assert_eq!(current_request_method(), None);
+    }
+
+    #[test]
+    fn nested_request_context_keeps_outer_response_cookies() {
+        let request = |method| RequestContext {
+            request: HttpRequest {
+                method,
+                path: "/cookie".into(),
+                headers: vec![],
+                body: vec![],
+            },
+            params: HashMap::new(),
+        };
+        let _ = take_response_cookies();
+        with_request_context(request(HttpMethod::Get), || {
+            set_cookie("outer", "one");
+            with_request_context(request(HttpMethod::Post), || {
+                set_cookie("inner", "two");
+                assert_eq!(take_response_cookies().len(), 1);
+                set_cookie("inner_after_read", "three");
+            });
+            assert_eq!(current_request_method().as_deref(), Some("GET"));
+        });
+        let cookies = take_response_cookies();
+        assert_eq!(cookies.len(), 1, "nested response must not overwrite outer cookies");
+        assert!(cookies[0].starts_with("outer=one;"));
+    }
+
+    #[test]
+    fn panicking_handler_does_not_leak_response_cookies() {
+        let _ = take_response_cookies();
+        let failure = std::panic::catch_unwind(|| {
+            with_request_context(
+                RequestContext {
+                    request: HttpRequest {
+                        method: HttpMethod::Get,
+                        path: "/cookie".into(),
+                        headers: vec![],
+                        body: vec![],
+                    },
+                    params: HashMap::new(),
+                },
+                || {
+                    set_cookie("secret", "must-not-leak");
+                    panic!("test panic");
+                },
+            );
+        });
+        assert!(failure.is_err());
+        assert!(take_response_cookies().is_empty());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use nulang::bytecode::CodeModule;
 use nulang::lexer::Lexer;
 use nulang::parser::Parser;
-use nulang::runtime::{HttpMethod, WebDevServer, WebRoute};
+use nulang::runtime::{HttpMethod, HttpRequest, WebDevServer, WebRoute};
 use nulang::typechecker::TypeChecker;
 use nulang::web::contracts::compile_module_contracts;
 use nulang::web::runtime_bindings::{compile_runtime_route_plan, RuntimeWebRoute};
@@ -164,4 +164,90 @@ fn legacy_route_still_falls_back_over_real_http() {
 
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
     assert!(response_body(&response).starts_with("legacy"), "{response}");
+}
+
+#[test]
+fn injected_typed_request_uses_same_route_contracts() {
+    let response = WebDevServer::inject(
+        &[typed_query_route()],
+        HttpRequest {
+            method: HttpMethod::Get,
+            path: "/users?limit=25".into(),
+            headers: vec![("Host".into(), "localhost".into())],
+            body: vec![],
+        },
+        None,
+        None,
+    );
+
+    assert_eq!(response.status, 200);
+    assert!(
+        String::from_utf8(response.body).unwrap().starts_with("25"),
+        "injected request must execute the compiled typed handler"
+    );
+    assert!(response.headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("X-Content-Type-Options") && value == "nosniff"
+    }));
+}
+
+#[test]
+fn injected_invalid_query_is_a_structured_client_error() {
+    let response = WebDevServer::inject(
+        &[typed_query_route()],
+        HttpRequest {
+            method: HttpMethod::Get,
+            path: "/users?limit=many".into(),
+            headers: vec![],
+            body: vec![],
+        },
+        None,
+        None,
+    );
+
+    assert_eq!(response.status, 400);
+    assert!(response.headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("Content-Type") && value == "application/problem+json"
+    }));
+    let problem: serde_json::Value =
+        serde_json::from_slice(&response.body).expect("valid problem JSON");
+    assert_eq!(problem["code"], "invalid_request_input");
+    assert_eq!(problem["source"], "query");
+}
+
+#[test]
+fn injected_legacy_route_and_not_found_match_socket_dispatch() {
+    let routes = vec![RuntimeWebRoute {
+        route: legacy_route(),
+        plan: None,
+    }];
+    let request = |path: &str| HttpRequest {
+        method: HttpMethod::Get,
+        path: path.to_string(),
+        headers: vec![],
+        body: vec![],
+    };
+    let legacy = WebDevServer::inject(&routes, request("/legacy"), None, None);
+    assert_eq!(legacy.status, 200);
+    assert!(String::from_utf8(legacy.body).unwrap().starts_with("legacy"));
+
+    let missing = WebDevServer::inject(&routes, request("/absent"), None, None);
+    assert_eq!(missing.status, 404);
+    assert_eq!(missing.body, b"Not found");
+}
+
+#[test]
+fn injected_streaming_endpoint_fails_explicitly_instead_of_hanging() {
+    let response = WebDevServer::inject(
+        &[],
+        HttpRequest {
+            method: HttpMethod::Get,
+            path: "/__nulang/sse/events".into(),
+            headers: vec![],
+            body: vec![],
+        },
+        None,
+        None,
+    );
+    assert_eq!(response.status, 501);
+    assert_eq!(response.body, b"Streaming is not supported by request injection");
 }
